@@ -1,0 +1,163 @@
+-- allium: 3
+-- skilj.allium
+
+-- Scope: SkilJ, a Rust library for building event-sourced, DDD-style
+--   applications backed by a single-instance Postgres database, exposing
+--   commands and queries over GraphQL.
+-- Includes: Bounded contexts, Commands, Events and their possible
+--   origins, Command/Event type registration with JSON-Schema payload
+--   definitions, the admin bounded context that registers other bounded
+--   contexts and their types, the coarse shape of projections built from
+--   events, and raw event stream subscriptions with per-field filtering.
+-- Excludes:
+--   - Fine-grained token-based access control (captured as declared
+--     intent on event types for now; enforcement is future work)
+--   - Multi-instance / distributed deployment
+--   - The detailed projection query surface and GraphQL wire contract
+--     (deferred to a later, more detailed pass)
+-- Dependencies: none yet
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Filter {
+    field: String              -- name of a field in the event type's schema
+    operator: FilterOperator
+    value: String               -- comparison value, serialised to match the field's declared type
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum FilterOperator { equals | contains | is_like | greater_than | less_than }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity BoundedContext {
+    name: String
+
+    event_types: EventType with bounded_context = this
+    command_types: CommandType with bounded_context = this
+    commands: Command with bounded_context = this
+    events: Event with bounded_context = this
+    projections: Projection with bounded_context = this
+    subscriptions: Subscription with bounded_context = this
+}
+
+entity CommandType {
+    bounded_context: BoundedContext
+    name: String
+    schema: String              -- JSON Schema describing the command's payload fields and optionality
+}
+
+entity EventType {
+    bounded_context: BoundedContext
+    name: String
+    schema: String              -- JSON Schema describing the event's payload fields and optionality
+                                 -- schema updates must remain backwards compatible with prior versions
+
+    -- Command-triggered origin is always permitted; the other three
+    -- origins require explicit opt-in per event type.
+    external_creation_allowed: Boolean
+    direct_creation_allowed: Boolean
+    direct_creation_role: String?          -- declared intent only for now; see open questions
+    system_triggered_allowed: Boolean
+    system_triggered_schedule: String?     -- cron expression
+}
+
+entity Command {
+    bounded_context: BoundedContext
+    command_type: CommandType
+    payload: String                        -- JSON-encoded command data, conforms to command_type.schema
+    created_at: Timestamp
+
+    -- Events produced by this command, stored in the same transaction.
+    triggered_events: CommandTriggered with command = this
+}
+
+entity Event {
+    bounded_context: BoundedContext
+    event_type: EventType
+    payload: String                        -- JSON-encoded event data, conforms to event_type.schema
+    created_at: Timestamp
+    origin: CommandTriggered | ExternalTriggered | DirectlyCreated | SystemTriggered
+}
+
+variant CommandTriggered : Event {
+    command: Command
+}
+
+variant ExternalTriggered : Event {
+    source_content: String                 -- source-specific payload, e.g. a raw JSON blob
+    source_context: String?                -- source-specific provenance data; shape open, see open questions
+}
+
+variant DirectlyCreated : Event {
+    client_id: String
+}
+
+variant SystemTriggered : Event {}
+
+entity Projection {
+    bounded_context: BoundedContext
+    name: String
+}
+
+entity Subscription {
+    bounded_context: BoundedContext
+    created_at: Timestamp
+    kind: AllEventsSubscription | EventTypeSubscription
+}
+
+variant AllEventsSubscription : Subscription {}
+
+variant EventTypeSubscription : Subscription {
+    event_type: EventType
+    filters: List<Filter>
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+default BoundedContext admin = { name: "admin" }
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueEventTypeNamePerContext {
+    for a in EventTypes:
+        for b in EventTypes:
+            a != b and a.bounded_context = b.bounded_context implies a.name != b.name
+}
+
+invariant UniqueCommandTypeNamePerContext {
+    for a in CommandTypes:
+        for b in CommandTypes:
+            a != b and a.bounded_context = b.bounded_context implies a.name != b.name
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "External event context: how much source-specific metadata should be persisted, and does the shape vary per source type (e.g. Kafka vs webhook)?"
+
+open question "Direct-creation role is captured as declared intent now, unenforced until token-based access control lands. Structurally, is this just a plain optional field, or should it be a distinct annotation the checker treats specially once enforcement exists?"
+
+open question "System-triggered schedule: does the library run its own internal scheduler against the cron expression, or does it rely on something external calling in at the right time?"
+
+open question "How does the admin bounded context's own commands (e.g. registering a new event type) actually create BoundedContext/EventType/CommandType entities elsewhere in the system? Is this ordinary rules reacting to admin events, the same mechanism as any other bounded context, or does it need special-casing?"
+
+open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). This isn't structurally enforced here - is that validation done at subscription-registration time, or at query time?"
+
+open question "The all-events subscription per bounded context has 'limited to no filtering' - what, if anything, can it filter on (e.g. event type name only), versus the full per-field filtering on EventTypeSubscription?"
+
+open question "Projections: how do they declare which event types they consume, how do they get rebuilt/kept up to date, and how are they exposed as GraphQL queries?"
+
+open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Everything is open (no auth) for now; fine-grained token-based access control is deferred."
