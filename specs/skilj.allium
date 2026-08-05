@@ -27,6 +27,41 @@ value Filter {
     value: String               -- comparison value, serialised to match the field's declared type
 }
 
+value Metadata {
+    type: String                -- denormalised name of the event/command type this message conforms to
+    version: Integer             -- schema_version of the type at the time this message was created
+    client_id: String          -- identifies the client/caller that produced this message in some cases it might refer to the original call, for an event it might be the client that issues the command
+    created_at: Timestamp
+}
+
+value Tag {
+    key: String                 -- shared across event types, e.g. "account"
+    value: String                -- e.g. "123"
+}
+
+value TagMapping {
+    key: String                 -- the tag key this mapping produces, e.g. "account" - the same key
+                                 -- can be declared by multiple event types, so a consistency boundary
+                                 -- can span all of them regardless of type (e.g. MoneyAdded and
+                                 -- MoneySubtracted both mapping their account_id field to "account")
+    field: String                -- name of the payload field this key's value is read from, for this
+                                 -- event type specifically
+}
+
+value EventSpec {
+    event_type: EventType
+    payload: String              -- JSON-encoded, conforms to event_type.schema
+}
+
+value CommandDecision {
+    accepted: Boolean
+    events: List<EventSpec>      -- ignored when accepted = false
+    rejection_reason: String?    -- domain-specific explanation from the decider; surfaced verbatim
+                                  -- as the GraphQL error message when accepted = false. Producing a
+                                  -- meaningful message here is the decider's responsibility - it
+                                  -- needs domain knowledge this library doesn't have.
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -39,6 +74,9 @@ enum FilterOperator { equals | contains | is_like | greater_than | less_than }
 
 entity BoundedContext {
     name: String
+    status: active | archived              -- archived: no longer accepts new commands/events, but its
+                                            -- history is retained (event sourcing is append-only; a
+                                            -- bounded context is deactivated, never erased)
 
     event_types: EventType with bounded_context = this
     command_types: CommandType with bounded_context = this
@@ -46,34 +84,89 @@ entity BoundedContext {
     events: Event with bounded_context = this
     projections: Projection with bounded_context = this
     subscriptions: Subscription with bounded_context = this
+
+    transitions status {
+        active -> archived
+        terminal: archived
+    }
 }
 
 entity CommandType {
     bounded_context: BoundedContext
     name: String
     schema: String              -- JSON Schema describing the command's payload fields and optionality
+    schema_version: Integer     -- increments on each schema change; changes must stay backwards compatible
+
+    -- Mirrors EventType.tag_mappings: derives this command's
+    -- consistency_tags from its own payload, using the same shared keys
+    -- events are tagged with, so the two are directly comparable.
+    tag_mappings: Set<TagMapping>
 }
 
 entity EventType {
     bounded_context: BoundedContext
     name: String
     schema: String              -- JSON Schema describing the event's payload fields and optionality
-                                 -- schema updates must remain backwards compatible with prior versions
+    schema_version: Integer     -- increments on each schema change; changes must stay backwards compatible
+
+    -- Deliberately opt-in and small: each mapping promotes one payload
+    -- field to an indexed, queryable tag. Only mapped fields are
+    -- indexed - not every field - to keep the index footprint bounded.
+    tag_mappings: Set<TagMapping>
 
     -- Command-triggered origin is always permitted; the other three
     -- origins require explicit opt-in per event type.
     external_creation_allowed: Boolean
+    external_creation_tokens: ExternalEventToken with event_type = this
     direct_creation_allowed: Boolean
-    direct_creation_role: String?          -- declared intent only for now; see open questions
+    direct_creation_tokens: DirectCreationToken with event_type = this
     system_triggered_allowed: Boolean
-    system_triggered_schedule: String?     -- cron expression
+    system_triggered_schedule: String?     -- cron expression, evaluated by the core's own in-process
+                                            -- scheduler; the core cannot rely on an OS-level cron
 }
+
+entity Token {
+    id: String                             -- non-secret identifier, safe to log and store on events
+    event_type: EventType
+    secret: String                         -- opaque bearer credential (distinct from id)
+    status: active | revoked
+    created_at: Timestamp
+    revoked_at: Timestamp? when status = revoked
+    purpose: ExternalEventToken | DirectCreationToken
+
+    -- Scoped to exactly one EventType: holding a token authorises acting
+    -- (submitting an external event, or directly creating one) for that
+    -- type only, nothing else. Lifecycle is tracked by the admin bounded
+    -- context via TokenCreated/TokenRevoked.
+    transitions status {
+        active -> revoked
+        terminal: revoked
+    }
+}
+
+variant ExternalEventToken : Token {
+    -- Held by an out-of-core adapter (e.g. a Kafka client, which needs OS
+    -- facilities the core deliberately avoids) to authenticate against
+    -- ExternalEventIngestion and fail independently if its own
+    -- dependency is unavailable.
+}
+
+variant DirectCreationToken : Token {}
 
 entity Command {
     bounded_context: BoundedContext
     command_type: CommandType
     payload: String                        -- JSON-encoded command data, conforms to command_type.schema
-    created_at: Timestamp
+    metadata: Metadata                     -- client_id comes from the GraphQL request context: an
+                                            -- identity-provider identity once auth exists, an
+                                            -- anonymous/session marker until then
+
+    -- Dynamic consistency boundary: the tags this command's decision was
+    -- based on, and the highest Event.sequence observed among events
+    -- matching those tags at decision time. Null when the command does
+    -- not use a consistency boundary.
+    consistency_tags: Set<Tag>
+    consistency_boundary: Integer?
 
     -- Events produced by this command, stored in the same transaction.
     triggered_events: CommandTriggered with command = this
@@ -83,7 +176,11 @@ entity Event {
     bounded_context: BoundedContext
     event_type: EventType
     payload: String                        -- JSON-encoded event data, conforms to event_type.schema
-    created_at: Timestamp
+    metadata: Metadata
+    sequence: Integer                      -- append position within bounded_context: monotonically
+                                            -- increasing, gapless, starting at 0
+    tags: Set<Tag>                         -- derived from event_type.tag_mappings at creation time,
+                                            -- not caller-supplied
     origin: CommandTriggered | ExternalTriggered | DirectlyCreated | SystemTriggered
 }
 
@@ -94,13 +191,18 @@ variant CommandTriggered : Event {
 variant ExternalTriggered : Event {
     source_content: String                 -- source-specific payload, e.g. a raw JSON blob
     source_context: String?                -- source-specific provenance data; shape open, see open questions
+    -- metadata.client_id holds the id of the ExternalEventToken used to submit this event
 }
 
 variant DirectlyCreated : Event {
-    client_id: String
+    -- metadata.client_id holds the id of the DirectCreationToken used to create this event
 }
 
-variant SystemTriggered : Event {}
+variant SystemTriggered : Event {
+    invariant ClientIdIsSystem {
+        metadata.client_id = "system"
+    }
+}
 
 entity Projection {
     bounded_context: BoundedContext
@@ -124,7 +226,189 @@ variant EventTypeSubscription : Subscription {
 -- Defaults
 ------------------------------------------------------------
 
-default BoundedContext admin = { name: "admin" }
+default BoundedContext admin = { name: "admin", status: active }
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- next_sequence(bounded_context), used below in CreateExternalEvent,
+-- CreateDirectEvent and ProcessCommand, and the consistency-boundary
+-- re-check in ProcessCommand, are both enforced at the Postgres level
+-- rather than in application code: a single row per bounded context
+-- (e.g. in a sequence-counter table) is locked with SELECT ... FOR
+-- UPDATE as part of the same transaction that inserts the new
+-- Command/Event rows, then incremented and released on commit. This one
+-- lock scope gives both guarantees for free - gapless assignment (the
+-- counter only advances on a committed transaction, unlike a Postgres
+-- SEQUENCE, which is non-transactional and does leave gaps on rollback)
+-- and the DCB conflict re-check (no concurrent committer for the same
+-- bounded context can be interleaved while the row is locked). Only the
+-- final re-check and insert need the lock; reading matching events and
+-- running decide() beforehand does not.
+
+rule CreateExternalEvent {
+    when: SubmitExternalEvent(adapter, event_type, payload, source_content, source_context?)
+    requires: event_type.external_creation_allowed = true
+    requires: adapter.event_type = event_type
+    requires: adapter.status = active
+    ensures:
+        ExternalTriggered.created(
+            bounded_context: event_type.bounded_context,
+            event_type: event_type,
+            payload: payload,
+            metadata: {
+                type: event_type.name,
+                version: event_type.schema_version,
+                client_id: adapter.id,
+                created_at: now
+            },
+            sequence: next_sequence(event_type.bounded_context),
+            tags: derive_tags(event_type, payload),
+            source_content: source_content,
+            source_context: source_context
+        )
+}
+
+rule CreateDirectEvent {
+    when: SubmitDirectEvent(adapter, event_type, payload)
+    requires: event_type.direct_creation_allowed = true
+    requires: adapter.event_type = event_type
+    requires: adapter.status = active
+    ensures:
+        DirectlyCreated.created(
+            bounded_context: event_type.bounded_context,
+            event_type: event_type,
+            payload: payload,
+            metadata: {
+                type: event_type.name,
+                version: event_type.schema_version,
+                client_id: adapter.id,
+                created_at: now
+            },
+            sequence: next_sequence(event_type.bounded_context),
+            tags: derive_tags(event_type, payload)
+        )
+}
+
+rule ProcessCommand {
+    when: SubmitCommand(client_id, command_type, payload)
+    requires: command_type.bounded_context.status = active
+
+    let consistency_tags = derive_tags(command_type, payload)
+    let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
+    let matching_events =
+        Events where bounded_context = command_type.bounded_context
+            and sequence <= boundary
+            and consistency_tags.any(t => t in tags)
+
+    -- decide() is the plugged-in, bounded-context-specific decider (e.g.
+    -- "is there enough balance to withdraw"). This library only owns the
+    -- read/decide/commit shape, not the business logic itself. boundary
+    -- and matching_events are evaluated fresh at commit time (see the
+    -- Postgres locking note above the rules), so decide() always sees
+    -- complete, current data for its tags - there is no separate staler
+    -- state to reconcile against.
+    let decision = decide(command_type, payload, matching_events)
+    requires: decision.accepted = true
+
+    ensures:
+        let command = Command.created(
+            bounded_context: command_type.bounded_context,
+            command_type: command_type,
+            payload: payload,
+            metadata: {
+                type: command_type.name,
+                version: command_type.schema_version,
+                client_id: client_id,
+                created_at: now
+            },
+            consistency_tags: consistency_tags,
+            consistency_boundary: boundary
+        )
+        for spec in decision.events:
+            CommandTriggered.created(
+                bounded_context: command_type.bounded_context,
+                event_type: spec.event_type,
+                payload: spec.payload,
+                metadata: {
+                    type: spec.event_type.name,
+                    version: spec.event_type.schema_version,
+                    client_id: client_id,
+                    created_at: now
+                },
+                sequence: next_sequence(command_type.bounded_context),
+                tags: derive_tags(spec.event_type, spec.payload),
+                command: command
+            )
+
+    @guidance
+        -- Performance note, not a change in behaviour: decide() may be
+        -- called an extra time in practice. An implementation can read
+        -- matching_events and call decide() once optimistically, without
+        -- holding the per-bounded-context lock, then take the lock only
+        -- to fetch whatever events arrived after boundary (not a full
+        -- re-scan) and call decide() again immediately with the
+        -- complete set if anything new showed up. A conflict is a
+        -- staleness signal, not an automatic rejection - only the final,
+        -- fresh decision determines accepted/rejected. Either way the
+        -- rule's own requires/ensures above is what must hold at commit.
+}
+
+-- The five rules below are the admin bounded context's operations. In
+-- principle each should itself be a Command producing a CommandTriggered
+-- Event (BoundedContextAdded, BoundedContextArchived, TokenCreated,
+-- TokenRevoked) within the admin bounded context, the same as any other
+-- bounded context's commands - full dogfooding. That wiring depends on
+-- the still-open general command-processing mechanism, so for now these
+-- are modelled as direct effects, consistent with CreateExternalEvent
+-- and CreateDirectEvent above.
+
+rule AddBoundedContext {
+    when: AddBoundedContext(name)
+    requires: not exists BoundedContext{name: name}
+    ensures:
+        BoundedContext.created(name: name, status: active)
+}
+
+rule ArchiveBoundedContext {
+    when: ArchiveBoundedContext(bounded_context)
+    requires: bounded_context.status = active
+    ensures:
+        bounded_context.status = archived
+}
+
+rule CreateExternalEventToken {
+    when: CreateExternalEventToken(event_type)
+    ensures:
+        ExternalEventToken.created(
+            id: generate_token_id(),
+            event_type: event_type,
+            secret: generate_token_secret(),
+            status: active,
+            created_at: now
+        )
+}
+
+rule CreateDirectCreationToken {
+    when: CreateDirectCreationToken(event_type)
+    ensures:
+        DirectCreationToken.created(
+            id: generate_token_id(),
+            event_type: event_type,
+            secret: generate_token_secret(),
+            status: active,
+            created_at: now
+        )
+}
+
+rule RevokeToken {
+    when: RevokeToken(token)
+    requires: token.status = active
+    ensures:
+        token.status = revoked
+        token.revoked_at = now
+}
 
 ------------------------------------------------------------
 -- Invariants
@@ -142,17 +426,93 @@ invariant UniqueCommandTypeNamePerContext {
             a != b and a.bounded_context = b.bounded_context implies a.name != b.name
 }
 
+invariant DynamicConsistencyBoundaryHonoured {
+    -- A command decides based on events matching its consistency_tags,
+    -- up to consistency_boundary (the highest sequence observed at
+    -- decision time). Any event with a matching tag and a higher
+    -- sequence must be one of this command's own triggered events -
+    -- never a foreign event that slipped in between the command's read
+    -- and its commit.
+    for c in Commands:
+        for e in Events:
+            (e.bounded_context = c.bounded_context and c.consistency_tags.any(t => t in e.tags)
+                and e.sequence > c.consistency_boundary)
+                implies e in c.triggered_events
+}
+
+invariant SequenceIsGaplessPerBoundedContext {
+    for e in Events:
+        e.sequence = 0 or Events.any(other => other.bounded_context = e.bounded_context and other.sequence = e.sequence - 1)
+}
+
+invariant ConsistencyTagKeysAreDeclared {
+    -- A command may only consistency-check against tag keys that some
+    -- EventType actually declares (and therefore indexes). This is the
+    -- structural form of "can we verify an index exists for this tag at
+    -- runtime".
+    for c in Commands:
+        for tag in c.consistency_tags:
+            EventTypes.any(et => et.tag_mappings.any(m => m.key = tag.key))
+}
+
+invariant EventTagsMatchDeclaredMappings {
+    for e in Events:
+        for tag in e.tags:
+            e.event_type.tag_mappings.any(m => m.key = tag.key)
+}
+
+invariant CommandConsistencyTagsMatchDeclaredMappings {
+    for c in Commands:
+        for tag in c.consistency_tags:
+            c.command_type.tag_mappings.any(m => m.key = tag.key)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ExternalEventIngestion {
+    facing adapter: ExternalEventToken
+    context event_type: EventType
+        where this = adapter.event_type and external_creation_allowed = true and adapter.status = active
+
+    provides:
+        SubmitExternalEvent(adapter, event_type, payload, source_content, source_context?)
+
+    @guarantee TokenScopedToEventType
+        -- A token only authorises submitting events for the EventType it
+        -- was issued for; it grants no other capability.
+
+    @guidance
+        -- Exposed as both a REST endpoint and a GraphQL mutation. The
+        -- behavioural contract above is identical across both bindings;
+        -- the choice of protocol is an implementation detail.
+}
+
+surface DirectEventCreation {
+    facing adapter: DirectCreationToken
+    context event_type: EventType
+        where this = adapter.event_type and direct_creation_allowed = true and adapter.status = active
+
+    provides:
+        SubmitDirectEvent(adapter, event_type, payload)
+
+    @guarantee TokenScopedToEventType
+        -- A token only authorises creating events for the EventType it
+        -- was issued for; it grants no other capability.
+
+    @guidance
+        -- Exposed as both a REST endpoint and a GraphQL mutation, the
+        -- same as external event ingestion.
+}
+
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
 
 open question "External event context: how much source-specific metadata should be persisted, and does the shape vary per source type (e.g. Kafka vs webhook)?"
 
-open question "Direct-creation role is captured as declared intent now, unenforced until token-based access control lands. Structurally, is this just a plain optional field, or should it be a distinct annotation the checker treats specially once enforcement exists?"
-
-open question "System-triggered schedule: does the library run its own internal scheduler against the cron expression, or does it rely on something external calling in at the right time?"
-
-open question "How does the admin bounded context's own commands (e.g. registering a new event type) actually create BoundedContext/EventType/CommandType entities elsewhere in the system? Is this ordinary rules reacting to admin events, the same mechanism as any other bounded context, or does it need special-casing?"
+open question "EventType/CommandType registration is unresolved (unlike bounded context add/archive and token create/revoke, which are now modelled). One option: explicit admin commands, mirroring AddBoundedContext. Another: derived from Rust code structure - e.g. a bounded_context::administration module holds all the message/query/projection types for that context - with the running instance reconciling on startup, creating any EventType/CommandType compiled into the binary but missing from storage. This could also extend to auto-creating the BoundedContext itself at startup, as an alternative or complement to the explicit AddBoundedContext command. Which approach, or some mix?"
 
 open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). This isn't structurally enforced here - is that validation done at subscription-registration time, or at query time?"
 
@@ -161,3 +521,13 @@ open question "The all-events subscription per bounded context has 'limited to n
 open question "Projections: how do they declare which event types they consume, how do they get rebuilt/kept up to date, and how are they exposed as GraphQL queries?"
 
 open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Everything is open (no auth) for now; fine-grained token-based access control is deferred."
+
+open question "Schema versioning tracks a current schema_version counter per type, but not the historical schema text for prior versions. Do consumers reading old events need to look up the exact schema that was active for their recorded version, or is 'each version stays backwards compatible' sufficient without keeping that history?"
+
+open question "decide() and CommandDecision are the plugged-in, bounded-context-specific decider - genuinely out of this library's scope, and now responsible for producing rejection_reason too. Is that plugin boundary worth specifying formally (e.g. as a Rust trait each bounded context implements), or left entirely to the consuming code with no contract here?"
+
+open question "Tag keys declared via tag_mappings are plain strings with no namespace - could two unrelated bounded contexts collide on the same key (e.g. both using \"account\")? (Sequence scope is resolved: per bounded context, gapless. Serialisation mechanism is resolved: a Postgres row lock per bounded context, not application-level coordination.)"
+
+open question "derive_tags(event_type, payload) is a black box: does TagMapping.field validate against event_type.schema at registration time (so a mapping can't reference a field that doesn't exist), or is that left unchecked since schema is just an opaque JSON Schema string to the spec?"
+
+open question "Are there cases where a consistency boundary needs 'all events of a specific EventType' with no field-level tag at all, rather than a key/value tag? Raised as a possible exception but not confirmed as a real requirement."
