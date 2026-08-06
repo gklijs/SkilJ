@@ -8,13 +8,30 @@
 --   origins, Command/Event type registration with JSON-Schema payload
 --   definitions, the admin bounded context that registers other bounded
 --   contexts and their types, the coarse shape of projections built from
---   events, and raw event stream subscriptions with per-field filtering.
+--   events, raw event stream subscriptions with per-field filtering,
+--   role-based access control over the GraphQL surface (Role/AccessToken,
+--   scoped per bounded context to read/write/admin levels, plus a
+--   superadmin flag on Role for creating new bounded contexts), and
+--   per-field sensitivity marking on events with crypto-shredding for
+--   erasure (SensitiveField, EncryptionKey, right-to-be-forgotten via
+--   ForgetSubject).
 -- Excludes:
---   - Fine-grained token-based access control (captured as declared
---     intent on event types for now; enforcement is future work)
+--   - Enforcement of read-level access (querying projections, creating
+--     subscriptions) and of sensitive-field decryption
+--     (AccessToken.can_read_sensitive): both models exist, but there is
+--     no query/subscription surface yet to gate either against - see the
+--     detailed projection query surface exclusion below
+--   - Retroactive encryption of historical events when a field is newly
+--     marked sensitive: event sourcing is append-only, so this is a
+--     structural consequence, not a gap (see EventType.sensitive_fields
+--     and Event.encryption_keys)
+--   - The encryption scheme itself (algorithm, key derivation, physical
+--     key storage) - protect_sensitive_fields is a black box, consistent
+--     with how Token.secret generation is already treated
 --   - Multi-instance / distributed deployment
---   - The detailed projection query surface and GraphQL wire contract
---     (deferred to a later, more detailed pass)
+--   - The detailed projection query surface and GraphQL wire contract,
+--     including how a Role's secret is transmitted (deferred to a later,
+--     more detailed pass)
 -- Dependencies: none yet
 
 ------------------------------------------------------------
@@ -62,11 +79,30 @@ value CommandDecision {
                                   -- needs domain knowledge this library doesn't have.
 }
 
+value SensitiveField {
+    field: String                -- name of the payload field to store encrypted
+    subject_key: String          -- canonical subject dimension this field belongs to
+                                  -- (e.g. "user") - shared across event types, so the
+                                  -- same EncryptionKey covers a subject regardless of
+                                  -- which event type or payload field name captured it
+    subject_field: String        -- name of the payload field this event type reads the
+                                  -- concrete subject value from (e.g. "user_id")
+}
+
+value EncryptedPayload {
+    payload: String                      -- payload with each declared sensitive field's
+                                          -- value replaced by ciphertext
+    encryption_keys: Set<EncryptionKey>  -- the EncryptionKeys used, one per distinct
+                                          -- subject a sensitive field referenced
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
 
 enum FilterOperator { equals | contains | is_like | greater_than | less_than }
+
+enum AccessLevel { read | write | admin }
 
 ------------------------------------------------------------
 -- Entities and Variants
@@ -84,6 +120,8 @@ entity BoundedContext {
     events: Event with bounded_context = this
     projections: Projection with bounded_context = this
     subscriptions: Subscription with bounded_context = this
+    access_tokens: AccessToken with bounded_context = this
+    encryption_keys: EncryptionKey with bounded_context = this
 
     transitions status {
         active -> archived
@@ -113,6 +151,14 @@ entity EventType {
     -- field to an indexed, queryable tag. Only mapped fields are
     -- indexed - not every field - to keep the index footprint bounded.
     tag_mappings: Set<TagMapping>
+
+    -- Opt-in, mirrors tag_mappings in shape. Adding an entry here only
+    -- affects events created from this point forward - it does not
+    -- retroactively encrypt this type's existing history, since events
+    -- are immutable. See Event.encryption_keys to tell which historical
+    -- events predate a given entry (and so still hold that field in
+    -- plaintext).
+    sensitive_fields: Set<SensitiveField>
 
     -- Command-triggered origin is always permitted; the other three
     -- origins require explicit opt-in per event type.
@@ -153,13 +199,83 @@ variant ExternalEventToken : Token {
 
 variant DirectCreationToken : Token {}
 
+entity Role {
+    id: String                             -- non-secret identifier, safe to log and store on events
+    secret: String                         -- opaque bearer credential presented by GraphQL clients
+    name: String
+    superadmin: Boolean                    -- grants AddBoundedContext and all Role/AccessToken
+                                            -- management, independently of any AccessToken below
+    status: active | revoked
+    created_at: Timestamp
+    revoked_at: Timestamp? when status = revoked
+
+    -- A Role reaches multiple bounded contexts by holding multiple
+    -- AccessTokens, one per context - there is no single grant that
+    -- spans contexts other than superadmin, which is orthogonal to
+    -- context scoping entirely (see AccessToken).
+    access_tokens: AccessToken with role = this
+
+    transitions status {
+        active -> revoked
+        terminal: revoked
+    }
+}
+
+entity AccessToken {
+    role: Role
+    bounded_context: BoundedContext
+    level: AccessLevel
+    can_read_sensitive: Boolean             -- orthogonal to level: authorises decrypting
+                                             -- sensitive fields within this token's
+                                             -- bounded context. A write or admin token
+                                             -- does not see decrypted sensitive values
+                                             -- unless this is also true.
+    status: active | revoked
+    created_at: Timestamp
+    revoked_at: Timestamp? when status = revoked
+
+    -- Scoped to exactly one BoundedContext: holding this token authorises
+    -- the given level within that context only, nothing else. Levels
+    -- accumulate: read authorises querying and subscribing; write
+    -- includes read and additionally authorises submitting commands;
+    -- admin includes write and additionally authorises the
+    -- admin-bounded-context mutations that target this specific context
+    -- (archiving it, creating/revoking tokens for its own event types) -
+    -- but not AddBoundedContext, which is gated by Role.superadmin
+    -- instead, since creating a context isn't "for" any existing one.
+    transitions status {
+        active -> revoked
+        terminal: revoked
+    }
+}
+
+entity EncryptionKey {
+    bounded_context: BoundedContext
+    subject_key: String                    -- e.g. "user" - see SensitiveField.subject_key
+    subject_value: String                  -- e.g. "123"
+    status: active | destroyed
+    created_at: Timestamp
+    destroyed_at: Timestamp? when status = destroyed
+
+    -- Crypto-shredding: destroying this key is what "forgets" a subject
+    -- (see ForgetSubject). Historical events encrypted under it keep
+    -- their ciphertext exactly as stored - event sourcing is
+    -- append-only, so forgetting never edits or removes an event - the
+    -- ciphertext simply becomes permanently unreadable. A later event
+    -- for the same subject provisions a new active key; it does not
+    -- revive this one.
+    transitions status {
+        active -> destroyed
+        terminal: destroyed
+    }
+}
+
 entity Command {
     bounded_context: BoundedContext
     command_type: CommandType
     payload: String                        -- JSON-encoded command data, conforms to command_type.schema
-    metadata: Metadata                     -- client_id comes from the GraphQL request context: an
-                                            -- identity-provider identity once auth exists, an
-                                            -- anonymous/session marker until then
+    metadata: Metadata                     -- client_id is the id of the Role behind the AccessToken
+                                            -- that submitted this command (see CommandSubmission)
 
     -- Dynamic consistency boundary: the tags this command's decision was
     -- based on, and the highest Event.sequence observed among events
@@ -181,6 +297,13 @@ entity Event {
                                             -- increasing, gapless, starting at 0
     tags: Set<Tag>                         -- derived from event_type.tag_mappings at creation time,
                                             -- not caller-supplied
+    encryption_keys: Set<EncryptionKey>    -- captured at creation time: one key per distinct
+                                            -- subject a sensitive field referenced at that
+                                            -- moment. Empty if event_type declared no
+                                            -- sensitive fields when this event was created -
+                                            -- such an event holds those fields in plaintext,
+                                            -- even if sensitive_fields later gains an entry
+                                            -- for them (see EventType.sensitive_fields)
     origin: CommandTriggered | ExternalTriggered | DirectlyCreated | SystemTriggered
 }
 
@@ -207,6 +330,12 @@ variant SystemTriggered : Event {
 entity Projection {
     bounded_context: BoundedContext
     name: String
+
+    -- No field-level structure yet (see open questions on the detailed
+    -- projection query surface). Sensitivity is declared once, on the
+    -- source EventType (see EventType.sensitive_fields) - a projection
+    -- built from a sensitive field inherits the same restriction rather
+    -- than re-declaring it.
 }
 
 entity Subscription {
@@ -246,17 +375,35 @@ default BoundedContext admin = { name: "admin", status: active }
 -- bounded context can be interleaved while the row is locked). Only the
 -- final re-check and insert need the lock; reading matching events and
 -- running decide() beforehand does not.
+--
+-- protect_sensitive_fields(event_type, payload), used in the same three
+-- rules, follows a similar pattern: it get-or-creates the EncryptionKey
+-- for each subject a sensitive field in event_type.sensitive_fields
+-- references (each key provisioned exactly once, in the same
+-- transaction as the event's own insert), then returns the payload with
+-- those fields' values replaced by ciphertext plus the keys used. A
+-- no-op - unchanged payload, empty key set - when sensitive_fields is
+-- empty. Unlike next_sequence's target, EncryptionKey is a real,
+-- rule-governed entity (see its transitions and ForgetSubject below);
+-- this call only ever provisions - destruction is always a separate,
+-- explicitly authorised action. It may be called more than once for the
+-- same event_type/payload within one rule execution (see ProcessCommand)
+-- and is idempotent when it is: repeat calls find the key already
+-- provisioned rather than creating another one.
 
 rule CreateExternalEvent {
     when: SubmitExternalEvent(adapter, event_type, payload, source_content, source_context?)
     requires: event_type.external_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
+
+    let protected = protect_sensitive_fields(event_type, payload)
+
     ensures:
         ExternalTriggered.created(
             bounded_context: event_type.bounded_context,
             event_type: event_type,
-            payload: payload,
+            payload: protected.payload,
             metadata: {
                 type: event_type.name,
                 version: event_type.schema_version,
@@ -265,6 +412,7 @@ rule CreateExternalEvent {
             },
             sequence: next_sequence(event_type.bounded_context),
             tags: derive_tags(event_type, payload),
+            encryption_keys: protected.encryption_keys,
             source_content: source_content,
             source_context: source_context
         )
@@ -275,11 +423,14 @@ rule CreateDirectEvent {
     requires: event_type.direct_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
+
+    let protected = protect_sensitive_fields(event_type, payload)
+
     ensures:
         DirectlyCreated.created(
             bounded_context: event_type.bounded_context,
             event_type: event_type,
-            payload: payload,
+            payload: protected.payload,
             metadata: {
                 type: event_type.name,
                 version: event_type.schema_version,
@@ -287,12 +438,16 @@ rule CreateDirectEvent {
                 created_at: now
             },
             sequence: next_sequence(event_type.bounded_context),
-            tags: derive_tags(event_type, payload)
+            tags: derive_tags(event_type, payload),
+            encryption_keys: protected.encryption_keys
         )
 }
 
 rule ProcessCommand {
-    when: SubmitCommand(client_id, command_type, payload)
+    when: SubmitCommand(access_token, command_type, payload)
+    requires: access_token.status = active
+    requires: access_token.level in {write, admin}
+    requires: access_token.bounded_context = command_type.bounded_context
     requires: command_type.bounded_context.status = active
 
     let consistency_tags = derive_tags(command_type, payload)
@@ -320,7 +475,7 @@ rule ProcessCommand {
             metadata: {
                 type: command_type.name,
                 version: command_type.schema_version,
-                client_id: client_id,
+                client_id: access_token.role.id,
                 created_at: now
             },
             consistency_tags: consistency_tags,
@@ -330,15 +485,16 @@ rule ProcessCommand {
             CommandTriggered.created(
                 bounded_context: command_type.bounded_context,
                 event_type: spec.event_type,
-                payload: spec.payload,
+                payload: protect_sensitive_fields(spec.event_type, spec.payload).payload,
                 metadata: {
                     type: spec.event_type.name,
                     version: spec.event_type.schema_version,
-                    client_id: client_id,
+                    client_id: access_token.role.id,
                     created_at: now
                 },
                 sequence: next_sequence(command_type.bounded_context),
                 tags: derive_tags(spec.event_type, spec.payload),
+                encryption_keys: protect_sensitive_fields(spec.event_type, spec.payload).encryption_keys,
                 command: command
             )
 
@@ -365,21 +521,29 @@ rule ProcessCommand {
 -- and CreateDirectEvent above.
 
 rule AddBoundedContext {
-    when: AddBoundedContext(name)
+    when: AddBoundedContext(caller, name)
+    requires: caller.status = active
+    requires: caller.superadmin = true
     requires: not exists BoundedContext{name: name}
     ensures:
         BoundedContext.created(name: name, status: active)
 }
 
 rule ArchiveBoundedContext {
-    when: ArchiveBoundedContext(bounded_context)
+    when: ArchiveBoundedContext(access_token, bounded_context)
+    requires: access_token.status = active
+    requires: access_token.level = admin
+    requires: access_token.bounded_context = bounded_context
     requires: bounded_context.status = active
     ensures:
         bounded_context.status = archived
 }
 
 rule CreateExternalEventToken {
-    when: CreateExternalEventToken(event_type)
+    when: CreateExternalEventToken(access_token, event_type)
+    requires: access_token.status = active
+    requires: access_token.level = admin
+    requires: access_token.bounded_context = event_type.bounded_context
     ensures:
         ExternalEventToken.created(
             id: generate_token_id(),
@@ -391,7 +555,10 @@ rule CreateExternalEventToken {
 }
 
 rule CreateDirectCreationToken {
-    when: CreateDirectCreationToken(event_type)
+    when: CreateDirectCreationToken(access_token, event_type)
+    requires: access_token.status = active
+    requires: access_token.level = admin
+    requires: access_token.bounded_context = event_type.bounded_context
     ensures:
         DirectCreationToken.created(
             id: generate_token_id(),
@@ -403,11 +570,93 @@ rule CreateDirectCreationToken {
 }
 
 rule RevokeToken {
-    when: RevokeToken(token)
+    when: RevokeToken(access_token, token)
+    requires: access_token.status = active
+    requires: access_token.level = admin
+    requires: access_token.bounded_context = token.event_type.bounded_context
     requires: token.status = active
     ensures:
         token.status = revoked
         token.revoked_at = now
+}
+
+-- The four rules below manage Role and AccessToken themselves - the
+-- access-control layer that gates every rule above. All four require an
+-- existing active superadmin Role, which resolves the obvious circularity
+-- (access control needs access control) for every case except the very
+-- first superadmin Role: see open questions. Modelled as direct effects
+-- for the same reason as the five rules above.
+
+rule CreateRole {
+    when: CreateRole(caller, name, superadmin)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    ensures:
+        Role.created(
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            name: name,
+            superadmin: superadmin,
+            status: active,
+            created_at: now
+        )
+}
+
+rule RevokeRole {
+    when: RevokeRole(caller, role)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: role.status = active
+    ensures:
+        role.status = revoked
+        role.revoked_at = now
+        for token in role.access_tokens where status = active:
+            token.status = revoked
+            token.revoked_at = now
+}
+
+rule GrantAccessToken {
+    when: GrantAccessToken(caller, role, bounded_context, level, can_read_sensitive)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: role.status = active
+    requires: bounded_context.status = active
+    requires: not exists AccessToken{role: role, bounded_context: bounded_context, status: active}
+    ensures:
+        AccessToken.created(
+            role: role,
+            bounded_context: bounded_context,
+            level: level,
+            can_read_sensitive: can_read_sensitive,
+            status: active,
+            created_at: now
+        )
+}
+
+rule RevokeAccessToken {
+    when: RevokeAccessToken(caller, access_token)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: access_token.status = active
+    ensures:
+        access_token.status = revoked
+        access_token.revoked_at = now
+}
+
+-- ForgetSubject is not part of the superadmin-only group above: it is a
+-- per-context admin operation, like ArchiveBoundedContext and the token
+-- rules earlier - an admin-level AccessToken for a context can forget
+-- subjects within it, the same way it can archive that context.
+
+rule ForgetSubject {
+    when: ForgetSubject(access_token, key)
+    requires: access_token.status = active
+    requires: access_token.level = admin
+    requires: access_token.bounded_context = key.bounded_context
+    requires: key.status = active
+    ensures:
+        key.status = destroyed
+        key.destroyed_at = now
 }
 
 ------------------------------------------------------------
@@ -467,6 +716,64 @@ invariant CommandConsistencyTagsMatchDeclaredMappings {
             c.command_type.tag_mappings.any(m => m.key = tag.key)
 }
 
+invariant RevokedRoleImpliesTokensRevoked {
+    for r in Roles:
+        r.status = revoked implies r.access_tokens.all(t => t.status = revoked)
+}
+
+invariant UniqueActiveAccessPerRoleAndContext {
+    -- A Role holds at most one active grant per bounded context, so
+    -- "what can this Role do in this context" is never ambiguous.
+    for a in AccessTokens:
+        for b in AccessTokens:
+            a != b and a.role = b.role and a.bounded_context = b.bounded_context
+                implies not (a.status = active and b.status = active)
+}
+
+invariant UniqueActiveEncryptionKeyPerSubject {
+    -- At most one active key per (bounded context, subject), so
+    -- protect_sensitive_fields' get-or-create lookup is never ambiguous.
+    for a in EncryptionKeys:
+        for b in EncryptionKeys:
+            a != b and a.bounded_context = b.bounded_context
+                and a.subject_key = b.subject_key and a.subject_value = b.subject_value
+                implies not (a.status = active and b.status = active)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ReadAccess {
+    -- Any active AccessToken authorises read: write and admin tokens
+    -- include read implicitly, since they can already do strictly more.
+    -- Not yet used in any surface - there is no query/subscription
+    -- surface to attach it to (see open questions) - declared here so
+    -- the level hierarchy is documented and ready when that surface is
+    -- specified.
+    identified_by: AccessToken where status = active
+}
+
+actor WriteAccess {
+    identified_by: AccessToken where status = active and level in {write, admin}
+}
+
+actor AdminAccess {
+    identified_by: AccessToken where status = active and level = admin
+}
+
+actor SensitiveDataAccess {
+    -- Authorises reading the decrypted value of sensitive fields, on top
+    -- of whatever level the underlying AccessToken already grants. Not
+    -- yet used in any surface - same reason as ReadAccess: there is no
+    -- query surface to attach it to yet.
+    identified_by: AccessToken where status = active and can_read_sensitive = true
+}
+
+actor Superadmin {
+    identified_by: Role where status = active and superadmin = true
+}
+
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
@@ -506,21 +813,128 @@ surface DirectEventCreation {
         -- same as external event ingestion.
 }
 
+surface CommandSubmission {
+    facing access_token: WriteAccess
+    context command_type: CommandType
+        where bounded_context = access_token.bounded_context and bounded_context.status = active
+
+    provides:
+        SubmitCommand(access_token, command_type, payload)
+
+    @guarantee TokenScopedToBoundedContext
+        -- A write-level token only authorises submitting commands for
+        -- CommandTypes belonging to its own bounded context.
+
+    @guidance
+        -- Exposed as a GraphQL mutation, qualified by bounded context per
+        -- the unified-graph naming scheme.
+}
+
+surface EventTypeAdminOperations {
+    facing access_token: AdminAccess
+    context event_type: EventType
+        where bounded_context = access_token.bounded_context
+
+    provides:
+        CreateExternalEventToken(access_token, event_type)
+        CreateDirectCreationToken(access_token, event_type)
+
+    @guarantee TokenScopedToBoundedContext
+        -- An admin-level token only authorises creating adapter tokens
+        -- for EventTypes belonging to its own bounded context.
+}
+
+surface TokenRevocation {
+    facing access_token: AdminAccess
+    context token: Token
+        where event_type.bounded_context = access_token.bounded_context and status = active
+
+    provides:
+        RevokeToken(access_token, token)
+
+    @guarantee TokenScopedToBoundedContext
+        -- An admin-level token only authorises revoking adapter tokens
+        -- whose EventType belongs to its own bounded context.
+}
+
+surface BoundedContextArchival {
+    facing access_token: AdminAccess
+    context bounded_context: BoundedContext
+        where this = access_token.bounded_context and status = active
+
+    provides:
+        ArchiveBoundedContext(access_token, bounded_context)
+
+    @guarantee TokenScopedToBoundedContext
+        -- An admin-level token only authorises archiving its own
+        -- bounded context, never another one.
+}
+
+surface SubjectErasure {
+    facing access_token: AdminAccess
+    context key: EncryptionKey
+        where bounded_context = access_token.bounded_context and status = active
+
+    provides:
+        ForgetSubject(access_token, key)
+
+    @guarantee TokenScopedToBoundedContext
+        -- An admin-level token only authorises forgetting subjects within
+        -- its own bounded context.
+
+    @guidance
+        -- Exposed as a GraphQL mutation. There is no un-forget: destroying
+        -- an EncryptionKey is irreversible by design.
+}
+
+surface BoundedContextCreation {
+    facing caller: Superadmin
+
+    provides:
+        AddBoundedContext(caller, name)
+
+    @guarantee SuperadminOnly
+        -- Creating a bounded context isn't "for" any existing context,
+        -- so it is gated by Role.superadmin rather than a per-context
+        -- AccessToken.
+}
+
+surface AccessManagement {
+    facing caller: Superadmin
+
+    provides:
+        CreateRole(caller, name, superadmin)
+        RevokeRole(caller, role)
+        GrantAccessToken(caller, role, bounded_context, level, can_read_sensitive)
+        RevokeAccessToken(caller, access_token)
+
+    @guarantee SuperadminOnly
+        -- Only an active Role with superadmin = true may create or
+        -- revoke Roles, or grant/revoke AccessTokens on their behalf -
+        -- including its own. There is no self-service path.
+
+    @guidance
+        -- Exposed as GraphQL mutations. Bootstrapping the very first
+        -- superadmin Role is unresolved - see open questions.
+}
+
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
 
 open question "External event context: how much source-specific metadata should be persisted, and does the shape vary per source type (e.g. Kafka vs webhook)?"
 
-open question "EventType/CommandType registration is unresolved (unlike bounded context add/archive and token create/revoke, which are now modelled). One option: explicit admin commands, mirroring AddBoundedContext. Another: derived from Rust code structure - e.g. a bounded_context::administration module holds all the message/query/projection types for that context - with the running instance reconciling on startup, creating any EventType/CommandType compiled into the binary but missing from storage. This could also extend to auto-creating the BoundedContext itself at startup, as an alternative or complement to the explicit AddBoundedContext command. Which approach, or some mix?"
+open question "EventType/CommandType registration is unresolved (unlike bounded context add/archive and token create/revoke, which are now modelled). One option: explicit admin commands, mirroring AddBoundedContext. Another: derived from Rust code structure - e.g. a bounded_context::administration module holds all the message/query/projection types for that context - with the running instance reconciling on startup, creating any EventType/CommandType compiled into the binary but missing from storage. This could also extend to auto-creating the BoundedContext itself at startup, as an alternative or complement to the explicit AddBoundedContext command. Which approach, or some mix? Whichever is chosen, it should also cover the still-open question of what an AccessToken scoped to the admin bounded context itself would mean - today admin operations are direct effects with no CommandTypes of their own to hold write-level access."
 
 open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). This isn't structurally enforced here - is that validation done at subscription-registration time, or at query time?"
 
 open question "The all-events subscription per bounded context has 'limited to no filtering' - what, if anything, can it filter on (e.g. event type name only), versus the full per-field filtering on EventTypeSubscription?"
 
-open question "Projections: how do they declare which event types they consume, how do they get rebuilt/kept up to date, and how are they exposed as GraphQL queries?"
+open question "Projections: how do they declare which event types they consume, how do they get rebuilt/kept up to date, and how are they exposed as GraphQL queries? Whichever design is chosen needs to carry sensitive fields through: a projection built from a sensitive EventType field should stay encrypted/redacted the same way the source event is, gated by the same AccessToken.can_read_sensitive."
 
-open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Everything is open (no auth) for now; fine-grained token-based access control is deferred."
+open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Write and admin mutations are now gated by AccessToken/Role (see Actor Declarations and the CommandSubmission/EventTypeAdminOperations/TokenRevocation/BoundedContextArchival/BoundedContextCreation/AccessManagement surfaces). Still open: how a Role's secret is transmitted on the wire, and how read-level access (AccessLevel.read already models it) gates the query/subscription surface once that surface itself is specified."
+
+open question "Bootstrapping: CreateRole, RevokeRole, GrantAccessToken and RevokeAccessToken (see AccessManagement) all require an existing active superadmin Role, so nothing within the spec's own rules can create the very first one. Is this an out-of-band operational step (e.g. a seed value read once at first startup, outside the GraphQL surface entirely), or does the spec need to model an explicit bootstrap exception?"
 
 open question "Schema versioning tracks a current schema_version counter per type, but not the historical schema text for prior versions. Do consumers reading old events need to look up the exact schema that was active for their recorded version, or is 'each version stays backwards compatible' sufficient without keeping that history?"
 
@@ -528,6 +942,10 @@ open question "decide() and CommandDecision are the plugged-in, bounded-context-
 
 open question "Tag keys declared via tag_mappings are plain strings with no namespace - could two unrelated bounded contexts collide on the same key (e.g. both using \"account\")? (Sequence scope is resolved: per bounded context, gapless. Serialisation mechanism is resolved: a Postgres row lock per bounded context, not application-level coordination.)"
 
-open question "derive_tags(event_type, payload) is a black box: does TagMapping.field validate against event_type.schema at registration time (so a mapping can't reference a field that doesn't exist), or is that left unchecked since schema is just an opaque JSON Schema string to the spec?"
+open question "derive_tags(event_type, payload) is a black box: does TagMapping.field validate against event_type.schema at registration time (so a mapping can't reference a field that doesn't exist), or is that left unchecked since schema is just an opaque JSON Schema string to the spec? The same question applies to SensitiveField.field and SensitiveField.subject_field."
 
 open question "Are there cases where a consistency boundary needs 'all events of a specific EventType' with no field-level tag at all, rather than a key/value tag? Raised as a possible exception but not confirmed as a real requirement."
+
+open question "Historical data left behind when a field is newly marked sensitive: EventType.sensitive_fields only affects events created from that point forward (event sourcing is append-only, so existing events can't be edited in place - see Event.encryption_keys). Is 'it stays plaintext forever unless the whole bounded context is archived' acceptable, or does adding a sensitive_fields entry need a supported one-time backfill/purge path for the data that already exists, run outside the normal event-creation flow?"
+
+open question "Should CommandType support sensitive_fields the same way EventType does? Command.payload is also stored permanently, but commands aren't queried the same way events/projections are, so it's unclear whether the same exposure risk applies."
