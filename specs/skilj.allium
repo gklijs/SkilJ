@@ -322,9 +322,9 @@ variant DirectlyCreated : Event {
 }
 
 variant SystemTriggered : Event {
-    invariant ClientIdIsSystem {
-        metadata.client_id = "system"
-    }
+    -- No variant-specific fields: the scheduler is the originator, so
+    -- there is no external token or command to point back at. See
+    -- SystemTriggeredClientIdIsSystem for the client_id constraint.
 }
 
 entity Projection {
@@ -511,14 +511,15 @@ rule ProcessCommand {
         -- rule's own requires/ensures above is what must hold at commit.
 }
 
--- The five rules below are the admin bounded context's operations. In
+-- The seven rules below are the admin bounded context's operations. In
 -- principle each should itself be a Command producing a CommandTriggered
--- Event (BoundedContextAdded, BoundedContextArchived, TokenCreated,
--- TokenRevoked) within the admin bounded context, the same as any other
--- bounded context's commands - full dogfooding. That wiring depends on
--- the still-open general command-processing mechanism, so for now these
--- are modelled as direct effects, consistent with CreateExternalEvent
--- and CreateDirectEvent above.
+-- Event (BoundedContextAdded, BoundedContextArchived, EventTypeRegistered,
+-- CommandTypeRegistered, TokenCreated, TokenRevoked) within the admin
+-- bounded context, the same as any other bounded context's commands -
+-- full dogfooding. That wiring depends on the still-open general
+-- command-processing mechanism, so for now these are modelled as direct
+-- effects, consistent with CreateExternalEvent and CreateDirectEvent
+-- above.
 
 rule AddBoundedContext {
     when: AddBoundedContext(caller, name)
@@ -537,6 +538,109 @@ rule ArchiveBoundedContext {
     requires: bounded_context.status = active
     ensures:
         bounded_context.status = archived
+}
+
+-- RegisterEventType and RegisterCommandType below are idempotent upserts,
+-- meant to be driven by a startup reconciliation loop: the running
+-- instance discovers the EventType/CommandType definitions compiled into
+-- its own binary (derived from the Rust type definitions themselves - a
+-- black box here, the same as decide() and protect_sensitive_fields) and
+-- registers each one against its bounded context. Re-registering an
+-- unchanged shape is a no-op, so the loop can run on every startup.
+--
+-- schema_version tracks payload-shape compatibility specifically (see
+-- EventType.schema_version), so it only advances when schema itself
+-- changed. tag_mappings, sensitive_fields and the origin permissions are
+-- always reconciled to the given values without a version bump - they
+-- don't affect how a stored payload is interpreted.
+--
+-- Both are gated by an admin-level AccessToken for the target bounded
+-- context, the same as the rules above. An AccessToken scoped to the
+-- admin bounded context itself deliberately gains no new meaning here: a
+-- grant on the admin context must not become a way to register types into
+-- arbitrary other contexts.
+
+rule RegisterEventType {
+    when: RegisterEventType(access_token, bounded_context, name, schema, tag_mappings,
+        sensitive_fields, external_creation_allowed, direct_creation_allowed,
+        system_triggered_allowed, system_triggered_schedule?)
+    requires: access_token.status = active
+    requires: access_token.level = admin
+    requires: access_token.bounded_context = bounded_context
+    requires: bounded_context.status = active
+
+    let existing = EventType{bounded_context: bounded_context, name: name}
+
+    -- Tag mapping keys are additive-only on re-registration: events
+    -- already carry tags under the keys declared so far, and
+    -- EventTagsMatchDeclaredMappings checks a tag's key against the
+    -- EventType's current mappings. Dropping a key would strand that
+    -- history, so registration is rejected outright rather than silently
+    -- losing it. The field a key reads from may change freely.
+    requires:
+        not exists existing
+        or existing.tag_mappings.all(m => tag_mappings.any(n => n.key = m.key))
+
+    let schema_changed = exists existing and existing.schema != schema
+
+    ensures:
+        if exists existing:
+            existing.schema = schema
+            existing.schema_version =
+                if schema_changed: existing.schema_version + 1 else: existing.schema_version
+            existing.tag_mappings = tag_mappings
+            existing.sensitive_fields = sensitive_fields
+            existing.external_creation_allowed = external_creation_allowed
+            existing.direct_creation_allowed = direct_creation_allowed
+            existing.system_triggered_allowed = system_triggered_allowed
+            existing.system_triggered_schedule = system_triggered_schedule
+        else:
+            EventType.created(
+                bounded_context: bounded_context,
+                name: name,
+                schema: schema,
+                schema_version: 1,
+                tag_mappings: tag_mappings,
+                sensitive_fields: sensitive_fields,
+                external_creation_allowed: external_creation_allowed,
+                direct_creation_allowed: direct_creation_allowed,
+                system_triggered_allowed: system_triggered_allowed,
+                system_triggered_schedule: system_triggered_schedule
+            )
+}
+
+rule RegisterCommandType {
+    when: RegisterCommandType(access_token, bounded_context, name, schema, tag_mappings)
+    requires: access_token.status = active
+    requires: access_token.level = admin
+    requires: access_token.bounded_context = bounded_context
+    requires: bounded_context.status = active
+
+    let existing = CommandType{bounded_context: bounded_context, name: name}
+
+    -- Additive-only for the same reason as RegisterEventType, protecting
+    -- CommandConsistencyTagsMatchDeclaredMappings: commands already
+    -- recorded a consistency_tags set drawn from the keys declared so far.
+    requires:
+        not exists existing
+        or existing.tag_mappings.all(m => tag_mappings.any(n => n.key = m.key))
+
+    let schema_changed = exists existing and existing.schema != schema
+
+    ensures:
+        if exists existing:
+            existing.schema = schema
+            existing.schema_version =
+                if schema_changed: existing.schema_version + 1 else: existing.schema_version
+            existing.tag_mappings = tag_mappings
+        else:
+            CommandType.created(
+                bounded_context: bounded_context,
+                name: name,
+                schema: schema,
+                schema_version: 1,
+                tag_mappings: tag_mappings
+            )
 }
 
 rule CreateExternalEventToken {
@@ -716,6 +820,15 @@ invariant CommandConsistencyTagsMatchDeclaredMappings {
             c.command_type.tag_mappings.any(m => m.key = tag.key)
 }
 
+invariant SystemTriggeredClientIdIsSystem {
+    -- The other three origins record a real originator in client_id (a
+    -- token id, or the Role id behind the submitting AccessToken). A
+    -- system-triggered event has none, so it records the literal
+    -- "system" rather than borrowing an identity it doesn't have.
+    for e in Events:
+        e.origin = SystemTriggered implies e.metadata.client_id = "system"
+}
+
 invariant RevokedRoleImpliesTokensRevoked {
     for r in Roles:
         r.status = revoked implies r.access_tokens.all(t => t.status = revoked)
@@ -830,6 +943,28 @@ surface CommandSubmission {
         -- the unified-graph naming scheme.
 }
 
+surface TypeRegistration {
+    facing access_token: AdminAccess
+    context bounded_context: BoundedContext
+        where this = access_token.bounded_context and status = active
+
+    provides:
+        RegisterEventType(access_token, bounded_context, name, schema, tag_mappings,
+            sensitive_fields, external_creation_allowed, direct_creation_allowed,
+            system_triggered_allowed, system_triggered_schedule?)
+        RegisterCommandType(access_token, bounded_context, name, schema, tag_mappings)
+
+    @guarantee TokenScopedToBoundedContext
+        -- An admin-level token only authorises registering event and
+        -- command types into its own bounded context, never another one.
+
+    @guidance
+        -- Typically driven by a startup reconciliation loop rather than by
+        -- ad-hoc human calls, so the same shape is expected to be
+        -- submitted repeatedly and unchanged. Still exposed as a GraphQL
+        -- mutation as well, for manual and operational use.
+}
+
 surface EventTypeAdminOperations {
     facing access_token: AdminAccess
     context event_type: EventType
@@ -923,8 +1058,6 @@ surface AccessManagement {
 ------------------------------------------------------------
 
 open question "External event context: how much source-specific metadata should be persisted, and does the shape vary per source type (e.g. Kafka vs webhook)?"
-
-open question "EventType/CommandType registration is unresolved (unlike bounded context add/archive and token create/revoke, which are now modelled). One option: explicit admin commands, mirroring AddBoundedContext. Another: derived from Rust code structure - e.g. a bounded_context::administration module holds all the message/query/projection types for that context - with the running instance reconciling on startup, creating any EventType/CommandType compiled into the binary but missing from storage. This could also extend to auto-creating the BoundedContext itself at startup, as an alternative or complement to the explicit AddBoundedContext command. Which approach, or some mix? Whichever is chosen, it should also cover the still-open question of what an AccessToken scoped to the admin bounded context itself would mean - today admin operations are direct effects with no CommandTypes of their own to hold write-level access."
 
 open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). This isn't structurally enforced here - is that validation done at subscription-registration time, or at query time?"
 
