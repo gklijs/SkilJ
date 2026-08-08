@@ -10,6 +10,9 @@
 --   definitions, the admin bounded context that registers other bounded
 --   contexts and their types, the coarse shape of projections built from
 --   events, raw event stream subscriptions with per-field filtering,
+--   an in-memory per-bounded-context cache of the most recent events,
+--   warmed at startup from Postgres up to a configurable count
+--   (default 1000), so recent reads need no database round trip,
 --   per-field sensitivity marking on events with crypto-shredding for
 --   erasure (SensitiveField, EncryptionKey, right-to-be-forgotten via
 --   ForgetSubject), and two independent authentication tracks:
@@ -448,6 +451,28 @@ default BoundedContext admin = { name: "admin", status: active }
 -- same event_type/payload within one rule execution (see ProcessCommand)
 -- and is idempotent when it is: repeat calls find the key already
 -- provisioned rather than creating another one.
+--
+-- Reading events - the Events collections read by FetchEvents and
+-- ProcessCommand below - is served by an in-memory cache of the most
+-- recent events, scoped per bounded context exactly as sequence and
+-- next_sequence already are. On startup each bounded context's cache is
+-- warmed by fetching its own events from Postgres in descending
+-- sequence order, up to a configurable count that defaults to 1000. That
+-- count is a library/runtime configuration knob set when the process
+-- starts, not a registered or admin-managed value: it is deliberately
+-- not a field on BoundedContext and nothing registers it, for the same
+-- reason the next_sequence row lock isn't modelled as an entity. Events
+-- are appended to their bounded context's cache as they are committed,
+-- so the latest events are always available without a database round
+-- trip.
+--
+-- Postgres remains the source of truth throughout; the cache is purely a
+-- read-path optimisation and never a limit on what is readable. Any read
+-- the cache cannot satisfy - events older than the warm-up window, or
+-- any read on an instance that has cold-started and not yet warmed -
+-- resolves against Postgres and returns exactly the same events. The
+-- cache changes how fast a read is answered, never which events a caller
+-- can see, so no rule below is conditioned on it.
 
 rule CreateExternalEvent {
     when: SubmitExternalEvent(adapter, event_type, payload, source_content, source_context?)
@@ -514,6 +539,14 @@ rule CreateDirectEvent {
 -- Unlike the write rules, this deliberately does not require the bounded
 -- context to be active: archiving stops new commands and events, but
 -- keeps the history, and reading that history is the point.
+--
+-- This is the read the in-memory event cache primarily serves (see the
+-- note above the rules): a workflow polling from a recent cursor is
+-- answered from its bounded context's cache without a Postgres round
+-- trip. candidates below is still the full set of matching events
+-- regardless - a cursor reaching further back than the cache holds is
+-- answered from Postgres and delivers the same events, just less
+-- quickly.
 
 rule FetchEvents {
     when: FetchEvents(token, read_type, filters, after_sequence?)
@@ -635,6 +668,13 @@ rule ProcessCommand {
         -- staleness signal, not an automatic rejection - only the final,
         -- fresh decision determines accepted/rejected. Either way the
         -- rule's own requires/ensures above is what must hold at commit.
+        --
+        -- The in-memory event cache helps here too, since a consistency
+        -- boundary typically spans recent events for a tag: matching_events
+        -- can often be assembled without a Postgres round trip, and the
+        -- under-lock step reads only what arrived after boundary. This
+        -- changes nothing about what matching_events contains - a boundary
+        -- reaching past the cached window is completed from Postgres.
 }
 
 -- The nine rules below are the admin bounded context's operations. In
@@ -1140,12 +1180,27 @@ surface EventFetch {
         -- GraphQL track; a bearer token carries no such grant and so
         -- never sees a decrypted value.
 
+    @guarantee LatestEventsAlwaysAvailable
+        -- A fetch always sees every committed event of its type that
+        -- matches the request, including the most recently committed
+        -- ones, and the recent end of that history is served without a
+        -- database round trip. Older events are answered more slowly but
+        -- just as completely: the in-memory cache bounds how fast a read
+        -- is answered, never how far back a caller may read.
+
     @guidance
         -- REST only. Deliberately coarse: this establishes the capability
         -- and its scoping, not the query wire contract. Paging, cursor
         -- encoding and which filter operators are valid for which schema
         -- field are all still open (see open questions), as is the
         -- real-time websocket complement to this pull-based fetch.
+        --
+        -- This is the read the per-bounded-context in-memory event cache
+        -- is primarily there for (see the note above the rules): its
+        -- startup warm-up count - configured when the process starts,
+        -- defaulting to the 1000 most recent events per bounded context -
+        -- is a tuning decision about how far back reads stay fast, not
+        -- about what this surface will answer.
 }
 
 surface CommandSubmission {
