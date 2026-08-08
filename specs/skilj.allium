@@ -8,49 +8,67 @@
 -- Includes: Bounded contexts, Commands, Events and their possible
 --   origins, Command/Event type registration with JSON-Schema payload
 --   definitions, the admin bounded context that registers other bounded
---   contexts and their types, the coarse shape of projections built from
---   events, raw event stream subscriptions with per-field filtering,
+--   contexts and their types, projections built from events - registered
+--   from the compiled binary the same way event and command types are,
+--   updated asynchronously by default with an opt-in synchronous mode,
+--   and queried over GraphQL as richly-typed fields with an optional
+--   read-your-writes wait - raw event stream subscriptions with
+--   per-field filtering,
 --   an in-memory per-bounded-context cache of the most recent events,
 --   warmed at startup from Postgres up to a configurable count
 --   (default 1000), so recent reads need no database round trip,
 --   per-field sensitivity marking on events with crypto-shredding for
 --   erasure (SensitiveField, EncryptionKey, right-to-be-forgotten via
 --   ForgetSubject), and two independent authentication tracks:
---   - GraphQL: a Role is a human or service identity holding a secret
---     credential, and reaches a bounded context through a
+--   - GraphQL: identity is delegated to a trusted external identity
+--     provider. A caller presents a JWT the IdP issued; SkilJ verifies
+--     that JWT's signature against the IdP's JWKS (a black box here,
+--     same as protect_sensitive_fields) and trusts its subject claim,
+--     which resolves to the active Role bound to that value via
+--     Role.external_subject. SkilJ issues and stores no credential of
+--     its own for a Role - there is nothing to "log in" to on SkilJ's
+--     side. A Role reaches a bounded context through a
 --     RoleAccessMapping - a per-bounded-context grant at
---     read/write/admin level, plus a superadmin flag on Role for
+--     read/write/admin level - plus a superadmin flag on Role for
 --     creating new bounded contexts. Used by admin roles for
---     maintenance and by website consumers. The wire format of the
---     Role secret is deliberately left abstract here.
+--     maintenance and by website consumers. See the identity
+--     resolution note above entity Role.
 --   - REST (and, likely, websocket later): a family of narrowly scoped
 --     bearer tokens (AccessToken, with one variant per target type -
 --     ExternalEventToken, DirectCreationToken, CommandToken,
---     EventReadToken). Each token authorises exactly one capability
---     against exactly one registered type, and each is issued and
---     revoked independently by an admin over GraphQL. Used to submit
---     external events, to let AI/automated callers trigger commands,
---     and to fetch events for remote workflows.
+--     EventReadToken), issued by SkilJ itself and presented as
+--     "Authorization: Bearer <id>.<secret>". Each token authorises
+--     exactly one capability against exactly one registered type, and
+--     each is issued and revoked independently by an admin over
+--     GraphQL. Used to submit external events, to let AI/automated
+--     callers trigger commands, and to fetch events for remote
+--     workflows.
 -- Excludes:
---   - Enforcement of read-level access (querying projections, creating
---     subscriptions) and of sensitive-field decryption
---     (RoleAccessMapping.can_read_sensitive): both models exist, but there is
---     no query/subscription surface yet to gate either against - see the
---     detailed projection query surface exclusion below
+--   - Enforcement of read-level access on the subscription path, and of
+--     sensitive-field decryption there: querying projections is now
+--     gated (ProjectionQuery faces ReadAccess and defers sensitive
+--     values to RoleAccessMapping.can_read_sensitive), but there is
+--     still no subscription surface to gate either against
 --   - Retroactive encryption of historical events when a field is newly
 --     marked sensitive: event sourcing is append-only, so this is a
 --     structural consequence, not a gap (see EventType.sensitive_fields
 --     and Event.encryption_keys)
 --   - The encryption scheme itself (algorithm, key derivation, physical
 --     key storage) - protect_sensitive_fields is a black box, consistent
---     with how AccessToken.secret generation is already treated
+--     with how AccessToken.secret generation and JWT signature
+--     verification are already treated
 --   - Multi-instance / distributed deployment
---   - The detailed projection query surface and GraphQL wire contract,
---     including how a Role's secret is transmitted - still unresolved,
---     and deliberately not committed to any particular scheme (deferred
---     to a later, more detailed pass)
---   - How REST bearer tokens are presented on the wire, for the same
---     reason
+--   - The GraphQL wire contract itself, beyond identity resolution and
+--     the surfaces specified here: how a Projection.schema becomes a
+--     concrete GraphQL type, field and argument naming, paging and error
+--     shape are all still deferred to a later, more detailed pass
+--   - The external IdP trust configuration values themselves - JWKS
+--     endpoint, issuer, signing algorithm, and which claim carries the
+--     subject (default "sub"). Resolved as runtime/library
+--     configuration for exactly one trusted IdP, in the same register
+--     as the event cache's startup warm-up count, rather than modelled
+--     as domain state; the additive path to trusting several IdPs later
+--     is recorded in the identity resolution note above entity Role
 --   - The websocket complement to token-authenticated event fetching
 --     (see open questions)
 -- Dependencies: none yet
@@ -207,7 +225,9 @@ entity EventType {
 
 entity AccessToken {
     id: String                             -- non-secret identifier, safe to log and store on events
-    secret: String                         -- opaque bearer credential (distinct from id)
+    secret: String                         -- opaque bearer credential (distinct from id), stored
+                                            -- hashed and never compared in plaintext - see the REST
+                                            -- token presentation note above the surfaces
     status: active | revoked
     created_at: Timestamp
     revoked_at: Timestamp? when status = revoked
@@ -254,9 +274,66 @@ variant EventReadToken : AccessToken {
     event_type: EventType
 }
 
+-- GraphQL identity resolution. SkilJ does not authenticate GraphQL
+-- callers itself; it delegates to a trusted external identity provider
+-- and only authorises. On every GraphQL operation:
+--   1. The caller presents a JWT the IdP issued. SkilJ verifies that
+--      JWT's signature against the IdP's JWKS - a black box here, the
+--      same register as protect_sensitive_fields and
+--      generate_token_secret.
+--   2. SkilJ trusts the subject claim of a verified JWT, and nothing
+--      else in it.
+--   3. That claim value resolves to the one active Role whose
+--      external_subject matches it (see UniqueActiveExternalSubject,
+--      which is what makes "the one" well defined).
+--   4. That Role's RoleAccessMappings are resolved live, from current
+--      state - never from anything carried in the JWT. The JWT
+--      establishes identity only; it never carries authorisation.
+--
+-- This is safe because every rule already re-checks Role.status and
+-- RoleAccessMapping.status = active freshly on each operation (it did
+-- so before this delegation too). Revoking a Role or one of its
+-- RoleAccessMappings therefore takes effect immediately, regardless of
+-- how much validity the external JWT itself has left, and no denylist
+-- of outstanding JWTs is needed.
+--
+-- What "the trusted IdP" resolves to concretely is runtime/library
+-- configuration, not domain state. A deployment trusts exactly one
+-- external IdP, and that IdP's JWKS endpoint, issuer, expected signing
+-- algorithm, and which claim carries the subject (defaulting to the
+-- standard "sub", but configurable) are all set when the process
+-- starts. None of them is a registered entity, a field on anything, or
+-- an admin-managed value - the same register as the in-memory event
+-- cache's startup warm-up count (see the note above the rules), and for
+-- the same reason: nothing in the domain reads or writes them, they
+-- only parameterise the black-box verification in step 1 above.
+--
+-- Trusting exactly one IdP is a deliberate deferral, not a placeholder
+-- to revisit blindly. Adding a second (or Nth) trusted IdP later is an
+-- additive migration, not a breaking one: an issuer field alongside
+-- Role.external_subject, defaulted for existing Roles to the single
+-- already-configured issuer, and UniqueActiveExternalSubject widening
+-- from keying on external_subject alone to keying on the
+-- (issuer, external_subject) pair - two IdPs could plausibly issue the
+-- same subject value, and the wider key is what keeps "the one active
+-- Role" well defined when they do. Nothing already specified changes
+-- shape for that: the resolution steps above, the invariant's
+-- existence, CreateRole and the AccessManagement surface all stay as
+-- they are, and only the key the invariant uniques on gets wider. That
+-- is why deferring is safe rather than merely convenient.
+
 entity Role {
     id: String                             -- non-secret identifier, safe to log and store on events
-    secret: String                         -- opaque bearer credential presented by GraphQL clients
+    external_subject: String               -- the subject claim value, from a JWT the trusted external
+                                            -- IdP issued, that this Role is bound to. Deliberately
+                                            -- separate from id, which is SkilJ's own internal
+                                            -- identifier (and what lands in metadata.client_id on
+                                            -- GraphQL-originated commands and events): external_subject
+                                            -- may carry PII (an email address, say) depending on the
+                                            -- IdP's claim shape, so keeping the two distinct means
+                                            -- SkilJ's own event history never embeds it, and the
+                                            -- internal id stays stable even if the IdP-side identity
+                                            -- is re-provisioned.
     name: String
     superadmin: Boolean                    -- grants AddBoundedContext and all Role/RoleAccessMapping
                                             -- management, independently of any RoleAccessMapping below
@@ -289,9 +366,12 @@ entity RoleAccessMapping {
     created_at: Timestamp
     revoked_at: Timestamp? when status = revoked
 
-    -- A grant, not a credential in its own right: the credential a
-    -- GraphQL caller presents is Role.secret, and this records what that
-    -- Role may do where. Scoped to exactly one BoundedContext: it
+    -- A grant, not a credential in its own right: a GraphQL caller
+    -- presents a JWT from the trusted external IdP, which resolves to a
+    -- Role (see the identity resolution note above entity Role), and
+    -- this records what that Role may do where. Resolved live on every
+    -- operation, never carried in the JWT.
+    -- Scoped to exactly one BoundedContext: it
     -- authorises the given level within that context only, nothing else.
     -- Levels accumulate: read authorises querying and subscribing; write
     -- includes read and additionally authorises submitting commands;
@@ -391,12 +471,47 @@ variant SystemTriggered : Event {
 entity Projection {
     bounded_context: BoundedContext
     name: String
+    schema: String              -- JSON Schema describing the queryable fields this projection
+                                 -- answers with, in exactly the same register as
+                                 -- EventType.schema and CommandType.schema: a black box to this
+                                 -- spec, derived from the Rust projection definition. It is what
+                                 -- the GraphQL type for this projection is generated from, so a
+                                 -- projection is introspectable and a client (a mobile app, say)
+                                 -- consumes a real, typed subset of the graph rather than
+                                 -- parsing an opaque blob.
+    schema_version: Integer     -- increments on each schema change; changes must stay backwards compatible
 
-    -- No field-level structure yet (see open questions on the detailed
-    -- projection query surface). Sensitivity is declared once, on the
-    -- source EventType (see EventType.sensitive_fields) - a projection
-    -- built from a sensitive field inherits the same restriction rather
-    -- than re-declaring it.
+    -- Which EventTypes feed this projection. Known at compile time,
+    -- derived from the Rust projection definition the same way
+    -- EventType/CommandType schemas are, and reconciled here by
+    -- RegisterProjection. Knowing it statically is what lets an event
+    -- being created inline find exactly the sync projections it must
+    -- update, without a runtime discovery step.
+    consumed_event_types: Set<EventType>
+
+    -- Opt-in, and deliberate friction: use with care. A sync projection
+    -- is updated inline, in the same transaction as the event that feeds
+    -- it, so it is never stale - but its update cost is paid on the write
+    -- path of every event it consumes, and a failure there fails the
+    -- write. The default (false) updates asynchronously instead, off the
+    -- write path, at the cost of possible lag (see caught_up_to).
+    sync: Boolean
+
+    -- Highest Event.sequence within bounded_context this projection has
+    -- processed - whether or not that event's type is one it consumes, so
+    -- it tracks position in the stream rather than only the events that
+    -- changed something. Null before it has processed anything. A sync
+    -- projection is always at the bounded context's latest committed
+    -- sequence by construction (see SyncProjectionNeverLags); an async one
+    -- may trail, which is exactly what a query's wait_for_sequence waits
+    -- past.
+    caught_up_to: Integer?
+
+    -- The schema's own contents stay a black box here, the same as
+    -- EventType.schema. Sensitivity is declared once, on the source
+    -- EventType (see EventType.sensitive_fields) - a projection built
+    -- from a sensitive field inherits the same restriction rather than
+    -- re-declaring it (see ProjectionQuery).
 }
 
 entity Subscription {
@@ -473,6 +588,40 @@ default BoundedContext admin = { name: "admin", status: active }
 -- resolves against Postgres and returns exactly the same events. The
 -- cache changes how fast a read is answered, never which events a caller
 -- can see, so no rule below is conditioned on it.
+--
+-- project(projection, event) - the plugged-in, projection-specific fold
+-- that applies one event to one projection's stored state - is a black
+-- box in the same register as decide(): this library owns when a
+-- projection is updated and what a caller may then see, not what the
+-- projection computes. It runs in one of two places, chosen per
+-- projection by Projection.sync:
+--   - Asynchronously (the default). A background consumer per bounded
+--     context walks that context's committed events in sequence order
+--     and, for each projection, calls project() when the event's type is
+--     in the projection's consumed_event_types, then advances that
+--     projection's own caught_up_to to the event's sequence either way.
+--     This runs outside any request's transaction, so a projection can
+--     trail the write that fed it.
+--   - Synchronously, when Projection.sync is true. The update happens
+--     inline, in the same transaction that creates the event - which for
+--     a CommandTriggered event is the same transaction as the command
+--     that produced it - so it commits or fails with the write. Called
+--     from CreateExternalEvent, CreateDirectEvent and ProcessCommand
+--     alike, for every sync projection in the bounded context whose
+--     consumed_event_types include the type of event just created;
+--     caught_up_to advances for every sync projection in that context
+--     regardless. Because consumed_event_types is known at compile time
+--     (see Projection), the set to update is resolved statically, with no
+--     runtime discovery. This is deliberate friction, not a fast path:
+--     see Projection.sync.
+--
+-- await_projection_caught_up(projection, sequence), used by
+-- QueryProjection below, is the reader-side counterpart: it blocks until
+-- projection.caught_up_to reaches sequence and reports whether it got
+-- there, up to an implementation-defined timeout - the same black-box
+-- register as the Postgres row lock above, and open in the same way (see
+-- open questions on the wait timeout). A sync projection satisfies it
+-- immediately and always, by construction.
 
 rule CreateExternalEvent {
     when: SubmitExternalEvent(adapter, event_type, payload, source_content, source_context?)
@@ -482,6 +631,8 @@ rule CreateExternalEvent {
 
     let protected = protect_sensitive_fields(event_type, payload)
 
+    -- Every sync projection consuming this event type is updated inline,
+    -- in this same transaction - see the project() note above the rules.
     ensures:
         ExternalTriggered.created(
             bounded_context: event_type.bounded_context,
@@ -509,6 +660,8 @@ rule CreateDirectEvent {
 
     let protected = protect_sensitive_fields(event_type, payload)
 
+    -- Sync projection updates happen inline here too - see the project()
+    -- note above the rules.
     ensures:
         DirectlyCreated.created(
             bounded_context: event_type.bounded_context,
@@ -526,15 +679,17 @@ rule CreateDirectEvent {
         )
 }
 
--- The only read operation specified so far, and the REST track's reason
--- for existing beyond writing: a remote workflow drives itself off one
+-- The REST track's reason for existing beyond writing, and the raw half
+-- of the two reads specified here (QueryProjection below is the derived,
+-- GraphQL half): a remote workflow drives itself off one
 -- event type's stream without holding a GraphQL Role. after_sequence is
 -- the caller's own cursor - absent means "from the beginning", and
 -- sequences start at 0 per bounded context. The filters reuse the same
 -- Filter shape an EventTypeSubscription declares, so narrowing a fetch
 -- and narrowing a subscription look the same to a caller. The detailed
 -- query/filter wire contract, including paging, is still open (see the
--- filter-validation and projection open questions).
+-- filter-validation open question, and the wire-contract exclusion in the
+-- scope header).
 --
 -- Unlike the write rules, this deliberately does not require the bounded
 -- context to be active: archiving stops new commands and events, but
@@ -565,6 +720,53 @@ rule FetchEvents {
             event_type: read_type,
             events: filter(candidates, e => matches_filters(e, filters))
         )
+}
+
+-- The GraphQL read, and the counterpart to FetchEvents above: where a
+-- REST caller pulls raw events, a Role queries a projection built from
+-- them. Read-only - it delivers a result rather than changing stored
+-- state - so it follows FetchEvents' shape rather than the write rules'.
+--
+-- wait_for_sequence is the caller's read-your-writes lever, and is the
+-- only thing that distinguishes an async projection from a sync one from
+-- the outside: pass the highest Event.sequence already known (typically
+-- from the triggered events of a command just submitted) and the query
+-- waits for the projection to reach it before answering. Omit it and the
+-- projection answers from wherever it currently is. A sync projection is
+-- already there, always.
+--
+-- Like FetchEvents, this deliberately does not require the bounded
+-- context to be active: archiving stops writes, and reading what was
+-- built before that is the point.
+
+rule QueryProjection {
+    when: QueryProjection(access_mapping, projection, wait_for_sequence?)
+    requires: access_mapping.status = active
+    requires: access_mapping.bounded_context = projection.bounded_context
+
+    -- Blocks until the projection has caught up, and fails the query if
+    -- it does not within the implementation-defined wait - see the
+    -- await_projection_caught_up note above the rules. Vacuously true
+    -- when the caller asked for no particular position.
+    requires:
+        wait_for_sequence = null
+        or await_projection_caught_up(projection, wait_for_sequence)
+
+    ensures:
+        ProjectionDelivered(
+            access_mapping: access_mapping,
+            projection: projection,
+            result: read_projection(projection, access_mapping.can_read_sensitive)
+        )
+
+    @guidance
+        -- read_projection(projection, reveal_sensitive) is a black box in
+        -- the same register as decide() and project(): this library owns
+        -- who may read a projection and at what position, not how the
+        -- projection's own stored state answers a query. Passing
+        -- can_read_sensitive into it rather than post-filtering the
+        -- result is deliberate - a caller without the grant is never
+        -- handed a decrypted value to redact afterwards.
 }
 
 -- A command reaches ProcessCommand from exactly one of two callers, each
@@ -626,6 +828,9 @@ rule ProcessCommand {
     let decision = decide(command_type, payload, matching_events)
     requires: decision.accepted = true
 
+    -- Every sync projection consuming one of the event types created
+    -- below is updated in this same transaction, alongside the command
+    -- and its events - see the project() note above the rules.
     ensures:
         let command = Command.created(
             bounded_context: command_type.bounded_context,
@@ -706,25 +911,27 @@ rule ArchiveBoundedContext {
         bounded_context.status = archived
 }
 
--- RegisterEventType and RegisterCommandType below are idempotent upserts,
--- meant to be driven by a startup reconciliation loop: the running
--- instance discovers the EventType/CommandType definitions compiled into
--- its own binary (derived from the Rust type definitions themselves - a
--- black box here, the same as decide() and protect_sensitive_fields) and
--- registers each one against its bounded context. Re-registering an
--- unchanged shape is a no-op, so the loop can run on every startup.
+-- RegisterEventType, RegisterCommandType and RegisterProjection below are
+-- idempotent upserts, meant to be driven by a startup reconciliation
+-- loop: the running instance discovers the EventType/CommandType/
+-- Projection definitions compiled into its own binary (derived from the
+-- Rust type and projection definitions themselves - a black box here, the
+-- same as decide() and protect_sensitive_fields) and registers each one
+-- against its bounded context. Re-registering an unchanged shape is a
+-- no-op, so the loop can run on every startup.
 --
 -- schema_version tracks payload-shape compatibility specifically (see
 -- EventType.schema_version), so it only advances when schema itself
--- changed. tag_mappings, sensitive_fields and the origin permissions are
--- always reconciled to the given values without a version bump - they
--- don't affect how a stored payload is interpreted.
+-- changed. tag_mappings, sensitive_fields, the origin permissions and a
+-- projection's consumed_event_types and sync flag are always reconciled
+-- to the given values without a version bump - they don't affect how a
+-- stored payload is interpreted.
 --
--- Both are gated by an admin-level RoleAccessMapping for the target bounded
--- context, the same as the rules above. A RoleAccessMapping scoped to the
--- admin bounded context itself deliberately gains no new meaning here: a
--- grant on the admin context must not become a way to register types into
--- arbitrary other contexts.
+-- All three are gated by an admin-level RoleAccessMapping for the target
+-- bounded context, the same as the rules above. A RoleAccessMapping scoped
+-- to the admin bounded context itself deliberately gains no new meaning
+-- here: a grant on the admin context must not become a way to register
+-- types into arbitrary other contexts.
 --
 -- Registration is also where the two REST opt-ins are set:
 -- EventType.event_read_allowed and CommandType.rest_trigger_allowed. Both
@@ -820,6 +1027,53 @@ rule RegisterCommandType {
             )
 }
 
+rule RegisterProjection {
+    when: RegisterProjection(access_mapping, bounded_context, name, schema,
+        consumed_event_types, sync)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = bounded_context
+    requires: bounded_context.status = active
+
+    -- Every EventType a projection consumes must belong to the same
+    -- bounded context: a projection is built from its own context's
+    -- stream, and the async consumer and the inline sync path both walk
+    -- exactly that stream.
+    requires: consumed_event_types.all(et => et.bounded_context = bounded_context)
+
+    let existing = Projection{bounded_context: bounded_context, name: name}
+
+    -- Deliberately no additive-only constraint on consumed_event_types,
+    -- unlike RegisterEventType's tag_mappings. Tag mapping keys are
+    -- additive because stored events already carry tags under them and
+    -- EventTagsMatchDeclaredMappings checks that history against the
+    -- current mappings. A projection's built content isn't modelled here,
+    -- so there is no equivalent invariant to strand: dropping a consumed
+    -- type leaves nothing structurally inconsistent. What it does leave
+    -- open is whether the projection's existing state should be rebuilt -
+    -- see the open question on re-registering a projection that already
+    -- holds state.
+    let schema_changed = exists existing and existing.schema != schema
+
+    ensures:
+        if exists existing:
+            existing.schema = schema
+            existing.schema_version =
+                if schema_changed: existing.schema_version + 1 else: existing.schema_version
+            existing.consumed_event_types = consumed_event_types
+            existing.sync = sync
+        else:
+            Projection.created(
+                bounded_context: bounded_context,
+                name: name,
+                schema: schema,
+                schema_version: 1,
+                consumed_event_types: consumed_event_types,
+                sync: sync,
+                caught_up_to: null
+            )
+}
+
 -- The four token-minting rules below are deliberately uniform: one rule
 -- per AccessToken variant, each gated by an admin-level RoleAccessMapping
 -- for the bounded context that owns the type being scoped to. Minting a
@@ -912,17 +1166,33 @@ rule RevokeToken {
 -- access-control layer that gates every rule above. All four require an
 -- existing active superadmin Role, which resolves the obvious circularity
 -- (access control needs access control) for every case except the very
--- first superadmin Role: see open questions. Modelled as direct effects
--- for the same reason as the five rules above.
+-- first superadmin Role. That one is provisioned out of band: a one-time
+-- seed/migration step at first deployment inserts a Role row directly
+-- with superadmin = true and external_subject set to whichever IdP
+-- identity is to operate as the initial admin, bypassing CreateRole's
+-- requirement of an existing superadmin caller since by definition none
+-- exists yet. It bypasses the GraphQL surface entirely and is not
+-- modelled as a rule; how and where that step is triggered is still open
+-- (see open questions). Modelled as direct effects for the same reason
+-- as the five rules above.
 
 rule CreateRole {
-    when: CreateRole(caller, name, superadmin)
+    -- external_subject is supplied explicitly by the superadmin: creating
+    -- a Role is exactly the act of registering which external IdP
+    -- identity maps to it. SkilJ mints no credential of its own here.
+    when: CreateRole(caller, name, superadmin, external_subject)
     requires: caller.status = active
     requires: caller.superadmin = true
+
+    -- Guards UniqueActiveExternalSubject: an external identity that is
+    -- already actively claimed cannot be claimed a second time, so
+    -- resolving a verified subject claim to a Role stays unambiguous.
+    requires: not exists Role{external_subject: external_subject, status: active}
+
     ensures:
         Role.created(
             id: generate_token_id(),
-            secret: generate_token_secret(),
+            external_subject: external_subject,
             name: name,
             superadmin: superadmin,
             status: active,
@@ -1003,6 +1273,36 @@ invariant UniqueCommandTypeNamePerContext {
             a != b and a.bounded_context = b.bounded_context implies a.name != b.name
 }
 
+invariant UniqueProjectionNamePerContext {
+    for a in Projections:
+        for b in Projections:
+            a != b and a.bounded_context = b.bounded_context implies a.name != b.name
+}
+
+invariant SyncProjectionNeverLags {
+    -- What Projection.sync buys, stated as a property rather than as a
+    -- mechanism: once a sync projection has been updated at least once,
+    -- no committed event in its bounded context can sit ahead of it,
+    -- since every subsequent one is applied in the same transaction as
+    -- the event that feeds it. Phrased against Events directly, the same
+    -- way DynamicConsistencyBoundaryHonoured compares Commands with
+    -- Events, rather than through a "latest sequence" helper this spec
+    -- doesn't otherwise have.
+    --
+    -- Deliberately scoped to caught_up_to != null: a sync projection that
+    -- has never yet been updated is exempted rather than treated as a
+    -- violation, since a fresh registration - or a flip from async to
+    -- sync - has no committed transaction to have piggybacked on yet.
+    -- That startup/flip gap is real and unresolved (see the open
+    -- question on re-registering a projection that already holds state);
+    -- this invariant only states what must hold once a sync projection
+    -- has actually caught up, not how or when it first gets there.
+    for p in Projections:
+        for e in Events:
+            (p.sync = true and p.caught_up_to != null and e.bounded_context = p.bounded_context)
+                implies p.caught_up_to >= e.sequence
+}
+
 invariant DynamicConsistencyBoundaryHonoured {
     -- A command decides based on events matching its consistency_tags,
     -- up to consistency_boundary (the highest sequence observed at
@@ -1067,6 +1367,17 @@ invariant UniqueActiveAccessPerRoleAndContext {
                 implies not (a.status = active and b.status = active)
 }
 
+invariant UniqueActiveExternalSubject {
+    -- At most one active Role per external_subject, so a verified subject
+    -- claim from the IdP resolves to exactly one Role. Two active Roles
+    -- claiming the same external identity would make identity resolution
+    -- ambiguous, and therefore authorisation ambiguous with it.
+    for a in Roles:
+        for b in Roles:
+            a != b and a.external_subject = b.external_subject
+                implies not (a.status = active and b.status = active)
+}
+
 invariant UniqueActiveEncryptionKeyPerSubject {
     -- At most one active key per (bounded context, subject), so
     -- protect_sensitive_fields' get-or-create lookup is never ambiguous.
@@ -1082,17 +1393,20 @@ invariant UniqueActiveEncryptionKeyPerSubject {
 ------------------------------------------------------------
 
 -- The four actors below are all GraphQL-track identities: each is a
--- RoleAccessMapping, and the credential actually presented is the
--- Role.secret behind it. The REST track has no actors of its own - an
--- AccessToken variant is the party a REST surface faces directly.
+-- RoleAccessMapping, reached from the Role a verified external JWT's
+-- subject claim resolved to (see the identity resolution note above
+-- entity Role). Nothing here is established by the JWT itself: the
+-- status and level conditions below are evaluated against current state
+-- on every operation, so revocation bites immediately. The REST track
+-- has no actors of its own - an AccessToken variant is the party a REST
+-- surface faces directly.
 
 actor ReadAccess {
     -- Any active RoleAccessMapping authorises read: write and admin grants
     -- include read implicitly, since they can already do strictly more.
-    -- Not yet used in any surface - there is no query/subscription
-    -- surface to attach it to (see open questions) - declared here so
-    -- the level hierarchy is documented and ready when that surface is
-    -- specified.
+    -- Faced by ProjectionQuery. The subscription surface, when it is
+    -- specified, is expected to face this same actor (see open
+    -- questions).
     identified_by: RoleAccessMapping where status = active
 }
 
@@ -1106,9 +1420,12 @@ actor AdminAccess {
 
 actor SensitiveDataAccess {
     -- Authorises reading the decrypted value of sensitive fields, on top
-    -- of whatever level the underlying RoleAccessMapping already grants. Not
-    -- yet used in any surface - same reason as ReadAccess: there is no
-    -- query surface to attach it to yet.
+    -- of whatever level the underlying RoleAccessMapping already grants.
+    -- Orthogonal to level rather than a level of its own, so it is not
+    -- what a surface faces: ProjectionQuery faces ReadAccess and reads
+    -- can_read_sensitive off that same mapping (see its
+    -- SensitiveFieldsStayProtected guarantee). A caller who is this actor
+    -- is by construction also a ReadAccess one.
     identified_by: RoleAccessMapping where status = active and can_read_sensitive = true
 }
 
@@ -1119,6 +1436,29 @@ actor Superadmin {
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
+
+-- REST token presentation, written once here and pointed at from each of
+-- the four REST surfaces below (ExternalEventIngestion,
+-- DirectEventCreation, CommandTrigger, EventFetch), the same way the
+-- in-memory event cache note above the rules is. An AccessToken is
+-- presented as:
+--
+--     Authorization: Bearer <id>.<secret>
+--
+-- The id half is the non-secret AccessToken.id, so the server looks the
+-- token row up by primary key - a single indexed lookup, no scan over
+-- candidate tokens. The secret half is then verified against that row's
+-- stored hash with a constant-time comparison, so a failed verification
+-- leaks nothing timing-wise about how much of the secret was right. Both
+-- the hashing scheme and the comparison are black boxes here, the same
+-- register as generate_token_secret and generate_token_id: the spec owns
+-- that the secret is never stored or compared in plaintext, not which
+-- primitive does it.
+--
+-- This is the REST track only. GraphQL callers present a JWT from the
+-- trusted external IdP instead and hold no SkilJ-issued secret at all
+-- (see the identity resolution note above entity Role); the two tracks
+-- share no credential and no presentation.
 
 surface ExternalEventIngestion {
     facing adapter: ExternalEventToken
@@ -1137,6 +1477,9 @@ surface ExternalEventIngestion {
         -- kept off the GraphQL surface: GraphQL is the Role/
         -- RoleAccessMapping track, REST is the AccessToken track, and a
         -- caller holds a credential for one or the other.
+        --
+        -- The token is presented as "Authorization: Bearer <id>.<secret>"
+        -- - see the REST token presentation note above the surfaces.
 }
 
 surface DirectEventCreation {
@@ -1152,7 +1495,9 @@ surface DirectEventCreation {
         -- was issued for; it grants no other capability.
 
     @guidance
-        -- REST only, the same as external event ingestion.
+        -- REST only, the same as external event ingestion, including the
+        -- "Authorization: Bearer <id>.<secret>" presentation described in
+        -- the note above the surfaces.
 }
 
 surface EventFetch {
@@ -1189,10 +1534,12 @@ surface EventFetch {
         -- is answered, never how far back a caller may read.
 
     @guidance
-        -- REST only. Deliberately coarse: this establishes the capability
-        -- and its scoping, not the query wire contract. Paging, cursor
-        -- encoding and which filter operators are valid for which schema
-        -- field are all still open (see open questions), as is the
+        -- REST only, with the token presented as
+        -- "Authorization: Bearer <id>.<secret>" - see the note above the
+        -- surfaces. Deliberately coarse otherwise: this establishes the
+        -- capability and its scoping, not the query wire contract. Paging,
+        -- cursor encoding and which filter operators are valid for which
+        -- schema field are all still open (see open questions), as is the
         -- real-time websocket complement to this pull-based fetch.
         --
         -- This is the read the per-bounded-context in-memory event cache
@@ -1201,6 +1548,74 @@ surface EventFetch {
         -- defaulting to the 1000 most recent events per bounded context -
         -- is a tuning decision about how far back reads stay fast, not
         -- about what this surface will answer.
+}
+
+surface ProjectionQuery {
+    facing access_mapping: ReadAccess
+    context projection: Projection
+        where bounded_context = access_mapping.bounded_context
+
+    exposes:
+        projection.name
+        projection.schema
+        projection.schema_version
+
+    provides:
+        QueryProjection(access_mapping, projection, wait_for_sequence?)
+
+    @guarantee GrantScopedToBoundedContext
+        -- A grant only authorises querying projections belonging to its
+        -- own bounded context; a projection in any other context is not
+        -- merely unreadable but invisible. Read level is enough - write
+        -- and admin grants include it, since they can already do strictly
+        -- more - which is why this faces ReadAccess rather than a level of
+        -- its own.
+
+    @guarantee SensitiveFieldsStayProtected
+        -- A projection built from a field its source EventType marked
+        -- sensitive stays protected exactly as the source event is:
+        -- sensitivity is declared once, on the EventType, and inherited
+        -- rather than re-declared per projection. Decryption is gated by
+        -- can_read_sensitive on the very same RoleAccessMapping this
+        -- surface faces, so a caller without that grant is never handed a
+        -- decrypted value - not even one it is expected to discard (see
+        -- QueryProjection's guidance on read_projection).
+
+    @guarantee ReadYourWritesWhenRequested
+        -- A query naming a wait_for_sequence is never answered from a
+        -- position behind it: either the projection has reached that
+        -- sequence and answers, or the query fails. It is never silently
+        -- answered from a stale position. A query naming no sequence
+        -- makes no such promise and answers from wherever the projection
+        -- currently is.
+
+    @guidance
+        -- GraphQL only: a query, qualified by bounded context per the
+        -- unified-graph naming scheme, authenticated as a Role and gated
+        -- by that Role's RoleAccessMapping - the read counterpart to
+        -- CommandSubmission's mutation. The REST track has no equivalent:
+        -- a token-holding caller pulls raw events via EventFetch instead.
+        --
+        -- Richly typed rather than opaque: the GraphQL type this surface
+        -- answers with is generated from Projection.schema, which is a
+        -- black box here in exactly the same register as
+        -- EventType.schema and CommandType.schema. That is what lets a
+        -- client consume a real, typed subset of the graph and introspect
+        -- it, rather than parsing a blob. How a schema becomes a concrete
+        -- GraphQL type, and field/argument naming with it, stays deferred
+        -- (see the scope header's exclusions).
+        --
+        -- wait_for_sequence is the read-your-writes lever and the only
+        -- thing that distinguishes an async projection from a sync one
+        -- from out here. The intended use is submit-then-read: a caller
+        -- submits a command, takes the highest sequence among the events
+        -- it triggered, and passes that as wait_for_sequence on the
+        -- follow-up query, so it observes its own write rather than the
+        -- state that preceded it. Omitting it is the cheap path for
+        -- callers that tolerate lag. A sync projection satisfies any
+        -- sequence immediately, so the argument costs such a caller
+        -- nothing. How long the wait lasts before the query fails is
+        -- still open (see open questions).
 }
 
 surface CommandSubmission {
@@ -1237,7 +1652,9 @@ surface CommandTrigger {
         -- way to read anything back beyond the command's own outcome.
 
     @guidance
-        -- REST only. Intended for AI and other automated callers, which
+        -- REST only, with the token presented as
+        -- "Authorization: Bearer <id>.<secret>" - see the note above the
+        -- surfaces. Intended for AI and other automated callers, which
         -- is why the command type must opt in via rest_trigger_allowed:
         -- a command being submittable by a Role over GraphQL does not
         -- make it triggerable by a token.
@@ -1254,16 +1671,32 @@ surface TypeRegistration {
             system_triggered_allowed, event_read_allowed, system_triggered_schedule?)
         RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
             rest_trigger_allowed)
+        RegisterProjection(access_mapping, bounded_context, name, schema,
+            consumed_event_types, sync)
 
     @guarantee GrantScopedToBoundedContext
-        -- An admin-level grant only authorises registering event and
-        -- command types into its own bounded context, never another one.
+        -- An admin-level grant only authorises registering event types,
+        -- command types and projections into its own bounded context,
+        -- never another one. For a projection this extends to what it
+        -- reads: every EventType it consumes must belong to that same
+        -- context, so registration is never a way to build a view across
+        -- the boundary.
 
     @guidance
         -- GraphQL only. Typically driven by a startup reconciliation loop
         -- rather than by ad-hoc human calls, so the same shape is expected
         -- to be submitted repeatedly and unchanged. Still a GraphQL
         -- mutation, for manual and operational use.
+        --
+        -- Projections are reconciled the same way as event and command
+        -- types, and belong here for the same reason: a projection's
+        -- schema, the event types it consumes and whether it updates
+        -- synchronously are all compiled into the running binary, so the
+        -- same loop that registers types registers them too. schema_version
+        -- advances only when schema itself changed; consumed_event_types
+        -- and sync are reconciled to the given values on every call.
+        -- What re-registration does not do is rebuild what a projection
+        -- already holds (see open questions).
 }
 
 surface EventTypeAdminOperations {
@@ -1373,7 +1806,7 @@ surface AccessManagement {
     facing caller: Superadmin
 
     provides:
-        CreateRole(caller, name, superadmin)
+        CreateRole(caller, name, superadmin, external_subject)
         RevokeRole(caller, role)
         GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive)
         RevokeRoleAccessMapping(caller, access_mapping)
@@ -1383,9 +1816,21 @@ surface AccessManagement {
         -- revoke Roles, or grant/revoke RoleAccessMappings on their behalf -
         -- including its own. There is no self-service path.
 
+    @guarantee ExternalIdentityRegisteredExplicitly
+        -- A Role is bound to an external IdP identity only because a
+        -- superadmin named that identity when creating it. No Role comes
+        -- into being by a JWT merely presenting an unrecognised subject
+        -- claim: an unmatched claim resolves to no Role and authorises
+        -- nothing.
+
     @guidance
-        -- Exposed as GraphQL mutations. Bootstrapping the very first
-        -- superadmin Role is unresolved - see open questions.
+        -- Exposed as GraphQL mutations. The very first superadmin Role
+        -- cannot come from here - CreateRole requires a superadmin caller
+        -- and none exists yet - so it is seeded out of band at first
+        -- deployment: a Role row inserted directly with superadmin = true
+        -- and external_subject set to the initial admin's IdP identity.
+        -- See the note above CreateRole; how that seed step is triggered
+        -- is still open.
 }
 
 ------------------------------------------------------------
@@ -1398,15 +1843,15 @@ open question "Which filter operators are actually valid for a given field depen
 
 open question "The all-events subscription per bounded context has 'limited to no filtering' - what, if anything, can it filter on (e.g. event type name only), versus the full per-field filtering on EventTypeSubscription?"
 
-open question "Projections: how do they declare which event types they consume, how do they get rebuilt/kept up to date, and how are they exposed as GraphQL queries? Whichever design is chosen needs to carry sensitive fields through: a projection built from a sensitive EventType field should stay encrypted/redacted the same way the source event is, gated by the same RoleAccessMapping.can_read_sensitive."
+open question "How long await_projection_caught_up waits before a QueryProjection carrying a wait_for_sequence gives up is implementation-defined here, and its shape is open with it: is the bound a library/runtime configuration knob set at process start (the same register as the event cache's warm-up count), a per-query argument the caller chooses, or a fixed value? A timing-out query is rejected rather than answered stale (see QueryProjection's requires and its ReadYourWritesWhenRequested guarantee), but what the caller is told - specifically, whether 'the projection did not catch up in time' is distinguishable from any other rejection, so a caller can retry rather than treat it as a permanent failure - is not settled."
 
-open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Write and admin mutations are gated by Role/RoleAccessMapping (see Actor Declarations and the CommandSubmission/TypeRegistration/EventTypeAdminOperations/CommandTypeAdminOperations/TokenRevocation/BoundedContextArchival/SubjectErasure/BoundedContextCreation/AccessManagement surfaces). Still open: how a Role's secret is transmitted on the wire - deliberately still abstract, and not committed to JWT or any other scheme - and how read-level access (AccessLevel.read already models it) gates the query/subscription surface once that surface itself is specified."
+open question "Re-registering a projection that already holds state: RegisterProjection reconciles schema, consumed_event_types and sync in place, but nothing rebuilds what was already built from the stream, and caught_up_to is left where it is. Does changing schema, or adding/dropping a consumed EventType, require a replay from the start of the bounded context's stream - and if so, what does the projection answer while it rebuilds? Flipping sync from false to true is the sharpest case: an async projection may be lagging at that moment, so SyncProjectionNeverLags is violated from the flip until it catches up. Either the flip has to catch the projection up atomically before it takes effect, or that stale-but-declared-sync window has to be accepted and named."
 
-open question "REST surface: how is an AccessToken presented on the wire (header, scheme, encoding), and is that the same mechanism as the GraphQL Role secret or a separate one? The spec deliberately keeps both abstract for now, but the two tracks could plausibly share a presentation even though they never share a credential."
+open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Write and admin mutations are gated by Role/RoleAccessMapping (see Actor Declarations and the CommandSubmission/TypeRegistration/EventTypeAdminOperations/CommandTypeAdminOperations/TokenRevocation/BoundedContextArchival/SubjectErasure/BoundedContextCreation/AccessManagement surfaces). The query half is now resolved: ProjectionQuery faces ReadAccess, so any active RoleAccessMapping on a bounded context authorises querying that context's projections and no others, with sensitive values gated by can_read_sensitive on that same mapping. Still open: the subscription half. Nothing here faces the Subscription/EventTypeSubscription entities yet, so there is no surface on which read-level access, sensitive-field protection or per-field filtering are gated for real-time delivery - see the scope header's exclusions and the websocket open question below. (Caller identity is resolved: a JWT from a trusted external IdP, verified and resolved to a Role via Role.external_subject - see the identity resolution note above entity Role.)"
 
-open question "Websocket complement to EventFetch: fetching over REST is pull-based, so a remote workflow either polls or lags. A websocket (or other push) binding authenticated by the same EventReadToken looks like the natural near-term addition, reusing Subscription/EventTypeSubscription/Filter rather than inventing a second filter model. Not specified here - open questions are whether it is the same capability under a different binding (so the same event_read_allowed opt-in and the same token) or a separately opt-in-able one, and how delivery guarantees and cursor/resume semantics differ from the pull case."
+open question "Websocket complement to EventFetch: fetching over REST is pull-based, so a remote workflow either polls or lags. Resolved: it is the same capability under a different binding - the same EventReadToken and the same EventType.event_read_allowed opt-in, presented via an Authorization header at the connection handshake (the audience is server-side remote workflows, not browser JS, so header-based auth at handshake is viable), and reusing Subscription/EventTypeSubscription/Filter rather than a second filter model. Still open: delivery guarantees (at-least-once vs at-most-once, and what happens to events produced while a connection is down) and cursor/resume semantics for the push case."
 
-open question "Bootstrapping: CreateRole, RevokeRole, GrantRoleAccessMapping and RevokeRoleAccessMapping (see AccessManagement) all require an existing active superadmin Role, so nothing within the spec's own rules can create the very first one. Is this an out-of-band operational step (e.g. a seed value read once at first startup, outside the GraphQL surface entirely), or does the spec need to model an explicit bootstrap exception?"
+open question "Bootstrapping the first superadmin Role is resolved in principle - an out-of-band seed/migration step at first deployment inserts a Role row directly with superadmin = true and external_subject set to the initial admin's IdP identity, bypassing the GraphQL surface and CreateRole's superadmin-caller requirement (see the note above CreateRole). What remains open is how and where that step is triggered: a migration run by the library, a CLI subcommand, a configuration value read once at first startup, or left entirely to the consuming application's own deployment process."
 
 open question "Schema versioning tracks a current schema_version counter per type, but not the historical schema text for prior versions. Do consumers reading old events need to look up the exact schema that was active for their recorded version, or is 'each version stays backwards compatible' sufficient without keeping that history?"
 
