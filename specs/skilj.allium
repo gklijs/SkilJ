@@ -3,22 +3,35 @@
 
 -- Scope: SkilJ, a Rust library for building event-sourced, DDD-style
 --   applications backed by a single-instance Postgres database, exposing
---   commands and queries over GraphQL.
+--   two clearly separated callers: a GraphQL surface for admin and
+--   website consumers, and a REST surface for machine callers.
 -- Includes: Bounded contexts, Commands, Events and their possible
 --   origins, Command/Event type registration with JSON-Schema payload
 --   definitions, the admin bounded context that registers other bounded
 --   contexts and their types, the coarse shape of projections built from
 --   events, raw event stream subscriptions with per-field filtering,
---   role-based access control over the GraphQL surface (Role/AccessToken,
---   scoped per bounded context to read/write/admin levels, plus a
---   superadmin flag on Role for creating new bounded contexts), and
 --   per-field sensitivity marking on events with crypto-shredding for
 --   erasure (SensitiveField, EncryptionKey, right-to-be-forgotten via
---   ForgetSubject).
+--   ForgetSubject), and two independent authentication tracks:
+--   - GraphQL: a Role is a human or service identity holding a secret
+--     credential, and reaches a bounded context through a
+--     RoleAccessMapping - a per-bounded-context grant at
+--     read/write/admin level, plus a superadmin flag on Role for
+--     creating new bounded contexts. Used by admin roles for
+--     maintenance and by website consumers. The wire format of the
+--     Role secret is deliberately left abstract here.
+--   - REST (and, likely, websocket later): a family of narrowly scoped
+--     bearer tokens (AccessToken, with one variant per target type -
+--     ExternalEventToken, DirectCreationToken, CommandToken,
+--     EventReadToken). Each token authorises exactly one capability
+--     against exactly one registered type, and each is issued and
+--     revoked independently by an admin over GraphQL. Used to submit
+--     external events, to let AI/automated callers trigger commands,
+--     and to fetch events for remote workflows.
 -- Excludes:
 --   - Enforcement of read-level access (querying projections, creating
 --     subscriptions) and of sensitive-field decryption
---     (AccessToken.can_read_sensitive): both models exist, but there is
+--     (RoleAccessMapping.can_read_sensitive): both models exist, but there is
 --     no query/subscription surface yet to gate either against - see the
 --     detailed projection query surface exclusion below
 --   - Retroactive encryption of historical events when a field is newly
@@ -27,11 +40,16 @@
 --     and Event.encryption_keys)
 --   - The encryption scheme itself (algorithm, key derivation, physical
 --     key storage) - protect_sensitive_fields is a black box, consistent
---     with how Token.secret generation is already treated
+--     with how AccessToken.secret generation is already treated
 --   - Multi-instance / distributed deployment
 --   - The detailed projection query surface and GraphQL wire contract,
---     including how a Role's secret is transmitted (deferred to a later,
---     more detailed pass)
+--     including how a Role's secret is transmitted - still unresolved,
+--     and deliberately not committed to any particular scheme (deferred
+--     to a later, more detailed pass)
+--   - How REST bearer tokens are presented on the wire, for the same
+--     reason
+--   - The websocket complement to token-authenticated event fetching
+--     (see open questions)
 -- Dependencies: none yet
 
 ------------------------------------------------------------
@@ -120,7 +138,7 @@ entity BoundedContext {
     events: Event with bounded_context = this
     projections: Projection with bounded_context = this
     subscriptions: Subscription with bounded_context = this
-    access_tokens: AccessToken with bounded_context = this
+    access_mappings: RoleAccessMapping with bounded_context = this
     encryption_keys: EncryptionKey with bounded_context = this
 
     transitions status {
@@ -139,6 +157,13 @@ entity CommandType {
     -- consistency_tags from its own payload, using the same shared keys
     -- events are tagged with, so the two are directly comparable.
     tag_mappings: Set<TagMapping>
+
+    -- Opt-in, mirroring EventType.external_creation_allowed: submitting
+    -- this command over GraphQL with a write-level RoleAccessMapping is
+    -- always permitted, but letting an automated caller trigger it over
+    -- REST with a CommandToken requires explicit opt-in per command type.
+    rest_trigger_allowed: Boolean
+    command_tokens: CommandToken with command_type = this
 }
 
 entity EventType {
@@ -169,51 +194,78 @@ entity EventType {
     system_triggered_allowed: Boolean
     system_triggered_schedule: String?     -- cron expression, evaluated by the core's own in-process
                                             -- scheduler; the core cannot rely on an OS-level cron
+
+    -- Opt-in in the same shape as the origin permissions above, but for
+    -- reading rather than writing: whether events of this type may be
+    -- fetched over REST with an EventReadToken.
+    event_read_allowed: Boolean
+    event_read_tokens: EventReadToken with event_type = this
 }
 
-entity Token {
+entity AccessToken {
     id: String                             -- non-secret identifier, safe to log and store on events
-    event_type: EventType
     secret: String                         -- opaque bearer credential (distinct from id)
     status: active | revoked
     created_at: Timestamp
     revoked_at: Timestamp? when status = revoked
-    purpose: ExternalEventToken | DirectCreationToken
+    purpose: ExternalEventToken | DirectCreationToken | CommandToken | EventReadToken
 
-    -- Scoped to exactly one EventType: holding a token authorises acting
-    -- (submitting an external event, or directly creating one) for that
-    -- type only, nothing else. Lifecycle is tracked by the admin bounded
-    -- context via TokenCreated/TokenRevoked.
+    -- The bearer credential of the REST track. Each variant is scoped to
+    -- exactly one registered type - an EventType for the three
+    -- event-shaped variants, a CommandType for CommandToken - and holding
+    -- one authorises exactly one capability against that single type,
+    -- nothing else. The scoping field therefore lives on the variant, not
+    -- here: the base only carries what every token has regardless of what
+    -- it points at. Tokens are minted and revoked by an admin over
+    -- GraphQL; lifecycle is tracked by the admin bounded context via
+    -- TokenCreated/TokenRevoked.
     transitions status {
         active -> revoked
         terminal: revoked
     }
 }
 
-variant ExternalEventToken : Token {
+variant ExternalEventToken : AccessToken {
     -- Held by an out-of-core adapter (e.g. a Kafka client, which needs OS
     -- facilities the core deliberately avoids) to authenticate against
     -- ExternalEventIngestion and fail independently if its own
     -- dependency is unavailable.
+    event_type: EventType
 }
 
-variant DirectCreationToken : Token {}
+variant DirectCreationToken : AccessToken {
+    event_type: EventType
+}
+
+variant CommandToken : AccessToken {
+    -- Held by an AI or otherwise automated caller that triggers a command
+    -- over REST rather than over GraphQL. The command itself is processed
+    -- exactly as a GraphQL-submitted one (see ProcessCommand); only the
+    -- authentication differs.
+    command_type: CommandType
+}
+
+variant EventReadToken : AccessToken {
+    -- Held by a remote workflow that fetches events of one type to drive
+    -- itself. Read-only: it authorises no writing of any kind.
+    event_type: EventType
+}
 
 entity Role {
     id: String                             -- non-secret identifier, safe to log and store on events
     secret: String                         -- opaque bearer credential presented by GraphQL clients
     name: String
-    superadmin: Boolean                    -- grants AddBoundedContext and all Role/AccessToken
-                                            -- management, independently of any AccessToken below
+    superadmin: Boolean                    -- grants AddBoundedContext and all Role/RoleAccessMapping
+                                            -- management, independently of any RoleAccessMapping below
     status: active | revoked
     created_at: Timestamp
     revoked_at: Timestamp? when status = revoked
 
     -- A Role reaches multiple bounded contexts by holding multiple
-    -- AccessTokens, one per context - there is no single grant that
+    -- RoleAccessMappings, one per context - there is no single grant that
     -- spans contexts other than superadmin, which is orthogonal to
-    -- context scoping entirely (see AccessToken).
-    access_tokens: AccessToken with role = this
+    -- context scoping entirely (see RoleAccessMapping).
+    access_mappings: RoleAccessMapping with role = this
 
     transitions status {
         active -> revoked
@@ -221,28 +273,31 @@ entity Role {
     }
 }
 
-entity AccessToken {
+entity RoleAccessMapping {
     role: Role
     bounded_context: BoundedContext
     level: AccessLevel
     can_read_sensitive: Boolean             -- orthogonal to level: authorises decrypting
-                                             -- sensitive fields within this token's
-                                             -- bounded context. A write or admin token
+                                             -- sensitive fields within this mapping's
+                                             -- bounded context. A write or admin grant
                                              -- does not see decrypted sensitive values
                                              -- unless this is also true.
     status: active | revoked
     created_at: Timestamp
     revoked_at: Timestamp? when status = revoked
 
-    -- Scoped to exactly one BoundedContext: holding this token authorises
-    -- the given level within that context only, nothing else. Levels
-    -- accumulate: read authorises querying and subscribing; write
+    -- A grant, not a credential in its own right: the credential a
+    -- GraphQL caller presents is Role.secret, and this records what that
+    -- Role may do where. Scoped to exactly one BoundedContext: it
+    -- authorises the given level within that context only, nothing else.
+    -- Levels accumulate: read authorises querying and subscribing; write
     -- includes read and additionally authorises submitting commands;
     -- admin includes write and additionally authorises the
     -- admin-bounded-context mutations that target this specific context
-    -- (archiving it, creating/revoking tokens for its own event types) -
-    -- but not AddBoundedContext, which is gated by Role.superadmin
-    -- instead, since creating a context isn't "for" any existing one.
+    -- (archiving it, minting/revoking AccessTokens for its own event and
+    -- command types) - but not AddBoundedContext, which is gated by
+    -- Role.superadmin instead, since creating a context isn't "for" any
+    -- existing one.
     transitions status {
         active -> revoked
         terminal: revoked
@@ -274,8 +329,11 @@ entity Command {
     bounded_context: BoundedContext
     command_type: CommandType
     payload: String                        -- JSON-encoded command data, conforms to command_type.schema
-    metadata: Metadata                     -- client_id is the id of the Role behind the AccessToken
-                                            -- that submitted this command (see CommandSubmission)
+    metadata: Metadata                     -- client_id identifies the caller that submitted this
+                                            -- command: the id of the Role behind the
+                                            -- RoleAccessMapping over GraphQL (see CommandSubmission),
+                                            -- or the id of the CommandToken over REST (see
+                                            -- CommandTrigger)
 
     -- Dynamic consistency boundary: the tags this command's decision was
     -- based on, and the highest Event.sequence observed among events
@@ -443,12 +501,80 @@ rule CreateDirectEvent {
         )
 }
 
-rule ProcessCommand {
-    when: SubmitCommand(access_token, command_type, payload)
-    requires: access_token.status = active
-    requires: access_token.level in {write, admin}
-    requires: access_token.bounded_context = command_type.bounded_context
+-- The only read operation specified so far, and the REST track's reason
+-- for existing beyond writing: a remote workflow drives itself off one
+-- event type's stream without holding a GraphQL Role. after_sequence is
+-- the caller's own cursor - absent means "from the beginning", and
+-- sequences start at 0 per bounded context. The filters reuse the same
+-- Filter shape an EventTypeSubscription declares, so narrowing a fetch
+-- and narrowing a subscription look the same to a caller. The detailed
+-- query/filter wire contract, including paging, is still open (see the
+-- filter-validation and projection open questions).
+--
+-- Unlike the write rules, this deliberately does not require the bounded
+-- context to be active: archiving stops new commands and events, but
+-- keeps the history, and reading that history is the point.
+
+rule FetchEvents {
+    when: FetchEvents(token, read_type, filters, after_sequence?)
+    requires: token.status = active
+    requires: token.event_type = read_type
+    requires: read_type.event_read_allowed = true
+
+    let candidates =
+        Events where bounded_context = read_type.bounded_context
+            and event_type = read_type
+            and sequence > (after_sequence ?? -1)
+
+    ensures:
+        EventsDelivered(
+            token: token,
+            event_type: read_type,
+            events: filter(candidates, e => matches_filters(e, filters))
+        )
+}
+
+-- A command reaches ProcessCommand from exactly one of two callers, each
+-- authenticated its own way, and the two rules below are the only
+-- difference between them: a Role acting over GraphQL through its
+-- per-context grant, or an automated caller acting over REST with a
+-- CommandToken scoped to this one command type. Everything after
+-- authentication - the consistency boundary, decide(), the events
+-- written - is identical, so it is specified once, in ProcessCommand,
+-- rather than mirrored per caller. CommandAuthorised is an internal
+-- hand-off within the same transaction, not an asynchronous boundary: a
+-- decision to reject is still reported to the original caller.
+
+rule AuthoriseCommandSubmission {
+    when: SubmitCommand(access_mapping, command_type, payload)
+    requires: access_mapping.status = active
+    requires: access_mapping.level in {write, admin}
+    requires: access_mapping.bounded_context = command_type.bounded_context
     requires: command_type.bounded_context.status = active
+    ensures:
+        CommandAuthorised(
+            command_type: command_type,
+            payload: payload,
+            client_id: access_mapping.role.id
+        )
+}
+
+rule AuthoriseCommandTrigger {
+    when: TriggerCommand(token, command_type, payload)
+    requires: token.status = active
+    requires: token.command_type = command_type
+    requires: command_type.rest_trigger_allowed = true
+    requires: command_type.bounded_context.status = active
+    ensures:
+        CommandAuthorised(
+            command_type: command_type,
+            payload: payload,
+            client_id: token.id
+        )
+}
+
+rule ProcessCommand {
+    when: CommandAuthorised(command_type, payload, client_id)
 
     let consistency_tags = derive_tags(command_type, payload)
     let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
@@ -475,7 +601,7 @@ rule ProcessCommand {
             metadata: {
                 type: command_type.name,
                 version: command_type.schema_version,
-                client_id: access_token.role.id,
+                client_id: client_id,
                 created_at: now
             },
             consistency_tags: consistency_tags,
@@ -489,7 +615,7 @@ rule ProcessCommand {
                 metadata: {
                     type: spec.event_type.name,
                     version: spec.event_type.schema_version,
-                    client_id: access_token.role.id,
+                    client_id: client_id,
                     created_at: now
                 },
                 sequence: next_sequence(command_type.bounded_context),
@@ -511,7 +637,7 @@ rule ProcessCommand {
         -- rule's own requires/ensures above is what must hold at commit.
 }
 
--- The seven rules below are the admin bounded context's operations. In
+-- The nine rules below are the admin bounded context's operations. In
 -- principle each should itself be a Command producing a CommandTriggered
 -- Event (BoundedContextAdded, BoundedContextArchived, EventTypeRegistered,
 -- CommandTypeRegistered, TokenCreated, TokenRevoked) within the admin
@@ -531,10 +657,10 @@ rule AddBoundedContext {
 }
 
 rule ArchiveBoundedContext {
-    when: ArchiveBoundedContext(access_token, bounded_context)
-    requires: access_token.status = active
-    requires: access_token.level = admin
-    requires: access_token.bounded_context = bounded_context
+    when: ArchiveBoundedContext(access_mapping, bounded_context)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
     ensures:
         bounded_context.status = archived
@@ -554,19 +680,25 @@ rule ArchiveBoundedContext {
 -- always reconciled to the given values without a version bump - they
 -- don't affect how a stored payload is interpreted.
 --
--- Both are gated by an admin-level AccessToken for the target bounded
--- context, the same as the rules above. An AccessToken scoped to the
+-- Both are gated by an admin-level RoleAccessMapping for the target bounded
+-- context, the same as the rules above. A RoleAccessMapping scoped to the
 -- admin bounded context itself deliberately gains no new meaning here: a
 -- grant on the admin context must not become a way to register types into
 -- arbitrary other contexts.
+--
+-- Registration is also where the two REST opt-ins are set:
+-- EventType.event_read_allowed and CommandType.rest_trigger_allowed. Both
+-- are reconciled the same way as the origin permissions - a type is
+-- reachable over REST only because its own registration says so, never
+-- because a token happens to exist for it.
 
 rule RegisterEventType {
-    when: RegisterEventType(access_token, bounded_context, name, schema, tag_mappings,
+    when: RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
         sensitive_fields, external_creation_allowed, direct_creation_allowed,
-        system_triggered_allowed, system_triggered_schedule?)
-    requires: access_token.status = active
-    requires: access_token.level = admin
-    requires: access_token.bounded_context = bounded_context
+        system_triggered_allowed, event_read_allowed, system_triggered_schedule?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
 
     let existing = EventType{bounded_context: bounded_context, name: name}
@@ -594,6 +726,7 @@ rule RegisterEventType {
             existing.direct_creation_allowed = direct_creation_allowed
             existing.system_triggered_allowed = system_triggered_allowed
             existing.system_triggered_schedule = system_triggered_schedule
+            existing.event_read_allowed = event_read_allowed
         else:
             EventType.created(
                 bounded_context: bounded_context,
@@ -605,15 +738,17 @@ rule RegisterEventType {
                 external_creation_allowed: external_creation_allowed,
                 direct_creation_allowed: direct_creation_allowed,
                 system_triggered_allowed: system_triggered_allowed,
-                system_triggered_schedule: system_triggered_schedule
+                system_triggered_schedule: system_triggered_schedule,
+                event_read_allowed: event_read_allowed
             )
 }
 
 rule RegisterCommandType {
-    when: RegisterCommandType(access_token, bounded_context, name, schema, tag_mappings)
-    requires: access_token.status = active
-    requires: access_token.level = admin
-    requires: access_token.bounded_context = bounded_context
+    when: RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
+        rest_trigger_allowed)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
 
     let existing = CommandType{bounded_context: bounded_context, name: name}
@@ -633,21 +768,29 @@ rule RegisterCommandType {
             existing.schema_version =
                 if schema_changed: existing.schema_version + 1 else: existing.schema_version
             existing.tag_mappings = tag_mappings
+            existing.rest_trigger_allowed = rest_trigger_allowed
         else:
             CommandType.created(
                 bounded_context: bounded_context,
                 name: name,
                 schema: schema,
                 schema_version: 1,
-                tag_mappings: tag_mappings
+                tag_mappings: tag_mappings,
+                rest_trigger_allowed: rest_trigger_allowed
             )
 }
 
+-- The four token-minting rules below are deliberately uniform: one rule
+-- per AccessToken variant, each gated by an admin-level RoleAccessMapping
+-- for the bounded context that owns the type being scoped to. Minting a
+-- REST credential is itself a GraphQL admin operation - the REST track
+-- never issues its own credentials.
+
 rule CreateExternalEventToken {
-    when: CreateExternalEventToken(access_token, event_type)
-    requires: access_token.status = active
-    requires: access_token.level = admin
-    requires: access_token.bounded_context = event_type.bounded_context
+    when: CreateExternalEventToken(access_mapping, event_type)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = event_type.bounded_context
     ensures:
         ExternalEventToken.created(
             id: generate_token_id(),
@@ -659,10 +802,10 @@ rule CreateExternalEventToken {
 }
 
 rule CreateDirectCreationToken {
-    when: CreateDirectCreationToken(access_token, event_type)
-    requires: access_token.status = active
-    requires: access_token.level = admin
-    requires: access_token.bounded_context = event_type.bounded_context
+    when: CreateDirectCreationToken(access_mapping, event_type)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = event_type.bounded_context
     ensures:
         DirectCreationToken.created(
             id: generate_token_id(),
@@ -673,18 +816,59 @@ rule CreateDirectCreationToken {
         )
 }
 
+rule CreateCommandToken {
+    when: CreateCommandToken(access_mapping, command_type)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = command_type.bounded_context
+    ensures:
+        CommandToken.created(
+            id: generate_token_id(),
+            command_type: command_type,
+            secret: generate_token_secret(),
+            status: active,
+            created_at: now
+        )
+}
+
+rule CreateEventReadToken {
+    when: CreateEventReadToken(access_mapping, event_type)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = event_type.bounded_context
+    ensures:
+        EventReadToken.created(
+            id: generate_token_id(),
+            event_type: event_type,
+            secret: generate_token_secret(),
+            status: active,
+            created_at: now
+        )
+}
+
+-- One revocation rule for every AccessToken variant: whichever type a
+-- token is scoped to, the admin who may revoke it is the admin of the
+-- bounded context that owns that type. token_scope names that context,
+-- and is the only place the variants differ here - CommandToken points
+-- at a CommandType, the other three at an EventType.
+
 rule RevokeToken {
-    when: RevokeToken(access_token, token)
-    requires: access_token.status = active
-    requires: access_token.level = admin
-    requires: access_token.bounded_context = token.event_type.bounded_context
+    when: RevokeToken(access_mapping, token)
+
+    let token_scope =
+        if token.purpose = CommandToken: token.command_type.bounded_context
+        else: token.event_type.bounded_context
+
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = token_scope
     requires: token.status = active
     ensures:
         token.status = revoked
         token.revoked_at = now
 }
 
--- The four rules below manage Role and AccessToken themselves - the
+-- The four rules below manage Role and RoleAccessMapping themselves - the
 -- access-control layer that gates every rule above. All four require an
 -- existing active superadmin Role, which resolves the obvious circularity
 -- (access control needs access control) for every case except the very
@@ -714,20 +898,20 @@ rule RevokeRole {
     ensures:
         role.status = revoked
         role.revoked_at = now
-        for token in role.access_tokens where status = active:
-            token.status = revoked
-            token.revoked_at = now
+        for mapping in role.access_mappings where status = active:
+            mapping.status = revoked
+            mapping.revoked_at = now
 }
 
-rule GrantAccessToken {
-    when: GrantAccessToken(caller, role, bounded_context, level, can_read_sensitive)
+rule GrantRoleAccessMapping {
+    when: GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive)
     requires: caller.status = active
     requires: caller.superadmin = true
     requires: role.status = active
     requires: bounded_context.status = active
-    requires: not exists AccessToken{role: role, bounded_context: bounded_context, status: active}
+    requires: not exists RoleAccessMapping{role: role, bounded_context: bounded_context, status: active}
     ensures:
-        AccessToken.created(
+        RoleAccessMapping.created(
             role: role,
             bounded_context: bounded_context,
             level: level,
@@ -737,26 +921,26 @@ rule GrantAccessToken {
         )
 }
 
-rule RevokeAccessToken {
-    when: RevokeAccessToken(caller, access_token)
+rule RevokeRoleAccessMapping {
+    when: RevokeRoleAccessMapping(caller, access_mapping)
     requires: caller.status = active
     requires: caller.superadmin = true
-    requires: access_token.status = active
+    requires: access_mapping.status = active
     ensures:
-        access_token.status = revoked
-        access_token.revoked_at = now
+        access_mapping.status = revoked
+        access_mapping.revoked_at = now
 }
 
 -- ForgetSubject is not part of the superadmin-only group above: it is a
 -- per-context admin operation, like ArchiveBoundedContext and the token
--- rules earlier - an admin-level AccessToken for a context can forget
+-- rules earlier - an admin-level RoleAccessMapping for a context can forget
 -- subjects within it, the same way it can archive that context.
 
 rule ForgetSubject {
-    when: ForgetSubject(access_token, key)
-    requires: access_token.status = active
-    requires: access_token.level = admin
-    requires: access_token.bounded_context = key.bounded_context
+    when: ForgetSubject(access_mapping, key)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = key.bounded_context
     requires: key.status = active
     ensures:
         key.status = destroyed
@@ -822,23 +1006,23 @@ invariant CommandConsistencyTagsMatchDeclaredMappings {
 
 invariant SystemTriggeredClientIdIsSystem {
     -- The other three origins record a real originator in client_id (a
-    -- token id, or the Role id behind the submitting AccessToken). A
+    -- token id, or the Role id behind the submitting RoleAccessMapping). A
     -- system-triggered event has none, so it records the literal
     -- "system" rather than borrowing an identity it doesn't have.
     for e in Events:
         e.origin = SystemTriggered implies e.metadata.client_id = "system"
 }
 
-invariant RevokedRoleImpliesTokensRevoked {
+invariant RevokedRoleImpliesMappingsRevoked {
     for r in Roles:
-        r.status = revoked implies r.access_tokens.all(t => t.status = revoked)
+        r.status = revoked implies r.access_mappings.all(t => t.status = revoked)
 }
 
 invariant UniqueActiveAccessPerRoleAndContext {
     -- A Role holds at most one active grant per bounded context, so
     -- "what can this Role do in this context" is never ambiguous.
-    for a in AccessTokens:
-        for b in AccessTokens:
+    for a in RoleAccessMappings:
+        for b in RoleAccessMappings:
             a != b and a.role = b.role and a.bounded_context = b.bounded_context
                 implies not (a.status = active and b.status = active)
 }
@@ -857,30 +1041,35 @@ invariant UniqueActiveEncryptionKeyPerSubject {
 -- Actor Declarations
 ------------------------------------------------------------
 
+-- The four actors below are all GraphQL-track identities: each is a
+-- RoleAccessMapping, and the credential actually presented is the
+-- Role.secret behind it. The REST track has no actors of its own - an
+-- AccessToken variant is the party a REST surface faces directly.
+
 actor ReadAccess {
-    -- Any active AccessToken authorises read: write and admin tokens
+    -- Any active RoleAccessMapping authorises read: write and admin grants
     -- include read implicitly, since they can already do strictly more.
     -- Not yet used in any surface - there is no query/subscription
     -- surface to attach it to (see open questions) - declared here so
     -- the level hierarchy is documented and ready when that surface is
     -- specified.
-    identified_by: AccessToken where status = active
+    identified_by: RoleAccessMapping where status = active
 }
 
 actor WriteAccess {
-    identified_by: AccessToken where status = active and level in {write, admin}
+    identified_by: RoleAccessMapping where status = active and level in {write, admin}
 }
 
 actor AdminAccess {
-    identified_by: AccessToken where status = active and level = admin
+    identified_by: RoleAccessMapping where status = active and level = admin
 }
 
 actor SensitiveDataAccess {
     -- Authorises reading the decrypted value of sensitive fields, on top
-    -- of whatever level the underlying AccessToken already grants. Not
+    -- of whatever level the underlying RoleAccessMapping already grants. Not
     -- yet used in any surface - same reason as ReadAccess: there is no
     -- query surface to attach it to yet.
-    identified_by: AccessToken where status = active and can_read_sensitive = true
+    identified_by: RoleAccessMapping where status = active and can_read_sensitive = true
 }
 
 actor Superadmin {
@@ -904,9 +1093,10 @@ surface ExternalEventIngestion {
         -- was issued for; it grants no other capability.
 
     @guidance
-        -- Exposed as both a REST endpoint and a GraphQL mutation. The
-        -- behavioural contract above is identical across both bindings;
-        -- the choice of protocol is an implementation detail.
+        -- REST only. Token-authenticated capabilities are deliberately
+        -- kept off the GraphQL surface: GraphQL is the Role/
+        -- RoleAccessMapping track, REST is the AccessToken track, and a
+        -- caller holds a credential for one or the other.
 }
 
 surface DirectEventCreation {
@@ -922,99 +1112,189 @@ surface DirectEventCreation {
         -- was issued for; it grants no other capability.
 
     @guidance
-        -- Exposed as both a REST endpoint and a GraphQL mutation, the
-        -- same as external event ingestion.
+        -- REST only, the same as external event ingestion.
+}
+
+surface EventFetch {
+    facing token: EventReadToken
+    context event_type: EventType
+        where this = token.event_type and event_read_allowed = true and token.status = active
+
+    exposes:
+        event_type.name
+        event_type.schema
+        event_type.schema_version
+
+    provides:
+        FetchEvents(token, event_type, filters, after_sequence?)
+
+    @guarantee TokenScopedToEventType
+        -- A token only authorises reading events of the one EventType it
+        -- was issued for; it grants no write capability at all, and no
+        -- visibility into any other type.
+
+    @guarantee SensitiveFieldsStayEncrypted
+        -- Sensitive fields are delivered as stored, which is to say as
+        -- ciphertext. Decryption is gated by
+        -- RoleAccessMapping.can_read_sensitive, which belongs to the
+        -- GraphQL track; a bearer token carries no such grant and so
+        -- never sees a decrypted value.
+
+    @guidance
+        -- REST only. Deliberately coarse: this establishes the capability
+        -- and its scoping, not the query wire contract. Paging, cursor
+        -- encoding and which filter operators are valid for which schema
+        -- field are all still open (see open questions), as is the
+        -- real-time websocket complement to this pull-based fetch.
 }
 
 surface CommandSubmission {
-    facing access_token: WriteAccess
+    facing access_mapping: WriteAccess
     context command_type: CommandType
-        where bounded_context = access_token.bounded_context and bounded_context.status = active
+        where bounded_context = access_mapping.bounded_context and bounded_context.status = active
 
     provides:
-        SubmitCommand(access_token, command_type, payload)
+        SubmitCommand(access_mapping, command_type, payload)
 
-    @guarantee TokenScopedToBoundedContext
-        -- A write-level token only authorises submitting commands for
+    @guarantee GrantScopedToBoundedContext
+        -- A write-level grant only authorises submitting commands for
         -- CommandTypes belonging to its own bounded context.
 
     @guidance
-        -- Exposed as a GraphQL mutation, qualified by bounded context per
-        -- the unified-graph naming scheme.
+        -- GraphQL only: a mutation, qualified by bounded context per the
+        -- unified-graph naming scheme, authenticated as a Role and gated
+        -- by that Role's RoleAccessMapping. The token-authenticated way
+        -- to trigger the same command over REST is CommandTrigger; both
+        -- converge on ProcessCommand.
+}
+
+surface CommandTrigger {
+    facing token: CommandToken
+    context command_type: CommandType
+        where this = token.command_type and rest_trigger_allowed = true and token.status = active
+
+    provides:
+        TriggerCommand(token, command_type, payload)
+
+    @guarantee TokenScopedToCommandType
+        -- A token only authorises triggering the one CommandType it was
+        -- issued for; it grants no other capability, and in particular no
+        -- way to read anything back beyond the command's own outcome.
+
+    @guidance
+        -- REST only. Intended for AI and other automated callers, which
+        -- is why the command type must opt in via rest_trigger_allowed:
+        -- a command being submittable by a Role over GraphQL does not
+        -- make it triggerable by a token.
 }
 
 surface TypeRegistration {
-    facing access_token: AdminAccess
+    facing access_mapping: AdminAccess
     context bounded_context: BoundedContext
-        where this = access_token.bounded_context and status = active
+        where this = access_mapping.bounded_context and status = active
 
     provides:
-        RegisterEventType(access_token, bounded_context, name, schema, tag_mappings,
+        RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
             sensitive_fields, external_creation_allowed, direct_creation_allowed,
-            system_triggered_allowed, system_triggered_schedule?)
-        RegisterCommandType(access_token, bounded_context, name, schema, tag_mappings)
+            system_triggered_allowed, event_read_allowed, system_triggered_schedule?)
+        RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
+            rest_trigger_allowed)
 
-    @guarantee TokenScopedToBoundedContext
-        -- An admin-level token only authorises registering event and
+    @guarantee GrantScopedToBoundedContext
+        -- An admin-level grant only authorises registering event and
         -- command types into its own bounded context, never another one.
 
     @guidance
-        -- Typically driven by a startup reconciliation loop rather than by
-        -- ad-hoc human calls, so the same shape is expected to be
-        -- submitted repeatedly and unchanged. Still exposed as a GraphQL
-        -- mutation as well, for manual and operational use.
+        -- GraphQL only. Typically driven by a startup reconciliation loop
+        -- rather than by ad-hoc human calls, so the same shape is expected
+        -- to be submitted repeatedly and unchanged. Still a GraphQL
+        -- mutation, for manual and operational use.
 }
 
 surface EventTypeAdminOperations {
-    facing access_token: AdminAccess
+    facing access_mapping: AdminAccess
     context event_type: EventType
-        where bounded_context = access_token.bounded_context
+        where bounded_context = access_mapping.bounded_context
 
     provides:
-        CreateExternalEventToken(access_token, event_type)
-        CreateDirectCreationToken(access_token, event_type)
+        CreateExternalEventToken(access_mapping, event_type)
+        CreateDirectCreationToken(access_mapping, event_type)
+        CreateEventReadToken(access_mapping, event_type)
 
-    @guarantee TokenScopedToBoundedContext
-        -- An admin-level token only authorises creating adapter tokens
-        -- for EventTypes belonging to its own bounded context.
+    @guarantee GrantScopedToBoundedContext
+        -- An admin-level grant only authorises minting tokens for
+        -- EventTypes belonging to its own bounded context.
+
+    @guidance
+        -- GraphQL only, even though every token minted here is used over
+        -- REST: issuing a credential is an admin operation, so it lives
+        -- on the admin track.
+}
+
+surface CommandTypeAdminOperations {
+    facing access_mapping: AdminAccess
+    context command_type: CommandType
+        where bounded_context = access_mapping.bounded_context
+
+    provides:
+        CreateCommandToken(access_mapping, command_type)
+
+    @guarantee GrantScopedToBoundedContext
+        -- An admin-level grant only authorises minting tokens for
+        -- CommandTypes belonging to its own bounded context.
+
+    @guidance
+        -- GraphQL only, the same as EventTypeAdminOperations. Separate
+        -- from it only because the thing being scoped to is a CommandType
+        -- rather than an EventType.
 }
 
 surface TokenRevocation {
-    facing access_token: AdminAccess
-    context token: Token
-        where event_type.bounded_context = access_token.bounded_context and status = active
+    facing access_mapping: AdminAccess
+    context token: AccessToken where status = active
+
+    let token_scope =
+        if token.purpose = CommandToken: token.command_type.bounded_context
+        else: token.event_type.bounded_context
 
     provides:
-        RevokeToken(access_token, token)
+        RevokeToken(access_mapping, token)
+            when token_scope = access_mapping.bounded_context
 
-    @guarantee TokenScopedToBoundedContext
-        -- An admin-level token only authorises revoking adapter tokens
-        -- whose EventType belongs to its own bounded context.
+    @guarantee GrantScopedToBoundedContext
+        -- An admin-level grant only authorises revoking tokens whose
+        -- scoped type - EventType or CommandType - belongs to its own
+        -- bounded context. Which context that is per variant is spelled
+        -- out by token_scope in RevokeToken.
+
+    @guidance
+        -- GraphQL only, and covers every AccessToken variant: revocation
+        -- is one operation regardless of what the token was scoped to.
 }
 
 surface BoundedContextArchival {
-    facing access_token: AdminAccess
+    facing access_mapping: AdminAccess
     context bounded_context: BoundedContext
-        where this = access_token.bounded_context and status = active
+        where this = access_mapping.bounded_context and status = active
 
     provides:
-        ArchiveBoundedContext(access_token, bounded_context)
+        ArchiveBoundedContext(access_mapping, bounded_context)
 
-    @guarantee TokenScopedToBoundedContext
-        -- An admin-level token only authorises archiving its own
+    @guarantee GrantScopedToBoundedContext
+        -- An admin-level grant only authorises archiving its own
         -- bounded context, never another one.
 }
 
 surface SubjectErasure {
-    facing access_token: AdminAccess
+    facing access_mapping: AdminAccess
     context key: EncryptionKey
-        where bounded_context = access_token.bounded_context and status = active
+        where bounded_context = access_mapping.bounded_context and status = active
 
     provides:
-        ForgetSubject(access_token, key)
+        ForgetSubject(access_mapping, key)
 
-    @guarantee TokenScopedToBoundedContext
-        -- An admin-level token only authorises forgetting subjects within
+    @guarantee GrantScopedToBoundedContext
+        -- An admin-level grant only authorises forgetting subjects within
         -- its own bounded context.
 
     @guidance
@@ -1031,7 +1311,7 @@ surface BoundedContextCreation {
     @guarantee SuperadminOnly
         -- Creating a bounded context isn't "for" any existing context,
         -- so it is gated by Role.superadmin rather than a per-context
-        -- AccessToken.
+        -- RoleAccessMapping.
 }
 
 surface AccessManagement {
@@ -1040,12 +1320,12 @@ surface AccessManagement {
     provides:
         CreateRole(caller, name, superadmin)
         RevokeRole(caller, role)
-        GrantAccessToken(caller, role, bounded_context, level, can_read_sensitive)
-        RevokeAccessToken(caller, access_token)
+        GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive)
+        RevokeRoleAccessMapping(caller, access_mapping)
 
     @guarantee SuperadminOnly
         -- Only an active Role with superadmin = true may create or
-        -- revoke Roles, or grant/revoke AccessTokens on their behalf -
+        -- revoke Roles, or grant/revoke RoleAccessMappings on their behalf -
         -- including its own. There is no self-service path.
 
     @guidance
@@ -1063,11 +1343,15 @@ open question "Which filter operators are actually valid for a given field depen
 
 open question "The all-events subscription per bounded context has 'limited to no filtering' - what, if anything, can it filter on (e.g. event type name only), versus the full per-field filtering on EventTypeSubscription?"
 
-open question "Projections: how do they declare which event types they consume, how do they get rebuilt/kept up to date, and how are they exposed as GraphQL queries? Whichever design is chosen needs to carry sensitive fields through: a projection built from a sensitive EventType field should stay encrypted/redacted the same way the source event is, gated by the same AccessToken.can_read_sensitive."
+open question "Projections: how do they declare which event types they consume, how do they get rebuilt/kept up to date, and how are they exposed as GraphQL queries? Whichever design is chosen needs to carry sensitive fields through: a projection built from a sensitive EventType field should stay encrypted/redacted the same way the source event is, gated by the same RoleAccessMapping.can_read_sensitive."
 
-open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Write and admin mutations are now gated by AccessToken/Role (see Actor Declarations and the CommandSubmission/EventTypeAdminOperations/TokenRevocation/BoundedContextArchival/BoundedContextCreation/AccessManagement surfaces). Still open: how a Role's secret is transmitted on the wire, and how read-level access (AccessLevel.read already models it) gates the query/subscription surface once that surface itself is specified."
+open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Write and admin mutations are gated by Role/RoleAccessMapping (see Actor Declarations and the CommandSubmission/TypeRegistration/EventTypeAdminOperations/CommandTypeAdminOperations/TokenRevocation/BoundedContextArchival/SubjectErasure/BoundedContextCreation/AccessManagement surfaces). Still open: how a Role's secret is transmitted on the wire - deliberately still abstract, and not committed to JWT or any other scheme - and how read-level access (AccessLevel.read already models it) gates the query/subscription surface once that surface itself is specified."
 
-open question "Bootstrapping: CreateRole, RevokeRole, GrantAccessToken and RevokeAccessToken (see AccessManagement) all require an existing active superadmin Role, so nothing within the spec's own rules can create the very first one. Is this an out-of-band operational step (e.g. a seed value read once at first startup, outside the GraphQL surface entirely), or does the spec need to model an explicit bootstrap exception?"
+open question "REST surface: how is an AccessToken presented on the wire (header, scheme, encoding), and is that the same mechanism as the GraphQL Role secret or a separate one? The spec deliberately keeps both abstract for now, but the two tracks could plausibly share a presentation even though they never share a credential."
+
+open question "Websocket complement to EventFetch: fetching over REST is pull-based, so a remote workflow either polls or lags. A websocket (or other push) binding authenticated by the same EventReadToken looks like the natural near-term addition, reusing Subscription/EventTypeSubscription/Filter rather than inventing a second filter model. Not specified here - open questions are whether it is the same capability under a different binding (so the same event_read_allowed opt-in and the same token) or a separately opt-in-able one, and how delivery guarantees and cursor/resume semantics differ from the pull case."
+
+open question "Bootstrapping: CreateRole, RevokeRole, GrantRoleAccessMapping and RevokeRoleAccessMapping (see AccessManagement) all require an existing active superadmin Role, so nothing within the spec's own rules can create the very first one. Is this an out-of-band operational step (e.g. a seed value read once at first startup, outside the GraphQL surface entirely), or does the spec need to model an explicit bootstrap exception?"
 
 open question "Schema versioning tracks a current schema_version counter per type, but not the historical schema text for prior versions. Do consumers reading old events need to look up the exact schema that was active for their recorded version, or is 'each version stays backwards compatible' sufficient without keeping that history?"
 
