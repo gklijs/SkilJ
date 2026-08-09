@@ -13,7 +13,10 @@
 --   updated asynchronously by default with an opt-in synchronous mode,
 --   and queried over GraphQL as richly-typed fields with an optional
 --   read-your-writes wait - raw event stream subscriptions with
---   per-field filtering,
+--   per-field filtering, gated by the same RoleAccessMapping-based read
+--   access and sensitive-field protection as querying, forward-only from
+--   an optional caller-supplied sequence so a live feed never replays
+--   history a caller is expected to have queried separately,
 --   an in-memory per-bounded-context cache of the most recent events,
 --   warmed at startup from Postgres up to a configurable count
 --   (default 1000), so recent reads need no database round trip,
@@ -44,11 +47,6 @@
 --     callers trigger commands, and to fetch events for remote
 --     workflows.
 -- Excludes:
---   - Enforcement of read-level access on the subscription path, and of
---     sensitive-field decryption there: querying projections is now
---     gated (ProjectionQuery faces ReadAccess and defers sensitive
---     values to RoleAccessMapping.can_read_sensitive), but there is
---     still no subscription surface to gate either against
 --   - Retroactive encryption of historical events when a field is newly
 --     marked sensitive: event sourcing is append-only, so this is a
 --     structural consequence, not a gap (see EventType.sensitive_fields
@@ -516,7 +514,25 @@ entity Projection {
 
 entity Subscription {
     bounded_context: BoundedContext
+    access_mapping: RoleAccessMapping      -- the caller this subscription delivers to. Who may
+                                            -- see it, and how, is resolved from this same
+                                            -- mapping on every delivery - re-checked live, the
+                                            -- same as everywhere else on the GraphQL track (see
+                                            -- the note above Actor Declarations) - so a
+                                            -- revocation mid-subscription stops delivery
+                                            -- immediately rather than at the next reconnect.
     created_at: Timestamp
+    from_sequence: Integer                 -- delivery starts strictly after this Event.sequence.
+                                            -- Fixed once at creation: the bounded context's
+                                            -- latest committed sequence at that moment by
+                                            -- default (see CreateAllEventsSubscription/
+                                            -- CreateEventTypeSubscription), or an earlier
+                                            -- caller-supplied one. Never replayed - a
+                                            -- subscription answers with fresh events going
+                                            -- forward, not history. A caller wanting current
+                                            -- state first queries it separately (FetchEvents or
+                                            -- QueryProjection) and supplies the sequence it read
+                                            -- up to here for a gap-free handoff into the live feed.
     kind: AllEventsSubscription | EventTypeSubscription
 }
 
@@ -767,6 +783,108 @@ rule QueryProjection {
         -- can_read_sensitive into it rather than post-filtering the
         -- result is deliberate - a caller without the grant is never
         -- handed a decrypted value to redact afterwards.
+}
+
+-- CreateAllEventsSubscription and CreateEventTypeSubscription register a
+-- standing Subscription; DeliverToSubscriptions below is what actually
+-- pushes events to it. Both creation rules resolve the same default: when
+-- the caller omits from_sequence, delivery starts from the bounded
+-- context's current latest committed sequence, so a freshly created
+-- subscription sees only what happens next. A caller who instead supplies
+-- from_sequence - typically the sequence it last read via FetchEvents or
+-- QueryProjection, or the point it last disconnected from a prior
+-- subscription - resumes from there with no gap and no replay of
+-- anything earlier. Neither rule requires the bounded context to be
+-- active: unlike EventFetch and QueryProjection, this is deliberate the
+-- other way - an archived context accepts no new events, so a
+-- subscription against one would be created only to sit forever unfed.
+
+rule CreateAllEventsSubscription {
+    when: CreateAllEventsSubscription(access_mapping, from_sequence?)
+    requires: access_mapping.status = active
+    requires: access_mapping.bounded_context.status = active
+
+    let starting_point =
+        from_sequence
+        ?? (Events where bounded_context = access_mapping.bounded_context).count - 1
+
+    ensures:
+        AllEventsSubscription.created(
+            bounded_context: access_mapping.bounded_context,
+            access_mapping: access_mapping,
+            created_at: now,
+            from_sequence: starting_point
+        )
+}
+
+rule CreateEventTypeSubscription {
+    when: CreateEventTypeSubscription(access_mapping, event_type, filters, from_sequence?)
+    requires: access_mapping.status = active
+    requires: access_mapping.bounded_context = event_type.bounded_context
+    requires: event_type.bounded_context.status = active
+
+    let starting_point =
+        from_sequence
+        ?? (Events where bounded_context = event_type.bounded_context).count - 1
+
+    ensures:
+        EventTypeSubscription.created(
+            bounded_context: event_type.bounded_context,
+            access_mapping: access_mapping,
+            created_at: now,
+            from_sequence: starting_point,
+            event_type: event_type,
+            filters: filters
+        )
+}
+
+-- render_event(event, access_mapping) is a black box in the same register
+-- as read_projection(projection, reveal_sensitive): this library owns who
+-- a subscription delivers to and which of its fields arrive decrypted,
+-- not how the payload is rendered into a GraphQL push. A sensitive field
+-- decrypts under either of two independent grants, checked per field
+-- against that field's own EncryptionKey.subject_value:
+--   - access_mapping.can_read_sensitive = true - the same
+--     bounded-context-wide grant read_projection already reads, or
+--   - access_mapping.role.external_subject = the field's subject_value -
+--     the caller's own verified IdP identity matches the subject the
+--     field is about, so a caller reading their own data needs no
+--     separate grant. This only fires when a bounded context tags a
+--     sensitive field's subject using the same identifier space as
+--     external_subject in the first place; where that alignment doesn't
+--     hold, this path simply never matches and can_read_sensitive remains
+--     the only way in - fails closed, not open.
+-- Every other field is left as stored ciphertext, exactly as
+-- read_projection and FetchEvents leave an unauthorised field - never
+-- decrypted and then redacted afterwards.
+--
+-- DeliverToSubscriptions runs outside the transaction that committed the
+-- triggering event, the same register as an async projection's update:
+-- best-effort, after the fact, for every still-active subscription whose
+-- from_sequence the new event is past. What "best-effort" guarantees
+-- under a dropped connection - at-least-once vs at-most-once delivery -
+-- is still open (see open questions); from_sequence is what lets a caller
+-- resume without a gap once it notices one.
+
+rule DeliverToSubscriptions {
+    when: event: Event.created
+    for subscription in Subscriptions
+            where bounded_context = event.bounded_context
+                and from_sequence < event.sequence
+                and access_mapping.status = active:
+        let matches =
+            if subscription.kind = AllEventsSubscription:
+                true
+            else:
+                subscription.event_type = event.event_type
+                    and matches_filters(event, subscription.filters)
+        ensures:
+            if matches:
+                EventDelivered(
+                    subscription: subscription,
+                    event: event,
+                    rendered_payload: render_event(event, subscription.access_mapping)
+                )
 }
 
 -- A command reaches ProcessCommand from exactly one of two callers, each
@@ -1279,6 +1397,14 @@ invariant UniqueProjectionNamePerContext {
             a != b and a.bounded_context = b.bounded_context implies a.name != b.name
 }
 
+invariant SubscriptionScopedToGrantContext {
+    -- A Subscription only ever belongs to the bounded context its own
+    -- access_mapping is granted against - the structural form of
+    -- EventSubscription's GrantScopedToBoundedContext.
+    for s in Subscriptions:
+        s.bounded_context = s.access_mapping.bounded_context
+}
+
 invariant SyncProjectionNeverLags {
     -- What Projection.sync buys, stated as a property rather than as a
     -- mechanism: once a sync projection has been updated at least once,
@@ -1404,9 +1530,7 @@ invariant UniqueActiveEncryptionKeyPerSubject {
 actor ReadAccess {
     -- Any active RoleAccessMapping authorises read: write and admin grants
     -- include read implicitly, since they can already do strictly more.
-    -- Faced by ProjectionQuery. The subscription surface, when it is
-    -- specified, is expected to face this same actor (see open
-    -- questions).
+    -- Faced by ProjectionQuery and EventSubscription.
     identified_by: RoleAccessMapping where status = active
 }
 
@@ -1616,6 +1740,58 @@ surface ProjectionQuery {
         -- sequence immediately, so the argument costs such a caller
         -- nothing. How long the wait lasts before the query fails is
         -- still open (see open questions).
+}
+
+surface EventSubscription {
+    facing access_mapping: ReadAccess
+
+    provides:
+        CreateAllEventsSubscription(access_mapping, from_sequence?)
+        CreateEventTypeSubscription(access_mapping, event_type, filters, from_sequence?)
+
+    @guarantee GrantScopedToBoundedContext
+        -- A grant only authorises subscribing within its own bounded
+        -- context - either kind - and only ever delivers events from
+        -- that context. Read level is enough; write and admin grants
+        -- include it, the same reasoning as ProjectionQuery.
+
+    @guarantee FreshEventsOnly
+        -- A subscription never replays history: delivery starts strictly
+        -- after from_sequence, fixed once at creation time (see
+        -- CreateAllEventsSubscription/CreateEventTypeSubscription and
+        -- DeliverToSubscriptions). A caller wanting current state first
+        -- queries it separately - FetchEvents or QueryProjection - and,
+        -- for a gap-free handoff into the live feed, supplies the
+        -- sequence it read up to as from_sequence here.
+
+    @guarantee SensitiveFieldsStayProtected
+        -- A sensitive field is delivered decrypted only when the
+        -- receiving access_mapping is entitled to it: either
+        -- can_read_sensitive is true on the mapping (the same
+        -- bounded-context-wide grant ProjectionQuery reads), or the
+        -- caller's own verified identity matches that field's own
+        -- subject (see render_event's note above DeliverToSubscriptions).
+        -- A caller entitled to neither still receives the event, with
+        -- that field left as ciphertext exactly as EventFetch and
+        -- ProjectionQuery leave it - never decrypted and then filtered
+        -- afterwards.
+
+    @guidance
+        -- GraphQL subscription, not a query or mutation: the real-time
+        -- counterpart to ProjectionQuery, the same way CommandSubmission
+        -- is the mutation counterpart to a query. A subscription's
+        -- lifetime is the live connection's - created when the client
+        -- issues the subscription operation, ended when it unsubscribes
+        -- or disconnects. There is no separate cancel mutation and no
+        -- state that outlives the connection beyond what from_sequence
+        -- lets a caller hand to a fresh one on reconnect.
+        --
+        -- No context clause: CreateAllEventsSubscription is scoped
+        -- entirely by access_mapping.bounded_context, and
+        -- CreateEventTypeSubscription's event_type carries its own
+        -- bounded_context, checked directly in each rule's requires -
+        -- there is no single entity both actions share the way
+        -- ProjectionQuery shares Projection.
 }
 
 surface CommandSubmission {
@@ -1847,9 +2023,11 @@ open question "How long await_projection_caught_up waits before a QueryProjectio
 
 open question "Re-registering a projection that already holds state: RegisterProjection reconciles schema, consumed_event_types and sync in place, but nothing rebuilds what was already built from the stream, and caught_up_to is left where it is. Does changing schema, or adding/dropping a consumed EventType, require a replay from the start of the bounded context's stream - and if so, what does the projection answer while it rebuilds? Flipping sync from false to true is the sharpest case: an async projection may be lagging at that moment, so SyncProjectionNeverLags is violated from the flip until it catches up. Either the flip has to catch the projection up atomically before it takes effect, or that stale-but-declared-sync window has to be accepted and named."
 
-open question "GraphQL surface: within one unified graph spanning all bounded contexts, commands become mutations and subscriptions/projections become queries/subscriptions, with names qualified by bounded context to stay unique. Write and admin mutations are gated by Role/RoleAccessMapping (see Actor Declarations and the CommandSubmission/TypeRegistration/EventTypeAdminOperations/CommandTypeAdminOperations/TokenRevocation/BoundedContextArchival/SubjectErasure/BoundedContextCreation/AccessManagement surfaces). The query half is now resolved: ProjectionQuery faces ReadAccess, so any active RoleAccessMapping on a bounded context authorises querying that context's projections and no others, with sensitive values gated by can_read_sensitive on that same mapping. Still open: the subscription half. Nothing here faces the Subscription/EventTypeSubscription entities yet, so there is no surface on which read-level access, sensitive-field protection or per-field filtering are gated for real-time delivery - see the scope header's exclusions and the websocket open question below. (Caller identity is resolved: a JWT from a trusted external IdP, verified and resolved to a Role via Role.external_subject - see the identity resolution note above entity Role.)"
+open question "Websocket complement to EventFetch: fetching over REST is pull-based, so a remote workflow either polls or lags. Resolved: it is the same capability under a different binding - the same EventReadToken and the same EventType.event_read_allowed opt-in, presented via an Authorization header at the connection handshake (the audience is server-side remote workflows, not browser JS, so header-based auth at handshake is viable), and reusing Subscription/EventTypeSubscription/Filter rather than a second filter model. Still open: delivery guarantees (at-least-once vs at-most-once, and what happens to events produced while a connection is down) and cursor/resume semantics for the push case - note that the GraphQL subscription surface (EventSubscription) resolves the cursor/resume half for its own track via from_sequence; this REST/token track has not adopted the same answer yet."
 
-open question "Websocket complement to EventFetch: fetching over REST is pull-based, so a remote workflow either polls or lags. Resolved: it is the same capability under a different binding - the same EventReadToken and the same EventType.event_read_allowed opt-in, presented via an Authorization header at the connection handshake (the audience is server-side remote workflows, not browser JS, so header-based auth at handshake is viable), and reusing Subscription/EventTypeSubscription/Filter rather than a second filter model. Still open: delivery guarantees (at-least-once vs at-most-once, and what happens to events produced while a connection is down) and cursor/resume semantics for the push case."
+open question "EventSubscription's delivery guarantees during a dropped GraphQL connection: from_sequence gives a reconnecting caller a resume point, but nothing here specifies at-least-once vs at-most-once delivery while connected, or whether the client is expected to detect a gap itself (e.g. via a monotonic sequence check) and resume with a fresh from_sequence, or whether that detection is the library's job too."
+
+open question "Self-subject sensitive-field access - a caller decrypting their own data because their verified identity matches a field's subject, introduced for EventSubscription's render_event - has no counterpart on ProjectionQuery or EventFetch, which still gate decryption on can_read_sensitive alone. Should the same self-access path apply uniformly across all three reads, or is real-time delivery a deliberately narrower case?"
 
 open question "Bootstrapping the first superadmin Role is resolved in principle - an out-of-band seed/migration step at first deployment inserts a Role row directly with superadmin = true and external_subject set to the initial admin's IdP identity, bypassing the GraphQL surface and CreateRole's superadmin-caller requirement (see the note above CreateRole). What remains open is how and where that step is triggered: a migration run by the library, a CLI subcommand, a configuration value read once at first startup, or left entirely to the consuming application's own deployment process."
 
