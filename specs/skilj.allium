@@ -536,7 +536,17 @@ entity Subscription {
     kind: AllEventsSubscription | EventTypeSubscription
 }
 
-variant AllEventsSubscription : Subscription {}
+variant AllEventsSubscription : Subscription {
+    event_types: Set<EventType>    -- restricts delivery to these event types; empty means every
+                                    -- event type in the bounded context, the same "empty means
+                                    -- unfiltered" convention as EventTypeSubscription.filters.
+                                    -- No per-field filtering here, unlike EventTypeSubscription:
+                                    -- a Filter's field is only unambiguous within one event
+                                    -- type's schema, and this variant deliberately spans every
+                                    -- type in the bounded context, each with its own schema. A
+                                    -- caller wanting field-level filtering opens an
+                                    -- EventTypeSubscription per type of interest instead.
+}
 
 variant EventTypeSubscription : Subscription {
     event_type: EventType
@@ -634,9 +644,13 @@ default BoundedContext admin = { name: "admin", status: active }
 -- await_projection_caught_up(projection, sequence), used by
 -- QueryProjection below, is the reader-side counterpart: it blocks until
 -- projection.caught_up_to reaches sequence and reports whether it got
--- there, up to an implementation-defined timeout - the same black-box
--- register as the Postgres row lock above, and open in the same way (see
--- open questions on the wait timeout). A sync projection satisfies it
+-- there, up to a wait bound. Resolved: that bound is a process-start
+-- runtime/library configuration knob, the same register as the event
+-- cache's warm-up count and the external IdP's trust configuration (see
+-- the scope header) - not a per-query argument (that would grow the
+-- wire contract this spec deliberately leaves deferred) and not a fixed
+-- value baked into the library (an operator can tune how long a caller
+-- waits without a code change). A sync projection satisfies it
 -- immediately and always, by construction.
 
 rule CreateExternalEvent {
@@ -704,8 +718,21 @@ rule CreateDirectEvent {
 -- Filter shape an EventTypeSubscription declares, so narrowing a fetch
 -- and narrowing a subscription look the same to a caller. The detailed
 -- query/filter wire contract, including paging, is still open (see the
--- filter-validation open question, and the wire-contract exclusion in the
--- scope header).
+-- wire-contract exclusion in the scope header).
+--
+-- valid_filters(event_type, filters) is a black box in the same register
+-- as matches_filters itself: this library owns that a filter is rejected
+-- outright rather than silently matching nothing (or everything) when it
+-- doesn't make sense, not the exact matrix of which FilterOperator
+-- applies to which JSON Schema type. It checks two things per filter -
+-- that field names a field event_type.schema actually declares, and that
+-- operator is one that field's declared type supports (e.g. greater_than
+-- against a string-typed field is invalid, not merely always-false).
+-- Checked once, at the point filters are supplied: registration time for
+-- an EventTypeSubscription (see CreateEventTypeSubscription), call time
+-- for FetchEvents, since it has no persisted filter to register ahead of
+-- one. A subscription or fetch with an invalid filter is rejected rather
+-- than silently created or answered with results nobody asked for.
 --
 -- Unlike the write rules, this deliberately does not require the bounded
 -- context to be active: archiving stops new commands and events, but
@@ -724,6 +751,7 @@ rule FetchEvents {
     requires: token.status = active
     requires: token.event_type = read_type
     requires: read_type.event_read_allowed = true
+    requires: valid_filters(read_type, filters)
 
     let candidates =
         Events where bounded_context = read_type.bounded_context
@@ -761,9 +789,15 @@ rule QueryProjection {
     requires: access_mapping.bounded_context = projection.bounded_context
 
     -- Blocks until the projection has caught up, and fails the query if
-    -- it does not within the implementation-defined wait - see the
+    -- it does not within the configured wait - see the
     -- await_projection_caught_up note above the rules. Vacuously true
-    -- when the caller asked for no particular position.
+    -- when the caller asked for no particular position. Resolved: this
+    -- rejection is reported as a timeout specifically, distinguishable
+    -- from one caused by e.g. a revoked grant or the wrong bounded
+    -- context (see ReadYourWritesWhenRequested), the same way
+    -- CommandDecision.rejection_reason is surfaced verbatim rather than
+    -- left generic - so a caller can tell "retry" from "permanently
+    -- invalid".
     requires:
         wait_for_sequence = null
         or await_projection_caught_up(projection, wait_for_sequence)
@@ -798,11 +832,20 @@ rule QueryProjection {
 -- active: unlike EventFetch and QueryProjection, this is deliberate the
 -- other way - an archived context accepts no new events, so a
 -- subscription against one would be created only to sit forever unfed.
+-- CreateEventTypeSubscription rejects an invalid filter up front via
+-- valid_filters, the same check and the same reasoning as FetchEvents -
+-- see the note above it.
 
 rule CreateAllEventsSubscription {
-    when: CreateAllEventsSubscription(access_mapping, from_sequence?)
+    when: CreateAllEventsSubscription(access_mapping, event_types, from_sequence?)
     requires: access_mapping.status = active
     requires: access_mapping.bounded_context.status = active
+
+    -- Every named event type must belong to the same bounded context as
+    -- the grant - the same check and the same reasoning as
+    -- RegisterProjection's consumed_event_types. An empty set is not a
+    -- vacuous case of this: it is the "no restriction" state itself.
+    requires: event_types.all(et => et.bounded_context = access_mapping.bounded_context)
 
     let starting_point =
         from_sequence
@@ -813,7 +856,8 @@ rule CreateAllEventsSubscription {
             bounded_context: access_mapping.bounded_context,
             access_mapping: access_mapping,
             created_at: now,
-            from_sequence: starting_point
+            from_sequence: starting_point,
+            event_types: event_types
         )
 }
 
@@ -822,6 +866,7 @@ rule CreateEventTypeSubscription {
     requires: access_mapping.status = active
     requires: access_mapping.bounded_context = event_type.bounded_context
     requires: event_type.bounded_context.status = active
+    requires: valid_filters(event_type, filters)
 
     let starting_point =
         from_sequence
@@ -874,7 +919,8 @@ rule DeliverToSubscriptions {
                 and access_mapping.status = active:
         let matches =
             if subscription.kind = AllEventsSubscription:
-                true
+                subscription.event_types.count = 0
+                    or event.event_type in subscription.event_types
             else:
                 subscription.event_type = event.event_type
                     and matches_filters(event, subscription.filters)
@@ -1661,10 +1707,12 @@ surface EventFetch {
         -- REST only, with the token presented as
         -- "Authorization: Bearer <id>.<secret>" - see the note above the
         -- surfaces. Deliberately coarse otherwise: this establishes the
-        -- capability and its scoping, not the query wire contract. Paging,
-        -- cursor encoding and which filter operators are valid for which
-        -- schema field are all still open (see open questions), as is the
-        -- real-time websocket complement to this pull-based fetch.
+        -- capability and its scoping, not the query wire contract. Paging
+        -- and cursor encoding are still open (see open questions), as is
+        -- the real-time websocket complement to this pull-based fetch. A
+        -- filter whose operator doesn't fit its field's declared type is
+        -- rejected outright, not merely unsatisfiable - see valid_filters
+        -- in the note above rule FetchEvents.
         --
         -- This is the read the per-bounded-context in-memory event cache
         -- is primarily there for (see the note above the rules): its
@@ -1711,7 +1759,11 @@ surface ProjectionQuery {
         -- sequence and answers, or the query fails. It is never silently
         -- answered from a stale position. A query naming no sequence
         -- makes no such promise and answers from wherever the projection
-        -- currently is.
+        -- currently is. A failure here is reported as a timeout
+        -- specifically - distinguishable from any other rejection this
+        -- surface can produce - so a caller knows to retry rather than
+        -- treat it as permanent (see the requires clause in
+        -- QueryProjection).
 
     @guidance
         -- GraphQL only: a query, qualified by bounded context per the
@@ -1746,7 +1798,7 @@ surface EventSubscription {
     facing access_mapping: ReadAccess
 
     provides:
-        CreateAllEventsSubscription(access_mapping, from_sequence?)
+        CreateAllEventsSubscription(access_mapping, event_types, from_sequence?)
         CreateEventTypeSubscription(access_mapping, event_type, filters, from_sequence?)
 
     @guarantee GrantScopedToBoundedContext
@@ -1785,6 +1837,13 @@ surface EventSubscription {
         -- or disconnects. There is no separate cancel mutation and no
         -- state that outlives the connection beyond what from_sequence
         -- lets a caller hand to a fresh one on reconnect.
+        --
+        -- AllEventsSubscription.event_types narrows which event types are
+        -- delivered (empty means every type in the bounded context) but
+        -- offers no per-field filtering the way EventTypeSubscription
+        -- does - see the note on that field. A caller wanting field-level
+        -- filtering across several types opens one EventTypeSubscription
+        -- per type instead of a single AllEventsSubscription.
         --
         -- No context clause: CreateAllEventsSubscription is scoped
         -- entirely by access_mapping.bounded_context, and
@@ -2015,11 +2074,11 @@ surface AccessManagement {
 
 open question "External event context: how much source-specific metadata should be persisted, and does the shape vary per source type (e.g. Kafka vs webhook)?"
 
-open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). This isn't structurally enforced here - is that validation done at subscription-registration time, or at query time?"
+open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). Resolved: a new black box, valid_filters(event_type, filters), rejects a filter whose field doesn't exist or whose operator doesn't fit that field's declared type - checked at registration time for CreateEventTypeSubscription and at call time for FetchEvents (see the note above rule FetchEvents). What's still open is the exact type-to-operator matrix itself, which the black box owns rather than this spec - and whether the same field-exists check should apply to TagMapping.field and SensitiveField.field/subject_field, which have the identical gap unaddressed (see that open question below)."
 
-open question "The all-events subscription per bounded context has 'limited to no filtering' - what, if anything, can it filter on (e.g. event type name only), versus the full per-field filtering on EventTypeSubscription?"
+open question "The all-events subscription per bounded context has 'limited to no filtering' - what, if anything, can it filter on (e.g. event type name only), versus the full per-field filtering on EventTypeSubscription? Resolved: AllEventsSubscription gained event_types (empty means every type; non-empty restricts delivery to those types), but still no per-field Filter - a Filter.field is only unambiguous within one event type's schema, and this variant deliberately spans every type's schema in the bounded context. A caller wanting field-level filtering across several types opens one EventTypeSubscription per type instead (see the variant's own field comment and CreateAllEventsSubscription)."
 
-open question "How long await_projection_caught_up waits before a QueryProjection carrying a wait_for_sequence gives up is implementation-defined here, and its shape is open with it: is the bound a library/runtime configuration knob set at process start (the same register as the event cache's warm-up count), a per-query argument the caller chooses, or a fixed value? A timing-out query is rejected rather than answered stale (see QueryProjection's requires and its ReadYourWritesWhenRequested guarantee), but what the caller is told - specifically, whether 'the projection did not catch up in time' is distinguishable from any other rejection, so a caller can retry rather than treat it as a permanent failure - is not settled."
+open question "How long await_projection_caught_up waits before a QueryProjection carrying a wait_for_sequence gives up is implementation-defined here. Resolved: the bound is a process-start runtime/library configuration knob, the same register as the event cache's warm-up count - not a per-query argument (would grow the deferred wire contract) and not fixed (an operator can tune it without a code change). Also resolved: a timing-out query's rejection is reported distinguishably from any other rejection this surface can produce (see QueryProjection's requires and its ReadYourWritesWhenRequested guarantee), so a caller can tell 'retry' from 'permanently invalid' - the same treatment CommandDecision.rejection_reason already gets. The exact GraphQL error shape that carries that distinction stays deferred with the rest of the wire contract (see the scope header's exclusions)."
 
 open question "Re-registering a projection that already holds state: RegisterProjection reconciles schema, consumed_event_types and sync in place, but nothing rebuilds what was already built from the stream, and caught_up_to is left where it is. Does changing schema, or adding/dropping a consumed EventType, require a replay from the start of the bounded context's stream - and if so, what does the projection answer while it rebuilds? Flipping sync from false to true is the sharpest case: an async projection may be lagging at that moment, so SyncProjectionNeverLags is violated from the flip until it catches up. Either the flip has to catch the projection up atomically before it takes effect, or that stale-but-declared-sync window has to be accepted and named."
 
@@ -2037,7 +2096,7 @@ open question "decide() and CommandDecision are the plugged-in, bounded-context-
 
 open question "Tag keys declared via tag_mappings are plain strings with no namespace - could two unrelated bounded contexts collide on the same key (e.g. both using \"account\")? (Sequence scope is resolved: per bounded context, gapless. Serialisation mechanism is resolved: a Postgres row lock per bounded context, not application-level coordination.)"
 
-open question "derive_tags(event_type, payload) is a black box: does TagMapping.field validate against event_type.schema at registration time (so a mapping can't reference a field that doesn't exist), or is that left unchecked since schema is just an opaque JSON Schema string to the spec? The same question applies to SensitiveField.field and SensitiveField.subject_field."
+open question "derive_tags(event_type, payload) is a black box: does TagMapping.field validate against event_type.schema at registration time (so a mapping can't reference a field that doesn't exist), or is that left unchecked since schema is just an opaque JSON Schema string to the spec? The same question applies to SensitiveField.field and SensitiveField.subject_field. Filter.field just gained exactly this check, via valid_filters (see the filter-operator open question above) - the same field-exists validation, at the same registration-time-or-call-time granularity, would resolve this one too if applied here."
 
 open question "Are there cases where a consistency boundary needs 'all events of a specific EventType' with no field-level tag at all, rather than a key/value tag? Raised as a possible exception but not confirmed as a real requirement."
 
