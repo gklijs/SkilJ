@@ -20,9 +20,13 @@
 --   an in-memory per-bounded-context cache of the most recent events,
 --   warmed at startup from Postgres up to a configurable count
 --   (default 1000), so recent reads need no database round trip,
---   per-field sensitivity marking on events with crypto-shredding for
---   erasure (SensitiveField, EncryptionKey, right-to-be-forgotten via
---   ForgetSubject), and two independent authentication tracks:
+--   per-field sensitivity marking on events and commands alike - both
+--   resolving to the same per-subject EncryptionKey, so crypto-shredding
+--   erases both at once (SensitiveField, EncryptionKey,
+--   right-to-be-forgotten via ForgetSubject) - admin-facing retrieval of
+--   stored commands, by command type, by time window, or by the event a
+--   command produced (CommandQuery), and two independent authentication
+--   tracks:
 --   - GraphQL: identity is delegated to a trusted external identity
 --     provider. A caller presents a JWT the IdP issued; SkilJ verifies
 --     that JWT's signature against the IdP's JWKS (a black box here,
@@ -47,10 +51,12 @@
 --     callers trigger commands, and to fetch events for remote
 --     workflows.
 -- Excludes:
---   - Retroactive encryption of historical events when a field is newly
---     marked sensitive: event sourcing is append-only, so this is a
+--   - Retroactive encryption of historical events and commands when a
+--     field is newly marked sensitive: event sourcing is append-only and
+--     a stored command is never rewritten either, so this is a
 --     structural consequence, not a gap (see EventType.sensitive_fields
---     and Event.encryption_keys)
+--     with Event.encryption_keys, and CommandType.sensitive_fields with
+--     Command.encryption_keys)
 --   - The encryption scheme itself (algorithm, key derivation, physical
 --     key storage) - protect_sensitive_fields is a black box, consistent
 --     with how AccessToken.secret generation and JWT signature
@@ -114,6 +120,36 @@ value CommandDecision {
                                   -- as the GraphQL error message when accepted = false. Producing a
                                   -- meaningful message here is the decider's responsibility - it
                                   -- needs domain knowledge this library doesn't have.
+    rejection_kind: String?      -- machine-readable label for what kind of rejection this is, set by
+                                  -- the decider alongside rejection_reason and, like it, effectively
+                                  -- required whenever accepted = false (and ignored otherwise, the
+                                  -- same as events). It exists because a caller - typically a UI
+                                  -- reached over GraphQL - needs to branch on the kind of rejection
+                                  -- programmatically, e.g. to decide whether to offer a retry, and
+                                  -- must not have to parse the free-text English of rejection_reason
+                                  -- to do it. A command that would push an account balance below zero
+                                  -- is a business-rule rejection a decider might tag
+                                  -- "insufficient_balance", distinct in kind from some other
+                                  -- rejection the same decider can produce, even though both arrive
+                                  -- as a plain message today.
+                                  --
+                                  -- Deliberately an opaque String rather than an enum declared here,
+                                  -- the same treatment EventType.schema, CommandType.schema and
+                                  -- rejection_reason already get. The possible kinds are genuinely
+                                  -- per-bounded-context: different deciders, different domains,
+                                  -- different error taxonomies. A fixed closed set in this file would
+                                  -- force every bounded context this library hosts - unrelated
+                                  -- domains, by design - into one shared error vocabulary, which is
+                                  -- exactly the business knowledge the library does not have. Which
+                                  -- values exist, and how stable they are, is each bounded context's
+                                  -- own contract with its own callers.
+                                  --
+                                  -- Like rejection_reason it surfaces at the GraphQL boundary when a
+                                  -- command is rejected, alongside the message rather than instead of
+                                  -- it (an error extension/code being the obvious carrier). The exact
+                                  -- wire shape stays deferred with the rest of the wire contract -
+                                  -- see the scope header's exclusions, and the same framing above
+                                  -- rule QueryProjection.
 }
 
 value SensitiveField {
@@ -176,6 +212,19 @@ entity CommandType {
     -- consistency_tags from its own payload, using the same shared keys
     -- events are tagged with, so the two are directly comparable.
     tag_mappings: Set<TagMapping>
+
+    -- Opt-in, in the same shape as EventType.sensitive_fields and using
+    -- the identical SensitiveField convention, so a subject named by a
+    -- command resolves to the very same EncryptionKey an event naming it
+    -- resolves to (see EncryptionKey and the protect_sensitive_fields
+    -- note above the rules). A command's payload is stored permanently
+    -- too, and CommandQuery reads it back. Adding an entry here only
+    -- affects commands submitted from this point forward - it does not
+    -- retroactively encrypt this type's existing history, since a stored
+    -- command is never rewritten. See Command.encryption_keys to tell
+    -- which historical commands predate a given entry (and so still hold
+    -- that field in plaintext).
+    sensitive_fields: Set<SensitiveField>
 
     -- Opt-in, mirroring EventType.external_creation_allowed: submitting
     -- this command over GraphQL with a write-level RoleAccessMapping is
@@ -415,6 +464,15 @@ entity Command {
                                             -- RoleAccessMapping over GraphQL (see CommandSubmission),
                                             -- or the id of the CommandToken over REST (see
                                             -- CommandTrigger)
+    encryption_keys: Set<EncryptionKey>    -- captured at creation time, exactly as
+                                            -- Event.encryption_keys is: one key per distinct
+                                            -- subject a sensitive field referenced at that
+                                            -- moment. Empty if command_type declared no
+                                            -- sensitive fields when this command was
+                                            -- submitted - such a command holds those fields in
+                                            -- plaintext, even if sensitive_fields later gains
+                                            -- an entry for them (see
+                                            -- CommandType.sensitive_fields)
 
     -- Dynamic consistency boundary: the tags this command's decision was
     -- based on, and the highest Event.sequence observed among events
@@ -578,20 +636,41 @@ default BoundedContext admin = { name: "admin", status: active }
 -- final re-check and insert need the lock; reading matching events and
 -- running decide() beforehand does not.
 --
--- protect_sensitive_fields(event_type, payload), used in the same three
--- rules, follows a similar pattern: it get-or-creates the EncryptionKey
--- for each subject a sensitive field in event_type.sensitive_fields
--- references (each key provisioned exactly once, in the same
--- transaction as the event's own insert), then returns the payload with
--- those fields' values replaced by ciphertext plus the keys used. A
--- no-op - unchanged payload, empty key set - when sensitive_fields is
--- empty. Unlike next_sequence's target, EncryptionKey is a real,
--- rule-governed entity (see its transitions and ForgetSubject below);
--- this call only ever provisions - destruction is always a separate,
--- explicitly authorised action. It may be called more than once for the
--- same event_type/payload within one rule execution (see ProcessCommand)
--- and is idempotent when it is: repeat calls find the key already
--- provisioned rather than creating another one.
+-- protect_sensitive_fields(type, payload), used in the same three rules
+-- and, for the command's own payload, in ProcessCommand, follows a
+-- similar pattern: it get-or-creates the EncryptionKey for each subject
+-- a sensitive field in type.sensitive_fields references (each key
+-- provisioned exactly once, in the same transaction as the event's or
+-- command's own insert), then returns the payload with those fields'
+-- values replaced by ciphertext plus the keys used. A no-op - unchanged
+-- payload, empty key set - when sensitive_fields is empty. Unlike
+-- next_sequence's target, EncryptionKey is a real, rule-governed entity
+-- (see its transitions and ForgetSubject below); this call only ever
+-- provisions - destruction is always a separate, explicitly authorised
+-- action. It may be called more than once for the same type/payload
+-- within one rule execution (see ProcessCommand) and is idempotent when
+-- it is: repeat calls find the key already provisioned rather than
+-- creating another one.
+--
+-- It takes an EventType and a CommandType interchangeably, and that is
+-- load-bearing rather than convenient. Sensitivity is declared
+-- identically on both (EventType.sensitive_fields and
+-- CommandType.sensitive_fields are the same Set<SensitiveField>, with
+-- the same subject_key/subject_field convention), and an EncryptionKey
+-- is identified by bounded_context, subject_key and subject_value alone
+-- - never by which type declared the field. A command and an event
+-- naming the same subject within one bounded context therefore encrypt
+-- under the very same key. That is what makes erasure whole with no
+-- erasure-side change at all: ForgetSubject destroys one key, and every
+-- payload ciphertext written under it - command payloads and event
+-- payloads alike - becomes permanently unreadable at once. Unreadable to
+-- everyone, including a superadmin and including anyone reading the
+-- Postgres rows directly, because the plaintext was never stored in the
+-- first place. Neither ForgetSubject nor the SubjectErasure surface needs
+-- to know that commands exist. (One caveat, tracked as its own open
+-- question: a tag whose TagMapping reads a field that is also marked
+-- sensitive is stored as plaintext in Event.tags/Command.consistency_tags
+-- and is not covered by the key's destruction.)
 --
 -- Reading events - the Events collections read by FetchEvents and
 -- ProcessCommand below - is served by an in-memory cache of the most
@@ -806,17 +885,26 @@ rule QueryProjection {
         ProjectionDelivered(
             access_mapping: access_mapping,
             projection: projection,
-            result: read_projection(projection, access_mapping.can_read_sensitive)
+            result: read_projection(projection, access_mapping)
         )
 
     @guidance
-        -- read_projection(projection, reveal_sensitive) is a black box in
+        -- read_projection(projection, access_mapping) is a black box in
         -- the same register as decide() and project(): this library owns
         -- who may read a projection and at what position, not how the
-        -- projection's own stored state answers a query. Passing
-        -- can_read_sensitive into it rather than post-filtering the
-        -- result is deliberate - a caller without the grant is never
-        -- handed a decrypted value to redact afterwards.
+        -- projection's own stored state answers a query. It takes the
+        -- whole grant rather than a single boolean because a sensitive
+        -- field decrypts under either of two independent grants, decided
+        -- per field: access_mapping.can_read_sensitive = true, or
+        -- access_mapping.role.external_subject matching that field's own
+        -- EncryptionKey.subject_value - the caller's verified IdP
+        -- identity is the subject the field is about. That is the same
+        -- two-grant test render_event applies to a subscription push;
+        -- see the note above DeliverToSubscriptions for why the
+        -- self-subject half fails closed. Deciding inside the black box
+        -- rather than post-filtering the result is deliberate - a caller
+        -- with neither grant is never handed a decrypted value to redact
+        -- afterwards.
 }
 
 -- CreateAllEventsSubscription and CreateEventTypeSubscription register a
@@ -884,13 +972,13 @@ rule CreateEventTypeSubscription {
 }
 
 -- render_event(event, access_mapping) is a black box in the same register
--- as read_projection(projection, reveal_sensitive): this library owns who
+-- as read_projection(projection, access_mapping): this library owns who
 -- a subscription delivers to and which of its fields arrive decrypted,
 -- not how the payload is rendered into a GraphQL push. A sensitive field
 -- decrypts under either of two independent grants, checked per field
 -- against that field's own EncryptionKey.subject_value:
 --   - access_mapping.can_read_sensitive = true - the same
---     bounded-context-wide grant read_projection already reads, or
+--     bounded-context-wide grant read_projection applies too, or
 --   - access_mapping.role.external_subject = the field's subject_value -
 --     the caller's own verified IdP identity matches the subject the
 --     field is about, so a caller reading their own data needs no
@@ -902,6 +990,14 @@ rule CreateEventTypeSubscription {
 -- Every other field is left as stored ciphertext, exactly as
 -- read_projection and FetchEvents leave an unauthorised field - never
 -- decrypted and then redacted afterwards.
+--
+-- Both grants are the GraphQL track's, and the self-subject one is so
+-- structurally: FetchEvents authenticates an EventReadToken, a bearer
+-- credential scoped to an EventType and tied to no Role, so there is no
+-- verified caller identity to compare a field's subject_value against.
+-- REST reading only ciphertext is a consequence of that token model
+-- rather than a gap left open - see EventFetch's
+-- SensitiveFieldsStayEncrypted.
 --
 -- DeliverToSubscriptions runs outside the transaction that committed the
 -- triggering event, the same register as an async projection's update:
@@ -989,8 +1085,35 @@ rule ProcessCommand {
     -- Postgres locking note above the rules), so decide() always sees
     -- complete, current data for its tags - there is no separate staler
     -- state to reconcile against.
+    --
+    -- Its contract is the whole of CommandDecision: on acceptance, the
+    -- events to append; on rejection, both rejection_reason (the
+    -- human-readable explanation) and rejection_kind (the machine-readable
+    -- label a caller branches on) - see CommandDecision for why the latter
+    -- stays an opaque String rather than an enum this library enumerates.
+    --
+    -- Resolved: that plugin boundary stays a prose contract here, not a
+    -- formally specified interface. Whether the implementation expresses
+    -- decide() as a Rust trait each bounded context implements, as a
+    -- closure registered per command type, or as something else again, is
+    -- a language and tooling concern this spec deliberately does not reach
+    -- into - the same register in which it never says how
+    -- protect_sensitive_fields encrypts, or how next_sequence takes its
+    -- Postgres lock. Every other black box in this file (project(),
+    -- read_projection, render_event, render_command, derive_tags, valid_filters,
+    -- valid_tag_mappings, valid_sensitive_fields, next_sequence,
+    -- generate_token_secret) is documented exactly this way; decide() is
+    -- not special enough to earn a different treatment.
     let decision = decide(command_type, payload, matching_events)
     requires: decision.accepted = true
+
+    -- The command's own payload is protected on the way into storage,
+    -- exactly as an event's is, and under the same per-subject keys - see
+    -- the protect_sensitive_fields note above the rules. Deliberately
+    -- after decide(): the decider is handed the payload as submitted,
+    -- since it needs the plaintext to decide with; only what is stored is
+    -- ciphertext.
+    let protected = protect_sensitive_fields(command_type, payload)
 
     -- Every sync projection consuming one of the event types created
     -- below is updated in this same transaction, alongside the command
@@ -999,13 +1122,14 @@ rule ProcessCommand {
         let command = Command.created(
             bounded_context: command_type.bounded_context,
             command_type: command_type,
-            payload: payload,
+            payload: protected.payload,
             metadata: {
                 type: command_type.name,
                 version: command_type.schema_version,
                 client_id: client_id,
                 created_at: now
             },
+            encryption_keys: protected.encryption_keys,
             consistency_tags: consistency_tags,
             consistency_boundary: boundary
         )
@@ -1044,6 +1168,90 @@ rule ProcessCommand {
         -- under-lock step reads only what arrived after boundary. This
         -- changes nothing about what matching_events contains - a boundary
         -- reaching past the cached window is completed from Postgres.
+}
+
+-- The command-side read, and the only one there is: CommandSubmission
+-- and CommandTrigger only submit, and a Projection is built from
+-- EventTypes alone, so before this nothing anywhere read a stored
+-- Command.payload back. Admin-level rather than read-level deliberately.
+-- A command payload is one caller's own input as it was submitted, not a
+-- curated view of it the way a projection is, so reading other callers'
+-- commands is an operator and audit capability rather than part of
+-- ordinary reading - which is why this faces AdminAccess, the same actor
+-- SubjectErasure and TypeRegistration face.
+--
+-- It answers two shapes of question with one rule: "which commands of
+-- this type were submitted in this window" (command_types, plus the
+-- optional after/before bounds on metadata.created_at - both inclusive,
+-- and each omittable independently of the other), and "which command
+-- produced this event" (triggered_event, the reverse of
+-- CommandTriggered.command). triggered_event is a CommandTriggered
+-- specifically rather than any Event: a command-triggered event is the
+-- only kind that has a command behind it at all, and belonging to some
+-- command's triggered_events is exactly what makes it one.
+--
+-- Every filter narrows and none overrides another. Supplying
+-- triggered_event alongside a command_types or time filter its command
+-- does not satisfy yields nothing, rather than the command anyway: a
+-- caller stating two conditions gets what meets both, and is never
+-- handed a result contradicting a filter it supplied itself. That
+-- uniform conjunction is also what keeps an empty command_types set
+-- meaning "no restriction" rather than "no results" - not a vacuous case
+-- but the unrestricted state itself, exactly as
+-- AllEventsSubscription.event_types is.
+--
+-- Like FetchEvents and QueryProjection, this deliberately does not
+-- require the bounded context to be active: archiving stops new commands,
+-- and reading the ones submitted before that is the point.
+
+rule FetchCommands {
+    when: FetchCommands(access_mapping, command_types, after?, before?, triggered_event?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+
+    -- Every named command type must belong to the same bounded context as
+    -- the grant - the same check and the same reasoning as
+    -- CreateAllEventsSubscription's event_types.
+    requires: command_types.all(ct => ct.bounded_context = access_mapping.bounded_context)
+
+    -- And the same scoping for the reverse lookup: an event from another
+    -- bounded context is not a way into that context's commands.
+    requires:
+        triggered_event = null
+        or triggered_event?.bounded_context = access_mapping.bounded_context
+
+    let candidates =
+        Commands where bounded_context = access_mapping.bounded_context
+            and (command_types.count = 0 or command_type in command_types)
+            and (after = null or metadata.created_at >= after)
+            and (before = null or metadata.created_at <= before)
+            and (triggered_event = null or triggered_event in triggered_events)
+
+    ensures:
+        CommandsDelivered(
+            access_mapping: access_mapping,
+            commands: map(candidates, c => render_command(c, access_mapping))
+        )
+
+    @guidance
+        -- render_command(command, access_mapping) is a black box in the
+        -- same register as read_projection and render_event, and applies
+        -- the identical two-grant test per sensitive field - see
+        -- render_event's note above DeliverToSubscriptions for the full
+        -- explanation rather than a second copy of it here. In short: a
+        -- field decrypts when access_mapping.can_read_sensitive is true,
+        -- or when access_mapping.role.external_subject matches that
+        -- field's own EncryptionKey.subject_value; every other field is
+        -- left as stored ciphertext, never decrypted and then redacted
+        -- afterwards. An admin grant on its own is not a sensitive-data
+        -- grant here any more than it is on a projection:
+        -- can_read_sensitive is orthogonal to level (see
+        -- RoleAccessMapping).
+        --
+        -- map(candidates, ...) is the same collection-combinator register
+        -- as filter(candidates, ...) in FetchEvents: the library owns
+        -- which commands are delivered and which of their fields arrive
+        -- decrypted, not how a stored command is rendered onto the wire.
 }
 
 -- The nine rules below are the admin bounded context's operations. In
@@ -1091,6 +1299,30 @@ rule ArchiveBoundedContext {
 -- to the given values without a version bump - they don't affect how a
 -- stored payload is interpreted.
 --
+-- valid_tag_mappings(schema, tag_mappings) and
+-- valid_sensitive_fields(schema, sensitive_fields) are black boxes in the
+-- same register as valid_filters (see the note above rule FetchEvents):
+-- this library owns that a mapping naming a field that doesn't exist is
+-- rejected outright, rather than silently deriving no tag or protecting
+-- nothing, not how a JSON Schema is walked to answer the question. They
+-- check field existence and nothing else - valid_tag_mappings that every
+-- TagMapping.field is a field schema declares, valid_sensitive_fields the
+-- same for every SensitiveField.field and SensitiveField.subject_field.
+-- There is no FilterOperator-style type-matching concern here: a tag
+-- mapping or a sensitive field reads a value, it never compares one, so
+-- the field's declared type has no bearing on whether the mapping makes
+-- sense.
+--
+-- Both validate against the schema submitted in the same call, not the
+-- registered type's current one, so a registration that changes schema
+-- and tag_mappings together is checked against the shape it is moving to
+-- rather than the one it is leaving. Unlike filters, these are only ever
+-- checked at registration time: tag_mappings and sensitive_fields exist
+-- solely as registered state on an EventType or CommandType and are never
+-- supplied ad hoc by a caller, so there is no call-time counterpart. A
+-- registration whose tag_mappings or sensitive_fields fail the check is
+-- rejected outright, exactly as an invalid filter is.
+--
 -- All three are gated by an admin-level RoleAccessMapping for the target
 -- bounded context, the same as the rules above. A RoleAccessMapping scoped
 -- to the admin bounded context itself deliberately gains no new meaning
@@ -1111,6 +1343,8 @@ rule RegisterEventType {
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+    requires: valid_tag_mappings(schema, tag_mappings)
+    requires: valid_sensitive_fields(schema, sensitive_fields)
 
     let existing = EventType{bounded_context: bounded_context, name: name}
 
@@ -1156,11 +1390,13 @@ rule RegisterEventType {
 
 rule RegisterCommandType {
     when: RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
-        rest_trigger_allowed)
+        sensitive_fields, rest_trigger_allowed)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+    requires: valid_tag_mappings(schema, tag_mappings)
+    requires: valid_sensitive_fields(schema, sensitive_fields)
 
     let existing = CommandType{bounded_context: bounded_context, name: name}
 
@@ -1179,6 +1415,7 @@ rule RegisterCommandType {
             existing.schema_version =
                 if schema_changed: existing.schema_version + 1 else: existing.schema_version
             existing.tag_mappings = tag_mappings
+            existing.sensitive_fields = sensitive_fields
             existing.rest_trigger_allowed = rest_trigger_allowed
         else:
             CommandType.created(
@@ -1187,6 +1424,7 @@ rule RegisterCommandType {
                 schema: schema,
                 schema_version: 1,
                 tag_mappings: tag_mappings,
+                sensitive_fields: sensitive_fields,
                 rest_trigger_allowed: rest_trigger_allowed
             )
 }
@@ -1690,10 +1928,14 @@ surface EventFetch {
 
     @guarantee SensitiveFieldsStayEncrypted
         -- Sensitive fields are delivered as stored, which is to say as
-        -- ciphertext. Decryption is gated by
-        -- RoleAccessMapping.can_read_sensitive, which belongs to the
-        -- GraphQL track; a bearer token carries no such grant and so
-        -- never sees a decrypted value.
+        -- ciphertext. Both paths to decryption belong to the GraphQL
+        -- track and neither can be reached from here: a bearer token
+        -- carries no RoleAccessMapping and so no can_read_sensitive, and
+        -- the self-subject path is structurally unavailable rather than
+        -- merely withheld - an EventReadToken is scoped to an EventType
+        -- and tied to no Role, so there is no verified caller identity to
+        -- match against a field's subject. A caller needing its own
+        -- sensitive data reads it over GraphQL.
 
     @guarantee LatestEventsAlwaysAvailable
         -- A fetch always sees every committed event of its type that
@@ -1747,11 +1989,15 @@ surface ProjectionQuery {
         -- A projection built from a field its source EventType marked
         -- sensitive stays protected exactly as the source event is:
         -- sensitivity is declared once, on the EventType, and inherited
-        -- rather than re-declared per projection. Decryption is gated by
-        -- can_read_sensitive on the very same RoleAccessMapping this
-        -- surface faces, so a caller without that grant is never handed a
-        -- decrypted value - not even one it is expected to discard (see
-        -- QueryProjection's guidance on read_projection).
+        -- rather than re-declared per projection. Decryption is decided
+        -- per field against the very same RoleAccessMapping this surface
+        -- faces, under either of two grants: the bounded-context-wide
+        -- can_read_sensitive, or the caller's own verified IdP identity
+        -- matching that field's subject - a Role reading data about
+        -- itself needs no separate grant. A caller with neither is never
+        -- handed a decrypted value, not even one it is expected to
+        -- discard (see QueryProjection's guidance on read_projection).
+        -- This is the same test EventSubscription applies to a push.
 
     @guarantee ReadYourWritesWhenRequested
         -- A query naming a wait_for_sequence is never answered from a
@@ -1895,6 +2141,63 @@ surface CommandTrigger {
         -- make it triggerable by a token.
 }
 
+surface CommandQuery {
+    facing access_mapping: AdminAccess
+
+    provides:
+        FetchCommands(access_mapping, command_types, after?, before?, triggered_event?)
+
+    @guarantee GrantScopedToBoundedContext
+        -- An admin-level grant only authorises reading commands submitted
+        -- into its own bounded context; a command in any other context is
+        -- not merely unreadable but invisible, the same way a projection
+        -- in another context is to ProjectionQuery. This holds for the
+        -- reverse lookup too: naming an event from another bounded context
+        -- is not a way into that context's commands.
+
+    @guarantee SensitiveFieldsStayProtected
+        -- A field its CommandType marked sensitive is stored as
+        -- ciphertext and read back that way unless the caller is entitled
+        -- to it, decided per field against the very same RoleAccessMapping
+        -- this surface faces, under either of two grants: the
+        -- bounded-context-wide can_read_sensitive, or the caller's own
+        -- verified IdP identity matching that field's subject. Admin level
+        -- alone is not one of them - can_read_sensitive is orthogonal to
+        -- level. A caller with neither grant still receives the command,
+        -- with that field left as ciphertext exactly as ProjectionQuery
+        -- and EventSubscription leave it, never decrypted and then
+        -- redacted afterwards.
+        --
+        -- Erasure reaches these fields with nothing extra: a command and
+        -- an event naming the same subject encrypt under the same
+        -- EncryptionKey, so ForgetSubject makes both unreadable at once,
+        -- to this surface and to anyone reading the stored rows directly
+        -- (see the protect_sensitive_fields note above the rules).
+
+    @guidance
+        -- GraphQL only, and a query rather than a mutation: the audit
+        -- counterpart to CommandSubmission's mutation. Admin-facing on
+        -- purpose - see the note above rule FetchCommands for why reading
+        -- other callers' raw command payloads is not a read-level
+        -- capability. The REST track has no equivalent and is not meant
+        -- to grow one: a CommandToken triggers exactly one command type
+        -- and reads nothing back (see CommandTrigger's
+        -- TokenScopedToCommandType).
+        --
+        -- No context clause, for the same reason EventSubscription has
+        -- none: a fetch is scoped entirely by
+        -- access_mapping.bounded_context and may span several
+        -- CommandTypes at once, so there is no single entity the action
+        -- hangs off the way ProjectionQuery hangs off a Projection.
+        --
+        -- Deliberately coarse on the wire contract otherwise: this
+        -- establishes the capability, its scoping and its filters, not
+        -- how a query, its result shape, or paging and cursor encoding
+        -- are expressed - all still deferred with the rest of the wire
+        -- contract, exactly as they are for EventFetch and
+        -- ProjectionQuery (see the scope header's exclusions).
+}
+
 surface TypeRegistration {
     facing access_mapping: AdminAccess
     context bounded_context: BoundedContext
@@ -1905,7 +2208,7 @@ surface TypeRegistration {
             sensitive_fields, external_creation_allowed, direct_creation_allowed,
             system_triggered_allowed, event_read_allowed, system_triggered_schedule?)
         RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
-            rest_trigger_allowed)
+            sensitive_fields, rest_trigger_allowed)
         RegisterProjection(access_mapping, bounded_context, name, schema,
             consumed_event_types, sync)
 
@@ -2074,7 +2377,7 @@ surface AccessManagement {
 
 open question "External event context: how much source-specific metadata should be persisted, and does the shape vary per source type (e.g. Kafka vs webhook)?"
 
-open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). Resolved: a new black box, valid_filters(event_type, filters), rejects a filter whose field doesn't exist or whose operator doesn't fit that field's declared type - checked at registration time for CreateEventTypeSubscription and at call time for FetchEvents (see the note above rule FetchEvents). What's still open is the exact type-to-operator matrix itself, which the black box owns rather than this spec - and whether the same field-exists check should apply to TagMapping.field and SensitiveField.field/subject_field, which have the identical gap unaddressed (see that open question below)."
+open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). Resolved: a new black box, valid_filters(event_type, filters), rejects a filter whose field doesn't exist or whose operator doesn't fit that field's declared type - checked at registration time for CreateEventTypeSubscription and at call time for FetchEvents (see the note above rule FetchEvents). What's still open is the exact type-to-operator matrix itself, which the black box owns rather than this spec."
 
 open question "The all-events subscription per bounded context has 'limited to no filtering' - what, if anything, can it filter on (e.g. event type name only), versus the full per-field filtering on EventTypeSubscription? Resolved: AllEventsSubscription gained event_types (empty means every type; non-empty restricts delivery to those types), but still no per-field Filter - a Filter.field is only unambiguous within one event type's schema, and this variant deliberately spans every type's schema in the bounded context. A caller wanting field-level filtering across several types opens one EventTypeSubscription per type instead (see the variant's own field comment and CreateAllEventsSubscription)."
 
@@ -2086,20 +2389,16 @@ open question "Websocket complement to EventFetch: fetching over REST is pull-ba
 
 open question "EventSubscription's delivery guarantees during a dropped GraphQL connection: from_sequence gives a reconnecting caller a resume point, but nothing here specifies at-least-once vs at-most-once delivery while connected, or whether the client is expected to detect a gap itself (e.g. via a monotonic sequence check) and resume with a fresh from_sequence, or whether that detection is the library's job too."
 
-open question "Self-subject sensitive-field access - a caller decrypting their own data because their verified identity matches a field's subject, introduced for EventSubscription's render_event - has no counterpart on ProjectionQuery or EventFetch, which still gate decryption on can_read_sensitive alone. Should the same self-access path apply uniformly across all three reads, or is real-time delivery a deliberately narrower case?"
-
 open question "Bootstrapping the first superadmin Role is resolved in principle - an out-of-band seed/migration step at first deployment inserts a Role row directly with superadmin = true and external_subject set to the initial admin's IdP identity, bypassing the GraphQL surface and CreateRole's superadmin-caller requirement (see the note above CreateRole). What remains open is how and where that step is triggered: a migration run by the library, a CLI subcommand, a configuration value read once at first startup, or left entirely to the consuming application's own deployment process."
 
 open question "Schema versioning tracks a current schema_version counter per type, but not the historical schema text for prior versions. Do consumers reading old events need to look up the exact schema that was active for their recorded version, or is 'each version stays backwards compatible' sufficient without keeping that history?"
 
-open question "decide() and CommandDecision are the plugged-in, bounded-context-specific decider - genuinely out of this library's scope, and now responsible for producing rejection_reason too. Is that plugin boundary worth specifying formally (e.g. as a Rust trait each bounded context implements), or left entirely to the consuming code with no contract here?"
+open question "Retiring a tagged field: valid_tag_mappings now requires every TagMapping.field to exist in the schema being registered, and the older additive-only guard requires every previously declared key to survive re-registration. A schema revision that drops the payload field a key currently reads from - with no replacement field to repoint it at - satisfies neither: the key can't be dropped and can't name a field that no longer exists. Is that meant to be a dead end (the key's history is retired only by retiring the whole EventType/CommandType), or does a tagged field being dropped from the schema need its own supported path, e.g. explicitly retiring just that key while leaving its already-recorded tags in place?"
 
 open question "Tag keys declared via tag_mappings are plain strings with no namespace - could two unrelated bounded contexts collide on the same key (e.g. both using \"account\")? (Sequence scope is resolved: per bounded context, gapless. Serialisation mechanism is resolved: a Postgres row lock per bounded context, not application-level coordination.)"
-
-open question "derive_tags(event_type, payload) is a black box: does TagMapping.field validate against event_type.schema at registration time (so a mapping can't reference a field that doesn't exist), or is that left unchecked since schema is just an opaque JSON Schema string to the spec? The same question applies to SensitiveField.field and SensitiveField.subject_field. Filter.field just gained exactly this check, via valid_filters (see the filter-operator open question above) - the same field-exists validation, at the same registration-time-or-call-time granularity, would resolve this one too if applied here."
 
 open question "Are there cases where a consistency boundary needs 'all events of a specific EventType' with no field-level tag at all, rather than a key/value tag? Raised as a possible exception but not confirmed as a real requirement."
 
 open question "Historical data left behind when a field is newly marked sensitive: EventType.sensitive_fields only affects events created from that point forward (event sourcing is append-only, so existing events can't be edited in place - see Event.encryption_keys). Is 'it stays plaintext forever unless the whole bounded context is archived' acceptable, or does adding a sensitive_fields entry need a supported one-time backfill/purge path for the data that already exists, run outside the normal event-creation flow?"
 
-open question "Should CommandType support sensitive_fields the same way EventType does? Command.payload is also stored permanently, but commands aren't queried the same way events/projections are, so it's unclear whether the same exposure risk applies."
+open question "A tag derived from a field that is also marked sensitive survives crypto-shredding: derive_tags reads the plaintext payload, so the value lands in Event.tags and Command.consistency_tags as plaintext and stays there after ForgetSubject destroys the subject's EncryptionKey. Destroying the key makes the payload ciphertext permanently unreadable, but not the tag copy of that same value, which is stored separately and indexed. Is a subject identifier meant to be usable as a consistency tag key at all (it is the obvious thing to tag on - \"user\", \"account\"), and if so, does right-to-be-forgotten need to reach tags too - by rejecting a registration that marks a tagged field sensitive, by tagging a derived/hashed value instead of the raw one, or by accepting that a tag value is metadata that outlives erasure and saying so explicitly? Pre-existing for events, but sharpened by commands: CommandType.sensitive_fields and CommandType.tag_mappings read the same payload, and erasure now claims to reach command payloads even against superadmin and direct database access."
