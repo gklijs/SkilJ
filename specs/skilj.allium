@@ -96,16 +96,51 @@ value Metadata {
 
 value Tag {
     key: String                 -- shared across event types, e.g. "account"
-    value: String                -- e.g. "123"
+    value: String?              -- e.g. "123". Null is the "None" state: the mapped payload
+                                 -- field was absent from this particular payload, because the
+                                 -- schema declares it optional and this instance omitted it
+                                 -- (or, for a list-typed field, because the list was empty or
+                                 -- absent - see the derive_tags note above the rules). An
+                                 -- absent field still produces a Tag under its mapped key,
+                                 -- with value null, rather than no tag at all. That is
+                                 -- deliberate, not an oversight: it means a consistency
+                                 -- boundary or a filter can address "every event or command
+                                 -- where this field was never set" as a first-class case,
+                                 -- instead of that case being invisible. It is expected to be
+                                 -- a broad and rarely-useful match in practice - one tag key
+                                 -- with one null value covers the whole never-set population -
+                                 -- but a capability that is available and seldom wanted is a
+                                 -- different thing from one that does not exist.
 }
 
 value TagMapping {
     key: String                 -- the tag key this mapping produces, e.g. "account" - the same key
                                  -- can be declared by multiple event types, so a consistency boundary
                                  -- can span all of them regardless of type (e.g. MoneyAdded and
-                                 -- MoneySubtracted both mapping their account_id field to "account")
+                                 -- MoneySubtracted both mapping their account_id field to "account").
+                                 --
+                                 -- Keys are plain strings: no namespace prefix, no central registry.
+                                 -- None is needed, because every place a tag key is read partitions
+                                 -- by bounded context before comparing anything. ProcessCommand's
+                                 -- matching_events reads only Events where bounded_context =
+                                 -- command_type.bounded_context; DynamicConsistencyBoundaryHonoured
+                                 -- requires e.bounded_context = c.bounded_context; matches_filters is
+                                 -- only ever reached through an EventType, which belongs to exactly
+                                 -- one bounded context (FetchEvents, DeliverToSubscriptions); and
+                                 -- both Subscription variants are scoped by
+                                 -- access_mapping.bounded_context or event_type.bounded_context.
+                                 -- So two unrelated bounded contexts that both declare "account"
+                                 -- never interact - a key string is effectively namespaced by the
+                                 -- bounded context it is declared and matched within, without an
+                                 -- explicit prefix. Sharing a key is a within-context act, and only
+                                 -- that. This is also why ConsistencyTagKeysAreDeclared scopes its
+                                 -- check to the command's own bounded context.
     field: String                -- name of the payload field this key's value is read from, for this
-                                 -- event type specifically
+                                 -- event type specifically. It may name a scalar field or a
+                                 -- list-of-scalars field, and the field may be optional; how
+                                 -- many Tags each of those shapes derives, and what an absent
+                                 -- or empty one derives, is the derive_tags contract - see the
+                                 -- note above the rules.
 }
 
 value EventSpec {
@@ -202,11 +237,36 @@ entity BoundedContext {
     }
 }
 
+-- Payload schema shape, shared by CommandType.schema and
+-- EventType.schema below. For this version, an event or command payload
+-- schema describes a flat structure: scalar fields, each of which may be
+-- declared optional, and lists of scalars. Nested objects - and therefore
+-- nested field paths - are out of scope. That bounds what a TagMapping,
+-- a SensitiveField and a Filter each have to be able to name: a single
+-- top-level field name, never a path into a sub-object.
+--
+-- This is a stated expectation on what a bounded context's schema may
+-- declare, not something this spec enforces. A schema is an opaque JSON
+-- Schema string here and is never structurally parsed at this level (see
+-- the black boxes that do parse it: valid_tag_mappings,
+-- valid_sensitive_fields, valid_filters and
+-- schema_is_backwards_compatible), so nothing in this file can express
+-- "no nested objects" as a check. A bounded context that declares a
+-- nested schema anyway is outside the contract, and what its tags,
+-- sensitive fields and filters would mean is undefined rather than
+-- defined-and-forbidden - see the open question on nested structures.
+--
+-- Schema evolution is separately constrained, and that one is enforced:
+-- see schema_is_backwards_compatible in the note above RegisterEventType.
+
 entity CommandType {
     bounded_context: BoundedContext
     name: String
-    schema: String              -- JSON Schema describing the command's payload fields and optionality
-    schema_version: Integer     -- increments on each schema change; changes must stay backwards compatible
+    schema: String              -- JSON Schema describing the command's payload fields and optionality;
+                                -- flat structures only - see the payload schema shape note above
+    schema_version: Integer     -- increments on each schema change; changes must stay backwards
+                                -- compatible, enforced by schema_is_backwards_compatible at
+                                -- registration (see the note above RegisterEventType)
 
     -- Mirrors EventType.tag_mappings: derives this command's
     -- consistency_tags from its own payload, using the same shared keys
@@ -223,7 +283,10 @@ entity CommandType {
     -- retroactively encrypt this type's existing history, since a stored
     -- command is never rewritten. See Command.encryption_keys to tell
     -- which historical commands predate a given entry (and so still hold
-    -- that field in plaintext).
+    -- that field in plaintext). Nothing ever protects or removes that
+    -- plaintext later: there is no backfill or purge path, so this must
+    -- be declared before sensitive data starts flowing through the type
+    -- (see the protect_sensitive_fields note above the rules).
     sensitive_fields: Set<SensitiveField>
 
     -- Opt-in, mirroring EventType.external_creation_allowed: submitting
@@ -237,8 +300,12 @@ entity CommandType {
 entity EventType {
     bounded_context: BoundedContext
     name: String
-    schema: String              -- JSON Schema describing the event's payload fields and optionality
-    schema_version: Integer     -- increments on each schema change; changes must stay backwards compatible
+    schema: String              -- JSON Schema describing the event's payload fields and optionality;
+                                -- flat structures only - see the payload schema shape note above
+                                -- entity CommandType
+    schema_version: Integer     -- increments on each schema change; changes must stay backwards
+                                -- compatible, enforced by schema_is_backwards_compatible at
+                                -- registration (see the note above RegisterEventType)
 
     -- Deliberately opt-in and small: each mapping promotes one payload
     -- field to an indexed, queryable tag. Only mapped fields are
@@ -250,7 +317,10 @@ entity EventType {
     -- retroactively encrypt this type's existing history, since events
     -- are immutable. See Event.encryption_keys to tell which historical
     -- events predate a given entry (and so still hold that field in
-    -- plaintext).
+    -- plaintext). Nothing ever protects or removes that plaintext later:
+    -- there is no backfill or purge path, so this must be declared
+    -- before sensitive data starts flowing through the type (see the
+    -- protect_sensitive_fields note above the rules).
     sensitive_fields: Set<SensitiveField>
 
     -- Command-triggered origin is always permitted; the other three
@@ -535,7 +605,10 @@ entity Projection {
                                  -- projection is introspectable and a client (a mobile app, say)
                                  -- consumes a real, typed subset of the graph rather than
                                  -- parsing an opaque blob.
-    schema_version: Integer     -- increments on each schema change; changes must stay backwards compatible
+    schema_version: Integer     -- increments on each schema change; changes must stay backwards
+                                 -- compatible, enforced by schema_is_backwards_compatible at
+                                 -- registration exactly as an event or command type's schema is
+                                 -- (see the note above RegisterEventType)
 
     -- Which EventTypes feed this projection. Known at compile time,
     -- derived from the Rust projection definition the same way
@@ -667,10 +740,84 @@ default BoundedContext admin = { name: "admin", status: active }
 -- everyone, including a superadmin and including anyone reading the
 -- Postgres rows directly, because the plaintext was never stored in the
 -- first place. Neither ForgetSubject nor the SubjectErasure surface needs
--- to know that commands exist. (One caveat, tracked as its own open
--- question: a tag whose TagMapping reads a field that is also marked
--- sensitive is stored as plaintext in Event.tags/Command.consistency_tags
--- and is not covered by the key's destruction.)
+-- to know that commands exist. The one thing that could have undercut
+-- that wholeness - a TagMapping reading the same payload field a
+-- SensitiveField marks, copying its plaintext into Event.tags /
+-- Command.consistency_tags where no key destruction reaches it - is ruled
+-- out at registration time instead of being lived with: see the overlap
+-- constraint in the note above RegisterEventType.
+--
+-- What erasure cannot reach is data that was already plaintext. A
+-- SensitiveField protects only the payloads written after it was
+-- declared; commands and events of that type recorded before it was
+-- declared were never encrypted, so there is no EncryptionKey to destroy
+-- for them and ForgetSubject has nothing to act on. There is no
+-- backfill, purge or redaction path for that data, and this spec
+-- deliberately does not offer one: the only way to remove it would be to
+-- rewrite stored Command/Event rows in place, and immutability is
+-- load-bearing everywhere here - a stored command or event is never
+-- rewritten, the stream is append-only, and crypto-shredding exists
+-- precisely so that forgetting destroys a key rather than touching a
+-- row. Archiving is not a partial mitigation either: an archived
+-- bounded context stops accepting new commands and events but retains
+-- its history exactly as recorded (see BoundedContext.status). The
+-- practical consequence for whoever registers a type: sensitive_fields
+-- has to be declared before sensitive data starts flowing through that
+-- type. Declaring it later protects the future only, never the past.
+--
+-- Finding out which historical rows are still in that state - empty
+-- Event.encryption_keys/Command.encryption_keys for a type that now
+-- declares a sensitive_fields entry - is not something this library
+-- offers a query for, and deliberately so. It is an operator/compliance
+-- concern, not a security boundary this surface set needs to enforce:
+-- unlike the erasure question above, which is about stopping data from
+-- being read back through this library's own reads even by an admin,
+-- discovering what is still plaintext is something an operator with
+-- direct Postgres access - which they already have, to run this library
+-- at all - can already answer for themselves, since it is a structural
+-- property of the stored rows. Adding a surface for it would be a real
+-- but separable feature (e.g. a compliance-reporting read), not
+-- something to build ahead of an actual need for it.
+--
+-- derive_tags(type, payload), used by CreateExternalEvent,
+-- CreateDirectEvent and ProcessCommand above and below, is a black box in
+-- the same register as the rest: this library owns which tags a payload
+-- yields and therefore what a consistency boundary can address, not how a
+-- JSON payload is walked to read a field out of it. It takes an EventType
+-- and a CommandType interchangeably, for the same reason
+-- protect_sensitive_fields does - tag_mappings is the identical
+-- Set<TagMapping> on both, and Event.tags and Command.consistency_tags
+-- are directly comparable precisely because one function produces them
+-- both. Its full contract, per TagMapping in type.tag_mappings, given
+-- that payload schemas are flat (see the payload schema shape note above
+-- entity CommandType):
+--   - The mapped field is present and holds a scalar value: one
+--     Tag(key, value: that value). The ordinary case.
+--   - The mapped field is absent, because the schema declares it optional
+--     and this payload omitted it: one Tag(key, value: null). Not zero
+--     tags - see Tag.value for why the "None" state is deliberately
+--     addressable rather than invisible.
+--   - The mapped field holds a list of scalars: one Tag(key, value: e)
+--     per distinct element e, all sharing that mapping's key.
+--   - The mapped field holds an empty list, or is a list-typed field that
+--     is absent altogether: one Tag(key, value: null), exactly as an
+--     absent scalar. An empty list and a missing list are both "no value
+--     was provided", and collapsing them onto the same single "None" state
+--     keeps that one state rather than inventing a third.
+--
+-- Two consequences of the list case are worth naming rather than leaving
+-- to be rediscovered, and both fall out of Event.tags and
+-- Command.consistency_tags already being Set<Tag>:
+--   - ANY-match comes for free. The consistency-boundary match in
+--     ProcessCommand is consistency_tags.any(t => t in tags), i.e. "does
+--     any tag in one set appear in the other". A list-valued field
+--     contributing one tag per element therefore matches when any element
+--     matches, with no rule-level change at all - the semantics people
+--     usually want from a multi-valued tag are what the existing set
+--     membership already does.
+--   - Duplicate elements collapse. Two equal elements produce two equal
+--     Tags, and a Set holds one - so a list is effectively deduplicated
+--     for tagging purposes, again with nothing extra specified.
 --
 -- Reading events - the Events collections read by FetchEvents and
 -- ProcessCommand below - is served by an in-memory cache of the most
@@ -812,6 +959,17 @@ rule CreateDirectEvent {
 -- for FetchEvents, since it has no persisted filter to register ahead of
 -- one. A subscription or fetch with an invalid filter is rejected rather
 -- than silently created or answered with results nobody asked for.
+--
+-- The exact type-to-operator matrix - which FilterOperator values a
+-- string field supports, which an integer field does, and so on - is
+-- deliberately not enumerated here, and not left open either: it is
+-- exactly the kind of mechanism this spec consistently hands to a black
+-- box rather than specifying itself, the same register as how decide()
+-- reaches its verdict, how protect_sensitive_fields encrypts, or how
+-- next_sequence takes its Postgres lock. This library's job is that an
+-- invalid filter is rejected outright rather than silently mismatched
+-- (stated above); which matrix valid_filters uses to decide "invalid" is
+-- the black box's job, not a gap in this one.
 --
 -- Unlike the write rules, this deliberately does not require the bounded
 -- context to be active: archiving stops new commands and events, but
@@ -1292,6 +1450,21 @@ rule ArchiveBoundedContext {
 -- against its bounded context. Re-registering an unchanged shape is a
 -- no-op, so the loop can run on every startup.
 --
+-- The loop registers a bounded context's EventTypes before its
+-- CommandTypes (and, structurally already guaranteed by RegisterProjection
+-- taking consumed_event_types as a Set<EventType> of already-existing
+-- entities rather than names, Projections after both). This is what keeps
+-- ConsistencyTagKeysAreDeclared (see the invariant) satisfied at the
+-- moment a CommandType goes live within one reconciliation pass: any
+-- EventType that pass also registers has already landed by the time a
+-- CommandType consistency-checking on one of its tag keys becomes
+-- submittable. It does not reach across separate deploys - a CommandType
+-- shipped now that anticipates an EventType arriving in a later release
+-- is still a real gap between the two releases, accepted rather than
+-- structurally prevented, since closing that fully would mean rejecting a
+-- CommandType registration for referencing a key no EventType declares
+-- yet, which forecloses exactly this kind of staged rollout.
+--
 -- schema_version tracks payload-shape compatibility specifically (see
 -- EventType.schema_version), so it only advances when schema itself
 -- changed. tag_mappings, sensitive_fields, the origin permissions and a
@@ -1323,6 +1496,75 @@ rule ArchiveBoundedContext {
 -- registration whose tag_mappings or sensitive_fields fail the check is
 -- rejected outright, exactly as an invalid filter is.
 --
+-- schema_is_backwards_compatible(existing_schema, schema) is the third
+-- black box of that family, and the one that makes schema evolution a
+-- rule rather than an intention. All three registration rules carried
+-- "changes must stay backwards compatible" on their schema_version field
+-- already; this is what enforces it, uniformly across EventType,
+-- CommandType and Projection - enforcing it on some but not others would
+-- be arbitrary, since the same sentence was written on all three. It
+-- applies only when a registration is updating something: a first-time
+-- registration has no prior schema to be compatible with, so the guard is
+-- reached only when the type or projection already exists. An
+-- incompatible change is rejected outright, exactly as an invalid tag
+-- mapping is - there is no "accept it and bump the version harder" path.
+--
+-- The contract it computes, stated here in prose because computing it is
+-- the black box's job and enumerating JSON Schema mechanics is not this
+-- spec's:
+--   - Every field present in existing_schema is still present in schema.
+--     A declared field is permanent.
+--   - A field may move from required to optional, but never from optional
+--     to required. Loosening is allowed; tightening is not.
+--   - A newly added field must be optional, so that payloads written
+--     against the previous schema remain valid against this one.
+-- In short: additive and loosening only. Phasing a field out of use is
+-- done by declaring it optional and simply ceasing to populate it - the
+-- declaration itself stays forever, and readers of old payloads keep
+-- finding what they were written with.
+--
+-- That is also what resolves what used to be an open question about
+-- retiring a tagged field. The worry was a dead end: valid_tag_mappings
+-- requires every TagMapping.field to exist in the schema being
+-- registered, and the additive-only key guard below requires every
+-- previously declared key to survive re-registration, so a schema
+-- revision dropping the payload field a live key reads from could satisfy
+-- neither. With this check in place that revision is simply not a legal
+-- registration: a field a TagMapping points at cannot be removed by any
+-- compliant schema evolution, so the mapping can never lose its target
+-- and the dead end cannot be reached. A tagged field that has fallen out
+-- of use goes optional and stops being populated, which derive_tags
+-- already has a defined answer for - Tag(key, value: null), see its note
+-- above the rules. This deliberately rests on an enforced check rather
+-- than on an honour system: the reason no path is specified for retiring
+-- a key is that nothing can create the situation that would need one.
+--
+-- One further constraint sits alongside those two, but deliberately not
+-- inside either black box: it compares two sets the registration already
+-- carries and needs no schema knowledge at all, so it is stated directly.
+-- A registration is rejected when any TagMapping.field names the same
+-- payload field as a SensitiveField.field on that same type. derive_tags
+-- reads the plaintext payload before protect_sensitive_fields encrypts
+-- it, so such a mapping would smuggle the very value being encrypted into
+-- Event.tags / Command.consistency_tags - stored separately, indexed, and
+-- never touched by ForgetSubject. The tag copy would survive
+-- crypto-shredding even though the payload ciphertext itself became
+-- permanently unreadable. Forbidding the overlap closes that at
+-- registration time, structurally, rather than leaving it as a documented
+-- risk.
+--
+-- The constraint is on SensitiveField.field alone - the field that
+-- actually gets encrypted (e.g. "ssn", "email"). It says nothing about
+-- SensitiveField.subject_field, which is a different field (e.g.
+-- "user_id"): the plaintext identifier the EncryptionKey is looked up or
+-- derived by, never encrypted in the first place precisely because it has
+-- to stay readable to find the key. Tagging on a subject_field is
+-- unaffected and fully allowed - it is the normal way to build a
+-- per-subject consistency boundary, e.g. mapping account_id to the key
+-- "account" while also naming account_id as the subject_field for some
+-- encrypted field. This is not a blanket "don't tag identifying fields"
+-- rule; only overlap with SensitiveField.field is forbidden.
+--
 -- All three are gated by an admin-level RoleAccessMapping for the target
 -- bounded context, the same as the rules above. A RoleAccessMapping scoped
 -- to the admin bounded context itself deliberately gains no new meaning
@@ -1346,7 +1588,19 @@ rule RegisterEventType {
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
 
+    -- No TagMapping may read a field sensitive_fields encrypts: the tag
+    -- copy is plaintext and would outlive crypto-shredding. Only
+    -- SensitiveField.field is off limits, never subject_field - see the
+    -- note above.
+    requires: not tag_mappings.any(m => sensitive_fields.any(s => s.field = m.field))
+
     let existing = EventType{bounded_context: bounded_context, name: name}
+
+    -- Schema evolution is additive and loosening only, and a first
+    -- registration has nothing to be compatible with - see the note above.
+    requires:
+        not exists existing
+        or schema_is_backwards_compatible(existing.schema, schema)
 
     -- Tag mapping keys are additive-only on re-registration: events
     -- already carry tags under the keys declared so far, and
@@ -1398,7 +1652,18 @@ rule RegisterCommandType {
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
 
+    -- Same overlap constraint as RegisterEventType, for the same reason: a
+    -- command's consistency_tags are derived from its plaintext payload
+    -- and are not reached by ForgetSubject either.
+    requires: not tag_mappings.any(m => sensitive_fields.any(s => s.field = m.field))
+
     let existing = CommandType{bounded_context: bounded_context, name: name}
+
+    -- The same backwards-compatibility guard as RegisterEventType, for the
+    -- same reason: a command payload schema evolves additively too.
+    requires:
+        not exists existing
+        or schema_is_backwards_compatible(existing.schema, schema)
 
     -- Additive-only for the same reason as RegisterEventType, protecting
     -- CommandConsistencyTagsMatchDeclaredMappings: commands already
@@ -1444,6 +1709,15 @@ rule RegisterProjection {
     requires: consumed_event_types.all(et => et.bounded_context = bounded_context)
 
     let existing = Projection{bounded_context: bounded_context, name: name}
+
+    -- The same backwards-compatibility guard as the two type registrations,
+    -- for the same reason: Projection.schema_version carries the identical
+    -- "changes must stay backwards compatible" contract, and a client
+    -- consuming the generated GraphQL type is exactly the reader that
+    -- contract protects.
+    requires:
+        not exists existing
+        or schema_is_backwards_compatible(existing.schema, schema)
 
     -- Deliberately no additive-only constraint on consumed_event_types,
     -- unlike RegisterEventType's tag_mappings. Tag mapping keys are
@@ -1733,13 +2007,26 @@ invariant SequenceIsGaplessPerBoundedContext {
 }
 
 invariant ConsistencyTagKeysAreDeclared {
-    -- A command may only consistency-check against tag keys that some
-    -- EventType actually declares (and therefore indexes). This is the
-    -- structural form of "can we verify an index exists for this tag at
-    -- runtime".
+    -- A command may only consistency-check against tag keys that an
+    -- EventType in the command's own bounded context actually declares
+    -- (and therefore indexes). This is the structural form of "can we
+    -- verify an index exists for this tag at runtime".
+    --
+    -- Deliberately scoped to c.bounded_context, not all EventTypes: the
+    -- only events this command can ever match are its own context's (see
+    -- ProcessCommand's matching_events and
+    -- DynamicConsistencyBoundaryHonoured), so an identically named key
+    -- declared in some unrelated context indexes nothing this command
+    -- will read - see the namespacing note on TagMapping.key.
+    --
+    -- Held within one reconciliation pass by registering EventTypes before
+    -- CommandTypes (see the note above RegisterEventType), not by any
+    -- check in ProcessCommand itself - a CommandType shipped ahead of an
+    -- EventType it anticipates, in an earlier release, can still violate
+    -- this for as long as that gap lasts.
     for c in Commands:
         for tag in c.consistency_tags:
-            EventTypes.any(et => et.tag_mappings.any(m => m.key = tag.key))
+            c.bounded_context.event_types.any(et => et.tag_mappings.any(m => m.key = tag.key))
 }
 
 invariant EventTagsMatchDeclaredMappings {
@@ -2036,8 +2323,15 @@ surface ProjectionQuery {
         -- state that preceded it. Omitting it is the cheap path for
         -- callers that tolerate lag. A sync projection satisfies any
         -- sequence immediately, so the argument costs such a caller
-        -- nothing. How long the wait lasts before the query fails is
-        -- still open (see open questions).
+        -- nothing. How long the wait lasts before the query fails is a
+        -- process-start configuration knob, not a per-query argument or a
+        -- fixed value - see await_projection_caught_up's note above the
+        -- rules - and a timeout is reported distinguishably from any
+        -- other rejection this surface can produce, so a caller knows to
+        -- retry rather than treat it as permanent (see
+        -- ReadYourWritesWhenRequested above). The exact GraphQL error
+        -- shape that carries that distinction stays deferred with the
+        -- rest of the wire contract (see the scope header's exclusions).
 }
 
 surface EventSubscription {
@@ -2220,6 +2514,16 @@ surface TypeRegistration {
         -- context, so registration is never a way to build a view across
         -- the boundary.
 
+    @guarantee SchemaEvolutionStaysCompatible
+        -- Re-registering an EventType, CommandType or Projection with a
+        -- schema that would break an existing reader is rejected outright,
+        -- never silently accepted and versioned - enforced by
+        -- schema_is_backwards_compatible (see the note above
+        -- RegisterEventType). A field already declared is never removed
+        -- and never tightened from optional to required; a newly added
+        -- field must be optional. A first-time registration has no prior
+        -- schema to break and is unaffected.
+
     @guidance
         -- GraphQL only. Typically driven by a startup reconciliation loop
         -- rather than by ad-hoc human calls, so the same shape is expected
@@ -2377,12 +2681,6 @@ surface AccessManagement {
 
 open question "External event context: how much source-specific metadata should be persisted, and does the shape vary per source type (e.g. Kafka vs webhook)?"
 
-open question "Which filter operators are actually valid for a given field depends on that field's declared JSON Schema type (string vs integer vs identifier vs others). Resolved: a new black box, valid_filters(event_type, filters), rejects a filter whose field doesn't exist or whose operator doesn't fit that field's declared type - checked at registration time for CreateEventTypeSubscription and at call time for FetchEvents (see the note above rule FetchEvents). What's still open is the exact type-to-operator matrix itself, which the black box owns rather than this spec."
-
-open question "The all-events subscription per bounded context has 'limited to no filtering' - what, if anything, can it filter on (e.g. event type name only), versus the full per-field filtering on EventTypeSubscription? Resolved: AllEventsSubscription gained event_types (empty means every type; non-empty restricts delivery to those types), but still no per-field Filter - a Filter.field is only unambiguous within one event type's schema, and this variant deliberately spans every type's schema in the bounded context. A caller wanting field-level filtering across several types opens one EventTypeSubscription per type instead (see the variant's own field comment and CreateAllEventsSubscription)."
-
-open question "How long await_projection_caught_up waits before a QueryProjection carrying a wait_for_sequence gives up is implementation-defined here. Resolved: the bound is a process-start runtime/library configuration knob, the same register as the event cache's warm-up count - not a per-query argument (would grow the deferred wire contract) and not fixed (an operator can tune it without a code change). Also resolved: a timing-out query's rejection is reported distinguishably from any other rejection this surface can produce (see QueryProjection's requires and its ReadYourWritesWhenRequested guarantee), so a caller can tell 'retry' from 'permanently invalid' - the same treatment CommandDecision.rejection_reason already gets. The exact GraphQL error shape that carries that distinction stays deferred with the rest of the wire contract (see the scope header's exclusions)."
-
 open question "Re-registering a projection that already holds state: RegisterProjection reconciles schema, consumed_event_types and sync in place, but nothing rebuilds what was already built from the stream, and caught_up_to is left where it is. Does changing schema, or adding/dropping a consumed EventType, require a replay from the start of the bounded context's stream - and if so, what does the projection answer while it rebuilds? Flipping sync from false to true is the sharpest case: an async projection may be lagging at that moment, so SyncProjectionNeverLags is violated from the flip until it catches up. Either the flip has to catch the projection up atomically before it takes effect, or that stale-but-declared-sync window has to be accepted and named."
 
 open question "Websocket complement to EventFetch: fetching over REST is pull-based, so a remote workflow either polls or lags. Resolved: it is the same capability under a different binding - the same EventReadToken and the same EventType.event_read_allowed opt-in, presented via an Authorization header at the connection handshake (the audience is server-side remote workflows, not browser JS, so header-based auth at handshake is viable), and reusing Subscription/EventTypeSubscription/Filter rather than a second filter model. Still open: delivery guarantees (at-least-once vs at-most-once, and what happens to events produced while a connection is down) and cursor/resume semantics for the push case - note that the GraphQL subscription surface (EventSubscription) resolves the cursor/resume half for its own track via from_sequence; this REST/token track has not adopted the same answer yet."
@@ -2393,12 +2691,6 @@ open question "Bootstrapping the first superadmin Role is resolved in principle 
 
 open question "Schema versioning tracks a current schema_version counter per type, but not the historical schema text for prior versions. Do consumers reading old events need to look up the exact schema that was active for their recorded version, or is 'each version stays backwards compatible' sufficient without keeping that history?"
 
-open question "Retiring a tagged field: valid_tag_mappings now requires every TagMapping.field to exist in the schema being registered, and the older additive-only guard requires every previously declared key to survive re-registration. A schema revision that drops the payload field a key currently reads from - with no replacement field to repoint it at - satisfies neither: the key can't be dropped and can't name a field that no longer exists. Is that meant to be a dead end (the key's history is retired only by retiring the whole EventType/CommandType), or does a tagged field being dropped from the schema need its own supported path, e.g. explicitly retiring just that key while leaving its already-recorded tags in place?"
-
-open question "Tag keys declared via tag_mappings are plain strings with no namespace - could two unrelated bounded contexts collide on the same key (e.g. both using \"account\")? (Sequence scope is resolved: per bounded context, gapless. Serialisation mechanism is resolved: a Postgres row lock per bounded context, not application-level coordination.)"
+open question "Nested payload structures, deliberately parked for a later version. Event and command payload schemas are flat for now - scalar fields, optionally absent, and lists of scalars (see the payload schema shape note above entity CommandType, and the derive_tags contract above the rules) - so every TagMapping.field, SensitiveField.field/subject_field and Filter.field names a single top-level field. What any of them would mean for a nested field is undefined rather than decided: would a nested field be addressed by a dotted path, or does TagMapping/SensitiveField/Filter need a different shape for `field` entirely; what does tagging a field inside a list of objects derive; does marking a nested field sensitive encrypt the leaf or the enclosing object; and what does schema_is_backwards_compatible's 'every field present in existing_schema is still present' mean once fields nest. Not a gap in the current version - the flat contract is complete and enforced as far as it reaches - but the answer is wanted before any bounded context is invited to declare a nested schema."
 
 open question "Are there cases where a consistency boundary needs 'all events of a specific EventType' with no field-level tag at all, rather than a key/value tag? Raised as a possible exception but not confirmed as a real requirement."
-
-open question "Historical data left behind when a field is newly marked sensitive: EventType.sensitive_fields only affects events created from that point forward (event sourcing is append-only, so existing events can't be edited in place - see Event.encryption_keys). Is 'it stays plaintext forever unless the whole bounded context is archived' acceptable, or does adding a sensitive_fields entry need a supported one-time backfill/purge path for the data that already exists, run outside the normal event-creation flow?"
-
-open question "A tag derived from a field that is also marked sensitive survives crypto-shredding: derive_tags reads the plaintext payload, so the value lands in Event.tags and Command.consistency_tags as plaintext and stays there after ForgetSubject destroys the subject's EncryptionKey. Destroying the key makes the payload ciphertext permanently unreadable, but not the tag copy of that same value, which is stored separately and indexed. Is a subject identifier meant to be usable as a consistency tag key at all (it is the obvious thing to tag on - \"user\", \"account\"), and if so, does right-to-be-forgotten need to reach tags too - by rejecting a registration that marks a tagged field sensitive, by tagging a derived/hashed value instead of the raw one, or by accepting that a tag value is metadata that outlives erasure and saying so explicitly? Pre-existing for events, but sharpened by commands: CommandType.sensitive_fields and CommandType.tag_mappings read the same payload, and erasure now claims to reach command payloads even against superadmin and direct database access."
