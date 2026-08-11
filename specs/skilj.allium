@@ -579,8 +579,42 @@ variant CommandTriggered : Event {
 }
 
 variant ExternalTriggered : Event {
+    -- Both fields below are fully opaque, adapter-defined blobs. SkilJ
+    -- persists verbatim whatever the adapter sends and imposes no schema
+    -- of its own on them, validates nothing about them and interprets
+    -- nothing inside them - a black box in exactly the same register as
+    -- EventType.schema, CommandType.schema and Projection.schema, and as
+    -- the encryption scheme and JWT signature verification.
+    --
+    -- Resolved deliberately, and out of scope by design: SkilJ models no
+    -- "source type" concept anywhere - not here, not on
+    -- ExternalEventToken, nowhere - so there is no per-source-type shape
+    -- variance at this level. An adapter or consuming application that
+    -- wants a different shape per source encodes that convention inside
+    -- the blob itself (a source_type key within the JSON, say); SkilJ
+    -- neither tracks nor enforces it. Note also that these two fields sit
+    -- outside payload, so protect_sensitive_fields and derive_tags never
+    -- touch them (see CreateExternalEvent).
+    --
+    -- Adapters must therefore not put sensitive data into either field:
+    -- plaintext here survives crypto-shredding, since only the payload
+    -- fields named in EventType.sensitive_fields are encrypted under a
+    -- subject's key and only those are reachable by ForgetSubject. That is
+    -- a documented obligation on the adapter, in the same trust register as
+    -- declaring sensitive_fields before sensitive data flows - the adapter
+    -- is out-of-core code the same deploying team controls (see
+    -- ExternalEventToken), not untrusted end-user input. Opacity is the
+    -- point, so RegisterEventType has nothing to inspect here the way it
+    -- can rule out a TagMapping/SensitiveField overlap structurally.
+    -- Encrypting the whole blob under the event's encryption_keys was
+    -- rejected: an un-parsed blob declares no subject for an EncryptionKey
+    -- to be scoped to, so ForgetSubject could not shred it either. A
+    -- per-EventType opt-out refusing to persist source_content at all was
+    -- rejected as machinery that prevents nothing on any type not setting
+    -- it.
     source_content: String                 -- source-specific payload, e.g. a raw JSON blob
-    source_context: String?                -- source-specific provenance data; shape open, see open questions
+    source_context: String?                -- source-specific provenance data, e.g. a Kafka
+                                            -- topic/partition/offset or a webhook's headers
     -- metadata.client_id holds the id of the ExternalEventToken used to submit this event
 }
 
@@ -641,6 +675,57 @@ entity Projection {
     -- EventType (see EventType.sensitive_fields) - a projection built
     -- from a sensitive field inherits the same restriction rather than
     -- re-declaring it (see ProjectionQuery).
+
+    -- The rebuilds staged or running against this projection: at most one
+    -- pending and one building at a time
+    -- (UniqueRebuildPerProjectionAndStatus). Read from TypeRegistration,
+    -- which is what makes a waiting rebuild something an admin can look
+    -- up rather than something known only to whoever ran the deploy that
+    -- staged it.
+    rebuilds: ProjectionRebuild with projection = this
+}
+
+entity ProjectionRebuild {
+    projection: Projection      -- the live Projection this rebuild replaces when it is promoted
+
+    -- The newly declared definition, staged rather than applied: the same
+    -- four values RegisterProjection reconciles onto a Projection directly
+    -- when a change is trivial, held here instead when it is not (see the
+    -- note above that rule). The live Projection keeps serving its own
+    -- current definition, untouched, for as long as this row exists.
+    schema: String
+    schema_version: Integer
+    consumed_event_types: Set<EventType>
+    sync: Boolean
+
+    -- Highest Event.sequence within the projection's bounded context this
+    -- rebuild has processed under the new definition, tracked exactly as
+    -- Projection.caught_up_to tracks the live one. Null until an admin
+    -- triggers the rebuild, and null is also where a triggered rebuild
+    -- starts: a rebuild always replays from the start of the bounded
+    -- context's stream, never from wherever the live projection happens
+    -- to be.
+    caught_up_to: Integer?
+
+    status: pending | building
+
+    -- pending: staged by RegisterProjection and waiting for an admin to
+    -- call RebuildProjection - which may be indefinitely, across many
+    -- deploys, since re-registering the same non-trivial change restages
+    -- this same row rather than adding another. building: an admin has
+    -- triggered it and it is replaying its bounded context's stream under
+    -- the new definition.
+    --
+    -- building is terminal because there is no third stored state to
+    -- reach: once caught_up_to reaches the bounded context's latest
+    -- committed sequence the rebuild is promoted automatically and this
+    -- row ceases to exist (see the note above RegisterProjection). A
+    -- finished rebuild is not a ProjectionRebuild in some completed
+    -- status; it is the live Projection.
+    transitions status {
+        pending -> building
+        terminal: building
+    }
 }
 
 entity Subscription {
@@ -1694,6 +1779,74 @@ rule RegisterCommandType {
             )
 }
 
+-- Re-registering a projection that already holds state, resolved. The
+-- reconciliation loop above runs on every deploy, so RegisterProjection
+-- must never be the thing that starts a replay: a projection is rebuilt
+-- only when an admin explicitly asks for it (RebuildProjection below).
+-- What a registration does instead depends on whether the incoming change
+-- can honestly be applied to content that was already folded from the
+-- stream.
+--
+-- Trivial changes are applied in place, to the live Projection, exactly as
+-- they always were:
+--   - sync flipping true -> false. A sync projection sits at its bounded
+--     context's latest committed sequence by construction, so an async one
+--     carrying on from there has missed nothing.
+--   - adding a consumed EventType that has no committed events in this
+--     bounded context yet. Nothing was missed by not having consumed it,
+--     so there is nothing to replay for it - and unlike the schema case
+--     this is a question the stream itself can answer, so it is checked
+--     rather than assumed.
+--
+-- Every other change is staged as a ProjectionRebuild and touches the live
+-- Projection not at all: not its schema, not its schema_version, not its
+-- consumed_event_types, not its sync flag, not its caught_up_to. It keeps
+-- answering exactly what it answered before, under its current definition,
+-- for as long as nobody triggers the rebuild:
+--   - schema changed. What the projection already holds was folded under
+--     the previous definition; only a replay produces the new shape.
+--   - a consumed EventType added or dropped where that type does have
+--     committed events. Both directions are treated alike: an added type
+--     has history the projection never folded, a dropped type has history
+--     it did fold and must now forget. This supersedes the earlier reading
+--     that a drop is structurally harmless - harmless to the invariants is
+--     a different claim from leaving a correct projection behind.
+--   - sync flipping false -> true. This is the case that had no safe
+--     answer before: an async projection may be lagging at that moment, so
+--     declaring it sync in place would leave it stale-but-declared-sync
+--     until it caught up. Staging removes that window rather than naming
+--     it - the live projection stays async at its own position, and only
+--     becomes sync at promotion, by which point the rebuilt content is at
+--     the latest committed sequence already. SyncProjectionNeverLags needs
+--     no exemption for the flip and gets none.
+--
+-- Staging is idempotent the same way registration is: a non-trivial change
+-- with a pending rebuild already staged overwrites that pending row rather
+-- than accumulating rows, so redeploying the same binary stages the same
+-- definition once. A non-trivial change arriving while a rebuild is
+-- already building leaves that build strictly alone - it runs to
+-- completion and promotion under the definition it was triggered with -
+-- and lands in a new pending row alongside it, which needs its own
+-- RebuildProjection call once the current one finishes. At most one
+-- pending and one building rebuild coexist per projection (see
+-- UniqueRebuildPerProjectionAndStatus).
+--
+-- Promotion is automatic, and is the only way a rebuild ends. It is a
+-- background-process concern in the same register as the async project()
+-- consumer (see the note above the rules), not a third admin action: once
+-- a building rebuild's caught_up_to reaches its bounded context's latest
+-- committed sequence, its schema, schema_version, consumed_event_types,
+-- sync and caught_up_to replace the live Projection's, the content that
+-- projection held under the old definition is discarded, and the
+-- ProjectionRebuild row ceases to exist. QueryProjection is unaffected
+-- throughout: it reads "the live Projection", which quietly becomes the
+-- new one at promotion. No new rejection kind, no wire-contract change for
+-- readers, and no window in which a caller is answered from a half-built
+-- projection - while a rebuild is building, the projection answers from
+-- its existing content, at its existing position, under its existing
+-- schema. A rebuild is a second, private fold that nothing reads until it
+-- is complete, not a projection taken offline in view of its callers.
+
 rule RegisterProjection {
     when: RegisterProjection(access_mapping, bounded_context, name, schema,
         consumed_event_types, sync)
@@ -1719,26 +1872,43 @@ rule RegisterProjection {
         not exists existing
         or schema_is_backwards_compatible(existing.schema, schema)
 
-    -- Deliberately no additive-only constraint on consumed_event_types,
-    -- unlike RegisterEventType's tag_mappings. Tag mapping keys are
-    -- additive because stored events already carry tags under them and
+    -- Still no additive-only constraint on consumed_event_types, unlike
+    -- RegisterEventType's tag_mappings. Tag mapping keys are additive
+    -- because stored events already carry tags under them and
     -- EventTagsMatchDeclaredMappings checks that history against the
     -- current mappings. A projection's built content isn't modelled here,
-    -- so there is no equivalent invariant to strand: dropping a consumed
-    -- type leaves nothing structurally inconsistent. What it does leave
-    -- open is whether the projection's existing state should be rebuilt -
-    -- see the open question on re-registering a projection that already
-    -- holds state.
+    -- so there is no equivalent invariant to strand and a drop is
+    -- accepted rather than rejected - it is staged for a rebuild instead
+    -- (below), which is what makes accepting it safe.
     let schema_changed = exists existing and existing.schema != schema
 
+    -- The consumed types this registration adds or drops, in either
+    -- direction, and whether the stream holds anything for them. An added
+    -- or dropped type with no committed events changes nothing about what
+    -- the projection would have folded, so it needs no replay; one with
+    -- history does, whichever direction it moved in - see the note above.
+    let previously_consumed = if exists existing: existing.consumed_event_types else: {}
+    let changed_event_types =
+        (consumed_event_types - previously_consumed)
+            + (previously_consumed - consumed_event_types)
+    let consumed_change_has_history =
+        changed_event_types.any(et =>
+            Events.any(e => e.bounded_context = bounded_context and e.event_type = et))
+
+    let becoming_sync = exists existing and existing.sync = false and sync = true
+
+    let rebuild_needed =
+        exists existing
+        and (schema_changed or consumed_change_has_history or becoming_sync)
+
+    -- At most one pending rebuild exists per projection
+    -- (UniqueRebuildPerProjectionAndStatus), so this is the row to
+    -- restage when one is already waiting. A building rebuild is
+    -- deliberately not looked up: it is never touched from here.
+    let staged = ProjectionRebuild{projection: existing, status: pending}
+
     ensures:
-        if exists existing:
-            existing.schema = schema
-            existing.schema_version =
-                if schema_changed: existing.schema_version + 1 else: existing.schema_version
-            existing.consumed_event_types = consumed_event_types
-            existing.sync = sync
-        else:
+        if not exists existing:
             Projection.created(
                 bounded_context: bounded_context,
                 name: name,
@@ -1748,6 +1918,76 @@ rule RegisterProjection {
                 sync: sync,
                 caught_up_to: null
             )
+        else if rebuild_needed:
+            if exists staged:
+                staged.schema = schema
+                staged.schema_version =
+                    if schema_changed: existing.schema_version + 1 else: existing.schema_version
+                staged.consumed_event_types = consumed_event_types
+                staged.sync = sync
+                staged.caught_up_to = null
+            else:
+                ProjectionRebuild.created(
+                    projection: existing,
+                    schema: schema,
+                    schema_version:
+                        if schema_changed: existing.schema_version + 1 else: existing.schema_version,
+                    consumed_event_types: consumed_event_types,
+                    sync: sync,
+                    caught_up_to: null,
+                    status: pending
+                )
+        else:
+            -- A trivial change, by definition one the schema did not take
+            -- part in, so neither schema nor schema_version is touched
+            -- here: schema_changed being true is itself enough to make a
+            -- registration non-trivial.
+            existing.consumed_event_types = consumed_event_types
+            existing.sync = sync
+}
+
+-- The admin action the staging above waits for, and the only thing in this
+-- spec that starts a replay. It is deliberately separate from
+-- RegisterProjection rather than a branch within it: registration is
+-- driven by a deploy, this is driven by a person deciding the cost of a
+-- replay is worth paying now. Gated the same way registration is, by an
+-- admin-level grant for the projection's own bounded context - but not,
+-- unlike registration, on that context still being active. A rebuild only
+-- replays already-committed history: it writes no new command and no new
+-- event, which is the only thing an archived context forbids (see entity
+-- BoundedContext), and it is the same reason QueryProjection, FetchEvents
+-- and FetchCommands require no active context either. The requirement was
+-- here by analogy to RegisterProjection, which does need an active context
+-- because registration is part of a deploy-time reconciliation loop that
+-- means nothing against an archived one; that analogy does not hold for a
+-- replay-only action, so it is gone.
+--
+-- From the flip onwards the rebuild catches up from the start of the
+-- bounded context's stream under its staged definition, advancing its own
+-- caught_up_to through the same black-box mechanism an async projection
+-- already uses (see the project() and await_projection_caught_up notes
+-- above the rules); this spec pins down the observable caught_up_to
+-- contract and nothing beyond it. What happens when it arrives is
+-- promotion, described in the note above RegisterProjection.
+
+rule RebuildProjection {
+    when: RebuildProjection(access_mapping, projection)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = projection.bounded_context
+
+    let staged = ProjectionRebuild{projection: projection, status: pending}
+
+    -- Nothing staged is a rejection, not a silent no-op: an admin calling
+    -- this expects a replay to start, and when the running binary declares
+    -- exactly what the projection already serves there is nothing to
+    -- replay. The same treatment RevokeToken gives an already-revoked
+    -- token. A rebuild already building is not a second trigger either -
+    -- this only ever finds a pending row.
+    requires: exists staged
+
+    ensures:
+        staged.status = building
 }
 
 -- The four token-minting rules below are deliberately uniform: one rule
@@ -1955,6 +2195,20 @@ invariant UniqueProjectionNamePerContext {
             a != b and a.bounded_context = b.bounded_context implies a.name != b.name
 }
 
+invariant UniqueRebuildPerProjectionAndStatus {
+    -- At most one pending and at most one building ProjectionRebuild per
+    -- Projection, so "the staged next definition" and "the rebuild
+    -- currently replaying" are each a single, unambiguous row. That is
+    -- what lets RegisterProjection restage by overwriting the pending row
+    -- rather than accumulating rows, and RebuildProjection trigger "the"
+    -- pending one without choosing between candidates. The two coexisting
+    -- is the deliberate case: a non-trivial registration arriving mid-build
+    -- stages alongside the build rather than disturbing it.
+    for a in ProjectionRebuilds:
+        for b in ProjectionRebuilds:
+            a != b and a.projection = b.projection implies a.status != b.status
+}
+
 invariant SubscriptionScopedToGrantContext {
     -- A Subscription only ever belongs to the bounded context its own
     -- access_mapping is granted against - the structural form of
@@ -1975,12 +2229,18 @@ invariant SyncProjectionNeverLags {
     --
     -- Deliberately scoped to caught_up_to != null: a sync projection that
     -- has never yet been updated is exempted rather than treated as a
-    -- violation, since a fresh registration - or a flip from async to
-    -- sync - has no committed transaction to have piggybacked on yet.
-    -- That startup/flip gap is real and unresolved (see the open
-    -- question on re-registering a projection that already holds state);
-    -- this invariant only states what must hold once a sync projection
-    -- has actually caught up, not how or when it first gets there.
+    -- violation, since a fresh registration has no committed transaction
+    -- to have piggybacked on yet. This invariant only states what must
+    -- hold once a sync projection has actually caught up, not how or when
+    -- it first gets there.
+    --
+    -- A projection becoming sync is not a second case of that gap. sync
+    -- only ever flips false -> true through a rebuild, and a rebuild is
+    -- promoted already caught up (see the note above RegisterProjection),
+    -- so there is no moment at which a Projection is declared sync while
+    -- trailing. Quantified over Projections alone for the same reason: a
+    -- building ProjectionRebuild declaring sync = true while it is still
+    -- replaying is untouched by this, and correctly so - nothing reads it.
     for p in Projections:
         for e in Events:
             (p.sync = true and p.caught_up_to != null and e.bounded_context = p.bounded_context)
@@ -2497,6 +2757,14 @@ surface TypeRegistration {
     context bounded_context: BoundedContext
         where this = access_mapping.bounded_context and status = active
 
+    exposes:
+        for projection in bounded_context.projections:
+            projection.name
+            for rebuild in projection.rebuilds:
+                rebuild.status
+                rebuild.schema_version
+                rebuild.caught_up_to
+
     provides:
         RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
             sensitive_fields, external_creation_allowed, direct_creation_allowed,
@@ -2505,6 +2773,7 @@ surface TypeRegistration {
             sensitive_fields, rest_trigger_allowed)
         RegisterProjection(access_mapping, bounded_context, name, schema,
             consumed_event_types, sync)
+        RebuildProjection(access_mapping, projection)
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises registering event types,
@@ -2512,7 +2781,10 @@ surface TypeRegistration {
         -- never another one. For a projection this extends to what it
         -- reads: every EventType it consumes must belong to that same
         -- context, so registration is never a way to build a view across
-        -- the boundary.
+        -- the boundary. The same scoping governs what this surface shows:
+        -- the rebuilds visible here are those of its own context's
+        -- projections, and a projection in any other context is not merely
+        -- unrebuildable but invisible.
 
     @guarantee SchemaEvolutionStaysCompatible
         -- Re-registering an EventType, CommandType or Projection with a
@@ -2523,6 +2795,16 @@ surface TypeRegistration {
         -- and never tightened from optional to required; a newly added
         -- field must be optional. A first-time registration has no prior
         -- schema to break and is unaffected.
+
+    @guarantee RegistrationNeverRebuilds
+        -- Registering a projection never replays a stream and never
+        -- disturbs what a projection is already serving. A change that
+        -- could not honestly be applied to already-folded content is
+        -- staged and waits; only an explicit RebuildProjection call starts
+        -- the replay, and only promotion - automatic, and complete by
+        -- construction - changes what a reader sees. A deploy therefore
+        -- costs nothing and breaks nothing, however far the declared
+        -- definition has moved.
 
     @guidance
         -- GraphQL only. Typically driven by a startup reconciliation loop
@@ -2536,9 +2818,36 @@ surface TypeRegistration {
         -- synchronously are all compiled into the running binary, so the
         -- same loop that registers types registers them too. schema_version
         -- advances only when schema itself changed; consumed_event_types
-        -- and sync are reconciled to the given values on every call.
+        -- and sync are reconciled to the given values on every call when
+        -- the change is trivial, and staged for a rebuild when it is not.
+        --
         -- What re-registration does not do is rebuild what a projection
-        -- already holds (see open questions).
+        -- already holds. RebuildProjection is that action, and it is here
+        -- rather than on a surface of its own because it completes the
+        -- same reconciliation: the deploy declares the new definition, an
+        -- admin decides when the replay it implies is paid for. It names
+        -- the projection alone - what to rebuild it into is whatever the
+        -- last registration staged, never a fresh definition supplied at
+        -- trigger time. See the note above RegisterProjection.
+        --
+        -- Because that decision is a person's rather than a deploy's, the
+        -- staged rebuilds are readable here: for each of the context's
+        -- projections, whether a rebuild is pending or building, which
+        -- staged definition is waiting (schema_version) and how far a
+        -- running one has replayed (caught_up_to). Without it an admin's
+        -- only notice that a rebuild is outstanding is having run the
+        -- deploy that staged it, and a projection may drift arbitrarily
+        -- far from what its own binary declares unnoticed. Deliberately
+        -- coarse, as everywhere else on this track: this establishes that
+        -- the pending rebuild is visible and scoped, not how it is paged
+        -- or shaped on the wire (see the scope header's exclusions).
+        --
+        -- RebuildProjection no longer requires an active bounded context -
+        -- a replay writes nothing, so archival does not forbid it (see the
+        -- note above the rule). This surface still binds active contexts
+        -- only, though, so a rebuild staged before its context was
+        -- archived remains out of reach from here; what entry point it
+        -- should get is an open question.
 }
 
 surface EventTypeAdminOperations {
@@ -2679,9 +2988,7 @@ surface AccessManagement {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "External event context: how much source-specific metadata should be persisted, and does the shape vary per source type (e.g. Kafka vs webhook)?"
-
-open question "Re-registering a projection that already holds state: RegisterProjection reconciles schema, consumed_event_types and sync in place, but nothing rebuilds what was already built from the stream, and caught_up_to is left where it is. Does changing schema, or adding/dropping a consumed EventType, require a replay from the start of the bounded context's stream - and if so, what does the projection answer while it rebuilds? Flipping sync from false to true is the sharpest case: an async projection may be lagging at that moment, so SyncProjectionNeverLags is violated from the flip until it catches up. Either the flip has to catch the projection up atomically before it takes effect, or that stale-but-declared-sync window has to be accepted and named."
+open question "RebuildProjection no longer requires an active bounded context - a replay only re-reads committed history, so archival, which forbids new commands and events, does not forbid it - but TypeRegistration, the only surface that provides it, binds its context as 'BoundedContext where this = access_mapping.bounded_context and status = active'. A rebuild staged before its context was archived is therefore still unreachable, now for a surface reason rather than a rule reason. Does that context clause drop 'status = active' and move the condition onto the three Register* actions as per-action guards - behaviour-preserving, since each of those rules already requires it - does RebuildProjection move to a surface of its own that admits archived contexts, or is a rebuild against a context that was then archived simply not worth triggering, in which case the stranded row wants an explicit disposal path rather than an implicit one?"
 
 open question "Websocket complement to EventFetch: fetching over REST is pull-based, so a remote workflow either polls or lags. Resolved: it is the same capability under a different binding - the same EventReadToken and the same EventType.event_read_allowed opt-in, presented via an Authorization header at the connection handshake (the audience is server-side remote workflows, not browser JS, so header-based auth at handshake is viable), and reusing Subscription/EventTypeSubscription/Filter rather than a second filter model. Still open: delivery guarantees (at-least-once vs at-most-once, and what happens to events produced while a connection is down) and cursor/resume semantics for the push case - note that the GraphQL subscription surface (EventSubscription) resolves the cursor/resume half for its own track via from_sequence; this REST/token track has not adopted the same answer yet."
 
