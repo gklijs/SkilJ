@@ -73,8 +73,21 @@
 --     as the event cache's startup warm-up count, rather than modelled
 --     as domain state; the additive path to trusting several IdPs later
 --     is recorded in the identity resolution note above entity Role
---   - The websocket complement to token-authenticated event fetching
---     (see open questions)
+--   - The websocket complement to token-authenticated event fetching:
+--     excluded as a surface here, not undecided. It is the same
+--     capability under a different binding - the same EventReadToken and
+--     the same EventType.event_read_allowed opt-in, presented in an
+--     Authorization header at the connection handshake (the audience is
+--     server-side remote workflows, not browser JS, so header-based auth
+--     at handshake is viable), reusing Subscription /
+--     EventTypeSubscription / Filter rather than a second filter model,
+--     and taking EventSubscription's delivery and resume answer
+--     unchanged: at most once while the connection is live, nothing held
+--     for a connection that is not, and a reconnect that creates a fresh
+--     subscription from the last sequence received rather than resuming
+--     the old one (see EventSubscription's DeliveryIsAtMostOnce). What
+--     stays excluded is its wire contract, alongside the GraphQL wire
+--     contract already excluded above
 -- Dependencies: none yet
 
 ------------------------------------------------------------
@@ -722,6 +735,14 @@ entity ProjectionRebuild {
     -- row ceases to exist (see the note above RegisterProjection). A
     -- finished rebuild is not a ProjectionRebuild in some completed
     -- status; it is the live Projection.
+    --
+    -- A discarded rebuild has the same shape, for the same reason: an
+    -- admin who decides a staged replay is not worth paying for calls
+    -- DiscardProjectionRebuild and the pending row ceases to exist, with
+    -- the live Projection left serving its current definition, untouched.
+    -- There is no discarded status either - a rebuild that has ended is
+    -- either the live Projection or nothing at all. Only a pending row can
+    -- be discarded; a building one runs to promotion.
     transitions status {
         pending -> building
         terminal: building
@@ -737,6 +758,13 @@ entity Subscription {
                                             -- the note above Actor Declarations) - so a
                                             -- revocation mid-subscription stops delivery
                                             -- immediately rather than at the next reconnect.
+                                            -- It does not merely fall silent either: the
+                                            -- server closes the connection, with a reason
+                                            -- the caller can tell apart from an ordinary
+                                            -- transport drop, so a revoked subscription is
+                                            -- never mistaken for a quiet bounded context
+                                            -- (see EventSubscription's
+                                            -- RevocationClosesTheConnection).
     created_at: Timestamp
     from_sequence: Integer                 -- delivery starts strictly after this Event.sequence.
                                             -- Fixed once at creation: the bounded context's
@@ -749,6 +777,12 @@ entity Subscription {
                                             -- state first queries it separately (FetchEvents or
                                             -- QueryProjection) and supplies the sequence it read
                                             -- up to here for a gap-free handoff into the live feed.
+                                            -- Reconnecting after a dropped connection is that
+                                            -- same handoff, not a second mechanism: the old
+                                            -- subscription is gone with its connection, and the
+                                            -- caller creates a fresh one whose from_sequence is
+                                            -- the last sequence it actually received (see
+                                            -- EventSubscription's DeliveryIsAtMostOnce).
     kind: AllEventsSubscription | EventTypeSubscription
 }
 
@@ -1245,10 +1279,25 @@ rule CreateEventTypeSubscription {
 -- DeliverToSubscriptions runs outside the transaction that committed the
 -- triggering event, the same register as an async projection's update:
 -- best-effort, after the fact, for every still-active subscription whose
--- from_sequence the new event is past. What "best-effort" guarantees
--- under a dropped connection - at-least-once vs at-most-once delivery -
--- is still open (see open questions); from_sequence is what lets a caller
--- resume without a gap once it notices one.
+-- from_sequence the new event is past. "Best-effort" means at most once
+-- and no more: while a subscription's connection is live it receives
+-- every matching event once, in sequence order, and there is nothing to
+-- acknowledge back. Nothing is held for a connection that is not live -
+-- a subscription lasts exactly as long as its connection, so an event
+-- committed while that connection is down is delivered to no one and
+-- kept for no one. A caller that wants what it missed reads it back
+-- (FetchEvents or QueryProjection) and starts a fresh subscription from
+-- the last sequence it actually received; see Subscription.from_sequence
+-- and EventSubscription's DeliveryIsAtMostOnce.
+--
+-- The still-active check on the grant below is a live re-check on every
+-- delivery rather than a snapshot taken at creation (see the note on
+-- Subscription.access_mapping), and dropping out of this loop is not all
+-- that happens to a revoked caller: the same revocation closes its
+-- connection, with a reason it can tell apart from an ordinary transport
+-- drop, so it learns its subscription is over instead of merely ceasing
+-- to hear from one - see EventSubscription's
+-- RevocationClosesTheConnection.
 
 rule DeliverToSubscriptions {
     when: event: Event.created
@@ -1831,9 +1880,12 @@ rule RegisterCommandType {
 -- pending and one building rebuild coexist per projection (see
 -- UniqueRebuildPerProjectionAndStatus).
 --
--- Promotion is automatic, and is the only way a rebuild ends. It is a
--- background-process concern in the same register as the async project()
--- consumer (see the note above the rules), not a third admin action: once
+-- Promotion is automatic, and is the only way a rebuild ends in a changed
+-- projection - the one other way it ends, an admin discarding it while it
+-- is still pending, changes nothing a reader sees at all (see the note
+-- above DiscardProjectionRebuild). It is a background-process concern in
+-- the same register as the async project() consumer (see the note above
+-- the rules), not an admin action of its own: once
 -- a building rebuild's caught_up_to reaches its bounded context's latest
 -- committed sequence, its schema, schema_version, consumed_event_types,
 -- sync and caught_up_to replace the live Projection's, the content that
@@ -1985,9 +2037,62 @@ rule RebuildProjection {
     -- token. A rebuild already building is not a second trigger either -
     -- this only ever finds a pending row.
     requires: exists staged
+    requires: staged.status = pending
 
     ensures:
         staged.status = building
+}
+
+-- The other exit from a pending rebuild, and the only thing in this spec
+-- that ends one without a replay. An admin who looks at a staged rebuild
+-- and decides the replay is not worth paying for says so here: the pending
+-- row ceases to exist and the live Projection carries on serving its own
+-- current definition, untouched, exactly as it was while the row sat
+-- there. Nothing is replayed, nothing is promoted, and nothing a reader
+-- sees changes - dropping a staged definition is the one operation on a
+-- rebuild that costs nothing.
+--
+-- Gated exactly as RebuildProjection is, and for the same reasons -
+-- including the absence of an active-context requirement. Discarding
+-- writes no command and no new event, and the archived case is the one
+-- that most needs it: RegisterProjection does require an active context,
+-- so a rebuild staged before its context was archived can never be
+-- restaged, superseded or reconciled away, and without this it would sit
+-- pending forever against a stream that no longer grows. It is not
+-- restricted to that case, though. An admin who staged a change and
+-- thought better of it before triggering it is making the same decision
+-- against a live context, and there is no reason to make them wait for a
+-- deploy to unmake it.
+--
+-- Only a pending rebuild can be discarded. A build already running is left
+-- to finish under the definition it was triggered with: promotion is what
+-- ends it, which is the same reason RegisterProjection never touches a
+-- building row either.
+--
+-- Discarding is a decision about now, not a standing refusal. Against an
+-- active context the next deploy declaring that same definition stages it
+-- again, and correctly so - the running binary still says that is what the
+-- projection should be. What a discard buys is that the staged row and the
+-- replay it implies stop waiting on an admin who has already decided
+-- against them; it does not overrule what the binary declares.
+
+rule DiscardProjectionRebuild {
+    when: DiscardProjectionRebuild(access_mapping, projection)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = projection.bounded_context
+
+    let staged = ProjectionRebuild{projection: projection, status: pending}
+
+    -- Nothing staged is a rejection rather than a silent no-op, the same
+    -- treatment RebuildProjection gives it: an admin calling this expects
+    -- there to be a staged definition to drop. A rebuild already building
+    -- is not discardable either - this only ever finds a pending row.
+    requires: exists staged
+    requires: staged.status = pending
+
+    ensures:
+        not exists staged
 }
 
 -- The four token-minting rules below are deliberately uniform: one rule
@@ -2497,11 +2602,16 @@ surface EventFetch {
         -- "Authorization: Bearer <id>.<secret>" - see the note above the
         -- surfaces. Deliberately coarse otherwise: this establishes the
         -- capability and its scoping, not the query wire contract. Paging
-        -- and cursor encoding are still open (see open questions), as is
-        -- the real-time websocket complement to this pull-based fetch. A
-        -- filter whose operator doesn't fit its field's declared type is
-        -- rejected outright, not merely unsatisfiable - see valid_filters
-        -- in the note above rule FetchEvents.
+        -- and cursor encoding stay deferred with the rest of that
+        -- contract, as does the real-time websocket complement to this
+        -- pull-based fetch - what that complement will be is settled
+        -- though, down to reusing this token, this opt-in, the
+        -- Subscription/Filter model and EventSubscription's delivery and
+        -- resume answer; only its wire contract is outstanding (see the
+        -- scope header's exclusions). A filter whose operator doesn't fit
+        -- its field's declared type is rejected outright, not merely
+        -- unsatisfiable - see valid_filters in the note above rule
+        -- FetchEvents.
         --
         -- This is the read the per-bounded-context in-memory event cache
         -- is primarily there for (see the note above the rules): its
@@ -2616,6 +2726,43 @@ surface EventSubscription {
         -- for a gap-free handoff into the live feed, supplies the
         -- sequence it read up to as from_sequence here.
 
+    @guarantee DeliveryIsAtMostOnce
+        -- While the connection is live, every matching event arrives
+        -- once, in sequence order: no duplicates, no gaps, and nothing to
+        -- acknowledge back. Nothing is held for a connection that is not
+        -- live. A subscription lasts exactly as long as its connection,
+        -- so an event committed while that connection is down reaches
+        -- this caller not at all - it is not queued, retried or replayed
+        -- afterwards. A transport-level disconnect is therefore the only
+        -- way an event can be missed here, and it is by the same token
+        -- the only signal that one was: a live stream has no gap to watch
+        -- for, so there is no separate sequence-monitoring duty on the
+        -- client beyond noticing that its connection dropped.
+
+    @guarantee RevocationClosesTheConnection
+        -- A subscription whose backing grant is revoked does not merely
+        -- fall silent: the server closes its connection, and closes it
+        -- with a reason the caller can tell apart from an ordinary
+        -- transport drop. This follows directly from
+        -- DeliveryIsAtMostOnce - a live connection is the caller's only
+        -- evidence that it has missed nothing - so a revoked
+        -- subscription left open would be indistinguishable from a
+        -- bounded context with nothing to say, and the caller would wait
+        -- on it indefinitely believing itself current.
+        --
+        -- The two closes call for different responses, which is why they
+        -- are told apart. An ordinary drop means "reconnect from the last
+        -- sequence you received": the client-driven handoff described
+        -- under FreshEventsOnly, with a read-back over FetchEvents or
+        -- QueryProjection for the span committed while away. This one
+        -- means the subscription is permanently over - the grant it
+        -- delivered to no longer exists, so neither a fresh subscription
+        -- nor a QueryProjection read-back under that same grant will be
+        -- accepted, and reconnecting under it is pointless until a
+        -- superadmin grants access again. Nothing the caller was entitled
+        -- to is left unseen either: delivery stops at the revocation,
+        -- which is the same instant the entitlement does.
+
     @guarantee SensitiveFieldsStayProtected
         -- A sensitive field is delivered decrypted only when the
         -- receiving access_mapping is entitled to it: either
@@ -2637,6 +2784,27 @@ surface EventSubscription {
         -- or disconnects. There is no separate cancel mutation and no
         -- state that outlives the connection beyond what from_sequence
         -- lets a caller hand to a fresh one on reconnect.
+        --
+        -- Reconnecting is therefore creating a subscription, not resuming
+        -- one: the dropped subscription no longer exists to resume. The
+        -- client supplies as from_sequence the last sequence it actually
+        -- received - each delivered event carries its own - and, if it
+        -- cares about what was committed while it was away, reads that
+        -- span back over FetchEvents or QueryProjection first. That is
+        -- deliberately the same move as the initial handoff into the live
+        -- feed described under FreshEventsOnly, driven entirely by the
+        -- client, rather than a second resume mechanism owned by the
+        -- server. The websocket complement to EventFetch adopts this same
+        -- answer unchanged when it arrives (see the scope header's
+        -- exclusions).
+        --
+        -- The one close the client must not treat that way is a revoked
+        -- grant's (see RevocationClosesTheConnection). That the close
+        -- carries a reason, and that the reason is distinguishable from
+        -- an ordinary transport drop, is guaranteed here; the exact close
+        -- code or error payload carrying it stays deferred with the rest
+        -- of the wire contract, exactly as ProjectionQuery's timeout
+        -- distinction does (see the scope header's exclusions).
         --
         -- AllEventsSubscription.event_types narrows which event types are
         -- delivered (empty means every type in the bounded context) but
@@ -2755,7 +2923,7 @@ surface CommandQuery {
 surface TypeRegistration {
     facing access_mapping: AdminAccess
     context bounded_context: BoundedContext
-        where this = access_mapping.bounded_context and status = active
+        where this = access_mapping.bounded_context
 
     exposes:
         for projection in bounded_context.projections:
@@ -2769,11 +2937,15 @@ surface TypeRegistration {
         RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
             sensitive_fields, external_creation_allowed, direct_creation_allowed,
             system_triggered_allowed, event_read_allowed, system_triggered_schedule?)
+            when bounded_context.status = active
         RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
             sensitive_fields, rest_trigger_allowed)
+            when bounded_context.status = active
         RegisterProjection(access_mapping, bounded_context, name, schema,
             consumed_event_types, sync)
+            when bounded_context.status = active
         RebuildProjection(access_mapping, projection)
+        DiscardProjectionRebuild(access_mapping, projection)
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises registering event types,
@@ -2804,7 +2976,10 @@ surface TypeRegistration {
         -- the replay, and only promotion - automatic, and complete by
         -- construction - changes what a reader sees. A deploy therefore
         -- costs nothing and breaks nothing, however far the declared
-        -- definition has moved.
+        -- definition has moved. Discarding a staged rebuild costs nothing
+        -- either, and for the same reason: it drops the waiting definition
+        -- and leaves the live projection serving exactly what it served
+        -- before.
 
     @guidance
         -- GraphQL only. Typically driven by a startup reconciliation loop
@@ -2842,12 +3017,33 @@ surface TypeRegistration {
         -- the pending rebuild is visible and scoped, not how it is paged
         -- or shaped on the wire (see the scope header's exclusions).
         --
-        -- RebuildProjection no longer requires an active bounded context -
-        -- a replay writes nothing, so archival does not forbid it (see the
-        -- note above the rule). This surface still binds active contexts
-        -- only, though, so a rebuild staged before its context was
-        -- archived remains out of reach from here; what entry point it
-        -- should get is an open question.
+        -- RebuildProjection does not require an active bounded context - a
+        -- replay writes nothing, so archival does not forbid it (see the
+        -- note above the rule) - and this surface no longer binds active
+        -- contexts only either. A rebuild staged before its context was
+        -- archived therefore stays reachable, and the staged rebuilds of an
+        -- archived context's projections stay readable, which is the whole
+        -- point of showing them: a stranded row an admin cannot see is a
+        -- stranded row an admin cannot act on.
+        --
+        -- Acting on one means one of two things, and both are here.
+        -- RebuildProjection pays for the replay; DiscardProjectionRebuild
+        -- drops the staged definition and leaves the live projection
+        -- serving what it already serves. Neither is narrowed by archival,
+        -- so a rebuild staged before its context was archived is no longer
+        -- stranded at all: an admin can still run it, and can now also
+        -- decide it is not worth running. A pending rebuild is a decision
+        -- waiting to be made, not one nobody can unmake. Discard reaches
+        -- pending rows only - a rebuild already replaying runs to
+        -- promotion (see the note above the rule).
+        --
+        -- The active-context condition sits on the three Register* actions
+        -- instead, one guard each. That is where it always belonged:
+        -- registration is part of a deploy-time reconciliation loop and
+        -- means nothing against an archived context, and each of those
+        -- rules already requires it, so the guards restate the rule rather
+        -- than adding to it. Nothing else on this surface is narrowed by
+        -- archival.
 }
 
 surface EventTypeAdminOperations {
@@ -2987,12 +3183,6 @@ surface AccessManagement {
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
-
-open question "RebuildProjection no longer requires an active bounded context - a replay only re-reads committed history, so archival, which forbids new commands and events, does not forbid it - but TypeRegistration, the only surface that provides it, binds its context as 'BoundedContext where this = access_mapping.bounded_context and status = active'. A rebuild staged before its context was archived is therefore still unreachable, now for a surface reason rather than a rule reason. Does that context clause drop 'status = active' and move the condition onto the three Register* actions as per-action guards - behaviour-preserving, since each of those rules already requires it - does RebuildProjection move to a surface of its own that admits archived contexts, or is a rebuild against a context that was then archived simply not worth triggering, in which case the stranded row wants an explicit disposal path rather than an implicit one?"
-
-open question "Websocket complement to EventFetch: fetching over REST is pull-based, so a remote workflow either polls or lags. Resolved: it is the same capability under a different binding - the same EventReadToken and the same EventType.event_read_allowed opt-in, presented via an Authorization header at the connection handshake (the audience is server-side remote workflows, not browser JS, so header-based auth at handshake is viable), and reusing Subscription/EventTypeSubscription/Filter rather than a second filter model. Still open: delivery guarantees (at-least-once vs at-most-once, and what happens to events produced while a connection is down) and cursor/resume semantics for the push case - note that the GraphQL subscription surface (EventSubscription) resolves the cursor/resume half for its own track via from_sequence; this REST/token track has not adopted the same answer yet."
-
-open question "EventSubscription's delivery guarantees during a dropped GraphQL connection: from_sequence gives a reconnecting caller a resume point, but nothing here specifies at-least-once vs at-most-once delivery while connected, or whether the client is expected to detect a gap itself (e.g. via a monotonic sequence check) and resume with a fresh from_sequence, or whether that detection is the library's job too."
 
 open question "Bootstrapping the first superadmin Role is resolved in principle - an out-of-band seed/migration step at first deployment inserts a Role row directly with superadmin = true and external_subject set to the initial admin's IdP identity, bypassing the GraphQL surface and CreateRole's superadmin-caller requirement (see the note above CreateRole). What remains open is how and where that step is triggered: a migration run by the library, a CLI subcommand, a configuration value read once at first startup, or left entirely to the consuming application's own deployment process."
 
