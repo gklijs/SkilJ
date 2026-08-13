@@ -95,14 +95,28 @@
 ------------------------------------------------------------
 
 value Filter {
-    field: String              -- name of a field in the event type's schema
+    field: String              -- names a field in the event type's schema, either as a bare
+                                -- top-level field name or as a two-segment dotted path reaching
+                                -- one leaf inside a nested shape (e.g. address.country). Never
+                                -- deeper than two segments - the one-level nesting cap makes
+                                -- that structurally impossible - and never a nested-object-typed
+                                -- field itself: there is no filtering on the whole address, only
+                                -- on a scalar leaf within it (see the payload schema shape note
+                                -- above entity CommandType)
     operator: FilterOperator
     value: String               -- comparison value, serialised to match the field's declared type
 }
 
 value Metadata {
     type: String                -- denormalised name of the event/command type this message conforms to
-    version: Integer             -- schema_version of the type at the time this message was created
+    version: Integer             -- schema_version of the type at the time this message was created.
+                                 -- Audit and provenance only. A reader never resolves it to the
+                                 -- schema text that was in force then: none is kept, and none is
+                                 -- needed, because backwards-compatible-only evolution makes the
+                                 -- type's current schema a superset of every schema it has ever
+                                 -- had, so that current schema still describes this payload in
+                                 -- full. See the schema_is_backwards_compatible note above rule
+                                 -- RegisterEventType.
     client_id: String          -- identifies the client/caller that produced this message in some cases it might refer to the original call, for an event it might be the client that issues the command
     created_at: Timestamp
 }
@@ -131,6 +145,10 @@ value TagMapping {
                                  -- can be declared by multiple event types, so a consistency boundary
                                  -- can span all of them regardless of type (e.g. MoneyAdded and
                                  -- MoneySubtracted both mapping their account_id field to "account").
+                                 -- What a shared key buys is that reach across types, at one value of
+                                 -- the key - not a boundary over every value of it. There is no
+                                 -- type-wide, valueless form of tag, and the derive_tags note above
+                                 -- the rules says why that is settled rather than missing.
                                  --
                                  -- Keys are plain strings: no namespace prefix, no central registry.
                                  -- None is needed, because every place a tag key is read partitions
@@ -153,7 +171,12 @@ value TagMapping {
                                  -- list-of-scalars field, and the field may be optional; how
                                  -- many Tags each of those shapes derives, and what an absent
                                  -- or empty one derives, is the derive_tags contract - see the
-                                 -- note above the rules.
+                                 -- note above the rules. It may be written either as a bare
+                                 -- top-level field name or as a two-segment dotted path reaching
+                                 -- one leaf inside a nested shape (e.g. address.country); never
+                                 -- deeper, and never a nested-object-typed field itself, since
+                                 -- there is no tag whose value is a whole address (see the
+                                 -- payload schema shape note above entity CommandType).
 }
 
 value EventSpec {
@@ -208,6 +231,15 @@ value SensitiveField {
                                   -- which event type or payload field name captured it
     subject_field: String        -- name of the payload field this event type reads the
                                   -- concrete subject value from (e.g. "user_id")
+
+    -- Both field and subject_field may be written either as a bare
+    -- top-level field name or as a two-segment dotted path reaching one
+    -- leaf inside a nested shape (e.g. address.country) - never deeper,
+    -- and never a nested-object-typed field itself. A whole nested object
+    -- cannot be marked sensitive; only a scalar leaf within it can, and
+    -- that leaf alone is what gets replaced by ciphertext. See the payload
+    -- schema shape note above entity CommandType for why encrypting the
+    -- enclosing object is the wrong shape rather than merely unbuilt.
 }
 
 value EncryptedPayload {
@@ -234,6 +266,18 @@ entity BoundedContext {
     status: active | archived              -- archived: no longer accepts new commands/events, but its
                                             -- history is retained (event sourcing is append-only; a
                                             -- bounded context is deactivated, never erased)
+    created_at: Timestamp                  -- when this context came into being: the moment
+                                            -- AddBoundedContext was called, for every context an
+                                            -- admin adds, and the moment of SkilJ's own first
+                                            -- startup for the admin context (see the note above the
+                                            -- Defaults section)
+    created_by: ContextCreator             -- on whose authority it came into being - a real
+                                            -- superadmin Role, or SkilJ itself for the admin
+                                            -- context alone (see entity ContextCreator below).
+                                            -- Recorded rather than derived: creation is not itself a
+                                            -- Command or Event yet (see the note above the admin
+                                            -- rules), so without these two fields nothing anywhere
+                                            -- says when a context appeared or on whose authority
 
     event_types: EventType with bounded_context = this
     command_types: CommandType with bounded_context = this
@@ -250,33 +294,115 @@ entity BoundedContext {
     }
 }
 
--- Payload schema shape, shared by CommandType.schema and
--- EventType.schema below. For this version, an event or command payload
--- schema describes a flat structure: scalar fields, each of which may be
--- declared optional, and lists of scalars. Nested objects - and therefore
--- nested field paths - are out of scope. That bounds what a TagMapping,
--- a SensitiveField and a Filter each have to be able to name: a single
--- top-level field name, never a path into a sub-object.
+-- Who a BoundedContext was created by. The two cases differ in kind
+-- rather than one being a missing instance of the other: every bounded
+-- context an admin adds is created by a real superadmin Role that called
+-- AddBoundedContext, while the admin bounded context is created by SkilJ
+-- itself, which is not a Role and cannot be made into one - a Role is an
+-- external IdP identity that can authenticate (see entity Role and the
+-- GraphQL identity resolution note above it), and the library is not
+-- that.
 --
--- This is a stated expectation on what a bounded context's schema may
--- declare, not something this spec enforces. A schema is an opaque JSON
--- Schema string here and is never structurally parsed at this level (see
--- the black boxes that do parse it: valid_tag_mappings,
--- valid_sensitive_fields, valid_filters and
+-- Same shape, and the same reason, as Event.origin's SystemTriggered
+-- variant: when the system itself is the originator there is no external
+-- identity to point back at, so that case is modelled as its own variant
+-- rather than as a null Role whose meaning lives only in prose. What a
+-- superadmin reads in BoundedContextDirectory is therefore a real value
+-- for every context, the admin one included.
+entity ContextCreator {
+    kind: SuperadminCreator | SystemCreator
+}
+
+variant SuperadminCreator : ContextCreator {
+    role: Role                  -- the superadmin Role that called AddBoundedContext
+}
+
+variant SystemCreator : ContextCreator {
+    -- No variant-specific fields, exactly as SystemTriggered has none:
+    -- SkilJ is the creator, so there is no Role to point at. Exactly one
+    -- instance exists - the `skilj` default - and it creates exactly one
+    -- thing, the admin bounded context (see
+    -- SystemCreatedContextIsTheAdminContext).
+}
+
+-- Payload schema shape, shared by CommandType.schema and
+-- EventType.schema below. An event or command payload schema describes a
+-- structure whose leaves are all scalar and whose nesting is capped at
+-- exactly one level. Each top-level field is declared as one of three
+-- things: a scalar, which may be declared optional; a list of scalars; or
+-- a named, reusable nested object shape (e.g. address: Address). A nested
+-- shape's own fields must themselves be scalars or lists of scalars -
+-- there is no second level of nesting inside it - and a nested shape may
+-- only be the type of a single field, never the element type of a list,
+-- so there are no lists of nested objects. What the one permitted level
+-- buys is reuse: one shape declared once and embedded by several event
+-- and command types. It is not a licence for arbitrary structure.
+--
+-- TagMapping.field, SensitiveField.field, SensitiveField.subject_field
+-- and Filter.field each name a target within that shape, written one of
+-- two ways: a bare top-level field name, exactly as before, or a
+-- two-segment dotted path reaching one leaf inside a nested shape (e.g.
+-- address.country). Two segments is the deepest a path can ever be, and
+-- that is structural rather than a rule to remember - the one-level
+-- nesting cap leaves nothing at a third segment to address.
+--
+-- What is still not a target is a nested-object-typed field itself. There
+-- is no tagging, protecting or filtering by "the whole address"; only by
+-- a scalar leaf within it. valid_tag_mappings, valid_sensitive_fields and
+-- valid_filters resolve a dotted path by walking one level into the named
+-- shape's own declared fields, and reject anything that does not land on
+-- a scalar or list-of-scalar leaf - the same existing check as for a bare
+-- top-level name, resolved one level deeper, not a second mechanism. A
+-- bounded context therefore no longer needs a separate, parallel
+-- top-level field to tag, protect or filter by something that lives
+-- inside a reusable shape: the shape can be reused and its leaves
+-- addressed, rather than reuse being bought at the cost of addressing.
+--
+-- For sensitivity specifically, what gets encrypted is the leaf and only
+-- the leaf. protect_sensitive_fields replaces that one leaf's value with
+-- ciphertext in place, leaving the rest of the enclosing object and the
+-- surrounding payload structurally untouched (see its note above the
+-- rules). That is the correct shape, and marking the whole nested object
+-- sensitive would be the wrong one: encrypting an object would make its
+-- declared type depend on the reader - an object for an entitled one, a
+-- ciphertext string for everyone else - which breaks the
+-- field-type-immutability rule the compatibility contract already fixes
+-- (see the fourth bullet of schema_is_backwards_compatible in the note
+-- above RegisterEventType). A leaf has no such problem: a scalar keeps
+-- the same declared type whether it holds plaintext or ciphertext,
+-- exactly as today's flat sensitive fields already work.
+--
+-- The nesting cap itself is a stated expectation on what a bounded
+-- context's schema may declare, not something this spec enforces - the
+-- same register the flat-only convention it widens was already stated
+-- in. A
+-- schema is an opaque JSON Schema string here and is never structurally
+-- parsed at this level (see the black boxes that do parse it:
+-- valid_tag_mappings, valid_sensitive_fields, valid_filters and
 -- schema_is_backwards_compatible), so nothing in this file can express
--- "no nested objects" as a check. A bounded context that declares a
--- nested schema anyway is outside the contract, and what its tags,
--- sensitive fields and filters would mean is undefined rather than
--- defined-and-forbidden - see the open question on nested structures.
+-- "at most one level of nesting" as a check. A bounded context that
+-- declares a deeper schema anyway is outside the contract, and what its
+-- tags, sensitive fields and filters would mean there is undefined rather
+-- than defined-and-forbidden. What is enforced is the other side of the
+-- same coin: a path that does not resolve to a scalar or list-of-scalar
+-- leaf within one level is rejected at registration or call time by the
+-- valid_* black boxes above, so a schema that stays inside the contract
+-- cannot address its way out of it.
 --
 -- Schema evolution is separately constrained, and that one is enforced:
 -- see schema_is_backwards_compatible in the note above RegisterEventType.
+-- Its contract governs the top-level field only; a nested shape's own
+-- internal evolution is not tracked there. The exception is a leaf some
+-- TagMapping, SensitiveField or Filter addresses, which cannot be dropped
+-- from its shape - pinned by the valid_* existence check rather than by
+-- that contract. See that note for both halves.
 
 entity CommandType {
     bounded_context: BoundedContext
     name: String
     schema: String              -- JSON Schema describing the command's payload fields and optionality;
-                                -- flat structures only - see the payload schema shape note above
+                                -- scalar leaves, at most one level of reusable nesting - see the
+                                -- payload schema shape note above
     schema_version: Integer     -- increments on each schema change; changes must stay backwards
                                 -- compatible, enforced by schema_is_backwards_compatible at
                                 -- registration (see the note above RegisterEventType)
@@ -314,8 +440,8 @@ entity EventType {
     bounded_context: BoundedContext
     name: String
     schema: String              -- JSON Schema describing the event's payload fields and optionality;
-                                -- flat structures only - see the payload schema shape note above
-                                -- entity CommandType
+                                -- scalar leaves, at most one level of reusable nesting - see the
+                                -- payload schema shape note above entity CommandType
     schema_version: Integer     -- increments on each schema change; changes must stay backwards
                                 -- compatible, enforced by schema_is_backwards_compatible at
                                 -- registration (see the note above RegisterEventType)
@@ -402,6 +528,40 @@ variant EventReadToken : AccessToken {
     -- Held by a remote workflow that fetches events of one type to drive
     -- itself. Read-only: it authorises no writing of any kind.
     event_type: EventType
+}
+
+-- The bootstrap secret: the only credential SkilJ ever generates for
+-- itself, and the only way the first superadmin Role comes into being. The
+-- mechanism is spelled out above rule CreateSuperadmin; what this
+-- declaration answers is why it is a construct of its own rather than a
+-- fifth AccessToken variant.
+--
+-- It is presented the way an AccessToken is - a bearer secret rather than
+-- a resolved identity - and that is the whole of the resemblance. Every
+-- property that shapes AccessToken is wrong here. An AccessToken is scoped
+-- to exactly one registered type inside exactly one bounded context, while
+-- superadmin is orthogonal to bounded contexts entirely (see
+-- RoleAccessMapping). An AccessToken is minted over GraphQL by an admin
+-- who already exists, while this one is generated by SkilJ before any Role
+-- exists to mint anything. And an AccessToken is a persisted row with a
+-- status, revoked individually through the TokenRevocation surface, while
+-- this one is held in memory only, never written to Postgres at all, and
+-- ends either at the next restart or at the moment the first superadmin
+-- exists - neither of which is a revocation anyone performs. Making it a
+-- variant would inherit scoping, persistence and revocation machinery,
+-- none of which applies to it.
+--
+-- There is no id half either. An AccessToken is presented as
+-- "<id>.<secret>" so the server can look its row up by primary key before
+-- verifying the secret (see the REST token presentation note above the
+-- surfaces); there is at most one of these at a time and no row to look
+-- up, so the secret is the whole credential.
+entity BootstrapSecret {
+    secret: String                         -- high-entropy, generated fresh at each process start for
+                                            -- as long as no active superadmin Role exists, printed
+                                            -- once to SkilJ's own startup log and held nowhere but
+                                            -- that process's memory. How it is generated is a black
+                                            -- box, the same register as generate_token_secret.
 }
 
 -- GraphQL identity resolution. SkilJ does not authenticate GraphQL
@@ -807,7 +967,39 @@ variant EventTypeSubscription : Subscription {
 -- Defaults
 ------------------------------------------------------------
 
+-- The two instances that exist before any caller does, and so are created
+-- by no rule.
+--
+-- admin is the one bounded context AddBoundedContext did not create - it
+-- exists unconditionally, before the first superadmin Role does - and
+-- cannot create either, since that rule's `not exists
+-- BoundedContext{name: name}` guard already sees this one. It is
+-- permanent in the other direction too: nothing removes a bounded
+-- context, here or anywhere else in this file.
+--
+-- Only its name and status are literal above, because only those are
+-- spec-time constants. Its created_at and created_by are real recorded
+-- values, so a static default declaration is the wrong place for them:
+-- both are written by SkilJ itself, at its own first startup. created_at
+-- is that first-start moment, and created_by is the skilj marker below.
+-- Nothing else could have written either - no caller and no Role existed
+-- yet to have created this context.
+--
+-- That stamping stands on its own. It is not part of, and does not wait
+-- for, the arrival of the first superadmin Role: the bootstrap secret is
+-- generated at this same first startup, but the Role it authorises is
+-- claimed by a separate explicit call that may come minutes later, months
+-- later, or - in a deployment nobody ever finishes setting up - never (see
+-- the note above rule CreateSuperadmin). This context's provenance is
+-- stamped either way. It is also stamped only once: unlike the bootstrap
+-- secret, which is regenerated on every startup until it is claimed, this
+-- acts only while the values are unset, so a later restart never restamps
+-- them.
+--
+-- skilj is that marker: the single SystemCreator instance, standing for
+-- the library itself rather than for any Role.
 default BoundedContext admin = { name: "admin", status: active }
+default SystemCreator skilj = { }
 
 ------------------------------------------------------------
 -- Rules
@@ -835,7 +1027,18 @@ default BoundedContext admin = { name: "admin", status: active }
 -- provisioned exactly once, in the same transaction as the event's or
 -- command's own insert), then returns the payload with those fields'
 -- values replaced by ciphertext plus the keys used. A no-op - unchanged
--- payload, empty key set - when sensitive_fields is empty. Unlike
+-- payload, empty key set - when sensitive_fields is empty.
+--
+-- "Those fields" includes a SensitiveField.field written as a two-segment
+-- dotted path (see the payload schema shape note above entity
+-- CommandType). The value substituted is the leaf's and only the leaf's:
+-- the enclosing nested object keeps its other fields, and the payload
+-- keeps its structure, with one scalar inside it now holding ciphertext
+-- instead of plaintext. That is why leaf-level is the only sound level -
+-- a scalar's declared type is the same either way, whereas encrypting the
+-- whole object would flip its type between object and string depending on
+-- who reads it. subject_field resolves the same way, and is read, never
+-- encrypted, exactly as when it names a top-level field. Unlike
 -- next_sequence's target, EncryptionKey is a real, rule-governed entity
 -- (see its transitions and ForgetSubject below); this call only ever
 -- provisions - destruction is always a separate, explicitly authorised
@@ -907,8 +1110,10 @@ default BoundedContext admin = { name: "admin", status: active }
 -- protect_sensitive_fields does - tag_mappings is the identical
 -- Set<TagMapping> on both, and Event.tags and Command.consistency_tags
 -- are directly comparable precisely because one function produces them
--- both. Its full contract, per TagMapping in type.tag_mappings, given
--- that payload schemas are flat (see the payload schema shape note above
+-- both. Its full contract, per TagMapping in type.tag_mappings, where
+-- "the mapped field" means whatever TagMapping.field resolves to - a
+-- top-level field named bare, or the one leaf a two-segment dotted path
+-- reaches inside a nested shape (see the payload schema shape note above
 -- entity CommandType):
 --   - The mapped field is present and holds a scalar value: one
 --     Tag(key, value: that value). The ordinary case.
@@ -924,6 +1129,19 @@ default BoundedContext admin = { name: "admin", status: active }
 --     was provided", and collapsing them onto the same single "None" state
 --     keeps that one state rather than inventing a third.
 --
+-- A dotted path adds no fifth case. It extracts the leaf value exactly as
+-- a bare name extracts a top-level one, and produces exactly the same
+-- Tag(key, value: that leaf value). A leaf can be missing in two ways -
+-- the nested object field is absent from the payload altogether, or the
+-- object is present but that particular leaf inside it is absent, since a
+-- nested shape's own fields may be optional too - and both are the second
+-- bullet above, unchanged: one Tag(key, value: null). There is no
+-- "doubly absent" state distinguishable from the ordinary one. That
+-- follows the same reasoning that already collapsed an empty list and a
+-- missing list onto the single "None" state: absence is absence, and
+-- multiplying the ways to be absent would multiply the states a
+-- consistency boundary or filter has to address.
+--
 -- Two consequences of the list case are worth naming rather than leaving
 -- to be rediscovered, and both fall out of Event.tags and
 -- Command.consistency_tags already being Set<Tag>:
@@ -937,6 +1155,48 @@ default BoundedContext admin = { name: "admin", status: active }
 --   - Duplicate elements collapse. Two equal elements produce two equal
 --     Tags, and a Set holds one - so a list is effectively deduplicated
 --     for tagging purposes, again with nothing extra specified.
+--
+-- A consistency boundary is therefore always scoped to values, never to
+-- a type as a whole, and that is settled rather than an omission. There
+-- is no tag meaning "every event of this type, whatever the value", and
+-- the shape of the mechanism is what rules it out: matching_events in
+-- ProcessCommand is always consistency_tags.any(t => t in tags), and
+-- consistency_tags is always derive_tags over the submitting command's
+-- own payload. A boundary can only ever name values the submitter
+-- itself supplied, and no payload field has a value that could mean
+-- "match regardless of value". Nor is there a second read path to
+-- compensate: a bounded context's decide() is handed matching_events
+-- and nothing else. This library's own rules can check history
+-- unscoped - CreateSuperadmin's `not exists Role{superadmin: true,
+-- status: active}` is exactly that - but that is a rule in this file,
+-- not something a plugged-in decider can reach for.
+--
+-- The requirements that look like they need a type-wide read generally
+-- do not. A balance check spanning every deposit and withdrawal on an
+-- account, or a capacity cap on a session's registrations, each have
+-- their scoping identifier sitting in the submitting command's own
+-- payload. Tag-map account_id or session_id on the command type and on
+-- the event types concerned, and the existing mechanism already gathers
+-- every relevant event across every type sharing that key, scoped to
+-- that one account or session - which is what those requirements
+-- actually want. Spanning event types is what a shared key buys (see
+-- TagMapping.key); spanning every value of a key is a different thing.
+--
+-- What is genuinely unavailable is the cross-instance form: "500
+-- attendees across every workshop combined" rather than 30 per
+-- workshop, or "100 withdrawals a day system-wide" rather than per
+-- account. No such requirement has been identified, and it is not being
+-- provided speculatively, because the cost would be structural rather
+-- than incidental. Tag matching is fast precisely because Event.tags
+-- and Command.consistency_tags are stored separately and indexed (see
+-- the overlap constraint in the note above RegisterEventType) and
+-- because the per-bounded-context event cache primarily serves
+-- tag-scoped lookups (see the performance guidance in ProcessCommand).
+-- An unscoped read has no tag to narrow by, so neither the index nor
+-- the cache can serve it: it would scan a type's whole history on every
+-- submission, bounded by neither - the exact cost both exist to avoid.
+-- Should such a requirement ever turn up, it wants a mechanism designed
+-- for it, not a wildcard value smuggled into Tag.
 --
 -- Reading events - the Events collections read by FetchEvents and
 -- ProcessCommand below - is served by an in-memory cache of the most
@@ -1073,6 +1333,13 @@ rule CreateDirectEvent {
 -- that field names a field event_type.schema actually declares, and that
 -- operator is one that field's declared type supports (e.g. greater_than
 -- against a string-typed field is invalid, not merely always-false).
+-- A Filter.field written as a two-segment dotted path is checked the same
+-- way, one level deeper: the path is resolved by walking into the named
+-- nested shape's own declared fields, and the leaf's declared type is
+-- matched against the operator by the same matrix. No new operator
+-- semantics - a filter on address.country compares a string exactly as a
+-- filter on a top-level string field does (see the payload schema shape
+-- note above entity CommandType).
 -- Checked once, at the point filters are supplied: registration time for
 -- an EventTypeSubscription (see CreateEventTypeSubscription), call time
 -- for FetchEvents, since it has no persisted filter to register ahead of
@@ -1546,6 +1813,143 @@ rule FetchCommands {
         -- decrypted, not how a stored command is rendered onto the wire.
 }
 
+-- The event-side counterpart to FetchCommands, and the gap it closes is a
+-- real one: before these three, no GraphQL caller could read raw
+-- historical events at all. EventSubscription pushes and never replays
+-- (see its FreshEventsOnly), and FetchEvents pulls but only over REST,
+-- for a single EventType, authenticated by a bearer token with no Role
+-- behind it. A Role holding an admin grant had no way to look at the
+-- stream its own bounded context had accumulated.
+--
+-- Admin-level rather than read-level, for exactly the reason spelled out
+-- above FetchCommands: a raw event is one writer's own record as it was
+-- appended, not a curated view of it the way a projection is, so reading
+-- other callers' events is an operator and audit capability rather than
+-- part of ordinary reading. Read-level callers query projections.
+--
+-- The three narrow the same population three ways. event_types restricts
+-- by type, empty meaning no restriction - the unrestricted state itself
+-- rather than a vacuous case, the same convention as
+-- AllEventsSubscription.event_types and FetchCommands.command_types, and
+-- checked the same way: every named type must belong to the grant's own
+-- bounded context. tags matches an event's own derived tags with the
+-- ANY-match semantics the consistency boundary in ProcessCommand already
+-- uses (see the derive_tags note above the rules), and reuses Tag
+-- unchanged: a tag key is shared across event types by design, which is
+-- what makes it the right narrowing here where event_types may name
+-- several types at once. The per-field Filter mechanism FetchEvents uses
+-- cannot do that job - a Filter.field is only unambiguous within one
+-- event type's schema, the same reason AllEventsSubscription carries no
+-- filters. after_sequence is the caller's own cursor, absent meaning from
+-- the beginning, exactly as in FetchEvents.
+--
+-- Like FetchEvents, QueryProjection and FetchCommands, none of the three
+-- requires the bounded context to be active: archiving stops new events,
+-- and reading the ones appended before that is the point.
+--
+-- Served by the same in-memory per-bounded-context event cache FetchEvents
+-- reads through (see the note above the rules), so the recent end of
+-- history is answered without a Postgres round trip and older events
+-- simply more slowly - the cache bounds how fast a read is answered,
+-- never how far back it reaches.
+
+rule QueryEvents {
+    when: QueryEvents(access_mapping, event_types, tags?, after_sequence?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+
+    -- Every named event type must belong to the same bounded context as
+    -- the grant - the same check and the same reasoning as
+    -- CreateAllEventsSubscription's event_types.
+    requires: event_types.all(et => et.bounded_context = access_mapping.bounded_context)
+
+    -- Bound before the candidate set below so the caller's tag set stays
+    -- nameable inside it, where tags is each event's own field.
+    let wanted_tags = tags
+
+    let candidates =
+        Events where bounded_context = access_mapping.bounded_context
+            and (event_types.count = 0 or event_type in event_types)
+            and (wanted_tags = null or wanted_tags.any(t => t in tags))
+            and sequence > (after_sequence ?? -1)
+
+    ensures:
+        EventsQueried(
+            access_mapping: access_mapping,
+            events: map(candidates, e => render_event(e, access_mapping))
+        )
+
+    @guidance
+        -- render_event(event, access_mapping) is the same black box
+        -- DeliverToSubscriptions pushes through, applying the identical
+        -- two-grant test per sensitive field - see the note above that
+        -- rule rather than a second copy of it here. In short: a field
+        -- decrypts when access_mapping.can_read_sensitive is true, or when
+        -- access_mapping.role.external_subject matches that field's own
+        -- EncryptionKey.subject_value; every other field arrives as stored
+        -- ciphertext, never decrypted and then redacted afterwards. An
+        -- admin grant is not a sensitive-data grant here any more than it
+        -- is in FetchCommands - can_read_sensitive is orthogonal to level.
+        --
+        -- The delivery is named apart from FetchEvents' EventsDelivered
+        -- because it carries a different thing: a grant and events drawn
+        -- from a whole bounded context, rather than a token and events of
+        -- the one type it was issued for.
+}
+
+rule CountEvents {
+    when: CountEvents(access_mapping, event_types, tags?)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: event_types.all(et => et.bounded_context = access_mapping.bounded_context)
+
+    let wanted_tags = tags
+
+    -- The same narrowing as QueryEvents minus the cursor: a count is a
+    -- live aggregate over everything matching, not a page of it, so a
+    -- sequence window would only describe how far a caller happened to
+    -- have read. It answers the same question the browse answers, which
+    -- is why it takes the same filters rather than an unfiltered total.
+    let candidates =
+        Events where bounded_context = access_mapping.bounded_context
+            and (event_types.count = 0 or event_type in event_types)
+            and (wanted_tags = null or wanted_tags.any(t => t in tags))
+
+    ensures:
+        EventsCounted(
+            access_mapping: access_mapping,
+            count: candidates.count
+        )
+}
+
+rule InspectEvent {
+    when: InspectEvent(access_mapping, event)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = event.bounded_context
+
+    ensures:
+        EventInspected(
+            access_mapping: access_mapping,
+            event: event,
+            rendered_payload: render_event(event, access_mapping)
+        )
+
+    @guidance
+        -- Single-event detail, and what it adds over picking the same
+        -- event out of a QueryEvents result is provenance: when it was
+        -- created (metadata.created_at) and how (origin). Each origin
+        -- variant already carries its own answer to "how" - the Command
+        -- behind a CommandTriggered event, the adapter's source blob and
+        -- context on an ExternalTriggered one, the token-derived client_id
+        -- on a DirectlyCreated one, and the scheduler itself on a
+        -- SystemTriggered one (see SystemTriggeredClientIdIsSystem) - so
+        -- nothing new is recorded for this rule to read.
+        --
+        -- Sensitive fields are rendered under the same two-grant test
+        -- QueryEvents applies; see its guidance.
+}
+
 -- The nine rules below are the admin bounded context's operations. In
 -- principle each should itself be a Command producing a CommandTriggered
 -- Event (BoundedContextAdded, BoundedContextArchived, EventTypeRegistered,
@@ -1556,13 +1960,86 @@ rule FetchCommands {
 -- effects, consistent with CreateExternalEvent and CreateDirectEvent
 -- above.
 
+-- Creating a bounded context grants nobody access to it. AddBoundedContext
+-- writes the BoundedContext and nothing else: no RoleAccessMapping comes
+-- with it, not even one for the superadmin who made the call. The only
+-- thing that ever brings a RoleAccessMapping into being is an explicit
+-- GrantRoleAccessMapping, so a freshly created context is inert the moment
+-- it exists. Every per-context surface faces an actor identified by an
+-- active RoleAccessMapping - ReadAccess, WriteAccess, AdminAccess - and
+-- the AccessTokens the REST track presents are minted only by an
+-- admin-level one, so until a grant is made the context has no reader, no
+-- writer, no admin and no token. Not even ArchiveBoundedContext reaches
+-- it, being admin-gated itself. A superadmin can see it in
+-- BoundedContextDirectory and do nothing else with it.
+--
+-- The startup reconciliation loop is the first thing this stops.
+-- RegisterEventType, RegisterCommandType and RegisterProjection each take
+-- an admin-level access_mapping scoped to the target context (see the note
+-- above them and surface TypeRegistration), so a deploy carrying a
+-- brand-new context's types registers none of them. The order is fixed and
+-- manual at its first step: AddBoundedContext, then GrantRoleAccessMapping
+-- giving some Role admin on that context, and only then the loop.
+--
+-- That is a consequence of a decision already made rather than an
+-- oversight. Auto-granting the creating superadmin admin access as a side
+-- effect of creation is exactly the self-service path surface
+-- AccessManagement's SuperadminOnly guarantee rules out: a grant is made
+-- on a Role's behalf by a superadmin as its own separately audited act,
+-- never as a by-product of some other operation. Creating a context and
+-- granting access into what was created are two actions because they are
+-- two decisions.
+--
+-- So a bounded context created and never granted to anyone is a valid
+-- state, if rarely an intended one, and a permanent one: nothing can ever
+-- happen inside it - no type registered, no event, no command, no read -
+-- until a superadmin grants some Role access to it. Nothing expires,
+-- reminds or repairs it in the meantime.
+
 rule AddBoundedContext {
     when: AddBoundedContext(caller, name)
     requires: caller.status = active
     requires: caller.superadmin = true
     requires: not exists BoundedContext{name: name}
     ensures:
-        BoundedContext.created(name: name, status: active)
+        let creator = SuperadminCreator.created(role: caller)
+        BoundedContext.created(
+            name: name,
+            status: active,
+            created_at: now,
+            created_by: creator
+        )
+}
+
+-- The read counterpart to AddBoundedContext, and superadmin-gated for the
+-- same reason: a bounded context directory is not "for" any one context,
+-- so no RoleAccessMapping is the right key to it. It answers the question
+-- an admin frontend has before it can ask anything else - which bounded
+-- contexts exist, when each appeared and who created it - without relying
+-- on GraphQL introspection to discover them.
+--
+-- It is not one of the nine the note above counts: those are the admin
+-- bounded context's mutations, each of which should one day be a Command
+-- producing an Event. This one writes nothing, so there is nothing for it
+-- to dogfood into - it follows FetchCommands' and QueryProjection's shape
+-- rather than the rules around it.
+--
+-- Unrestricted across contexts and statuses alike: a superadmin already
+-- reaches every context by construction, and an archived context is
+-- exactly what a directory should keep showing, since its history stays
+-- readable (the same reasoning FetchEvents, QueryProjection and
+-- FetchCommands apply to their own reads).
+
+rule ListBoundedContexts {
+    when: ListBoundedContexts(caller)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+
+    ensures:
+        BoundedContextsListed(
+            caller: caller,
+            bounded_contexts: BoundedContexts
+        )
 }
 
 rule ArchiveBoundedContext {
@@ -1571,6 +2048,18 @@ rule ArchiveBoundedContext {
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+
+    -- The admin context is permanent. The note above the Defaults section
+    -- already says nothing removes a bounded context, here or anywhere
+    -- else in this file; this guard is what makes that hold for archiving
+    -- too, which is the only other way a context stops accepting work.
+    -- Archiving admin would strand the system: the grants, tokens and
+    -- Roles that gate every other context's administration all live in it,
+    -- so a superadmin holding an admin-level grant on admin could
+    -- otherwise lock everyone, themselves included, out of every context
+    -- at once. See invariant AdminContextIsPermanent.
+    requires: bounded_context != admin
+
     ensures:
         bounded_context.status = archived
 }
@@ -1615,6 +2104,10 @@ rule ArchiveBoundedContext {
 -- check field existence and nothing else - valid_tag_mappings that every
 -- TagMapping.field is a field schema declares, valid_sensitive_fields the
 -- same for every SensitiveField.field and SensitiveField.subject_field.
+-- For a two-segment dotted path (see the payload schema shape note above
+-- entity CommandType) "exists" means the whole path resolves: the outer
+-- field is declared, its declared type is the named nested shape, and
+-- that shape declares the named leaf. Same check, one level deeper.
 -- There is no FilterOperator-style type-matching concern here: a tag
 -- mapping or a sensitive field reads a value, it never compares one, so
 -- the field's declared type has no bearing on whether the mapping makes
@@ -1652,10 +2145,44 @@ rule ArchiveBoundedContext {
 --     to required. Loosening is allowed; tightening is not.
 --   - A newly added field must be optional, so that payloads written
 --     against the previous schema remain valid against this one.
--- In short: additive and loosening only. Phasing a field out of use is
--- done by declaring it optional and simply ceasing to populate it - the
--- declaration itself stays forever, and readers of old payloads keep
--- finding what they were written with.
+--   - A field's declared type never changes. What was declared an integer
+--     stays an integer for that field's whole lifetime, exactly as its
+--     name does. No widening, no narrowing, no lateral change.
+-- In short: fields may be added or loosened, never removed, tightened or
+-- retyped. Phasing a field out of use is done by declaring it optional
+-- and simply ceasing to populate it - the declaration itself stays
+-- forever, and readers of old payloads keep finding what they were
+-- written with.
+--
+-- All four bullets apply to the outer, top-level field only. A payload
+-- schema may declare a field whose type is a nested object shape (one
+-- level, reuse only - see the payload schema shape note above entity
+-- CommandType), and that shape's own internal evolution - fields added,
+-- removed or retyped inside it - is not tracked, validated or enforced
+-- here at all. It is entirely the bounded context's own responsibility,
+-- in the same "not something this spec enforces" register the top-level
+-- JSON Schema type matrix is already left in. Nesting introduces no new
+-- failure mode: if a nested shape's definition changes at all, the schema
+-- text of every event or command type embedding it differs, so
+-- schema_changed is true and schema_version bumps for each of them -
+-- exactly the mechanism that already fires when any scalar field changes.
+-- That is expected, ordinary versioning behaviour, not a nested-specific
+-- complication. The one part of a nested shape that does get pinned is
+-- pinned by a different mechanism, not by these four bullets: a leaf some
+-- TagMapping, SensitiveField or Filter actually addresses - see the
+-- extension below.
+--
+-- The type bullet is deliberately the blunt answer rather than the
+-- permissive one. "Widening is allowed" would be defensible in a world
+-- with a canonical subtype order - Avro and Protobuf both have one - but
+-- JSON Schema does not, so the widening matrix itself would have to be
+-- delegated to the black box, and that would be a genuinely fuzzier
+-- black box than the FilterOperator-to-field-type matrix this one
+-- already resembles. Immutability is also just what the first bullet
+-- already says about a field's name, applied to what the field is: a
+-- declared field is permanent, and so is what it was declared as. A type
+-- that needs a differently typed value declares a new optional field for
+-- it and leaves the old one standing.
 --
 -- That is also what resolves what used to be an open question about
 -- retiring a tagged field. The worry was a dead end: valid_tag_mappings
@@ -1672,6 +2199,57 @@ rule ArchiveBoundedContext {
 -- above the rules. This deliberately rests on an enforced check rather
 -- than on an honour system: the reason no path is specified for retiring
 -- a key is that nothing can create the situation that would need one.
+--
+-- That protection extends to a leaf reached by a two-segment dotted path,
+-- symmetrically and with no new machinery - it is the same existence
+-- check, resolved one level deeper. If a TagMapping.field is
+-- address.country, valid_tag_mappings is satisfied only when the whole
+-- path resolves in the schema being registered, so country must still be
+-- declared inside Address, not merely address still declared at the outer
+-- level. A schema revision that keeps address but drops country from
+-- Address is therefore not a legal registration for that type, exactly as
+-- dropping a tagged top-level field is not. The same holds wherever the
+-- equivalent existence check applies: valid_sensitive_fields for
+-- SensitiveField.field and subject_field, and valid_filters for
+-- Filter.field at subscription registration and fetch time.
+--
+-- This is the one thing that pins any part of a nested shape's interior,
+-- and it pins exactly as much as is being used: an addressed leaf, and
+-- nothing else in the shape. The bullets above still govern the top level
+-- only, so the rest of a nested shape's internal evolution stays the
+-- bounded context's own affair. What cannot happen is a live tag,
+-- sensitive field or filter silently losing the leaf it reads, which is
+-- the property that mattered at the top level and matters identically one
+-- level in.
+--
+-- The same contract settles a second question, this one about the past
+-- rather than the future: why no historical schema text is kept
+-- anywhere. Only the current schema and a current schema_version exist
+-- per type; the text that was in force at version 3 is simply gone once
+-- version 4 is registered. That is sufficient, and it is sufficient
+-- because of the shape above rather than by luck. The four bullets
+-- together mean every field any prior version ever declared is still
+-- declared now, at a requiredness no tighter than it then had and at the
+-- same type it then had. So a type's current schema is a superset of
+-- every schema that type has ever had: a payload written under any
+-- earlier version is still valid against the current one, and every
+-- field it carries is still described there, correctly typed. A consumer
+-- reading an old event never needs the historical text, because the
+-- single schema it can already reach describes what it is holding,
+-- completely and correctly.
+--
+-- That is what Metadata.version is for, and what it is not for. It
+-- records the schema_version a message was written under - audit and
+-- provenance, "this was produced against v3" - not a key a reader
+-- resolves to something before it can interpret the payload. Nothing in
+-- this spec reads it back to validate against, and nothing needs to.
+--
+-- That argument needs all three of presence, requiredness and type to be
+-- pinned down, and all three are: presence and requiredness by the first
+-- three bullets, type by the fourth. Nothing a legal registration can do
+-- leaves a field of an old payload described by a type it was not
+-- written against, so the superset holds outright rather than only for
+-- the parts of a payload whose types happen not to have moved.
 --
 -- One further constraint sits alongside those two, but deliberately not
 -- inside either black box: it compares two sets the registration already
@@ -2183,19 +2761,127 @@ rule RevokeToken {
         token.revoked_at = now
 }
 
--- The four rules below manage Role and RoleAccessMapping themselves - the
--- access-control layer that gates every rule above. All four require an
--- existing active superadmin Role, which resolves the obvious circularity
--- (access control needs access control) for every case except the very
--- first superadmin Role. That one is provisioned out of band: a one-time
--- seed/migration step at first deployment inserts a Role row directly
--- with superadmin = true and external_subject set to whichever IdP
--- identity is to operate as the initial admin, bypassing CreateRole's
--- requirement of an existing superadmin caller since by definition none
--- exists yet. It bypasses the GraphQL surface entirely and is not
--- modelled as a rule; how and where that step is triggered is still open
--- (see open questions). Modelled as direct effects for the same reason
--- as the five rules above.
+-- The five rules below manage Role and RoleAccessMapping themselves - the
+-- access-control layer that gates every rule above. Four of them require
+-- an existing active superadmin Role, which resolves the obvious
+-- circularity (access control needs access control) for every case except
+-- the very first superadmin Role. CreateSuperadmin is how that one comes
+-- into being, and it is the only rule in this file that no Role
+-- authorises.
+--
+-- At its own first process startup, if no active superadmin Role exists
+-- yet, SkilJ generates a random, high-entropy bootstrap secret and prints
+-- it once to its own startup log. The secret is held in memory and nowhere
+-- else: never written to Postgres, never read from an environment variable
+-- or a configuration file, never persisted anywhere at all. How it is
+-- generated is a black box here, exactly as AccessToken.secret's
+-- generation is (see generate_token_secret) - the spec owns that it is
+-- unguessable and unstored, not which primitive produces it.
+--
+-- It is regenerated fresh on every startup, for as long as no superadmin
+-- exists. Restarting before anyone has claimed it invalidates the previous
+-- one and prints a new one in its place. That is the design rather than a
+-- side effect of it: there is no durable secret sitting anywhere waiting
+-- to leak, and an operator who loses the printed value restarts to get
+-- another instead of being locked out of their own deployment.
+--
+-- Deliberately not a configuration value naming the initial admin's IdP
+-- subject, which is the obvious alternative and the worse one. A
+-- configured value is exactly the kind of thing that ends up in a process
+-- listing, a container spec, a CI log and a secret manager, and it stays
+-- there, readable, long after the one moment it mattered. A secret that
+-- exists only in one process's memory, for one startup, has no such
+-- resting places. It is also why the initial admin's external identity is
+-- configured nowhere: it is supplied by whoever claims the secret, in the
+-- same call.
+--
+-- Claiming it is CreateSuperadmin(bootstrap, bootstrap_secret, name,
+-- external_subject) - a GraphQL mutation like the four below, but the one
+-- that faces no resolved Role, since structurally it cannot: no Role
+-- exists yet for the very first call. It faces the BootstrapSecret
+-- directly, in the same shape the REST surfaces face an AccessToken
+-- variant rather than a resolved identity (see entity BootstrapSecret for
+-- why it is not one of those variants, and surface SuperadminBootstrap).
+--
+-- Two guards carry the gate proper. The secret presented must match the
+-- one currently held in memory, and no active superadmin Role may exist -
+-- the same `not exists` idiom AddBoundedContext uses for its name
+-- uniqueness. The second is what closes the door structurally rather than
+-- by convention: the instant an active superadmin exists, CreateSuperadmin
+-- can never fire again, whatever is done with a printed secret afterwards
+-- and however many times the process restarts. There is deliberately no
+-- way to reopen it. A documented reopening path is a documented way in,
+-- and no operational convenience is worth that.
+--
+-- The one state in which the door is open again is the state in which it
+-- was open to begin with: no active superadmin Role at all. After the
+-- first claim that is only reachable by revoking every superadmin Role,
+-- which takes superadmin authority to do (see RevokeRole). So it is not a
+-- bypass - it is the same self-healing that per-restart regeneration
+-- gives, applied to a deployment whose superadmins have all been revoked
+-- and which would otherwise be permanently unmanageable.
+--
+-- A third guard is inherited rather than specific to bootstrapping: the
+-- external_subject claimed must not already be actively claimed, exactly
+-- as in CreateRole. Without it UniqueActiveExternalSubject would break in
+-- the reopened case above, where ordinary non-superadmin Roles may already
+-- exist and hold subjects of their own.
+--
+-- What a successful call hands back is the created Role's own details -
+-- its id, name and external_subject - and nothing else. In particular no
+-- SkilJ-issued credential to log in with: this Role authenticates from
+-- here on with a JWT from the trusted external IdP whose subject claim is
+-- the external_subject just bound, exactly like every other Role (see the
+-- identity resolution note above entity Role). SkilJ issues and stores no
+-- credential of its own for any Role, and this is not the exception - the
+-- bootstrap secret authorises one act of creation and is not a login.
+--
+-- The admin bounded context's own provenance is stamped at that same first
+-- startup, but is independent of everything above: its created_at, and its
+-- created_by pointing at the skilj SystemCreator marker, are written when
+-- SkilJ first starts, whether or not CreateSuperadmin is ever called and
+-- however long it takes to be. That provenance has the same problem this
+-- mechanism has - nothing existed yet to have created it either - but not
+-- the same timing, and unlike the bootstrap secret it is stamped once and
+-- never restamped by a later restart. See the note above the Defaults
+-- section.
+--
+-- Owning the bootstrap in the library rather than leaving it to the
+-- consuming application, a migration script or a separate CLI binary is
+-- the point rather than a convenience: it is what keeps Role's schema
+-- entirely internal to SkilJ, with no raw SQL and no internal write path
+-- handed to consumers just to get started. CreateSuperadmin is modelled as
+-- a direct effect for the same reason as the token rules above.
+
+rule CreateSuperadmin {
+    -- name and external_subject are supplied by whoever holds the secret:
+    -- claiming the bootstrap is exactly the act of registering which
+    -- external IdP identity is to operate as the initial superadmin.
+    when: CreateSuperadmin(bootstrap, bootstrap_secret, name, external_subject)
+
+    -- Closes the door, permanently, the moment there is a superadmin to
+    -- close it behind - see the note above.
+    requires: not exists Role{superadmin: true, status: active}
+
+    -- The secret presented must be the one currently held in memory.
+    -- Compared the way an AccessToken secret is: constant time, so a failed
+    -- attempt leaks nothing about how much of it was right (see the REST
+    -- token presentation note above the surfaces).
+    requires: secret_matches(bootstrap_secret, bootstrap.secret)
+
+    -- Guards UniqueActiveExternalSubject, exactly as CreateRole does.
+    requires: not exists Role{external_subject: external_subject, status: active}
+
+    ensures:
+        Role.created(
+            id: generate_token_id(),
+            external_subject: external_subject,
+            name: name,
+            superadmin: true,
+            status: active,
+            created_at: now
+        )
+}
 
 rule CreateRole {
     -- external_subject is supplied explicitly by the superadmin: creating
@@ -2415,6 +3101,26 @@ invariant SystemTriggeredClientIdIsSystem {
         e.origin = SystemTriggered implies e.metadata.client_id = "system"
 }
 
+invariant SystemCreatedContextIsTheAdminContext {
+    -- The counterpart of the above for bounded contexts. AddBoundedContext
+    -- always records the calling superadmin Role, so the system marker is
+    -- the admin context's alone: no other context may claim SkilJ as its
+    -- creator, and the admin context never acquires a Role it was not
+    -- created by.
+    for bc in BoundedContexts:
+        bc.created_by.kind = SystemCreator implies bc = admin
+}
+
+invariant AdminContextIsPermanent {
+    -- The admin context never stops accepting work. ArchiveBoundedContext
+    -- is the only rule that can move a context out of active, and it
+    -- guards against this one; stating it here makes the property
+    -- checkable in its own right rather than an emergent consequence of
+    -- that guard, so a later rule that also archives cannot quietly
+    -- reintroduce the hole.
+    admin.status = active
+}
+
 invariant RevokedRoleImpliesMappingsRevoked {
     for r in Roles:
         r.status = revoked implies r.access_mappings.all(t => t.status = revoked)
@@ -2461,7 +3167,10 @@ invariant UniqueActiveEncryptionKeyPerSubject {
 -- status and level conditions below are evaluated against current state
 -- on every operation, so revocation bites immediately. The REST track
 -- has no actors of its own - an AccessToken variant is the party a REST
--- surface faces directly.
+-- surface faces directly. SuperadminBootstrap is the one GraphQL surface
+-- with no actor either, for a related reason: there is no Role to resolve
+-- when the first one does not yet exist, so it faces the BootstrapSecret
+-- directly in the same way (see entity BootstrapSecret).
 
 actor ReadAccess {
     -- Any active RoleAccessMapping authorises read: write and admin grants
@@ -2821,6 +3530,86 @@ surface EventSubscription {
         -- ProjectionQuery shares Projection.
 }
 
+surface EventQuery {
+    facing access_mapping: AdminAccess
+    context event: Event
+        where bounded_context = access_mapping.bounded_context
+
+    exposes:
+        event.metadata.created_at
+        event.origin
+
+    provides:
+        QueryEvents(access_mapping, event_types, tags?, after_sequence?)
+        CountEvents(access_mapping, event_types, tags?)
+        InspectEvent(access_mapping, event)
+
+    @guarantee GrantScopedToBoundedContext
+        -- An admin-level grant only authorises reading events appended
+        -- into its own bounded context - browsing them, counting them and
+        -- inspecting one of them alike. An event in any other context is
+        -- not merely unreadable but invisible, the same way a command in
+        -- another context is to CommandQuery and a projection in another
+        -- context is to ProjectionQuery. Naming one directly is no way
+        -- around that either: this surface exists only for events of the
+        -- grant's own context, so another context's event is not something
+        -- InspectEvent can be pointed at.
+
+    @guarantee SensitiveFieldsStayProtected
+        -- A field its EventType marked sensitive is stored as ciphertext
+        -- and read back that way unless the caller is entitled to it,
+        -- decided per field against the very same RoleAccessMapping this
+        -- surface faces, under either of two grants: the
+        -- bounded-context-wide can_read_sensitive, or the caller's own
+        -- verified IdP identity matching that field's subject. Admin level
+        -- alone is not one of them - can_read_sensitive is orthogonal to
+        -- level. A caller with neither grant still receives the event,
+        -- with that field left as ciphertext exactly as ProjectionQuery,
+        -- EventSubscription and CommandQuery leave it, never decrypted and
+        -- then redacted afterwards.
+        --
+        -- This covers browsing and inspecting. Counting is outside it
+        -- because there is nothing for it to cover: a count discloses no
+        -- field content, only how many events matched filters the caller
+        -- supplied itself.
+
+    @guarantee LatestEventsAlwaysAvailable
+        -- A query always sees every committed event of its bounded context
+        -- that matches the request, including the most recently committed
+        -- ones, and the recent end of that history is served without a
+        -- database round trip. Older events are answered more slowly but
+        -- just as completely: the in-memory cache this surface shares with
+        -- EventFetch bounds how fast a read is answered, never how far
+        -- back a caller may read. A count is answered over that same
+        -- complete population, not over the cached window.
+
+    @guidance
+        -- GraphQL only, and queries rather than mutations: the
+        -- admin-facing pull that neither existing event read provides.
+        -- EventSubscription pushes and never replays history (see its
+        -- FreshEventsOnly), so it answers nothing about the past;
+        -- EventFetch pulls, but over REST, for one EventType, on a bearer
+        -- token with no Role behind it (see its TokenScopedToEventType).
+        -- A Role holding an admin grant had no way in before this - see
+        -- the note above rule QueryEvents for why this is admin-facing
+        -- rather than part of ordinary read-level reading.
+        --
+        -- The context clause is what makes InspectEvent's scoping
+        -- structural rather than a check - an event outside the grant's
+        -- bounded context is not addressable here at all - the same
+        -- pattern ProjectionQuery uses for a Projection. QueryEvents and
+        -- CountEvents range over that same context rather than over the
+        -- one event, the way FetchCommands ranges over its context's
+        -- commands.
+        --
+        -- Deliberately coarse on the wire contract otherwise: this
+        -- establishes the capability and its scoping, not how a query, its
+        -- result shape, or paging and cursor encoding are expressed - all
+        -- still deferred with the rest of that contract, exactly as they
+        -- are for EventFetch, ProjectionQuery and CommandQuery (see the
+        -- scope header's exclusions).
+}
+
 surface CommandSubmission {
     facing access_mapping: WriteAccess
     context command_type: CommandType
@@ -2987,6 +3776,15 @@ surface TypeRegistration {
         -- to be submitted repeatedly and unchanged. Still a GraphQL
         -- mutation, for manual and operational use.
         --
+        -- The loop cannot reach a bounded context nobody has been granted
+        -- access to. This surface faces AdminAccess, so a context created
+        -- but not yet granted registers nothing on any deploy, however
+        -- often the loop runs: a superadmin has to run
+        -- GrantRoleAccessMapping for some Role on that context first. See
+        -- the note above rule AddBoundedContext for why that step is
+        -- deliberately manual and what an ungranted context can and cannot
+        -- do.
+        --
         -- Projections are reconciled the same way as event and command
         -- types, and belong here for the same reason: a projection's
         -- schema, the event types it consumes and whether it updates
@@ -3147,6 +3945,93 @@ surface BoundedContextCreation {
         -- Creating a bounded context isn't "for" any existing context,
         -- so it is gated by Role.superadmin rather than a per-context
         -- RoleAccessMapping.
+
+    @guidance
+        -- A successful call leaves a context nobody can use yet: creation
+        -- grants no RoleAccessMapping, not even to the caller, and every
+        -- per-context operation - type registration included - needs one.
+        -- The next step is always GrantRoleAccessMapping on surface
+        -- AccessManagement; see the note above rule AddBoundedContext for
+        -- why the two are separate acts.
+}
+
+surface BoundedContextDirectory {
+    facing caller: Superadmin
+
+    exposes:
+        for bounded_context in BoundedContexts:
+            bounded_context.name
+            bounded_context.status
+            bounded_context.created_at
+            bounded_context.created_by
+            for mapping in bounded_context.access_mappings:
+                mapping.role.name
+                mapping.role.id
+                mapping.role.external_subject
+                mapping.level
+                mapping.can_read_sensitive
+                mapping.status
+
+    provides:
+        ListBoundedContexts(caller)
+
+    @guarantee SuperadminOnly
+        -- Listing bounded contexts isn't "for" any existing context, so it
+        -- is gated by Role.superadmin rather than a per-context
+        -- RoleAccessMapping - the read counterpart to
+        -- BoundedContextCreation's mutation, gated the same way.
+
+    @guidance
+        -- GraphQL only, and a query rather than a mutation. It exists for
+        -- admin frontends that would otherwise have to introspect the
+        -- schema to find out which bounded contexts a deployment has: the
+        -- directory answers that directly, with each context's name,
+        -- status and provenance.
+        --
+        -- The access mappings come with it deliberately. A superadmin
+        -- already sees every one of these values through CreateRole and
+        -- AccessManagement, so surfacing them here discloses nothing new -
+        -- it only answers "who currently has what access to this bounded
+        -- context" in one place, instead of a separate query per context.
+        --
+        -- Wire contract deferred as everywhere else: result shape, paging
+        -- and cursor encoding, and GraphQL type and argument naming stay
+        -- with the rest of that contract (see the scope header's
+        -- exclusions).
+}
+
+surface SuperadminBootstrap {
+    facing bootstrap: BootstrapSecret
+
+    provides:
+        CreateSuperadmin(bootstrap, bootstrap_secret, name, external_subject)
+
+    @guarantee ClosesPermanentlyOnFirstClaim
+        -- Reachable only while no active superadmin Role exists anywhere -
+        -- the instant one does, this action can never fire again, for any
+        -- caller, with any secret, however many times the process
+        -- restarts. There is no reopening path while a superadmin remains
+        -- active; see the note above rule CreateSuperadmin for the one
+        -- state that does reopen it (every superadmin Role revoked) and
+        -- why that is self-healing rather than a bypass.
+
+    @guarantee NoCredentialIssued
+        -- A successful call hands back only the created Role's own id,
+        -- name and external_subject - never a secret to authenticate
+        -- with. The Role it creates authenticates from then on with a
+        -- JWT from the trusted external IdP, exactly like every other
+        -- Role (see the identity resolution note above entity Role).
+        -- SkilJ issues no login credential of its own for any Role, and
+        -- the bootstrap secret is not the exception: it authorises one
+        -- act of creation, not a session.
+
+    @guidance
+        -- GraphQL only, and the one surface with no Role-based actor
+        -- behind it - see the Actor Declarations note above for why it
+        -- faces BootstrapSecret directly instead. The full mechanism -
+        -- how the secret is generated, why it lives in memory only, and
+        -- what closes and reopens this surface - is spelled out in the
+        -- note above rule CreateSuperadmin rather than repeated here.
 }
 
 surface AccessManagement {
@@ -3173,21 +4058,23 @@ surface AccessManagement {
     @guidance
         -- Exposed as GraphQL mutations. The very first superadmin Role
         -- cannot come from here - CreateRole requires a superadmin caller
-        -- and none exists yet - so it is seeded out of band at first
-        -- deployment: a Role row inserted directly with superadmin = true
-        -- and external_subject set to the initial admin's IdP identity.
-        -- See the note above CreateRole; how that seed step is triggered
-        -- is still open.
+        -- and none exists yet - so it comes from surface
+        -- SuperadminBootstrap instead, claimed with a secret SkilJ prints
+        -- to its own startup log rather than any caller-supplied value.
+        -- See the note above rule CreateSuperadmin for the full mechanism.
 }
 
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Bootstrapping the first superadmin Role is resolved in principle - an out-of-band seed/migration step at first deployment inserts a Role row directly with superadmin = true and external_subject set to the initial admin's IdP identity, bypassing the GraphQL surface and CreateRole's superadmin-caller requirement (see the note above CreateRole). What remains open is how and where that step is triggered: a migration run by the library, a CLI subcommand, a configuration value read once at first startup, or left entirely to the consuming application's own deployment process."
-
-open question "Schema versioning tracks a current schema_version counter per type, but not the historical schema text for prior versions. Do consumers reading old events need to look up the exact schema that was active for their recorded version, or is 'each version stays backwards compatible' sufficient without keeping that history?"
-
-open question "Nested payload structures, deliberately parked for a later version. Event and command payload schemas are flat for now - scalar fields, optionally absent, and lists of scalars (see the payload schema shape note above entity CommandType, and the derive_tags contract above the rules) - so every TagMapping.field, SensitiveField.field/subject_field and Filter.field names a single top-level field. What any of them would mean for a nested field is undefined rather than decided: would a nested field be addressed by a dotted path, or does TagMapping/SensitiveField/Filter need a different shape for `field` entirely; what does tagging a field inside a list of objects derive; does marking a nested field sensitive encrypt the leaf or the enclosing object; and what does schema_is_backwards_compatible's 'every field present in existing_schema is still present' mean once fields nest. Not a gap in the current version - the flat contract is complete and enforced as far as it reaches - but the answer is wanted before any bounded context is invited to declare a nested schema."
-
-open question "Are there cases where a consistency boundary needs 'all events of a specific EventType' with no field-level tag at all, rather than a key/value tag? Raised as a possible exception but not confirmed as a real requirement."
+-- None. Dotted-path addressing into nested payload fields, the last
+-- question standing here, is now answered in full: TagMapping.field,
+-- SensitiveField.field/subject_field and Filter.field each accept a
+-- two-segment path, sensitivity encrypts at the leaf, and the existence
+-- check that makes an addressed field permanent resolves one level deeper
+-- (see the payload schema shape note above entity CommandType, and the
+-- derive_tags, protect_sensitive_fields, valid_filters and
+-- schema_is_backwards_compatible notes above the rules). Lists of nested
+-- objects and any second level of nesting remain excluded, but as a
+-- decided cap with stated reasoning rather than an unresolved question.
