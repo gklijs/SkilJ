@@ -188,7 +188,7 @@ value CommandDecision {
     accepted: Boolean
     events: List<EventSpec>      -- ignored when accepted = false
     rejection_reason: String?    -- domain-specific explanation from the decider; surfaced verbatim
-                                  -- as the GraphQL error message when accepted = false. Producing a
+                                  -- to the caller when accepted = false. Producing a
                                   -- meaningful message here is the decider's responsibility - it
                                   -- needs domain knowledge this library doesn't have.
     rejection_kind: String?      -- machine-readable label for what kind of rejection this is, set by
@@ -215,12 +215,11 @@ value CommandDecision {
                                   -- values exist, and how stable they are, is each bounded context's
                                   -- own contract with its own callers.
                                   --
-                                  -- Like rejection_reason it surfaces at the GraphQL boundary when a
-                                  -- command is rejected, alongside the message rather than instead of
-                                  -- it (an error extension/code being the obvious carrier). The exact
-                                  -- wire shape stays deferred with the rest of the wire contract -
-                                  -- see the scope header's exclusions, and the same framing above
-                                  -- rule QueryProjection.
+                                  -- Like rejection_reason it is surfaced to the caller when a command
+                                  -- is rejected, alongside the message rather than instead of it. The
+                                  -- exact wire shape stays deferred with the rest of the wire
+                                  -- contract - see the scope header's exclusions, and the same
+                                  -- framing above rule QueryProjection.
 }
 
 value SensitiveField {
@@ -256,6 +255,8 @@ value EncryptedPayload {
 enum FilterOperator { equals | contains | is_like | greater_than | less_than }
 
 enum AccessLevel { read | write | admin }
+
+enum AckMode { auto_advance | manual_ack }
 
 ------------------------------------------------------------
 -- Entities and Variants
@@ -963,6 +964,40 @@ variant EventTypeSubscription : Subscription {
     filters: List<Filter>
 }
 
+-- The server-side read position of one EventReadToken: the whole of what
+-- a cursor is, which is a token, how far it has got, and what moves it.
+-- The REST counterpart to Subscription above - both remember where a
+-- caller is in a stream, one for a live push over GraphQL, this one for a
+-- token-authenticated pull (see the note above rule ConsumeEvents).
+--
+-- Keyed by the token and nothing finer. A token is already minted
+-- individually per reader by an admin (see CreateEventReadToken), so it
+-- identifies who is reading; two independent read positions are therefore
+-- two tokens, not two names sharing one. See UniqueReadCursorPerToken,
+-- which is what makes "the cursor for this token" well defined.
+entity ReadCursor {
+    token: EventReadToken
+    ack_mode: AckMode                      -- chosen when this cursor first appears - on the token's
+                                            -- first ConsumeEvents call - and fixed for the token's
+                                            -- lifetime. A later call may restate the same mode but
+                                            -- never change it (see rule ConsumeEvents); changing
+                                            -- mode means a new token.
+    sequence: Integer                      -- auto_advance: the highest sequence served so far.
+                                            -- ConsumeEvents itself advances it on every call.
+                                            -- manual_ack: the highest sequence acknowledged so far.
+                                            -- Serving events never moves it - only
+                                            -- AcknowledgeEvents does - so consuming again before
+                                            -- acknowledging re-serves the same events. That
+                                            -- re-service is the mechanism rather than a special
+                                            -- case, and it is exactly what makes manual_ack
+                                            -- at-least-once (see EventFetch's
+                                            -- DeliveryFollowsAckMode). Starts at -1, before the
+                                            -- first sequence of a bounded context, the same "from
+                                            -- the beginning" position FetchEvents' absent
+                                            -- after_sequence resolves to.
+    updated_at: Timestamp                  -- when this cursor last moved
+}
+
 ------------------------------------------------------------
 -- Defaults
 ------------------------------------------------------------
@@ -1387,6 +1422,133 @@ rule FetchEvents {
             event_type: read_type,
             events: filter(candidates, e => matches_filters(e, filters))
         )
+}
+
+-- Server-side read cursors: the second and third way to read the very
+-- stream FetchEvents above pulls, under an identical permission model -
+-- the same EventReadToken, the same event_read_allowed opt-in, the same
+-- single EventType, the same filters. What differs is only who remembers
+-- where the caller got to. FetchEvents remembers nothing: after_sequence
+-- is the caller's own cursor, carried on every call. ConsumeEvents and
+-- AcknowledgeEvents keep that position on the server instead, so a caller
+-- with nowhere durable to write a cursor of its own - a stateless worker,
+-- a shell script, one step of a remote workflow - can still poll a stream
+-- without re-reading it from the beginning.
+--
+-- A cursor is keyed by the token and by nothing else. There is
+-- deliberately no consumer-name concept alongside it: an EventReadToken
+-- is already minted individually per reader (see CreateEventReadToken),
+-- so the token is the reader's identity, and two independent read
+-- positions are two tokens - an existing, lightweight mechanism - rather
+-- than two names sharing one token.
+--
+-- The cursor is get-or-created on first use, in the same register as
+-- protect_sensitive_fields' EncryptionKey lookup (see the note above the
+-- rules): the first ConsumeEvents call for a token provisions the row, in
+-- the same transaction that answers that call, and every later call finds
+-- it. That first call is also the only one that decides ack_mode. A later
+-- call may omit it and inherit what is stored, or restate the same mode,
+-- but naming the other one is rejected rather than applied - a consumer's
+-- delivery guarantee never changes underneath it.
+--
+-- The two modes differ in exactly one thing, which is what moves the
+-- cursor:
+--   - auto_advance: serving moves it. ConsumeEvents advances the cursor
+--     to the highest sequence it just served, so the next call continues
+--     strictly after that. An event served to a caller that then dies
+--     before processing it is never served again - at most once, the same
+--     guarantee EventSubscription makes under DeliveryIsAtMostOnce.
+--   - manual_ack: only AcknowledgeEvents moves it. Serving leaves the
+--     cursor where it was, so consuming again before acknowledging
+--     re-serves the same events - at least once, with duplicates on
+--     redelivery for the caller to handle (idempotent processing, say)
+--     and never de-duplicated here (see EventFetch's
+--     DeliveryFollowsAckMode).
+--
+-- Neither rule requires the bounded context to be active, for the same
+-- reason FetchEvents does not: archiving stops writes, and reading the
+-- retained history is the point. Both are served by the same
+-- per-bounded-context event cache FetchEvents is (see the note above the
+-- rules), and both leave sensitive fields as stored ciphertext for the
+-- same structural reason (see EventFetch's SensitiveFieldsStayEncrypted).
+--
+-- A revoked token's cursor needs no disposal path and gets none. Both
+-- rules require token.status = active and revocation is terminal, so the
+-- row simply becomes permanently unreachable - the same end every other
+-- row in this file reaches, since nothing here is ever deleted.
+--
+-- highest_sequence(events) is a black box in the same trivial register as
+-- the filter(events, ...) beside it: the greatest Event.sequence among a
+-- set of events, or null when that set is empty.
+
+rule ConsumeEvents {
+    when: ConsumeEvents(token, ack_mode?, filters)
+    requires: token.status = active
+    requires: token.event_type.event_read_allowed = true
+    requires: valid_filters(token.event_type, filters)
+
+    -- Null when this token has never consumed before; the ensures below
+    -- is what provisions it in that case.
+    let cursor = ReadCursor{token: token}
+    let is_new = not exists cursor
+
+    -- A brand new cursor must state its mode; an existing one may omit
+    -- it, but a supplied mode has to match the stored one.
+    requires: not is_new or ack_mode != null
+    requires: is_new or ack_mode = null or ack_mode = cursor.ack_mode
+
+    let mode = if is_new: ack_mode else: cursor.ack_mode
+    let position = if is_new: -1 else: cursor.sequence
+
+    let candidates =
+        Events where bounded_context = token.event_type.bounded_context
+            and event_type = token.event_type
+            and sequence > position
+
+    let served = filter(candidates, e => matches_filters(e, filters))
+
+    -- Unchanged when nothing matched, in either mode: an auto_advance
+    -- cursor has nothing new to advance past, and a manual_ack one never
+    -- moves here at all.
+    let next_position =
+        if mode = auto_advance: highest_sequence(served) ?? position
+        else: position
+
+    ensures:
+        EventsConsumed(
+            token: token,
+            event_type: token.event_type,
+            events: served
+        )
+        if is_new:
+            ReadCursor.created(
+                token: token,
+                ack_mode: mode,
+                sequence: next_position,
+                updated_at: now
+            )
+        else if mode = auto_advance:
+            cursor.sequence = next_position
+            cursor.updated_at = now
+}
+
+rule AcknowledgeEvents {
+    when: AcknowledgeEvents(token, sequence)
+    requires: token.status = active
+
+    let cursor = ReadCursor{token: token}
+    requires: exists cursor
+    requires: cursor.ack_mode = manual_ack
+
+    -- Forward only, the same monotonicity Event.sequence itself has: an
+    -- acknowledgement may confirm ground already covered, never hand it
+    -- back. A caller that wants to re-read what it already acknowledged
+    -- reads it over FetchEvents, which takes its own cursor.
+    requires: sequence >= cursor.sequence
+
+    ensures:
+        cursor.sequence = sequence
+        cursor.updated_at = now
 }
 
 -- The GraphQL read, and the counterpart to FetchEvents above: where a
@@ -3156,6 +3318,17 @@ invariant UniqueActiveEncryptionKeyPerSubject {
                 implies not (a.status = active and b.status = active)
 }
 
+invariant UniqueReadCursorPerToken {
+    -- At most one cursor per EventReadToken, so ConsumeEvents'
+    -- get-or-create lookup is never ambiguous. Unqualified by status,
+    -- unlike UniqueActiveEncryptionKeyPerSubject above: a cursor has no
+    -- lifecycle of its own - it exists or it does not - and is never
+    -- superseded by a fresh one.
+    for a in ReadCursors:
+        for b in ReadCursors:
+            a != b implies a.token != b.token
+}
+
 ------------------------------------------------------------
 -- Actor Declarations
 ------------------------------------------------------------
@@ -3281,11 +3454,16 @@ surface EventFetch {
 
     provides:
         FetchEvents(token, event_type, filters, after_sequence?)
+        ConsumeEvents(token, ack_mode?, filters)
+        AcknowledgeEvents(token, sequence)
 
     @guarantee TokenScopedToEventType
         -- A token only authorises reading events of the one EventType it
         -- was issued for; it grants no write capability at all, and no
-        -- visibility into any other type.
+        -- visibility into any other type. This holds for all three reads
+        -- alike - the token is the whole of the permission model here,
+        -- and a server-side cursor adds reach into nothing it did not
+        -- already reach.
 
     @guarantee SensitiveFieldsStayEncrypted
         -- Sensitive fields are delivered as stored, which is to say as
@@ -3306,6 +3484,31 @@ surface EventFetch {
         -- just as completely: the in-memory cache bounds how fast a read
         -- is answered, never how far back a caller may read.
 
+    @guarantee CursorIsPerTokenAndItsModeIsFixed
+        -- A server-side read position belongs to one EventReadToken and
+        -- to nothing finer: there is no consumer name to pass, and two
+        -- independent positions mean two tokens. Whichever ack_mode a
+        -- token's first ConsumeEvents call chose is the one it keeps for
+        -- that token's lifetime - a later call may omit it or restate it,
+        -- and is rejected if it names the other one - so the delivery
+        -- guarantee a consumer is running under never changes underneath
+        -- it.
+
+    @guarantee DeliveryFollowsAckMode
+        -- auto_advance is at-most-once: serving advances the cursor, so
+        -- an event served to a caller that dies before processing it is
+        -- never served again. That is the same guarantee EventSubscription
+        -- makes under DeliveryIsAtMostOnce, reached here by a cursor
+        -- rather than by a live connection.
+        --
+        -- manual_ack is at-least-once, and the one place in this
+        -- specification that guarantee exists: nothing is passed over
+        -- unacknowledged, and the price is that a caller consuming twice
+        -- without acknowledging in between is served the same events
+        -- twice. Handling those duplicates is the caller's own
+        -- responsibility - idempotent processing, say - and never
+        -- something this library de-duplicates on its behalf.
+
     @guidance
         -- REST only, with the token presented as
         -- "Authorization: Bearer <id>.<secret>" - see the note above the
@@ -3321,6 +3524,21 @@ surface EventFetch {
         -- its field's declared type is rejected outright, not merely
         -- unsatisfiable - see valid_filters in the note above rule
         -- FetchEvents.
+        --
+        -- Three ways to read the one EventType this token was issued for,
+        -- all pull-based and all under this same permission model.
+        -- FetchEvents is client-tracked and unchanged: the caller keeps
+        -- its own position and passes after_sequence on every call, which
+        -- stays the simplest thing for a caller with somewhere durable to
+        -- keep a cursor. ConsumeEvents is server-tracked in either ack
+        -- mode: SkilJ keeps the position, keyed by the token alone (see
+        -- entity ReadCursor and the note above rule ConsumeEvents).
+        -- AcknowledgeEvents moves a manual_ack cursor forward once the
+        -- caller has actually processed what it was served. Mixing the
+        -- client-tracked read with the server-tracked one on a single
+        -- token is not forbidden, but it means two positions that know
+        -- nothing of each other: FetchEvents neither reads the cursor nor
+        -- moves it.
         --
         -- This is the read the per-bounded-context in-memory event cache
         -- is primarily there for (see the note above the rules): its

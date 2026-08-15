@@ -198,6 +198,33 @@ own bootstrap, not the consuming application" pattern already locked in
 for the superadmin-seeding and admin-bounded-context work in the Allium
 spec.
 
+### 2.2.1 Every `Integer` is `i64`/`BIGINT`, uniformly
+
+Allium's `Integer` type is abstract — it carries no bit-width at the
+spec level (the language uses it identically for a bounded
+`retry_count`/`max_login_attempts` and for a monotonically-growing
+`Event.sequence`), so the storage width is entirely this document's
+decision, not the spec's. `sequence`-derived fields
+(`Event.sequence`, `Command.consistency_boundary`,
+`Projection.caught_up_to`, `ProjectionRebuild.caught_up_to`,
+`Subscription.from_sequence`, `ReadCursor.sequence`, every
+`after_sequence?`/`wait_for_sequence?` argument compared against them,
+and `CountEvents`' result) are the field that actually motivates this:
+`i32`/`INT` tops out at ~2.1 billion, reachable in weeks at even modest
+sustained throughput on a single long-lived bounded context.
+
+Rather than widening only those fields and leaving genuinely bounded
+counters (`schema_version` on `EventType`/`CommandType`/`Projection`/
+`ProjectionRebuild`, `Metadata.version`) at `i32`, **every `Integer`
+maps to Rust `i64` and Postgres `BIGINT`, uniformly, no per-field
+judgment call.** The storage cost of 4 extra bytes on a
+schema-revision counter is nothing; the risk profile is what decides
+it — a field picked too narrow needs a production column-type
+migration and a wire-contract-breaking change to fix later, while a
+field picked wide that never needed it costs nothing at all. This also
+means nobody has to re-litigate "does this new field need to be wide"
+for every future `Integer` the spec grows.
+
 ### 2.3 Property-based testing: `proptest`
 
 Standard choice for Rust; matches the `allium:propagate` skill's own
@@ -451,14 +478,39 @@ GraphQL-ecosystem anti-pattern it generally is on top of that — unstable
 under concurrent writes, since a new event pushes every later offset by
 one.
 
-### 5.4 Error shape
+### 5.4 Error shape — and a correction: business rejections aren't errors
 
-Builds directly on §4's `code()`/`message()` trait: `code()` maps to
-`extensions.code` on the GraphQL error, `message()` to the error's own
-top-level `message` field. Standard `async-graphql` error-extension
-usage (`Error::new(message).extend_with(|_, e| e.set("code", code))`) —
-nothing new invented here either, which is the point of having settled
-§4 first.
+Builds on §4's `code()`/`message()` trait, but only for one of the two
+tiers. Revisiting this after designing the REST side surfaced a real gap:
+`code()`/`message()` fit library-level errors cleanly (`extensions.code`
++ the error's own top-level `message`, standard `async-graphql`
+error-extension usage), but a `CommandRejected` isn't a failure of the
+*request* — `decide()` ran successfully and produced a legitimate
+business answer of "no." Putting that through GraphQL's `errors` array
+is a well-known anti-pattern; this also required a small correction to
+`specs/skilj.allium` itself, since `value CommandDecision`'s own comment
+had prematurely committed to exactly that shape ("surfaced verbatim as
+the GraphQL error message... an error extension/code being the obvious
+carrier") — now fixed to defer the wire shape like everything else in
+that file, with this document as where it actually gets decided.
+
+**Business rejections surface as ordinary typed data**, the same pattern
+Shopify's `userErrors` and similar "typed payload" conventions use:
+
+```graphql
+type SubmitCommandPayload {
+  accepted: Boolean!
+  triggeredEventSequences: [Int!]   # present when accepted
+  rejectionReason: String           # present when not accepted
+  rejectionKind: String             # present when not accepted
+}
+```
+
+Library-level errors (revoked grant, wrong bounded context, malformed
+input) still go through GraphQL's real `errors` array via `code()`/
+`message()`, unchanged. The REST design in §7 mirrors this exact split —
+that's what keeps the two wire contracts consistent with each other
+rather than accidentally answering the same question two different ways.
 
 ---
 
@@ -497,24 +549,124 @@ exchange, or anything else OIDC bundles in.
 
 ---
 
-## 7. Open for a future pass
+## 7. The REST wire contract
 
-Not yet designed — listed here so they aren't lost, not because they're
-blocked on anything above:
+### 7.1 Purpose: narrowly-scoped agents and automated callers, not general access
 
-- **The REST wire contract's equivalent details** — request/response body
-  shapes for `ExternalEventIngestion`/`DirectEventCreation`/`EventFetch`/
-  `CommandTrigger`, and how §4's error tiers render as HTTP status codes
-  and JSON bodies. Not raised explicitly until now; noted so it isn't
-  silently assumed "the same as GraphQL, done."
+Worth stating plainly since it's the frame every choice below follows
+from: REST exists for callers holding a specific, admin-issued
+`AccessToken` scoped to exactly one registered type — AI agents, remote
+workflows, adapters — never for general application access, which is
+what the GraphQL/Role track is for. Every design choice below (flat
+capability routes, no browsing, no cross-type reads) follows from that:
+REST is deliberately narrow, not a second general-purpose API.
+
+### 7.2 Routing: capability-based, not type-or-context-in-path
+
+Since every `AccessToken` variant is already scoped to exactly one
+registered type (`ExternalEventToken.event_type`, etc.), the URL doesn't
+need to repeat that — the presented token alone determines what's being
+read or written:
+
+```
+POST /v1/events/external        -- ExternalEventIngestion (ExternalEventToken)
+POST /v1/events/direct          -- DirectEventCreation (DirectCreationToken)
+GET  /v1/events                 -- EventFetch's FetchEvents (EventReadToken, client-tracked)
+GET  /v1/events/consume         -- EventFetch's ConsumeEvents (EventReadToken, server-tracked)
+POST /v1/events/consume/ack     -- EventFetch's AcknowledgeEvents (EventReadToken, manual_ack only)
+POST /v1/commands/trigger       -- CommandTrigger (CommandToken)
+```
+
+Presenting the wrong token variant at a route is a 403, not a 404 — the
+route exists, the credential just doesn't authorize that action.
+
+### 7.3 Request/response bodies
+
+```
+POST /v1/events/external
+  { "payload": {...}, "sourceContent": "...", "sourceContext": "..." }  # sourceContext optional
+  -> 201 { "sequence": 42 }
+
+POST /v1/events/direct
+  { "payload": {...} }
+  -> 201 { "sequence": 43 }
+
+GET /v1/events?filter=field:op:value&filter=field2:op2:value2&after=41
+  -> 200 { "events": [...], "nextCursor": "44" }   # cursor = sequence, same convention as §5.3
+
+GET /v1/events/consume?mode=auto|manual
+  -> 200 { "events": [...] }
+  # mode required on a token's first call, optional (and validated to match) after that -
+  # see entity ReadCursor in the spec. No "after"/cursor param at all: the position lives
+  # server-side, keyed by the token alone.
+
+POST /v1/events/consume/ack
+  { "sequence": 44 }
+  -> 200 {}
+  # only valid when the token's cursor is in manual_ack mode; 409 otherwise
+
+POST /v1/commands/trigger
+  { "payload": {...} }
+  -> 200 { "accepted": true, "triggeredEventSequences": [44, 45] }
+  -> 200 { "accepted": false, "rejectionReason": "...", "rejectionKind": "insufficient_funds" }
+```
+
+`filter=field:op:value`, repeatable, was picked over a single
+JSON-encoded query param — plain and readable in a URL, and
+`FilterOperator`/field/value is a small enough shape that
+colon-separation doesn't get ambiguous. `CommandTrigger`'s 200-with-
+`accepted:false` mirrors §5.4's GraphQL fix exactly: a rejection is a
+legitimate outcome of a successful request, not an HTTP-level error.
+
+### 7.4 Three ways to read events, on purpose
+
+`GET /v1/events`, `GET /v1/events/consume`, and `POST /v1/events/consume/ack`
+exist because different callers have genuinely different needs, not
+because one design subsumes the others:
+
+| | Who tracks position | Delivery | When to use |
+|---|---|---|---|
+| `GET /v1/events` (client-tracked) | The caller, in its own storage | Whatever the caller implements | The caller already has somewhere durable to keep a cursor (a database row, a checkpoint file) and wants full control |
+| `GET /v1/events/consume?mode=auto` (server-tracked, auto-advance) | skilj, per token | At-most-once — an event served is never served again, even if the caller crashes before processing it | A stateless worker, a shell script, a quick integration — simplest to use, occasional missed events on crash is acceptable |
+| `GET /v1/events/consume?mode=manual` + `POST .../ack` (server-tracked, manual-ack) | skilj, per token, advanced only on explicit ack | At-least-once — nothing is lost, but a crash between fetch and ack means the same events are redelivered next time | Processing must not silently drop events, and the caller can handle duplicate delivery safely (idempotent processing) |
+
+Two independent read positions under this model means two separate
+`EventReadToken`s (already a lightweight, existing mechanism — an admin
+mints tokens per reader), not a shared token with a caller-supplied
+consumer name — a `ReadCursor` is 1:1 with a token in the spec, on
+purpose. Mixing the client-tracked and server-tracked reads against the
+*same* token is allowed but the two positions know nothing of each
+other: `FetchEvents` never reads or moves the server-side cursor.
+
+This same table (in plainer terms, aimed at people integrating the
+library rather than building it) belongs in `README.md` — see the update
+made alongside this document.
+
+### 7.5 Error mapping
+
+Library-level errors (the `code()`/`message()` tier from §4) map to
+standard HTTP semantics: 401 (missing/malformed bearer credential), 403
+(valid credential, wrong permission — revoked token, wrong token
+variant for the route, an opt-in flag like `external_creation_allowed`
+off), 400 (malformed body, invalid filter), 409 (a state conflict — a
+bounded context archived, or an acknowledgement against an `auto_advance`
+cursor). Body is `{ "code": ..., "message": ... }` from the same trait
+GraphQL renders through, so a client library sees the identical shape
+regardless of which track it's talking to. `CommandRejected` is 200, not
+an error status, per §7.3/§5.4.
 
 ---
 
-## 8. Next steps
+## 8. Open for a future pass
 
-Every item through §6 is now settled. The one remaining open item (§7)
-doesn't block starting on `skilj-core` or `skilj-graphql`, so this is a
+Nothing outstanding right now — every item raised so far has a decision
+recorded above.
+
+---
+
+## 9. Next steps
+
+Every item through §7 is now settled, and §8 is empty. This is a
 reasonable point to return to `/allium:propagate` — scoped to one
 representative surface first, per the earlier discussion, rather than
-the full 319-obligation spec at once — while the REST wire contract gets
-worked through separately.
+the full 319-obligation spec at once.

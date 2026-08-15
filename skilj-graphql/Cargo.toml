@@ -1,0 +1,17 @@
+[package]
+name = "skilj-graphql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SkilJ's GraphQL surface: a unified async-graphql::dynamic schema rebuilt at runtime, and resolvers for every GraphQL-facing surface. See docs/architecture.md §5."
+
+[dependencies]
+skilj-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+async-graphql.workspace = true
+async-graphql-axum.workspace = true
+arc-swap.workspace = true
