@@ -23,6 +23,8 @@ fn bounded_context(name: &str) -> BoundedContext {
     BoundedContext {
         name: name.into(),
         status: BoundedContextStatus::Active,
+        created_at: timestamp(0),
+        created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
     }
 }
 
@@ -36,14 +38,23 @@ fn event_type(external_creation_allowed: bool, direct_creation_allowed: bool) ->
         sensitive_fields: Vec::new(),
         external_creation_allowed,
         direct_creation_allowed,
+        system_triggered_allowed: false,
+        system_triggered_schedule: None,
         event_read_allowed: false,
     }
+}
+
+fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
+    Utc.timestamp_opt(secs, 0).unwrap()
 }
 
 fn external_token(status: TokenStatus, event_type: EventType) -> ExternalEventToken {
     ExternalEventToken {
         id: "adapter-1".into(),
+        secret: "s3cr3t".into(),
         status,
+        created_at: timestamp(0),
+        revoked_at: None,
         event_type,
     }
 }
@@ -51,13 +62,12 @@ fn external_token(status: TokenStatus, event_type: EventType) -> ExternalEventTo
 fn direct_token(status: TokenStatus, event_type: EventType) -> DirectCreationToken {
     DirectCreationToken {
         id: "adapter-2".into(),
+        secret: "s3cr3t".into(),
         status,
+        created_at: timestamp(0),
+        revoked_at: None,
         event_type,
     }
-}
-
-fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
 }
 
 // ---------------------------------------------------------------------

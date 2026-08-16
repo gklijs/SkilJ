@@ -1,25 +1,24 @@
-//! Tests for the `CommandTrigger` surface and `ProcessCommand`
-//! (`specs/skilj.allium`) - propagated after the two event-creation
-//! surfaces (docs/architecture.md §9): entity `CommandToken`, rules
-//! `AuthoriseCommandTrigger`/`ProcessCommand`.
-//!
-//! Scope note: `CommandSubmission`/`AuthoriseCommandSubmission` (the
-//! GraphQL/`RoleAccessMapping` path) are deliberately **not** propagated
-//! this pass - they need `access_control::Role`/`RoleAccessMapping`/
-//! `AccessLevel`, none of which exist yet, a materially larger chunk of
-//! work than this pass's other additions. `process_command` itself is
-//! shared by both authorisation paths and is fully covered here via the
-//! `CommandToken` one; see `process_command`'s own doc comment.
+//! Tests for the `CommandTrigger`/`CommandSubmission` surfaces and
+//! `ProcessCommand` (`specs/skilj.allium`) - propagated after the two
+//! event-creation surfaces (docs/architecture.md §9): entity
+//! `CommandToken`, rules `AuthoriseCommandTrigger`/`ProcessCommand`.
+//! `AuthoriseCommandSubmission` (the GraphQL/`RoleAccessMapping` path) was
+//! added in a later pass, once `access_management.rs` supplied
+//! `access_control::Role`/`RoleAccessMapping`/`AccessLevel` to authorise
+//! it against - see `authorise_command_submission`'s own doc comment.
+//! `process_command` itself is shared by both authorisation paths and is
+//! fully covered here via the `CommandToken` one.
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
-//! filtered to this pass's source constructs, excluding
-//! `AuthoriseCommandSubmission`/`CommandSubmission`): 20 total.
-//! Uncovered/deferred this pass, with reason - see the doc comment at the
-//! bottom of this file:
-//!   - `surface-actor.CommandTrigger`/`surface-provides.CommandTrigger` (2)
-//!     - same REST-scaffolding gap as every prior surface's.
-//!   - `AuthoriseCommandSubmission`(5)/`CommandSubmission`(2) - the
-//!     Role/RoleAccessMapping gap above.
+//! filtered to this pass's source constructs): 25 total.
+//! Uncovered/deferred, with reason - see the doc comment at the bottom of
+//! this file:
+//!   - `surface-actor`/`surface-provides.CommandTrigger` (2) - REST-
+//!     scaffolding gap, same as every prior surface's.
+//!   - `surface-actor`/`surface-provides.CommandSubmission` (2) - the
+//!     GraphQL counterpart, same as `access_management.rs`'s own
+//!     `AccessManagement` gap - no resolver/schema wiring in
+//!     `skilj-graphql` yet.
 //!   - `SequenceIsGaplessPerBoundedContext`(1) - a property of the real,
 //!     Postgres-lock-backed `next_sequence`, not this pure engine.
 //!   - `ConsistencyTagKeysAreDeclared`(1) - per the invariant's own text,
@@ -29,7 +28,9 @@
 //!     ProcessCommand's.
 
 use chrono::{TimeZone, Utc};
-use skilj_core::access_control::{self, CommandToken, TokenStatus};
+use skilj_core::access_control::{
+    self, AccessLevel, CommandToken, Role, RoleAccessMapping, RoleStatus, TokenStatus,
+};
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{
     self, BoundedContext, BoundedContextStatus, CommandType, Event, EventOrigin, EventType,
@@ -44,6 +45,8 @@ fn bounded_context(status: BoundedContextStatus) -> BoundedContext {
     BoundedContext {
         name: "accounts".into(),
         status,
+        created_at: timestamp(0),
+        created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
     }
 }
 
@@ -65,7 +68,10 @@ fn command_type(
 fn command_token(status: TokenStatus, command_type: CommandType) -> CommandToken {
     CommandToken {
         id: "trigger-adapter".into(),
+        secret: "s3cr3t".into(),
         status,
+        created_at: timestamp(0),
+        revoked_at: None,
         command_type,
     }
 }
@@ -80,6 +86,8 @@ fn event_type() -> EventType {
         sensitive_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
+        system_triggered_allowed: false,
+        system_triggered_schedule: None,
         event_read_allowed: false,
     }
 }
@@ -111,6 +119,34 @@ fn event_with_tags(sequence: i64, tags: Vec<Tag>) -> Event {
 
 fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(secs, 0).unwrap()
+}
+
+fn role(status: RoleStatus) -> Role {
+    Role {
+        id: "role-1".into(),
+        external_subject: "user@example.com".into(),
+        name: "User".into(),
+        superadmin: false,
+        status,
+        created_at: timestamp(0),
+        revoked_at: None,
+    }
+}
+
+fn access_mapping(
+    status: RoleStatus,
+    level: AccessLevel,
+    bounded_context: BoundedContext,
+) -> RoleAccessMapping {
+    RoleAccessMapping {
+        role: role(RoleStatus::Active),
+        bounded_context,
+        level,
+        can_read_sensitive: false,
+        status,
+        created_at: timestamp(0),
+        revoked_at: None,
+    }
 }
 
 fn accepted(events: Vec<EventSpec>) -> CommandDecision {
@@ -191,6 +227,116 @@ fn authorise_command_trigger_rejects_an_archived_bounded_context() {
     let token = command_token(TokenStatus::Active, ct);
 
     let err = event_store::authorise_command_trigger(&token, "{}".into()).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        event_store::Error::BoundedContextArchived.code()
+    );
+}
+
+// ---------------------------------------------------------------------
+// rule-success.AuthoriseCommandSubmission / rule-failure.AuthoriseCommandSubmission.{1,2,3,4}
+// ---------------------------------------------------------------------
+
+#[test]
+fn authorise_command_submission_succeeds_and_stamps_client_id_from_the_roles_id() {
+    let ct = command_type(true, Vec::new());
+    let mapping = access_mapping(
+        RoleStatus::Active,
+        AccessLevel::Write,
+        ct.bounded_context.clone(),
+    );
+
+    let authorised =
+        event_store::authorise_command_submission(&mapping, &ct, r#"{"amount":10}"#.into())
+            .unwrap();
+
+    assert_eq!(authorised.command_type, ct);
+    assert_eq!(authorised.payload, r#"{"amount":10}"#);
+    assert_eq!(authorised.client_id, "role-1"); // mapping.role.id, not mapping.role.external_subject
+}
+
+/// An `admin`-level grant authorises submission too - `requires:
+/// access_mapping.level in {write, admin}`, not `= write`.
+#[test]
+fn authorise_command_submission_succeeds_for_an_admin_level_grant() {
+    let ct = command_type(true, Vec::new());
+    let mapping = access_mapping(
+        RoleStatus::Active,
+        AccessLevel::Admin,
+        ct.bounded_context.clone(),
+    );
+
+    let authorised = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap();
+
+    assert_eq!(authorised.command_type, ct);
+}
+
+/// rule-failure.AuthoriseCommandSubmission.1 - `requires: access_mapping.status = active`.
+#[test]
+fn authorise_command_submission_rejects_a_revoked_mapping() {
+    let ct = command_type(true, Vec::new());
+    let mapping = access_mapping(
+        RoleStatus::Revoked,
+        AccessLevel::Write,
+        ct.bounded_context.clone(),
+    );
+
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
+}
+
+/// rule-failure.AuthoriseCommandSubmission.2 - `requires: access_mapping.level in {write, admin}`.
+#[test]
+fn authorise_command_submission_rejects_a_read_level_mapping() {
+    let ct = command_type(true, Vec::new());
+    let mapping = access_mapping(
+        RoleStatus::Active,
+        AccessLevel::Read,
+        ct.bounded_context.clone(),
+    );
+
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        access_control::Error::InsufficientAccessLevel.code()
+    );
+}
+
+/// rule-failure.AuthoriseCommandSubmission.3 - `requires: access_mapping.bounded_context = command_type.bounded_context`.
+#[test]
+fn authorise_command_submission_rejects_a_mapping_scoped_to_a_different_bounded_context() {
+    let ct = command_type(true, Vec::new());
+    let other_context = BoundedContext {
+        name: "billing".into(),
+        status: BoundedContextStatus::Active,
+        created_at: timestamp(0),
+        created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+    };
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write, other_context);
+
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        access_control::Error::GrantBoundedContextMismatch.code()
+    );
+}
+
+/// rule-failure.AuthoriseCommandSubmission.4 - `requires: command_type.bounded_context.status = active`.
+#[test]
+fn authorise_command_submission_rejects_an_archived_bounded_context() {
+    let mut ct = command_type(true, Vec::new());
+    ct.bounded_context = bounded_context(BoundedContextStatus::Archived);
+    let mapping = access_mapping(
+        RoleStatus::Active,
+        AccessLevel::Write,
+        ct.bounded_context.clone(),
+    );
+
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -449,16 +595,17 @@ fn command_consistency_tags_are_empty_when_the_command_type_declares_no_tag_mapp
 }
 
 // ---------------------------------------------------------------------
-// surface-actor.CommandTrigger / surface-provides.CommandTrigger -
-// uncovered this pass
+// surface-actor/surface-provides.{CommandTrigger,CommandSubmission} -
+// uncovered
 // ---------------------------------------------------------------------
 //
-// Same REST-scaffolding gap as every prior surface's deferred obligations
-// (no bearer extractor, no route table in skilj-rest yet).
+// CommandTrigger (2): same REST-scaffolding gap as every prior surface's
+// deferred obligations (no bearer extractor, no route table in skilj-rest
+// yet).
 //
-// AuthoriseCommandSubmission (5 obligations) / CommandSubmission (2) -
-// deferred pending access_control::Role/RoleAccessMapping/AccessLevel,
-// none of which exist yet; see this file's header comment.
+// CommandSubmission (2): the GraphQL counterpart - no resolver/schema
+// wiring in skilj-graphql yet, same gap access_management.rs's own
+// AccessManagement surface has.
 //
 // SequenceIsGaplessPerBoundedContext (1) - a property of the real,
 // Postgres-lock-backed next_sequence (see the note above the rules in

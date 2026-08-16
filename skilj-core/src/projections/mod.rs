@@ -3,36 +3,331 @@
 //! `project()`, `read_projection()`, `await_projection_caught_up()`. See
 //! docs/architecture.md §3.2.
 
+use crate::access_control::{AccessLevel, RoleAccessMapping, RoleStatus};
 use crate::error::SkiljRejection;
+use crate::event_store::{BoundedContext, BoundedContextStatus, Event, EventType};
 
-// TODO: entity Projection, entity ProjectionRebuild, and the rules
-// listed above. `caught_up_to` on both entities is `i64` - see
-// docs/architecture.md §2.2.1.
+// TODO: `project()` - the plugged-in, per-projection fold black box (see
+// the note above the rules in specs/skilj.allium) - and the async
+// per-bounded-context consumer / sync inline dispatch that would call it,
+// including promotion (a building `ProjectionRebuild` replacing the live
+// `Projection` once caught up - a background-process concern, not
+// something any rule below performs). `read_projection()`/
+// `await_projection_caught_up()` are both fully caller-supplied in
+// `query_projection` below rather than having a real implementation here
+// - see its own doc comment for why (the same "black box in the same
+// register as decide()" treatment `process_command`'s `decision` gets).
+//
+// This module was originally scaffolded with its own placeholder `Error`
+// (`EventTypeOutsideBoundedContext`/`RebuildAlreadyStaged`/
+// `CaughtUpTimeout`) ahead of the rules themselves being worked out in
+// full. `Projection`/`ProjectionRebuild` and the four rules below were
+// first built directly in `event_store` instead - missing this module
+// entirely - then moved here once that mismatch against
+// docs/architecture.md's own module map was caught; `event_store`'s
+// `schema_is_backwards_compatible` is reused across the module boundary
+// the same way `bootstrap` already reuses `event_store::Error::
+// BoundedContextArchived`. The placeholder `Error` variants didn't
+// survive the move unchanged - `RebuildAlreadyStaged` in particular
+// named a rejection no rule actually has (restaging an already-pending
+// rebuild is `RegisterProjection`'s success path, not an error) - so
+// they were replaced with the three the rules actually need, matching
+// the naming convention `event_store`'s own `*NotInBoundedContext`
+// errors already use.
 
 /// Library-level errors this module's own rules reject for.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     #[error("a projection may only consume EventTypes from its own bounded context")]
-    EventTypeOutsideBoundedContext,
+    ConsumedEventTypeNotInBoundedContext,
 
-    #[error("this projection already has a rebuild pending or building")]
-    RebuildAlreadyStaged,
+    #[error("no pending ProjectionRebuild is staged for this projection")]
+    NoProjectionRebuildStaged,
 
-    #[error("the requested wait_for_sequence was not reached in time")]
-    CaughtUpTimeout,
+    /// Distinguishable from every other rejection this rule can produce
+    /// (see `ReadYourWritesWhenRequested`) - a caller retries a timeout,
+    /// unlike a permanent rejection such as a revoked grant.
+    #[error(
+        "the projection did not catch up to the requested sequence within the configured wait"
+    )]
+    ProjectionCaughtUpTimedOut,
 }
 
 impl SkiljRejection for Error {
     fn code(&self) -> &str {
         match self {
-            Error::EventTypeOutsideBoundedContext => "event_type_outside_bounded_context",
-            Error::RebuildAlreadyStaged => "rebuild_already_staged",
-            Error::CaughtUpTimeout => "caught_up_timeout",
+            Error::ConsumedEventTypeNotInBoundedContext => {
+                "consumed_event_type_not_in_bounded_context"
+            }
+            Error::NoProjectionRebuildStaged => "no_projection_rebuild_staged",
+            Error::ProjectionCaughtUpTimedOut => "projection_caught_up_timed_out",
         }
     }
 
     fn message(&self) -> String {
         self.to_string()
     }
+}
+
+/// See `entity Projection`. `rebuilds` (a relationship projection, not a
+/// stored field - the same treatment `EventType`'s `*_tokens` get) is
+/// omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Projection {
+    pub bounded_context: BoundedContext,
+    pub name: String,
+    pub schema: String,
+    pub schema_version: i64,
+    pub consumed_event_types: Vec<EventType>,
+    pub sync: bool,
+    pub caught_up_to: Option<i64>,
+}
+
+/// See `entity ProjectionRebuild`'s `status` field/transition graph.
+/// `building` is terminal - see the entity's own doc comment: promotion
+/// and discarding both end a rebuild by making the row cease to exist,
+/// neither is a further `status` transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionRebuildStatus {
+    Pending,
+    Building,
+}
+
+/// See `entity ProjectionRebuild`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionRebuild {
+    pub projection: Projection,
+    pub schema: String,
+    pub schema_version: i64,
+    pub consumed_event_types: Vec<EventType>,
+    pub sync: bool,
+    pub caught_up_to: Option<i64>,
+    pub status: ProjectionRebuildStatus,
+}
+
+/// The outcome of `register_projection` below - the spec's own three-way
+/// `ensures` branch (`Projection.created`, staging/restaging a
+/// `ProjectionRebuild`, or reconciling the live `Projection` in place),
+/// made explicit the same way `event_store::EventTypeRegistration` makes
+/// `RegisterEventType`'s two-way branch explicit. `RebuildStaged` doesn't
+/// separately distinguish "a new row was staged" from "an already-staged
+/// row was restaged" - unlike the created/updated split on the other two,
+/// that distinction isn't its own obligation here (`allium plan` has no
+/// `rule-entity-creation` for `RegisterProjection` - its `ensures` block
+/// is a three-way conditional, not a single `.created()` clause), and the
+/// returned `ProjectionRebuild`'s own fields already show what a caller
+/// needs either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionRegistration {
+    Created(Projection),
+    RebuildStaged(ProjectionRebuild),
+    ReconciledTrivially(Projection),
+}
+
+/// See `rule RegisterProjection`. `existing` is `Projection{bounded_context,
+/// name}` and `staged` is `ProjectionRebuild{projection: existing, status:
+/// pending}`, both as already looked up by the caller - the same get-or-
+/// create lookup treatment `event_store::register_event_type`'s `existing`
+/// and `event_store::consume_events`' `existing_cursor` get.
+/// `bounded_context_events` is every `Event` in `bounded_context` this
+/// engine currently knows of, for `consumed_change_has_history` - the one
+/// check in this function that needs more than the two looked-up rows,
+/// the same full-snapshot treatment `access_control::create_role`'s
+/// `existing_roles` gets elsewhere.
+#[allow(clippy::too_many_arguments)]
+pub fn register_projection(
+    access_mapping: &RoleAccessMapping,
+    bounded_context: &BoundedContext,
+    name: String,
+    schema: String,
+    consumed_event_types: Vec<EventType>,
+    sync: bool,
+    existing: Option<&Projection>,
+    staged: Option<&ProjectionRebuild>,
+    bounded_context_events: &[Event],
+) -> crate::error::Result<ProjectionRegistration> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(crate::access_control::Error::GrantNotActive.into());
+    }
+    if access_mapping.level != AccessLevel::Admin {
+        return Err(crate::access_control::Error::InsufficientAccessLevel.into());
+    }
+    if &access_mapping.bounded_context != bounded_context {
+        return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
+    }
+    if bounded_context.status != BoundedContextStatus::Active {
+        return Err(crate::event_store::Error::BoundedContextArchived.into());
+    }
+    if !consumed_event_types
+        .iter()
+        .all(|et| &et.bounded_context == bounded_context)
+    {
+        return Err(Error::ConsumedEventTypeNotInBoundedContext.into());
+    }
+
+    let Some(existing) = existing else {
+        return Ok(ProjectionRegistration::Created(Projection {
+            bounded_context: bounded_context.clone(),
+            name,
+            schema,
+            schema_version: 1,
+            consumed_event_types,
+            sync,
+            caught_up_to: None,
+        }));
+    };
+
+    if !crate::event_store::schema_is_backwards_compatible(&existing.schema, &schema) {
+        return Err(crate::event_store::Error::SchemaIncompatible.into());
+    }
+
+    let schema_changed = existing.schema != schema;
+    let changed_event_types = existing
+        .consumed_event_types
+        .iter()
+        .filter(|et| !consumed_event_types.contains(et))
+        .chain(
+            consumed_event_types
+                .iter()
+                .filter(|et| !existing.consumed_event_types.contains(et)),
+        );
+    let consumed_change_has_history = changed_event_types
+        .into_iter()
+        .any(|et| bounded_context_events.iter().any(|e| &e.event_type == et));
+    let becoming_sync = !existing.sync && sync;
+    let rebuild_needed = schema_changed || consumed_change_has_history || becoming_sync;
+
+    let new_schema_version = if schema_changed {
+        existing.schema_version + 1
+    } else {
+        existing.schema_version
+    };
+
+    if !rebuild_needed {
+        // A trivial change, by definition one the schema did not take part
+        // in (schema_changed is itself enough to make a registration
+        // non-trivial), so neither schema nor schema_version is touched.
+        return Ok(ProjectionRegistration::ReconciledTrivially(Projection {
+            consumed_event_types,
+            sync,
+            ..existing.clone()
+        }));
+    }
+
+    Ok(ProjectionRegistration::RebuildStaged(match staged {
+        Some(staged) => ProjectionRebuild {
+            schema,
+            schema_version: new_schema_version,
+            consumed_event_types,
+            sync,
+            caught_up_to: None,
+            ..staged.clone()
+        },
+        None => ProjectionRebuild {
+            projection: existing.clone(),
+            schema,
+            schema_version: new_schema_version,
+            consumed_event_types,
+            sync,
+            caught_up_to: None,
+            status: ProjectionRebuildStatus::Pending,
+        },
+    }))
+}
+
+/// See `rule RebuildProjection`. `staged` is `ProjectionRebuild{projection,
+/// status: pending}` as already looked up by the caller - since that
+/// lookup is itself filtered to `status: pending`, `staged.status =
+/// pending` (the spec's own second `requires`) holds true by construction
+/// whenever `staged` is `Some` at all, the same "derived, not a separate
+/// parameter" treatment `event_store::authorise_command_trigger`'s
+/// `token.command_type = command_type` gets.
+pub fn rebuild_projection(
+    access_mapping: &RoleAccessMapping,
+    projection: &Projection,
+    staged: Option<&ProjectionRebuild>,
+) -> crate::error::Result<ProjectionRebuild> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(crate::access_control::Error::GrantNotActive.into());
+    }
+    if access_mapping.level != AccessLevel::Admin {
+        return Err(crate::access_control::Error::InsufficientAccessLevel.into());
+    }
+    if access_mapping.bounded_context != projection.bounded_context {
+        return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
+    }
+    let Some(staged) = staged else {
+        return Err(Error::NoProjectionRebuildStaged.into());
+    };
+
+    Ok(ProjectionRebuild {
+        status: ProjectionRebuildStatus::Building,
+        ..staged.clone()
+    })
+}
+
+/// See `rule DiscardProjectionRebuild`. Same lookup treatment as
+/// `rebuild_projection`'s `staged` above. Returns the discarded row
+/// rather than `()`: the spec's own `ensures` is a deletion (`not exists
+/// staged`), which this pure function can't perform itself (see
+/// `access_control::revoke_role`'s cascade for the same "hands back what
+/// changed" shape applied to an update rather than a delete) - the caller
+/// is the one that removes the row this confirms discarding.
+pub fn discard_projection_rebuild(
+    access_mapping: &RoleAccessMapping,
+    projection: &Projection,
+    staged: Option<&ProjectionRebuild>,
+) -> crate::error::Result<ProjectionRebuild> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(crate::access_control::Error::GrantNotActive.into());
+    }
+    if access_mapping.level != AccessLevel::Admin {
+        return Err(crate::access_control::Error::InsufficientAccessLevel.into());
+    }
+    if access_mapping.bounded_context != projection.bounded_context {
+        return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
+    }
+    let Some(staged) = staged else {
+        return Err(Error::NoProjectionRebuildStaged.into());
+    };
+
+    Ok(staged.clone())
+}
+
+/// See `rule QueryProjection`. `read_projection(projection, access_mapping)`
+/// and `await_projection_caught_up(projection, wait_for_sequence)` are
+/// both black boxes "in the same register as `decide()`" per the spec's
+/// own text above rule `CreateExternalEvent` - unlike `event_store::
+/// render_event`/`render_command`, there is no trivial/empty case to
+/// implement for real here (`Projection` carries no queryable content of
+/// its own to fall back to unchanged - that content is exactly what the
+/// black box computes), so both are caller-supplied outputs, the same
+/// treatment `event_store::process_command`'s `decision` gets. `caught_up`
+/// is only consulted when `wait_for_sequence` is `Some` - the spec's own
+/// `wait_for_sequence = null or await_projection_caught_up(...)`
+/// short-circuit, owned here rather than pushed onto the caller, the same
+/// "this function resolves its own null-coalescing" treatment
+/// `event_store::fetch_events`'s `after_sequence ?? -1` gets. A sync
+/// projection satisfies any sequence immediately, by construction (see
+/// the note above the rules) - reflected in whatever `caught_up` the
+/// caller computed, not re-derived here.
+pub fn query_projection(
+    access_mapping: &RoleAccessMapping,
+    projection: &Projection,
+    wait_for_sequence: Option<i64>,
+    caught_up: bool,
+    read_projection_result: String,
+) -> crate::error::Result<String> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(crate::access_control::Error::GrantNotActive.into());
+    }
+    if access_mapping.bounded_context != projection.bounded_context {
+        return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
+    }
+    if wait_for_sequence.is_some() && !caught_up {
+        return Err(Error::ProjectionCaughtUpTimedOut.into());
+    }
+
+    Ok(read_projection_result)
 }

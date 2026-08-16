@@ -36,6 +36,8 @@ fn bounded_context(name: &str) -> BoundedContext {
     BoundedContext {
         name: name.into(),
         status: BoundedContextStatus::Active,
+        created_at: timestamp(0),
+        created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
     }
 }
 
@@ -49,6 +51,8 @@ fn event_type(event_read_allowed: bool) -> EventType {
         sensitive_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
+        system_triggered_allowed: false,
+        system_triggered_schedule: None,
         event_read_allowed,
     }
 }
@@ -61,7 +65,14 @@ fn other_event_type() -> EventType {
 }
 
 fn token(status: TokenStatus, event_type: EventType) -> EventReadToken {
-    EventReadToken { status, event_type }
+    EventReadToken {
+        id: "reader-1".into(),
+        secret: "s3cr3t".into(),
+        status,
+        created_at: timestamp(0),
+        revoked_at: None,
+        event_type,
+    }
 }
 
 fn event(event_type: EventType, sequence: i64) -> Event {
@@ -559,7 +570,7 @@ proptest! {
 
             let result = event_store::consume_events(t, existing, ack_mode, &[], &[], Utc::now()).unwrap();
             if let CursorUpdate::Created(cursor) = result.cursor_update {
-                let previous = cursors.insert(key.clone(), cursor);
+                let previous = cursors.insert(key.clone(), *cursor);
                 prop_assert!(previous.is_none(), "a second ReadCursor.created for a token that already has one");
             }
         }

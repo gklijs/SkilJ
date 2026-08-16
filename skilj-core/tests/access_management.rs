@@ -2,9 +2,13 @@
 //! propagated after CommandTrigger/ProcessCommand (docs/architecture.md
 //! §9): entities `Role`/`RoleAccessMapping`, enum `AccessLevel`, rules
 //! `CreateRole`/`RevokeRole`/`GrantRoleAccessMapping`/
-//! `RevokeRoleAccessMapping`. This is what unblocks
-//! `AuthoriseCommandSubmission`/`CommandSubmission`, deferred in
-//! `command_processing.rs` for exactly this - a future pass.
+//! `RevokeRoleAccessMapping`. This is what unblocked
+//! `AuthoriseCommandSubmission`/`CommandSubmission`, added in
+//! `command_processing.rs` in a later pass once these existed to
+//! authorise against. `resolve_role_by_external_subject` - the JWT-to-
+//! Role identity resolution pipeline's one pure step - was added last, in
+//! its own later pass, and is tested here too since it shares this file's
+//! `Role` fixtures.
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
 //! filtered to this pass's source constructs): 36 total.
@@ -14,6 +18,9 @@
 //! `surface-actor`/`surface-provides.AccessManagement` (2, the GraphQL
 //! counterpart to every prior surface's REST-scaffolding gap - no
 //! resolver/schema wiring in `skilj-graphql` yet either).
+//! `resolve_role_by_external_subject` isn't a spec `rule`, so it adds no
+//! obligations to that count - see its own test section above the
+//! uncovered one at the bottom of this file.
 
 use chrono::{TimeZone, Utc};
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
@@ -65,6 +72,8 @@ fn bounded_context(status: BoundedContextStatus) -> BoundedContext {
     BoundedContext {
         name: "orders".into(),
         status,
+        created_at: timestamp(0),
+        created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
     }
 }
 
@@ -612,6 +621,81 @@ fn unique_active_access_per_role_and_context_is_enforced_by_grant_role_access_ma
     assert_eq!(
         err.code(),
         access_control::Error::DuplicateActiveMapping.code()
+    );
+}
+
+// ---------------------------------------------------------------------
+// resolve_role_by_external_subject - GraphQL identity resolution's one
+// pure step (see its own doc comment). Not a `rule` in the spec - the
+// prose above `entity Role` and `Actor Declarations`, not a separate
+// obligation `allium plan` enumerates - so covered directly rather than
+// against a specific obligation count.
+// ---------------------------------------------------------------------
+
+#[test]
+fn resolve_role_by_external_subject_finds_the_matching_active_role() {
+    let target = target_role(RoleStatus::Active);
+    let roles = vec![superadmin(RoleStatus::Active), target.clone()];
+
+    let resolved =
+        access_control::resolve_role_by_external_subject("user@example.com", &roles).unwrap();
+
+    assert_eq!(resolved, &target);
+}
+
+/// `UniqueActiveExternalSubject` is what makes this well defined - among
+/// several Roles, only the one whose `external_subject` actually matches
+/// is ever returned.
+#[test]
+fn resolve_role_by_external_subject_ignores_roles_with_a_different_subject() {
+    let roles = vec![
+        superadmin(RoleStatus::Active),
+        target_role(RoleStatus::Active),
+    ];
+
+    let resolved =
+        access_control::resolve_role_by_external_subject("admin@example.com", &roles).unwrap();
+
+    assert_eq!(resolved.external_subject, "admin@example.com");
+}
+
+/// A revoked Role's `external_subject` doesn't count as claimed - the
+/// same "revoked no longer holds the identity" reading `CreateSuperadmin`
+/// and `CreateRole` both give `UniqueActiveExternalSubject`.
+#[test]
+fn resolve_role_by_external_subject_ignores_a_revoked_role() {
+    let roles = vec![target_role(RoleStatus::Revoked)];
+
+    let err =
+        access_control::resolve_role_by_external_subject("user@example.com", &roles).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        access_control::Error::UnrecognisedSubject.code()
+    );
+}
+
+#[test]
+fn resolve_role_by_external_subject_rejects_an_unclaimed_subject() {
+    let roles = vec![superadmin(RoleStatus::Active)];
+
+    let err =
+        access_control::resolve_role_by_external_subject("nobody@example.com", &roles).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        access_control::Error::UnrecognisedSubject.code()
+    );
+}
+
+#[test]
+fn resolve_role_by_external_subject_rejects_when_no_roles_exist_at_all() {
+    let err =
+        access_control::resolve_role_by_external_subject("anyone@example.com", &[]).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        access_control::Error::UnrecognisedSubject.code()
     );
 }
 

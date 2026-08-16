@@ -86,7 +86,31 @@ pub struct EventSpec {
     pub payload: serde_json::Value,
 }
 
-// TODO: generate_token_secret, secret_matches, generate_token_id - the
-// crypto primitives `access_control::AccessToken` and
-// `bootstrap::BootstrapSecret` both build on (see specs/skilj.allium's
-// AccessToken.secret note and docs/architecture.md §3.2).
+// TODO: generate_token_secret, generate_token_id - the crypto primitives
+// `access_control::AccessToken` and `bootstrap::BootstrapSecret` both
+// build on (see specs/skilj.allium's AccessToken.secret note and
+// docs/architecture.md §3.2). `secret_matches` below was added
+// propagating `bootstrap::create_superadmin` - unlike the other two, it
+// needed no caller-supplied-output treatment (it takes strings, not
+// producing an opaque one), so it's real rather than deferred.
+
+/// See the `secret_matches` note above `rule CreateSuperadmin`: compares
+/// two secrets in time that depends only on their lengths, never on where
+/// they first differ, so a failed presentation leaks nothing about how
+/// much of the real secret was guessed correctly. Real rather than
+/// deferred - simple enough that there's no trivial/reachable-case split
+/// the way `protect_sensitive_fields`/`derive_tags` etc. have. A length
+/// mismatch still short-circuits (the length itself isn't the secret -
+/// only its content is), but every byte of an equal-length comparison is
+/// folded in regardless of an early difference.
+pub fn secret_matches(presented: &str, actual: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), actual.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
