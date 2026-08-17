@@ -7,16 +7,18 @@ use crate::access_control::{AccessLevel, RoleAccessMapping, RoleStatus};
 use crate::error::SkiljRejection;
 use crate::event_store::{BoundedContext, BoundedContextStatus, Event, EventType};
 
-// TODO: `project()` - the plugged-in, per-projection fold black box (see
-// the note above the rules in specs/skilj.allium) - and the async
-// per-bounded-context consumer / sync inline dispatch that would call it,
-// including promotion (a building `ProjectionRebuild` replacing the live
-// `Projection` once caught up - a background-process concern, not
-// something any rule below performs). `read_projection()`/
-// `await_projection_caught_up()` are both fully caller-supplied in
-// `query_projection` below rather than having a real implementation here
-// - see its own doc comment for why (the same "black box in the same
-// register as decide()" treatment `process_command`'s `decision` gets).
+// `project()` - the plugged-in, per-projection fold black box (see the
+// note above the rules in specs/skilj.allium) - is `plugin::
+// ProjectionDispatcher::project`, called both by the sync inline path
+// (`db::insert_event_and_update_sync_projections`) and the async
+// background consumer (`db::catch_up_bounded_context`), which also
+// drives a building `ProjectionRebuild`'s own replay and its automatic
+// promotion once caught up - see that function's own doc comment.
+// `read_projection()`/`await_projection_caught_up()` are both still
+// fully caller-supplied in `query_projection` below rather than having a
+// real implementation here - see its own doc comment for why (the same
+// "black box in the same register as decide()" treatment
+// `process_command`'s `decision` gets).
 //
 // This module was originally scaffolded with its own placeholder `Error`
 // (`EventTypeOutsideBoundedContext`/`RebuildAlreadyStaged`/

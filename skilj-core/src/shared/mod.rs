@@ -86,13 +86,35 @@ pub struct EventSpec {
     pub payload: serde_json::Value,
 }
 
-// TODO: generate_token_secret, generate_token_id - the crypto primitives
-// `access_control::AccessToken` and `bootstrap::BootstrapSecret` both
-// build on (see specs/skilj.allium's AccessToken.secret note and
-// docs/architecture.md §3.2). `secret_matches` below was added
-// propagating `bootstrap::create_superadmin` - unlike the other two, it
-// needed no caller-supplied-output treatment (it takes strings, not
-// producing an opaque one), so it's real rather than deferred.
+// `secret_matches` below was added propagating `bootstrap::create_superadmin`
+// - unlike `generate_token_secret`/`generate_token_id` below, it needed no
+// caller-supplied-output treatment (it takes strings, not producing an
+// opaque one), so it was real from the start rather than deferred.
+
+/// Generates the opaque `id` half of an `AccessToken`/`Role` - a UUIDv4,
+/// hyphens stripped (32 lowercase hex characters), matching every other
+/// identifier this codebase already treats as an opaque `String` rather
+/// than a typed newtype. Not a secret itself - safe to log, appear in a
+/// URL path, etc. - only `generate_token_secret` below carries the
+/// confidentiality requirement `secret_matches` is built to compare
+/// without leaking.
+pub fn generate_token_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Generates the `secret` half of an `AccessToken`/`BootstrapSecret` -
+/// two concatenated UUIDv4s (244 bits of randomness, comfortably more
+/// than a single v4's 122), hyphens stripped. `uuid`'s `v4` feature reads
+/// from the OS CSPRNG (`getrandom`), so this is cryptographically
+/// unpredictable, not merely unique like `generate_token_id` only needs
+/// to be.
+pub fn generate_token_secret() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
 
 /// See the `secret_matches` note above `rule CreateSuperadmin`: compares
 /// two secrets in time that depends only on their lengths, never on where

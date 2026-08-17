@@ -6,4 +6,7 @@
 //! which is what `skilj-graphql` is for. See §7.1.
 
 pub mod auth;
+pub mod error;
 pub mod routes;
+
+pub use routes::router;

@@ -126,8 +126,8 @@ fn query_events_returns_only_matching_later_events_rendered() {
     assert_eq!(
         rendered,
         vec![
-            r#"{"amount":10}"#.to_string(),
-            r#"{"amount":20}"#.to_string()
+            (1, r#"{"amount":10}"#.to_string()),
+            (2, r#"{"amount":20}"#.to_string())
         ]
     );
 }
@@ -140,7 +140,7 @@ fn query_events_with_no_after_sequence_starts_from_the_beginning() {
 
     let rendered = event_store::query_events(&mapping, &[], None, None, &events).unwrap();
 
-    assert_eq!(rendered, vec!["first".to_string()]);
+    assert_eq!(rendered, vec![(0, "first".to_string())]);
 }
 
 /// An empty `event_types` means "no restriction", not "no results" - the
@@ -170,7 +170,7 @@ fn query_events_filters_by_named_event_type() {
 
     let rendered = event_store::query_events(&mapping, &[placed], None, None, &events).unwrap();
 
-    assert_eq!(rendered, vec!["a".to_string()]);
+    assert_eq!(rendered, vec![(0, "a".to_string())]);
 }
 
 /// `tags` uses ANY-match semantics against an event's own derived tags -
@@ -188,7 +188,7 @@ fn query_events_filters_by_any_matching_tag() {
         event_store::query_events(&mapping, &[], Some(&[tag("account", "A")]), None, &events)
             .unwrap();
 
-    assert_eq!(rendered, vec!["a".to_string()]);
+    assert_eq!(rendered, vec![(0, "a".to_string())]);
 }
 
 /// Events outside the grant's own bounded context never appear, even

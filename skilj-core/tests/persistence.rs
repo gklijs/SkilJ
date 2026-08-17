@@ -1,0 +1,1320 @@
+//! Round-trip tests for `skilj_core::db` - the Postgres persistence layer
+//! added propagating `skilj-rest`'s five wired routes (docs/
+//! architecture.md §7.2/§7.4). Unlike every other test file in this
+//! crate (pure functions, no I/O), these need a real Postgres to run
+//! against:
+//!
+//! - Set `DATABASE_URL` (e.g.
+//!   `postgres://postgres:postgres@localhost/skilj_test`) to point at
+//!   one you already have running - fastest, and what CI should do.
+//! - Otherwise, `test_pool()` falls back to `postgresql_embedded`
+//!   (a dev-dependency only - never a real one): it downloads and runs a
+//!   real PostgreSQL binary as the current user, no Docker/root needed.
+//!   One instance is started per test *binary* (shared via a
+//!   process-wide `OnceCell`, not per test function - `setup()`/`start()`
+//!   cost real wall-clock time), and left running for the process to
+//!   clean up on exit rather than explicitly stopped, since there's no
+//!   single teardown point across many independently-scheduled
+//!   `#[tokio::test]` functions.
+//! - If neither works (no `DATABASE_URL` *and* the embedded download/
+//!   start fails - e.g. a sandboxed environment with no egress to fetch
+//!   the archive, or missing a system library like `libxml2` the
+//!   downloaded binary links against), every test skips itself with a
+//!   note on stderr rather than failing, so `cargo test --workspace`
+//!   still stays green with no database reachable at all.
+//!
+//! Every test picks its own random bounded-context name
+//! (`generate_token_id()` doubles as a convenient random-string source)
+//! rather than truncating shared tables between tests, so tests stay
+//! safe to run concurrently against the same database - the same reason
+//! `skilj-core`'s own pure-function tests never share mutable state.
+
+use chrono::{SubsecRound, Utc};
+use skilj_core::access_control::{
+    AccessLevel, DirectCreationToken, EventReadToken, ExternalEventToken, Role, RoleAccessMapping,
+    RoleStatus, TokenStatus,
+};
+use skilj_core::bootstrap::ContextCreator;
+use skilj_core::db::{self, AccessTokenKind, Pool};
+use skilj_core::event_store::{
+    AckMode, BoundedContext, BoundedContextStatus, CommandType, CursorUpdate, Event, EventOrigin,
+    EventType, ReadCursor,
+};
+use skilj_core::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
+use skilj_core::shared::{generate_token_id, generate_token_secret, Metadata, Tag};
+
+/// One `tokio::runtime::Runtime`, shared by every test in this binary via
+/// `#[test] fn ... { runtime().block_on(async { ... }) }` rather than
+/// `#[tokio::test]`'s own per-function runtime. Required, not a style
+/// preference: `sqlx::Pool`'s internal connection-maintenance task is
+/// spawned onto whichever runtime is active when the pool is created, and
+/// a pool built once (in `provision`, on whichever test happens to run
+/// first) and then reused by every other test - see `TEST_DB` below -
+/// would otherwise be reused from a *different* runtime than the one it
+/// was spawned on every time after the first, which manifests as
+/// `sqlx::Error::PoolTimedOut` once enough per-test runtimes have come
+/// and gone. Sharing one runtime for the whole binary is the standard fix.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new()
+            .expect("failed to build a tokio runtime for persistence tests")
+    })
+}
+
+/// Holds the connection pool alongside the embedded server (when one was
+/// started), purely so the latter isn't dropped - dropping
+/// `postgresql_embedded::PostgreSQL` stops the server (see its own
+/// `Drop` impl) - before the last test using it has run. Never read
+/// directly outside `provision`/`test_pool`.
+struct TestDb {
+    pool: Pool,
+    _embedded: Option<postgresql_embedded::PostgreSQL>,
+}
+
+static TEST_DB: tokio::sync::OnceCell<Option<TestDb>> = tokio::sync::OnceCell::const_new();
+
+/// `None` (with a stderr note explaining why) when no database could be
+/// reached at all - every test below opens with
+/// `let Some(pool) = test_pool().await else { return };`. See this
+/// module's own doc comment for the `DATABASE_URL`-then-embedded
+/// fallback and why provisioning happens once per test binary, not once
+/// per test function.
+async fn test_pool() -> Option<Pool> {
+    TEST_DB
+        .get_or_init(provision)
+        .await
+        .as_ref()
+        .map(|db| db.pool.clone())
+}
+
+async fn provision() -> Option<TestDb> {
+    if let Ok(database_url) = std::env::var("DATABASE_URL") {
+        let pool = match db::connect(&database_url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: DATABASE_URL is set but connecting failed: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = db::migrate(&pool).await {
+            eprintln!("skipping: DATABASE_URL migration failed: {e}");
+            return None;
+        }
+        return Some(TestDb {
+            pool,
+            _embedded: None,
+        });
+    }
+
+    let mut server = postgresql_embedded::PostgreSQL::default();
+    if let Err(e) = server.setup().await {
+        eprintln!(
+            "skipping: DATABASE_URL not set and embedded PostgreSQL setup failed \
+             (no network egress to fetch the binary, or a missing system library \
+             like libxml2 it links against): {e}"
+        );
+        return None;
+    }
+    if let Err(e) = server.start().await {
+        eprintln!("skipping: embedded PostgreSQL failed to start: {e}");
+        return None;
+    }
+    let database_name = "skilj_test";
+    if let Err(e) = server.create_database(database_name).await {
+        eprintln!("skipping: embedded PostgreSQL create_database failed: {e}");
+        return None;
+    }
+    let pool = match db::connect(&server.settings().url(database_name)).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("skipping: connecting to embedded PostgreSQL failed: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = db::migrate(&pool).await {
+        eprintln!("skipping: migrating embedded PostgreSQL failed: {e}");
+        return None;
+    }
+    Some(TestDb {
+        pool,
+        _embedded: Some(server),
+    })
+}
+
+fn unique_name(prefix: &str) -> String {
+    format!("{prefix}_{}", generate_token_id())
+}
+
+/// `Utc::now()` truncated to microsecond precision - `TIMESTAMPTZ` is
+/// microsecond-precision in Postgres, `chrono::Utc::now()` is nanosecond-
+/// precision in Rust, so a value built with the latter and compared
+/// against what a round-trip through the former hands back never
+/// `assert_eq!`s equal otherwise. Not a persistence bug - `db::insert_*`/
+/// `db::get_*` round-trip every value exactly as far as Postgres's own
+/// column precision allows; this only matters for test fixtures that
+/// construct a value in memory and then compare it byte-for-byte against
+/// the same value freshly loaded back.
+fn test_now() -> chrono::DateTime<Utc> {
+    Utc::now().trunc_subsecs(6)
+}
+
+async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
+    let bc = BoundedContext {
+        name: unique_name("bc"),
+        status: BoundedContextStatus::Active,
+        created_at: test_now(),
+        created_by: ContextCreator::SystemCreator,
+    };
+    db::insert_bounded_context(pool, &bc).await.unwrap();
+    bc
+}
+
+async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
+    let et = EventType {
+        bounded_context: bc.clone(),
+        name: unique_name("event_type"),
+        schema: r#"{"properties":{"amount":{"type":"number"}}}"#.to_string(),
+        schema_version: 1,
+        tag_mappings: Vec::new(),
+        sensitive_fields: Vec::new(),
+        external_creation_allowed: true,
+        direct_creation_allowed: true,
+        system_triggered_allowed: false,
+        system_triggered_schedule: None,
+        event_read_allowed: true,
+    };
+    db::upsert_event_type(pool, &et).await.unwrap();
+    et
+}
+
+async fn seed_command_type(pool: &Pool, bc: &BoundedContext) -> CommandType {
+    let ct = CommandType {
+        bounded_context: bc.clone(),
+        name: unique_name("command_type"),
+        schema: r#"{"properties":{"amount":{"type":"number"}}}"#.to_string(),
+        schema_version: 1,
+        tag_mappings: Vec::new(),
+        sensitive_fields: Vec::new(),
+        rest_trigger_allowed: true,
+    };
+    db::upsert_command_type(pool, &ct).await.unwrap();
+    ct
+}
+
+async fn seed_role(pool: &Pool, superadmin: bool) -> Role {
+    let role = Role {
+        id: generate_token_id(),
+        external_subject: unique_name("subject"),
+        name: "Test Role".to_string(),
+        superadmin,
+        status: RoleStatus::Active,
+        created_at: test_now(),
+        revoked_at: None,
+    };
+    db::insert_role(pool, &role).await.unwrap();
+    role
+}
+
+async fn seed_active_role_access_mapping(
+    pool: &Pool,
+    role: &Role,
+    bc: &BoundedContext,
+    level: AccessLevel,
+) -> RoleAccessMapping {
+    let mapping = RoleAccessMapping {
+        role: role.clone(),
+        bounded_context: bc.clone(),
+        level,
+        can_read_sensitive: false,
+        status: RoleStatus::Active,
+        created_at: test_now(),
+        revoked_at: None,
+    };
+    db::insert_role_access_mapping(pool, &mapping)
+        .await
+        .unwrap();
+    mapping
+}
+
+#[test]
+fn round_trips_a_system_created_bounded_context() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+
+        let loaded = db::get_bounded_context(&pool, &bc.name).await.unwrap();
+        assert_eq!(loaded, Some(bc));
+    });
+}
+
+#[test]
+fn round_trips_a_superadmin_created_bounded_context() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: unique_name("subject"),
+            name: "Superadmin".to_string(),
+            superadmin: true,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        let bc = BoundedContext {
+            name: unique_name("bc"),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SuperadminCreator { role: role.clone() },
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+
+        let loaded = db::get_bounded_context(&pool, &bc.name).await.unwrap();
+        assert_eq!(loaded, Some(bc));
+    });
+}
+
+#[test]
+fn get_bounded_context_is_none_for_an_unknown_name() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let loaded = db::get_bounded_context(&pool, &unique_name("missing"))
+            .await
+            .unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+/// `list_bounded_contexts` - added propagating `skilj-graphql`'s Phase 1
+/// admin console (`BoundedContextDirectory`'s `boundedContexts` query,
+/// docs/architecture.md §8 item 5's own plan). Every context this engine
+/// knows of, unfiltered - so two freshly-seeded contexts are both in the
+/// returned set, not just the one most recently inserted.
+#[test]
+fn list_bounded_contexts_includes_every_inserted_context() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc_a = seed_bounded_context(&pool).await;
+        let bc_b = seed_bounded_context(&pool).await;
+
+        let listed = db::list_bounded_contexts(&pool).await.unwrap();
+
+        assert!(listed.contains(&bc_a));
+        assert!(listed.contains(&bc_b));
+    });
+}
+
+#[test]
+fn round_trips_an_event_type() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+
+        let loaded = db::get_event_type(&pool, &bc.name, &et.name).await.unwrap();
+        assert_eq!(loaded, Some(et));
+    });
+}
+
+#[test]
+fn upsert_event_type_updates_in_place() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let mut et = seed_event_type(&pool, &bc).await;
+
+        et.schema_version = 2;
+        et.event_read_allowed = false;
+        db::upsert_event_type(&pool, &et).await.unwrap();
+
+        let loaded = db::get_event_type(&pool, &bc.name, &et.name).await.unwrap();
+        assert_eq!(loaded, Some(et));
+    });
+}
+
+#[test]
+fn next_sequence_starts_at_zero_and_increments() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+
+        assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 0);
+        assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 1);
+        assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 2);
+    });
+}
+
+#[test]
+fn next_sequence_is_independent_per_bounded_context() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let a = seed_bounded_context(&pool).await;
+        let b = seed_bounded_context(&pool).await;
+
+        assert_eq!(db::next_sequence(&pool, &a.name).await.unwrap(), 0);
+        assert_eq!(db::next_sequence(&pool, &b.name).await.unwrap(), 0);
+        assert_eq!(db::next_sequence(&pool, &a.name).await.unwrap(), 1);
+    });
+}
+
+fn sample_event(bc: &BoundedContext, et: &EventType, sequence: i64, client_id: &str) -> Event {
+    Event {
+        bounded_context: bc.clone(),
+        event_type: et.clone(),
+        payload: r#"{"amount":5}"#.to_string(),
+        metadata: Metadata {
+            r#type: et.name.clone(),
+            version: et.schema_version,
+            client_id: client_id.to_string(),
+            created_at: test_now(),
+        },
+        sequence,
+        tags: vec![Tag {
+            key: "region".to_string(),
+            value: Some("eu".to_string()),
+        }],
+        encryption_keys: Vec::new(),
+        origin: EventOrigin::ExternalTriggered {
+            source_content: "raw source".to_string(),
+            source_context: Some("adapter-1".to_string()),
+        },
+    }
+}
+
+#[test]
+fn round_trips_an_externally_triggered_event() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let event = sample_event(&bc, &et, 0, "adapter-token-id");
+        db::insert_event(&pool, &event, None).await.unwrap();
+
+        let loaded = db::list_events(&pool, &bc.name, &et.name).await.unwrap();
+        assert_eq!(loaded, vec![event]);
+    });
+}
+
+#[test]
+fn round_trips_a_directly_created_event() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let event = Event {
+            origin: EventOrigin::DirectlyCreated,
+            ..sample_event(&bc, &et, 0, "adapter-token-id")
+        };
+        db::insert_event(&pool, &event, None).await.unwrap();
+
+        let loaded = db::list_events(&pool, &bc.name, &et.name).await.unwrap();
+        assert_eq!(loaded, vec![event]);
+    });
+}
+
+#[test]
+fn list_events_is_ordered_by_sequence() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        for seq in [2_i64, 0, 1] {
+            db::insert_event(
+                &pool,
+                &sample_event(&bc, &et, seq, "adapter-token-id"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let loaded = db::list_events(&pool, &bc.name, &et.name).await.unwrap();
+        assert_eq!(
+            loaded.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    });
+}
+
+#[test]
+fn round_trips_an_external_event_token_and_its_kind() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let token = ExternalEventToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            event_type: et,
+        };
+        db::insert_external_event_token(&pool, &token)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db::access_token_kind(&pool, &token.id).await.unwrap(),
+            Some(AccessTokenKind::ExternalEvent)
+        );
+        let loaded = db::get_external_event_token(&pool, &token.id)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(token));
+    });
+}
+
+#[test]
+fn round_trips_a_direct_creation_token() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let token = DirectCreationToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            event_type: et,
+        };
+        db::insert_direct_creation_token(&pool, &token)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db::access_token_kind(&pool, &token.id).await.unwrap(),
+            Some(AccessTokenKind::DirectCreation)
+        );
+        let loaded = db::get_direct_creation_token(&pool, &token.id)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(token));
+    });
+}
+
+#[test]
+fn round_trips_a_revoked_event_read_token() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let now = test_now();
+        let token = EventReadToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Revoked,
+            created_at: now,
+            revoked_at: Some(now),
+            event_type: et,
+        };
+        db::insert_event_read_token(&pool, &token).await.unwrap();
+
+        assert_eq!(
+            db::access_token_kind(&pool, &token.id).await.unwrap(),
+            Some(AccessTokenKind::EventRead)
+        );
+        let loaded = db::get_event_read_token(&pool, &token.id).await.unwrap();
+        assert_eq!(loaded, Some(token));
+    });
+}
+
+/// The 401-vs-403 distinction `skilj-rest`'s auth layer relies on
+/// (`AccessTokenKind`'s own doc comment): a lookup under the wrong
+/// getter returns `None`, not the row - `get_direct_creation_token`
+/// must not hand back a token that's actually kind `external_event`.
+#[test]
+fn getting_a_token_by_the_wrong_kind_returns_none() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let token = ExternalEventToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            event_type: et,
+        };
+        db::insert_external_event_token(&pool, &token)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db::get_direct_creation_token(&pool, &token.id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db::get_event_read_token(&pool, &token.id).await.unwrap(),
+            None
+        );
+    });
+}
+
+#[test]
+fn access_token_kind_is_none_for_an_unknown_id() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        assert_eq!(
+            db::access_token_kind(&pool, &generate_token_id())
+                .await
+                .unwrap(),
+            None
+        );
+    });
+}
+
+#[test]
+fn read_cursor_is_none_before_the_first_consume() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let token = EventReadToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            event_type: et,
+        };
+        db::insert_event_read_token(&pool, &token).await.unwrap();
+
+        assert_eq!(db::get_read_cursor(&pool, &token).await.unwrap(), None);
+    });
+}
+
+#[test]
+fn apply_cursor_update_created_then_advanced_round_trips() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let token = EventReadToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            event_type: et,
+        };
+        db::insert_event_read_token(&pool, &token).await.unwrap();
+
+        let created_at = test_now();
+        let created = CursorUpdate::Created(Box::new(ReadCursor {
+            token: token.clone(),
+            ack_mode: AckMode::AutoAdvance,
+            sequence: 0,
+            updated_at: created_at,
+        }));
+        db::apply_cursor_update(&pool, &token, &created)
+            .await
+            .unwrap();
+        let loaded = db::get_read_cursor(&pool, &token).await.unwrap().unwrap();
+        assert_eq!(loaded.sequence, 0);
+        assert_eq!(loaded.ack_mode, AckMode::AutoAdvance);
+
+        let advanced_at = test_now();
+        let advanced = CursorUpdate::Advanced {
+            sequence: 5,
+            updated_at: advanced_at,
+        };
+        db::apply_cursor_update(&pool, &token, &advanced)
+            .await
+            .unwrap();
+        let loaded = db::get_read_cursor(&pool, &token).await.unwrap().unwrap();
+        assert_eq!(loaded.sequence, 5);
+        // ack_mode isn't part of an Advanced update - it stays whatever
+        // Created it with, per ReadCursor's own 1:1-with-a-token shape.
+        assert_eq!(loaded.ack_mode, AckMode::AutoAdvance);
+    });
+}
+
+#[test]
+fn record_acknowledgement_moves_the_cursor() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let token = EventReadToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            event_type: et,
+        };
+        db::insert_event_read_token(&pool, &token).await.unwrap();
+        db::apply_cursor_update(
+            &pool,
+            &token,
+            &CursorUpdate::Created(Box::new(ReadCursor {
+                token: token.clone(),
+                ack_mode: AckMode::ManualAck,
+                sequence: -1,
+                updated_at: test_now(),
+            })),
+        )
+        .await
+        .unwrap();
+
+        let ack_at = test_now();
+        db::record_acknowledgement(&pool, &token, 3, ack_at)
+            .await
+            .unwrap();
+
+        let loaded = db::get_read_cursor(&pool, &token).await.unwrap().unwrap();
+        assert_eq!(loaded.sequence, 3);
+        assert_eq!(loaded.ack_mode, AckMode::ManualAck);
+    });
+}
+
+#[test]
+fn round_trips_a_role() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, false).await;
+
+        let loaded = db::get_role(&pool, &role.id).await.unwrap();
+        assert_eq!(loaded, Some(role));
+    });
+}
+
+#[test]
+fn get_role_is_none_for_an_unknown_id() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let loaded = db::get_role(&pool, &generate_token_id()).await.unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+#[test]
+fn list_roles_includes_every_inserted_role() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, true).await;
+
+        let loaded = db::list_roles(&pool).await.unwrap();
+        // A `contains` check, not exact equality - other tests running
+        // concurrently against the same database insert their own roles
+        // too (see this file's own doc comment on why every test uses a
+        // random name rather than assuming exclusive access).
+        assert!(loaded.contains(&role));
+    });
+}
+
+#[test]
+fn update_role_persists_a_revocation() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, false).await;
+
+        let revoked_at = test_now();
+        let revoked = Role {
+            status: RoleStatus::Revoked,
+            revoked_at: Some(revoked_at),
+            ..role
+        };
+        db::update_role(&pool, &revoked).await.unwrap();
+
+        let loaded = db::get_role(&pool, &revoked.id).await.unwrap();
+        assert_eq!(loaded, Some(revoked));
+    });
+}
+
+#[test]
+fn round_trips_an_active_role_access_mapping() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, false).await;
+        let bc = seed_bounded_context(&pool).await;
+        let mapping = seed_active_role_access_mapping(&pool, &role, &bc, AccessLevel::Admin).await;
+
+        let loaded = db::get_active_role_access_mapping(&pool, &role.id, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(mapping));
+    });
+}
+
+#[test]
+fn get_active_role_access_mapping_is_none_when_no_mapping_exists() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, false).await;
+        let bc = seed_bounded_context(&pool).await;
+
+        let loaded = db::get_active_role_access_mapping(&pool, &role.id, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+#[test]
+fn get_active_role_access_mapping_is_none_after_revocation() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, false).await;
+        let bc = seed_bounded_context(&pool).await;
+        seed_active_role_access_mapping(&pool, &role, &bc, AccessLevel::Write).await;
+
+        db::revoke_active_role_access_mapping(&pool, &role.id, &bc.name, test_now())
+            .await
+            .unwrap();
+
+        let loaded = db::get_active_role_access_mapping(&pool, &role.id, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+#[test]
+fn revoke_active_role_access_mapping_is_a_noop_when_none_is_active() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, false).await;
+        let bc = seed_bounded_context(&pool).await;
+
+        // No mapping exists at all yet - revoking should affect zero rows,
+        // not error.
+        db::revoke_active_role_access_mapping(&pool, &role.id, &bc.name, test_now())
+            .await
+            .unwrap();
+
+        let loaded = db::get_active_role_access_mapping(&pool, &role.id, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+#[test]
+fn list_role_access_mappings_includes_active_and_revoked() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, false).await;
+        let bc_active = seed_bounded_context(&pool).await;
+        let bc_revoked = seed_bounded_context(&pool).await;
+        let active =
+            seed_active_role_access_mapping(&pool, &role, &bc_active, AccessLevel::Read).await;
+        seed_active_role_access_mapping(&pool, &role, &bc_revoked, AccessLevel::Write).await;
+        let revoked_at = test_now();
+        db::revoke_active_role_access_mapping(&pool, &role.id, &bc_revoked.name, revoked_at)
+            .await
+            .unwrap();
+
+        let loaded = db::list_role_access_mappings(&pool).await.unwrap();
+        assert!(loaded.contains(&active));
+        assert!(loaded.iter().any(|m| {
+            m.role == role
+                && m.bounded_context == bc_revoked
+                && m.status == RoleStatus::Revoked
+                && m.revoked_at == Some(revoked_at)
+        }));
+    });
+}
+
+#[test]
+fn list_active_role_access_mappings_for_role_excludes_other_roles_and_revoked() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role_a = seed_role(&pool, false).await;
+        let role_b = seed_role(&pool, false).await;
+        let bc_a = seed_bounded_context(&pool).await;
+        let bc_b = seed_bounded_context(&pool).await;
+        let active =
+            seed_active_role_access_mapping(&pool, &role_a, &bc_a, AccessLevel::Admin).await;
+        seed_active_role_access_mapping(&pool, &role_a, &bc_b, AccessLevel::Read).await;
+        db::revoke_active_role_access_mapping(&pool, &role_a.id, &bc_b.name, test_now())
+            .await
+            .unwrap();
+        seed_active_role_access_mapping(&pool, &role_b, &bc_a, AccessLevel::Write).await;
+
+        let loaded = db::list_active_role_access_mappings_for_role(&pool, &role_a.id)
+            .await
+            .unwrap();
+        assert_eq!(loaded, vec![active]);
+    });
+}
+
+#[test]
+fn round_trips_a_command_type() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let ct = seed_command_type(&pool, &bc).await;
+
+        let loaded = db::get_command_type(&pool, &bc.name, &ct.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(ct));
+    });
+}
+
+#[test]
+fn get_command_type_is_none_for_an_unknown_name() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+
+        let loaded = db::get_command_type(&pool, &bc.name, &unique_name("missing"))
+            .await
+            .unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+#[test]
+fn upsert_command_type_updates_in_place() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let mut ct = seed_command_type(&pool, &bc).await;
+
+        ct.schema_version = 2;
+        ct.rest_trigger_allowed = false;
+        db::upsert_command_type(&pool, &ct).await.unwrap();
+
+        let loaded = db::get_command_type(&pool, &bc.name, &ct.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(ct));
+    });
+}
+
+#[test]
+fn round_trips_a_projection_with_no_consumed_event_types() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{"balance":{"type":"number"}}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+
+        let loaded = db::get_projection(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(projection));
+    });
+}
+
+#[test]
+fn round_trips_a_projection_with_consumed_event_types() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et_a = seed_event_type(&pool, &bc).await;
+        let et_b = seed_event_type(&pool, &bc).await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{"balance":{"type":"number"}}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: vec![et_a.clone(), et_b.clone()],
+            sync: true,
+            caught_up_to: Some(41),
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+
+        let mut loaded = db::get_projection(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap()
+            .unwrap();
+        loaded
+            .consumed_event_types
+            .sort_by(|a, b| a.name.cmp(&b.name));
+        let mut expected = vec![et_a, et_b];
+        expected.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(loaded.consumed_event_types, expected);
+        assert_eq!(loaded.caught_up_to, Some(41));
+        assert!(loaded.sync);
+    });
+}
+
+#[test]
+fn upsert_projection_replaces_consumed_event_types() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et_a = seed_event_type(&pool, &bc).await;
+        let et_b = seed_event_type(&pool, &bc).await;
+        let mut projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: vec![et_a.clone()],
+            sync: false,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+
+        // Replace et_a with et_b entirely - the old join row must be gone,
+        // not just the new one added.
+        projection.consumed_event_types = vec![et_b.clone()];
+        db::upsert_projection(&pool, &projection).await.unwrap();
+
+        let loaded = db::get_projection(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.consumed_event_types, vec![et_b]);
+    });
+}
+
+#[test]
+fn get_projection_is_none_for_an_unknown_name() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+
+        let loaded = db::get_projection(&pool, &bc.name, &unique_name("missing"))
+            .await
+            .unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+#[test]
+fn round_trips_a_projection_rebuild() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: Some(10),
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+
+        let rebuild = ProjectionRebuild {
+            projection: projection.clone(),
+            schema: r#"{"properties":{"total":{"type":"number"}}}"#.to_string(),
+            schema_version: 2,
+            consumed_event_types: vec![et.clone()],
+            sync: true,
+            caught_up_to: None,
+            status: ProjectionRebuildStatus::Pending,
+        };
+        db::upsert_projection_rebuild(&pool, &rebuild)
+            .await
+            .unwrap();
+
+        let loaded = db::get_projection_rebuild(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(rebuild));
+    });
+}
+
+#[test]
+fn get_projection_rebuild_is_none_when_none_staged() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+
+        let loaded = db::get_projection_rebuild(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+#[test]
+fn upsert_projection_rebuild_restages_in_place() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+        let first = ProjectionRebuild {
+            projection: projection.clone(),
+            schema: "{}".to_string(),
+            schema_version: 2,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: None,
+            status: ProjectionRebuildStatus::Pending,
+        };
+        db::upsert_projection_rebuild(&pool, &first).await.unwrap();
+
+        let restaged = ProjectionRebuild {
+            status: ProjectionRebuildStatus::Building,
+            schema_version: 3,
+            ..first
+        };
+        db::upsert_projection_rebuild(&pool, &restaged)
+            .await
+            .unwrap();
+
+        let loaded = db::get_projection_rebuild(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap();
+        // One row, not two - restaging replaces it in place.
+        assert_eq!(loaded, Some(restaged));
+    });
+}
+
+#[test]
+fn delete_projection_rebuild_removes_it() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+        let rebuild = ProjectionRebuild {
+            projection: projection.clone(),
+            schema: "{}".to_string(),
+            schema_version: 2,
+            consumed_event_types: vec![et],
+            sync: false,
+            caught_up_to: None,
+            status: ProjectionRebuildStatus::Pending,
+        };
+        db::upsert_projection_rebuild(&pool, &rebuild)
+            .await
+            .unwrap();
+
+        db::delete_projection_rebuild(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap();
+
+        let loaded = db::get_projection_rebuild(&pool, &bc.name, &projection.name)
+            .await
+            .unwrap();
+        assert_eq!(loaded, None);
+    });
+}
+
+// ---------------------------------------------------------------------
+// Schema-per-bounded-context provisioning / hard deletion
+// (docs/architecture.md §2.2.2, `DeleteBoundedContext` in
+// specs/skilj.allium)
+// ---------------------------------------------------------------------
+
+/// `insert_bounded_context` provisions a real, independently-usable
+/// `bc_<name>` schema, not just the `bounded_contexts` registry row -
+/// every per-context table is there and empty, ready for
+/// `seed_event_type`/etc. to write into without any further setup. Two
+/// contexts get two entirely separate schemas: an `EventType` registered
+/// in one is invisible from the other's, the isolation the whole design
+/// exists for (docs/architecture.md §2.2.2).
+#[test]
+fn provisioning_creates_an_independently_queryable_schema_per_context() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc_a = seed_bounded_context(&pool).await;
+        let bc_b = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc_a).await;
+
+        // Visible from the context it was registered in...
+        assert_eq!(
+            db::get_event_type(&pool, &bc_a.name, &et.name)
+                .await
+                .unwrap(),
+            Some(et.clone())
+        );
+        // ...but not from a different context's own, separate schema.
+        assert_eq!(
+            db::get_event_type(&pool, &bc_b.name, &et.name)
+                .await
+                .unwrap(),
+            None
+        );
+    });
+}
+
+/// `hard_delete_bounded_context` removes the schema (a query against it
+/// afterward finds nothing - the same `None` a never-provisioned context
+/// would give) and the `bounded_contexts` registry row together, and its
+/// `role_access_mappings`/`access_token_index` rows are gone too, via the
+/// `ON DELETE CASCADE` FK - no separate cleanup query needed. Afterward,
+/// the same name is free to be reused by a fresh `insert_bounded_context`
+/// call - a genuinely different context, not the old one reappearing.
+#[test]
+fn hard_delete_drops_the_schema_and_cascades_the_registry_row() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let role = seed_role(&pool, false).await;
+        let mapping = seed_active_role_access_mapping(&pool, &role, &bc, AccessLevel::Admin).await;
+        let token = ExternalEventToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            event_type: et.clone(),
+        };
+        db::insert_external_event_token(&pool, &token)
+            .await
+            .unwrap();
+
+        db::hard_delete_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db::get_bounded_context(&pool, &bc.name).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            db::get_active_role_access_mapping(&pool, &mapping.role.id, &bc.name)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(db::access_token_kind(&pool, &token.id).await.unwrap(), None);
+
+        // The name is free again - a fresh context, not the old one back.
+        let reused = BoundedContext {
+            name: bc.name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+        };
+        db::insert_bounded_context(&pool, &reused).await.unwrap();
+        assert_eq!(
+            db::get_bounded_context(&pool, &bc.name).await.unwrap(),
+            Some(reused)
+        );
+        // The reused schema starts genuinely empty - the old EventType
+        // doesn't resurface under the recycled name.
+        assert_eq!(
+            db::get_event_type(&pool, &bc.name, &et.name).await.unwrap(),
+            None
+        );
+    });
+}

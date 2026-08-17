@@ -265,8 +265,11 @@ enum AckMode { auto_advance | manual_ack }
 entity BoundedContext {
     name: String
     status: active | archived              -- archived: no longer accepts new commands/events, but its
-                                            -- history is retained (event sourcing is append-only; a
-                                            -- bounded context is deactivated, never erased)
+                                            -- history is retained (event sourcing is append-only;
+                                            -- archiving deactivates a bounded context, it never
+                                            -- erases one). Erasing is a separate, later, deliberate
+                                            -- act, and archiving is its precondition rather than a
+                                            -- softer form of it - see rule DeleteBoundedContext
     created_at: Timestamp                  -- when this context came into being: the moment
                                             -- AddBoundedContext was called, for every context an
                                             -- admin adds, and the moment of SkilJ's own first
@@ -423,8 +426,9 @@ entity CommandType {
     -- retroactively encrypt this type's existing history, since a stored
     -- command is never rewritten. See Command.encryption_keys to tell
     -- which historical commands predate a given entry (and so still hold
-    -- that field in plaintext). Nothing ever protects or removes that
-    -- plaintext later: there is no backfill or purge path, so this must
+    -- that field in plaintext). Nothing ever protects that plaintext
+    -- later, and nothing short of deleting the whole bounded context
+    -- removes it: there is no backfill or purge path, so this must
     -- be declared before sensitive data starts flowing through the type
     -- (see the protect_sensitive_fields note above the rules).
     sensitive_fields: Set<SensitiveField>
@@ -457,8 +461,9 @@ entity EventType {
     -- retroactively encrypt this type's existing history, since events
     -- are immutable. See Event.encryption_keys to tell which historical
     -- events predate a given entry (and so still hold that field in
-    -- plaintext). Nothing ever protects or removes that plaintext later:
-    -- there is no backfill or purge path, so this must be declared
+    -- plaintext). Nothing ever protects that plaintext later, and nothing
+    -- short of deleting the whole bounded context removes it: there is
+    -- no backfill or purge path, so this must be declared
     -- before sensitive data starts flowing through the type (see the
     -- protect_sensitive_fields note above the rules).
     sensitive_fields: Set<SensitiveField>
@@ -1009,8 +1014,11 @@ entity ReadCursor {
 -- exists unconditionally, before the first superadmin Role does - and
 -- cannot create either, since that rule's `not exists
 -- BoundedContext{name: name}` guard already sees this one. It is
--- permanent in the other direction too: nothing removes a bounded
--- context, here or anywhere else in this file.
+-- permanent in the other direction too: nothing removes this bounded
+-- context. Other contexts can now be removed - DeleteBoundedContext ends
+-- an archived one outright - but that rule guards against this one by
+-- name, so admin is the single context whose permanence is absolute. See
+-- invariant AdminContextIsPermanent.
 --
 -- Only its name and status are literal above, because only those are
 -- spec-time constants. Its created_at and created_by are real recorded
@@ -1110,14 +1118,18 @@ default SystemCreator skilj = { }
 -- declared were never encrypted, so there is no EncryptionKey to destroy
 -- for them and ForgetSubject has nothing to act on. There is no
 -- backfill, purge or redaction path for that data, and this spec
--- deliberately does not offer one: the only way to remove it would be to
--- rewrite stored Command/Event rows in place, and immutability is
+-- deliberately does not offer one: the only targeted way to remove it
+-- would be to rewrite stored Command/Event rows in place, and immutability is
 -- load-bearing everywhere here - a stored command or event is never
 -- rewritten, the stream is append-only, and crypto-shredding exists
 -- precisely so that forgetting destroys a key rather than touching a
 -- row. Archiving is not a partial mitigation either: an archived
 -- bounded context stops accepting new commands and events but retains
--- its history exactly as recorded (see BoundedContext.status). The
+-- its history exactly as recorded (see BoundedContext.status). Deleting
+-- that archived context afterwards does remove the plaintext, but as a
+-- way out rather than a redaction path: DeleteBoundedContext is all or
+-- nothing and works on a whole bounded context, never on one subject's
+-- data within a context anyone still wants. The
 -- practical consequence for whoever registers a type: sensitive_fields
 -- has to be declared before sensitive data starts flowing through that
 -- type. Declaring it later protects the future only, never the past.
@@ -1475,7 +1487,11 @@ rule FetchEvents {
 -- A revoked token's cursor needs no disposal path and gets none. Both
 -- rules require token.status = active and revocation is terminal, so the
 -- row simply becomes permanently unreachable - the same end every other
--- row in this file reaches, since nothing here is ever deleted.
+-- row in this file reaches, since nothing here is deleted one row at a
+-- time. The one rule that removes anything, DeleteBoundedContext, works
+-- at whole-bounded-context granularity: it takes such a cursor with it,
+-- along with everything else scoped to the context, and is no more a
+-- disposal path for one stale cursor than it is for one stale event.
 --
 -- highest_sequence(events) is a black box in the same trivial register as
 -- the filter(events, ...) beside it: the greatest Event.sequence among a
@@ -2112,12 +2128,12 @@ rule InspectEvent {
         -- QueryEvents applies; see its guidance.
 }
 
--- The nine rules below are the admin bounded context's operations. In
+-- The ten rules below are the admin bounded context's operations. In
 -- principle each should itself be a Command producing a CommandTriggered
--- Event (BoundedContextAdded, BoundedContextArchived, EventTypeRegistered,
--- CommandTypeRegistered, TokenCreated, TokenRevoked) within the admin
--- bounded context, the same as any other bounded context's commands -
--- full dogfooding. That wiring depends on the still-open general
+-- Event (BoundedContextAdded, BoundedContextArchived, BoundedContextDeleted,
+-- EventTypeRegistered, CommandTypeRegistered, TokenCreated, TokenRevoked)
+-- within the admin bounded context, the same as any other bounded
+-- context's commands - full dogfooding. That wiring depends on the still-open general
 -- command-processing mechanism, so for now these are modelled as direct
 -- effects, consistent with CreateExternalEvent and CreateDirectEvent
 -- above.
@@ -2163,6 +2179,23 @@ rule AddBoundedContext {
     requires: caller.status = active
     requires: caller.superadmin = true
     requires: not exists BoundedContext{name: name}
+
+    -- A name is not only a label. It is carried through verbatim as an
+    -- identifier by the layers underneath this spec, which accept a
+    -- restricted character set and a bounded length, so a name that would
+    -- not survive that trip is refused here rather than failing somewhere
+    -- later and less legibly. valid_bounded_context_name(name) holds when
+    -- the name is made only of lowercase letters, digits and underscores,
+    -- starts with a letter, and is at most 40 characters long. It is a
+    -- black box for the same reason valid_filters and valid_tag_mappings
+    -- are: a character-level check is below the level this file works at.
+    --
+    -- This is the only gate a name ever passes. There is no rename, so a
+    -- name is chosen once, at the moment of creation, and every later use
+    -- of it - including a reuse after DeleteBoundedContext frees it - comes
+    -- back through this same rule and this same check.
+    requires: valid_bounded_context_name(name)
+
     ensures:
         let creator = SuperadminCreator.created(role: caller)
         BoundedContext.created(
@@ -2180,7 +2213,7 @@ rule AddBoundedContext {
 -- contexts exist, when each appeared and who created it - without relying
 -- on GraphQL introspection to discover them.
 --
--- It is not one of the nine the note above counts: those are the admin
+-- It is not one of the ten the note above counts: those are the admin
 -- bounded context's mutations, each of which should one day be a Command
 -- producing an Event. This one writes nothing, so there is nothing for it
 -- to dogfood into - it follows FetchCommands' and QueryProjection's shape
@@ -2212,9 +2245,11 @@ rule ArchiveBoundedContext {
     requires: bounded_context.status = active
 
     -- The admin context is permanent. The note above the Defaults section
-    -- already says nothing removes a bounded context, here or anywhere
-    -- else in this file; this guard is what makes that hold for archiving
-    -- too, which is the only other way a context stops accepting work.
+    -- already says nothing removes it - DeleteBoundedContext below guards
+    -- against it by name for exactly this reason; this guard is what makes
+    -- the same hold for archiving, the only other way a context stops
+    -- accepting work. It also keeps admin out of reach of deletion twice
+    -- over, since only an archived context can be deleted.
     -- Archiving admin would strand the system: the grants, tokens and
     -- Roles that gate every other context's administration all live in it,
     -- so a superadmin holding an admin-level grant on admin could
@@ -2224,6 +2259,77 @@ rule ArchiveBoundedContext {
 
     ensures:
         bounded_context.status = archived
+}
+
+-- The one rule in this file that removes something rather than
+-- deactivating it, and deliberately the hardest one to reach.
+--
+-- Two steps, never one. The context has to be archived already, by a
+-- separate earlier call: archiving stops new commands and events while
+-- leaving everything recorded still readable, and deleting is the second,
+-- deliberate act that ends that too. So no single call turns a live
+-- bounded context into nothing, and whoever only meant to stop a context
+-- already has what they wanted after step one.
+--
+-- Superadmin-gated rather than grant-gated, unlike ArchiveBoundedContext
+-- directly above, and that difference is the point rather than an
+-- oversight. An admin-level RoleAccessMapping authorises everything that
+-- happens inside its context, up to and including stopping it - but not
+-- ending it. Deleting a context is not an operation within that context;
+-- it is an operation on the set of contexts a deployment has, the same
+-- kind of thing AddBoundedContext and ListBoundedContexts are, and gated
+-- the same way for the same reason.
+--
+-- Everything scoped to the deleted context ceases to exist with it: its
+-- EventTypes and CommandTypes, its Commands and Events, its Projections
+-- and ProjectionRebuilds, its Subscriptions and ReadCursors, the
+-- AccessTokens minted over its types, the EncryptionKeys its ciphertext
+-- was written under, the SuperadminCreator AddBoundedContext minted for
+-- it, and every RoleAccessMapping granting a Role access to it. The
+-- ensures below says only that the BoundedContext itself no longer
+-- exists; the cascade is left to the implementation rather than itemised
+-- entity by entity here, the same treatment next_sequence's row lock and
+-- the warm event cache already get. What this file does state is the
+-- observable end state: afterwards nothing anywhere answers a question
+-- about that context.
+--
+-- The name comes free again. AddBoundedContext's `not exists
+-- BoundedContext{name: name}` guard is true once more, so a later call
+-- may take the name back - and what it gets is a new bounded context with
+-- its own created_at and created_by, not the old one revived. That is
+-- exactly why this is modelled as the context ceasing to exist rather
+-- than as a third BoundedContext.status value: a deleted-but-present
+-- context would still carry a creation stamp describing nothing, and a
+-- reused name would inherit it.
+--
+-- What does not go away is the fact that any of it happened. Each of the
+-- ten admin operations - adding, archiving and now deleting among them -
+-- is meant in the end to be a Command against the admin bounded
+-- context producing an Event there (see the note above them; none has
+-- that wiring yet, and this rule does not start it). Once they do, a
+-- context's whole created/archived/deleted history stays permanently
+-- readable in admin, which nothing can delete - hence the
+-- `bounded_context != admin` guard below and invariant
+-- AdminContextIsPermanent. Only the deleted context's own operational
+-- data is genuinely gone; the record that it once existed was never its
+-- data to take.
+--
+-- One consequence of requiring archived first is worth saying plainly.
+-- ArchiveBoundedContext needs an admin-level grant on its target, so a
+-- context created and never granted to anyone - the permanently inert
+-- state the note above AddBoundedContext describes - cannot be archived,
+-- and therefore cannot be deleted either. Getting rid of a mistake still
+-- starts with GrantRoleAccessMapping.
+
+rule DeleteBoundedContext {
+    when: DeleteBoundedContext(caller, bounded_context)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: bounded_context.status = archived
+    requires: bounded_context != admin
+
+    ensures:
+        not exists bounded_context
 }
 
 -- RegisterEventType, RegisterCommandType and RegisterProjection below are
@@ -4134,6 +4240,32 @@ surface BoundedContextArchival {
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises archiving its own
         -- bounded context, never another one.
+}
+
+surface BoundedContextDeletion {
+    facing caller: Superadmin
+    context bounded_context: BoundedContext where status = archived
+
+    provides:
+        DeleteBoundedContext(caller, bounded_context)
+
+    @guarantee SuperadminOnly
+        -- Deleting a bounded context is an operation on the set of
+        -- contexts a deployment has, not one within a context, so it is
+        -- gated by Role.superadmin rather than by a per-context
+        -- RoleAccessMapping - a deliberately higher bar than
+        -- BoundedContextArchival's, which an admin-level grant reaches.
+
+    @guidance
+        -- GraphQL only, and separate from BoundedContextArchival despite
+        -- the neighbouring subject: this surface faces a different party
+        -- and applies only to contexts archiving has already finished
+        -- with, so the two cannot share a context binding.
+        --
+        -- Irreversible, and the only irreversible operation here besides
+        -- ForgetSubject. Everything scoped to the context goes with it -
+        -- see the note above rule DeleteBoundedContext for what that
+        -- covers and for why the name becomes available again afterwards.
 }
 
 surface SubjectErasure {

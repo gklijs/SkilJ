@@ -9,12 +9,14 @@
 use crate::error::SkiljRejection;
 use crate::event_store::BoundedContext;
 
-// TODO: real JWKS fetching and JWT signature verification (step 1 of the
-// identity resolution note above `entity Role`) - genuine I/O and a
-// black box per the spec's own text, so it doesn't fit this crate's
-// pure-function register the way `resolve_role_by_external_subject`
-// below (step 3, the one pure part of that pipeline) does. The four
-// actors (`ReadAccess`/`WriteAccess`/`AdminAccess`/`SensitiveDataAccess`)
+// Real JWKS fetching and JWT signature verification (step 1 of the
+// identity resolution note above `entity Role`) now live below
+// (`IdpConfig`/`SigningAlgorithm`/`JwksCache`/`verify_and_extract_subject`)
+// - genuine I/O, so unlike every pure function in this module they
+// aren't tested by construction alone; see their own doc comments and
+// docs/architecture.md §6 for the concrete design the spec's own "black
+// box" text left this document to fill in. The four actors
+// (`ReadAccess`/`WriteAccess`/`AdminAccess`/`SensitiveDataAccess`)
 // and `Superadmin` have no resolution function of their own to add
 // beyond that: each is a predicate over an already-resolved
 // `RoleAccessMapping`/`Role` (see `actor ReadAccess` etc. in the spec),
@@ -213,6 +215,27 @@ pub enum Error {
 
     #[error("this Role already holds an active RoleAccessMapping for this bounded context")]
     DuplicateActiveMapping,
+
+    #[error("the presented JWT is malformed: {0}")]
+    MalformedJwt(String),
+
+    #[error("the presented JWT has no key id (kid) header, so no JWKS entry can verify it")]
+    JwtMissingKeyId,
+
+    #[error(
+        "the presented JWT's key id (kid) doesn't match any key in the trusted IdP's JWKS, \
+         even after a refetch"
+    )]
+    UnknownSigningKey,
+
+    #[error("the presented JWT failed verification: {0}")]
+    JwtVerificationFailed(String),
+
+    #[error("the presented JWT's verified claims have no {0} claim to trust as the subject")]
+    MissingSubjectClaim(String),
+
+    #[error("fetching the trusted IdP's JWKS failed: {0}")]
+    JwksFetchFailed(String),
 }
 
 impl SkiljRejection for Error {
@@ -227,6 +250,12 @@ impl SkiljRejection for Error {
             Error::UnrecognisedSubject => "unrecognised_subject",
             Error::ExternalSubjectAlreadyClaimed => "external_subject_already_claimed",
             Error::DuplicateActiveMapping => "duplicate_active_mapping",
+            Error::MalformedJwt(_) => "malformed_jwt",
+            Error::JwtMissingKeyId => "jwt_missing_key_id",
+            Error::UnknownSigningKey => "unknown_signing_key",
+            Error::JwtVerificationFailed(_) => "jwt_verification_failed",
+            Error::MissingSubjectClaim(_) => "missing_subject_claim",
+            Error::JwksFetchFailed(_) => "jwks_fetch_failed",
         }
     }
 
@@ -246,6 +275,206 @@ pub(crate) fn require_active_superadmin(caller: &Role) -> crate::error::Result<(
         return Err(Error::NotSuperadmin.into());
     }
     Ok(())
+}
+
+/// A deployment's trust configuration for exactly one external IdP - see
+/// the identity resolution note above `entity Role` and docs/
+/// architecture.md §6. Runtime/library configuration, not domain state,
+/// the same register the spec's own note gives the in-memory event
+/// cache's startup warm-up count: nothing in the domain reads or writes
+/// these values, they only parameterise `verify_and_extract_subject`
+/// below.
+#[derive(Debug, Clone)]
+pub struct IdpConfig {
+    pub jwks_endpoint: reqwest::Url,
+    pub issuer: String,
+    pub signing_algorithm: SigningAlgorithm,
+    /// Defaults to `"sub"`, the standard JWT subject claim - the one
+    /// degree of freedom the spec's own note leaves step 2 ("SkilJ
+    /// trusts the subject claim of a verified JWT... configurable" per
+    /// the identity resolution note's closing paragraph).
+    pub subject_claim: String,
+}
+
+impl IdpConfig {
+    pub fn new(
+        jwks_endpoint: reqwest::Url,
+        issuer: impl Into<String>,
+        signing_algorithm: SigningAlgorithm,
+    ) -> Self {
+        Self {
+            jwks_endpoint,
+            issuer: issuer.into(),
+            signing_algorithm,
+            subject_claim: "sub".to_string(),
+        }
+    }
+
+    pub fn with_subject_claim(mut self, claim: impl Into<String>) -> Self {
+        self.subject_claim = claim.into();
+        self
+    }
+}
+
+/// The signing algorithms `IdpConfig` accepts - asymmetric only.
+/// `jsonwebtoken::Algorithm` also offers HMAC variants, deliberately not
+/// wrapped here: an HMAC signature is verified with the same secret it
+/// was signed with, which would mean this process and the external IdP
+/// sharing a symmetric secret - a trust shape the spec's own "SkilJ does
+/// not authenticate GraphQL callers itself; it delegates to a trusted
+/// external identity provider" framing doesn't fit. SkilJ only ever
+/// verifies a JWT an external IdP already signed with its own private
+/// key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningAlgorithm {
+    Rs256,
+    Rs384,
+    Rs512,
+    Es256,
+    Es384,
+}
+
+impl SigningAlgorithm {
+    fn to_jsonwebtoken(self) -> jsonwebtoken::Algorithm {
+        match self {
+            SigningAlgorithm::Rs256 => jsonwebtoken::Algorithm::RS256,
+            SigningAlgorithm::Rs384 => jsonwebtoken::Algorithm::RS384,
+            SigningAlgorithm::Rs512 => jsonwebtoken::Algorithm::RS512,
+            SigningAlgorithm::Es256 => jsonwebtoken::Algorithm::ES256,
+            SigningAlgorithm::Es384 => jsonwebtoken::Algorithm::ES384,
+        }
+    }
+}
+
+/// Caches an IdP's JWKS (JSON Web Key Set), keyed by each key's own
+/// `kid` - see docs/architecture.md §6 for why this is reactive-refresh
+/// rather than a background-timer poll: a JWT whose `kid` isn't already
+/// cached triggers exactly one refetch of the whole set before giving
+/// up, rather than a task refreshing on a schedule nothing here needs to
+/// manage the lifecycle of. `min_refetch_interval` (a few seconds', not
+/// configurable - an internal safety margin, not a tuning knob) is what
+/// keeps a caller presenting JWTs with garbage `kid` values from cheaply
+/// forcing a refetch on every single request.
+///
+/// One `JwksCache` per `IdpConfig`, held for the process's lifetime
+/// (`Skilj` holds one, built once in `.build()`) - never reconstructed
+/// per request, so its cached keys and refetch timer persist exactly the
+/// way this design depends on.
+pub struct JwksCache {
+    client: reqwest::Client,
+    jwks_endpoint: reqwest::Url,
+    min_refetch_interval: std::time::Duration,
+    keys: tokio::sync::RwLock<std::collections::HashMap<String, jsonwebtoken::DecodingKey>>,
+    last_refetch: tokio::sync::RwLock<Option<std::time::Instant>>,
+}
+
+impl JwksCache {
+    pub fn new(jwks_endpoint: reqwest::Url) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            jwks_endpoint,
+            min_refetch_interval: std::time::Duration::from_secs(5),
+            keys: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            last_refetch: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// The cached `DecodingKey` for `kid`, refetching the whole JWKS
+    /// document once first when it isn't already cached and the minimum
+    /// refetch interval has elapsed since the last attempt (whether or
+    /// not that attempt found the key being looked for now) - `None`
+    /// either way it still can't be found, which
+    /// `verify_and_extract_subject` below turns into
+    /// `Error::UnknownSigningKey`.
+    async fn key_for(&self, kid: &str) -> crate::error::Result<Option<jsonwebtoken::DecodingKey>> {
+        if let Some(key) = self.keys.read().await.get(kid) {
+            return Ok(Some(key.clone()));
+        }
+
+        {
+            let mut last_refetch = self.last_refetch.write().await;
+            let now = std::time::Instant::now();
+            if last_refetch.is_some_and(|last| now.duration_since(last) < self.min_refetch_interval)
+            {
+                return Ok(None);
+            }
+            *last_refetch = Some(now);
+        }
+
+        self.refetch().await?;
+        Ok(self.keys.read().await.get(kid).cloned())
+    }
+
+    async fn refetch(&self) -> crate::error::Result<()> {
+        let jwks: jsonwebtoken::jwk::JwkSet = self
+            .client
+            .get(self.jwks_endpoint.clone())
+            .send()
+            .await
+            .map_err(|e| Error::JwksFetchFailed(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| Error::JwksFetchFailed(e.to_string()))?;
+
+        let mut keys = self.keys.write().await;
+        keys.clear();
+        for jwk in &jwks.keys {
+            let (Some(kid), Ok(decoding_key)) = (
+                jwk.common.key_id.clone(),
+                jsonwebtoken::DecodingKey::from_jwk(jwk),
+            ) else {
+                continue;
+            };
+            keys.insert(kid, decoding_key);
+        }
+        Ok(())
+    }
+}
+
+/// Step 1 of the identity resolution note above `entity Role`: verifies
+/// `jwt`'s signature against `config`'s trusted IdP (fetching/caching its
+/// JWKS via `cache` as needed), then step 2, pulling out - and trusting -
+/// only `config.subject_claim`. Everything else in the JWT's claims is
+/// read by nobody: `jsonwebtoken::decode` verifies the signature,
+/// `issuer` and algorithm, but claims are decoded into a generic JSON map
+/// rather than a fixed struct, since `subject_claim` is configurable
+/// rather than always `"sub"`.
+///
+/// Genuine I/O (JWKS fetch on a cache miss), so - unlike every function
+/// above in this module - not a pure function `skilj-core`'s own test
+/// suite exercises via plain unit tests; see this crate's `tests/`
+/// directory for its own JWKS-serving test harness instead. Called by
+/// `skilj-graphql`'s auth extractor, once per request that presents a
+/// bearer JWT; its output is what `resolve_role_by_external_subject`
+/// below takes as `verified_subject`.
+pub async fn verify_and_extract_subject(
+    jwt: &str,
+    config: &IdpConfig,
+    cache: &JwksCache,
+) -> crate::error::Result<String> {
+    let header =
+        jsonwebtoken::decode_header(jwt).map_err(|e| Error::MalformedJwt(e.to_string()))?;
+    let kid = header.kid.ok_or(Error::JwtMissingKeyId)?;
+    let Some(decoding_key) = cache.key_for(&kid).await? else {
+        return Err(Error::UnknownSigningKey.into());
+    };
+
+    let mut validation = jsonwebtoken::Validation::new(config.signing_algorithm.to_jsonwebtoken());
+    validation.set_issuer(&[&config.issuer]);
+
+    let token_data = jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
+        jwt,
+        &decoding_key,
+        &validation,
+    )
+    .map_err(|e| Error::JwtVerificationFailed(e.to_string()))?;
+
+    token_data
+        .claims
+        .get(&config.subject_claim)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| Error::MissingSubjectClaim(config.subject_claim.clone()).into())
 }
 
 /// See the GraphQL identity resolution note above `entity Role`, step 3:

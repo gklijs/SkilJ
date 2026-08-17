@@ -15,6 +15,15 @@ thiserror.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
 jsonwebtoken.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+skilj-macros.workspace = true
 
 [dev-dependencies]
+postgresql_embedded = "0.21.0"
 proptest.workspace = true
+# Only to serve a real JWKS document from a real local HTTP server in
+# access_control's own JWT-verification tests - skilj-core stays zero
+# web-framework dependency for real, non-test, use (docs/architecture.md
+# §3.2) since this is dev-only.
+axum.workspace = true

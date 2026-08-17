@@ -1,0 +1,15 @@
+[package]
+name = "skilj-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The one deliberate proc-macro exception to skilj-core's no-macros plugin API (docs/architecture.md §1.3.1): #[requires_role(...)] on a CommandType impl."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true, features = ["full"] }
+quote.workspace = true
+proc-macro2.workspace = true

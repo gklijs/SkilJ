@@ -12,3 +12,13 @@ skilj-graphql.workspace = true
 skilj-rest.workspace = true
 tokio.workspace = true
 axum.workspace = true
+chrono.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+postgresql_embedded = "0.21.0"
+serde.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+jsonwebtoken.workspace = true

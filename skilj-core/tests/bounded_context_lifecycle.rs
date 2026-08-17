@@ -1,21 +1,32 @@
 //! Tests for the `BoundedContextCreation`/`BoundedContextDirectory`/
-//! `BoundedContextArchival`/`SuperadminBootstrap` surfaces
-//! (`specs/skilj.allium`) - propagated after the token lifecycle pass
-//! (docs/architecture.md §9): entities `BootstrapSecret`/`ContextCreator`
-//! (+ `SuperadminCreator`/`SystemCreator`), rules `AddBoundedContext`/
-//! `ListBoundedContexts`/`ArchiveBoundedContext`/`CreateSuperadmin`. This
-//! is what grew `event_store::BoundedContext` from `name`/`status` alone
-//! to the full entity - `created_at`/`created_by` - and `secret_matches`
-//! from `// TODO` to real (see each's own doc comment).
+//! `BoundedContextArchival`/`BoundedContextDeletion`/`SuperadminBootstrap`
+//! surfaces (`specs/skilj.allium`) - propagated after the token lifecycle
+//! pass (docs/architecture.md §9): entities `BootstrapSecret`/
+//! `ContextCreator` (+ `SuperadminCreator`/`SystemCreator`), rules
+//! `AddBoundedContext`/`ListBoundedContexts`/`ArchiveBoundedContext`/
+//! `CreateSuperadmin`. This is what grew `event_store::BoundedContext`
+//! from `name`/`status` alone to the full entity - `created_at`/
+//! `created_by` - and `secret_matches` from `// TODO` to real (see each's
+//! own doc comment).
+//!
+//! `DeleteBoundedContext` (5 further obligations) was added in the
+//! schema-per-bounded-context pass and is covered here too - see
+//! `bootstrap::delete_bounded_context`'s own doc comment for why it's a
+//! pure decision only, with no `db::hard_delete_bounded_context` call in
+//! these tests (that's `skilj-core/tests/persistence.rs`'s job, against
+//! real Postgres). The same pass also added `AddBoundedContext`'s new
+//! `requires: valid_bounded_context_name(name)` (1 further obligation,
+//! `rule-failure.AddBoundedContext.4`).
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
-//! filtered to this pass's source constructs): 26 total.
+//! filtered to this pass's source constructs): 32 total.
 //! Uncovered this pass, with reason - see the doc comment at the bottom of
 //! this file: `entity-relationship.BoundedContext.*` (8) - every
 //! relationship projection deferred the same "caller resolves it, not a
 //! stored field" way as everywhere else in this codebase - and
-//! `surface-actor`/`surface-exposure`/`surface-provides` for the three
-//! GraphQL-only surfaces (7), same scaffolding gap as `CommandSubmission`'s.
+//! `surface-actor`/`surface-exposure`/`surface-provides` for the four
+//! GraphQL-only surfaces (9, `BoundedContextDeletion` included), same
+//! scaffolding gap as `CommandSubmission`'s.
 
 use chrono::{TimeZone, Utc};
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
@@ -101,6 +112,31 @@ fn bootstrap_secret() -> BootstrapSecret {
 fn bootstrap_secret_carries_its_declared_field() {
     let b = bootstrap_secret();
     assert_eq!(b.secret, "high-entropy-bootstrap-secret");
+}
+
+/// `generate_bootstrap_secret` - added propagating `skilj-graphql`'s
+/// Phase 1 admin console (docs/architecture.md §8 item 5's own plan).
+/// `Some` when no active superadmin exists yet - the reachable case,
+/// checked here only for "produces a secret at all"; `create_superadmin`'s
+/// own tests already cover matching against a real one end-to-end.
+#[test]
+fn generate_bootstrap_secret_produces_a_secret_when_no_active_superadmin_exists() {
+    let secret = bootstrap::generate_bootstrap_secret(&[]);
+    assert!(secret.is_some());
+
+    let secret = bootstrap::generate_bootstrap_secret(&[non_superadmin()]);
+    assert!(secret.is_some());
+
+    let secret = bootstrap::generate_bootstrap_secret(&[superadmin(RoleStatus::Revoked)]);
+    assert!(secret.is_some());
+}
+
+/// `ClosesPermanentlyOnFirstClaim` (`surface SuperadminBootstrap`): once
+/// an active superadmin exists, there is nothing left to generate.
+#[test]
+fn generate_bootstrap_secret_is_none_once_an_active_superadmin_exists() {
+    let secret = bootstrap::generate_bootstrap_secret(&[superadmin(RoleStatus::Active)]);
+    assert!(secret.is_none());
 }
 
 #[test]
@@ -200,6 +236,62 @@ fn add_bounded_context_rejects_the_admin_name_even_though_admin_was_never_added_
     .unwrap_err();
 
     assert_eq!(err.code(), bootstrap::Error::BoundedContextNameTaken.code());
+}
+
+/// rule-failure.AddBoundedContext.4 - `requires: valid_bounded_context_name(name)`.
+#[test]
+fn add_bounded_context_rejects_a_name_with_an_uppercase_character() {
+    let caller = superadmin(RoleStatus::Active);
+
+    let err =
+        bootstrap::add_bounded_context(&caller, "Billing".into(), &[], timestamp(0)).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        bootstrap::Error::InvalidBoundedContextName.code()
+    );
+}
+
+/// rule-failure.AddBoundedContext.4 - a name that doesn't start with a
+/// letter is refused the same way.
+#[test]
+fn add_bounded_context_rejects_a_name_starting_with_a_digit() {
+    let caller = superadmin(RoleStatus::Active);
+
+    let err =
+        bootstrap::add_bounded_context(&caller, "1billing".into(), &[], timestamp(0)).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        bootstrap::Error::InvalidBoundedContextName.code()
+    );
+}
+
+/// rule-failure.AddBoundedContext.4 - over the 40-character cap.
+#[test]
+fn add_bounded_context_rejects_a_name_over_forty_characters() {
+    let caller = superadmin(RoleStatus::Active);
+    let name = "a".repeat(41);
+
+    let err = bootstrap::add_bounded_context(&caller, name, &[], timestamp(0)).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        bootstrap::Error::InvalidBoundedContextName.code()
+    );
+}
+
+/// A name made only of lowercase letters, digits and underscores,
+/// starting with a letter, at exactly the 40-character cap, is accepted.
+#[test]
+fn add_bounded_context_accepts_a_name_at_exactly_the_length_cap() {
+    let caller = superadmin(RoleStatus::Active);
+    let name = format!("a{}", "1".repeat(39));
+    assert_eq!(name.len(), 40);
+
+    let bc = bootstrap::add_bounded_context(&caller, name.clone(), &[], timestamp(0)).unwrap();
+
+    assert_eq!(bc.name, name);
 }
 
 // ---------------------------------------------------------------------
@@ -340,6 +432,75 @@ fn archive_bounded_context_only_ever_produces_the_archived_status() {
     let archived = bootstrap::archive_bounded_context(&mapping, &bc).unwrap();
 
     assert_eq!(archived.status, BoundedContextStatus::Archived);
+}
+
+// ---------------------------------------------------------------------
+// rule-success.DeleteBoundedContext / rule-failure.DeleteBoundedContext.{1..4}
+// ---------------------------------------------------------------------
+
+#[test]
+fn delete_bounded_context_succeeds_for_an_archived_non_admin_context() {
+    let caller = superadmin(RoleStatus::Active);
+    let bc = bounded_context("billing", BoundedContextStatus::Archived);
+
+    bootstrap::delete_bounded_context(&caller, &bc).unwrap();
+}
+
+/// rule-failure.DeleteBoundedContext.1 - `requires: caller.status = active`.
+#[test]
+fn delete_bounded_context_rejects_a_revoked_caller() {
+    let caller = superadmin(RoleStatus::Revoked);
+    let bc = bounded_context("billing", BoundedContextStatus::Archived);
+
+    let err = bootstrap::delete_bounded_context(&caller, &bc).unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::RoleNotActive.code());
+}
+
+/// rule-failure.DeleteBoundedContext.2 - `requires: caller.superadmin = true`.
+#[test]
+fn delete_bounded_context_rejects_a_non_superadmin_caller() {
+    let caller = non_superadmin();
+    let bc = bounded_context("billing", BoundedContextStatus::Archived);
+
+    let err = bootstrap::delete_bounded_context(&caller, &bc).unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::NotSuperadmin.code());
+}
+
+/// rule-failure.DeleteBoundedContext.3 - `requires: bounded_context.status = archived`.
+#[test]
+fn delete_bounded_context_rejects_a_still_active_context() {
+    let caller = superadmin(RoleStatus::Active);
+    let bc = bounded_context("billing", BoundedContextStatus::Active);
+
+    let err = bootstrap::delete_bounded_context(&caller, &bc).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        bootstrap::Error::BoundedContextNotArchived.code()
+    );
+}
+
+/// rule-failure.DeleteBoundedContext.4 - `requires: bounded_context != admin`.
+/// Checked even for a (hypothetically) archived `admin` - `admin` can
+/// never reach `Archived` through `archive_bounded_context` (see
+/// `archive_bounded_context_rejects_the_admin_context` above), but this
+/// rule's own guard doesn't rely on that to hold.
+#[test]
+fn delete_bounded_context_rejects_the_admin_context_even_if_archived() {
+    let caller = superadmin(RoleStatus::Active);
+    let bc = bounded_context(
+        bootstrap::ADMIN_BOUNDED_CONTEXT_NAME,
+        BoundedContextStatus::Archived,
+    );
+
+    let err = bootstrap::delete_bounded_context(&caller, &bc).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        bootstrap::Error::CannotDeleteAdminContext.code()
+    );
 }
 
 // ---------------------------------------------------------------------

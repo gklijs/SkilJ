@@ -391,6 +391,17 @@ pub enum Error {
     /// get wrong.
     #[error("decide() named an event type this bounded context has not registered: {0}")]
     UnregisteredEventType(String),
+
+    /// Not spec-modeled either, same register as `UnregisteredEventType`
+    /// right above: a command payload, or a stored `Event`'s own payload,
+    /// didn't deserialize into the compiled binary's typed
+    /// `CommandType::Payload`/`BoundedContextEvent`-implementing enum
+    /// variant. Reachable today since nothing yet validates a payload
+    /// against `EventType.schema`/`CommandType.schema` at write time -
+    /// see docs/architecture.md §1.6/§1.7 for where this is raised (the
+    /// `skilj` facade's decide()-dispatch bridge).
+    #[error("stored payload did not decode into its expected type: {0}")]
+    PayloadDecodeFailed(String),
 }
 
 impl SkiljRejection for Error {
@@ -416,6 +427,7 @@ impl SkiljRejection for Error {
             Error::DirectCreationNotAllowed => "direct_creation_not_allowed",
             Error::RestTriggerNotAllowed => "rest_trigger_not_allowed",
             Error::UnregisteredEventType(_) => "unregistered_event_type",
+            Error::PayloadDecodeFailed(_) => "payload_decode_failed",
         }
     }
 
@@ -909,19 +921,25 @@ pub fn forget_subject(
 /// this module's own doc comment). An empty `event_types`/`tags` means
 /// "no restriction", per the spec's own convention - not a vacuous case,
 /// so both are checked with `is_empty()`/`is_none()` rather than treated
-/// as "matches nothing". Returns the rendered payloads only, exactly what
-/// `EventsQueried.events: map(candidates, e => render_event(e,
-/// access_mapping))` binds - the wire contract around what else a caller
-/// sees per event stays deferred, same register as everywhere else this
-/// spec is "deliberately coarse on the wire contract" (see the surface's
-/// own guidance).
+/// as "matches nothing".
+///
+/// Returns each candidate's own `sequence` alongside its rendered
+/// payload, not the rendered payload alone - the wire contract around
+/// what else a caller sees per event stays deferred, same register as
+/// everywhere else this spec is "deliberately coarse on the wire
+/// contract" (see the surface's own guidance), but `sequence` isn't
+/// optional scenery: it's the one thing a paging caller needs back to
+/// supply as the next call's own `after_sequence`, propagating
+/// `skilj-graphql`'s `EventQuery` resolver (§8 item 5, Phase 3) - a
+/// caller with only the rendered strings back could never page past the
+/// first call.
 pub fn query_events(
     access_mapping: &RoleAccessMapping,
     event_types: &[EventType],
     tags: Option<&[Tag]>,
     after_sequence: Option<i64>,
     bounded_context_events: &[Event],
-) -> crate::error::Result<Vec<String>> {
+) -> crate::error::Result<Vec<(i64, String)>> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
     }
@@ -942,7 +960,7 @@ pub fn query_events(
         .filter(|e| event_types.is_empty() || event_types.contains(&e.event_type))
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
         .filter(|e| e.sequence > after)
-        .map(|e| render_event(e, access_mapping))
+        .map(|e| (e.sequence, render_event(e, access_mapping)))
         .collect())
 }
 

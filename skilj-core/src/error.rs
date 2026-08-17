@@ -31,6 +31,14 @@ pub enum Error {
 
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+
+    /// Distinct from `Database` above - a migration failure means the
+    /// schema itself couldn't be brought up to date (a startup-time
+    /// concern, raised by `Skilj::builder().build()` - see docs/
+    /// architecture.md §1.5/§1.7), not that an otherwise-healthy schema
+    /// rejected one query.
+    #[error("migration error: {0}")]
+    Migration(#[from] sqlx::migrate::MigrateError),
 }
 
 /// Implemented by every error tier so the eventual GraphQL/REST rendering
@@ -53,6 +61,7 @@ impl SkiljRejection for Error {
             Error::Bootstrap(e) => e.code(),
             Error::CommandRejected { kind, .. } => kind,
             Error::Database(_) => "database_error",
+            Error::Migration(_) => "migration_error",
         }
     }
 
@@ -64,6 +73,7 @@ impl SkiljRejection for Error {
             Error::Bootstrap(e) => e.message(),
             Error::CommandRejected { reason, .. } => reason.clone(),
             Error::Database(e) => e.to_string(),
+            Error::Migration(e) => e.to_string(),
         }
     }
 }

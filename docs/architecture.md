@@ -80,6 +80,59 @@ hand-written. A derive/attribute macro to cut per-type boilerplate
 shows what's actually tedious — designing it now, before any type has
 been written by hand, risks locking in the wrong ergonomics.
 
+### 1.3.1 The one exception: `#[requires_role(...)]`
+
+A `CommandType` can declare an extra, caller-facing role-name gate on top
+of the ordinary write-level `RoleAccessMapping` check — some commands
+need to be restricted to a specific role beyond "anyone with write access
+to this bounded context." The user asked for this to read as an
+annotation on the command's own declaration, not a trait method its
+author has to remember to override, so — deliberately, as the one named
+exception to §1.3's "no macros for now" — it's a real `#[proc_macro_attribute]`,
+`skilj-macros::requires_role`, applied directly above the `impl
+CommandType for ...` block:
+
+```rust
+#[requires_role("treasury_officer")]
+impl CommandType for WithdrawMoney {
+    type Payload = WithdrawPayload;
+    type Event = BankingEvent;
+    const NAME: &'static str = "WithdrawMoney";
+    fn decide(payload: &Self::Payload, matching_events: &[BankingEvent]) -> CommandDecision {
+        // ...
+    }
+}
+```
+
+It expands to nothing more than overriding `CommandType::required_role()`
+(a new trait method, `None` by default — same register as
+`rest_trigger_allowed()`) to return `Some("treasury_officer")`. Every
+other plugin trait method stays exactly as hand-written as before; this
+doesn't reopen the general "no macros" decision, generate any other
+boilerplate, or touch `NAME`/`decide()`/schema derivation.
+
+Two things worth being explicit about:
+
+- **Not a spec-level concept, not persisted anywhere.** `required_role()`
+  never reaches `specs/skilj.allium`, the `command_types` table, or
+  `RegisterCommandType` — it's carried only in the in-memory registry
+  `skilj`'s builder already keeps (`RegisteredCommandType`), read back out
+  through a new `CommandDispatcher::required_role(bounded_context,
+  command_type) -> Option<Option<&'static str>>` method (outer `None` =
+  "not registered at all," mirroring `dispatch`'s own convention).
+- **Checked by `skilj-graphql`'s mutation resolver only, once it exists
+  (§8 item 5)** — before calling `CommandDispatcher::dispatch` at all, so
+  an unauthorised caller never reaches `decide()`. REST triggering is
+  untouched: `CommandToken` is already its own, separate per-token
+  capability grant, and paying for this check there would be redundant.
+- **A real caveat, not glossed over**: `Role.name` carries no uniqueness
+  guarantee anywhere in `specs/skilj.allium` (see `entity Role`) — this
+  check is only as trustworthy as a deployment's own discipline in
+  keeping role names meaningful and non-colliding. `skilj-core` doesn't
+  and can't enforce that; it's a caller-managed convention layered on
+  top, the same register as choosing sensible `EventType`/`CommandType`
+  names in the first place.
+
 ### 1.4 `matching_events` is a generated per-bounded-context enum
 
 `decide()`'s `matching_events` can span multiple `EventType`s at once —
@@ -166,6 +219,151 @@ consequence of the general principle, not a special case invented for
 reconciliation — the same rejection reaches a human admin calling
 `RegisterEventType` by hand over GraphQL exactly the same way.
 
+**Done.** `roles`/`role_access_mappings` tables and their `skilj-core::db`
+functions exist, and `.build()`'s reconciliation loop is implemented for
+real in `skilj::SkiljBuilder` and verified end-to-end against a real
+Postgres (§8 item 2, `skilj/tests/reconciliation.rs`). One clarification
+against the paragraph above worth recording: `.build()` treats a
+`.reconciliation_role(...)` naming no active Role at all as a genuine
+`Err` (`access_control::Error::UnrecognisedSubject`), not a silent skip -
+only *omitting* `.reconciliation_role(...)` entirely skips reconciliation
+cleanly. A misconfigured `external_subject` is a real problem worth
+surfacing, not indistinguishable from the "haven't set this up yet" case.
+
+### 1.6 Raw `Event` → typed `Event`: the `BoundedContextEvent` trait
+
+§1.4 called `BankingEvent` (or whichever per-bounded-context enum) SkilJ
+"generates" — true at the design level, but §1.3 also decided **no
+macros for now**, so nothing actually generates that enum's *source
+code*. The app author hand-writes it, the same way they hand-write every
+other `impl EventType`/`CommandType`/`Projection`. What was still
+undecided is the other half: `decide()` receives `matching_events:
+&[Self::Event]`, but every event this engine actually stores or loads is
+the untyped `event_store::Event` (a JSON `payload: String` plus an
+`EventType` reference) — something has to bridge from one to the other,
+and nothing did.
+
+Resolved: one small trait, implemented once per bounded context on that
+context's own hand-written enum, matching the existing "hand-written,
+one `impl` per type" register rather than inventing a second mechanism:
+
+```rust
+pub trait BoundedContextEvent: Sized {
+    /// `None` when `event.event_type.name` doesn't match any variant
+    /// this enum declares - never expected in practice (a caller only
+    /// ever passes this bounded context's own events), so `None` is a
+    /// defensive case, not a designed-for one. `Some(Err(..))` when the
+    /// stored payload doesn't deserialize into the matched variant's
+    /// payload type - reachable today, since nothing yet validates a
+    /// payload against `EventType.schema` at write time.
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>>;
+}
+```
+
+```rust
+impl BoundedContextEvent for BankingEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "MoneyDeposited" => Some(serde_json::from_str(&event.payload).map(Self::MoneyDeposited)),
+            "MoneyWithdrawn" => Some(serde_json::from_str(&event.payload).map(Self::MoneyWithdrawn)),
+            _ => None,
+        }
+    }
+}
+```
+
+`CommandType::Event`/`Projection::Event` (currently a bare `type Event;`
+in `skilj-core::plugin`) each grow a `: BoundedContextEvent` bound once
+this is implemented — the trait itself is the contract §1.7's dispatch
+bridge builds on, not an optional convenience.
+
+### 1.7 The builder's internal registry, and the decide()-dispatch bridge
+
+The other missing half: `SkiljBuilder::event_type::<T>()`/
+`command_type::<T>()`/`projection::<T>()` are `todo!()` stubs today (they
+don't even record `T`). Resolved shape, all living in the `skilj` facade
+crate (not `skilj-core` — the type-erasure boundary the note above rule
+`ProcessCommand` describes is exactly this registry, so it belongs on the
+far side of it, in application-shaped code, per §3.1's crate split):
+
+- **What gets captured per `.event_type::<T: EventType>()` call**: a
+  plain data record — `T::NAME`, `T::Payload`'s JSON Schema (via
+  `schemars::schema_for!`, serialised with `serde_json::to_string` — the
+  same "derived from the Rust type" register §1.2 already committed to),
+  `tag_mappings()`, `sensitive_fields()`, `external_creation_allowed()`,
+  `direct_creation_allowed()`, `event_read_allowed()`. Enough to call
+  `event_store::register_event_type` during reconciliation, nothing
+  dispatched at runtime (an `EventType` is pure declaration - see its own
+  doc comment). `system_triggered_allowed`/`system_triggered_schedule`
+  (fields the full `EventType` entity has but the plugin trait doesn't
+  expose) stay hard-defaulted to `false`/`None` here — the scheduler that
+  would consult them doesn't exist yet either (same register as
+  `EventOrigin::SystemTriggered` itself, still unmodelled), so there's no
+  builder-exposed knob for a feature nothing yet reads.
+- **What gets captured per `.command_type::<T: CommandType>()` call**:
+  the same kind of record (`T::NAME`, schema, `tag_mappings()`,
+  `sensitive_fields()`, `rest_trigger_allowed()`) for registration, *plus*
+  a boxed, type-erased decider:
+
+  ```rust
+  type DeciderFn = Box<dyn Fn(&str, &[Event]) -> skilj_core::error::Result<CommandDecision> + Send + Sync>;
+
+  fn decider<T: CommandType>() -> DeciderFn {
+      Box::new(|payload_json, raw_events| {
+          let payload: T::Payload = serde_json::from_str(payload_json)
+              .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
+          let mut matching = Vec::with_capacity(raw_events.len());
+          for event in raw_events {
+              if let Some(converted) = T::Event::try_from_event(event) {
+                  matching.push(converted.map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?);
+              }
+          }
+          Ok(T::decide(&payload, &matching))
+      })
+  }
+  ```
+
+  This is the whole dispatch bridge: it closes over `T` alone (no runtime
+  state), so it's built once, at `.command_type::<T>()` call time, and
+  stored keyed by `(bounded_context, T::NAME)`. `CommandTrigger`'s
+  handler (still to be wired — see §8) becomes: resolve the token → look
+  up the decider by `(bounded_context, command_type_name)` → call it with
+  the raw payload string and this bounded context's matching events
+  (`consistency_boundary_and_matching_events`, unchanged) → feed the
+  resulting `CommandDecision` into `event_store::process_command` exactly
+  as already implemented.
+- **New library-level error**: `event_store::Error::PayloadDecodeFailed(String)`
+  — the "stored data doesn't match what the compiled binary expects"
+  case §1.6 flags as reachable. Same closed-set-of-defensive-checks
+  register as `Error::UnregisteredEventType` right above it in that enum;
+  renders through the existing `SkiljRejection` trait unchanged, no new
+  wire-contract work needed on either GraphQL or REST.
+- **`.projection::<T: Projection>()`** captures the equivalent
+  registration record (schema from `T::State`, `sync()`) now, for
+  consistency — a `project()` dispatch closure of the identical shape is
+  a natural follow-up once something actually drives projections forward
+  (still unmodelled per `crate::projections`' own doc comment), but isn't
+  built this pass since nothing calls it yet.
+- **Storage**: `Skilj` holds `HashMap<(String, String), RegisteredEventType>`/
+  `HashMap<(String, String), RegisteredCommandType>`/
+  `HashMap<(String, String), RegisteredProjection>`, each keyed by
+  `(bounded_context, name)` — plain data plus (for command types) the one
+  boxed closure above. No trait objects beyond that one `Fn`; everything
+  else is concrete data collected eagerly at each builder call.
+- **`resolve_event_type`** (the caller-supplied closure
+  `event_store::process_command` already takes) is a lookup into this
+  same `event_types` map, scoped to the command's own bounded context —
+  the registry built here *is* that registry, not a second one.
+
+**New persistence need, not yet built**: `process_command`'s
+`consistency_boundary_and_matching_events` wants every `Event` in a
+bounded context matching a set of tags, not one `event_type`'s events —
+`db::list_events` today is scoped to `(bounded_context, event_type_name)`
+(all that `EventFetch`'s routes needed). A `db::list_events_for_bounded_context`
+(or equivalent) is a straightforward addition once `CommandTrigger`'s
+implementation pass actually happens — no design question, just not
+written yet. Tracked in §8.
+
 ---
 
 ## 2. Ecosystem choices
@@ -225,6 +423,78 @@ field picked wide that never needed it costs nothing at all. This also
 means nobody has to re-litigate "does this new field need to be wide"
 for every future `Integer` the spec grows.
 
+### 2.2.2 Schema-per-bounded-context storage
+
+Every table falls into one of two tiers, split by whether it's shared
+across bounded contexts or scoped to exactly one:
+
+- **Global** (Postgres schema `public`, tracked by the static
+  `sqlx::migrate!` set in `skilj-core/migrations/`): `roles`,
+  `bounded_contexts`, `role_access_mappings`, `access_token_index`. Small,
+  admin-managed, and either cross-context by nature (`Role` isn't scoped
+  to one context; `bounded_contexts` is the registry of contexts itself)
+  or a deliberate exception explained below (`access_token_index`).
+- **Per-bounded-context** (Postgres schema `bc_<name>`, one per
+  `BoundedContext`, provisioned and torn down dynamically in Rust code —
+  `skilj_core::db::provision_bounded_context_schema`/
+  `hard_delete_bounded_context` — never a `sqlx::migrate!` migration):
+  `event_types`, `command_types`, `commands`, `projections`,
+  `projection_rebuilds` and their consumed-event-type join tables,
+  `access_tokens`, `read_cursors`, `events`, and a single-row `sequence`
+  table backing `next_sequence`. Every row scoped to one context lives
+  here, in that context's own tables, with its own indexes — one very
+  active context's query and index-maintenance load never touches
+  another's.
+
+This buys two things at once: **query/index isolation** (a hot context's
+`events` table and its indexes are physically separate from every other
+context's, so growth in one doesn't degrade lookups in another the way
+one shared table filtered by a `bounded_context` column would), and a
+**genuinely atomic hard delete** — `DROP SCHEMA "bc_<name>" CASCADE`
+removes every one of that context's tables, rows and indexes in a single
+statement, instead of an error-prone sweep of `DELETE ... WHERE
+bounded_context = $1` across a dozen tables. See `DeleteBoundedContext`
+in `specs/skilj.allium` and `bootstrap::delete_bounded_context` (the pure
+gate: superadmin caller, context already `archived`, never `admin`) for
+the rule this backs.
+
+The `bc_` prefix on every per-context schema name is what keeps a
+context from ever colliding with a real Postgres schema (`public`,
+`pg_catalog`, …) purely by being named the same thing — `pg_catalog`
+itself, say. Combined with `AddBoundedContext`'s own new `requires:
+valid_bounded_context_name(name)` (lowercase letters/digits/underscores,
+starting with a letter, capped short enough to leave room for the
+prefix under Postgres's 63-byte identifier limit), a context's `name` is
+safe to interpolate directly into `CREATE SCHEMA`/`DROP SCHEMA` — the
+double-quoting `schema_ident` still applies around it is defence in
+depth, not the only thing standing between this and SQL injection.
+
+Provisioning and deprovisioning are each one Postgres transaction:
+`insert_bounded_context` creates the new schema and every per-context
+table inside it, then inserts the `bounded_contexts` registry row, all
+in one transaction — a failure partway through leaves neither an
+orphaned schema nor a dangling registry row, since Postgres DDL
+(`CREATE SCHEMA`/`CREATE TABLE`) is transactional and rolls back like
+any other statement. `hard_delete_bounded_context` is the same shape in
+reverse: `DROP SCHEMA ... CASCADE` then `DELETE FROM bounded_contexts`,
+one transaction — whose own `ON DELETE CASCADE` FK cleans up that
+context's `role_access_mappings` rows automatically, no separate cleanup
+query needed.
+
+One consequence needed its own small global table: `access_tokens` moving
+into each context's own schema breaks `skilj-rest`'s bearer-credential
+lookup, since `Authorization: Bearer <id>.<secret>` carries only the
+token's `id` — no bounded context alongside it to say which schema to
+search. `access_token_index` (`id TEXT PRIMARY KEY, bounded_context TEXT
+NOT NULL REFERENCES bounded_contexts (name) ON DELETE CASCADE`) is the
+fix: one cheap global row per token, resolved first to learn which
+schema holds the full row — the same "small, cross-cutting table stays
+global" reasoning `role_access_mappings` already gets above. `read_cursors`
+needed no equivalent treatment: every caller reaching `get_read_cursor`
+already holds a fully-resolved `EventReadToken` (bounded context already
+known) by that point, since resolving the token itself is what already
+went through `access_token_index`.
+
 ### 2.3 Property-based testing: `proptest`
 
 Standard choice for Rust; matches the `allium:propagate` skill's own
@@ -249,7 +519,12 @@ rather than modelled as domain state").
 A workspace of four crates: `skilj-core` (the domain engine, zero
 web-framework dependency), `skilj-graphql` and `skilj-rest` (the two
 surfaces, each independently usable), and `skilj` (a thin facade for the
-common case of wanting both).
+common case of wanting both). A fifth, `skilj-macros`, sits underneath
+`skilj-core` as an implementation detail, not a fifth thing a consumer
+chooses to depend on directly — it exists solely to provide
+`#[requires_role(...)]` (§1.3.1), re-exported through
+`skilj_core::plugin` so nothing outside `skilj-core`'s own `Cargo.toml`
+ever names it.
 
 Splitting `skilj-core` out on its own was decided because it pays for
 itself twice: it keeps the domain engine's own test suite (in particular
@@ -659,14 +934,313 @@ an error status, per §7.3/§5.4.
 
 ## 8. Open for a future pass
 
-Nothing outstanding right now — every item raised so far has a decision
-recorded above.
+Every *design* question raised so far has a decision recorded above
+(§1.6/§1.7 closed the last two: the `BoundedContextEvent` conversion
+trait, and the builder's registry/decider shape). What's left is
+implementation, in dependency order:
+
+1. ~~**`Role`/`RoleAccessMapping` persistence**~~ — **done.** `roles`/
+   `role_access_mappings` tables exist (`migrations/0001_init.sql`,
+   `bounded_contexts.created_by_role_id` now a real FK into `roles`
+   rather than the denormalised columns an earlier pass used before this
+   table existed), with full CRUD in `skilj-core/src/db` and round-trip
+   coverage in `skilj-core/tests/persistence.rs` (28 tests, passing
+   against a real Postgres). Still blocks reconciliation (§1.5),
+   `AccessManagement`'s actual rules, and JWT→`Role` identity resolution
+   — those callers just don't exist yet (items 2/4/5 below).
+2. ~~**The builder's registry, for real**~~ — **done.** `skilj`'s
+   `SkiljBuilder::event_type::<T>()`/`command_type::<T>()`/`projection::<T>()`
+   build and store the §1.7 records for real (`schemars`-derived schemas,
+   the boxed decider closure for command types), and `.build()` runs
+   reconciliation against a named `.reconciliation_role(...)` end to end:
+   resolves the Role, checks admin access per bounded context (skipping,
+   not erroring, when it's missing - §1.5), calls
+   `register_event_type`/`register_command_type`/`register_projection`,
+   and persists whatever each returns. `skilj-core::plugin::BoundedContextEvent`
+   (§1.6) is implemented too, as `CommandType::Event`/`Projection::Event`'s
+   new bound. Verified end-to-end against a real Postgres
+   (`skilj/tests/reconciliation.rs`: registers a full event
+   type/command type/projection trio, the admin-access skip path, the
+   reconciliation-omitted no-op path, and idempotent re-registration).
+   New along the way: `event_store::Error::PayloadDecodeFailed` (the
+   decoder's own error case, per §1.7) and `skilj_core::Error::Migration`
+   (`.build()`'s own `db::migrate` call needed a variant to propagate
+   into).
+3. ~~**`db::list_events_for_bounded_context`**~~ — **done**, alongside (2)
+   (`register_projection`'s own `bounded_context_events` needed it).
+4. ~~**`POST /v1/commands/trigger`**~~ — **done.** `skilj-rest`'s sixth
+   and final route (§7.2), completing REST end to end. Resolved the
+   crate-boundary question (2) flagged: a new `CommandDispatcher` trait
+   lives in `skilj-core::plugin` (`dispatch(bounded_context, command_type,
+   payload, matching_events) -> Option<Result<CommandDecision>>`) -
+   `skilj-rest::router()` now takes an `Arc<dyn CommandDispatcher>` as a
+   second parameter rather than reaching into `skilj` directly, keeping
+   `skilj-rest` independently usable per §3.1 (a `skilj-core` +
+   `skilj-rest`-only consumer implements the trait by hand instead of
+   using `skilj`'s builder). `skilj`'s own `Skilj` now holds the
+   `command_types` registry (`Arc`-wrapped) and implements the trait via
+   a small private `Dispatcher` wrapper, so `Skilj::rest_router()` can
+   hand out a cheap `Arc<dyn CommandDispatcher>` without `Skilj` itself
+   needing to live behind an `Arc`.
+   Two more real gaps closed along the way, both flagged and confirmed
+   with the user before building: `Command` had no table at all (added,
+   with a synthetic `id` - the one table in this schema that needs one
+   for a real reason, since `Event.origin`'s `CommandTriggered` variant
+   embeds a whole `Command` by value and needs to reference it), and
+   `events.origin_kind = 'command_triggered'` was previously unhandled
+   (`insert_event`/row-loading both `panic!`ed on it) - now a real
+   `origin_command_id` FK column plus full read/write support.
+   `CommandToken` also gained the `insert`/`get` pair the other three
+   `AccessToken` variants already had.
+   Verified end-to-end against a real Postgres via `skilj/tests/command_trigger.rs`
+   - a genuine HTTP request through `Skilj::rest_router()`, through the
+   dispatcher, into a real `decide()`, back out through
+   `process_command`'s persistence, including an explicit check that a
+   `command_triggered` origin reads back correctly (the highest-risk new
+   code path this item added) - plus the rejection-is-200 case and a
+   malformed-credential 401.
+5. **`skilj-graphql`** — **Phase 1 done** (see the plan at
+   `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`): real JWT/JWKS
+   verification (`access_control::{IdpConfig, SigningAlgorithm, JwksCache,
+   verify_and_extract_subject}`, `reqwest`-based, reactive-refresh per §6)
+   and the full superadmin admin console over a real `async_graphql::dynamic`
+   schema — `createSuperadmin`, `createRole`/`revokeRole`/
+   `grantRoleAccessMapping`/`revokeRoleAccessMapping`, `addBoundedContext`/
+   `archiveBoundedContext`/`deleteBoundedContext`, `boundedContexts`.
+   `Skilj::graphql_router()` mounts it at `POST /graphql`, mirroring
+   `rest_router()`. Verified end-to-end (`skilj/tests/graphql_admin_console.rs`):
+   a real HTTP GraphQL request, through a real local JWKS server and real
+   signed JWTs, through every mutation/query above in sequence, back out
+   through Postgres persistence — bootstrap → grant → create/archive/
+   delete a bounded context → directory listing confirms it's gone.
+   **Phase 2 done too**: four of its five remaining static-typed,
+   `AdminAccess`-gated surfaces — `TypeRegistration` (`registerEventType`/
+   `registerCommandType`/`registerProjection`/`rebuildProjection`/
+   `discardProjectionRebuild`, plus a `projections(boundedContext:)` query
+   satisfying the surface's own `exposes` list), `EventTypeAdminOperations`
+   (`createExternalEventToken`/`createDirectCreationToken`/
+   `createEventReadToken`), `CommandTypeAdminOperations`
+   (`createCommandToken`), `TokenRevocation` (`revokeToken`, returning
+   the new `AccessToken` GraphQL union — `ExternalEventToken` |
+   `DirectCreationToken` | `EventReadToken` | `CommandToken`, tagged via
+   `FieldValue::with_type`). **`SubjectErasure` (`ForgetSubject`)
+   deliberately excluded**: `EncryptionKey` has no persistence at all
+   yet (`protect_sensitive_fields` is still `todo!()` for its only
+   non-empty case — the one thing that would ever create a row to
+   forget), so there's nothing this resolver could be exercised against;
+   same "don't build ahead of what's wired" discipline REST already
+   followed for the identical reason. Two small persistence gaps
+   surfaced and filled along the way: `db::list_projections_for_bounded_context`
+   and `db::revoke_access_token` (resolves the owning schema via
+   `access_token_index` the same way `fetch_access_token_row` already
+   does, then a status-only `UPDATE`). Verified end-to-end
+   (`skilj/tests/graphql_type_registration.rs`): register an event type,
+   a command type and a projection; a schema change on the projection
+   stages a rebuild instead of updating in place; `rebuildProjection`/
+   `discardProjectionRebuild` both round-trip; every token-minting
+   mutation returns a real secret; `revokeToken` resolves the union
+   correctly by id alone.
+   **Phase 3 done too, scoped to three of its five surfaces** (see the
+   plan for the full reasoning): `EventQuery` (`queryEvents`/
+   `countEvents`/`inspectEvent`), `CommandQuery` (`fetchCommands`),
+   `CommandSubmission` (`submitCommand`) — every pure function they
+   needed already existed and was tested, the same shape Phase 1/2 had.
+   **`ProjectionQuery`/`EventSubscription` deliberately excluded**,
+   confirmed with the user: neither is a GraphQL-plumbing gap.
+   `ProjectionQuery` needs `project()` (still `todo!()` — no projection
+   state exists anywhere to query, regardless of wire shape);
+   `EventSubscription` needs a real-time event-delivery mechanism (none
+   exists — no broadcast channel, no Postgres `LISTEN`/`NOTIFY`). Both
+   stay open, real prerequisites for a future pass, not GraphQL work.
+   `submitCommand` is the highest-value addition: it's what finally
+   gives `CommandDispatcher::required_role` (§1.3.1, built two sessions
+   earlier with no caller) a real caller, checked before `dispatch` so
+   an unauthorised caller never reaches `decide()`. `queryEvents` gets a
+   genuine cursor (`event_store::query_events`'s return type changed
+   from `Vec<String>` to `Vec<(i64, String)>` — sequence paired with the
+   rendered payload, since a paging client needs the sequence back to
+   supply as the next call's `afterSequence`); `fetchCommands` stays a
+   flat `[String!]!` with plain `after`/`before` timestamp arguments, no
+   Relay envelope — `Command` carries no exposed id, so a literal
+   `edges{node,cursor}`/`pageInfo` shape (§5.3's stated default) doesn't
+   naturally fit it, confirmed with the user rather than forced. Two more
+   small persistence gaps filled: `db::get_event_by_sequence`
+   (`InspectEvent`'s own lookup key) and
+   `db::list_commands_for_bounded_context` (`FetchCommands`' full-snapshot
+   parameter — no "list every command in a context" function existed).
+   Verified end-to-end (`skilj/tests/graphql_business_surfaces.rs`):
+   `submitCommand` accepted/rejected paths, a `#[requires_role(...)]`-gated
+   command type rejecting the wrong caller and accepting the right one,
+   `queryEvents` paging past a known sequence, `countEvents`,
+   `inspectEvent` (checking a `COMMAND_TRIGGERED` origin), `fetchCommands`.
+   One new workspace-wide decision made getting to Phase 1: **`axum`
+   bumped 0.7 → 0.8** (async-graphql-axum 7.2.1 requires 0.8) — no route
+   in this codebase uses path parameters, so the `:id` → `{id}` breaking
+   change never applied; the only real fix needed was dropping
+   `#[axum::async_trait]` (native `async fn` in traits, no macro).
+6. **`project()`'s own dispatch closure** — **done, both cases** (see the
+   plan at `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`):
+   `project()` runs in one of two genuinely different ways (the note
+   above the rules) — the inline, same-transaction `sync: true` case
+   landed first; this pass added the async (`sync: false`, the default)
+   case, plus `ProjectionRebuild` replay-to-completion and automatic
+   promotion, confirmed with the user as both in scope for the same pass
+   (leaving `RebuildProjection` unbuilt-in-practice — it flips a row to
+   `building` and nothing had ever advanced one — would have been worse
+   than not building it at all).
+
+   **The design**: one shared background task, not one per bounded
+   context — `SkiljBuilder::build()` spawns it via `tokio::spawn`, on a
+   configurable timer (`SkiljBuilder::async_projection_poll_interval`,
+   default 500ms; runs an immediate catch-up before its first sleep, so
+   an event created right after `.build()` returns doesn't also pay for
+   a full idle interval). One shared task rather than per-context because
+   a bounded context's first async `Projection`/`ProjectionRebuild` can
+   appear at any point after `.build()` returns (`registerProjection` is
+   a live GraphQL mutation) — a per-context task model would need its own
+   dynamic spawn-on-demand lifecycle to notice that; re-listing every
+   bounded context each tick (`db::list_bounded_contexts`) sidesteps it
+   entirely. Poll-only, confirmed with the user: no `LISTEN`/`NOTIFY`, no
+   broadcast channel, no new event-delivery trait threaded through the
+   four event-creation call sites — `ProjectionQuery`'s own
+   `wait_for_sequence` exists specifically because async projections are
+   *expected* to lag, not to be eliminated. No shutdown API — the spawned
+   task is detached and runs for the process's lifetime, the same "don't
+   build ahead of what's wired" call this crate makes repeatedly (nothing
+   today needs to gracefully stop a running `Skilj`). A single bounded
+   context's own failure during a tick is logged to stderr and skipped,
+   not allowed to stop the task or block the rest of that tick.
+
+   The real work is **`db::catch_up_bounded_context`** (called once per
+   bounded context, per tick) — loads every `sync = false` `Projection`
+   and every `building` `ProjectionRebuild` in the context, finds the
+   lowest `caught_up_to` among them, loads events past that point via
+   the new `db::list_events_for_bounded_context_from`, then folds each
+   one into everything still behind it — the identical `SELECT ... FOR
+   UPDATE` / fold-via-dispatcher / `UPDATE` transactional shape
+   `insert_event_and_update_sync_projections` already established, one
+   transaction per event, `caught_up_to` always advancing "either way"
+   (the same rule the sync case follows). A `ProjectionRebuild` always
+   replays asynchronously regardless of its own *target* `sync` value —
+   the replay itself is background work either way; `sync: true` only
+   takes effect after promotion. `db::promote_projection_rebuild` runs
+   once a building rebuild's `caught_up_to` reaches the bounded context's
+   latest committed sequence (`db::latest_sequence`, new): one
+   transaction copies the rebuild's `schema`/`schema_version`/`sync`/
+   `caught_up_to` onto the live `Projection` row, replaces
+   `projection_consumed_event_types` wholesale, copies the rebuild's own
+   `projection_rebuild_state` into `projection_state` (the live
+   projection's old state is discarded, per the note above
+   `RegisterProjection`), then deletes every rebuild-side row.
+
+   **New persistence**: `projection_rebuild_state` (per bounded-context
+   schema, mirroring `projection_state`) — a rebuild's own private fold,
+   never sharing a row with the live projection's, since both can exist
+   at once during a replay window. Unlike `projection_state`, it isn't
+   seeded at registration time: a rebuild's `caught_up_to` resets to
+   `None` on every `db::upsert_projection_rebuild` call (including a
+   restage of an already-`building` row — `register_projection`'s own
+   struct-update construction does this unconditionally), which
+   invalidates whatever a previous attempt had accumulated; only the
+   *current* dispatcher, not whichever caller happened to trigger the
+   reset, knows the right starting value. So `ProjectionDispatcher`
+   gained a second method, `default_state(bounded_context,
+   projection_name) -> Option<String>` (`RegisteredProjection`'s own
+   `default_state_json`, exposed per-lookup instead of only at
+   registration) — `catch_up_bounded_context` deletes a `None`-`caught_up_to`
+   rebuild's stale state row up front, then reseeds it from
+   `default_state()` the moment it actually starts folding. A rebuild
+   this process's dispatcher can't resolve at all (no compiled type
+   registered here for that name — a purely GraphQL-staged rebuild, say)
+   still advances: its state freezes at `"{}"`, a placeholder never
+   actually deserialised by anything, since `dispatcher.project()`
+   returns `None` for the same lookup key `default_state()` did — the
+   same "position always advances, state only changes when the
+   dispatcher can" treatment the sync path already gives an unconsumed
+   event.
+
+   Mirrors `CommandDispatcher`/`DeciderFn` (§1.7) exactly: a new
+   `ProjectionDispatcher` trait (`skilj-core::plugin`) - `fn project(&self,
+   bounded_context, projection_name, state_json, event) ->
+   Option<Result<String>>` - implemented by a new `RegisteredProjection`
+   closure built in `registered_projection::<T>()` (deserialise
+   `state_json` into `T::State`, defaulting via `T::State::default()`
+   at registration time rather than at fold time; convert `event` via
+   `BoundedContextEvent::try_from_event`; call `T::project()` **only**
+   when `event.event_type.name` is in `T::consumed_event_types()` -
+   `try_from_event` succeeding isn't by itself permission, since a
+   projection's generated `Event` enum can have variants beyond what it
+   declared consuming). `Skilj::projection_dispatcher()` mirrors
+   `command_dispatcher()`; both `skilj-rest`'s `AppState` and
+   `skilj-graphql`'s `GraphqlState` carry the resulting `Arc<dyn
+   ProjectionDispatcher>` alongside the existing command one.
+
+   New persistence: a `projection_state` table per bounded-context schema
+   (`projection_name`, `state`, `updated_at`), seeded at registration time
+   so a fold's own row lock always finds something to lock rather than
+   needing an insert-or-update branch; `db::get_projection_state`
+   (for whoever eventually builds `ProjectionQuery`'s `read_projection`);
+   and the real transactional entry point, **`db::
+   insert_event_and_update_sync_projections`** — one `pool.begin()`:
+   insert the event, then for every `sync = true` projection in the
+   context, `SELECT ... FOR UPDATE` its `projection_state` row (the same
+   row-lock-based serialisation `next_sequence` already relies on),
+   fold via the dispatcher, `UPDATE` state, and `UPDATE caught_up_to`
+   **unconditionally** (the note above the rules: "advances... either
+   way", even for an event whose type this projection doesn't consume) —
+   then commit. `insert_event` itself was refactored to take `impl
+   sqlx::PgExecutor<'_>` instead of a bare `&Pool` (no call-site changes
+   needed elsewhere), so the new function reuses it directly for the
+   insert step rather than duplicating that SQL. All four event-creation
+   call sites (`skilj-rest`'s two REST event routes, its `CommandTrigger`
+   handler, `skilj-graphql`'s `submitCommand` resolver) switched to the
+   new function - a no-op behaviour change for every bounded context with
+   no `sync` projections (every existing test fixture).
+
+   `ProjectionQuery` (the GraphQL surface) is **still not built**, even
+   after this - `read_projection`'s wire-facing half still needs the
+   JSON-Schema→GraphQL-type mechanism (§5.1, unbuilt); this item resolved
+   its *other* prerequisite ("no projection state exists to query"), for
+   both the sync and async cases now.
+
+   Verified end-to-end, real Postgres: `skilj-core/tests/sync_projections.rs`
+   exercises the transactional persistence function directly against a
+   hand-rolled `ProjectionDispatcher` test double (a consumed event
+   updates state and `caught_up_to`; an unconsumed one advances
+   `caught_up_to` only; two sync projections both update off one write);
+   `skilj/tests/sync_projections.rs` proves the real path end-to-end - a
+   real `Projection` registered through the builder, triggered twice
+   over a real `POST /v1/commands/trigger` request, the running total
+   correctly accumulating across both. `skilj-core/tests/async_projections.rs`
+   does the same for the async half — a cold-start catch-up folding
+   existing history, a no-op second tick, and a `ProjectionRebuild`
+   replaying from scratch (not resuming the live projection's own prior
+   progress) and promoting automatically once caught up, with the live
+   row's `schema`/`schema_version`/state all visibly replaced and the
+   rebuild row gone; `skilj/tests/async_projections.rs` proves the
+   spawned task itself is real — a command triggered over REST, then a
+   short poll loop waiting on `db::get_projection_state` to reflect it,
+   with no request-path code calling `project()` directly.
 
 ---
 
 ## 9. Next steps
 
-Every item through §7 is now settled, and §8 is empty. This is a
-reasonable point to return to `/allium:propagate` — scoped to one
-representative surface first, per the earlier discussion, rather than
-the full 319-obligation spec at once.
+Items 1–4 of §8 are done (persistence, the builder registry, REST fully
+wired), item 5 (`skilj-graphql`) is done through Phase 3, and item 6
+(`project()`) is done for both the sync and async cases, including
+`ProjectionRebuild` replay and promotion - see each item's own writeup
+for the full breakdown. What's left, in no particular order (none blocks
+any other):
+
+- `skilj-graphql`'s `ProjectionQuery`/`EventSubscription` - `ProjectionQuery`
+  now has real projection state to read (sync and async alike) but still
+  needs the JSON-Schema→GraphQL-type mechanism (§5.1); `EventSubscription`
+  needs a real-time event-delivery mechanism, not GraphQL plumbing.
+- `SubjectErasure`/`ForgetSubject` - blocked on `EncryptionKey`
+  persistence, itself blocked on `protect_sensitive_fields` actually
+  being implemented for its non-empty case.
+
+`/allium:propagate`, scoped to one representative surface at a time,
+remains the right tool once code lands that a surface's obligations
+haven't been checked against yet.
