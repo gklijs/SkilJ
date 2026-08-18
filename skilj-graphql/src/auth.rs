@@ -55,6 +55,52 @@ pub async fn resolve_role(
             "Authorization header is not a well-formed \"Bearer <jwt>\" credential",
         ));
     };
+    verify_jwt_to_role(jwt, identity, pool).await.map(Some)
+}
+
+/// `resolve_role`'s own counterpart for a GraphQL-over-websocket
+/// connection - reads the bearer credential from the `connection_init`
+/// message's own JSON payload (there is no per-message header on an
+/// already-established websocket, so this is the graphql-ws protocol's
+/// own place for it), the same `{"Authorization": "Bearer <jwt>"}` shape
+/// as the header case, just JSON instead of an HTTP header. `Ok(None)`
+/// when the payload has no recognisable credential at all - valid, the
+/// same "some callers need none" case `resolve_role` itself allows;
+/// `Err` (rejecting the whole connection before any subscription starts)
+/// for anything present but invalid, mirroring `resolve_role` exactly.
+pub async fn resolve_role_from_connection_init(
+    payload: &serde_json::Value,
+    identity: Option<&Identity>,
+    pool: &Pool,
+) -> Result<Option<Role>, async_graphql::Error> {
+    let Some(header_value) = payload
+        .get("Authorization")
+        .or_else(|| payload.get("authorization"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(jwt) = header_value.strip_prefix("Bearer ") else {
+        return Err(malformed_credential(
+            "connection_init's Authorization payload is not a well-formed \"Bearer <jwt>\" \
+             credential",
+        ));
+    };
+    verify_jwt_to_role(jwt, identity, pool).await.map(Some)
+}
+
+/// The shared core `resolve_role`/`resolve_role_from_connection_init`
+/// both need once they have a bare JWT string in hand: verify it, then
+/// resolve its subject to an active `Role`. Always `Err` on failure,
+/// never `Ok(None)` - a bearer credential was *presented* by the time
+/// either caller reaches this, so "doesn't resolve" is always a real
+/// rejection here, unlike the "absent entirely" case each caller checks
+/// for itself first.
+async fn verify_jwt_to_role(
+    jwt: &str,
+    identity: Option<&Identity>,
+    pool: &Pool,
+) -> Result<Role, async_graphql::Error> {
     let Some(identity) = identity else {
         return Err(async_graphql::Error::new(
             "this deployment has no identity_provider configured - no bearer JWT can ever verify",
@@ -77,7 +123,7 @@ pub async fn resolve_role(
         skilj_core::access_control::resolve_role_by_external_subject(&verified_subject, &roles)
             .map_err(crate::error::to_graphql_error)?
             .clone();
-    Ok(Some(role))
+    Ok(role)
 }
 
 fn malformed_credential(message: &str) -> async_graphql::Error {

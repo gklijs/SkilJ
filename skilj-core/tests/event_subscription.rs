@@ -403,7 +403,11 @@ fn deliver_to_subscriptions_delivers_to_an_all_events_subscription_with_no_restr
         event_types: Vec::new(), // empty - no restriction
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, std::slice::from_ref(&sub));
+    let delivered = event_store::deliver_to_subscriptions(
+        &e,
+        std::slice::from_ref(&sub),
+        |_, _| unreachable!(),
+    );
 
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0].subscription, sub);
@@ -424,7 +428,7 @@ fn deliver_to_subscriptions_all_events_subscription_filters_by_named_event_types
         event_types: vec![placed], // doesn't include the event's own type
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[sub]);
+    let delivered = event_store::deliver_to_subscriptions(&e, &[sub], |_, _| unreachable!());
 
     assert!(delivered.is_empty());
 }
@@ -442,7 +446,7 @@ fn deliver_to_subscriptions_event_type_subscription_matches_type_and_filters() {
         filters: Vec::new(), // empty filters - real, always matches
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[sub]);
+    let delivered = event_store::deliver_to_subscriptions(&e, &[sub], |_, _| unreachable!());
 
     assert_eq!(delivered.len(), 1);
 }
@@ -461,7 +465,7 @@ fn deliver_to_subscriptions_event_type_subscription_never_matches_a_different_ev
         filters: Vec::new(),
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[sub]);
+    let delivered = event_store::deliver_to_subscriptions(&e, &[sub], |_, _| unreachable!());
 
     assert!(delivered.is_empty());
 }
@@ -480,7 +484,7 @@ fn deliver_to_subscriptions_never_delivers_at_or_before_from_sequence() {
         event_types: Vec::new(),
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[sub]);
+    let delivered = event_store::deliver_to_subscriptions(&e, &[sub], |_, _| unreachable!());
 
     assert!(delivered.is_empty());
 }
@@ -499,7 +503,7 @@ fn deliver_to_subscriptions_never_delivers_to_a_revoked_grant() {
         event_types: Vec::new(),
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[sub]);
+    let delivered = event_store::deliver_to_subscriptions(&e, &[sub], |_, _| unreachable!());
 
     assert!(delivered.is_empty());
 }
@@ -521,7 +525,7 @@ fn deliver_to_subscriptions_never_delivers_across_bounded_contexts() {
         event_types: Vec::new(),
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[sub]);
+    let delivered = event_store::deliver_to_subscriptions(&e, &[sub], |_, _| unreachable!());
 
     assert!(delivered.is_empty());
 }

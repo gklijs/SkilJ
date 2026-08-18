@@ -36,9 +36,10 @@ use crate::access_control::{
     RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use crate::bootstrap::ContextCreator;
+use crate::encryption::{self, DataKey, EncryptionMasterKey};
 use crate::event_store::{
-    AckMode, BoundedContext, BoundedContextStatus, Command, CommandType, CursorUpdate, Event,
-    EventOrigin, EventType, ReadCursor,
+    AckMode, BoundedContext, BoundedContextStatus, Command, CommandType, CursorUpdate,
+    EncryptionKey, EncryptionKeyStatus, Event, EventOrigin, EventType, ReadCursor,
 };
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use crate::shared::{Metadata, SensitiveField, Tag, TagMapping};
@@ -198,6 +199,41 @@ async fn provision_bounded_context_schema(
     .execute(&mut **tx)
     .await?;
 
+    // See `entity EncryptionKey`. No FK to what a `SensitiveField`
+    // declares it for - identified by `(subject_key, subject_value)`
+    // alone, shared across every `EventType`/`CommandType` that
+    // references the same subject (docs/architecture.md's write-up of
+    // this pass). `wrapped_key`/`wrap_nonce` are this process's own
+    // envelope-encryption detail (`skilj_core::encryption`), never part
+    // of the spec's own entity - `NULL` once destroyed
+    // (`db::destroy_encryption_key`), real crypto-shredding rather than
+    // a status flag alone. The partial unique index is the identical
+    // pattern `roles_unique_active_external_subject` already uses: at
+    // most one *active* key per subject, while a destroyed one stays
+    // around permanently (append-only, like everything else here) so a
+    // later event for the same subject provisions a genuinely new key
+    // rather than colliding with the old row.
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.encryption_keys (
+            id BIGSERIAL PRIMARY KEY,
+            subject_key TEXT NOT NULL,
+            subject_value TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('active', 'destroyed')),
+            created_at TIMESTAMPTZ NOT NULL,
+            destroyed_at TIMESTAMPTZ,
+            wrapped_key BYTEA,
+            wrap_nonce BYTEA
+        )"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(&format!(
+        "CREATE UNIQUE INDEX encryption_keys_unique_active ON {schema}.encryption_keys \
+         (subject_key, subject_value) WHERE status = 'active'"
+    ))
+    .execute(&mut **tx)
+    .await?;
+
     sqlx::query(&format!(
         "CREATE TABLE {schema}.commands (
             id BIGSERIAL PRIMARY KEY,
@@ -207,7 +243,6 @@ async fn provision_bounded_context_schema(
             metadata_version BIGINT NOT NULL,
             metadata_client_id TEXT NOT NULL,
             metadata_created_at TIMESTAMPTZ NOT NULL,
-            encryption_keys JSONB NOT NULL DEFAULT '[]',
             consistency_tags JSONB NOT NULL DEFAULT '[]',
             consistency_boundary BIGINT
         )"
@@ -216,6 +251,20 @@ async fn provision_bounded_context_schema(
     .await?;
     sqlx::query(&format!(
         "CREATE INDEX commands_by_created_at ON {schema}.commands (metadata_created_at)"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    // `EncryptionKey` is a real, independently-lived entity (its own
+    // status/lifecycle - see `entity EncryptionKey`), so it's referenced
+    // here, not JSONB-embedded like `tag_mappings`/`sensitive_fields` -
+    // the same distinction `projection_rebuilds`/`consumed_event_types`
+    // already draw for the identical reason.
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.command_encryption_keys (
+            command_id BIGINT NOT NULL REFERENCES {schema}.commands (id),
+            encryption_key_id BIGINT NOT NULL REFERENCES {schema}.encryption_keys (id),
+            PRIMARY KEY (command_id, encryption_key_id)
+        )"
     ))
     .execute(&mut **tx)
     .await?;
@@ -326,7 +375,6 @@ async fn provision_bounded_context_schema(
             metadata_client_id TEXT NOT NULL,
             metadata_created_at TIMESTAMPTZ NOT NULL,
             tags JSONB NOT NULL DEFAULT '[]',
-            encryption_keys JSONB NOT NULL DEFAULT '[]',
             origin_kind TEXT NOT NULL CHECK (
                 origin_kind IN ('external_triggered', 'directly_created', 'command_triggered', 'system_triggered')
             ),
@@ -339,6 +387,18 @@ async fn provision_bounded_context_schema(
     .await?;
     sqlx::query(&format!(
         "CREATE INDEX events_by_type ON {schema}.events (event_type_name, sequence)"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    // See `command_encryption_keys` above - the identical join-table
+    // treatment, keyed by `sequence` instead of a synthetic id since
+    // `events.sequence` is already `Event`'s own natural primary key.
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.event_encryption_keys (
+            event_sequence BIGINT NOT NULL REFERENCES {schema}.events (sequence),
+            encryption_key_id BIGINT NOT NULL REFERENCES {schema}.encryption_keys (id),
+            PRIMARY KEY (event_sequence, encryption_key_id)
+        )"
     ))
     .execute(&mut **tx)
     .await?;
@@ -780,6 +840,349 @@ pub async fn get_command_type(
     Ok(row.map(|r| r.into_domain(bc)))
 }
 
+// --- EncryptionKey ---
+
+fn encryption_key_status_from_str(s: &str) -> EncryptionKeyStatus {
+    match s {
+        "destroyed" => EncryptionKeyStatus::Destroyed,
+        _ => EncryptionKeyStatus::Active,
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct EncryptionKeyRow {
+    id: i64,
+    subject_key: String,
+    subject_value: String,
+    status: String,
+    created_at: DateTime<Utc>,
+    destroyed_at: Option<DateTime<Utc>>,
+    wrapped_key: Option<Vec<u8>>,
+    wrap_nonce: Option<Vec<u8>>,
+}
+
+impl EncryptionKeyRow {
+    fn to_domain(&self, bounded_context: BoundedContext) -> EncryptionKey {
+        EncryptionKey {
+            bounded_context,
+            subject_key: self.subject_key.clone(),
+            subject_value: self.subject_value.clone(),
+            status: encryption_key_status_from_str(&self.status),
+            created_at: self.created_at,
+            destroyed_at: self.destroyed_at,
+        }
+    }
+}
+
+const ENCRYPTION_KEY_COLUMNS: &str =
+    "id, subject_key, subject_value, status, created_at, destroyed_at, wrapped_key, wrap_nonce";
+
+/// `event_store::protect_sensitive_fields`'s own get-or-create - "each key
+/// provisioned exactly once... idempotent... repeat calls find the key
+/// already provisioned rather than creating another one" (the note above
+/// `rule CreateExternalEvent`). Not literally inside the same transaction
+/// as the event/command write it protects - reuses the same "pre-resolve,
+/// then inject as a plain closure" shape `next_sequence`'s own callers
+/// already use for the identical "pure core needs a value only I/O can
+/// produce" problem (see docs/architecture.md's write-up of this pass).
+/// `ON CONFLICT ... DO NOTHING RETURNING` first, falling back to a plain
+/// `SELECT` on the race-lost case - the standard upsert-or-fetch idiom,
+/// safe under `encryption_keys_unique_active`'s own partial unique index.
+///
+/// Returns the row's own synthetic `id` alongside the domain entity (which
+/// has none, matching `entity EncryptionKey` itself) and the unwrapped
+/// `DataKey` - the same "domain struct has no id, caller gets one back
+/// anyway for FK purposes" treatment `insert_command`'s own return value
+/// already has. The caller needs `id` to link `event_encryption_keys`/
+/// `command_encryption_keys` join rows once the event/command itself is
+/// inserted.
+pub async fn get_or_create_encryption_key(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+    master_key: &EncryptionMasterKey,
+) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
+    let bc = get_bounded_context(pool, bounded_context).await?.expect(
+        "get_or_create_encryption_key: bounded_context row must exist for any caller reaching this",
+    );
+    let schema = schema_ident(bounded_context);
+
+    if let Some(row) =
+        get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await?
+    {
+        let data_key = unwrap_row(master_key, &row)?;
+        return Ok((row.to_domain(bc), row.id, data_key));
+    }
+
+    let (data_key, wrapped, nonce) = encryption::generate_and_wrap_data_key(master_key);
+    let now = Utc::now();
+    let inserted: Option<EncryptionKeyRow> = sqlx::query_as(&format!(
+        "INSERT INTO {schema}.encryption_keys \
+         (subject_key, subject_value, status, created_at, wrapped_key, wrap_nonce) \
+         VALUES ($1, $2, 'active', $3, $4, $5) \
+         ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
+         RETURNING {ENCRYPTION_KEY_COLUMNS}"
+    ))
+    .bind(subject_key)
+    .bind(subject_value)
+    .bind(now)
+    .bind(&wrapped)
+    .bind(&nonce)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = inserted {
+        return Ok((row.to_domain(bc), row.id, data_key));
+    }
+
+    // Lost the race to a concurrent provisioner - the row it created is
+    // now the active one; re-fetch and unwrap that instead of the key
+    // just generated above (which was never persisted, so it must not be
+    // used - the two would silently disagree on later re-reads).
+    let row = get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value)
+        .await?
+        .expect(
+            "get_or_create_encryption_key: INSERT lost the race but no active row was found \
+             immediately after - a concurrent provisioner must have destroyed it in between, \
+             which the active-only unique index makes vanishingly unlikely within one call",
+        );
+    let data_key = unwrap_row(master_key, &row)?;
+    Ok((row.to_domain(bc), row.id, data_key))
+}
+
+fn unwrap_row(
+    master_key: &EncryptionMasterKey,
+    row: &EncryptionKeyRow,
+) -> crate::error::Result<DataKey> {
+    let wrapped = row
+        .wrapped_key
+        .as_deref()
+        .expect("an active encryption_keys row always still has its wrapped key");
+    let nonce = row
+        .wrap_nonce
+        .as_deref()
+        .expect("an active encryption_keys row always still has its wrap nonce");
+    Ok(encryption::unwrap_data_key(master_key, wrapped, nonce)?)
+}
+
+/// The pre-resolution step every `event_store::protect_sensitive_fields`
+/// caller needs before it can call that pure function at all - see
+/// `docs/architecture.md`'s write-up of this pass and
+/// `event_store::sensitive_field_subjects`'s own doc comment. Resolves
+/// (get-or-creates) every `EncryptionKey` `payload` will need, merging
+/// into `resolved` rather than returning a fresh map - a caller
+/// protecting more than one payload against the same subject (a command
+/// and the events it produces, in `process_command`'s case) calls this
+/// once per payload, accumulating into the same map, so a shared subject
+/// resolves to the identical `EncryptionKey` everywhere, exactly as the
+/// spec requires. A no-op, no `master_key` needed, when `sensitive_fields`
+/// is empty or names no subjects actually present in `payload` - the
+/// identical "empty is a no-op" register `protect_sensitive_fields`
+/// itself is in. `master_key: None` with something to resolve is a real,
+/// actionable configuration error, not a silent skip.
+pub async fn resolve_encryption_keys(
+    pool: &Pool,
+    bounded_context: &str,
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+    master_key: Option<&EncryptionMasterKey>,
+    resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+) -> crate::error::Result<()> {
+    let subjects = crate::event_store::sensitive_field_subjects(sensitive_fields, payload);
+    if subjects.is_empty() {
+        return Ok(());
+    }
+    let master_key = master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    for (subject_key, subject_value) in subjects {
+        if resolved.contains_key(&(subject_key.clone(), subject_value.clone())) {
+            continue;
+        }
+        let provisioned = get_or_create_encryption_key(
+            pool,
+            bounded_context,
+            &subject_key,
+            &subject_value,
+            master_key,
+        )
+        .await?;
+        resolved.insert((subject_key, subject_value), provisioned);
+    }
+    Ok(())
+}
+
+/// The read-side twin of `resolve_encryption_keys` above - the
+/// pre-resolution step `event_store::render_event`/`render_command`'s own
+/// caller needs before it can call either pure function at all. Same
+/// accumulator-across-a-batch shape (a subject shared across many
+/// events/commands in one query resolves once, not once per row) -
+/// `resolvers::event_query`/`command_query`/`event_subscription` each
+/// call this once per event/command in the batch being rendered,
+/// accumulating into the same map.
+///
+/// Unlike the write side, this **filters by
+/// `event_store::sensitive_field_is_granted` first** - only a subject
+/// this caller is actually granted decrypt access to is ever looked up,
+/// so an unauthorised caller's query needs no `master_key` at all, no
+/// matter how many sensitive fields the payload declares. `master_key:
+/// None` with at least one *granted* subject to resolve is a real,
+/// actionable configuration error (confirmed via `AskUserQuestion` before
+/// building - mirrors `resolve_encryption_keys`'s own identical
+/// precedent) - a caller who *is* entitled to see a decrypted value
+/// deserves to know the server can't produce one, not silent ciphertext
+/// indistinguishable from "you're not authorised." A subject that *is*
+/// granted but has no active key (destroyed by `ForgetSubject`, or never
+/// provisioned) simply isn't inserted into `resolved` - `render_event`/
+/// `render_command`'s own `resolve_data_key` closure sees `None` for it,
+/// the correct crypto-shredding outcome, not an error.
+pub async fn resolve_data_keys_for_reading(
+    pool: &Pool,
+    bounded_context: &str,
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+    access_mapping: &crate::access_control::RoleAccessMapping,
+    master_key: Option<&EncryptionMasterKey>,
+    resolved: &mut std::collections::HashMap<(String, String), DataKey>,
+) -> crate::error::Result<()> {
+    let granted_subjects: Vec<(String, String)> =
+        crate::event_store::sensitive_field_subjects(sensitive_fields, payload)
+            .into_iter()
+            .filter(|(_, subject_value)| {
+                crate::event_store::sensitive_field_is_granted(access_mapping, subject_value)
+            })
+            .collect();
+    if granted_subjects.is_empty() {
+        return Ok(());
+    }
+    let master_key = master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    for (subject_key, subject_value) in granted_subjects {
+        if resolved.contains_key(&(subject_key.clone(), subject_value.clone())) {
+            continue;
+        }
+        if let Some(data_key) = get_active_data_key(
+            pool,
+            bounded_context,
+            &subject_key,
+            &subject_value,
+            master_key,
+        )
+        .await?
+        {
+            resolved.insert((subject_key, subject_value), data_key);
+        }
+    }
+    Ok(())
+}
+
+/// The `id`s `insert_event_and_update_sync_projections`/`insert_command`
+/// need for their own join-row writes, for exactly the `EncryptionKey`s a
+/// `protect_sensitive_fields` call actually returned as used (`Event`/
+/// `Command.encryption_keys`) - re-keyed back into `resolved` by
+/// `(subject_key, subject_value)`, the only identity `EncryptionKey`
+/// itself carries.
+pub fn encryption_key_ids(
+    used: &[EncryptionKey],
+    resolved: &std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+) -> Vec<i64> {
+    used.iter()
+        .map(|k| {
+            resolved
+                .get(&(k.subject_key.clone(), k.subject_value.clone()))
+                .expect("every key protect_sensitive_fields used came from resolve_encryption_keys' own resolve_key closure, so it must still be in the map that built it")
+                .1
+        })
+        .collect()
+}
+
+async fn get_active_encryption_key_row(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+) -> crate::error::Result<Option<EncryptionKeyRow>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<EncryptionKeyRow> = sqlx::query_as(&format!(
+        "SELECT {ENCRYPTION_KEY_COLUMNS} FROM {schema}.encryption_keys \
+         WHERE subject_key = $1 AND subject_value = $2 AND status = 'active'"
+    ))
+    .bind(subject_key)
+    .bind(subject_value)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// The active `EncryptionKey` for one subject, if any - `resolvers::
+/// subject_erasure`'s own lookup before calling the pure `forget_subject`
+/// (§SubjectErasure's `context key: EncryptionKey where ... status =
+/// active`). No key material - `get_or_create_encryption_key` is the only
+/// function that ever needs (and returns) that.
+pub async fn get_active_encryption_key(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+) -> crate::error::Result<Option<EncryptionKey>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(None);
+    };
+    Ok(
+        get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value)
+            .await?
+            .map(|row| row.to_domain(bc)),
+    )
+}
+
+/// The real decrypt-on-read pass's own lookup - the active subject's
+/// `DataKey`, unwrapped and ready to decrypt with, if any. Composes
+/// `get_active_encryption_key_row` (already used by `get_or_create_encryption_key`)
+/// with the identical `unwrap_row` that function already calls - no new
+/// SQL. `None` covers both "never provisioned" and "destroyed by
+/// `ForgetSubject`" identically, matching `resolve_data_keys_for_reading`'s
+/// own doc comment for why that's correct crypto-shredding behaviour, not
+/// a gap.
+pub async fn get_active_data_key(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+    master_key: &EncryptionMasterKey,
+) -> crate::error::Result<Option<DataKey>> {
+    match get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await? {
+        Some(row) => Ok(Some(unwrap_row(master_key, &row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Persists `forget_subject`'s outcome - real crypto-shredding, not just
+/// the status flip: `wrapped_key`/`wrap_nonce` are set to `NULL` in the
+/// same statement, so even the master key can no longer recover this
+/// subject's `DataKey` afterwards (see `forget_subject`'s own doc comment:
+/// "this function's own caller enacts [it] by destroying the key row").
+/// Scoped to `status = 'active'` in the `WHERE` clause purely
+/// defensively, since the pure rule already rejects an inactive key
+/// before this is ever called.
+pub async fn destroy_encryption_key(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+    destroyed_at: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(&format!(
+        "UPDATE {schema}.encryption_keys SET status = 'destroyed', destroyed_at = $1, \
+         wrapped_key = NULL, wrap_nonce = NULL \
+         WHERE subject_key = $2 AND subject_value = $3 AND status = 'active'"
+    ))
+    .bind(destroyed_at)
+    .bind(subject_key)
+    .bind(subject_value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // --- Command ---
 
 #[derive(sqlx::FromRow)]
@@ -827,17 +1230,23 @@ const COMMAND_COLUMNS: &str = "command_type_name, payload, metadata_type, metada
 /// identity to update against (see the migration's own doc comment on
 /// `commands`), so every call is a new row. Returns the new row's `id`,
 /// needed to link the `Event`s `process_command` produced back to it (see
-/// `insert_event`'s own `command_id` parameter).
-pub async fn insert_command(pool: &Pool, command: &Command) -> crate::error::Result<i64> {
-    debug_assert!(
-        command.encryption_keys.is_empty(),
-        "insert_command: EncryptionKey persistence isn't wired yet - protect_sensitive_fields' \
-         non-empty branch is still todo!(), so no caller of this function can produce one"
-    );
+/// `insert_event`'s own `command_id` parameter). `encryption_key_ids` is
+/// `get_or_create_encryption_key`'s own returned `id`s for
+/// `command.encryption_keys` - see `insert_event_and_update_sync_projections`'s
+/// own doc comment on why the domain struct alone isn't enough to link
+/// the join rows. A real transaction now (previously a single statement),
+/// so the command row and its own `command_encryption_keys` rows commit
+/// or fail together.
+pub async fn insert_command(
+    pool: &Pool,
+    command: &Command,
+    encryption_key_ids: &[i64],
+) -> crate::error::Result<i64> {
     let schema = schema_ident(&command.bounded_context.name);
+    let mut tx = pool.begin().await?;
     let (id,): (i64,) = sqlx::query_as(&format!(
-        "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}, encryption_keys) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id"
+        "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id"
     ))
     .bind(&command.command_type.name)
     .bind(&command.payload)
@@ -847,9 +1256,21 @@ pub async fn insert_command(pool: &Pool, command: &Command) -> crate::error::Res
     .bind(command.metadata.created_at)
     .bind(Json(&command.consistency_tags))
     .bind(command.consistency_boundary)
-    .bind(Json(Vec::<serde_json::Value>::new()))
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+
+    for encryption_key_id in encryption_key_ids {
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.command_encryption_keys (command_id, encryption_key_id) \
+             VALUES ($1, $2)"
+        ))
+        .bind(id)
+        .bind(encryption_key_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -1805,11 +2226,6 @@ pub async fn insert_event<'e>(
     event: &Event,
     command_id: Option<i64>,
 ) -> crate::error::Result<()> {
-    debug_assert!(
-        event.encryption_keys.is_empty(),
-        "insert_event: EncryptionKey persistence isn't wired yet - protect_sensitive_fields' \
-         non-empty branch is still todo!(), so no caller of this function can produce one"
-    );
     let (origin_kind, source_content, source_context) = match &event.origin {
         EventOrigin::ExternalTriggered {
             source_content,
@@ -1843,9 +2259,9 @@ pub async fn insert_event<'e>(
     let schema = schema_ident(&event.bounded_context.name);
     sqlx::query(&format!(
         "INSERT INTO {schema}.events (sequence, event_type_name, payload, metadata_type, \
-         metadata_version, metadata_client_id, metadata_created_at, tags, encryption_keys, \
+         metadata_version, metadata_client_id, metadata_created_at, tags, \
          origin_kind, origin_source_content, origin_source_context, origin_command_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"
     ))
     .bind(event.sequence)
     .bind(&event.event_type.name)
@@ -1855,7 +2271,6 @@ pub async fn insert_event<'e>(
     .bind(&event.metadata.client_id)
     .bind(event.metadata.created_at)
     .bind(Json(&event.tags))
-    .bind(Json(Vec::<serde_json::Value>::new()))
     .bind(origin_kind)
     .bind(source_content)
     .bind(source_context)
@@ -1893,6 +2308,8 @@ pub async fn insert_event_and_update_sync_projections(
     event: &Event,
     command_id: Option<i64>,
     dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    encryption_key_ids: &[i64],
+    broadcaster: &crate::event_store::EventBroadcaster,
 ) -> crate::error::Result<()> {
     let bounded_context = &event.bounded_context.name;
     let schema = schema_ident(bounded_context);
@@ -1910,6 +2327,23 @@ pub async fn insert_event_and_update_sync_projections(
 
     let mut tx = pool.begin().await?;
     insert_event(&mut *tx, event, command_id).await?;
+
+    // `event.encryption_keys`' own `id`s aren't carried on the domain
+    // struct (it has none, matching `entity EncryptionKey` itself) -
+    // `encryption_key_ids` is what `get_or_create_encryption_key` handed
+    // the caller back alongside it, threaded through here so this
+    // transaction can also link the join rows atomically with the event
+    // insert they belong to.
+    for encryption_key_id in encryption_key_ids {
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.event_encryption_keys (event_sequence, encryption_key_id) \
+             VALUES ($1, $2)"
+        ))
+        .bind(event.sequence)
+        .bind(encryption_key_id)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     for projection in &sync_projections {
         let (current_state,): (String,) = sqlx::query_as(&format!(
@@ -1944,6 +2378,14 @@ pub async fn insert_event_and_update_sync_projections(
     }
 
     tx.commit().await?;
+
+    // EventSubscription's own real-time delivery - after the commit, not
+    // before: a subscriber must never see an event that could still have
+    // rolled back (see EventBroadcaster's own doc comment for why this
+    // is the one choke point every event-creation call site already
+    // shares).
+    broadcaster.publish(event);
+
     Ok(())
 }
 

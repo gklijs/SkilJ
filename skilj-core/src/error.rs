@@ -26,6 +26,9 @@ pub enum Error {
     #[error(transparent)]
     Bootstrap(#[from] crate::bootstrap::Error),
 
+    #[error(transparent)]
+    Encryption(#[from] crate::encryption::Error),
+
     #[error("command rejected: {reason}")]
     CommandRejected { reason: String, kind: String },
 
@@ -59,6 +62,7 @@ impl SkiljRejection for Error {
             Error::EventStore(e) => e.code(),
             Error::Projections(e) => e.code(),
             Error::Bootstrap(e) => e.code(),
+            Error::Encryption(e) => e.code(),
             Error::CommandRejected { kind, .. } => kind,
             Error::Database(_) => "database_error",
             Error::Migration(_) => "migration_error",
@@ -71,6 +75,7 @@ impl SkiljRejection for Error {
             Error::EventStore(e) => e.message(),
             Error::Projections(e) => e.message(),
             Error::Bootstrap(e) => e.message(),
+            Error::Encryption(e) => e.message(),
             Error::CommandRejected { reason, .. } => reason.clone(),
             Error::Database(e) => e.to_string(),
             Error::Migration(e) => e.to_string(),

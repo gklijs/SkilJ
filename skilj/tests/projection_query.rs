@@ -1,10 +1,13 @@
-//! End-to-end tests for `skilj-graphql`'s Phase 3 - `EventQuery`,
-//! `CommandQuery`, `CommandSubmission`. Same real-HTTP-through-
+//! End-to-end tests for `skilj-graphql`'s `ProjectionQuery` - the
+//! JSON-Schema-driven `projection` field (see `skilj_graphql::projection_types`
+//! for the type-generation mechanism itself, and its own crate-level unit
+//! tests for the scalar/nullable/list/nested-object mapping in isolation;
+//! this file is the real end-to-end path only). Same real-HTTP-through-
 //! `Skilj::graphql_router()`, real-JWKS-server harness as
-//! `skilj/tests/graphql_admin_console.rs`/`graphql_type_registration.rs`,
-//! see either's own doc comment for the details, duplicated here rather
-//! than extracted into shared test-support (the same call every prior
-//! pass in this project already made).
+//! `skilj/tests/graphql_business_surfaces.rs` - see its own doc comment
+//! for the details, duplicated here rather than extracted into shared
+//! test-support (the same call every prior pass in this project already
+//! made).
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -14,10 +17,9 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{requires_role, CommandType, EventType, IdpConfig, SigningAlgorithm, Skilj};
+use skilj::{CommandType, EventType, IdpConfig, Projection, SigningAlgorithm, Skilj};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
-use skilj_core::db::Pool;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
 use skilj_core::plugin::BoundedContextEvent;
 use skilj_core::shared::{generate_token_id, CommandDecision, EventSpec};
@@ -76,7 +78,6 @@ impl EventType for MoneyDeposited {
 }
 
 enum BankingEvent {
-    #[allow(dead_code)]
     MoneyDeposited(MoneyDepositedPayload),
 }
 
@@ -103,34 +104,52 @@ impl CommandType for WithdrawMoney {
     type Event = BankingEvent;
     const NAME: &'static str = "WithdrawMoney";
     fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
-        if payload.amount > 1000 {
-            CommandDecision::Rejected {
-                reason: "insufficient funds".to_string(),
-                kind: "insufficient_funds".to_string(),
-            }
-        } else {
-            CommandDecision::Accepted {
-                events: vec![EventSpec {
-                    event_type: "MoneyDeposited".to_string(),
-                    payload: serde_json::json!({ "amount": payload.amount }),
-                }],
-            }
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "MoneyDeposited".to_string(),
+                payload: serde_json::json!({ "amount": payload.amount }),
+            }],
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct CloseAccountPayload {}
+/// The one-level nested shape - exercises `projection_types`' `$ref`
+/// resolution end-to-end, not just via its own crate-level unit tests.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct LastDeposit {
+    amount: i64,
+}
 
-struct CloseAccount;
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct AccountBalanceState {
+    total: i64,
+    last_deposit: LastDeposit,
+}
 
-#[requires_role("treasury_officer")]
-impl CommandType for CloseAccount {
-    type Payload = CloseAccountPayload;
+/// `sync()`, deliberately - `ProjectionQuery` is the surface under test
+/// here, not the projection mechanism itself (§8 item 6, already covered
+/// by `skilj-core/tests/sync_projections.rs`/`async_projections.rs`) -
+/// `sync` keeps `caught_up_to` deterministically current the moment a
+/// command's write commits, so `waitForSequence` assertions below don't
+/// also need to tolerate the background consumer's own poll cadence.
+struct AccountBalance;
+
+impl Projection for AccountBalance {
+    type State = AccountBalanceState;
     type Event = BankingEvent;
-    const NAME: &'static str = "CloseAccount";
-    fn decide(_payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
-        CommandDecision::Accepted { events: vec![] }
+    const NAME: &'static str = "AccountBalance";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["MoneyDeposited"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event) {
+        let BankingEvent::MoneyDeposited(payload) = event;
+        state.total += payload.amount;
+        state.last_deposit = LastDeposit {
+            amount: payload.amount,
+        };
     }
 }
 
@@ -147,7 +166,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Runtime::new()
-            .expect("failed to build a tokio runtime for graphql_business_surfaces tests")
+            .expect("failed to build a tokio runtime for projection_query tests")
     })
 }
 
@@ -197,7 +216,7 @@ async fn provision() -> Option<TestDb> {
         eprintln!("skipping: embedded PostgreSQL failed to start: {e}");
         return None;
     }
-    let database_name = "skilj_graphql_business_surfaces_test";
+    let database_name = "skilj_projection_query_test";
     if let Err(e) = server.create_database(database_name).await {
         eprintln!("skipping: embedded PostgreSQL create_database failed: {e}");
         return None;
@@ -267,75 +286,6 @@ fn sign_jwt(subject: &str) -> String {
     jsonwebtoken::encode(&header, &claims, &key).expect("signing a well-formed JWT never fails")
 }
 
-/// Builds a fully reconciled `Skilj` (`MoneyDeposited`/`WithdrawMoney`/
-/// `CloseAccount` registered), a real admin-level Role + grant on a
-/// fresh bounded context (admin level satisfies both `AdminAccess`'s own
-/// requirement and `CommandSubmission`'s `Write | Admin` check), and that
-/// Role's own signed JWT.
-async fn setup() -> (Skilj, Pool, String, String, Role) {
-    let database_url = test_database_url()
-        .await
-        .expect("test_database_url() must be Some - caller already checked");
-    let jwks_url = serve_jwks().await;
-
-    let pool = skilj_core::db::connect(&database_url).await.unwrap();
-
-    let admin_subject = unique_name("admin");
-    let role = Role {
-        id: generate_token_id(),
-        external_subject: admin_subject.clone(),
-        name: "Admin".to_string(),
-        superadmin: false,
-        status: RoleStatus::Active,
-        created_at: test_now(),
-        revoked_at: None,
-    };
-    skilj_core::db::insert_role(&pool, &role).await.unwrap();
-
-    let bc_name = unique_name("banking");
-    let bc = BoundedContext {
-        name: bc_name.clone(),
-        status: BoundedContextStatus::Active,
-        created_at: test_now(),
-        created_by: ContextCreator::SystemCreator,
-    };
-    skilj_core::db::insert_bounded_context(&pool, &bc)
-        .await
-        .unwrap();
-
-    let mapping = RoleAccessMapping {
-        role: role.clone(),
-        bounded_context: bc.clone(),
-        level: AccessLevel::Admin,
-        can_read_sensitive: false,
-        status: RoleStatus::Active,
-        created_at: test_now(),
-        revoked_at: None,
-    };
-    skilj_core::db::insert_role_access_mapping(&pool, &mapping)
-        .await
-        .unwrap();
-
-    let (skilj, report) = Skilj::builder(database_url.clone())
-        .identity_provider(IdpConfig::new(
-            jwks_url.parse().unwrap(),
-            TEST_ISSUER,
-            SigningAlgorithm::Rs256,
-        ))
-        .bounded_context(bc_name.clone())
-        .event_type::<MoneyDeposited>()
-        .command_type::<WithdrawMoney>()
-        .command_type::<CloseAccount>()
-        .reconciliation_role(admin_subject)
-        .build()
-        .await
-        .unwrap();
-    assert_eq!(report.skipped_no_access, Vec::<String>::new());
-
-    let jwt = sign_jwt(&role.external_subject);
-    (skilj, pool, bc_name, jwt, role)
-}
-
 async fn graphql_request(
     router: &axum::Router,
     jwt: Option<&str>,
@@ -360,192 +310,239 @@ async fn graphql_request(
 }
 
 const SUBMIT_COMMAND_MUTATION: &str = "\
-    mutation($bc: String!, $name: String!, $payload: String!) { \
-        submitCommand(boundedContext: $bc, commandTypeName: $name, payload: $payload) { \
-            accepted triggeredEventSequences rejectionReason rejectionKind \
+    mutation($bc: String!, $payload: String!) { \
+        submitCommand(boundedContext: $bc, commandTypeName: \"WithdrawMoney\", payload: $payload) { \
+            accepted triggeredEventSequences \
         } \
     }";
 
 #[test]
-fn full_business_surfaces_lifecycle_end_to_end() {
+fn projection_query_end_to_end() {
     runtime().block_on(async {
         if test_database_url().await.is_none() {
             return;
         }
-        let (skilj, _pool, bc_name, jwt, _admin_role) = setup().await;
-        let router = skilj.graphql_router().await.unwrap();
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
 
-        // submitCommand - accepted path.
-        let response = graphql_request(
-            &router,
-            Some(&jwt),
-            SUBMIT_COMMAND_MUTATION,
-            json!({ "bc": bc_name, "name": "WithdrawMoney", "payload": r#"{"amount":20}"# }),
-        )
-        .await;
-        assert!(
-            response.get("errors").is_none(),
-            "unexpected errors: {response:?}"
-        );
-        assert_eq!(response["data"]["submitCommand"]["accepted"], true);
-        let sequences = response["data"]["submitCommand"]["triggeredEventSequences"]
-            .as_array()
-            .unwrap();
-        assert_eq!(sequences.len(), 1);
-        let first_sequence = sequences[0].as_i64().unwrap();
-
-        // submitCommand - a second, later command, for pagination below.
-        let response = graphql_request(
-            &router,
-            Some(&jwt),
-            SUBMIT_COMMAND_MUTATION,
-            json!({ "bc": bc_name, "name": "WithdrawMoney", "payload": r#"{"amount":30}"# }),
-        )
-        .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
-        let second_sequence =
-            response["data"]["submitCommand"]["triggeredEventSequences"][0].as_i64().unwrap();
-
-        // submitCommand - rejected path renders as 200-shaped typed data,
-        // not a GraphQL error (§5.4/§7.3).
-        let response = graphql_request(
-            &router,
-            Some(&jwt),
-            SUBMIT_COMMAND_MUTATION,
-            json!({ "bc": bc_name, "name": "WithdrawMoney", "payload": r#"{"amount":5000}"# }),
-        )
-        .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
-        assert_eq!(response["data"]["submitCommand"]["accepted"], false);
-        assert_eq!(response["data"]["submitCommand"]["rejectionKind"], "insufficient_funds");
-
-        // submitCommand against a #[requires_role("treasury_officer")]
-        // command type - rejected: the admin Role's own name is "Admin",
-        // not "treasury_officer".
-        let response = graphql_request(
-            &router,
-            Some(&jwt),
-            SUBMIT_COMMAND_MUTATION,
-            json!({ "bc": bc_name, "name": "CloseAccount", "payload": "{}" }),
-        )
-        .await;
-        assert_eq!(
-            response["errors"][0]["extensions"]["code"],
-            "insufficient_role"
-        );
-
-        // The same command type succeeds for a Role actually named
-        // "treasury_officer" - still needs its own admin grant.
-        let officer_subject = unique_name("officer");
-        let officer_role = Role {
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
             id: generate_token_id(),
-            external_subject: officer_subject.clone(),
-            name: "treasury_officer".to_string(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
             superadmin: false,
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
         };
-        skilj_core::db::insert_role(&_pool, &officer_role).await.unwrap();
-        let officer_mapping = RoleAccessMapping {
-            role: officer_role,
-            bounded_context: skilj_core::db::get_bounded_context(&_pool, &bc_name)
-                .await
-                .unwrap()
-                .unwrap(),
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+
+        let admin_mapping = RoleAccessMapping {
+            role: admin_role.clone(),
+            bounded_context: bc.clone(),
             level: AccessLevel::Admin,
             can_read_sensitive: false,
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
         };
-        skilj_core::db::insert_role_access_mapping(&_pool, &officer_mapping)
+        skilj_core::db::insert_role_access_mapping(&pool, &admin_mapping)
             .await
             .unwrap();
-        let officer_jwt = sign_jwt(&officer_subject);
 
-        let response = graphql_request(
-            &router,
-            Some(&officer_jwt),
-            SUBMIT_COMMAND_MUTATION,
-            json!({ "bc": bc_name, "name": "CloseAccount", "payload": "{}" }),
-        )
-        .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
-        assert_eq!(response["data"]["submitCommand"]["accepted"], true);
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<WithdrawMoney>()
+            .projection::<AccountBalance>()
+            .reconciliation_role(admin_subject)
+            .projection_query_wait_timeout(std::time::Duration::from_millis(150))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
 
-        // queryEvents - real pagination via afterSequence.
-        let response = graphql_request(
-            &router,
-            Some(&jwt),
-            "query($bc: String!, $after: Int) { \
-                queryEvents(boundedContext: $bc, eventTypes: [], afterSequence: $after) { \
-                    sequence payload \
-                } \
-            }",
-            json!({ "bc": bc_name, "after": first_sequence }),
-        )
-        .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
-        let events = response["data"]["queryEvents"].as_array().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["sequence"], second_sequence);
-        assert_eq!(events[0]["payload"], r#"{"amount":30}"#);
+        let admin_jwt = sign_jwt(&admin_role.external_subject);
+        let router = skilj.graphql_router().await.unwrap();
 
-        // countEvents.
-        let response = graphql_request(
-            &router,
-            Some(&jwt),
-            "query($bc: String!) { countEvents(boundedContext: $bc, eventTypes: []) }",
-            json!({ "bc": bc_name }),
-        )
-        .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
-        assert_eq!(response["data"]["countEvents"], 2);
-
-        // inspectEvent.
-        let response = graphql_request(
-            &router,
-            Some(&jwt),
-            "query($bc: String!, $seq: Int!) { \
-                inspectEvent(boundedContext: $bc, sequence: $seq) { \
-                    renderedPayload event { origin { kind } } \
-                } \
-            }",
-            json!({ "bc": bc_name, "seq": first_sequence }),
-        )
-        .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
-        assert_eq!(
-            response["data"]["inspectEvent"]["renderedPayload"],
-            r#"{"amount":20}"#
-        );
-        assert_eq!(
-            response["data"]["inspectEvent"]["event"]["origin"]["kind"],
-            "COMMAND_TRIGGERED"
+        let type_name =
+            skilj_graphql::projection_types::graphql_type_name(&bc_name, "AccountBalance");
+        let query = format!(
+            "query($bc: String!, $name: String!, $wait: Int) {{ \
+                projection(boundedContext: $bc, name: $name, waitForSequence: $wait) {{ \
+                    ... on {type_name} {{ total lastDeposit {{ amount }} }} \
+                }} \
+            }}"
         );
 
-        // fetchCommands.
+        // Trigger a real command, producing a real event.
         let response = graphql_request(
             &router,
-            Some(&jwt),
-            "query($bc: String!) { fetchCommands(boundedContext: $bc, commandTypes: [\"WithdrawMoney\"]) }",
-            json!({ "bc": bc_name }),
-        )
-        .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
-        let commands = response["data"]["fetchCommands"].as_array().unwrap();
-        assert_eq!(commands.len(), 2);
-
-        // Gating: no caller at all is rejected for submitCommand, before
-        // anything runs.
-        let response = graphql_request(
-            &router,
-            None,
+            Some(&admin_jwt),
             SUBMIT_COMMAND_MUTATION,
-            json!({ "bc": bc_name, "name": "WithdrawMoney", "payload": r#"{"amount":1}"# }),
+            json!({ "bc": bc_name, "payload": r#"{"amount":20}"# }),
         )
         .await;
-        assert_eq!(response["errors"][0]["extensions"]["code"], "unauthenticated");
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        let first_sequence = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+
+        // No waitForSequence at all - answers from wherever the
+        // projection currently is (sync, so already current).
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "name": "AccountBalance", "wait": null }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(response["data"]["projection"]["total"], 20);
+        assert_eq!(response["data"]["projection"]["lastDeposit"]["amount"], 20);
+
+        // waitForSequence naming the triggering event's own sequence -
+        // the read-your-writes lever actually runs and succeeds, not
+        // just accepted syntactically.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "name": "AccountBalance", "wait": first_sequence }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(response["data"]["projection"]["total"], 20);
+
+        // waitForSequence past anything that will ever be reached within
+        // the short configured timeout - a distinguishable timeout
+        // rejection (ReadYourWritesWhenRequested), not a generic error.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "name": "AccountBalance", "wait": first_sequence + 1000 }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "projection_caught_up_timed_out"
+        );
+
+        // A Read-level-only grant still succeeds - ProjectionQuery faces
+        // ReadAccess, not AdminAccess (require_read_mapping, not
+        // require_admin_mapping).
+        let reader_subject = unique_name("reader");
+        let reader_role = Role {
+            id: generate_token_id(),
+            external_subject: reader_subject.clone(),
+            name: "Reader".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &reader_role)
+            .await
+            .unwrap();
+        let reader_mapping = RoleAccessMapping {
+            role: reader_role,
+            bounded_context: bc.clone(),
+            level: AccessLevel::Read,
+            can_read_sensitive: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &reader_mapping)
+            .await
+            .unwrap();
+        let reader_jwt = sign_jwt(&reader_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&reader_jwt),
+            &query,
+            json!({ "bc": bc_name, "name": "AccountBalance", "wait": null }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(response["data"]["projection"]["total"], 20);
+
+        // A caller with no grant on this bounded context at all is
+        // rejected - GrantScopedToBoundedContext's own "no mapping
+        // collapses into the same rejection a revoked one gets".
+        let stranger_subject = unique_name("stranger");
+        let stranger_role = Role {
+            id: generate_token_id(),
+            external_subject: stranger_subject.clone(),
+            name: "Stranger".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &stranger_role)
+            .await
+            .unwrap();
+        let stranger_jwt = sign_jwt(&stranger_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&stranger_jwt),
+            &query,
+            json!({ "bc": bc_name, "name": "AccountBalance", "wait": null }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "grant_not_active"
+        );
+
+        // An unknown projection name - the resolver rejects before ever
+        // needing to select a concrete fragment type, so the query
+        // document (still naming the real type) stays valid regardless.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "name": "NoSuchProjection", "wait": null }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "Projection_not_found"
+        );
     });
 }

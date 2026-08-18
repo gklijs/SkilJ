@@ -181,6 +181,38 @@ pub fn submit_command_field() -> Field {
                 }
                 let mut sequences = sequences.into_iter();
 
+                // protect_sensitive_fields' own pre-resolution step, for
+                // the command's own payload *and* every accepted event
+                // spec's - see `db::resolve_encryption_keys`'s own doc
+                // comment (mirrors `skilj-rest`'s own `post_commands_trigger`
+                // handler exactly).
+                let mut resolved = HashMap::new();
+                skilj_core::db::resolve_encryption_keys(
+                    &state.pool,
+                    &bounded_context_name,
+                    &authorised.command_type.sensitive_fields,
+                    &authorised.payload,
+                    state.encryption_master_key.as_ref(),
+                    &mut resolved,
+                )
+                .await
+                .map_err(to_graphql_error)?;
+                for spec in &event_specs {
+                    if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
+                        let spec_payload = spec.payload.to_string();
+                        skilj_core::db::resolve_encryption_keys(
+                            &state.pool,
+                            &bounded_context_name,
+                            &event_type.sensitive_fields,
+                            &spec_payload,
+                            state.encryption_master_key.as_ref(),
+                            &mut resolved,
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
+                    }
+                }
+
                 let result: skilj_core::event_store::ProcessCommandResult =
                     skilj_core::event_store::process_command(
                         &authorised.command_type,
@@ -198,19 +230,35 @@ pub fn submit_command_field() -> Field {
                             )
                         },
                         Utc::now(),
+                        |subject_key, subject_value| {
+                            let (key, _, data_key) = resolved
+                                .get(&(subject_key.to_string(), subject_value.to_string()))
+                                .expect(
+                                    "resolve_encryption_keys pre-resolved every subject \
+                                     sensitive_field_subjects named",
+                                );
+                            (key.clone(), data_key.clone())
+                        },
                     )
                     .map_err(to_graphql_error)?;
 
-                let command_id = skilj_core::db::insert_command(&state.pool, &result.command)
-                    .await
-                    .map_err(to_graphql_error)?;
+                let command_key_ids =
+                    skilj_core::db::encryption_key_ids(&result.command.encryption_keys, &resolved);
+                let command_id =
+                    skilj_core::db::insert_command(&state.pool, &result.command, &command_key_ids)
+                        .await
+                        .map_err(to_graphql_error)?;
                 let mut triggered_event_sequences = Vec::with_capacity(result.events.len());
                 for event in &result.events {
+                    let event_key_ids =
+                        skilj_core::db::encryption_key_ids(&event.encryption_keys, &resolved);
                     skilj_core::db::insert_event_and_update_sync_projections(
                         &state.pool,
                         event,
                         Some(command_id),
                         state.projection_dispatcher.as_ref(),
+                        &event_key_ids,
+                        &state.event_broadcaster,
                     )
                     .await
                     .map_err(to_graphql_error)?;

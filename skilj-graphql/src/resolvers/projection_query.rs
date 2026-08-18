@@ -1,0 +1,127 @@
+//! `surface ProjectionQuery` - the one field, `projection`. `ReadAccess`-
+//! gated (any active level - `require_read_mapping`, not
+//! `require_admin_mapping`). See `crate::projection_types` for how the
+//! `ProjectionResult` union and its per-projection member types are
+//! generated.
+
+use super::{not_found, require_read_mapping};
+use crate::error::to_graphql_error;
+use crate::projection_types::graphql_type_name;
+use crate::GraphqlState;
+use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
+use skilj_core::db::Pool;
+
+/// `await_projection_caught_up(projection, wait_for_sequence)`'s real
+/// implementation (the black box `skilj_core::projections::query_projection`
+/// leaves to its caller - see that function's own doc comment): polls
+/// `Projection.caught_up_to` until it reaches `wait_for_sequence` or
+/// `timeout` elapses. Trivially fast for a sync projection - its
+/// `caught_up_to` is already current the moment the write transaction
+/// that produced `wait_for_sequence` committed (see
+/// `db::insert_event_and_update_sync_projections`), so the very first
+/// poll already succeeds; for an async one it may need to wait out one
+/// or more of the background consumer's own poll ticks
+/// (`db::catch_up_bounded_context`).
+async fn wait_until_caught_up(
+    pool: &Pool,
+    bounded_context: &str,
+    projection_name: &str,
+    wait_for_sequence: i64,
+    timeout: std::time::Duration,
+) -> skilj_core::error::Result<bool> {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let projection =
+            skilj_core::db::get_projection(pool, bounded_context, projection_name).await?;
+        if let Some(projection) = &projection {
+            if projection.caught_up_to.unwrap_or(-1) >= wait_for_sequence {
+                return Ok(true);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// `projection(boundedContext: String!, name: String!, waitForSequence: Int): ProjectionResult!`
+///
+/// `read_projection`'s real scope this pass: returns the projection's
+/// stored state verbatim - no per-field sensitive-value decrypt/redact
+/// logic, because no event can carry `encryption_keys` yet
+/// (`protect_sensitive_fields` is still `todo!()` for its only non-empty
+/// case, the same gap `SubjectErasure` is blocked on), so no projection
+/// can contain protected content to decide about yet.
+/// `SensitiveFieldsStayProtected` is vacuously satisfied today, not
+/// broken - the identical "don't build ahead of what's wired" call
+/// Phase 2 already made for excluding `SubjectErasure` itself, for the
+/// same underlying reason.
+pub fn field() -> Field {
+    Field::new("projection", TypeRef::named_nn("ProjectionResult"), |ctx| {
+        FieldFuture::new(async move {
+            let state = ctx.data::<GraphqlState>()?;
+            let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
+            let access_mapping =
+                require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+            let name = ctx.args.try_get("name")?.string()?.to_string();
+            let wait_for_sequence = ctx
+                .args
+                .get("waitForSequence")
+                .filter(|v| !v.is_null())
+                .map(|v| v.i64())
+                .transpose()?;
+
+            let projection =
+                skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)
+                    .await
+                    .map_err(to_graphql_error)?
+                    .ok_or_else(|| not_found("Projection", &name))?;
+
+            let caught_up = match wait_for_sequence {
+                None => true,
+                Some(seq) => wait_until_caught_up(
+                    &state.pool,
+                    &bounded_context_name,
+                    &name,
+                    seq,
+                    state.projection_query_wait_timeout,
+                )
+                .await
+                .map_err(to_graphql_error)?,
+            };
+
+            let state_json =
+                skilj_core::db::get_projection_state(&state.pool, &bounded_context_name, &name)
+                    .await
+                    .map_err(to_graphql_error)?
+                    .unwrap_or_else(|| "{}".to_string());
+
+            let result = skilj_core::projections::query_projection(
+                &access_mapping,
+                &projection,
+                wait_for_sequence,
+                caught_up,
+                state_json,
+            )
+            .map_err(to_graphql_error)?;
+
+            let value: serde_json::Value = serde_json::from_str(&result)
+                .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+
+            Ok(Some(FieldValue::owned_any(value).with_type(
+                graphql_type_name(&bounded_context_name, &name),
+            )))
+        })
+    })
+    .argument(InputValue::new(
+        "boundedContext",
+        TypeRef::named_nn(TypeRef::STRING),
+    ))
+    .argument(InputValue::new("name", TypeRef::named_nn(TypeRef::STRING)))
+    .argument(InputValue::new(
+        "waitForSequence",
+        TypeRef::named(TypeRef::INT),
+    ))
+}

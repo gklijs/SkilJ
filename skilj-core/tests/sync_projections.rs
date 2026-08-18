@@ -241,9 +241,16 @@ fn a_consumed_event_updates_both_state_and_caught_up_to() {
 
         let seq = db::next_sequence(&pool, &bc.name).await.unwrap();
         let e = event(&bc, &et, seq, 20);
-        db::insert_event_and_update_sync_projections(&pool, &e, None, &TestDispatcher)
-            .await
-            .unwrap();
+        db::insert_event_and_update_sync_projections(
+            &pool,
+            &e,
+            None,
+            &TestDispatcher,
+            &[],
+            &skilj_core::event_store::EventBroadcaster::new(16),
+        )
+        .await
+        .unwrap();
 
         let state = db::get_projection_state(&pool, &bc.name, "AccountBalance")
             .await
@@ -274,9 +281,16 @@ fn an_unconsumed_event_advances_caught_up_to_but_not_state() {
 
         let seq = db::next_sequence(&pool, &bc.name).await.unwrap();
         let e = event(&bc, &other, seq, 999);
-        db::insert_event_and_update_sync_projections(&pool, &e, None, &TestDispatcher)
-            .await
-            .unwrap();
+        db::insert_event_and_update_sync_projections(
+            &pool,
+            &e,
+            None,
+            &TestDispatcher,
+            &[],
+            &skilj_core::event_store::EventBroadcaster::new(16),
+        )
+        .await
+        .unwrap();
 
         let state = db::get_projection_state(&pool, &bc.name, "AccountBalance")
             .await
@@ -306,9 +320,16 @@ fn two_sync_projections_both_update_from_one_event() {
 
         let seq = db::next_sequence(&pool, &bc.name).await.unwrap();
         let e = event(&bc, &et, seq, 30);
-        db::insert_event_and_update_sync_projections(&pool, &e, None, &TestDispatcher)
-            .await
-            .unwrap();
+        db::insert_event_and_update_sync_projections(
+            &pool,
+            &e,
+            None,
+            &TestDispatcher,
+            &[],
+            &skilj_core::event_store::EventBroadcaster::new(16),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             db::get_projection_state(&pool, &bc.name, "AccountBalance")

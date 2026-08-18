@@ -13,6 +13,7 @@
 pub mod access_control;
 pub mod bootstrap;
 pub mod db;
+pub mod encryption;
 pub mod error;
 pub mod event_store;
 pub mod plugin;

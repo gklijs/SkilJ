@@ -39,7 +39,8 @@ use skilj_core::access_control::{
     CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
 };
 use skilj_core::db::{self, AccessTokenKind, Pool};
-use skilj_core::event_store::{self, AckMode, Event, EventType};
+use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::event_store::{self, AckMode, Event, EventBroadcaster, EventType};
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
 use skilj_core::shared::{secret_matches, CommandDecision};
 use std::collections::HashMap;
@@ -50,12 +51,16 @@ struct AppState {
     pool: Pool,
     dispatcher: Arc<dyn CommandDispatcher>,
     projection_dispatcher: Arc<dyn ProjectionDispatcher>,
+    encryption_master_key: Option<EncryptionMasterKey>,
+    event_broadcaster: EventBroadcaster,
 }
 
 pub fn router(
     pool: Pool,
     dispatcher: Arc<dyn CommandDispatcher>,
     projection_dispatcher: Arc<dyn ProjectionDispatcher>,
+    encryption_master_key: Option<EncryptionMasterKey>,
+    event_broadcaster: EventBroadcaster,
 ) -> Router {
     Router::new()
         .route("/v1/events/external", post(post_events_external))
@@ -68,6 +73,8 @@ pub fn router(
             pool,
             dispatcher,
             projection_dispatcher,
+            encryption_master_key,
+            event_broadcaster,
         })
 }
 
@@ -308,6 +315,22 @@ async fn post_events_external(
     let payload = serde_json::to_string(&body.payload)
         .expect("serde_json::Value serialization is infallible");
 
+    // `protect_sensitive_fields`'s own pre-resolution step - see
+    // `db::resolve_encryption_keys`'s own doc comment. A no-op unless
+    // `token.event_type.sensitive_fields` actually names a subject this
+    // payload carries.
+    let bounded_context_name = token.event_type.bounded_context.name.clone();
+    let mut resolved = HashMap::new();
+    db::resolve_encryption_keys(
+        &state.pool,
+        &bounded_context_name,
+        &token.event_type.sensitive_fields,
+        &payload,
+        state.encryption_master_key.as_ref(),
+        &mut resolved,
+    )
+    .await?;
+
     let event = event_store::create_external_event(
         &token,
         payload,
@@ -315,12 +338,21 @@ async fn post_events_external(
         body.source_context,
         next_seq,
         Utc::now(),
+        |subject_key, subject_value| {
+            let (key, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect("resolve_encryption_keys pre-resolved every subject sensitive_field_subjects named");
+            (key.clone(), data_key.clone())
+        },
     )?;
+    let encryption_key_ids = db::encryption_key_ids(&event.encryption_keys, &resolved);
     db::insert_event_and_update_sync_projections(
         &state.pool,
         &event,
         None,
         state.projection_dispatcher.as_ref(),
+        &encryption_key_ids,
+        &state.event_broadcaster,
     )
     .await?;
 
@@ -342,12 +374,38 @@ async fn post_events_direct(
     let payload = serde_json::to_string(&body.payload)
         .expect("serde_json::Value serialization is infallible");
 
-    let event = event_store::create_direct_event(&token, payload, next_seq, Utc::now())?;
+    let bounded_context_name = token.event_type.bounded_context.name.clone();
+    let mut resolved = HashMap::new();
+    db::resolve_encryption_keys(
+        &state.pool,
+        &bounded_context_name,
+        &token.event_type.sensitive_fields,
+        &payload,
+        state.encryption_master_key.as_ref(),
+        &mut resolved,
+    )
+    .await?;
+
+    let event = event_store::create_direct_event(
+        &token,
+        payload,
+        next_seq,
+        Utc::now(),
+        |subject_key, subject_value| {
+            let (key, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect("resolve_encryption_keys pre-resolved every subject sensitive_field_subjects named");
+            (key.clone(), data_key.clone())
+        },
+    )?;
+    let encryption_key_ids = db::encryption_key_ids(&event.encryption_keys, &resolved);
     db::insert_event_and_update_sync_projections(
         &state.pool,
         &event,
         None,
         state.projection_dispatcher.as_ref(),
+        &encryption_key_ids,
+        &state.event_broadcaster,
     )
     .await?;
 
@@ -519,6 +577,37 @@ async fn post_commands_trigger(
     }
     let mut sequences = sequences.into_iter();
 
+    // `protect_sensitive_fields`'s own pre-resolution step, for the
+    // command's own payload *and* every accepted event spec's - see
+    // `db::resolve_encryption_keys`'s own doc comment on why this
+    // accumulates into one shared map rather than resolving each
+    // separately: a subject the command and one of its own events both
+    // name must resolve to the identical `EncryptionKey`.
+    let mut resolved = HashMap::new();
+    db::resolve_encryption_keys(
+        &state.pool,
+        &bounded_context_name,
+        &authorised.command_type.sensitive_fields,
+        &authorised.payload,
+        state.encryption_master_key.as_ref(),
+        &mut resolved,
+    )
+    .await?;
+    for spec in &event_specs {
+        if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
+            let spec_payload = spec.payload.to_string();
+            db::resolve_encryption_keys(
+                &state.pool,
+                &bounded_context_name,
+                &event_type.sensitive_fields,
+                &spec_payload,
+                state.encryption_master_key.as_ref(),
+                &mut resolved,
+            )
+            .await?;
+        }
+    }
+
     let result = event_store::process_command(
         &authorised.command_type,
         &authorised.payload,
@@ -534,16 +623,26 @@ async fn post_commands_trigger(
             )
         },
         Utc::now(),
+        |subject_key, subject_value| {
+            let (key, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect("resolve_encryption_keys pre-resolved every subject sensitive_field_subjects named");
+            (key.clone(), data_key.clone())
+        },
     )?;
 
-    let command_id = db::insert_command(&state.pool, &result.command).await?;
+    let command_key_ids = db::encryption_key_ids(&result.command.encryption_keys, &resolved);
+    let command_id = db::insert_command(&state.pool, &result.command, &command_key_ids).await?;
     let mut triggered_event_sequences = Vec::with_capacity(result.events.len());
     for event in &result.events {
+        let event_key_ids = db::encryption_key_ids(&event.encryption_keys, &resolved);
         db::insert_event_and_update_sync_projections(
             &state.pool,
             event,
             Some(command_id),
             state.projection_dispatcher.as_ref(),
+            &event_key_ids,
+            &state.event_broadcaster,
         )
         .await?;
         triggered_event_sequences.push(event.sequence);

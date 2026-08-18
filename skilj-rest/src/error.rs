@@ -119,6 +119,10 @@ fn status_for(err: &CoreError) -> StatusCode {
         // route reachable today can actually produce one of these.
         CoreError::Projections(_) => StatusCode::INTERNAL_SERVER_ERROR,
         CoreError::Bootstrap(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // A misconfigured/missing encryption_master_key or a corrupted
+        // wrapped key are both operator-facing configuration/data-integrity
+        // problems, never a caller-facing 4xx.
+        CoreError::Encryption(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // §7.3/§5.4: a rejection is a legitimate outcome of a successful
         // request, not an HTTP-level error - CommandTrigger's own handler
         // renders this as 200-with-typed-data instead of ever routing a

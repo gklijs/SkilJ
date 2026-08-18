@@ -27,7 +27,10 @@ use skilj_core::access_control::{
     RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use skilj_core::bootstrap::ContextCreator;
-use skilj_core::event_store::{BoundedContext, BoundedContextStatus, CommandType, EventType};
+use skilj_core::event_store::{
+    BoundedContext, BoundedContextStatus, CommandType, EncryptionKey, EncryptionKeyStatus,
+    EventType,
+};
 use skilj_core::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use skilj_core::shared::{SensitiveField, TagMapping};
 
@@ -883,4 +886,77 @@ pub fn submit_command_payload_object() -> Object {
             TypeRef::named(TypeRef::STRING),
             |r: &SubmitCommandResult| optional_string(r.rejection_kind.clone()),
         ))
+}
+
+pub fn encryption_key_status_name(status: EncryptionKeyStatus) -> &'static str {
+    match status {
+        EncryptionKeyStatus::Active => "ACTIVE",
+        EncryptionKeyStatus::Destroyed => "DESTROYED",
+    }
+}
+
+pub fn encryption_key_status_enum() -> Enum {
+    Enum::new("EncryptionKeyStatus")
+        .item("ACTIVE")
+        .item("DESTROYED")
+}
+
+/// `entity EncryptionKey`, minus `bounded_context` (already implied by
+/// the query that scoped the lookup, the same treatment `RoleAccessMapping`
+/// gives its own `bounded_context` field) and any key material - that
+/// never crosses this boundary at all, see `skilj_core::encryption`'s own
+/// doc comment.
+pub fn encryption_key_object() -> Object {
+    Object::new("EncryptionKey")
+        .field(scalar_field(
+            "subjectKey",
+            TypeRef::named_nn(TypeRef::STRING),
+            |k: &EncryptionKey| Value::from(k.subject_key.clone()),
+        ))
+        .field(scalar_field(
+            "subjectValue",
+            TypeRef::named_nn(TypeRef::STRING),
+            |k: &EncryptionKey| Value::from(k.subject_value.clone()),
+        ))
+        .field(scalar_field(
+            "status",
+            TypeRef::named_nn("EncryptionKeyStatus"),
+            |k: &EncryptionKey| Value::from(encryption_key_status_name(k.status)),
+        ))
+        .field(scalar_field(
+            "createdAt",
+            TypeRef::named_nn(TypeRef::STRING),
+            |k: &EncryptionKey| Value::from(k.created_at.to_rfc3339()),
+        ))
+        .field(scalar_field(
+            "destroyedAt",
+            TypeRef::named(TypeRef::STRING),
+            |k: &EncryptionKey| optional_timestamp(k.destroyed_at),
+        ))
+}
+
+/// `value Filter`'s own `operator` field. `resolvers::event_subscription`'s
+/// own `eventsByType(filters: ...)` is this type's only user - `filters`
+/// is real wire-shape (matching `CreateEventTypeSubscription`'s own
+/// signature faithfully), but a non-empty list is rejected eagerly at
+/// the resolver (see `resolvers::parse_filters`'s own doc comment for
+/// why) rather than ever reaching `matches_filters`'s still-`todo!()`
+/// non-empty case.
+pub fn filter_operator_enum() -> Enum {
+    Enum::new("FilterOperator")
+        .item("EQUALS")
+        .item("CONTAINS")
+        .item("IS_LIKE")
+        .item("GREATER_THAN")
+        .item("LESS_THAN")
+}
+
+pub fn filter_input() -> InputObject {
+    InputObject::new("FilterInput")
+        .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
+        .field(InputValue::new(
+            "operator",
+            TypeRef::named_nn("FilterOperator"),
+        ))
+        .field(InputValue::new("value", TypeRef::named_nn(TypeRef::STRING)))
 }

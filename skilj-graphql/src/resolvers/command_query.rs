@@ -6,7 +6,7 @@
 //! fit it the way `EventQuery`'s genuine sequence cursor does (confirmed
 //! with the user - see the Phase 3 plan).
 
-use super::{not_found, require_admin_mapping};
+use super::{not_found, require_admin_mapping, resolve_read_data_keys};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, InputValue, TypeRef};
@@ -83,6 +83,26 @@ pub fn fetch_commands_field() -> Field {
                 .await
                 .map_err(to_graphql_error)?;
 
+                // Same scoped-to-commandTypes pre-resolution `queryEvents`
+                // uses - see that resolver's own comment for why this
+                // doesn't try to replicate fetch_commands' full filter.
+                let mut data_keys = std::collections::HashMap::new();
+                for c in bounded_context_commands.iter().filter(|c| {
+                    c.bounded_context == access_mapping.bounded_context
+                        && (command_types.is_empty() || command_types.contains(&c.command_type))
+                }) {
+                    resolve_read_data_keys(
+                        &state.pool,
+                        &bounded_context_name,
+                        &c.command_type.sensitive_fields,
+                        &c.payload,
+                        &access_mapping,
+                        state.encryption_master_key.as_ref(),
+                        &mut data_keys,
+                    )
+                    .await?;
+                }
+
                 let rendered = skilj_core::event_store::fetch_commands(
                     &access_mapping,
                     &command_types,
@@ -90,6 +110,7 @@ pub fn fetch_commands_field() -> Field {
                     before,
                     triggered_event.as_ref(),
                     &bounded_context_commands,
+                    |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
                 )
                 .map_err(to_graphql_error)?;
 

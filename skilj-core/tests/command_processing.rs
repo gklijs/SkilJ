@@ -371,6 +371,7 @@ fn process_command_accepts_and_creates_the_command_and_its_triggered_events() {
             seq
         },
         timestamp(1000),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap();
 
@@ -427,6 +428,7 @@ fn process_command_calls_next_sequence_once_per_triggered_event_in_order() {
             seq
         },
         timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap();
 
@@ -453,6 +455,7 @@ fn process_command_surfaces_a_rejected_decision_verbatim() {
         |_| None,
         || 0,
         timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap_err();
 
@@ -483,6 +486,7 @@ fn process_command_rejects_an_event_spec_naming_an_unregistered_event_type() {
         |_| None,
         || 0,
         timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap_err();
 
@@ -588,6 +592,7 @@ fn command_consistency_tags_are_empty_when_the_command_type_declares_no_tag_mapp
         |_| None,
         || 0,
         timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap();
 

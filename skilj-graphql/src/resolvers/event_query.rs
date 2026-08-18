@@ -1,7 +1,7 @@
 //! `surface EventQuery` - `queryEvents`, `countEvents`, `inspectEvent`.
 //! `AdminAccess`-gated, via the shared `require_admin_mapping` helper.
 
-use super::{not_found, require_admin_mapping};
+use super::{not_found, require_admin_mapping, resolve_read_data_keys};
 use crate::error::to_graphql_error;
 use crate::gql_types::InspectedEventData;
 use crate::GraphqlState;
@@ -68,12 +68,37 @@ pub fn query_events_field() -> Field {
                 .await
                 .map_err(to_graphql_error)?;
 
+                // Decrypt-on-read's own pre-resolution step - scoped to
+                // events matching the caller's own `eventTypes` argument
+                // (the cheapest part of query_events' own filter to
+                // replicate here without duplicating the whole thing);
+                // `tags`/`afterSequence` may narrow the actual results
+                // further, so this may resolve a few more keys than
+                // strictly needed, never fewer - no correctness impact.
+                let mut data_keys = std::collections::HashMap::new();
+                for e in bounded_context_events.iter().filter(|e| {
+                    e.bounded_context == access_mapping.bounded_context
+                        && (event_types.is_empty() || event_types.contains(&e.event_type))
+                }) {
+                    resolve_read_data_keys(
+                        &state.pool,
+                        &bounded_context_name,
+                        &e.event_type.sensitive_fields,
+                        &e.payload,
+                        &access_mapping,
+                        state.encryption_master_key.as_ref(),
+                        &mut data_keys,
+                    )
+                    .await?;
+                }
+
                 let results = skilj_core::event_store::query_events(
                     &access_mapping,
                     &event_types,
                     tags.as_deref(),
                     after_sequence,
                     &bounded_context_events,
+                    |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
                 )
                 .map_err(to_graphql_error)?;
 
@@ -161,7 +186,22 @@ pub fn inspect_event_field() -> Field {
                     .map_err(to_graphql_error)?
                     .ok_or_else(|| not_found("Event", &sequence.to_string()))?;
 
-            let inspected = skilj_core::event_store::inspect_event(&access_mapping, &event)
+            let mut data_keys = std::collections::HashMap::new();
+            resolve_read_data_keys(
+                &state.pool,
+                &bounded_context_name,
+                &event.event_type.sensitive_fields,
+                &event.payload,
+                &access_mapping,
+                state.encryption_master_key.as_ref(),
+                &mut data_keys,
+            )
+            .await?;
+
+            let inspected =
+                skilj_core::event_store::inspect_event(&access_mapping, &event, |sk, sv| {
+                    data_keys.get(&(sk.to_string(), sv.to_string())).cloned()
+                })
                 .map_err(to_graphql_error)?;
 
             Ok(Some(FieldValue::owned_any(InspectedEventData {

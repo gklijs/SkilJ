@@ -16,3 +16,4 @@ axum.workspace = true
 async-graphql.workspace = true
 async-graphql-axum.workspace = true
 arc-swap.workspace = true
+asynk-strim.workspace = true

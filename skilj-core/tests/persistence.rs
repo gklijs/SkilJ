@@ -36,9 +36,10 @@ use skilj_core::access_control::{
 };
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, AccessTokenKind, Pool};
+use skilj_core::encryption::EncryptionMasterKey;
 use skilj_core::event_store::{
-    AckMode, BoundedContext, BoundedContextStatus, CommandType, CursorUpdate, Event, EventOrigin,
-    EventType, ReadCursor,
+    AckMode, BoundedContext, BoundedContextStatus, CommandType, CursorUpdate, EncryptionKeyStatus,
+    Event, EventOrigin, EventType, ReadCursor,
 };
 use skilj_core::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use skilj_core::shared::{generate_token_id, generate_token_secret, Metadata, Tag};
@@ -1315,6 +1316,167 @@ fn hard_delete_drops_the_schema_and_cascades_the_registry_row() {
         assert_eq!(
             db::get_event_type(&pool, &bc.name, &et.name).await.unwrap(),
             None
+        );
+    });
+}
+
+// --- EncryptionKey (§SubjectErasure) ---
+
+#[test]
+fn get_or_create_encryption_key_provisions_once_then_reuses_the_same_row() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([1u8; 32]);
+
+        let (first, first_id, _data_key) =
+            db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
+                .await
+                .unwrap();
+        assert_eq!(first.subject_key, "user");
+        assert_eq!(first.subject_value, "42");
+        assert_eq!(first.status, EncryptionKeyStatus::Active);
+        assert_eq!(first.destroyed_at, None);
+
+        let (second, second_id, _data_key) =
+            db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
+                .await
+                .unwrap();
+        assert_eq!(first_id, second_id);
+        assert_eq!(first, second);
+    });
+}
+
+#[test]
+fn get_active_encryption_key_is_none_for_an_unknown_subject() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        assert_eq!(
+            db::get_active_encryption_key(&pool, &bc.name, "user", "nope")
+                .await
+                .unwrap(),
+            None
+        );
+    });
+}
+
+/// Real crypto-shredding, not just a status flag: destroying nulls the
+/// wrapped key material too (see `db::destroy_encryption_key`'s own doc
+/// comment), and "a later event for the same subject provisions a new
+/// active key; it does not revive this one" (`entity EncryptionKey`'s own
+/// doc comment) - a genuinely different row, not the destroyed one back.
+#[test]
+fn destroy_encryption_key_is_irreversible_and_a_later_provision_is_a_new_key() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([2u8; 32]);
+
+        let (_key, original_id, _data_key) =
+            db::get_or_create_encryption_key(&pool, &bc.name, "user", "7", &master)
+                .await
+                .unwrap();
+        db::destroy_encryption_key(&pool, &bc.name, "user", "7", test_now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db::get_active_encryption_key(&pool, &bc.name, "user", "7")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let (revived, revived_id, _data_key) =
+            db::get_or_create_encryption_key(&pool, &bc.name, "user", "7", &master)
+                .await
+                .unwrap();
+        assert_eq!(revived.status, EncryptionKeyStatus::Active);
+        assert_ne!(revived_id, original_id);
+    });
+}
+
+// --- get_active_data_key (real decrypt-on-read) ---
+
+/// `get_active_data_key` round-trips a provisioned key back to the
+/// identical `DataKey` - proven indirectly (`DataKey` has no
+/// `PartialEq`/`Debug` by design) by encrypting under the freshly
+/// provisioned key and decrypting under the one this function returns.
+#[test]
+fn get_active_data_key_round_trips_a_provisioned_key() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([3u8; 32]);
+
+        let (_key, _id, provisioned) =
+            db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
+                .await
+                .unwrap();
+        let ciphertext = skilj_core::encryption::encrypt_leaf(&provisioned, "hello");
+
+        let fetched = db::get_active_data_key(&pool, &bc.name, "user", "42", &master)
+            .await
+            .unwrap()
+            .expect("the key just provisioned is active");
+        assert_eq!(
+            skilj_core::encryption::decrypt_leaf(&fetched, &ciphertext).unwrap(),
+            "hello"
+        );
+    });
+}
+
+#[test]
+fn get_active_data_key_is_none_for_an_unknown_subject() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([4u8; 32]);
+        assert!(
+            db::get_active_data_key(&pool, &bc.name, "user", "nope", &master)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+/// A destroyed key's own `wrapped_key`/`wrap_nonce` are nulled (real
+/// crypto-shredding, see `destroy_encryption_key`'s own doc comment) -
+/// `get_active_data_key` returns `None`, the identical treatment an
+/// unknown subject gets, not an error.
+#[test]
+fn get_active_data_key_is_none_for_a_destroyed_key() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([5u8; 32]);
+
+        db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
+            .await
+            .unwrap();
+        db::destroy_encryption_key(&pool, &bc.name, "user", "42", test_now())
+            .await
+            .unwrap();
+
+        assert!(
+            db::get_active_data_key(&pool, &bc.name, "user", "42", &master)
+                .await
+                .unwrap()
+                .is_none()
         );
     });
 }

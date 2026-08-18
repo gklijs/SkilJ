@@ -9,14 +9,18 @@
 pub mod auth;
 mod error;
 pub mod gql_types;
+pub mod projection_types;
 pub mod resolvers;
 pub mod schema;
 
 use async_graphql::dynamic::Schema;
 use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
+use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::event_store::EventBroadcaster;
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Everything a GraphQL request needs, baked into the schema's own
 /// global `.data()` at `router()` time (see `schema::build`'s own doc
@@ -41,15 +45,50 @@ pub struct GraphqlState {
     /// `Skilj::rest_router()` hands its own event-creation routes, reused
     /// here for the same reason `dispatcher` above is.
     pub projection_dispatcher: Arc<dyn ProjectionDispatcher>,
+    /// `ProjectionQuery`'s own `wait_for_sequence` timeout - "a process-
+    /// start configuration knob, not a per-query argument or a fixed
+    /// value" (the spec's own guidance above `rule QueryProjection`), the
+    /// same register `SkiljBuilder::async_projection_poll_interval`
+    /// already lives in. See `resolvers::projection_query::wait_until_caught_up`.
+    pub projection_query_wait_timeout: Duration,
+    /// `submitCommand`'s own bridge into `protect_sensitive_fields` for
+    /// the events/command it produces (§SubjectErasure) - the identical
+    /// `Option<EncryptionMasterKey>` `Skilj::rest_router()` hands its own
+    /// event-creation routes, reused here for the same reason
+    /// `dispatcher`/`projection_dispatcher` above are.
+    pub encryption_master_key: Option<EncryptionMasterKey>,
+    /// `EventSubscription`'s own real-time delivery source
+    /// (`resolvers::event_subscription`) - the identical `EventBroadcaster`
+    /// `Skilj::rest_router()` hands its own event-creation routes to
+    /// publish into, reused here for the same reason `dispatcher`/
+    /// `projection_dispatcher` above are: one shared, process-wide
+    /// broadcaster, not a second one.
+    pub event_broadcaster: EventBroadcaster,
 }
 
 /// Builds the schema from `state` and mounts it as a fresh `axum::Router`
-/// at `POST /graphql` - the one real caller is `Skilj::graphql_router()`.
-pub fn router(state: GraphqlState) -> axum::Router {
-    let schema = schema::build(state.clone());
-    axum::Router::new()
-        .route("/graphql", axum::routing::post(graphql_handler))
-        .with_state((schema, state))
+/// at `/graphql` - the one real caller is `Skilj::graphql_router()`.
+/// `async`, returning `Result`, since `schema::build` now needs to list
+/// every registered projection to generate `ProjectionQuery`'s own
+/// per-projection types (§5.1) - a real I/O failure mode `schema::build`'s
+/// own `.expect(...)` deliberately doesn't cover (that stays for a
+/// genuine schema-shape bug, never a runtime condition).
+///
+/// One path, method-routed: `POST` still goes to `graphql_handler`
+/// (queries/mutations); `GET` with the right `Upgrade`/`Sec-WebSocket-Protocol`
+/// headers goes to `graphql_ws_handler` (subscriptions) - axum's own
+/// documented idiom for exactly this "one path, a handler or a raw
+/// `Service` depending on method" case, confirmed against the installed
+/// crate source, not improvised. A GraphQL client's own protocol
+/// negotiation picks the right one; nothing here needs a second path.
+pub async fn router(state: GraphqlState) -> skilj_core::error::Result<axum::Router> {
+    let schema = schema::build(state.clone()).await?;
+    Ok(axum::Router::new()
+        .route(
+            "/graphql",
+            axum::routing::post(graphql_handler).get(graphql_ws_handler),
+        )
+        .with_state((schema, state)))
 }
 
 /// Resolves the caller (`auth::resolve_role`) before ever executing the
@@ -72,4 +111,45 @@ async fn graphql_handler(
         ]),
     };
     response.into()
+}
+
+/// Upgrades to a GraphQL-over-websocket connection for `EventSubscription`.
+/// Built directly against `async_graphql_axum::{GraphQLProtocol,
+/// GraphQLWebSocket}` rather than the higher-level `GraphQLSubscription`
+/// service wrapper - that wrapper builds its own `GraphQLWebSocket`
+/// internally with no way to reach `on_connection_init`, and the caller
+/// identity has to come from there (the graphql-ws protocol's own place
+/// for it - there is no per-message header on an already-established
+/// websocket). A `connection_init` payload with no recognisable bearer
+/// credential resolves to no caller (`Ok(None)`, matching
+/// `auth::resolve_role`'s own "missing = fine" case - some subscriptions
+/// may need no caller); one that's present but invalid rejects the whole
+/// connection before any subscription starts, via `on_connection_init`'s
+/// own `Err` path - the same "wrong credential is a hard stop" treatment
+/// `graphql_handler` already gives the header case.
+async fn graphql_ws_handler(
+    axum::extract::State((schema, state)): axum::extract::State<(Schema, GraphqlState)>,
+    protocol: async_graphql_axum::GraphQLProtocol,
+    upgrade: axum::extract::WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    upgrade
+        .protocols(async_graphql::http::ALL_WEBSOCKET_PROTOCOLS)
+        .on_upgrade(move |socket| {
+            async_graphql_axum::GraphQLWebSocket::new(socket, schema, protocol)
+                .on_connection_init(move |payload| {
+                    let state = state.clone();
+                    async move {
+                        let role = auth::resolve_role_from_connection_init(
+                            &payload,
+                            state.identity.as_ref(),
+                            &state.pool,
+                        )
+                        .await?;
+                        let mut data = async_graphql::Data::default();
+                        data.insert(role);
+                        Ok(data)
+                    }
+                })
+                .serve()
+        })
 }

@@ -293,7 +293,7 @@ fn full_type_registration_lifecycle_end_to_end() {
             return;
         }
         let (skilj, _pool, bc_name, jwt) = setup().await;
-        let router = skilj.graphql_router();
+        let router = skilj.graphql_router().await.unwrap();
 
         // Gating: no caller at all is rejected before anything runs.
         let response = graphql_request(

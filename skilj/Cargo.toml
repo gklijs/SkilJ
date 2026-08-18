@@ -22,3 +22,5 @@ serde.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken.workspace = true
+tokio-tungstenite = "0.29"
+futures-util = "0.3"

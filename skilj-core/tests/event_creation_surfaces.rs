@@ -104,6 +104,7 @@ fn create_external_event_succeeds_and_stamps_source_fields_and_metadata() {
         Some("orders-topic/0/144".into()),
         7,
         timestamp(500),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap();
 
@@ -144,6 +145,7 @@ fn create_external_event_allows_an_absent_source_context() {
         None,
         0,
         timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap();
 
@@ -165,6 +167,7 @@ fn create_external_event_rejects_an_event_type_not_opted_into_external_creation(
         None,
         0,
         timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap_err();
 
@@ -190,6 +193,7 @@ fn create_external_event_event_type_is_always_the_adapters_event_type_by_constru
         None,
         0,
         timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
     );
     assert_eq!(adapter.event_type, et);
 }
@@ -206,6 +210,7 @@ fn create_external_event_rejects_a_revoked_token() {
         None,
         0,
         timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
     )
     .unwrap_err();
 
@@ -222,9 +227,14 @@ fn create_direct_event_succeeds_and_stamps_metadata() {
     let et = event_type(false, true);
     let adapter = direct_token(TokenStatus::Active, et.clone());
 
-    let event =
-        event_store::create_direct_event(&adapter, r#"{"amount":10}"#.into(), 3, timestamp(200))
-            .unwrap();
+    let event = event_store::create_direct_event(
+        &adapter,
+        r#"{"amount":10}"#.into(),
+        3,
+        timestamp(200),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap();
 
     assert_eq!(event.bounded_context, bounded_context("orders"));
     assert_eq!(event.event_type, et);
@@ -242,7 +252,10 @@ fn create_direct_event_succeeds_and_stamps_metadata() {
 fn create_direct_event_rejects_an_event_type_not_opted_into_direct_creation() {
     let adapter = direct_token(TokenStatus::Active, event_type(false, false));
 
-    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0)).unwrap_err();
+    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
+        unreachable!("no sensitive fields in this test")
+    })
+    .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -257,7 +270,9 @@ fn create_direct_event_rejects_an_event_type_not_opted_into_direct_creation() {
 fn create_direct_event_event_type_is_always_the_adapters_event_type_by_construction() {
     let et = event_type(false, true);
     let adapter = direct_token(TokenStatus::Active, et.clone());
-    let _ = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0));
+    let _ = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
+        unreachable!("no sensitive fields in this test")
+    });
     assert_eq!(adapter.event_type, et);
 }
 
@@ -266,7 +281,10 @@ fn create_direct_event_event_type_is_always_the_adapters_event_type_by_construct
 fn create_direct_event_rejects_a_revoked_token() {
     let adapter = direct_token(TokenStatus::Revoked, event_type(false, true));
 
-    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0)).unwrap_err();
+    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
+        unreachable!("no sensitive fields in this test")
+    })
+    .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
 }

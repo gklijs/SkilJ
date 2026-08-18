@@ -20,7 +20,7 @@
 use skilj_core::access_control::{AccessLevel, JwksCache, Role};
 use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
-use skilj_core::event_store::{Error as EventStoreError, Event};
+use skilj_core::event_store::{Error as EventStoreError, Event, EventBroadcaster};
 use skilj_core::plugin::{BoundedContextEvent, CommandDispatcher};
 use skilj_core::projections::ProjectionRegistration;
 use skilj_core::shared::CommandDecision;
@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use skilj_core::access_control::{IdpConfig, SigningAlgorithm};
+pub use skilj_core::encryption::EncryptionMasterKey;
 pub use skilj_core::plugin::{requires_role, CommandType, EventType, Projection};
 
 /// `Skilj`'s own bundle of an `IdpConfig` and the `JwksCache` verifying
@@ -70,6 +71,25 @@ pub struct Skilj {
     /// to a verified subject without a configured IdP to verify it
     /// against).
     identity_provider: Option<Arc<IdentityProvider>>,
+    /// `ProjectionQuery`'s own `wait_for_sequence` timeout - see
+    /// `SkiljBuilder::projection_query_wait_timeout`'s own doc comment.
+    projection_query_wait_timeout: std::time::Duration,
+    /// `protect_sensitive_fields`'s own envelope-encryption master key -
+    /// see `SkiljBuilder::encryption_master_key`'s own doc comment.
+    /// `None` when never configured - fine as long as no bounded context
+    /// this process registers ever declares a real `sensitive_fields`
+    /// entry; `db::resolve_encryption_keys` is what actually raises the
+    /// configuration error the first time one does.
+    encryption_master_key: Option<EncryptionMasterKey>,
+    /// `EventSubscription`'s own real-time delivery source - see
+    /// `SkiljBuilder::event_broadcast_capacity`'s own doc comment. One
+    /// shared, process-wide broadcaster, constructed once in `.build()`
+    /// and handed to both `rest_router()` (every event-creation route
+    /// publishes into it) and `graphql_router()` (`allEvents`/
+    /// `eventsByType` subscribe to it) - the same "one dispatcher, not
+    /// two" treatment `command_dispatcher`/`projection_dispatcher`
+    /// already get.
+    event_broadcaster: EventBroadcaster,
 }
 
 /// `CommandDispatcher`'s own implementer - a thin wrapper around the
@@ -147,6 +167,9 @@ impl Skilj {
             command_types: HashMap::new(),
             projections: HashMap::new(),
             async_projection_poll_interval: std::time::Duration::from_millis(500),
+            projection_query_wait_timeout: std::time::Duration::from_secs(5),
+            encryption_master_key: None,
+            event_broadcast_capacity: 1024,
         }
     }
 
@@ -197,6 +220,8 @@ impl Skilj {
             self.pool.clone(),
             self.command_dispatcher(),
             self.projection_dispatcher(),
+            self.encryption_master_key.clone(),
+            self.event_broadcaster.clone(),
         )
     }
 
@@ -206,14 +231,19 @@ impl Skilj {
     /// `rest_router()` however `axum::Router::merge`/`nest` suits their
     /// own application - see `rest_router()`'s own doc comment.
     ///
-    /// Phase 1 only (docs/architecture.md §8 item 5's own plan): the
-    /// superadmin admin console - `createSuperadmin`, `createRole`/
-    /// `revokeRole`/`grantRoleAccessMapping`/`revokeRoleAccessMapping`,
-    /// `addBoundedContext`/`archiveBoundedContext`/`deleteBoundedContext`,
-    /// `boundedContexts`. The five dynamic, per-bounded-context business
-    /// surfaces (`ProjectionQuery`/`EventQuery`/`CommandQuery`/
-    /// `CommandSubmission`/`EventSubscription`) are a later phase.
-    pub fn graphql_router(&self) -> axum::Router {
+    /// Covers all 16 of the spec's GraphQL-facing surfaces: the
+    /// superadmin admin console, the `AdminAccess`-gated
+    /// type-registration/token surfaces, and all five dynamic
+    /// per-bounded-context business surfaces (`EventQuery`/`CommandQuery`/
+    /// `CommandSubmission`/`ProjectionQuery`/`EventSubscription`) - the
+    /// last of which mounts a GraphQL-over-websocket handler on the same
+    /// `/graphql` path (see `skilj_graphql::router`'s own doc comment).
+    ///
+    /// `async`, returning `Result`: building `ProjectionQuery`'s own
+    /// per-projection GraphQL types (§5.1) means `schema::build` now
+    /// makes real database calls, a failure mode this signature needs to
+    /// carry - see `skilj_graphql::router`'s own doc comment.
+    pub async fn graphql_router(&self) -> skilj_core::error::Result<axum::Router> {
         let state = skilj_graphql::GraphqlState {
             pool: self.pool.clone(),
             bootstrap_secret: self.bootstrap_secret.clone(),
@@ -226,8 +256,11 @@ impl Skilj {
                 }),
             dispatcher: self.command_dispatcher(),
             projection_dispatcher: self.projection_dispatcher(),
+            projection_query_wait_timeout: self.projection_query_wait_timeout,
+            encryption_master_key: self.encryption_master_key.clone(),
+            event_broadcaster: self.event_broadcaster.clone(),
         };
-        skilj_graphql::router(state)
+        skilj_graphql::router(state).await
     }
 }
 
@@ -405,6 +438,9 @@ pub struct SkiljBuilder {
     command_types: HashMap<(String, String), RegisteredCommandType>,
     projections: HashMap<(String, String), RegisteredProjection>,
     async_projection_poll_interval: std::time::Duration,
+    projection_query_wait_timeout: std::time::Duration,
+    encryption_master_key: Option<EncryptionMasterKey>,
+    event_broadcast_capacity: usize,
 }
 
 impl SkiljBuilder {
@@ -483,6 +519,47 @@ impl SkiljBuilder {
         self
     }
 
+    /// How long `ProjectionQuery`'s `waitForSequence` argument blocks
+    /// before failing with a distinguishable timeout, when the projection
+    /// hasn't caught up to the requested sequence yet - see
+    /// `rule QueryProjection`'s own guidance: "a process-start
+    /// configuration knob, not a per-query argument or a fixed value".
+    /// Defaults to 5s. Costs a sync projection nothing - its
+    /// `caught_up_to` is already current the moment its write committed,
+    /// so `waitForSequence` is satisfied on the very first poll.
+    pub fn projection_query_wait_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.projection_query_wait_timeout = timeout;
+        self
+    }
+
+    /// `protect_sensitive_fields`'s own envelope-encryption master key -
+    /// see `skilj_core::encryption`'s own module doc comment for the full
+    /// design. Optional: a bounded context with no real `sensitive_fields`
+    /// entry never needs one; declaring a sensitive field and then
+    /// actually writing an event/command that references it without one
+    /// configured is a genuine, actionable configuration error
+    /// (`encryption::Error::MasterKeyNotConfigured`), not a silent bypass.
+    /// A consuming application owns keeping this value stable across
+    /// restarts - losing it makes every already-provisioned
+    /// `EncryptionKey` permanently unrecoverable.
+    pub fn encryption_master_key(mut self, master_key: EncryptionMasterKey) -> Self {
+        self.encryption_master_key = Some(master_key);
+        self
+    }
+
+    /// How many not-yet-delivered events a single slow `EventSubscription`
+    /// subscriber may lag behind by before its next delivery attempt ends
+    /// its stream instead (`RecvError::Lagged` - see
+    /// `EventBroadcaster`'s/`resolvers::event_subscription`'s own doc
+    /// comments for why that's the correct behaviour, not a bug: no
+    /// silent gaps, ever). Defaults to 1024 - the same "sensible default,
+    /// opt-in override" register `async_projection_poll_interval` already
+    /// lives in.
+    pub fn event_broadcast_capacity(mut self, capacity: usize) -> Self {
+        self.event_broadcast_capacity = capacity;
+        self
+    }
+
     /// Runs the startup reconciliation loop automatically (§1.5). Returns
     /// `Err` only for a genuine registration rejection (e.g. an
     /// incompatible schema change) - a bounded context the reconciliation
@@ -528,12 +605,18 @@ impl SkiljBuilder {
         });
 
         let poll_interval = self.async_projection_poll_interval;
+        let projection_query_wait_timeout = self.projection_query_wait_timeout;
+        let encryption_master_key = self.encryption_master_key;
+        let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
         let skilj = Skilj {
             pool,
             command_types: Arc::new(self.command_types),
             projections: Arc::new(self.projections),
             bootstrap_secret,
             identity_provider,
+            projection_query_wait_timeout,
+            encryption_master_key,
+            event_broadcaster,
         };
 
         // The single shared background task backing §8 item 6's async

@@ -700,11 +700,55 @@ snake_case → camelCase on the way out, matching what `async-graphql`'s
 own derive macros already do by default — no new convention invented
 there.
 
-### 5.2 Namespacing: nested per bounded context
+**Built for real, §8 item 6.5's own pass**: `ProjectionQuery` is the
+first surface that actually needed this mapping (`skilj-graphql/src/
+projection_types.rs`), and confirmed the mapping above against a real
+`schemars::schema_for!` output (0.8): a nested struct field is
+`{"$ref": "#/definitions/Name"}`, resolved against the schema's own
+top-level `definitions` map (never a second, nested one — one level
+only, matching the payload schema shape cap `specs/skilj.allium` states
+above `entity CommandType`); an optional scalar's `type` may additionally
+appear as `["T","null"]`, but `required` array absence is the actual
+nullability signal used, not that array. A field shape outside this
+contract (which the spec itself says is stated but not enforced upstream
+— "undefined rather than defined-and-forbidden") renders as an opaque
+JSON-encoded `String` rather than panicking schema generation for the
+whole server over one misbehaving projection elsewhere. `SchemaRegistry`
+still isn't real, though — see the correction to §5.2 below.
 
-Each bounded context becomes a field on the root `Query`/`Mutation`/
-`Subscription` types, rather than every type/field carrying a
-bounded-context prefix baked into its name:
+### 5.2 Namespacing: nested per bounded context — corrected
+
+The original design here (kept below for the historical reasoning) was
+never actually built. Every dynamic per-bounded-context surface shipped
+(`EventQuery`/`CommandQuery`/`CommandSubmission`, Phase 3;
+`ProjectionQuery`/`EventSubscription`, later) is a **flat top-level field
+taking `boundedContext: String!` as a plain argument** — `queryEvents(boundedContext:
+..., ...)`, `projection(boundedContext: ..., name: ..., ...)`,
+`allEvents(boundedContext: ..., ...)` — not nested under a per-context
+`BankingQueries`/`BankingSubscriptions` type, and `SchemaRegistry`
+(the `ArcSwap` rebuild-on-registration-change mechanism this section
+originally assumed) is still an unused stub: the schema is built once,
+synchronously, at `Skilj::graphql_router()` time. This is the same kind
+of "reality diverged from the original prose" correction §5.4 already
+needed once, not a new decision reopened lightly — confirmed with the
+user specifically for `ProjectionQuery`, which is the first surface
+where the *type itself* (not just the field) needed to vary per
+registration: `ProjectionQuery` exposes one field,
+`projection(boundedContext, name, waitForSequence): ProjectionResult!`,
+where `ProjectionResult` is a GraphQL **union** over every registered
+projection's own generated type (selected via an inline fragment,
+`... on AccountBalance { total }`) — reusing `TokenRevocation`'s already-
+shipped `FieldValue::owned_any(v).with_type(name)` pattern exactly,
+rather than inventing per-projection-named fields, which would have
+reopened the nested-namespacing question this correction just closed.
+Each generated type is named `{boundedContext}_{projectionName}` to stay
+globally unique without nesting (two different bounded contexts can
+register a projection with the same name) — the flat-prefix scheme the
+original design below explicitly rejected for *fields*, reused here
+because a GraphQL *type* name has no scoping mechanism nesting would
+have given it anyway.
+
+The original nested-namespacing design, never implemented:
 
 ```graphql
 type Query {
@@ -728,16 +772,17 @@ type Mutation {
 }
 ```
 
-Chosen over flat prefixed names (`Banking_AccountBalance`,
-`bankingAccountBalance(id)`) because collisions between bounded contexts
-become structurally impossible rather than avoided by convention, and it
-matches how large multi-domain GraphQL APIs (Shopify, GitHub) namespace
-unrelated resource groups. Superadmin-facing, cross-context surfaces
-(`AccessManagement`, `BoundedContextCreation`, `BoundedContextDirectory`,
-`SuperadminBootstrap`) stay at the schema root — they aren't "for" any
-one bounded context, the same reasoning the spec itself already gives
-for gating them by `Superadmin` rather than a per-context
-`RoleAccessMapping`.
+It would have been chosen over flat prefixed names
+(`Banking_AccountBalance`, `bankingAccountBalance(id)`) because
+collisions between bounded contexts become structurally impossible
+rather than avoided by convention, and it matches how large multi-domain
+GraphQL APIs (Shopify, GitHub) namespace unrelated resource groups —
+still true in principle, just not what got built. Superadmin-facing,
+cross-context surfaces (`AccessManagement`, `BoundedContextCreation`,
+`BoundedContextDirectory`, `SuperadminBootstrap`) do stay at the schema
+root as planned — they aren't "for" any one bounded context, the same
+reasoning the spec itself already gives for gating them by `Superadmin`
+rather than a per-context `RoleAccessMapping`.
 
 ### 5.3 Pagination: Relay-style cursor connections
 
@@ -1023,13 +1068,14 @@ implementation, in dependency order:
    (`createCommandToken`), `TokenRevocation` (`revokeToken`, returning
    the new `AccessToken` GraphQL union — `ExternalEventToken` |
    `DirectCreationToken` | `EventReadToken` | `CommandToken`, tagged via
-   `FieldValue::with_type`). **`SubjectErasure` (`ForgetSubject`)
-   deliberately excluded**: `EncryptionKey` has no persistence at all
-   yet (`protect_sensitive_fields` is still `todo!()` for its only
-   non-empty case — the one thing that would ever create a row to
-   forget), so there's nothing this resolver could be exercised against;
-   same "don't build ahead of what's wired" discipline REST already
-   followed for the identical reason. Two small persistence gaps
+   `FieldValue::with_type`). **`SubjectErasure` (`ForgetSubject`) excluded
+   from this phase** — `EncryptionKey` had no persistence at all yet
+   (`protect_sensitive_fields` was still `todo!()` for its only non-empty
+   case — the one thing that would ever create a row to forget), so
+   there was nothing this resolver could be exercised against yet; same
+   "don't build ahead of what's wired" discipline REST already followed
+   for the identical reason. **Built for real in its own later pass —
+   see the `SubjectErasure` writeup further below.** Two small persistence gaps
    surfaced and filled along the way: `db::list_projections_for_bounded_context`
    and `db::revoke_access_token` (resolves the owning schema via
    `access_token_index` the same way `fetch_access_token_row` already
@@ -1045,14 +1091,16 @@ implementation, in dependency order:
    `countEvents`/`inspectEvent`), `CommandQuery` (`fetchCommands`),
    `CommandSubmission` (`submitCommand`) — every pure function they
    needed already existed and was tested, the same shape Phase 1/2 had.
-   **`ProjectionQuery`/`EventSubscription` deliberately excluded**,
-   confirmed with the user: neither is a GraphQL-plumbing gap.
-   `ProjectionQuery` needs `project()` (still `todo!()` — no projection
-   state exists anywhere to query, regardless of wire shape);
-   `EventSubscription` needs a real-time event-delivery mechanism (none
-   exists — no broadcast channel, no Postgres `LISTEN`/`NOTIFY`). Both
-   stay open, real prerequisites for a future pass, not GraphQL work.
-   `submitCommand` is the highest-value addition: it's what finally
+   **`ProjectionQuery`/`EventSubscription` deliberately excluded from
+   Phase 3**, confirmed with the user: neither was a GraphQL-plumbing gap
+   at the time. `ProjectionQuery` needed `project()` (`todo!()` then — no
+   projection state existed anywhere to query, regardless of wire shape) —
+   **built in its own later pass, once `project()` existed both sync and
+   async (§8 item 6); see the Phase 4 writeup below.** `EventSubscription`
+   needed a real-time event-delivery mechanism (none existed — no
+   broadcast channel, no Postgres `LISTEN`/`NOTIFY`) — **built in its own
+   later pass too, once that mechanism existed; see the Phase 6 writeup
+   further below.** `submitCommand` is the highest-value addition: it's what finally
    gives `CommandDispatcher::required_role` (§1.3.1, built two sessions
    earlier with no caller) a real caller, checked before `dispatch` so
    an unauthorised caller never reaches `decide()`. `queryEvents` gets a
@@ -1078,6 +1126,261 @@ implementation, in dependency order:
    in this codebase uses path parameters, so the `:id` → `{id}` breaking
    change never applied; the only real fix needed was dropping
    `#[axum::async_trait]` (native `async fn` in traits, no macro).
+
+   **Phase 4 done: `ProjectionQuery`.** Needed §5.1's own remaining
+   piece — a real JSON-Schema→GraphQL-type mapping, built as
+   `skilj-graphql/src/projection_types.rs` (see §5.1's own updated
+   writeup and §5.2's correction for the field-shape/schema-timing
+   decisions, both confirmed with the user). New `resolvers::
+   projection_query` field (`projection(boundedContext, name,
+   waitForSequence): ProjectionResult!`) is `ReadAccess`-gated via a new
+   `require_read_mapping` helper (`resolvers/mod.rs`) — any active level,
+   not `AdminAccess` like every prior dynamic surface, since
+   `query_projection` (`skilj-core::projections`) itself imposes no level
+   check. `await_projection_caught_up` is a real polling loop now
+   (`wait_until_caught_up`, 20ms ticks against `Projection.caught_up_to`)
+   bounded by a new process-start knob, `SkiljBuilder::
+   projection_query_wait_timeout` (default 5s) — the spec's own guidance
+   above `rule QueryProjection` explicitly asks for a configuration knob,
+   not a per-query argument. `read_projection`'s real scope this pass:
+   returns stored state verbatim, no per-field sensitive-value decrypt
+   logic — at the time this phase shipped, `protect_sensitive_fields` was
+   still `todo!()` for its non-empty case (the `SubjectErasure` pass
+   below is what made that real), so `SensitiveFieldsStayProtected` was
+   vacuously satisfied, not broken; the real two-grant decrypt-on-read
+   test is still deferred even now that encrypted content genuinely
+   exists — see the `SubjectErasure` writeup's own note on this.
+   `schema::build`/`skilj_graphql::router`/`Skilj::graphql_router()`
+   all became `async`, returning `Result` — a real, contained breaking
+   change (three existing test call sites needed a one-line `.await`
+   update), since listing every registered projection to generate their
+   types is a genuine I/O failure mode the old synchronous `.expect(...)`
+   never had to cover.
+
+   Verified: `skilj-graphql`'s own crate-level unit tests
+   (`projection_types::tests`, no DB) exercise the mapping directly
+   against a real captured `schemars::schema_for!` output via a real
+   GraphQL execution, not by reaching into `Object`/`Field` internals —
+   this caught a genuine bug before it ever reached a real end-to-end
+   test: a nested-object field's resolver was calling `.with_type(...)`
+   the same way the top-level union dispatch does, which is only correct
+   for an actual polymorphic (union/interface) field — a concrete nested
+   `Object` field doesn't need or want it, and doing so anyway broke
+   every nested-field query with an internal downcast error.
+   `skilj/tests/projection_query.rs` (new, real Postgres + real JWKS
+   server, one end-to-end test): a real sync `Projection` with a
+   one-level nested field, triggered via `submitCommand`, queried with no
+   `waitForSequence` and with one naming the triggering event's own
+   sequence (both succeed), a `waitForSequence` past what the short
+   configured timeout will ever reach (the distinguishable
+   `projection_caught_up_timed_out` rejection), a Read-level-only grant
+   succeeding (proving `ReadAccess`, not `AdminAccess`), a caller with no
+   grant at all on the bounded context rejected
+   (`GrantScopedToBoundedContext`'s "no mapping = same as revoked"), and
+   an unknown projection name. **All tests pass, stable across repeated
+   runs.**
+
+   **Phase 5 done: `SubjectErasure`.** `ForgetSubject` (the pure rule
+   itself) predates this pass and was already fully tested
+   (`skilj-core/tests/subject_erasure.rs`) — what this pass actually
+   built is everything around it: real `EncryptionKey` persistence,
+   `protect_sensitive_fields`'s non-empty branch (genuine encryption, not
+   `todo!()`), and the GraphQL mutation. The spec explicitly leaves "the
+   encryption scheme itself (algorithm, key derivation, physical key
+   storage)" to Rust-level discretion — the same register `AccessToken.secret`
+   generation and JWT verification are already in — so the actual scheme
+   is a real architecture decision, confirmed with the user before
+   building: envelope encryption via `ring` (already in the dependency
+   tree transitively via `reqwest`'s rustls-tls, promoted to a direct
+   `skilj-core` dependency — no new crate). Each `EncryptionKey` gets a
+   random AES-256-GCM `DataKey`, wrapped under a single
+   `SkiljBuilder::encryption_master_key([u8;32])` (optional — only needed
+   the moment a bounded context actually references a declared
+   `sensitive_fields` entry; a real, actionable
+   `encryption_master_key_not_configured` error otherwise, never a silent
+   bypass), stored alongside the row it protects (new `skilj_core::encryption`
+   module). Destroying a key (`db::destroy_encryption_key`) nulls the
+   wrapped bytes in the same statement that flips `status`/`destroyed_at`
+   — real crypto-shredding, irreversible even against someone who still
+   has the master key, not a status flag alone.
+
+   A second, more consequential discovery than the design itself: making
+   `protect_sensitive_fields` real meant `render_event`/`render_command`
+   (`EventQuery`/`CommandQuery`/`InspectEvent`'s own read-side black box)
+   were no longer safe as `todo!()` — their own doc comment had explicitly
+   staked that gap's safety on "no `Event` this engine produces ever has a
+   non-empty `sensitive_fields` type with anything encrypted to decrypt in
+   the first place," a claim this very pass makes false. Left alone, the
+   next `queryEvents`/`fetchCommands`/`inspectEvent` call against a real
+   sensitive field would have panicked in production. Fixed by dropping
+   the `todo!()` branch entirely — both functions now simply return the
+   stored payload verbatim (ciphertext included) regardless of
+   `sensitive_fields`, correct per the spec's own contract for an
+   unauthorised reader, since no caller gets real decryption yet either
+   way; the real two-grant decrypt-for-an-authorised-caller test stays
+   its own deferred follow-up, now finally buildable-and-testable since
+   this pass is what created the first real ciphertext to decrypt.
+
+   **Threading key resolution through the pure core**, without breaking
+   §1.1's "`decide()` and everything downstream stays I/O-free" rule:
+   reused the exact pattern sequence allocation already established
+   rather than inventing a new one — `process_command`'s own
+   `resolve_event_type`/`next_sequence` are plain closures the *caller*
+   pre-resolves before ever invoking the pure function; `resolve_key`
+   (new, threaded through `protect_sensitive_fields`/`process_command`/
+   `create_external_event`/`create_direct_event`) works identically. New
+   pure helper `event_store::sensitive_field_subjects` tells the caller
+   *which* subjects a payload needs keys for (no DB, no encryption — a
+   payload walk only); the caller resolves each via new
+   `db::get_or_create_encryption_key` (a bounded-context-scoped
+   `encryption_keys` table, partial-unique-indexed on `(subject_key,
+   subject_value) WHERE status = 'active'` — the identical pattern
+   `roles_unique_active_external_subject` already uses, since a destroyed
+   key must stay around permanently rather than being revived), building
+   one shared map `process_command` accumulates into across the command's
+   own payload *and* every accepted event spec's — a subject a command
+   and its own event both name resolves to the identical `EncryptionKey`
+   this way, exactly as the spec requires. `EncryptionKey` is a real,
+   independently-lived entity (its own lifecycle), so `Event`/`Command`
+   reference it via new `event_encryption_keys`/`command_encryption_keys`
+   join tables, not JSONB-embedded like `tag_mappings` — replacing two
+   placeholder JSONB columns that never held real data (safe to change,
+   nothing deployed).
+
+   New `resolvers::subject_erasure` (`forgetSubject(boundedContext,
+   subjectKey, subjectValue): EncryptionKey!`), `AdminAccess`-gated
+   (`require_admin_mapping`) matching `ForgetSubject`'s own
+   `access_mapping.level = admin` requirement — the surface has no
+   `exposes` list at all, so `EncryptionKey` is only ever reachable as
+   this one mutation's own return value.
+
+   Verified: `skilj-core/tests/encryption.rs` (new, 10 tests, no DB) —
+   `encrypt_leaf`/`wrap`/`unwrap` round-trip, a wrong master key failing
+   to unwrap, ciphertext never repeating for the same plaintext (fresh
+   nonce every call), `protect_sensitive_fields` actually encrypting a
+   declared leaf while leaving the rest of the payload (including the
+   read-only `subject_field` itself) untouched, and `render_event`
+   returning a non-empty-`sensitive_fields` event's payload verbatim
+   without panicking — the exact condition that used to crash.
+   `skilj-core/tests/persistence.rs` +3 (`encryption_keys` round-trip:
+   provision-then-reuse, `None` for an unknown subject, destroy nulling
+   the wrapped columns and a later provision for the same subject being a
+   genuinely new row, not the destroyed one back). `skilj/tests/subject_erasure.rs`
+   (new, real Postgres + real JWKS, one end-to-end test): a real
+   `EventType` with a real sensitive field, an event created via
+   `POST /v1/events/direct`, its *stored* payload confirmed genuinely
+   encrypted via a direct DB read (not just "the API accepted it"),
+   `forgetSubject` destroying the key over GraphQL, a second
+   `forgetSubject` on the same now-destroyed subject rejected (nothing
+   active left to find), and a caller with no grant on the bounded
+   context rejected before ever reaching the lookup. **All tests pass,
+   stable across repeated runs.**
+
+   **Phase 6 done: `EventSubscription`.** The last surface out of §8/§9 —
+   see the plan at `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`.
+   A real discovery, not assumed going in: `Subscription`/
+   `AllEventsSubscription`/`EventTypeSubscription`, `create_all_events_subscription`/
+   `create_event_type_subscription`, and `deliver_to_subscriptions` (the
+   pure "who matches and what do they get" computation, already calling
+   `render_event`) all already existed in `skilj-core/src/event_store/mod.rs`
+   from an earlier test-propagation pass — what this pass built was purely
+   the live-delivery infrastructure around them.
+
+   **The mechanism, confirmed against the spec's own Excludes list, not
+   assumed**: "Multi-instance / distributed deployment" is explicitly out
+   of scope for this whole library, so a single-process, in-memory
+   `tokio::sync::broadcast` channel (new `event_store::EventBroadcaster`)
+   is the architecturally correct delivery mechanism, not a shortcut —
+   Postgres `LISTEN`/`NOTIFY` or a broker would be solving a problem this
+   spec doesn't have. One publish point, not four:
+   `db::insert_event_and_update_sync_projections` gained a `broadcaster:
+   &EventBroadcaster` parameter and calls `.publish(event)` right after
+   `tx.commit().await?` succeeds — the same choke-point every
+   event-creation call site (2 REST routes, `CommandTrigger`,
+   `submitCommand`) already funnels through, so every one of them gets
+   real-time delivery at once, REST-originated events included.
+   `SkiljBuilder::event_broadcast_capacity` (default 1024) is the same
+   "sensible default, opt-in override" register `async_projection_poll_interval`
+   already lives in; `Skilj` holds one shared `EventBroadcaster`, threaded
+   into `rest_router()`/`graphql_router()` exactly like the two
+   dispatchers already are.
+
+   **Ending the stream, never silently continuing** — two guarantees the
+   spec is unusually explicit about, both resolved the same way: yield
+   one final, distinguishable `Err`, then stop. `async_graphql::dynamic`'s
+   own subscription execution loop already stops polling a stream the
+   instant a yielded item is an `Err` (confirmed against the installed
+   crate source), so no manual stream-termination bookkeeping was needed
+   beyond returning after the yield.
+   - `DeliveryIsAtMostOnce` ("no duplicates, no gaps... a transport-level
+     disconnect is... the only signal" one was missed): a
+     `tokio::sync::broadcast::Receiver` that falls behind returns
+     `RecvError::Lagged` on its next `recv()` — treated as
+     connection-equivalent, not silently skipped past.
+   - `RevocationClosesTheConnection`: `access_mapping` is re-checked
+     *live*, per delivered event, via a fresh `db::get_active_role_access_mapping`
+     call — never the snapshot captured at subscribe time — so a
+     mid-stream revocation stops delivery at the next matching event, not
+     at the next reconnect.
+
+   New `resolvers::event_subscription` — `allEvents(boundedContext,
+   eventTypes, fromSequence)`/`eventsByType(boundedContext, eventType,
+   filters, fromSequence)`, one field per the surface's own two
+   `provides`, `ReadAccess`-gated (`require_read_mapping`, reused from
+   `ProjectionQuery`). Built on `asynk-strim` (already transitively
+   present via `async-graphql`, promoted to a direct `skilj-graphql`
+   dependency) — the exact crate `async_graphql::dynamic`'s own
+   subscription examples use for a `yielder.yield_ok(...)`/
+   `yielder.yield_error(...)`-driven `Stream`. `filters` is real wire
+   shape (`gql_types::filter_input()`/`filter_operator_enum()`, a new
+   `parse_filters` helper), matching `CreateEventTypeSubscription`'s own
+   signature faithfully rather than being silently dropped — but a
+   non-empty list is rejected eagerly, the identical precedent REST's own
+   `GET /v1/events` route already set for the same underlying reason:
+   `matches_filters`/`valid_filters` are still `todo!()` for their
+   non-empty case, an existing, separately-tracked gap this pass didn't
+   newly touch.
+
+   **A genuine mid-implementation API discovery**: the plan assumed
+   `async_graphql_axum::GraphQLSubscription::new(schema).on_connection_init(...)`
+   would work for injecting the caller's identity into a subscription.
+   Reading the installed crate source showed `GraphQLSubscription` (the
+   simple `tower::Service` wrapper) builds its own `GraphQLWebSocket`
+   internally with no way to reach `on_connection_init` — only
+   `GraphQLWebSocket` itself exposes that builder method. Fixed by
+   writing `skilj_graphql::graphql_ws_handler` directly against
+   `GraphQLProtocol`/`WebSocketUpgrade` extractors, then
+   `GraphQLWebSocket::new(socket, schema, protocol).on_connection_init(...).serve()`
+   — mounted on the same `/graphql` path as the existing `POST` handler
+   via axum 0.8's own `post(handler).get(handler)` method-chaining idiom,
+   so a GraphQL client's own protocol negotiation picks the right one
+   with no new route needed. New `auth::resolve_role_from_connection_init`
+   mirrors `auth::resolve_role` exactly, reading the bearer credential
+   from the `connection_init` message's own JSON payload (the
+   graphql-ws protocol's own place for it) instead of an HTTP header,
+   sharing a factored-out `verify_jwt_to_role` core with the header case.
+
+   Verified: `skilj-core/tests/event_broadcast.rs` (new, no DB, 4 tests)
+   — `publish` reaching a `subscribe()`d receiver; zero receivers not
+   erroring; two independent subscribers both receiving the same event
+   (real fan-out); a lagging subscriber getting `RecvError::Lagged`.
+   `skilj/tests/event_subscription.rs` (new, real Postgres + real JWKS +
+   a real websocket client, since `tower::ServiceExt::oneshot` can't
+   drive a long-lived streaming connection the way every other
+   `skilj/tests/graphql_*.rs` test does — this one drives
+   `tokio-tungstenite` against `Skilj::graphql_router()` mounted on a
+   real `axum::serve` listener, alongside a cloned `axum::Router` for the
+   ordinary `submitCommand` calls that trigger real events): connects,
+   `connection_init`s with a real signed JWT, subscribes to `allEvents`,
+   triggers a real event in a *different* bounded context via
+   `submitCommand` and confirms nothing arrives, triggers a real matching
+   event and confirms it arrives with the correct sequence/payload, then
+   revokes the subscriber's own `RoleAccessMapping` mid-stream (a direct
+   DB update) and confirms the next matching event closes the
+   subscription with a `grant_not_active`-coded error followed by a
+   `complete` message, not silently. **All tests pass, stable across two
+   full workspace runs.** This closes out §8/§9 entirely — every item
+   from the original backlog is done.
 6. **`project()`'s own dispatch closure** — **done, both cases** (see the
    plan at `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`):
    `project()` runs in one of two genuinely different ways (the note
@@ -1222,24 +1525,106 @@ implementation, in dependency order:
    short poll loop waiting on `db::get_projection_state` to reflect it,
    with no request-path code calling `project()` directly.
 
+**Real decrypt-on-read: `render_event`/`render_command`, done - not a §8
+item itself, but the natural follow-up once `SubjectErasure` made
+`protect_sensitive_fields` real.** The spec is unusually explicit and
+consistent about what "real" means here - identical text above
+`DeliverToSubscriptions`/`QueryEvents`/`FetchCommands`/`QueryProjection`,
+restated in four `@guarantee SensitiveFieldsStayProtected` blocks: a
+sensitive field decrypts under either of two independent grants, checked
+per field against that field's own `EncryptionKey.subject_value` -
+`access_mapping.can_read_sensitive`, or `access_mapping.role.external_subject`
+matching it (a caller reading their own data needs no separate grant) -
+decided *inside* the black box, never as a post-hoc redaction. Confirmed
+via `AskUserQuestion` (both recommended, before building): scoped to
+`render_event`/`render_command` only this pass, `read_projection` staying
+a separate future item (see the §9 bullet above for why); a missing
+`encryption_master_key` for a caller who *is* otherwise granted is a hard,
+actionable error, mirroring `resolve_encryption_keys`'s own write-side
+precedent - never triggers for an unauthorised caller, who needs no key
+at all in this design.
+
+**The key insight that kept this small**: `protect_sensitive_fields`
+never touches `subject_field` itself - it stays plaintext in the stored
+payload forever. So `EncryptionKey.subject_value` for any sensitive field
+is always recoverable directly from the payload's own `subject_field`
+value, with no need to load `Event.encryption_keys`/`Command.encryption_keys`
+(confirmed, separately, to still never be populated from the DB on any
+load path - a real, pre-existing, currently-inert gap, left out of scope:
+nothing reads it, and this approach doesn't need it either). New
+`event_store::sensitive_field_is_granted` factors out the two-grant
+boolean itself, shared by both the pre-resolution step (which subjects
+are even worth fetching a key for) and `render_event`/`render_command`
+(whether to actually substitute a decrypted value) - never two
+independently-drifting copies of the same check. `render_event`/
+`render_command`/`query_events`/`inspect_event`/`fetch_commands`/
+`deliver_to_subscriptions` all gained a `resolve_data_key` closure
+parameter, the identical "impure resolution, pure decision" split
+`resolve_key` already has on the write side. A field granted but with no
+active key (destroyed by `ForgetSubject`, or never provisioned) is left
+untouched, no special-casing; a field granted but not actually valid
+ciphertext (the spec's own acknowledged historical-row case) is left
+untouched too, via the same `decrypt_leaf`-failed fallback - one
+mechanism covers both. The decrypted leaf always renders as a JSON
+string regardless of the field's original scalar type - an
+already-shipped consequence of `protect_sensitive_fields` itself
+discarding the original type at encrypt time, not a new limitation this
+pass introduces.
+
+New `db::get_active_data_key` (composes the already-private
+`get_active_encryption_key_row` with the already-existing `unwrap_row` -
+no new SQL) and `db::resolve_data_keys_for_reading` (the read-side twin of
+`resolve_encryption_keys`, filtered through `sensitive_field_is_granted`
+first so an unauthorised caller's query never needs a master key at all).
+New `resolvers::resolve_read_data_keys` in `skilj-graphql` wraps it for
+GraphQL's error shape; `event_query.rs`/`command_query.rs`/
+`event_subscription.rs` each call it once per event/command being
+rendered (scoped to the caller's own `eventTypes`/`commandTypes` argument
+where a batch is involved, not the full unfiltered snapshot - may resolve
+a few more keys than strictly needed when `tags`/`afterSequence` narrow
+further, never fewer, no correctness impact).
+
+Verified: `skilj-core/tests/encryption.rs` extended (11 new tests) -
+`render_event`/`render_command` actually decrypting under each grant
+independently, a destroyed/missing key still yielding ciphertext, a
+historical-plaintext leaf left untouched with no panic, and
+`sensitive_field_is_granted`'s own two branches directly.
+`skilj-core/tests/persistence.rs` +3 real-Postgres tests for
+`get_active_data_key`. New `skilj/tests/decrypt_on_read.rs` (real
+Postgres + real JWKS, 2 end-to-end tests): the full two-grant flow over
+`queryEvents` - neither grant sees ciphertext, `can_read_sensitive` sees
+plaintext, the matching `external_subject` sees plaintext with no
+`can_read_sensitive` at all, and - the crypto-shredding guarantee finally
+verified through the real read path, not just a raw DB check -
+`forgetSubject` destroying the key makes even the previously-granted
+caller see ciphertext again; a second test confirms a whole `Skilj` built
+with no `encryption_master_key` at all still answers queries fine when
+nothing returned needs decrypting. **All tests pass on the first
+real-Postgres run, stable across two full workspace runs.**
+
 ---
 
 ## 9. Next steps
 
-Items 1–4 of §8 are done (persistence, the builder registry, REST fully
-wired), item 5 (`skilj-graphql`) is done through Phase 3, and item 6
-(`project()`) is done for both the sync and async cases, including
+Every item in §8's original backlog is now done: items 1–4 (persistence,
+the builder registry, REST fully wired), item 5 (`skilj-graphql`) through
+Phase 6 (`EventSubscription`, on top of Phases 1-5), and item 6
+(`project()`) for both the sync and async cases, including
 `ProjectionRebuild` replay and promotion - see each item's own writeup
-for the full breakdown. What's left, in no particular order (none blocks
-any other):
+for the full breakdown. §8/§9's backlog is closed out. What's left is
+work that was always out of scope for it:
 
-- `skilj-graphql`'s `ProjectionQuery`/`EventSubscription` - `ProjectionQuery`
-  now has real projection state to read (sync and async alike) but still
-  needs the JSON-Schema→GraphQL-type mechanism (§5.1); `EventSubscription`
-  needs a real-time event-delivery mechanism, not GraphQL plumbing.
-- `SubjectErasure`/`ForgetSubject` - blocked on `EncryptionKey`
-  persistence, itself blocked on `protect_sensitive_fields` actually
-  being implemented for its non-empty case.
+- **`read_projection`'s own decrypt-on-read** - `render_event`/
+  `render_command` are done (see the writeup above), but `Projection`
+  declares no `sensitive_fields` at all, and `project()` folds into
+  arbitrary, opaque `projection_state` at fold time - there's no
+  field-to-`EncryptionKey` correspondence in stored state to walk at
+  query time the way `render_event` walks a payload. Confirmed via
+  `AskUserQuestion` as a separate, structurally different future item,
+  not attempted alongside `render_event`/`render_command`: it would need
+  a `Projection`-side sensitive-field declaration and a fold-time (not
+  query-time) decrypt decision, a genuinely different design, not a
+  variation on the one just built.
 
 `/allium:propagate`, scoped to one representative surface at a time,
 remains the right tool once code lands that a surface's obligations

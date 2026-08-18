@@ -147,7 +147,7 @@ fn render_command_passes_the_payload_through_unchanged_when_no_fields_are_sensit
     let c = command(command_type("PlaceOrder"), r#"{"amount":10}"#, 0);
 
     assert_eq!(
-        event_store::render_command(&c, &mapping),
+        event_store::render_command(&c, &mapping, &|_, _| unreachable!()),
         r#"{"amount":10}"#
     );
 }
@@ -162,7 +162,16 @@ fn fetch_commands_returns_every_matching_command_rendered() {
     let ct = command_type("PlaceOrder");
     let commands = vec![command(ct.clone(), "a", 0), command(ct, "b", 1)];
 
-    let rendered = event_store::fetch_commands(&mapping, &[], None, None, None, &commands).unwrap();
+    let rendered = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &commands,
+        |_, _| unreachable!(),
+    )
+    .unwrap();
 
     assert_eq!(rendered, vec!["a".to_string(), "b".to_string()]);
 }
@@ -177,7 +186,16 @@ fn fetch_commands_with_empty_command_types_matches_every_type() {
         command(command_type("CancelOrder"), "b", 1),
     ];
 
-    let rendered = event_store::fetch_commands(&mapping, &[], None, None, None, &commands).unwrap();
+    let rendered = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &commands,
+        |_, _| unreachable!(),
+    )
+    .unwrap();
 
     assert_eq!(rendered.len(), 2);
 }
@@ -189,8 +207,16 @@ fn fetch_commands_filters_by_named_command_type() {
     let cancel = command_type("CancelOrder");
     let commands = vec![command(place.clone(), "a", 0), command(cancel, "b", 1)];
 
-    let rendered =
-        event_store::fetch_commands(&mapping, &[place], None, None, None, &commands).unwrap();
+    let rendered = event_store::fetch_commands(
+        &mapping,
+        &[place],
+        None,
+        None,
+        None,
+        &commands,
+        |_, _| unreachable!(),
+    )
+    .unwrap();
 
     assert_eq!(rendered, vec!["a".to_string()]);
 }
@@ -215,6 +241,7 @@ fn fetch_commands_filters_by_created_at_window_inclusive_on_both_ends() {
         Some(timestamp(20)),
         None,
         &commands,
+        |_, _| unreachable!(),
     )
     .unwrap();
 
@@ -234,9 +261,16 @@ fn fetch_commands_filters_by_triggered_event() {
     let triggered_event = event_triggered_by(target_command.clone());
     let commands = vec![target_command, other_command];
 
-    let rendered =
-        event_store::fetch_commands(&mapping, &[], None, None, Some(&triggered_event), &commands)
-            .unwrap();
+    let rendered = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        Some(&triggered_event),
+        &commands,
+        |_, _| unreachable!(),
+    )
+    .unwrap();
 
     assert_eq!(rendered, vec!["the-one".to_string()]);
 }
@@ -258,6 +292,7 @@ fn fetch_commands_triggered_event_conjuncts_with_other_filters() {
         None,
         Some(&triggered_event),
         &commands,
+        |_, _| unreachable!(),
     )
     .unwrap();
 
@@ -272,9 +307,16 @@ fn fetch_commands_triggered_event_matches_nothing_for_a_non_command_triggered_ev
     let commands = vec![command(command_type("PlaceOrder"), "a", 0)];
     let unrelated_event = directly_created_event();
 
-    let rendered =
-        event_store::fetch_commands(&mapping, &[], None, None, Some(&unrelated_event), &commands)
-            .unwrap();
+    let rendered = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        Some(&unrelated_event),
+        &commands,
+        |_, _| unreachable!(),
+    )
+    .unwrap();
 
     assert!(rendered.is_empty());
 }
@@ -292,8 +334,16 @@ fn fetch_commands_never_returns_commands_from_another_bounded_context() {
         ..command(command_type("IssueInvoice"), "a", 0)
     };
 
-    let rendered =
-        event_store::fetch_commands(&mapping, &[], None, None, None, &[foreign_command]).unwrap();
+    let rendered = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &[foreign_command],
+        |_, _| unreachable!(),
+    )
+    .unwrap();
 
     assert!(rendered.is_empty());
 }
@@ -303,7 +353,9 @@ fn fetch_commands_never_returns_commands_from_another_bounded_context() {
 fn fetch_commands_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Admin);
 
-    let err = event_store::fetch_commands(&mapping, &[], None, None, None, &[]).unwrap_err();
+    let err =
+        event_store::fetch_commands(&mapping, &[], None, None, None, &[], |_, _| unreachable!())
+            .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -313,7 +365,9 @@ fn fetch_commands_rejects_a_revoked_mapping() {
 fn fetch_commands_rejects_a_write_level_mapping() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write);
 
-    let err = event_store::fetch_commands(&mapping, &[], None, None, None, &[]).unwrap_err();
+    let err =
+        event_store::fetch_commands(&mapping, &[], None, None, None, &[], |_, _| unreachable!())
+            .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -334,8 +388,16 @@ fn fetch_commands_rejects_a_named_command_type_from_another_bounded_context() {
         ..command_type("IssueInvoice")
     };
 
-    let err =
-        event_store::fetch_commands(&mapping, &[foreign_type], None, None, None, &[]).unwrap_err();
+    let err = event_store::fetch_commands(
+        &mapping,
+        &[foreign_type],
+        None,
+        None,
+        None,
+        &[],
+        |_, _| unreachable!(),
+    )
+    .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -356,8 +418,16 @@ fn fetch_commands_rejects_a_triggered_event_from_another_bounded_context() {
         ..directly_created_event()
     };
 
-    let err = event_store::fetch_commands(&mapping, &[], None, None, Some(&foreign_event), &[])
-        .unwrap_err();
+    let err = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        Some(&foreign_event),
+        &[],
+        |_, _| unreachable!(),
+    )
+    .unwrap_err();
 
     assert_eq!(
         err.code(),

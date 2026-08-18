@@ -17,6 +17,7 @@ use crate::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
     RoleAccessMapping, RoleStatus, TokenStatus,
 };
+use crate::encryption::DataKey;
 use crate::error::SkiljRejection;
 use crate::shared::{CommandDecision, Filter, Metadata, SensitiveField, Tag, TagMapping};
 
@@ -500,6 +501,51 @@ fn resolve_field<'a>(
     }
 }
 
+/// `resolve_field`'s own counterpart against a *payload* (real JSON data)
+/// rather than a *schema* (property definitions) - `protect_sensitive_fields`'s
+/// own field/subject_field lookup. Same trivial/deferred split: the bare
+/// top-level case is real, a dotted path is `todo!()`, for the identical
+/// reason `resolve_field` itself defers it.
+fn payload_field_value<'a>(
+    payload: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    match field.split_once('.') {
+        None => payload.get(field),
+        Some(_) => todo!(
+            "payload_field_value: one-level dotted-path resolution into a named nested shape - deferred, see resolve_field's own doc comment"
+        ),
+    }
+}
+
+/// The mutable counterpart to `payload_field_value` - `protect_sensitive_fields`'s
+/// own substitution step needs a place to write ciphertext back into.
+fn payload_field_value_mut<'a>(
+    payload: &'a mut serde_json::Value,
+    field: &str,
+) -> Option<&'a mut serde_json::Value> {
+    match field.split_once('.') {
+        None => payload.get_mut(field),
+        Some(_) => todo!(
+            "payload_field_value_mut: one-level dotted-path resolution into a named nested shape - deferred, see resolve_field's own doc comment"
+        ),
+    }
+}
+
+/// A payload field's own JSON value, as the plain string
+/// `EncryptionKey.subject_value`/`protect_sensitive_fields`'s own
+/// plaintext-to-encrypt both need - a bare JSON string is used as-is; any
+/// other scalar (number, boolean) is rendered via its own JSON literal
+/// text. `None` for anything structured (object/array/null), which has no
+/// sound single-string reading.
+fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 /// Black box (see the note above rule `RegisterEventType`): "every
 /// `TagMapping.field` names a field the schema declares" - real for the
 /// bare-field-name case (see `resolve_field`). Takes `schema` alone, not
@@ -592,28 +638,107 @@ fn highest_sequence(events: &[Event]) -> Option<i64> {
     events.iter().map(|e| e.sequence).max()
 }
 
-/// Black box (see the note above rule `CreateExternalEvent`): "a no-op -
-/// unchanged payload, empty key set - when `sensitive_fields` is empty"
-/// is the one part of its contract this pilot needs and implements for
-/// real. Get-or-creating an `EncryptionKey` per distinct subject and
-/// substituting ciphertext at each declared field's leaf is
-/// `ForgetSubject`/crypto-shredding's own pass to add. Takes
-/// `sensitive_fields` alone, not a whole `EventType`/`CommandType` -
-/// "it takes an EventType and a CommandType interchangeably" per the
-/// spec's own note, since `sensitive_fields` is the identical
-/// `Set<SensitiveField>` on both.
+/// Black box (see the note above rule `CreateExternalEvent`), now real for
+/// both branches. Still pure/I/O-free (§1.1) - `resolve_key` is a plain
+/// `Fn` closure the caller builds from *already*-provisioned
+/// `EncryptionKey`s (`db::get_or_create_encryption_key`, called once per
+/// distinct subject `sensitive_field_subjects` names, before this is ever
+/// invoked) - the identical "pure core needs a value only I/O can
+/// produce, so the caller pre-resolves it and hands over a closure"
+/// pattern `process_command`'s own `resolve_event_type`/`next_sequence`
+/// parameters already use, not a new one (see docs/architecture.md's
+/// write-up of this pass for the full reasoning). An unresolved lookup is
+/// a caller bug - `resolve_key` is trusted to always have what's needed,
+/// the same trust convention `next_sequence`'s own closure already gets.
+///
+/// Takes `sensitive_fields` alone, not a whole `EventType`/`CommandType`,
+/// since "it takes an EventType and a CommandType interchangeably" per
+/// the spec's own note - `sensitive_fields` is the identical
+/// `Set<SensitiveField>` on both. A field or its own `subject_field`
+/// missing from `payload` (an optional field the caller omitted) is
+/// skipped rather than encrypted with nothing to key it by - the same
+/// "absence reads as empty/no-op" register `schema_properties`/
+/// `schema_required` already use elsewhere in this module.
 pub fn protect_sensitive_fields(
     sensitive_fields: &[SensitiveField],
     payload: &str,
+    resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> ProtectedPayload {
     if sensitive_fields.is_empty() {
-        ProtectedPayload {
+        return ProtectedPayload {
             payload: payload.to_string(),
             encryption_keys: Vec::new(),
-        }
-    } else {
-        todo!("protect_sensitive_fields: get-or-create EncryptionKey per subject, substitute ciphertext at each leaf - deferred, see doc comment above")
+        };
     }
+
+    let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
+        "protect_sensitive_fields: payload is always valid JSON by the time this is called",
+    );
+    let mut used_keys: Vec<EncryptionKey> = Vec::new();
+
+    for sf in sensitive_fields {
+        let Some(subject_value) =
+            payload_field_value(&parsed, &sf.subject_field).and_then(json_scalar_to_string)
+        else {
+            continue;
+        };
+        let Some(plaintext) = payload_field_value(&parsed, &sf.field).map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string())
+        }) else {
+            continue;
+        };
+
+        let (key, data_key) = resolve_key(&sf.subject_key, &subject_value);
+        let ciphertext = crate::encryption::encrypt_leaf(&data_key, &plaintext);
+
+        if let Some(slot) = payload_field_value_mut(&mut parsed, &sf.field) {
+            *slot = serde_json::Value::String(ciphertext);
+        }
+        if !used_keys.contains(&key) {
+            used_keys.push(key);
+        }
+    }
+
+    ProtectedPayload {
+        payload: serde_json::to_string(&parsed)
+            .expect("re-serialising a parsed JSON Value is infallible"),
+        encryption_keys: used_keys,
+    }
+}
+
+/// Every distinct `(subject_key, subject_value)` pair `payload` will need
+/// an `EncryptionKey` for, per `sensitive_fields` - `protect_sensitive_fields`'s
+/// own caller uses this to know what to pre-provision (via
+/// `db::get_or_create_encryption_key`) before ever calling it, the same
+/// pre-resolution step `resolve_event_type`/`next_sequence` already need.
+/// Pure, no DB, no encryption - just a payload walk. A field whose
+/// `subject_field` is absent or non-scalar contributes nothing, matching
+/// `protect_sensitive_fields`'s own skip for that case.
+pub fn sensitive_field_subjects(
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+) -> Vec<(String, String)> {
+    if sensitive_fields.is_empty() {
+        return Vec::new();
+    }
+    let parsed: serde_json::Value = serde_json::from_str(payload).expect(
+        "sensitive_field_subjects: payload is always valid JSON by the time this is called",
+    );
+
+    let mut subjects = Vec::new();
+    for sf in sensitive_fields {
+        if let Some(subject_value) =
+            payload_field_value(&parsed, &sf.subject_field).and_then(json_scalar_to_string)
+        {
+            let pair = (sf.subject_key.clone(), subject_value);
+            if !subjects.contains(&pair) {
+                subjects.push(pair);
+            }
+        }
+    }
+    subjects
 }
 
 /// Black box (see the note above `derive_tags` in the spec). Same
@@ -631,45 +756,124 @@ pub fn derive_tags(tag_mappings: &[TagMapping], _payload: &str) -> Vec<Tag> {
     }
 }
 
-/// Black box (see the note above rule `DeliverToSubscriptions`, reused by
-/// `QueryEvents`/`CountEvents`/`InspectEvent` and `read_projection`'s own
-/// event-side counterpart): "leave every field as stored ciphertext -
-/// nothing to redact" is the one part of its contract this pass needs and
-/// implements for real, the same trivial/deferred split
-/// `protect_sensitive_fields` above has. That's not a narrower cut here:
-/// until `protect_sensitive_fields`' own non-empty branch actually
-/// encrypts a field, no `Event` this engine produces ever has a non-empty
-/// `sensitive_fields` type with anything encrypted to decrypt in the
-/// first place, so the empty case is every case currently reachable.
-/// Decrypting for real - the two-grant test against each field's own
-/// `EncryptionKey.subject_value` (`access_mapping.can_read_sensitive`, or
-/// `access_mapping.role.external_subject` matching it) - is deferred to
-/// whichever pass gives `protect_sensitive_fields` its own real
-/// encryption to invert.
-pub fn render_event(event: &Event, _access_mapping: &RoleAccessMapping) -> String {
-    if event.event_type.sensitive_fields.is_empty() {
-        event.payload.clone()
-    } else {
-        todo!(
-            "render_event: two-grant per-field decrypt test against EncryptionKey.subject_value - deferred, see doc comment above"
-        )
-    }
+/// The two-grant test itself (see the note above rule
+/// `DeliverToSubscriptions`, restated identically above `QueryEvents`/
+/// `FetchCommands`/`QueryProjection`): a sensitive field decrypts under
+/// either `access_mapping.can_read_sensitive`, or the caller's own
+/// verified identity matching the specific subject that field is about.
+/// Factored out as its own function so `render_event`/`render_command`
+/// (whether to actually substitute a decrypted value) and their own
+/// caller's pre-resolution step (which subjects are even worth fetching
+/// a key for) share the identical check, never two independently-drifting
+/// copies of the same boolean.
+pub fn sensitive_field_is_granted(access_mapping: &RoleAccessMapping, subject_value: &str) -> bool {
+    access_mapping.can_read_sensitive || access_mapping.role.external_subject == subject_value
 }
 
-/// See `render_event` above - same black box, same trivial/deferred
-/// split, applied to `Command.payload`/`CommandType.sensitive_fields`
-/// instead. See `rule FetchCommands`' own `@guidance` for why this is a
-/// distinct function rather than `render_event` reused: the two-grant
-/// test is identical, but the value being rendered is a `Command`, not an
+/// Black box (see the note above rule `DeliverToSubscriptions`, reused by
+/// `QueryEvents`/`CountEvents`/`InspectEvent` and `read_projection`'s own
+/// event-side counterpart - `read_projection` itself stays deferred, see
+/// docs/architecture.md's own write-up of this pass for why). Real now,
+/// both branches: per `sensitive_fields` entry, `sensitive_field_is_granted`
+/// decides whether to even attempt a decrypt; `resolve_data_key` (the
+/// caller's own pre-resolved closure, the identical "impure resolution,
+/// pure decision" split `resolve_key` already has on the write side) is
+/// only ever called for a field this caller is actually granted. `None`
+/// back from it - no active key, whether never provisioned or destroyed
+/// by `ForgetSubject` - leaves the leaf untouched, correct crypto-
+/// shredding behaviour with no special-casing needed. A field that *is*
+/// granted a key but fails to decrypt (`encryption::decrypt_leaf`
+/// returning `Err`) is left untouched too, not a panic - the spec's own
+/// acknowledged case of a historical row that predates `sensitive_fields`
+/// being declared on this type, so the leaf was never actually ciphertext
+/// to begin with (see the note above `AddBoundedContext`/`ForgetSubject`:
+/// "declaring it later protects the future only, never the past"). A
+/// field with neither grant is never even attempted - "left as stored
+/// ciphertext, never decrypted and then redacted afterwards" per the
+/// spec's own repeated wording. The decrypted leaf is always rendered as
+/// a JSON string regardless of the field's original scalar type - an
+/// already-shipped consequence of `protect_sensitive_fields` itself
+/// always storing ciphertext as a string leaf, discarding the original
+/// type at encrypt time; restoring it would need schema-aware re-parsing,
+/// a separate, out-of-scope piece of work.
+pub fn render_event(
+    event: &Event,
+    access_mapping: &RoleAccessMapping,
+    resolve_data_key: &impl Fn(&str, &str) -> Option<DataKey>,
+) -> String {
+    decrypt_sensitive_fields(
+        &event.event_type.sensitive_fields,
+        &event.payload,
+        access_mapping,
+        resolve_data_key,
+    )
+}
+
+/// See `render_event` above - same black box, same real decrypt logic,
+/// applied to `Command.payload`/`CommandType.sensitive_fields` instead.
+/// See `rule FetchCommands`' own `@guidance` for why this is a distinct
+/// function rather than `render_event` reused: the two-grant test is
+/// identical, but the value being rendered is a `Command`, not an
 /// `Event`.
-pub fn render_command(command: &Command, _access_mapping: &RoleAccessMapping) -> String {
-    if command.command_type.sensitive_fields.is_empty() {
-        command.payload.clone()
-    } else {
-        todo!(
-            "render_command: two-grant per-field decrypt test against EncryptionKey.subject_value - deferred, see render_event's doc comment above"
-        )
+pub fn render_command(
+    command: &Command,
+    access_mapping: &RoleAccessMapping,
+    resolve_data_key: &impl Fn(&str, &str) -> Option<DataKey>,
+) -> String {
+    decrypt_sensitive_fields(
+        &command.command_type.sensitive_fields,
+        &command.payload,
+        access_mapping,
+        resolve_data_key,
+    )
+}
+
+/// The shared walk `render_event`/`render_command` both need - same
+/// per-field shape `protect_sensitive_fields` itself already walks
+/// (`payload_field_value`/`json_scalar_to_string` reused unchanged), just
+/// decrypting in place instead of encrypting. Returns `payload` unchanged
+/// (not even re-serialised) when `sensitive_fields` is empty - the
+/// identical "empty is a no-op" register every other black box in this
+/// module already uses.
+fn decrypt_sensitive_fields(
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+    access_mapping: &RoleAccessMapping,
+    resolve_data_key: &impl Fn(&str, &str) -> Option<DataKey>,
+) -> String {
+    if sensitive_fields.is_empty() {
+        return payload.to_string();
     }
+
+    let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
+        "decrypt_sensitive_fields: payload is always valid JSON by the time this is called",
+    );
+
+    for sf in sensitive_fields {
+        let Some(subject_value) =
+            payload_field_value(&parsed, &sf.subject_field).and_then(json_scalar_to_string)
+        else {
+            continue;
+        };
+        if !sensitive_field_is_granted(access_mapping, &subject_value) {
+            continue;
+        }
+        let Some(data_key) = resolve_data_key(&sf.subject_key, &subject_value) else {
+            continue;
+        };
+        let Some(ciphertext) = payload_field_value(&parsed, &sf.field).and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let Ok(plaintext) = crate::encryption::decrypt_leaf(&data_key, ciphertext) else {
+            continue;
+        };
+        if let Some(slot) = payload_field_value_mut(&mut parsed, &sf.field) {
+            *slot = serde_json::Value::String(plaintext);
+        }
+    }
+
+    serde_json::to_string(&parsed).expect("re-serialising a parsed JSON Value is infallible")
 }
 
 /// The outcome of `register_event_type` below - the spec's own `if exists
@@ -939,6 +1143,7 @@ pub fn query_events(
     tags: Option<&[Tag]>,
     after_sequence: Option<i64>,
     bounded_context_events: &[Event],
+    resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
 ) -> crate::error::Result<Vec<(i64, String)>> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -960,7 +1165,12 @@ pub fn query_events(
         .filter(|e| event_types.is_empty() || event_types.contains(&e.event_type))
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
         .filter(|e| e.sequence > after)
-        .map(|e| (e.sequence, render_event(e, access_mapping)))
+        .map(|e| {
+            (
+                e.sequence,
+                render_event(e, access_mapping, &resolve_data_key),
+            )
+        })
         .collect())
 }
 
@@ -1015,6 +1225,7 @@ pub struct EventInspected {
 pub fn inspect_event(
     access_mapping: &RoleAccessMapping,
     event: &Event,
+    resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
 ) -> crate::error::Result<EventInspected> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -1028,7 +1239,7 @@ pub fn inspect_event(
 
     Ok(EventInspected {
         event: event.clone(),
-        rendered_payload: render_event(event, access_mapping),
+        rendered_payload: render_event(event, access_mapping, &resolve_data_key),
     })
 }
 
@@ -1053,6 +1264,7 @@ pub fn fetch_commands(
     before: Option<chrono::DateTime<chrono::Utc>>,
     triggered_event: Option<&Event>,
     bounded_context_commands: &[Command],
+    resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
 ) -> crate::error::Result<Vec<String>> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -1082,7 +1294,7 @@ pub fn fetch_commands(
                 _ => false,
             })
         })
-        .map(|c| render_command(c, access_mapping))
+        .map(|c| render_command(c, access_mapping, &resolve_data_key))
         .collect())
 }
 
@@ -1202,6 +1414,7 @@ pub struct EventDelivered {
 pub fn deliver_to_subscriptions(
     event: &Event,
     subscriptions: &[Subscription],
+    resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
 ) -> Vec<EventDelivered> {
     subscriptions
         .iter()
@@ -1221,9 +1434,57 @@ pub fn deliver_to_subscriptions(
         .map(|s| EventDelivered {
             subscription: s.clone(),
             event: event.clone(),
-            rendered_payload: render_event(event, s.access_mapping()),
+            rendered_payload: render_event(event, s.access_mapping(), &resolve_data_key),
         })
         .collect()
+}
+
+/// The real-time delivery mechanism `DeliverToSubscriptions`/
+/// `EventSubscription` need, deliberately as small as possible - see
+/// `docs/architecture.md`'s own write-up of this pass for why this is a
+/// single-process, in-memory broadcast rather than anything
+/// Postgres-`LISTEN`/`NOTIFY`- or broker-backed: "Multi-instance /
+/// distributed deployment" is explicitly out of this spec's scope
+/// (§Excludes), so there is exactly one process any event this engine
+/// produces could ever need to reach a live subscriber from.
+///
+/// `Clone`-cheap - `tokio::sync::broadcast::Sender` is already an `Arc`
+/// around its own internal state, so every clone shares the same
+/// channel, the same "hand out cheap clones from one shared thing"
+/// treatment `db::Pool`/the two dispatchers already get.
+#[derive(Clone)]
+pub struct EventBroadcaster(tokio::sync::broadcast::Sender<Event>);
+
+impl EventBroadcaster {
+    /// `capacity` is how many not-yet-delivered events a single slow
+    /// subscriber may lag behind by before its next `subscribe()`d
+    /// receiver starts reporting `Lagged` - see
+    /// `SkiljBuilder::event_broadcast_capacity`'s own doc comment.
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _receiver) = tokio::sync::broadcast::channel(capacity);
+        Self(sender)
+    }
+
+    /// A fresh, independent receiver - `resolvers::event_subscription`'s
+    /// own entry point, one call per live GraphQL subscription. Multiple
+    /// receivers each see every event published after they were created,
+    /// with no coordination needed between them - `broadcast`'s own
+    /// native fan-out, not something this type manages by hand.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
+        self.0.subscribe()
+    }
+
+    /// `db::insert_event_and_update_sync_projections`'s own post-commit
+    /// step - called once per committed event, regardless of which
+    /// call site produced it (REST or GraphQL alike), since this is the
+    /// one choke point every event write already funnels through. A
+    /// `SendError` (zero receivers currently subscribed) is the expected
+    /// steady state, not a failure - silently ignored, the same
+    /// "nobody's listening right now" non-error `tokio::sync::broadcast`
+    /// itself already models this way.
+    pub fn publish(&self, event: &Event) {
+        let _ = self.0.send(event.clone());
+    }
 }
 
 /// See `rule FetchEvents`. `read_type` isn't a separate parameter - it's
@@ -1407,6 +1668,7 @@ pub fn create_external_event(
     source_context: Option<String>,
     next_sequence: i64,
     now: chrono::DateTime<chrono::Utc>,
+    resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> crate::error::Result<Event> {
     if adapter.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
@@ -1416,7 +1678,7 @@ pub fn create_external_event(
         return Err(Error::ExternalCreationNotAllowed.into());
     }
 
-    let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload);
+    let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
     Ok(Event {
         bounded_context: event_type.bounded_context.clone(),
         event_type: event_type.clone(),
@@ -1447,6 +1709,7 @@ pub fn create_direct_event(
     payload: String,
     next_sequence: i64,
     now: chrono::DateTime<chrono::Utc>,
+    resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> crate::error::Result<Event> {
     if adapter.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
@@ -1456,7 +1719,7 @@ pub fn create_direct_event(
         return Err(Error::DirectCreationNotAllowed.into());
     }
 
-    let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload);
+    let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
     Ok(Event {
         bounded_context: event_type.bounded_context.clone(),
         event_type: event_type.clone(),
@@ -1632,10 +1895,15 @@ pub struct ProcessCommandResult {
 /// order - the same Postgres-lock-backed, caller-supplied value as
 /// `create_external_event`/`create_direct_event`'s.
 ///
-/// Eight parameters because this function's own scope is genuinely that
+/// Nine parameters because this function's own scope is genuinely that
 /// wide - it's `ProcessCommand`'s entire `let`/`ensures` body, not
 /// something a smaller grouping would simplify without inventing a
-/// struct that exists only to satisfy the lint.
+/// struct that exists only to satisfy the lint. `resolve_key` is
+/// `protect_sensitive_fields`'s own pre-resolution parameter, threaded
+/// through unchanged to both of this function's own call sites below (the
+/// command's payload, and each accepted event spec's) - a command and an
+/// event naming the same subject resolve to the very same `EncryptionKey`
+/// this way, exactly as the spec requires.
 #[allow(clippy::too_many_arguments)]
 pub fn process_command(
     command_type: &CommandType,
@@ -1646,6 +1914,7 @@ pub fn process_command(
     resolve_event_type: impl Fn(&str) -> Option<EventType>,
     mut next_sequence: impl FnMut() -> i64,
     now: chrono::DateTime<chrono::Utc>,
+    resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> crate::error::Result<ProcessCommandResult> {
     let event_specs = match decision {
         CommandDecision::Accepted { events } => events,
@@ -1658,7 +1927,7 @@ pub fn process_command(
     let (consistency_boundary, _matching_events) =
         consistency_boundary_and_matching_events(bounded_context_events, &consistency_tags);
 
-    let protected = protect_sensitive_fields(&command_type.sensitive_fields, payload);
+    let protected = protect_sensitive_fields(&command_type.sensitive_fields, payload, &resolve_key);
     let command = Command {
         bounded_context: command_type.bounded_context.clone(),
         command_type: command_type.clone(),
@@ -1679,7 +1948,8 @@ pub fn process_command(
         let event_type = resolve_event_type(&spec.event_type)
             .ok_or_else(|| Error::UnregisteredEventType(spec.event_type.clone()))?;
         let spec_payload = spec.payload.to_string();
-        let event_protected = protect_sensitive_fields(&event_type.sensitive_fields, &spec_payload);
+        let event_protected =
+            protect_sensitive_fields(&event_type.sensitive_fields, &spec_payload, &resolve_key);
         events.push(Event {
             bounded_context: command_type.bounded_context.clone(),
             event_type: event_type.clone(),

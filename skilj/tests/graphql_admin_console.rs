@@ -241,7 +241,7 @@ fn full_admin_console_lifecycle_end_to_end() {
             return;
         }
         let (skilj, _pool) = setup().await;
-        let router = skilj.graphql_router();
+        let router = skilj.graphql_router().await.unwrap();
         let bootstrap_secret = skilj
             .bootstrap_secret()
             .expect("no active superadmin exists yet on a freshly built Skilj")
