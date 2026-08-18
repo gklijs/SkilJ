@@ -224,11 +224,10 @@ pub fn parse_sensitive_fields(value: &ValueAccessor) -> async_graphql::Result<Ve
 /// Parses a `[FilterInput!]` argument into `Vec<Filter>` - used by
 /// `event_subscription::events_by_type_field`'s own `filters` argument.
 /// Real wire-shape (matching `CreateEventTypeSubscription`'s own
-/// signature faithfully), but see that module's own doc comment for why
-/// every caller of this rejects a non-empty result before it ever
-/// reaches `create_event_type_subscription`: `matches_filters`/
-/// `valid_filters` are still `todo!()` for their non-empty case, an
-/// existing, separately-tracked gap this pass doesn't newly touch.
+/// signature faithfully) and, now that `matches_filters`/`valid_filters`
+/// are real, real behaviour end to end - the output flows straight into
+/// `create_event_type_subscription`, whose own `valid_filters` call does
+/// the rejection for real.
 pub fn parse_filters(value: &ValueAccessor) -> async_graphql::Result<Vec<Filter>> {
     let mut filters = Vec::new();
     for item in value.list()?.iter() {

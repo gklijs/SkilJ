@@ -195,23 +195,16 @@ fn fetch_events_rejects_an_event_type_not_opted_into_reads() {
 #[test]
 fn fetch_events_rejects_an_invalid_filter() {
     let t = token(TokenStatus::Active, event_type(true));
+    // event_type()'s schema is "{}" - "amount" names no field it declares.
     let bogus_filter = vec![Filter {
         field: "amount".into(),
         operator: FilterOperator::GreaterThan,
         value: "10".into(),
     }];
 
-    // valid_filters' real type-checking is a deferred black box (see its
-    // doc comment) - this asserts today's contract, that a non-empty
-    // filter list is rejected until that black box lands, not the
-    // eventual type-checking behaviour itself.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_store::fetch_events(&t, &[], &bogus_filter, None)
-    }));
-    assert!(
-        result.is_err(),
-        "valid_filters is a deferred black box for non-empty filters - see its doc comment"
-    );
+    let err = event_store::fetch_events(&t, &[], &bogus_filter, None).unwrap_err();
+
+    assert_eq!(err.code(), event_store::Error::InvalidFilter.code());
 }
 
 // ---------------------------------------------------------------------
@@ -368,26 +361,24 @@ fn consume_events_rejects_an_event_type_not_opted_into_reads() {
 #[test]
 fn consume_events_rejects_an_invalid_filter() {
     let t = token(TokenStatus::Active, event_type(true));
+    // event_type()'s schema is "{}" - "amount" names no field it declares.
     let bogus_filter = vec![Filter {
         field: "amount".into(),
         operator: FilterOperator::GreaterThan,
         value: "10".into(),
     }];
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_store::consume_events(
-            &t,
-            None,
-            Some(AckMode::AutoAdvance),
-            &[],
-            &bogus_filter,
-            timestamp(0),
-        )
-    }));
-    assert!(
-        result.is_err(),
-        "valid_filters is a deferred black box for non-empty filters - see its doc comment"
-    );
+    let err = event_store::consume_events(
+        &t,
+        None,
+        Some(AckMode::AutoAdvance),
+        &[],
+        &bogus_filter,
+        timestamp(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), event_store::Error::InvalidFilter.code());
 }
 
 /// rule-failure.ConsumeEvents.4 - `requires: not is_new or ack_mode != null`.

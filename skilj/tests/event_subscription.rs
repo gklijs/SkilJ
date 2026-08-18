@@ -608,3 +608,189 @@ fn event_subscription_end_to_end() {
         assert_eq!(complete["type"], "complete");
     });
 }
+
+/// `eventsByType(filters: [...])` actually narrows a live push - real
+/// `valid_filters`/`matches_filters` (this pass), not the eager
+/// `filters_not_supported_error()` rejection every `filters` argument hit
+/// before it. Reuses the exact harness/fixtures above rather than
+/// duplicating the JWKS/JWT boilerplate a second time.
+#[test]
+fn events_by_type_subscription_narrows_by_a_real_filter() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: admin_role.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let reader_subject = unique_name("reader");
+        let reader_role = Role {
+            id: generate_token_id(),
+            external_subject: reader_subject.clone(),
+            name: "Reader".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &reader_role)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: reader_role.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Read,
+                can_read_sensitive: false,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<DepositMoney>()
+            .reconciliation_role(admin_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let admin_jwt = sign_jwt(&admin_role.external_subject);
+        let reader_jwt = sign_jwt(&reader_role.external_subject);
+
+        let router = skilj.graphql_router().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind an ephemeral port for the GraphQL test listener");
+        let addr = listener.local_addr().unwrap();
+        let serve_router = router.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, serve_router)
+                .await
+                .expect("the GraphQL test listener stopped unexpectedly");
+        });
+
+        let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
+        ws_send_json(
+            &mut ws,
+            json!({
+                "type": "connection_init",
+                "payload": { "Authorization": format!("Bearer {reader_jwt}") },
+            }),
+        )
+        .await;
+        let ack = ws_recv_json(&mut ws).await;
+        assert_eq!(ack["type"], "connection_ack");
+
+        ws_send_json(
+            &mut ws,
+            json!({
+                "id": "1",
+                "type": "subscribe",
+                "payload": {
+                    "query": "subscription($bc: String!) { \
+                        eventsByType(boundedContext: $bc, eventType: \"MoneyDeposited\", \
+                            filters: [{ field: \"amount\", operator: GREATER_THAN, value: \"10\" }]) \
+                        { sequence payload } \
+                    }",
+                    "variables": { "bc": bc_name },
+                },
+            }),
+        )
+        .await;
+
+        // A non-matching event (amount=5) - never delivered.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            DEPOSIT_MONEY_MUTATION,
+            json!({ "bc": bc_name, "payload": r#"{"amount":5}"# }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert!(
+            ws_try_recv_json(&mut ws, Duration::from_millis(500))
+                .await
+                .is_none(),
+            "a filtered-out event must never be delivered"
+        );
+
+        // A matching event (amount=20) - delivered.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            DEPOSIT_MONEY_MUTATION,
+            json!({ "bc": bc_name, "payload": r#"{"amount":20}"# }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        let matching_sequence = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+
+        let delivered = ws_recv_json(&mut ws).await;
+        assert_eq!(delivered["id"], "1");
+        assert_eq!(delivered["type"], "next");
+        assert_eq!(
+            delivered["payload"]["data"]["eventsByType"]["sequence"],
+            matching_sequence
+        );
+    });
+}

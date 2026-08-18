@@ -30,13 +30,14 @@ repository = "https://github.com/gklijs/skilj"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = { version = "0.8", features = ["chrono"] }
+schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 thiserror = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate"] }
 chrono = { version = "0.4", features = ["serde"] }
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 axum = "0.8"
+axum-extra = { version = "0.10", features = ["query"] }
 async-graphql = "7"
 async-graphql-axum = "7"
 arc-swap = "1"

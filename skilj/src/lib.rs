@@ -135,17 +135,30 @@ struct ProjectionDispatcherImpl {
 }
 
 impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
+    fn keys(
+        &self,
+        bounded_context: &str,
+        projection_name: &str,
+        event: &Event,
+    ) -> Option<Vec<String>> {
+        let registered = self
+            .projections
+            .get(&(bounded_context.to_string(), projection_name.to_string()))?;
+        Some((registered.keys)(event))
+    }
+
     fn project(
         &self,
         bounded_context: &str,
         projection_name: &str,
         state_json: &str,
         event: &Event,
+        key: &str,
     ) -> Option<skilj_core::error::Result<String>> {
         let registered = self
             .projections
             .get(&(bounded_context.to_string(), projection_name.to_string()))?;
-        Some((registered.project)(state_json, event))
+        Some((registered.project)(state_json, event, key))
     }
 
     fn default_state(&self, bounded_context: &str, projection_name: &str) -> Option<String> {
@@ -363,18 +376,29 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
     }
 }
 
-/// Applies one event to a projection's current state (as JSON), closing
-/// over a single `T: Projection` alone - no runtime captures beyond the
-/// `Box` itself, the same shape `DeciderFn` above already has. Built
-/// once, at `.projection::<T>()` call time (see `registered_projection`
-/// below), called by the new transactional `db::
-/// insert_event_and_update_sync_projections` (§8 item 6) through the
-/// `ProjectionDispatcher` bridge - `Dispatcher` below, this module's own
-/// implementer. Returns `state_json` unchanged when `event`'s own type
-/// isn't one this projection actually consumes - see
-/// `ProjectionDispatcher::project`'s own doc comment for why that check
-/// can't be left to `BoundedContextEvent::try_from_event` alone.
-type ProjectFn = Box<dyn Fn(&str, &Event) -> skilj_core::error::Result<String> + Send + Sync>;
+/// Which instance(s) of a projection's own state one event touches,
+/// closing over a single `T: Projection` alone - `T::keys`'s own
+/// type-erased bridge, the counterpart `ProjectFn` below has for
+/// `T::project`. Returns no keys at all - not `T::keys`'s own default -
+/// when `event`'s own type isn't one this projection actually consumes,
+/// mirroring `ProjectFn`'s identical "state passes through unchanged"
+/// treatment for the same case (see `ProjectionDispatcher::keys`'s own
+/// doc comment for why that check can't be left to
+/// `BoundedContextEvent::try_from_event` alone).
+type KeysFn = Box<dyn Fn(&Event) -> Vec<String> + Send + Sync>;
+
+/// Applies one event to a projection's current state (as JSON), for the
+/// one instance named by `key` - closing over a single `T: Projection`
+/// alone, no runtime captures beyond the `Box` itself, the same shape
+/// `DeciderFn` above already has. Built once, at `.projection::<T>()`
+/// call time (see `registered_projection` below), called by `db::
+/// insert_event_and_update_sync_projections`/`catch_up_bounded_context`
+/// (§8 item 6) through the `ProjectionDispatcher` bridge - `Dispatcher`
+/// below, this module's own implementer. Returns `state_json` unchanged
+/// when `event`'s own type isn't one this projection actually consumes -
+/// see `ProjectionDispatcher::project`'s own doc comment for why that
+/// check can't be left to `BoundedContextEvent::try_from_event` alone.
+type ProjectFn = Box<dyn Fn(&str, &Event, &str) -> skilj_core::error::Result<String> + Send + Sync>;
 
 /// See `RegisteredEventType` above - same shape and reasoning, for
 /// `Projection`. `consumed_event_types` carries `EventType::NAME`s only
@@ -382,21 +406,25 @@ type ProjectFn = Box<dyn Fn(&str, &Event) -> skilj_core::error::Result<String> +
 /// resolved into full `event_store::EventType`s during reconciliation,
 /// once the bounded context's own admin access has already been
 /// confirmed (see `reconcile_projections` below). `default_state_json`
-/// is what a fresh `projection_state` row is seeded with at registration
-/// time (`T::State::default()`, serialised) - `project`'s own closure
-/// never needs to invent a starting point at fold time.
+/// is what a *new* instance's own `projection_state` row starts from,
+/// lazily, the first time any event touches its key (§9's own "keyed /
+/// multi-row Projections" pass - nothing is seeded up front anymore,
+/// since a projection's own instances aren't known until events actually
+/// name them).
 struct RegisteredProjection {
     schema: String,
     consumed_event_types: Vec<&'static str>,
     sync: bool,
     default_state_json: String,
+    keys: KeysFn,
     project: ProjectFn,
 }
 
 fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
     let schema = schemars::schema_for!(T::State);
     let consumed_event_types = T::consumed_event_types();
-    let consumed_for_closure = consumed_event_types.clone();
+    let consumed_for_keys = consumed_event_types.clone();
+    let consumed_for_project = consumed_event_types.clone();
     let default_state_json = serde_json::to_string(&T::State::default())
         .expect("JSON serialization of a Default::default() State is infallible");
     RegisteredProjection {
@@ -404,8 +432,25 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
         consumed_event_types,
         sync: T::sync(),
         default_state_json,
-        project: Box::new(move |state_json, event| {
-            if !consumed_for_closure
+        keys: Box::new(move |event| {
+            if !consumed_for_keys
+                .iter()
+                .any(|&name| name == event.event_type.name)
+            {
+                return Vec::new();
+            }
+            let Some(Ok(converted)) = T::Event::try_from_event(event) else {
+                // Either the generated enum disagrees with
+                // consumed_event_types (unreachable in practice - both
+                // are derived from the same registered event types), or
+                // the stored payload doesn't decode - either way, no
+                // instance to report a key for.
+                return Vec::new();
+            };
+            T::keys(&converted)
+        }),
+        project: Box::new(move |state_json, event, key| {
+            if !consumed_for_project
                 .iter()
                 .any(|&name| name == event.event_type.name)
             {
@@ -423,7 +468,7 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
             };
             let converted =
                 converted.map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
-            T::project(&mut state, &converted);
+            T::project(&mut state, &converted, key);
             Ok(serde_json::to_string(&state).expect("JSON serialization of State is infallible"))
         }),
     }
@@ -833,15 +878,13 @@ async fn reconcile_projections(
             ProjectionRegistration::Created(projection)
             | ProjectionRegistration::ReconciledTrivially(projection) => {
                 skilj_core::db::upsert_projection(pool, &projection).await?;
-                // Idempotent - only actually inserts the first time this
-                // projection is ever registered (§8 item 6).
-                skilj_core::db::seed_projection_state(
-                    pool,
-                    bounded_context_name,
-                    name,
-                    &registered.default_state_json,
-                )
-                .await?;
+                // No `projection_state` seeding here anymore (§9's
+                // "keyed / multi-row Projections" pass) - a projection's
+                // own instances aren't known until events actually name
+                // them, so every instance's own row is created lazily,
+                // on first touch, the same uniform path whether this
+                // projection ever uses a real key or stays on the
+                // implicit single one.
             }
             ProjectionRegistration::RebuildStaged(rebuild) => {
                 skilj_core::db::upsert_projection_rebuild(pool, &rebuild).await?;

@@ -19,7 +19,9 @@ use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
 use skilj_core::plugin::BoundedContextEvent;
-use skilj_core::shared::{generate_token_id, generate_token_secret, CommandDecision, EventSpec};
+use skilj_core::shared::{
+    generate_token_id, generate_token_secret, CommandDecision, EventSpec, TagMapping,
+};
 use tower::ServiceExt;
 
 // --- fixtures ---
@@ -71,6 +73,17 @@ impl CommandType for WithdrawMoney {
     const NAME: &'static str = "WithdrawMoney";
     fn rest_trigger_allowed() -> bool {
         true
+    }
+    /// A real, non-empty `tag_mappings` entry - the previously-panicking
+    /// `derive_tags` path (`todo!()` for any non-empty `tag_mappings`),
+    /// now exercised for real over the actual REST surface, not just at
+    /// the pure-function layer. See `command_trigger_derives_real_tags_
+    /// from_a_real_tag_mapping` below.
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![TagMapping {
+            key: "amount".into(),
+            field: "amount".into(),
+        }]
     }
     /// Deliberately simple: rejects anything over 1000, otherwise emits
     /// one `MoneyDeposited` event carrying the same amount - just enough
@@ -309,6 +322,52 @@ fn command_trigger_accepts_and_persists_triggered_events() {
             skilj_core::event_store::EventOrigin::CommandTriggered { command } => {
                 assert_eq!(command.command_type.name, "WithdrawMoney");
                 assert_eq!(command.payload, r#"{"amount":20}"#);
+            }
+            other => panic!("expected a CommandTriggered origin, got {other:?}"),
+        }
+    });
+}
+
+/// Proof, over the real REST surface (not just `skilj-core`'s pure
+/// `derive_tags` unit tests), that a bounded context registering a real
+/// `tag_mappings` entry and then triggering a matching command no longer
+/// panics - `WithdrawMoney::tag_mappings()` above declares a real
+/// mapping, and `db::insert_command_and_events`'s round trip is what
+/// `process_command`'s own `derive_tags` call feeds into `Command.
+/// consistency_tags`/`Event.tags` alike.
+#[test]
+fn command_trigger_derives_real_tags_from_a_real_tag_mapping() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name) = setup().await;
+        let router = skilj.rest_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/commands/trigger")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"payload":{"amount":20}}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0].origin {
+            skilj_core::event_store::EventOrigin::CommandTriggered { command } => {
+                assert_eq!(
+                    command.consistency_tags,
+                    vec![skilj_core::shared::Tag {
+                        key: "amount".into(),
+                        value: Some("20".into()),
+                    }]
+                );
             }
             other => panic!("expected a CommandTriggered origin, got {other:?}"),
         }

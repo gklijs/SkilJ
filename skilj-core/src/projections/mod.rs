@@ -14,11 +14,15 @@ use crate::event_store::{BoundedContext, BoundedContextStatus, Event, EventType}
 // background consumer (`db::catch_up_bounded_context`), which also
 // drives a building `ProjectionRebuild`'s own replay and its automatic
 // promotion once caught up - see that function's own doc comment.
-// `read_projection()`/`await_projection_caught_up()` are both still
-// fully caller-supplied in `query_projection` below rather than having a
-// real implementation here - see its own doc comment for why (the same
+// `await_projection_caught_up()` is still fully caller-supplied in
+// `query_projection` below - see its own doc comment for why (the same
 // "black box in the same register as decide()" treatment
-// `process_command`'s `decision` gets).
+// `process_command`'s `decision` gets). `read_projection()` is real now -
+// see its own doc comment - but `query_projection` itself stays
+// unchanged: the resolver calls `read_projection` first and hands
+// `query_projection` the already-decrypted result, the identical
+// "pure function takes what the caller already resolved" shape
+// `event_store::query_events` has relative to `render_event`.
 //
 // This module was originally scaffolded with its own placeholder `Error`
 // (`EventTypeOutsideBoundedContext`/`RebuildAlreadyStaged`/
@@ -297,7 +301,32 @@ pub fn discard_projection_rebuild(
     Ok(staged.clone())
 }
 
-/// See `rule QueryProjection`. `read_projection(projection, access_mapping)`
+/// `read_projection`'s own real branch - see `crate::encryption::decrypt_ciphertext_leaves`'s
+/// own doc comment for the full design and why it's automatic rather than
+/// a declared `Projection.sensitive_fields`. `data_keys` is the caller's
+/// own pre-resolution (`db::list_active_data_keys_for_subject_value`,
+/// gated on `event_store::sensitive_field_is_granted` first) - empty
+/// means either the caller isn't granted for this instance's own subject,
+/// or nothing sensitive was ever found for it; either way `state_json` is
+/// returned verbatim, not even re-parsed. Non-empty means at least one
+/// key was resolved for this instance's own `key` - every string leaf,
+/// at any depth, is tried against each.
+pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey]) -> String {
+    if data_keys.is_empty() {
+        return state_json.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str(state_json) else {
+        // Not valid JSON - can't happen for a real projection_state row
+        // (always written by serde_json::to_string), but returning it
+        // verbatim rather than panicking matches every other black box's
+        // own "malformed input is left alone, never a crash" treatment.
+        return state_json.to_string();
+    };
+    crate::encryption::decrypt_ciphertext_leaves(&mut value, data_keys);
+    serde_json::to_string(&value).expect("re-serialising a parsed JSON Value is infallible")
+}
+
+/// See `rule QueryProjection`. `read_projection(projection, key, access_mapping)`
 /// and `await_projection_caught_up(projection, wait_for_sequence)` are
 /// both black boxes "in the same register as `decide()`" per the spec's
 /// own text above rule `CreateExternalEvent` - unlike `event_store::
@@ -314,9 +343,20 @@ pub fn discard_projection_rebuild(
 /// projection satisfies any sequence immediately, by construction (see
 /// the note above the rules) - reflected in whatever `caught_up` the
 /// caller computed, not re-derived here.
+///
+/// `key` (the rule's own `instance_key = key ?? ""`, already resolved by
+/// the caller - the identical null-coalescing treatment `wait_for_sequence`
+/// itself gets) is accepted here purely for trigger-parameter parity with
+/// `when: QueryProjection(access_mapping, projection, key?, wait_for_sequence?)` -
+/// this function's own `requires` clauses don't gate on it (which
+/// instance to read is already baked into `read_projection_result` by
+/// the time it's handed in), but `ProjectionDelivered`'s own `ensures`
+/// carries it alongside `result`, so the caller echoes it back in its own
+/// response shape.
 pub fn query_projection(
     access_mapping: &RoleAccessMapping,
     projection: &Projection,
+    _key: &str,
     wait_for_sequence: Option<i64>,
     caught_up: bool,
     read_projection_result: String,

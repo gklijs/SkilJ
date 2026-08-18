@@ -217,6 +217,37 @@ fn create_external_event_rejects_a_revoked_token() {
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
 }
 
+#[test]
+fn create_external_event_derives_real_tags_from_a_real_tag_mapping() {
+    let et = EventType {
+        tag_mappings: vec![skilj_core::shared::TagMapping {
+            key: "order".into(),
+            field: "order_id".into(),
+        }],
+        ..event_type(true, false)
+    };
+    let adapter = external_token(TokenStatus::Active, et);
+
+    let event = event_store::create_external_event(
+        &adapter,
+        r#"{"order_id":"O-1"}"#.into(),
+        "raw".into(),
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        event.tags,
+        vec![skilj_core::shared::Tag {
+            key: "order".into(),
+            value: Some("O-1".into()),
+        }]
+    );
+}
+
 // ---------------------------------------------------------------------
 // rule-success.CreateDirectEvent / rule-failure.CreateDirectEvent.{1,2,3}
 // / rule-entity-creation.CreateDirectEvent.1 / sum-type-variant.DirectlyCreated
@@ -245,6 +276,35 @@ fn create_direct_event_succeeds_and_stamps_metadata() {
     assert!(event.tags.is_empty());
     assert!(event.encryption_keys.is_empty());
     assert_eq!(event.origin, EventOrigin::DirectlyCreated);
+}
+
+#[test]
+fn create_direct_event_derives_real_tags_from_a_real_tag_mapping() {
+    let et = EventType {
+        tag_mappings: vec![skilj_core::shared::TagMapping {
+            key: "order".into(),
+            field: "order_id".into(),
+        }],
+        ..event_type(false, true)
+    };
+    let adapter = direct_token(TokenStatus::Active, et);
+
+    let event = event_store::create_direct_event(
+        &adapter,
+        r#"{"order_id":"O-2"}"#.into(),
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        event.tags,
+        vec![skilj_core::shared::Tag {
+            key: "order".into(),
+            value: Some("O-2".into()),
+        }]
+    );
 }
 
 /// rule-failure.CreateDirectEvent.1 - `requires: event_type.direct_creation_allowed = true`.

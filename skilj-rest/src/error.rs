@@ -41,13 +41,6 @@ pub enum RestError {
     /// `AccessTokenKind` than the route needs - §7.2's "presenting the
     /// wrong token variant at a route is a 403, not a 404".
     WrongTokenVariant,
-    /// §7.4's `filter=field:op:value` param is present, but
-    /// `valid_filters`/`matches_filters` are still `todo!()` for any
-    /// non-empty filter set (see `event_store`'s own doc comment) - a
-    /// route can't call into skilj-core with one without panicking the
-    /// process, so this is rejected here instead, before that call ever
-    /// happens.
-    FiltersNotSupported,
     /// A request-shape problem this crate's own routing layer catches
     /// before calling into skilj-core at all (e.g. `mode` isn't `"auto"`
     /// or `"manual"`) - distinct from a library-level `Error`, which
@@ -162,11 +155,6 @@ impl IntoResponse for RestError {
                 StatusCode::FORBIDDEN,
                 "wrong_token_variant".to_string(),
                 "this AccessToken's kind doesn't authorize this route".to_string(),
-            ),
-            RestError::FiltersNotSupported => (
-                StatusCode::BAD_REQUEST,
-                "filters_not_supported".to_string(),
-                "non-empty filter sets aren't supported yet".to_string(),
             ),
             RestError::InvalidRequest(message) => (
                 StatusCode::BAD_REQUEST,

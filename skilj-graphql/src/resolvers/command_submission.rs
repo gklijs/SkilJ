@@ -19,13 +19,10 @@
 //! sessions ago - finally gets one: checked *before* `dispatch`, so an
 //! unauthorised caller never reaches `decide()`.
 //!
-//! `ProjectionQuery`/`EventSubscription` stay out of this phase (and
-//! this crate entirely, for now) - see the Phase 3 plan
-//! (`/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`) for why:
-//! `ProjectionQuery` needs `project()` (still `todo!()` - no projection
-//! state exists anywhere to query), `EventSubscription` needs a
-//! real-time event-delivery mechanism (none exists yet). Neither is a
-//! GraphQL-plumbing gap this pass can close.
+//! `ProjectionQuery`/`EventSubscription` stayed out of this particular
+//! pass at the time this module was first written - both are real now,
+//! in `resolvers::projection_query`/`resolvers::event_subscription`
+//! respectively.
 
 use super::{not_found, require_caller};
 use crate::error::to_graphql_error;

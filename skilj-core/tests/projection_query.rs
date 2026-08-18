@@ -80,6 +80,7 @@ fn query_projection_succeeds_and_returns_the_supplied_result_when_no_sequence_is
     let result = projections::query_projection(
         &mapping,
         &p,
+        "",
         None,  // no wait_for_sequence
         false, // caught_up is irrelevant when nothing was requested
         r#"{"total":42}"#.into(),
@@ -99,6 +100,7 @@ fn query_projection_succeeds_when_caught_up_to_the_requested_sequence() {
     let result = projections::query_projection(
         &mapping,
         &p,
+        "",
         Some(10),
         true, // await_projection_caught_up already resolved true
         r#"{"total":99}"#.into(),
@@ -116,7 +118,8 @@ fn query_projection_succeeds_for_every_access_level() {
         let mapping = access_mapping(RoleStatus::Active, level);
         let p = projection();
 
-        let result = projections::query_projection(&mapping, &p, None, false, "ok".into()).unwrap();
+        let result =
+            projections::query_projection(&mapping, &p, "", None, false, "ok".into()).unwrap();
 
         assert_eq!(result, "ok");
     }
@@ -128,7 +131,7 @@ fn query_projection_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Read);
     let p = projection();
 
-    let err = projections::query_projection(&mapping, &p, None, false, "x".into()).unwrap_err();
+    let err = projections::query_projection(&mapping, &p, "", None, false, "x".into()).unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -145,7 +148,7 @@ fn query_projection_rejects_a_mapping_scoped_to_a_different_bounded_context() {
     };
     let p = projection();
 
-    let err = projections::query_projection(&mapping, &p, None, false, "x".into()).unwrap_err();
+    let err = projections::query_projection(&mapping, &p, "", None, false, "x".into()).unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -165,6 +168,7 @@ fn query_projection_rejects_with_a_distinguishable_timeout_when_not_caught_up_in
     let err = projections::query_projection(
         &mapping,
         &p,
+        "",
         Some(10),
         false, // await_projection_caught_up resolved false (timed out)
         "x".into(),
@@ -186,7 +190,7 @@ fn query_projection_never_times_out_when_no_sequence_was_requested() {
     let p = projection();
 
     let result =
-        projections::query_projection(&mapping, &p, None, false, "whatever".into()).unwrap();
+        projections::query_projection(&mapping, &p, "", None, false, "whatever".into()).unwrap();
 
     assert_eq!(result, "whatever");
 }

@@ -162,7 +162,29 @@ pub trait Projection {
         false
     }
 
-    fn project(state: &mut Self::State, event: &Self::Event);
+    /// Which instance(s) of this projection `event` updates - see the
+    /// instance-data note on `entity Projection` in the spec. Defaults to
+    /// one constant, unnamed key (`""`) - the "single shared value" case
+    /// every projection built before this pass already is, needing no
+    /// change at all to keep working exactly as it already does.
+    /// Returning more than one key (a transfer event naming both the
+    /// giver's and the receiver's own account id, say) folds this event
+    /// into each of those instances independently, via its own call to
+    /// `project()` - see that method's own doc comment for the `key`
+    /// parameter it's handed each time.
+    fn keys(_event: &Self::Event) -> Vec<String> {
+        vec![String::new()]
+    }
+
+    /// `key` is which instance is currently being folded - one of
+    /// `Self::keys(event)`'s own return values, handed back so `project()`
+    /// can tell them apart when an event touches more than one (compare
+    /// `key` against the event's own fields to decide, e.g., whether this
+    /// call is crediting or debiting). Ignored entirely by a projection
+    /// that never overrides `keys()` - it only ever sees the one constant
+    /// `""` instance, the same single fold every existing projection
+    /// already does.
+    fn project(state: &mut Self::State, event: &Self::Event, key: &str);
 }
 
 /// Type-erased dispatch to a bounded context's own typed `decide()` -
@@ -223,21 +245,37 @@ pub trait CommandDispatcher: Send + Sync {
 pub trait ProjectionDispatcher: Send + Sync {
     /// `None` when no `(bounded_context, projection_name)` pair matches
     /// anything registered - the same "pair isn't registered at all"
+    /// convention `dispatch`/`project` below already use. `Some(vec![])`
+    /// when the pair *is* registered but `event`'s own type isn't one
+    /// this projection actually consumes (`Projection::keys` is never
+    /// called for it) - `caught_up_to` still advances, no instance is
+    /// touched, the identical "position always advances, state only
+    /// changes when consumed" treatment this trait's own `project`
+    /// already documents. Otherwise, `Projection::keys(event)` verbatim -
+    /// every instance this one event updates, one call to `project`
+    /// below per key.
+    fn keys(
+        &self,
+        bounded_context: &str,
+        projection_name: &str,
+        event: &Event,
+    ) -> Option<Vec<String>>;
+
+    /// `None` when no `(bounded_context, projection_name)` pair matches
+    /// anything registered - the same "pair isn't registered at all"
     /// convention `CommandDispatcher::dispatch` uses. `Some(Ok(new_state))`
-    /// is the projection's `state_json` after folding `event` into it -
-    /// unchanged from the input `state_json` when `event`'s own type
-    /// isn't one this projection actually consumes (`Projection::
-    /// consumed_event_types()`), since a projection's generated `Event`
-    /// enum can have variants beyond what it declared consuming (the
-    /// same shared per-bounded-context enum `CommandType::Event` also
-    /// uses) - `BoundedContextEvent::try_from_event` succeeding is not by
-    /// itself permission to call `project()`.
+    /// is the projection's `state_json` after folding `event` into it,
+    /// for the one instance named by `key` (one of `keys`'s own return
+    /// values) - `BoundedContextEvent::try_from_event` succeeding is not
+    /// by itself permission to call `project()`; the caller only reaches
+    /// this once per key `keys` returned.
     fn project(
         &self,
         bounded_context: &str,
         projection_name: &str,
         state_json: &str,
         event: &Event,
+        key: &str,
     ) -> Option<crate::error::Result<String>>;
 
     /// `T::State::default()`, JSON-serialised - `None` for the identical

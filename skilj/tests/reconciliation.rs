@@ -89,7 +89,7 @@ impl Projection for AccountBalance {
     fn consumed_event_types() -> Vec<&'static str> {
         vec!["MoneyDeposited"]
     }
-    fn project(state: &mut Self::State, event: &Self::Event) {
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
         match event {
             BankingEvent::MoneyDeposited(p) => state.balance += p.amount,
         }

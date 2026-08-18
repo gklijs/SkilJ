@@ -2,10 +2,9 @@
 //! propagated after `event_subscription.rs` (docs/architecture.md §9):
 //! the full `EncryptionKey` entity (folding in `EncryptionKeyRef`'s old
 //! stand-in role - neither was populated by anything else yet) and rule
-//! `ForgetSubject`. Deliberately scoped to destruction only:
-//! `protect_sensitive_fields`'s get-or-create provisioning stays
-//! `todo!()` for its non-empty-`sensitive_fields` case - see
-//! `EncryptionKey`'s own doc comment for why.
+//! `ForgetSubject`. Deliberately scoped to destruction only at the time -
+//! `protect_sensitive_fields`'s get-or-create provisioning went real in a
+//! later pass (`skilj-core/tests/encryption.rs` covers it).
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
 //! filtered to this pass's source constructs): 12 of 14 total.

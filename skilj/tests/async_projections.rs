@@ -96,7 +96,7 @@ impl Projection for AccountBalance {
     fn consumed_event_types() -> Vec<&'static str> {
         vec!["MoneyDeposited"]
     }
-    fn project(state: &mut Self::State, event: &Self::Event) {
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
         let BankingEvent::MoneyDeposited(payload) = event;
         state.total += payload.amount;
     }
@@ -281,7 +281,7 @@ fn triggering_a_command_eventually_updates_a_real_async_projection_through_rest(
         let mut state = None;
         for _ in 0..40 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            state = db::get_projection_state(&pool, &bc_name, "AccountBalance")
+            state = db::get_projection_state(&pool, &bc_name, "AccountBalance", "")
                 .await
                 .unwrap();
             if state.as_deref() == Some(r#"{"total":20}"#) {

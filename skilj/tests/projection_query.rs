@@ -17,12 +17,16 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{CommandType, EventType, IdpConfig, Projection, SigningAlgorithm, Skilj};
+use skilj::{
+    CommandType, EncryptionMasterKey, EventType, IdpConfig, Projection, SigningAlgorithm, Skilj,
+};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
 use skilj_core::plugin::BoundedContextEvent;
-use skilj_core::shared::{generate_token_id, CommandDecision, EventSpec};
+use skilj_core::shared::{
+    generate_token_id, generate_token_secret, CommandDecision, EventSpec, SensitiveField,
+};
 use tower::ServiceExt;
 
 const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
@@ -77,8 +81,56 @@ impl EventType for MoneyDeposited {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct ItemPurchasedPayload {
+    customer_id: String,
+    item: String,
+}
+
+struct ItemPurchased;
+
+impl EventType for ItemPurchased {
+    type Payload = ItemPurchasedPayload;
+    const NAME: &'static str = "ItemPurchased";
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+}
+
+/// A real sensitive field on the *source* `EventType` - `email` is
+/// declared sensitive, keyed by `customer_id`. `project()` below copies
+/// it straight into `CustomerProfile`'s own state verbatim, still
+/// ciphertext at that point (nothing decrypts before folding) - real
+/// decrypt-on-read for a `Projection` happens entirely on the read side,
+/// automatically, with no `Projection.sensitive_fields` declaration
+/// anywhere (§9's own "read_projection's own decrypt-on-read" pass).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct AccountOpenedPayload {
+    customer_id: String,
+    email: String,
+}
+
+struct AccountOpened;
+
+impl EventType for AccountOpened {
+    type Payload = AccountOpenedPayload;
+    const NAME: &'static str = "AccountOpened";
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        vec![SensitiveField {
+            field: "email".to_string(),
+            subject_key: "customer".to_string(),
+            subject_field: "customer_id".to_string(),
+        }]
+    }
+}
+
 enum BankingEvent {
     MoneyDeposited(MoneyDepositedPayload),
+    ItemPurchased(ItemPurchasedPayload),
+    AccountOpened(AccountOpenedPayload),
 }
 
 impl BoundedContextEvent for BankingEvent {
@@ -86,6 +138,12 @@ impl BoundedContextEvent for BankingEvent {
         match event.event_type.name.as_str() {
             "MoneyDeposited" => {
                 Some(serde_json::from_str(&event.payload).map(BankingEvent::MoneyDeposited))
+            }
+            "ItemPurchased" => {
+                Some(serde_json::from_str(&event.payload).map(BankingEvent::ItemPurchased))
+            }
+            "AccountOpened" => {
+                Some(serde_json::from_str(&event.payload).map(BankingEvent::AccountOpened))
             }
             _ => None,
         }
@@ -144,12 +202,82 @@ impl Projection for AccountBalance {
     fn sync() -> bool {
         true
     }
-    fn project(state: &mut Self::State, event: &Self::Event) {
-        let BankingEvent::MoneyDeposited(payload) = event;
-        state.total += payload.amount;
-        state.last_deposit = LastDeposit {
-            amount: payload.amount,
-        };
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        if let BankingEvent::MoneyDeposited(payload) = event {
+            state.total += payload.amount;
+            state.last_deposit = LastDeposit {
+                amount: payload.amount,
+            };
+        }
+    }
+}
+
+/// Keyed by `customer_id` - §9's own "keyed / multi-row Projections"
+/// pass, exercised end-to-end: `ItemPurchased`'s own `customer_id` field
+/// names which customer's row an event belongs to, so each customer gets
+/// an independently-addressed instance from the shared `ItemPurchased`
+/// stream, not one blob shared by all of them.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct PurchaseHistoryState {
+    items: Vec<String>,
+}
+
+struct CustomerPurchaseHistory;
+
+impl Projection for CustomerPurchaseHistory {
+    type State = PurchaseHistoryState;
+    type Event = BankingEvent;
+    const NAME: &'static str = "CustomerPurchaseHistory";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["ItemPurchased"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn keys(event: &Self::Event) -> Vec<String> {
+        match event {
+            BankingEvent::ItemPurchased(payload) => vec![payload.customer_id.clone()],
+            _ => Vec::new(),
+        }
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        if let BankingEvent::ItemPurchased(payload) = event {
+            state.items.push(payload.item.clone());
+        }
+    }
+}
+
+/// Keyed by `customer_id`, folding `AccountOpened`'s own sensitive
+/// `email` field straight into its own state, verbatim - `project()`
+/// never decrypts (nothing does, before folding), so `email` here is
+/// real ciphertext until a granted caller queries it.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct CustomerProfileState {
+    email: String,
+}
+
+struct CustomerProfile;
+
+impl Projection for CustomerProfile {
+    type State = CustomerProfileState;
+    type Event = BankingEvent;
+    const NAME: &'static str = "CustomerProfile";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["AccountOpened"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn keys(event: &Self::Event) -> Vec<String> {
+        match event {
+            BankingEvent::AccountOpened(payload) => vec![payload.customer_id.clone()],
+            _ => Vec::new(),
+        }
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        if let BankingEvent::AccountOpened(payload) = event {
+            state.email = payload.email.clone();
+        }
     }
 }
 
@@ -544,5 +672,462 @@ fn projection_query_end_to_end() {
             response["errors"][0]["extensions"]["code"],
             "Projection_not_found"
         );
+    });
+}
+
+/// §9's own "keyed / multi-row Projections" pass, end-to-end: three real
+/// `ItemPurchased` events (two for `"alice"`, one for `"bob"`), each
+/// customer's own row queried independently, a never-touched key
+/// answering with the default (empty) state rather than an error, and
+/// the implicit `""` instance (`key` omitted entirely) - untouched by
+/// any of these customer-keyed events - answering the same way.
+#[test]
+fn keyed_projection_end_to_end() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("shop");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+
+        let admin_mapping = RoleAccessMapping {
+            role: admin_role.clone(),
+            bounded_context: bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &admin_mapping)
+            .await
+            .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<ItemPurchased>()
+            .projection::<CustomerPurchaseHistory>()
+            .reconciliation_role(admin_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        // A real direct-creation token, minted the same way the admin
+        // console already would - constructed directly here since
+        // minting one isn't itself under test.
+        let event_type = skilj_core::db::get_event_type(&pool, &bc_name, "ItemPurchased")
+            .await
+            .unwrap()
+            .unwrap();
+        let token = skilj_core::access_control::create_direct_creation_token(
+            &admin_mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            test_now(),
+        )
+        .unwrap();
+        skilj_core::db::insert_direct_creation_token(&pool, &token)
+            .await
+            .unwrap();
+        let credential = format!("{}.{}", token.id, token.secret);
+
+        let rest_router = skilj.rest_router();
+        for (customer, item) in [("alice", "book"), ("bob", "pen"), ("alice", "pen")] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/events/direct")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "payload": { "customer_id": customer, "item": item } }).to_string(),
+                ))
+                .unwrap();
+            let response = rest_router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let graphql_router = skilj.graphql_router().await.unwrap();
+        let admin_jwt = sign_jwt(&admin_role.external_subject);
+        let type_name =
+            skilj_graphql::projection_types::graphql_type_name(&bc_name, "CustomerPurchaseHistory");
+        let query = format!(
+            "query($bc: String!, $key: String) {{ \
+                projection(boundedContext: $bc, name: \"CustomerPurchaseHistory\", key: $key) {{ \
+                    ... on {type_name} {{ items }} \
+                }} \
+            }}"
+        );
+
+        let response = graphql_request(
+            &graphql_router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "alice" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        let items: Vec<&str> = response["data"]["projection"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(items, vec!["book", "pen"]);
+
+        let response = graphql_request(
+            &graphql_router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "bob" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        let items: Vec<&str> = response["data"]["projection"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(items, vec!["pen"]);
+
+        // A key nothing has touched yet - the default (empty) state, not
+        // an error.
+        let response = graphql_request(
+            &graphql_router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "carol" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert!(response["data"]["projection"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // key omitted entirely - the implicit "" instance, which none of
+        // these customer-keyed events ever touched either.
+        let response = graphql_request(
+            &graphql_router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": null }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert!(response["data"]["projection"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    });
+}
+
+const FORGET_SUBJECT_MUTATION: &str = "\
+    mutation($bc: String!, $subjectKey: String!, $subjectValue: String!) { \
+        forgetSubject(boundedContext: $bc, subjectKey: $subjectKey, subjectValue: $subjectValue) { \
+            status \
+        } \
+    }";
+
+/// §9's own "read_projection's own decrypt-on-read" pass, end-to-end:
+/// `CustomerProfile` is keyed by `customer_id` and folds `AccountOpened`'s
+/// own sensitive `email` field straight into its own state, verbatim -
+/// with no `Projection.sensitive_fields` declared anywhere. Neither
+/// grant sees ciphertext; `can_read_sensitive` and the matching
+/// `external_subject` both see plaintext; `forgetSubject` destroying the
+/// key makes even the previously-granted caller see ciphertext again -
+/// the crypto-shredding guarantee verified through a projection this
+/// time, not just raw events (`skilj/tests/decrypt_on_read.rs` already
+/// covers that for events).
+#[test]
+fn keyed_projection_decrypt_on_read_end_to_end() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("accounts");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+
+        let admin_mapping = RoleAccessMapping {
+            role: admin_role.clone(),
+            bounded_context: bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &admin_mapping)
+            .await
+            .unwrap();
+
+        // can_read_sensitive = true - grant (a).
+        let sensitive_subject = unique_name("sensitive-reader");
+        let sensitive_role = Role {
+            id: generate_token_id(),
+            external_subject: sensitive_subject.clone(),
+            name: "SensitiveReader".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &sensitive_role)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: sensitive_role.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Read,
+                can_read_sensitive: true,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // external_subject matching the customer id used below - grant
+        // (b), with no can_read_sensitive at all.
+        let self_role = Role {
+            id: generate_token_id(),
+            external_subject: "cust-1".to_string(),
+            name: "Self".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &self_role)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: self_role.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Read,
+                can_read_sensitive: false,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<AccountOpened>()
+            .projection::<CustomerProfile>()
+            .reconciliation_role(admin_subject)
+            .encryption_master_key(EncryptionMasterKey::from_bytes([7u8; 32]))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        // A real direct-creation token, minted the same way the admin
+        // console already would.
+        let event_type = skilj_core::db::get_event_type(&pool, &bc_name, "AccountOpened")
+            .await
+            .unwrap()
+            .unwrap();
+        let token = skilj_core::access_control::create_direct_creation_token(
+            &admin_mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            test_now(),
+        )
+        .unwrap();
+        skilj_core::db::insert_direct_creation_token(&pool, &token)
+            .await
+            .unwrap();
+        let credential = format!("{}.{}", token.id, token.secret);
+
+        let rest_router = skilj.rest_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "payload": { "customer_id": "cust-1", "email": "person@example.com" } })
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = rest_router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let graphql_router = skilj.graphql_router().await.unwrap();
+        let type_name =
+            skilj_graphql::projection_types::graphql_type_name(&bc_name, "CustomerProfile");
+        let query = format!(
+            "query($bc: String!, $key: String) {{ \
+                projection(boundedContext: $bc, name: \"CustomerProfile\", key: $key) {{ \
+                    ... on {type_name} {{ email }} \
+                }} \
+            }}"
+        );
+
+        // Neither grant - ciphertext.
+        let admin_jwt = sign_jwt(&admin_role.external_subject);
+        let response = graphql_request(
+            &graphql_router,
+            Some(&admin_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "cust-1" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        let ciphertext = response["data"]["projection"]["email"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(ciphertext, "person@example.com");
+
+        // Grant (a): can_read_sensitive.
+        let sensitive_jwt = sign_jwt(&sensitive_role.external_subject);
+        let response = graphql_request(
+            &graphql_router,
+            Some(&sensitive_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "cust-1" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["projection"]["email"],
+            "person@example.com"
+        );
+
+        // Grant (b): the caller's own external_subject matches the
+        // instance's own key.
+        let self_jwt = sign_jwt(&self_role.external_subject);
+        let response = graphql_request(
+            &graphql_router,
+            Some(&self_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "cust-1" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["projection"]["email"],
+            "person@example.com"
+        );
+
+        // forgetSubject destroys the key for real - even the previously
+        // can_read_sensitive-granted caller now sees ciphertext again.
+        let response = graphql_request(
+            &graphql_router,
+            Some(&admin_jwt),
+            FORGET_SUBJECT_MUTATION,
+            json!({ "bc": bc_name, "subjectKey": "customer", "subjectValue": "cust-1" }),
+        )
+        .await;
+        assert_eq!(response["data"]["forgetSubject"]["status"], "DESTROYED");
+
+        let response = graphql_request(
+            &graphql_router,
+            Some(&sensitive_jwt),
+            &query,
+            json!({ "bc": bc_name, "key": "cust-1" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(response["data"]["projection"]["email"], ciphertext);
     });
 }

@@ -401,3 +401,119 @@ fn render_command_decrypts_under_can_read_sensitive() {
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(parsed["email"], "person@example.com");
 }
+
+// --- encryption::decrypt_ciphertext_leaves: automatic Projection
+// decrypt-on-read, no `Projection.sensitive_fields` declaration at all
+// (§9's own "read_projection's own decrypt-on-read" pass) ---
+
+#[test]
+fn decrypt_ciphertext_leaves_decrypts_a_top_level_string_leaf() {
+    let master = master_key(12);
+    let (data_key, _, _) = encryption::generate_and_wrap_data_key(&master);
+    let ciphertext = encryption::encrypt_leaf(&data_key, "person@example.com");
+    let mut value = serde_json::json!({ "email": ciphertext, "total": 42 });
+
+    encryption::decrypt_ciphertext_leaves(&mut value, &[data_key]);
+
+    assert_eq!(value["email"], "person@example.com");
+    assert_eq!(value["total"], 42); // never a decrypt candidate - not a string
+}
+
+#[test]
+fn decrypt_ciphertext_leaves_decrypts_a_leaf_nested_inside_an_object() {
+    let master = master_key(13);
+    let (data_key, _, _) = encryption::generate_and_wrap_data_key(&master);
+    let ciphertext = encryption::encrypt_leaf(&data_key, "555-1234");
+    let mut value = serde_json::json!({ "contact": { "phone": ciphertext, "note": "unchanged" } });
+
+    encryption::decrypt_ciphertext_leaves(&mut value, &[data_key]);
+
+    assert_eq!(value["contact"]["phone"], "555-1234");
+    assert_eq!(value["contact"]["note"], "unchanged");
+}
+
+#[test]
+fn decrypt_ciphertext_leaves_decrypts_leaves_nested_inside_a_list_of_objects() {
+    let master = master_key(14);
+    let (data_key, _, _) = encryption::generate_and_wrap_data_key(&master);
+    let a = encryption::encrypt_leaf(&data_key, "alice@example.com");
+    let b = encryption::encrypt_leaf(&data_key, "bob@example.com");
+    let mut value = serde_json::json!({
+        "participants": [
+            { "email": a },
+            { "email": b, "grade": "A" },
+        ]
+    });
+
+    encryption::decrypt_ciphertext_leaves(&mut value, &[data_key]);
+
+    assert_eq!(value["participants"][0]["email"], "alice@example.com");
+    assert_eq!(value["participants"][1]["email"], "bob@example.com");
+    assert_eq!(value["participants"][1]["grade"], "A");
+}
+
+/// A leaf that isn't ciphertext under any candidate key - genuinely plain
+/// data, or ciphertext for some other subject - is left completely
+/// untouched, no panic.
+#[test]
+fn decrypt_ciphertext_leaves_leaves_a_non_matching_string_untouched() {
+    let master = master_key(15);
+    let (data_key, _, _) = encryption::generate_and_wrap_data_key(&master);
+    let mut value = serde_json::json!({ "note": "just a plain string" });
+
+    encryption::decrypt_ciphertext_leaves(&mut value, &[data_key]);
+
+    assert_eq!(value["note"], "just a plain string");
+}
+
+/// The first candidate key that actually decrypts a leaf wins - a leaf
+/// only ever matches the one key it was really encrypted under, the rest
+/// are tried and fail harmlessly.
+#[test]
+fn decrypt_ciphertext_leaves_tries_every_candidate_key_until_one_matches() {
+    let master = master_key(16);
+    let (wrong_key, _, _) = encryption::generate_and_wrap_data_key(&master);
+    let (right_key, _, _) = encryption::generate_and_wrap_data_key(&master);
+    let ciphertext = encryption::encrypt_leaf(&right_key, "secret");
+    let mut value = serde_json::json!({ "field": ciphertext });
+
+    encryption::decrypt_ciphertext_leaves(&mut value, &[wrong_key, right_key]);
+
+    assert_eq!(value["field"], "secret");
+}
+
+#[test]
+fn decrypt_ciphertext_leaves_never_touches_non_string_leaves() {
+    let master = master_key(17);
+    let (data_key, _, _) = encryption::generate_and_wrap_data_key(&master);
+    let mut value = serde_json::json!({ "count": 7, "active": true, "ratio": 1.5, "tag": null });
+
+    encryption::decrypt_ciphertext_leaves(&mut value, &[data_key]);
+
+    assert_eq!(value["count"], 7);
+    assert_eq!(value["active"], true);
+    assert_eq!(value["ratio"], 1.5);
+    assert!(value["tag"].is_null());
+}
+
+// --- projections::read_projection ---
+
+#[test]
+fn read_projection_returns_state_verbatim_when_no_data_keys_were_resolved() {
+    let state = skilj_core::projections::read_projection(r#"{"email":"ZmFrZQ=="}"#, &[]);
+    assert_eq!(state, r#"{"email":"ZmFrZQ=="}"#);
+}
+
+#[test]
+fn read_projection_decrypts_via_the_resolved_data_keys() {
+    let master = master_key(18);
+    let (data_key, _, _) = encryption::generate_and_wrap_data_key(&master);
+    let ciphertext = encryption::encrypt_leaf(&data_key, "person@example.com");
+    let state_json = format!(r#"{{"email":"{ciphertext}","total":3}}"#);
+
+    let decrypted = skilj_core::projections::read_projection(&state_json, &[data_key]);
+
+    let parsed: serde_json::Value = serde_json::from_str(&decrypted).unwrap();
+    assert_eq!(parsed["email"], "person@example.com");
+    assert_eq!(parsed["total"], 3);
+}

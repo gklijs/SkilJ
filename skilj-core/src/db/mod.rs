@@ -316,34 +316,43 @@ async fn provision_bounded_context_schema(
 
     // A building `ProjectionRebuild`'s own private fold - "second ...
     // nothing reads until it is complete" (the note above
-    // `RegisterProjection`), never the same row as the live projection's
+    // `RegisterProjection`), never the same rows as the live projection's
     // own `projection_state` below, since both can exist at once during a
-    // replay window. Seeded lazily by `catch_up_bounded_context`, not
-    // here or at registration time - unlike `projection_state`, there is
-    // no single call site that always has the right starting value (see
-    // `ProjectionDispatcher::default_state`'s own doc comment).
+    // replay window. `key` names which instance a row is (§9's "keyed /
+    // multi-row Projections" pass - see the `entity Projection` note in
+    // the spec) - `""` for a projection that never overrides
+    // `Projection::keys()`, the same single implicit instance every such
+    // projection already had. Always created lazily, on first touch, by
+    // whichever of `insert_event_and_update_sync_projections`/
+    // `catch_up_bounded_context` reaches this key first - there is no
+    // single call site that knows every instance a projection will ever
+    // have ahead of time.
     sqlx::query(&format!(
         "CREATE TABLE {schema}.projection_rebuild_state (
-            projection_name TEXT PRIMARY KEY REFERENCES {schema}.projection_rebuilds (projection_name),
+            projection_name TEXT NOT NULL REFERENCES {schema}.projection_rebuilds (projection_name),
+            key TEXT NOT NULL,
             state TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (projection_name, key)
         )"
     ))
     .execute(&mut **tx)
     .await?;
 
     // A sync projection's own materialised state (`project()`'s own
-    // fold output, JSON-encoded) - see docs/architecture.md's write-up
-    // of §8 item 6. Seeded with `T::State::default()` at registration
-    // time (`upsert_projection`), not created lazily here or on first
-    // fold, so `insert_event_and_update_sync_projections`'s own row lock
-    // always finds a row to lock rather than needing an insert-or-update
-    // branch.
+    // fold output, JSON-encoded, one row per instance/`key` - see the
+    // note on `projection_rebuild_state` just above) - see
+    // docs/architecture.md's write-up of §8 item 6 and §9's "keyed /
+    // multi-row Projections" pass. Created lazily, on first touch, not
+    // seeded at registration time - a projection's own instances aren't
+    // known until events actually name them.
     sqlx::query(&format!(
         "CREATE TABLE {schema}.projection_state (
-            projection_name TEXT PRIMARY KEY REFERENCES {schema}.projections (name),
+            projection_name TEXT NOT NULL REFERENCES {schema}.projections (name),
+            key TEXT NOT NULL,
             state TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (projection_name, key)
         )"
     ))
     .execute(&mut **tx)
@@ -1154,6 +1163,43 @@ pub async fn get_active_data_key(
     }
 }
 
+/// `projections::read_projection`'s own pre-resolution step - every active
+/// `EncryptionKey`'s own `DataKey`, for `subject_value` alone, across
+/// *every* `subject_key` namespace - unlike `get_active_data_key` above,
+/// which needs the exact `subject_key` a declared `SensitiveField` names,
+/// this is the automatic, undeclared case: a projection's own instance
+/// `key` is a subject value with no known-in-advance namespace, so every
+/// namespace with an active key for it is a real candidate (see
+/// `encryption::decrypt_ciphertext_leaves`'s own doc comment for why
+/// trying more than one candidate is safe, not a heuristic). Empty when
+/// nothing matches - no `master_key` needed at all in that case, the
+/// identical "nothing to resolve, no key required" property
+/// `resolve_data_keys_for_reading` already has. A **non-empty** match
+/// with `master_key: None` is the identical hard, actionable
+/// configuration error `resolve_encryption_keys`/`resolve_data_keys_for_reading`
+/// already raise for the same underlying reason - confirmed with the
+/// user before building real decrypt-on-read at all.
+pub async fn list_active_data_keys_for_subject_value(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_value: &str,
+    master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<Vec<DataKey>> {
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<EncryptionKeyRow> = sqlx::query_as(&format!(
+        "SELECT {ENCRYPTION_KEY_COLUMNS} FROM {schema}.encryption_keys \
+         WHERE subject_value = $1 AND status = 'active'"
+    ))
+    .bind(subject_value)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let master_key = master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    rows.iter().map(|row| unwrap_row(master_key, row)).collect()
+}
+
 /// Persists `forget_subject`'s outcome - real crypto-shredding, not just
 /// the status flip: `wrapped_key`/`wrap_nonce` are set to `NULL` in the
 /// same statement, so even the master key can no longer recover this
@@ -1413,70 +1459,111 @@ pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::e
     .await
 }
 
-/// Seeds a projection's own `projection_state` row with
-/// `default_state_json` (`T::State::default()`, serialised) - a no-op
-/// when a row already exists (`ON CONFLICT ... DO NOTHING`), so this is
-/// safe to call on every reconciliation pass, not only the first one
-/// that ever creates the projection - see `provision_bounded_context_schema`'s
-/// own note on why `projection_state` is seeded here rather than
-/// created lazily on first fold.
-pub async fn seed_projection_state(
-    pool: &Pool,
-    bounded_context: &str,
+/// Get-or-create-with-lock for one projection instance's own
+/// `projection_state` row, keyed by `(projection_name, key)` - the
+/// insert-or-update `insert_event_and_update_sync_projections`/
+/// `catch_up_bounded_context` both need now that instances are created
+/// lazily, on first touch, rather than pre-seeded at registration
+/// (§9's "keyed / multi-row Projections" pass). `ON CONFLICT ... DO
+/// UPDATE SET state = {schema}.projection_state.state` is a no-op write
+/// on the already-exists path - it exists purely so Postgres still
+/// acquires the row lock there too (the identical guarantee a plain
+/// `SELECT ... FOR UPDATE` gave the old always-pre-seeded schema),
+/// without ever overwriting real accumulated state with
+/// `default_state_json`. Generic over `impl sqlx::PgExecutor<'_>` (the
+/// same generalisation `insert_event` itself already has) so both
+/// callers can run this inside their own already-open transaction.
+async fn get_or_create_projection_state_for_update(
+    executor: impl sqlx::PgExecutor<'_>,
+    schema: &str,
     projection_name: &str,
+    key: &str,
     default_state_json: &str,
-) -> crate::error::Result<()> {
-    let schema = schema_ident(bounded_context);
-    sqlx::query(&format!(
-        "INSERT INTO {schema}.projection_state (projection_name, state, updated_at) \
-         VALUES ($1, $2, now()) \
-         ON CONFLICT (projection_name) DO NOTHING"
+) -> crate::error::Result<String> {
+    let (state,): (String,) = sqlx::query_as(&format!(
+        "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
+         VALUES ($1, $2, $3, now()) \
+         ON CONFLICT (projection_name, key) DO UPDATE SET state = {schema}.projection_state.state \
+         RETURNING state"
     ))
     .bind(projection_name)
+    .bind(key)
     .bind(default_state_json)
-    .execute(pool)
+    .fetch_one(executor)
     .await?;
-    Ok(())
+    Ok(state)
 }
 
-/// A projection's own materialised state, JSON-encoded - `None` only
-/// when the projection itself isn't registered at all (a real row always
-/// exists otherwise, seeded by `seed_projection_state` at registration
-/// time). For whoever eventually builds `ProjectionQuery`'s own
-/// `read_projection` - not read by anything in this pass, since that
-/// surface isn't built yet (§8 item 6's own scope note).
+/// `get_or_create_projection_state_for_update`'s own twin for
+/// `projection_rebuild_state` - see that function's own doc comment for
+/// the "no-op write, purely to acquire the lock" reasoning, identical
+/// here.
+async fn get_or_create_projection_rebuild_state_for_update(
+    executor: impl sqlx::PgExecutor<'_>,
+    schema: &str,
+    projection_name: &str,
+    key: &str,
+    default_state_json: &str,
+) -> crate::error::Result<String> {
+    let (state,): (String,) = sqlx::query_as(&format!(
+        "INSERT INTO {schema}.projection_rebuild_state (projection_name, key, state, updated_at) \
+         VALUES ($1, $2, $3, now()) \
+         ON CONFLICT (projection_name, key) DO UPDATE SET \
+         state = {schema}.projection_rebuild_state.state \
+         RETURNING state"
+    ))
+    .bind(projection_name)
+    .bind(key)
+    .bind(default_state_json)
+    .fetch_one(executor)
+    .await?;
+    Ok(state)
+}
+
+/// One projection instance's own materialised state, JSON-encoded -
+/// `None` when nothing has touched this `(projection_name, key)` pair
+/// yet (a legitimate, common state now that instances are created
+/// lazily - a customer with no purchase history yet, say - not an
+/// error; `resolvers::projection_query` falls back to
+/// `ProjectionDispatcher::default_state` for it, the same value a fresh
+/// instance would lazily start from).
 pub async fn get_projection_state(
     pool: &Pool,
     bounded_context: &str,
     projection_name: &str,
+    key: &str,
 ) -> crate::error::Result<Option<String>> {
     let schema = schema_ident(bounded_context);
     let row: Option<(String,)> = sqlx::query_as(&format!(
-        "SELECT state FROM {schema}.projection_state WHERE projection_name = $1"
+        "SELECT state FROM {schema}.projection_state WHERE projection_name = $1 AND key = $2"
     ))
     .bind(projection_name)
+    .bind(key)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(state,)| state))
 }
 
-/// A building `ProjectionRebuild`'s own materialised state, JSON-encoded.
-/// `None` when either nothing is staged at all or a staged rebuild hasn't
-/// been seeded yet (`catch_up_bounded_context` hasn't reached it in a
-/// poll tick yet, or the dispatcher has never recognised it - see
-/// `ProjectionDispatcher::default_state`). Mirrors `get_projection_state`
-/// above - for tests and anything else wanting to read this row directly
-/// outside the consumer's own row-locked transaction.
+/// A building `ProjectionRebuild`'s own materialised state, JSON-encoded,
+/// for one instance/`key`. `None` when either nothing is staged at all
+/// or a staged rebuild hasn't reached this key yet (`catch_up_bounded_context`
+/// hasn't reached it in a poll tick yet, or the dispatcher has never
+/// recognised it - see `ProjectionDispatcher::default_state`). Mirrors
+/// `get_projection_state` above - for tests and anything else wanting to
+/// read this row directly outside the consumer's own row-locked
+/// transaction.
 pub async fn get_projection_rebuild_state(
     pool: &Pool,
     bounded_context: &str,
     projection_name: &str,
+    key: &str,
 ) -> crate::error::Result<Option<String>> {
     let schema = schema_ident(bounded_context);
     let row: Option<(String,)> = sqlx::query_as(&format!(
-        "SELECT state FROM {schema}.projection_rebuild_state WHERE projection_name = $1"
+        "SELECT state FROM {schema}.projection_rebuild_state WHERE projection_name = $1 AND key = $2"
     ))
     .bind(projection_name)
+    .bind(key)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(state,)| state))
@@ -2346,27 +2433,50 @@ pub async fn insert_event_and_update_sync_projections(
     }
 
     for projection in &sync_projections {
-        let (current_state,): (String,) = sqlx::query_as(&format!(
-            "SELECT state FROM {schema}.projection_state WHERE projection_name = $1 FOR UPDATE"
-        ))
-        .bind(&projection.name)
-        .fetch_one(&mut *tx)
-        .await?;
+        // `Some(vec![])` (registered, but this event's type isn't
+        // consumed) and `None` (dispatcher doesn't recognise this
+        // projection at all) both fall through to an empty loop below -
+        // zero instances touched either way, `caught_up_to` still
+        // advances unconditionally after it (§9's "keyed / multi-row
+        // Projections" pass).
+        let keys = dispatcher
+            .keys(bounded_context, &projection.name, event)
+            .unwrap_or_default();
+        let default_state_json = dispatcher
+            .default_state(bounded_context, &projection.name)
+            .unwrap_or_default();
 
-        let new_state =
-            match dispatcher.project(bounded_context, &projection.name, &current_state, event) {
+        for key in &keys {
+            let current_state = get_or_create_projection_state_for_update(
+                &mut *tx,
+                &schema,
+                &projection.name,
+                key,
+                &default_state_json,
+            )
+            .await?;
+
+            let new_state = match dispatcher.project(
+                bounded_context,
+                &projection.name,
+                &current_state,
+                event,
+                key,
+            ) {
                 Some(result) => result?,
                 None => current_state,
             };
 
-        sqlx::query(&format!(
-            "UPDATE {schema}.projection_state SET state = $1, updated_at = now() \
-             WHERE projection_name = $2"
-        ))
-        .bind(&new_state)
-        .bind(&projection.name)
-        .execute(&mut *tx)
-        .await?;
+            sqlx::query(&format!(
+                "UPDATE {schema}.projection_state SET state = $1, updated_at = now() \
+                 WHERE projection_name = $2 AND key = $3"
+            ))
+            .bind(&new_state)
+            .bind(&projection.name)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         sqlx::query(&format!(
             "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
@@ -2482,39 +2592,48 @@ pub async fn catch_up_bounded_context(
             if projection.caught_up_to.unwrap_or(-1) >= event.sequence {
                 continue;
             }
-            let existing: Option<(String,)> = sqlx::query_as(&format!(
-                "SELECT state FROM {schema}.projection_state WHERE projection_name = $1 FOR UPDATE"
-            ))
-            .bind(&projection.name)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((current_state,)) = existing else {
-                // Never seeded - either reconciliation for this projection
-                // hasn't run in this process yet, or it was registered
-                // purely via GraphQL with no compiled counterpart to seed
-                // it (see `seed_projection_state`'s own callers). Nothing
-                // to fold into; retried every subsequent tick.
-                continue;
-            };
 
-            let new_state = match dispatcher.project(
-                bounded_context,
-                &projection.name,
-                &current_state,
-                event,
-            ) {
-                Some(result) => result?,
-                None => current_state,
-            };
+            // `Some(vec![])`/`None` both mean zero instances touched -
+            // see `insert_event_and_update_sync_projections`'s own
+            // identical comment.
+            let keys = dispatcher
+                .keys(bounded_context, &projection.name, event)
+                .unwrap_or_default();
+            let default_state_json = dispatcher
+                .default_state(bounded_context, &projection.name)
+                .unwrap_or_default();
 
-            sqlx::query(&format!(
-                "UPDATE {schema}.projection_state SET state = $1, updated_at = now() \
-                 WHERE projection_name = $2"
-            ))
-            .bind(&new_state)
-            .bind(&projection.name)
-            .execute(&mut *tx)
-            .await?;
+            for key in &keys {
+                let current_state = get_or_create_projection_state_for_update(
+                    &mut *tx,
+                    &schema,
+                    &projection.name,
+                    key,
+                    &default_state_json,
+                )
+                .await?;
+
+                let new_state = match dispatcher.project(
+                    bounded_context,
+                    &projection.name,
+                    &current_state,
+                    event,
+                    key,
+                ) {
+                    Some(result) => result?,
+                    None => current_state,
+                };
+
+                sqlx::query(&format!(
+                    "UPDATE {schema}.projection_state SET state = $1, updated_at = now() \
+                     WHERE projection_name = $2 AND key = $3"
+                ))
+                .bind(&new_state)
+                .bind(&projection.name)
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             sqlx::query(&format!(
                 "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
@@ -2529,39 +2648,45 @@ pub async fn catch_up_bounded_context(
             if rebuild.caught_up_to.unwrap_or(-1) >= event.sequence {
                 continue;
             }
-            let existing: Option<(String,)> = sqlx::query_as(&format!(
-                "SELECT state FROM {schema}.projection_rebuild_state WHERE projection_name = $1 \
-                 FOR UPDATE"
-            ))
-            .bind(&rebuild.projection.name)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let current_state = match existing {
-                Some((s,)) => s,
-                None => dispatcher
-                    .default_state(bounded_context, &rebuild.projection.name)
-                    .unwrap_or_else(|| "{}".to_string()),
-            };
 
-            let new_state = match dispatcher.project(
-                bounded_context,
-                &rebuild.projection.name,
-                &current_state,
-                event,
-            ) {
-                Some(result) => result?,
-                None => current_state,
-            };
+            let keys = dispatcher
+                .keys(bounded_context, &rebuild.projection.name, event)
+                .unwrap_or_default();
+            let default_state_json = dispatcher
+                .default_state(bounded_context, &rebuild.projection.name)
+                .unwrap_or_default();
 
-            sqlx::query(&format!(
-                "INSERT INTO {schema}.projection_rebuild_state (projection_name, state, updated_at) \
-                 VALUES ($1, $2, now()) \
-                 ON CONFLICT (projection_name) DO UPDATE SET state = EXCLUDED.state, updated_at = now()"
-            ))
-            .bind(&rebuild.projection.name)
-            .bind(&new_state)
-            .execute(&mut *tx)
-            .await?;
+            for key in &keys {
+                let current_state = get_or_create_projection_rebuild_state_for_update(
+                    &mut *tx,
+                    &schema,
+                    &rebuild.projection.name,
+                    key,
+                    &default_state_json,
+                )
+                .await?;
+
+                let new_state = match dispatcher.project(
+                    bounded_context,
+                    &rebuild.projection.name,
+                    &current_state,
+                    event,
+                    key,
+                ) {
+                    Some(result) => result?,
+                    None => current_state,
+                };
+
+                sqlx::query(&format!(
+                    "UPDATE {schema}.projection_rebuild_state SET state = $1, updated_at = now() \
+                     WHERE projection_name = $2 AND key = $3"
+                ))
+                .bind(&new_state)
+                .bind(&rebuild.projection.name)
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             sqlx::query(&format!(
                 "UPDATE {schema}.projection_rebuilds SET caught_up_to = $1 WHERE projection_name = $2"
@@ -2642,27 +2767,30 @@ pub async fn promote_projection_rebuild(
     .execute(&mut *tx)
     .await?;
 
-    let state_row: Option<(String,)> = sqlx::query_as(&format!(
-        "SELECT state FROM {schema}.projection_rebuild_state WHERE projection_name = $1"
+    // Every instance the rebuild accumulated replaces every live one -
+    // not just one row anymore (§9's "keyed / multi-row Projections"
+    // pass): delete the live set for this projection wholesale, then
+    // copy the rebuild's own set across in its place, the identical
+    // "delete then bulk `INSERT ... SELECT`" shape
+    // `projection_consumed_event_types` just above already uses. A
+    // rebuild whose dispatcher never resolved even once (see this
+    // function's own doc comment) has no rebuild-side rows to copy at
+    // all - the live set is simply left empty, not clobbered with
+    // nothing pretending to be something.
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.projection_state WHERE projection_name = $1"
     ))
     .bind(projection_name)
-    .fetch_optional(&mut *tx)
+    .execute(&mut *tx)
     .await?;
-    if let Some((state,)) = state_row {
-        sqlx::query(&format!(
-            "INSERT INTO {schema}.projection_state (projection_name, state, updated_at) \
-             VALUES ($1, $2, now()) \
-             ON CONFLICT (projection_name) DO UPDATE SET state = EXCLUDED.state, updated_at = now()"
-        ))
-        .bind(projection_name)
-        .bind(&state)
-        .execute(&mut *tx)
-        .await?;
-    }
-    // else: this rebuild's dispatcher never resolved even once (see this
-    // function's own doc comment) - nothing to copy; the live
-    // projection_state row, if any, is left as it was rather than
-    // clobbering real content with nothing.
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
+         SELECT projection_name, key, state, updated_at \
+         FROM {schema}.projection_rebuild_state WHERE projection_name = $1"
+    ))
+    .bind(projection_name)
+    .execute(&mut *tx)
+    .await?;
 
     sqlx::query(&format!(
         "DELETE FROM {schema}.projection_rebuild_state WHERE projection_name = $1"

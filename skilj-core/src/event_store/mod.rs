@@ -19,7 +19,9 @@ use crate::access_control::{
 };
 use crate::encryption::DataKey;
 use crate::error::SkiljRejection;
-use crate::shared::{CommandDecision, Filter, Metadata, SensitiveField, Tag, TagMapping};
+use crate::shared::{
+    CommandDecision, Filter, FilterOperator, Metadata, SensitiveField, Tag, TagMapping,
+};
 
 // TODO: the in-memory per-bounded-context event cache
 // (`query_events`/`count_events`/`create_all_events_subscription`/
@@ -162,10 +164,9 @@ pub enum EncryptionKeyStatus {
 /// `bounded_context`/`subject_key`/`subject_value` alone, never by which
 /// type declared the field (see the note above rule `CreateExternalEvent`),
 /// which is what lets a command and an event naming the same subject
-/// encrypt under the very same key. Provisioning
-/// (`protect_sensitive_fields`'s get-or-create) still stays `todo!()` for
-/// its non-empty-`sensitive_fields` case - only `forget_subject`
-/// (destruction) is real this pass; see this module's own doc comment.
+/// encrypt under the very same key. Both provisioning
+/// (`protect_sensitive_fields`'s get-or-create) and destruction
+/// (`forget_subject`) are real.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionKey {
     pub bounded_context: BoundedContext,
@@ -437,19 +438,165 @@ impl SkiljRejection for Error {
     }
 }
 
+/// A resolved leaf schema's own shape, classified for the "reject
+/// anything that does not land on a scalar or list-of-scalar leaf" check
+/// `valid_tag_mappings`/`valid_sensitive_fields`/`valid_filters` all share
+/// (see the payload schema shape note above `entity CommandType`) -
+/// `valid_filters` additionally uses the `Scalar` case's own `json_type`/
+/// `format` to pick which `FilterOperator`s are valid for that field.
+/// Follows a bare `$ref` itself: `schemars` renders a unit enum via
+/// `$ref` even for a *bare* top-level field (e.g.
+/// `{"$ref": "#/definitions/OrderStatus"}` where `OrderStatus` is itself
+/// `{"type": "string", "enum": [...]}`) - a plain scalar leaf, just
+/// declared indirectly, unlike a `$ref` resolving to a real nested-object
+/// shape (has its own `"properties"` rather than a scalar `"type"`),
+/// which stays `Other` for a bare reference (needs one more dot to reach
+/// a leaf inside it). `resolve_field`'s own dotted branch only follows a
+/// `$ref` when a caller supplies a dot, so a bare reference still needs
+/// resolving here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FieldKind {
+    Scalar {
+        json_type: &'static str,
+        format: Option<String>,
+    },
+    ListOfScalar,
+    Other,
+}
+
+/// A JSON Schema `"type"` value as one string - handles both the plain
+/// `"string"` shape and the `["string","null"]` shape an `Option<T>`
+/// field's `type` carries (nullability itself is decided from `required`
+/// elsewhere - this only recovers the *scalar* kind either shape names).
+/// Mirrors `skilj-graphql::projection_types::json_type_str` exactly - the
+/// identical extraction, needed again here since `skilj-core` can't
+/// depend on `skilj-graphql`.
+fn json_type_str(type_value: &serde_json::Value) -> Option<&str> {
+    match type_value {
+        serde_json::Value::String(s) => Some(s.as_str()),
+        serde_json::Value::Array(arr) => {
+            arr.iter().find_map(|v| v.as_str().filter(|s| *s != "null"))
+        }
+        _ => None,
+    }
+}
+
+fn classify(
+    schema: &serde_json::Value,
+    definitions: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> FieldKind {
+    if let Some(def_name) = schema
+        .get("$ref")
+        .and_then(|v| v.as_str())
+        .and_then(|r| r.rsplit('/').next())
+    {
+        return definitions
+            .and_then(|defs| defs.get(def_name))
+            .map(|resolved| classify(resolved, definitions))
+            .unwrap_or(FieldKind::Other);
+    }
+    match schema.get("type").and_then(json_type_str) {
+        Some(t @ ("string" | "integer" | "number" | "boolean")) => FieldKind::Scalar {
+            // Interned via a small match, not the borrowed &str - FieldKind::Scalar
+            // needs 'static so it can be constructed without carrying schema's own lifetime.
+            json_type: match t {
+                "string" => "string",
+                "integer" => "integer",
+                "number" => "number",
+                _ => "boolean",
+            },
+            format: schema
+                .get("format")
+                .and_then(|f| f.as_str())
+                .map(String::from),
+        },
+        Some("array") => match schema
+            .get("items")
+            .and_then(|i| i.get("type"))
+            .and_then(json_type_str)
+        {
+            Some("string" | "integer" | "number" | "boolean") => FieldKind::ListOfScalar,
+            _ => FieldKind::Other, // an array of non-scalar items - not a target either
+        },
+        _ => FieldKind::Other, // "object" (incl. a $ref resolved to one), unknown, or absent
+    }
+}
+
+/// `resolve_field` plus the shape check every caller of it here actually
+/// needs: `None` when the field doesn't resolve at all, or resolves to
+/// something that isn't a scalar or list-of-scalar leaf.
+fn resolve_field_kind(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    definitions: Option<&serde_json::Map<String, serde_json::Value>>,
+    field: &str,
+) -> Option<FieldKind> {
+    match classify(resolve_field(properties, definitions, field)?, definitions) {
+        FieldKind::Other => None,
+        kind => Some(kind),
+    }
+}
+
+/// The type-to-operator matrix (see the note above rule `FetchEvents`:
+/// "the exact type-to-operator matrix... is deliberately not enumerated
+/// here... exactly the kind of mechanism this spec consistently hands to
+/// a black box"). `format` values `"date-time"`/`"date"`/
+/// `"partial-date-time"` (`chrono::DateTime<Utc>`/`NaiveDate`/`NaiveTime`'s
+/// own three renderings) additionally get ordering operators - see
+/// `matches_filters`' own `string_ordering` for why the comparison itself
+/// needs real parsing, not plain string `Ord`, despite the check here
+/// being schema-driven.
+fn filter_operator_is_valid(kind: &FieldKind, operator: FilterOperator) -> bool {
+    match kind {
+        FieldKind::Scalar {
+            json_type: "string",
+            format,
+        } => {
+            matches!(
+                operator,
+                FilterOperator::Equals | FilterOperator::Contains | FilterOperator::IsLike
+            ) || (matches!(
+                format.as_deref(),
+                Some("date-time" | "date" | "partial-date-time")
+            ) && matches!(
+                operator,
+                FilterOperator::GreaterThan | FilterOperator::LessThan
+            ))
+        }
+        FieldKind::Scalar {
+            json_type: "integer" | "number",
+            ..
+        } => matches!(
+            operator,
+            FilterOperator::Equals | FilterOperator::GreaterThan | FilterOperator::LessThan
+        ),
+        FieldKind::Scalar {
+            json_type: "boolean",
+            ..
+        } => operator == FilterOperator::Equals,
+        FieldKind::Scalar { .. } => false, // unreachable - classify only ever sets one of the four above
+        FieldKind::ListOfScalar => operator == FilterOperator::Contains,
+        FieldKind::Other => false,
+    }
+}
+
 /// Black box shared with `QueryEvents`/`CountEvents` (see the note above
 /// rule `FetchEvents` and docs/architecture.md's "black boxes" list) -
-/// not owned by the EventFetch pilot. The empty-filter case is real and
-/// sufficient for every EventFetch obligation (none of them exercise
-/// filter semantics themselves); field/operator type-checking against
-/// `EventType.schema` is deferred to whichever surface propagates filter
-/// semantics first.
-pub fn valid_filters(_event_type: &EventType, filters: &[Filter]) -> bool {
+/// not owned by the EventFetch pilot. Checks two things per filter: that
+/// `field` names a field `event_type.schema` actually declares (bare or
+/// a two-segment dotted path - see `resolve_field`), and that `operator`
+/// is one that field's declared type supports (see `filter_operator_is_valid`).
+pub fn valid_filters(event_type: &EventType, filters: &[Filter]) -> bool {
     if filters.is_empty() {
-        true
-    } else {
-        todo!("valid_filters: field/operator type-checking against EventType.schema - deferred, see doc comment above")
+        return true;
     }
+    let Some(properties) = schema_properties(&event_type.schema) else {
+        return false;
+    };
+    let definitions = schema_definitions(&event_type.schema);
+    filters.iter().all(|f| {
+        resolve_field_kind(&properties, definitions.as_ref(), &f.field)
+            .is_some_and(|kind| filter_operator_is_valid(&kind, f.operator))
+    })
 }
 
 /// Parses `schema` as a JSON Schema object and returns its top-level
@@ -462,6 +609,17 @@ pub fn valid_filters(_event_type: &EventType, filters: &[Filter]) -> bool {
 fn schema_properties(schema: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
     let parsed: serde_json::Value = serde_json::from_str(schema).ok()?;
     parsed.get("properties")?.as_object().cloned()
+}
+
+/// `schema`'s own top-level `"definitions"` map - named reusable nested
+/// shapes a `"$ref"` elsewhere in the same schema points at (see
+/// `skilj-graphql::projection_types`'s own identical extraction for
+/// GraphQL type generation). `None` for anything that doesn't parse or
+/// declares none, the same "absence reads as empty" treatment
+/// `schema_properties` gives `properties`.
+fn schema_definitions(schema: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let parsed: serde_json::Value = serde_json::from_str(schema).ok()?;
+    parsed.get("definitions")?.as_object().cloned()
 }
 
 /// `schema`'s top-level `required` array, as field names - `[]` for
@@ -483,38 +641,48 @@ fn schema_required(schema: &str) -> Vec<String> {
 /// Resolves a `FieldPath` - a bare top-level field name, or a two-segment
 /// dotted path reaching one leaf inside a named nested shape - to the
 /// property schema object it names, per the payload schema shape note
-/// above `entity CommandType`. Real for the bare-name case, the common
-/// one every obligation propagated so far exercises; a dotted path
-/// additionally requires walking one level into the outer field's own
-/// nested `properties`, deferred (`todo!()`) to whichever pass needs
-/// named reusable nested shapes exercised for real - the same
-/// trivial/deferred split every other black box in this module has.
+/// above `entity CommandType`. The bare-name case is a direct
+/// `properties` lookup; a dotted path resolves its outer segment in
+/// `properties`, follows that property's own `"$ref"` into `definitions`
+/// (the same pattern `skilj-graphql::projection_types::build_field`
+/// already uses for GraphQL type generation, reused for consistency
+/// rather than reinvented), then looks the inner segment up in the
+/// resolved nested shape's own `properties`. `?`-chained throughout, so
+/// anything not shaped exactly right (no `$ref`, unknown definition
+/// name, no nested `properties`) falls through to `None` - "reject,
+/// don't guess", same as the bare-name case already does.
 fn resolve_field<'a>(
     properties: &'a serde_json::Map<String, serde_json::Value>,
+    definitions: Option<&'a serde_json::Map<String, serde_json::Value>>,
     field: &str,
 ) -> Option<&'a serde_json::Value> {
     match field.split_once('.') {
         None => properties.get(field),
-        Some(_) => todo!(
-            "resolve_field: one-level dotted-path resolution into a named nested shape - deferred, see doc comment above"
-        ),
+        Some((outer, inner)) => {
+            let def_name = properties
+                .get(outer)?
+                .get("$ref")?
+                .as_str()?
+                .rsplit('/')
+                .next()?;
+            definitions?.get(def_name)?.get("properties")?.get(inner)
+        }
     }
 }
 
 /// `resolve_field`'s own counterpart against a *payload* (real JSON data)
 /// rather than a *schema* (property definitions) - `protect_sensitive_fields`'s
-/// own field/subject_field lookup. Same trivial/deferred split: the bare
-/// top-level case is real, a dotted path is `todo!()`, for the identical
-/// reason `resolve_field` itself defers it.
+/// own field/subject_field lookup. No `definitions` needed here: real
+/// data has no `$ref`s, so a dotted path is simply nested `get` calls -
+/// absence at either segment falls through to `None`, the same as the
+/// bare-name case already does.
 fn payload_field_value<'a>(
     payload: &'a serde_json::Value,
     field: &str,
 ) -> Option<&'a serde_json::Value> {
     match field.split_once('.') {
         None => payload.get(field),
-        Some(_) => todo!(
-            "payload_field_value: one-level dotted-path resolution into a named nested shape - deferred, see resolve_field's own doc comment"
-        ),
+        Some((outer, inner)) => payload.get(outer)?.get(inner),
     }
 }
 
@@ -526,9 +694,7 @@ fn payload_field_value_mut<'a>(
 ) -> Option<&'a mut serde_json::Value> {
     match field.split_once('.') {
         None => payload.get_mut(field),
-        Some(_) => todo!(
-            "payload_field_value_mut: one-level dotted-path resolution into a named nested shape - deferred, see resolve_field's own doc comment"
-        ),
+        Some((outer, inner)) => payload.get_mut(outer)?.get_mut(inner),
     }
 }
 
@@ -547,11 +713,16 @@ fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
 }
 
 /// Black box (see the note above rule `RegisterEventType`): "every
-/// `TagMapping.field` names a field the schema declares" - real for the
-/// bare-field-name case (see `resolve_field`). Takes `schema` alone, not
-/// a whole `EventType`/`CommandType` - the identical `String` on both,
-/// same treatment `protect_sensitive_fields`/`derive_tags` get for
-/// `sensitive_fields`/`tag_mappings`.
+/// `TagMapping.field` names a field the schema declares" - covers both a
+/// bare field name and a two-segment dotted path into a named nested
+/// shape, and rejects a field that doesn't land on a scalar or
+/// list-of-scalar leaf (see `resolve_field_kind` - the payload schema
+/// shape note above `entity CommandType` calls for this on all three of
+/// `valid_tag_mappings`/`valid_sensitive_fields`/`valid_filters`, not
+/// just the last). Takes `schema` alone, not a whole `EventType`/
+/// `CommandType` - the identical `String` on both, same treatment
+/// `protect_sensitive_fields`/`derive_tags` get for `sensitive_fields`/
+/// `tag_mappings`.
 pub fn valid_tag_mappings(schema: &str, tag_mappings: &[TagMapping]) -> bool {
     if tag_mappings.is_empty() {
         return true;
@@ -559,13 +730,14 @@ pub fn valid_tag_mappings(schema: &str, tag_mappings: &[TagMapping]) -> bool {
     let Some(properties) = schema_properties(schema) else {
         return false;
     };
+    let definitions = schema_definitions(schema);
     tag_mappings
         .iter()
-        .all(|m| resolve_field(&properties, &m.field).is_some())
+        .all(|m| resolve_field_kind(&properties, definitions.as_ref(), &m.field).is_some())
 }
 
 /// Black box (see the note above rule `RegisterEventType`): the same
-/// existence check as `valid_tag_mappings` above, for both
+/// existence-and-shape check as `valid_tag_mappings` above, for both
 /// `SensitiveField.field` and `SensitiveField.subject_field`.
 pub fn valid_sensitive_fields(schema: &str, sensitive_fields: &[SensitiveField]) -> bool {
     if sensitive_fields.is_empty() {
@@ -574,9 +746,10 @@ pub fn valid_sensitive_fields(schema: &str, sensitive_fields: &[SensitiveField])
     let Some(properties) = schema_properties(schema) else {
         return false;
     };
+    let definitions = schema_definitions(schema);
     sensitive_fields.iter().all(|s| {
-        resolve_field(&properties, &s.field).is_some()
-            && resolve_field(&properties, &s.subject_field).is_some()
+        resolve_field_kind(&properties, definitions.as_ref(), &s.field).is_some()
+            && resolve_field_kind(&properties, definitions.as_ref(), &s.subject_field).is_some()
     })
 }
 
@@ -623,13 +796,138 @@ pub fn schema_is_backwards_compatible(existing_schema: &str, schema: &str) -> bo
     true
 }
 
-/// See `valid_filters` above - same deferral, same empty-filter fast path.
-pub fn matches_filters(_event: &Event, filters: &[Filter]) -> bool {
-    if filters.is_empty() {
-        true
-    } else {
-        todo!("matches_filters - deferred, see valid_filters above")
+/// Classic SQL-LIKE matching for `FilterOperator::IsLike` - `%` matches
+/// any run of characters (including none), `_` matches exactly one
+/// character, everything else matches itself literally. Case-sensitive,
+/// whole-string anchored (no implicit substring search - that's what
+/// `Contains` is for). Standard DP wildcard-matching, operating on
+/// `Vec<char>` for UTF-8 safety rather than byte indexing; no `regex`
+/// dependency needed for this.
+fn like_matches(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut dp = vec![vec![false; pattern.len() + 1]; text.len() + 1];
+    dp[0][0] = true;
+    for j in 1..=pattern.len() {
+        if pattern[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        }
     }
+    for i in 1..=text.len() {
+        for j in 1..=pattern.len() {
+            dp[i][j] = match pattern[j - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && text[i - 1] == c,
+            };
+        }
+    }
+    dp[text.len()][pattern.len()]
+}
+
+/// `GreaterThan`/`LessThan` for a string leaf. `matches_filters` has no
+/// schema, so unlike `valid_filters` it can't know in advance which of
+/// the three ordered formats (`date-time`/`date`/`partial-date-time`)
+/// it's looking at - tries each of `chrono::DateTime`'s/`NaiveDate`'s/
+/// `NaiveTime`'s own parsers in turn on *both* sides, since each format
+/// only parses its own shape. Real typed comparison (`PartialOrd`), not
+/// raw string `Ord` - plain string comparison is provably wrong here:
+/// chrono's own serde serialization trims trailing-zero fractional
+/// digits, even down to no fractional part at all when it's exactly
+/// zero, so e.g. `"...:00Z"` sorts *after* `"...:00.500Z"` as plain
+/// strings despite being chronologically earlier (`'Z'` > `'.'`).
+/// `valid_filters` already gated the field to one of these three formats
+/// before a caller could reach this at all; a value that doesn't parse
+/// under any of them here just doesn't match - the same "reject
+/// gracefully rather than panic" register as everywhere else in this
+/// module.
+fn string_ordering(payload: &str, filter_value: &str, operator: FilterOperator) -> bool {
+    fn cmp<T: PartialOrd>(a: T, b: T, operator: FilterOperator) -> bool {
+        match operator {
+            FilterOperator::GreaterThan => a > b,
+            FilterOperator::LessThan => a < b,
+            _ => false,
+        }
+    }
+    if let (Ok(a), Ok(b)) = (
+        chrono::DateTime::parse_from_rfc3339(payload),
+        chrono::DateTime::parse_from_rfc3339(filter_value),
+    ) {
+        return cmp(a, b, operator);
+    }
+    if let (Ok(a), Ok(b)) = (
+        chrono::NaiveDate::parse_from_str(payload, "%Y-%m-%d"),
+        chrono::NaiveDate::parse_from_str(filter_value, "%Y-%m-%d"),
+    ) {
+        return cmp(a, b, operator);
+    }
+    if let (Ok(a), Ok(b)) = (
+        chrono::NaiveTime::parse_from_str(payload, "%H:%M:%S%.f"),
+        chrono::NaiveTime::parse_from_str(filter_value, "%H:%M:%S%.f"),
+    ) {
+        return cmp(a, b, operator);
+    }
+    false
+}
+
+fn matches_one_filter(payload: &serde_json::Value, filter: &Filter) -> bool {
+    // Absent field never matches a comparison filter - `valid_filters`
+    // guarantees the field exists and is scalar/list-shaped in the
+    // *schema*; this only fires for a legitimately-optional field absent
+    // on this one specific event instance.
+    let Some(value) = payload_field_value(payload, &filter.field) else {
+        return false;
+    };
+    match value {
+        serde_json::Value::Array(items) => {
+            filter.operator == FilterOperator::Contains
+                && items.iter().any(|item| {
+                    json_scalar_to_string(item).as_deref() == Some(filter.value.as_str())
+                })
+        }
+        serde_json::Value::String(s) => match filter.operator {
+            FilterOperator::Equals => s == &filter.value,
+            FilterOperator::Contains => s.contains(filter.value.as_str()),
+            FilterOperator::IsLike => like_matches(s, &filter.value),
+            FilterOperator::GreaterThan | FilterOperator::LessThan => {
+                string_ordering(s, &filter.value, filter.operator)
+            }
+        },
+        serde_json::Value::Number(n) => {
+            let (Some(a), Ok(b)) = (n.as_f64(), filter.value.parse::<f64>()) else {
+                return false;
+            };
+            match filter.operator {
+                FilterOperator::Equals => a == b,
+                FilterOperator::GreaterThan => a > b,
+                FilterOperator::LessThan => a < b,
+                FilterOperator::Contains | FilterOperator::IsLike => false,
+            }
+        }
+        serde_json::Value::Bool(b) => {
+            filter.operator == FilterOperator::Equals && b.to_string() == filter.value
+        }
+        serde_json::Value::Null | serde_json::Value::Object(_) => false,
+    }
+}
+
+/// Black box (see the note above rule `FetchEvents`, also used by
+/// `ConsumeEvents`/`DeliverToSubscriptions`). Real now: parses
+/// `event.payload` once, then per filter resolves `field` via
+/// `payload_field_value` (bare or dotted, real since `derive_tags`) and
+/// matches on the actual runtime `serde_json::Value` - no schema access
+/// needed here, unlike `valid_filters`, which is what already gates
+/// which operator a given field can ever receive. A payload that somehow
+/// fails to parse as JSON (shouldn't happen - always valid JSON by the
+/// time it's stored) falls through to no match rather than panicking.
+pub fn matches_filters(event: &Event, filters: &[Filter]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) else {
+        return false;
+    };
+    filters.iter().all(|f| matches_one_filter(&payload, f))
 }
 
 /// The greatest `Event.sequence` among a set of events, or `None` when
@@ -741,19 +1039,57 @@ pub fn sensitive_field_subjects(
     subjects
 }
 
-/// Black box (see the note above `derive_tags` in the spec). Same
-/// deferral as `protect_sensitive_fields` above: real for the empty-
-/// `tag_mappings` case (no tags to derive), `todo!()` otherwise - walking
-/// a JSON payload to read a mapped field out of it is a different
-/// surface's obligation to add. Same "takes `tag_mappings` alone, not a
-/// whole `EventType`/`CommandType`" treatment as `protect_sensitive_fields`
-/// above, for the identical reason.
-pub fn derive_tags(tag_mappings: &[TagMapping], _payload: &str) -> Vec<Tag> {
-    if tag_mappings.is_empty() {
-        Vec::new()
-    } else {
-        todo!("derive_tags: walk payload per TagMapping, including the list/optional-field cases - deferred, see doc comment above")
+/// Pushes `Tag { key, value }` onto `tags` unless an identical tag is
+/// already present - `derive_tags`'s own "Set<Tag>" dedup, kept as a
+/// small helper rather than inlined since it's needed at two call sites
+/// below (the per-mapping "absent" fallback, and each distinct list
+/// element).
+fn push_unique_tag(tags: &mut Vec<Tag>, key: &str, value: Option<String>) {
+    let tag = Tag {
+        key: key.to_string(),
+        value,
+    };
+    if !tags.contains(&tag) {
+        tags.push(tag);
     }
+}
+
+/// Black box (see the note above `derive_tags` in the spec). Real now:
+/// per `TagMapping`, `payload_field_value` resolves `field` (bare or
+/// dotted, see its own doc comment) against the parsed payload. A
+/// non-empty JSON array pushes one `Tag(key, value: e)` per **distinct**
+/// scalar element (`json_scalar_to_string`) - a non-scalar element is
+/// silently skipped, undefined input rather than a spurious "absent"
+/// tag. Everything else - a present scalar, an explicit `null`, an empty
+/// array, or the field missing entirely - falls through to
+/// `json_scalar_to_string`'s own `None`-for-non-scalar behaviour, which
+/// already collapses every one of those onto the single correct
+/// `Tag(key, value: null)` "absent" state with no extra branching.
+/// `tag_mappings` empty needs no payload parse at all.
+pub fn derive_tags(tag_mappings: &[TagMapping], payload: &str) -> Vec<Tag> {
+    if tag_mappings.is_empty() {
+        return Vec::new();
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
+    let mut tags = Vec::new();
+    for mapping in tag_mappings {
+        let value = payload_field_value(&parsed, &mapping.field);
+        match value.and_then(|v| v.as_array()) {
+            Some(elements) if !elements.is_empty() => {
+                for element in elements {
+                    if let Some(scalar) = json_scalar_to_string(element) {
+                        push_unique_tag(&mut tags, &mapping.key, Some(scalar));
+                    }
+                }
+            }
+            _ => {
+                let scalar = value.and_then(json_scalar_to_string);
+                push_unique_tag(&mut tags, &mapping.key, scalar);
+            }
+        }
+    }
+    tags
 }
 
 /// The two-grant test itself (see the note above rule

@@ -20,19 +20,36 @@ use skilj_core::plugin::ProjectionDispatcher;
 use skilj_core::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use skilj_core::shared::{generate_token_id, Metadata};
 
-/// Same two registered projections `sync_projections.rs`'s own
-/// `TestDispatcher` has (`"AccountBalance"`/`"EventCount"`), plus
-/// `default_state` - the one thing this test double needs that the sync
-/// path never called.
+/// Same registered projection `sync_projections.rs`'s own `TestDispatcher`
+/// has (`"AccountBalance"`), single implicit key throughout - this file's
+/// own coverage is the async/rebuild machinery, not keyed projections
+/// (already covered directly by `sync_projections.rs`'s own
+/// `TransferBalances`), so there's no need to duplicate that here too.
 struct TestDispatcher;
 
 impl ProjectionDispatcher for TestDispatcher {
+    fn keys(
+        &self,
+        _bounded_context: &str,
+        projection_name: &str,
+        event: &Event,
+    ) -> Option<Vec<String>> {
+        match projection_name {
+            "AccountBalance" if event.event_type.name == "MoneyDeposited" => {
+                Some(vec![String::new()])
+            }
+            "AccountBalance" => Some(Vec::new()),
+            _ => None,
+        }
+    }
+
     fn project(
         &self,
         _bounded_context: &str,
         projection_name: &str,
         state_json: &str,
         event: &Event,
+        _key: &str,
     ) -> Option<skilj_core::error::Result<String>> {
         match projection_name {
             "AccountBalance" => {
@@ -47,19 +64,13 @@ impl ProjectionDispatcher for TestDispatcher {
                 let amount = payload["amount"].as_i64().unwrap_or(0);
                 Some(Ok((current + amount).to_string()))
             }
-            "EventCount" => {
-                let current: i64 = state_json
-                    .parse()
-                    .expect("test state is always a plain i64");
-                Some(Ok((current + 1).to_string()))
-            }
             _ => None,
         }
     }
 
     fn default_state(&self, _bounded_context: &str, projection_name: &str) -> Option<String> {
         match projection_name {
-            "AccountBalance" | "EventCount" => Some("0".to_string()),
+            "AccountBalance" => Some("0".to_string()),
             _ => None,
         }
     }
@@ -181,11 +192,12 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str) -> EventT
     et
 }
 
-/// Registers a `sync = false` `Projection` consuming `consumed`, seeding
-/// its `projection_state` row at `"0"` - the same shape
-/// `SkiljBuilder::projection::<T>()`'s own reconciliation does for a real
-/// `T::State::default()`, regardless of `sync` (see
-/// `reconcile_projections`'s own `Created`/`ReconciledTrivially` branch).
+/// Registers a `sync = false` `Projection` consuming `consumed` - no
+/// `projection_state` seeding anymore (§9's "keyed / multi-row
+/// Projections" pass): each instance's own row is created lazily, on
+/// first touch, starting from `TestDispatcher::default_state`'s own
+/// `"0"`, the same shape `SkiljBuilder::projection::<T>()`'s own
+/// reconciliation gives a real `T::State::default()`.
 async fn seed_async_projection(
     pool: &Pool,
     bc: &BoundedContext,
@@ -202,9 +214,6 @@ async fn seed_async_projection(
         caught_up_to: None,
     };
     db::upsert_projection(pool, &projection).await.unwrap();
-    db::seed_projection_state(pool, &bc.name, name, "0")
-        .await
-        .unwrap();
     projection
 }
 
@@ -250,7 +259,7 @@ fn a_cold_start_catch_up_folds_every_existing_event() {
             .await
             .unwrap();
 
-        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance")
+        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
             .await
             .unwrap();
         assert_eq!(state, Some("25".to_string()));
@@ -281,7 +290,7 @@ fn a_second_tick_with_no_new_events_is_a_no_op() {
             .await
             .unwrap();
 
-        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance")
+        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
             .await
             .unwrap();
         assert_eq!(state, Some("20".to_string()));
@@ -320,7 +329,7 @@ fn a_building_rebuild_replays_from_the_start_and_promotes_once_caught_up() {
             .unwrap();
         assert_eq!(mid_projection.caught_up_to, Some(first_seq));
         assert_eq!(
-            db::get_projection_state(&pool, &bc.name, "AccountBalance")
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
                 .await
                 .unwrap(),
             Some("20".to_string())
@@ -366,7 +375,7 @@ fn a_building_rebuild_replays_from_the_start_and_promotes_once_caught_up() {
         assert_eq!(promoted.caught_up_to, Some(last_seq));
 
         assert_eq!(
-            db::get_projection_state(&pool, &bc.name, "AccountBalance")
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
                 .await
                 .unwrap(),
             Some("25".to_string())

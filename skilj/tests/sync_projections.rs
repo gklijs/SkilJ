@@ -95,7 +95,7 @@ impl Projection for AccountBalance {
     fn sync() -> bool {
         true
     }
-    fn project(state: &mut Self::State, event: &Self::Event) {
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
         let BankingEvent::MoneyDeposited(payload) = event;
         state.total += payload.amount;
     }
@@ -241,13 +241,14 @@ fn triggering_a_command_updates_a_real_sync_projection_through_rest() {
             .unwrap();
         assert_eq!(report.skipped_no_access, Vec::<String>::new());
 
-        // The projection starts at its own default state, seeded at
-        // registration time.
-        let initial_state = db::get_projection_state(&pool, &bc_name, "AccountBalance")
+        // No instance exists yet - nothing is seeded at registration time
+        // anymore (§9's "keyed / multi-row Projections" pass): the
+        // implicit `""` instance is created lazily, the first time a
+        // consumed event actually touches it.
+        let initial_state = db::get_projection_state(&pool, &bc_name, "AccountBalance", "")
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(initial_state, r#"{"total":0}"#);
+        assert_eq!(initial_state, None);
 
         let command_type = db::get_command_type(&pool, &bc_name, "WithdrawMoney")
             .await
@@ -278,7 +279,7 @@ fn triggering_a_command_updates_a_real_sync_projection_through_rest() {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["accepted"], true);
 
-        let state = db::get_projection_state(&pool, &bc_name, "AccountBalance")
+        let state = db::get_projection_state(&pool, &bc_name, "AccountBalance", "")
             .await
             .unwrap()
             .unwrap();
@@ -295,7 +296,7 @@ fn triggering_a_command_updates_a_real_sync_projection_through_rest() {
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let state = db::get_projection_state(&pool, &bc_name, "AccountBalance")
+        let state = db::get_projection_state(&pool, &bc_name, "AccountBalance", "")
             .await
             .unwrap()
             .unwrap();

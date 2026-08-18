@@ -575,9 +575,9 @@ fn matching_events_never_exceed_their_own_boundary() {
 // "every tag in c.consistency_tags matches one of c.command_type.tag_mappings"
 // holds by construction of derive_tags, not a separate check - same
 // "true by construction" treatment as the by-construction tests above.
-// Real for the empty-tag_mappings case, per derive_tags' own doc comment:
-// empty tag_mappings can only ever derive an empty consistency_tags,
-// which vacuously satisfies the invariant.
+// Covered for both the empty-tag_mappings case (vacuously, per
+// derive_tags' own doc comment) and a real, non-empty tag_mappings case
+// below, now that derive_tags is real.
 
 #[test]
 fn command_consistency_tags_are_empty_when_the_command_type_declares_no_tag_mappings() {
@@ -597,6 +597,100 @@ fn command_consistency_tags_are_empty_when_the_command_type_declares_no_tag_mapp
     .unwrap();
 
     assert!(result.command.consistency_tags.is_empty());
+}
+
+#[test]
+fn command_consistency_tags_are_derived_for_real_from_a_real_tag_mapping() {
+    let ct = command_type(
+        true,
+        vec![skilj_core::shared::TagMapping {
+            key: "account".into(),
+            field: "account_id".into(),
+        }],
+    );
+
+    let result = event_store::process_command(
+        &ct,
+        r#"{"account_id":"A"}"#,
+        "trigger-adapter",
+        &[],
+        accepted(Vec::new()),
+        |_| None,
+        || 0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap();
+
+    assert_eq!(result.command.consistency_tags, vec![tag("account", "A")]);
+}
+
+#[test]
+fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
+    // Two commands against the same bounded context, sharing a tag key
+    // ("account") derived from real payloads via real `derive_tags` -
+    // unlike every other DCB test in this file, which hand-builds its
+    // own `Tag`/`Event` fixtures directly.
+    let ct = command_type(
+        true,
+        vec![skilj_core::shared::TagMapping {
+            key: "account".into(),
+            field: "account_id".into(),
+        }],
+    );
+
+    let first = event_store::process_command(
+        &ct,
+        r#"{"account_id":"A"}"#,
+        "trigger-adapter",
+        &[],
+        accepted(Vec::new()),
+        |_| None,
+        || 1,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap();
+
+    assert_eq!(first.command.consistency_tags, vec![tag("account", "A")]);
+
+    // A prior event carrying the same real-derived tag is now in the
+    // bounded context's history; a second command against the same
+    // account must see it as its own consistency boundary/matching set.
+    let prior_event = Event {
+        bounded_context: bounded_context(BoundedContextStatus::Active),
+        event_type: event_type(),
+        payload: r#"{"account_id":"A"}"#.into(),
+        metadata: skilj_core::shared::Metadata {
+            r#type: "FundsWithdrawn".into(),
+            version: 1,
+            client_id: "trigger-adapter".into(),
+            created_at: timestamp(1),
+        },
+        sequence: 1,
+        tags: first.command.consistency_tags.clone(),
+        encryption_keys: Vec::new(),
+        origin: EventOrigin::CommandTriggered {
+            command: Box::new(first.command.clone()),
+        },
+    };
+
+    let (boundary, matching) = event_store::consistency_boundary_and_matching_events(
+        std::slice::from_ref(&prior_event),
+        &event_store::derive_tags(&ct.tag_mappings, r#"{"account_id":"A"}"#),
+    );
+
+    assert_eq!(boundary, Some(1));
+    assert_eq!(matching.len(), 1);
+    assert_eq!(matching[0].payload, r#"{"account_id":"A"}"#);
+
+    // A different account's tag doesn't match at all.
+    let (boundary_other, matching_other) = event_store::consistency_boundary_and_matching_events(
+        std::slice::from_ref(&prior_event),
+        &event_store::derive_tags(&ct.tag_mappings, r#"{"account_id":"B"}"#),
+    );
+    assert_eq!(boundary_other, None);
+    assert!(matching_other.is_empty());
 }
 
 // ---------------------------------------------------------------------

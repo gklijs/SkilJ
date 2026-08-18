@@ -936,12 +936,10 @@ pub fn encryption_key_object() -> Object {
 }
 
 /// `value Filter`'s own `operator` field. `resolvers::event_subscription`'s
-/// own `eventsByType(filters: ...)` is this type's only user - `filters`
-/// is real wire-shape (matching `CreateEventTypeSubscription`'s own
-/// signature faithfully), but a non-empty list is rejected eagerly at
-/// the resolver (see `resolvers::parse_filters`'s own doc comment for
-/// why) rather than ever reaching `matches_filters`'s still-`todo!()`
-/// non-empty case.
+/// own `eventsByType(filters: ...)` is this type's only user - real wire
+/// shape (matching `CreateEventTypeSubscription`'s own signature
+/// faithfully) and real behaviour end to end now that `matches_filters`/
+/// `valid_filters` are real.
 pub fn filter_operator_enum() -> Enum {
     Enum::new("FilterOperator")
         .item("EQUALS")

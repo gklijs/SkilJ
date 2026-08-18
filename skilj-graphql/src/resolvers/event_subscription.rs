@@ -19,12 +19,10 @@
 //! (also unchanged) per delivered event against a *freshly refetched*
 //! `access_mapping` - never the snapshot captured at subscribe time (see
 //! below). `filters` is real wire-shape (matching
-//! `CreateEventTypeSubscription`'s own signature faithfully - not
-//! silently dropped), but a non-empty list is rejected eagerly, the
-//! identical precedent REST's own `GET /v1/events` route already set for
-//! the same underlying reason: `matches_filters`/`valid_filters` are
-//! still `todo!()` for their non-empty case, an existing,
-//! separately-tracked gap this pass doesn't newly touch.
+//! `CreateEventTypeSubscription`'s own signature faithfully) and real
+//! behaviour now that `matches_filters`/`valid_filters` are real -
+//! `create_event_type_subscription`'s own `valid_filters` call rejects an
+//! invalid filter the normal way, via `to_graphql_error`.
 //!
 //! **Ending the stream, never silently continuing** - both cases below
 //! yield exactly one final `Err` then return, the "stop polling the
@@ -58,15 +56,6 @@ fn subscription_lagged_error(skipped: u64) -> async_graphql::Error {
          reconnect and, if needed, catch up via queryEvents/countEvents first"
     ))
     .extend_with(|_, ext| ext.set("code", "subscription_lagged"))
-}
-
-/// Matches `RestError::FiltersNotSupported`'s own code/message exactly
-/// (`skilj-rest/src/error.rs`) - the same "non-empty filter sets aren't
-/// supported yet" rejection, at the same point in the flow (eagerly,
-/// before ever reaching `create_event_type_subscription`).
-fn filters_not_supported_error() -> async_graphql::Error {
-    async_graphql::Error::new("non-empty filter sets aren't supported yet")
-        .extend_with(|_, ext| ext.set("code", "filters_not_supported"))
 }
 
 /// `allEvents(boundedContext: String!, eventTypes: [String!], fromSequence: Int): QueriedEvent!`
@@ -229,9 +218,6 @@ pub fn events_by_type_field() -> SubscriptionField {
                 Some(value) => parse_filters(&value)?,
                 None => Vec::new(),
             };
-            if !filters.is_empty() {
-                return Err(filters_not_supported_error());
-            }
 
             let from_sequence = ctx
                 .args

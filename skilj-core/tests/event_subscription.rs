@@ -355,36 +355,28 @@ fn create_event_type_subscription_rejects_an_archived_bounded_context() {
 }
 
 /// rule-failure.CreateEventTypeSubscription.4 - `requires: valid_filters(event_type, filters)`.
-/// `valid_filters`' real type-checking is a deferred black box (see its
-/// own doc comment) - same treatment as `fetch_events_rejects_an_invalid_filter`
-/// in event_fetch_surface.rs: this asserts today's contract, that
-/// `create_event_type_subscription` reaches for `valid_filters` at all
-/// (a non-empty filter list hits its `todo!()` branch), not the eventual
-/// type-checking behaviour itself.
 #[test]
 fn create_event_type_subscription_rejects_an_invalid_filter() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Read);
     let et = event_type("OrderPlaced");
+    // event_type()'s schema is "{}" - "amount" names no field it declares.
     let non_empty_filters = vec![Filter {
         field: "amount".into(),
         operator: FilterOperator::GreaterThan,
         value: "10".into(),
     }];
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_store::create_event_type_subscription(
-            &mapping,
-            &et,
-            non_empty_filters,
-            None,
-            &[],
-            timestamp(0),
-        )
-    }));
-    assert!(
-        result.is_err(),
-        "valid_filters is a deferred black box for non-empty filters - see its doc comment"
-    );
+    let err = event_store::create_event_type_subscription(
+        &mapping,
+        &et,
+        non_empty_filters,
+        None,
+        &[],
+        timestamp(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), event_store::Error::InvalidFilter.code());
 }
 
 // ---------------------------------------------------------------------
@@ -449,6 +441,43 @@ fn deliver_to_subscriptions_event_type_subscription_matches_type_and_filters() {
     let delivered = event_store::deliver_to_subscriptions(&e, &[sub], |_, _| unreachable!());
 
     assert_eq!(delivered.len(), 1);
+}
+
+/// A real, non-empty filter actually narrows delivery - `matches_filters`
+/// is real now, not the always-true empty-filter fast path the test above
+/// exercises.
+#[test]
+fn deliver_to_subscriptions_event_type_subscription_narrows_by_a_real_filter() {
+    let et = event_type("OrderPlaced");
+    let sub = Subscription::EventTypeSubscription(Box::new(EventTypeSubscription {
+        bounded_context: bounded_context(BoundedContextStatus::Active),
+        access_mapping: access_mapping(RoleStatus::Active, AccessLevel::Read),
+        created_at: timestamp(0),
+        from_sequence: 0,
+        event_type: et.clone(),
+        filters: vec![Filter {
+            field: "amount".into(),
+            operator: FilterOperator::GreaterThan,
+            value: "10".into(),
+        }],
+    }));
+
+    let matching = event(et.clone(), 5, r#"{"amount":20}"#);
+    let non_matching = event(et, 6, r#"{"amount":5}"#);
+
+    assert_eq!(
+        event_store::deliver_to_subscriptions(&matching, std::slice::from_ref(&sub), |_, _| {
+            unreachable!()
+        })
+        .len(),
+        1
+    );
+    assert!(event_store::deliver_to_subscriptions(
+        &non_matching,
+        std::slice::from_ref(&sub),
+        |_, _| unreachable!()
+    )
+    .is_empty());
 }
 
 #[test]

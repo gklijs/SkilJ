@@ -28,11 +28,19 @@
 
 use crate::auth::BearerCredential;
 use crate::error::RestError;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+// `axum::extract::Query` doesn't support a repeated `filter=`/`filter=`
+// query param deserializing into `Vec<String>` (`serde_urlencoded`, which
+// it's built on, has no sequence support for query strings) - found via
+// this pass's own real end-to-end REST test, not assumed.
+// `axum_extra::extract::Query` (built on `serde_html_form`) does, and is
+// otherwise a drop-in-compatible replacement for the single-value fields
+// (`after`/`mode`) both query structs also carry.
+use axum_extra::extract::Query;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use skilj_core::access_control::{
@@ -42,7 +50,7 @@ use skilj_core::db::{self, AccessTokenKind, Pool};
 use skilj_core::encryption::EncryptionMasterKey;
 use skilj_core::event_store::{self, AckMode, Event, EventBroadcaster, EventType};
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
-use skilj_core::shared::{secret_matches, CommandDecision};
+use skilj_core::shared::{secret_matches, CommandDecision, Filter, FilterOperator};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -271,6 +279,50 @@ struct EventsQuery {
 #[derive(Deserialize)]
 struct ConsumeQuery {
     mode: Option<String>,
+    #[serde(default)]
+    filter: Vec<String>,
+}
+
+/// §7.3's `filter=field:op:value` wire shape, repeatable
+/// (`?filter=a:equals:1&filter=b:contains:x`) - `value` may itself
+/// contain `:`, so only the first two colons are structural
+/// (`splitn(3, ':')`). Operator tokens match `FilterOperator`'s own
+/// `#[serde(rename_all = "snake_case")]` spelling exactly, the same
+/// tokens the spec text itself uses. Malformed syntax or an unrecognised
+/// operator is this crate's own routing-layer rejection
+/// (`RestError::InvalidRequest`) - a real schema/operator mismatch (the
+/// field doesn't exist, or `greater_than` on a string) is deliberately
+/// *not* caught here; it flows through to `valid_filters` and surfaces
+/// as the normal `Core(EventStoreError::InvalidFilter)` → 400 path.
+fn parse_filter_param(raw: &str) -> Result<Filter, RestError> {
+    let mut parts = raw.splitn(3, ':');
+    let (Some(field), Some(op), Some(value)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(RestError::InvalidRequest(format!(
+            "malformed filter {raw:?} - expected field:op:value"
+        )));
+    };
+    let operator = match op {
+        "equals" => FilterOperator::Equals,
+        "contains" => FilterOperator::Contains,
+        "is_like" => FilterOperator::IsLike,
+        "greater_than" => FilterOperator::GreaterThan,
+        "less_than" => FilterOperator::LessThan,
+        other => {
+            return Err(RestError::InvalidRequest(format!(
+                "unknown filter operator {other:?} - expected one of equals, contains, \
+                 is_like, greater_than, less_than"
+            )))
+        }
+    };
+    Ok(Filter {
+        field: field.to_string(),
+        operator,
+        value: value.to_string(),
+    })
+}
+
+fn parse_filter_params(raw: &[String]) -> Result<Vec<Filter>, RestError> {
+    raw.iter().map(|s| parse_filter_param(s)).collect()
 }
 
 #[derive(Deserialize)]
@@ -422,9 +474,7 @@ async fn get_events(
     credential: BearerCredential,
     Query(query): Query<EventsQuery>,
 ) -> Result<impl IntoResponse, RestError> {
-    if !query.filter.is_empty() {
-        return Err(RestError::FiltersNotSupported);
-    }
+    let filters = parse_filter_params(&query.filter)?;
     let token = resolve_event_read_token(&state, &credential).await?;
     let events = db::list_events(
         &state.pool,
@@ -433,7 +483,7 @@ async fn get_events(
     )
     .await?;
 
-    let matched = event_store::fetch_events(&token, &events, &[], query.after)?;
+    let matched = event_store::fetch_events(&token, &events, &filters, query.after)?;
     let next_cursor = matched
         .last()
         .map(|e| e.sequence.to_string())
@@ -450,6 +500,7 @@ async fn get_events_consume(
     credential: BearerCredential,
     Query(query): Query<ConsumeQuery>,
 ) -> Result<impl IntoResponse, RestError> {
+    let filters = parse_filter_params(&query.filter)?;
     let token = resolve_event_read_token(&state, &credential).await?;
     let ack_mode = match query.mode.as_deref() {
         None => None,
@@ -475,7 +526,7 @@ async fn get_events_consume(
         existing_cursor.as_ref(),
         ack_mode,
         &events,
-        &[],
+        &filters,
         Utc::now(),
     )?;
     db::apply_cursor_update(&state.pool, &token, &result.cursor_update).await?;

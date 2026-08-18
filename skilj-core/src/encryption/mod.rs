@@ -26,11 +26,14 @@
 //! elsewhere on why "what's still plaintext" isn't a query this library
 //! offers.
 //!
-//! `decrypt_leaf` exists and is tested (round-tripping `encrypt_leaf`) but
-//! has no production caller yet - the real per-field, per-grant decrypt
-//! test (`render_event`/`render_command`'s own eventual non-trivial
-//! branch) is deferred to whichever pass builds real decrypt-on-read; see
-//! `event_store::render_event`'s own doc comment.
+//! `decrypt_leaf` backs the real per-field, per-grant decrypt test both
+//! `event_store::render_event`/`render_command` (a declared `SensitiveField`
+//! names the exact leaf and subject) and `projections::read_projection`
+//! (no declaration at all - `decrypt_ciphertext_leaves` below tries every
+//! string leaf in a projection's own stored state against every key
+//! resolved for the query's own instance `key`, safe to attempt broadly
+//! since `decrypt_leaf`'s own AEAD tag makes a false-positive match
+//! astronomically unlikely) both call into.
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -175,8 +178,7 @@ pub fn encrypt_leaf(data_key: &DataKey, plaintext: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(combined)
 }
 
-/// Inverts `encrypt_leaf` - see this module's own doc comment for why
-/// nothing calls this in production yet.
+/// Inverts `encrypt_leaf`.
 pub fn decrypt_leaf(data_key: &DataKey, ciphertext_b64: &str) -> Result<String, Error> {
     use base64::Engine;
     let combined = base64::engine::general_purpose::STANDARD
@@ -189,4 +191,55 @@ pub fn decrypt_leaf(data_key: &DataKey, ciphertext_b64: &str) -> Result<String, 
     let nonce_bytes: [u8; NONCE_LEN] = nonce_bytes.try_into().map_err(|_| Error::DecryptFailed)?;
     let opened = open(&data_key.0, nonce_bytes, ciphertext.to_vec())?;
     String::from_utf8(opened).map_err(|_| Error::DecryptFailed)
+}
+
+/// `projections::read_projection`'s own real branch - real decrypt-on-read
+/// for `Projection` state, with no field declared sensitive anywhere on
+/// `Projection` itself (see `docs/architecture.md`'s own write-up of this
+/// pass, and `specs/skilj.allium`'s `SensitiveFieldsStayProtected`
+/// guarantee on `ProjectionQuery`: "sensitivity is declared once, on the
+/// EventType, and inherited rather than re-declared per projection" -
+/// this is what actually delivers that, rather than asking a projection
+/// author to redeclare it, a design a declared-`sensitive_fields` draft
+/// was rejected for: an author who forgets to declare a field that
+/// really does hold sensitive content would otherwise leak it to every
+/// caller regardless of grant, silently).
+///
+/// Recurses into every object/array, trying `decrypt_leaf` against each
+/// of `data_keys` for every string leaf it finds, at any depth - no
+/// "one level of nesting" cap the way a *declared* `SensitiveField.field`
+/// path needs one for: there's no static path to validate at
+/// registration time here, so there's nothing stopping a full, generic
+/// walk, which is also strictly more thorough. A leaf that decrypts under
+/// none of `data_keys` is left completely untouched - genuinely plain
+/// data, or ciphertext for some other subject either way; a leaf that
+/// decrypts under one is real ciphertext for the subject those keys were
+/// resolved for, substituted with its plaintext. Every candidate key is
+/// tried in turn and the first successful one wins - `data_keys` is
+/// expected to be small (the number of distinct subjects the query's own
+/// instance `key` matches across every `subject_key` namespace, normally
+/// one), so this stays cheap even though it isn't declaratively scoped to
+/// one exact field.
+pub fn decrypt_ciphertext_leaves(value: &mut serde_json::Value, data_keys: &[DataKey]) {
+    match value {
+        serde_json::Value::String(s) => {
+            for data_key in data_keys {
+                if let Ok(plaintext) = decrypt_leaf(data_key, s) {
+                    *s = plaintext;
+                    return;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                decrypt_ciphertext_leaves(item, data_keys);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for field in fields.values_mut() {
+                decrypt_ciphertext_leaves(field, data_keys);
+            }
+        }
+        _ => {}
+    }
 }

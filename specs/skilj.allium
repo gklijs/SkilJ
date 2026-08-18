@@ -849,6 +849,21 @@ entity Projection {
     -- past.
     caught_up_to: Integer?
 
+    -- A projection's own instance data may be a single value or many,
+    -- each independently addressed by a caller-supplied key (see
+    -- QueryProjection): one row per customer for a purchase history, one
+    -- row per course for its participants, or exactly one unnamed
+    -- instance holding a single shared value - which is what a projection
+    -- nobody ever names a key against is. Which key or keys a given event
+    -- updates is decided by project() itself, from the event, in exactly
+    -- the same black-box register as what it computes: this library owns
+    -- when a projection is updated and what a caller may then see, not
+    -- how its instances are chosen or folded (see the project() note
+    -- above the rules). That multiplicity lives in the instance data the
+    -- fold produces, not in the projection's definition, so there is no
+    -- key field here and nothing extra for RegisterProjection to
+    -- reconcile.
+
     -- The schema's own contents stay a black box here, the same as
     -- EventType.schema. Sensitivity is declared once, on the source
     -- EventType (see EventType.sensitive_fields) - a projection built
@@ -1293,6 +1308,14 @@ default SystemCreator skilj = { }
 --     runtime discovery. This is deliberate friction, not a fast path:
 --     see Projection.sync.
 --
+-- Either way, one call to project() may update more than one of that
+-- projection's instances: a transfer event updating both the giver's own
+-- row and the receiver's own row is one event touching two keys, not two
+-- events. Which keys those are, and how many, is project()'s own
+-- decision from the event it is handed - this spec neither enumerates
+-- them nor bounds them, exactly as it never says what the fold computes
+-- (see the instance-data note on entity Projection).
+--
 -- await_projection_caught_up(projection, sequence), used by
 -- QueryProjection below, is the reader-side counterpart: it blocks until
 -- projection.caught_up_to reaches sequence and reports whether it got
@@ -1585,9 +1608,15 @@ rule AcknowledgeEvents {
 -- built before that is the point.
 
 rule QueryProjection {
-    when: QueryProjection(access_mapping, projection, wait_for_sequence?)
+    when: QueryProjection(access_mapping, projection, key?, wait_for_sequence?)
     requires: access_mapping.status = active
     requires: access_mapping.bounded_context = projection.bounded_context
+
+    -- Which of the projection's instances to answer from. A projection
+    -- holding one shared value is queried without a key, which is exactly
+    -- what the default stands for: the same single instance every time
+    -- (see the instance-data note on entity Projection).
+    let instance_key = key ?? ""
 
     -- Blocks until the projection has caught up, and fails the query if
     -- it does not within the configured wait - see the
@@ -1607,14 +1636,19 @@ rule QueryProjection {
         ProjectionDelivered(
             access_mapping: access_mapping,
             projection: projection,
-            result: read_projection(projection, access_mapping)
+            key: instance_key,
+            result: read_projection(projection, instance_key, access_mapping)
         )
 
     @guidance
-        -- read_projection(projection, access_mapping) is a black box in
-        -- the same register as decide() and project(): this library owns
-        -- who may read a projection and at what position, not how the
-        -- projection's own stored state answers a query. It takes the
+        -- read_projection(projection, key, access_mapping) is a black box
+        -- in the same register as decide() and project(): this library
+        -- owns who may read a projection, which instance of it and at
+        -- what position, not how the projection's own stored state
+        -- answers a query. The key names the instance to answer from -
+        -- one row of many, or the single shared instance a projection
+        -- that is never keyed holds - and the result delivered is that
+        -- instance's, never the whole projection's. It takes the
         -- whole grant rather than a single boolean because a sensitive
         -- field decrypts under either of two independent grants, decided
         -- per field: access_mapping.can_read_sensitive = true, or
@@ -1694,8 +1728,8 @@ rule CreateEventTypeSubscription {
 }
 
 -- render_event(event, access_mapping) is a black box in the same register
--- as read_projection(projection, access_mapping): this library owns who
--- a subscription delivers to and which of its fields arrive decrypted,
+-- as read_projection(projection, key, access_mapping): this library owns
+-- who a subscription delivers to and which of its fields arrive decrypted,
 -- not how the payload is rendered into a GraphQL push. A sensitive field
 -- decrypts under either of two independent grants, checked per field
 -- against that field's own EncryptionKey.subject_value:
@@ -3665,7 +3699,7 @@ surface ProjectionQuery {
         projection.schema_version
 
     provides:
-        QueryProjection(access_mapping, projection, wait_for_sequence?)
+        QueryProjection(access_mapping, projection, key?, wait_for_sequence?)
 
     @guarantee GrantScopedToBoundedContext
         -- A grant only authorises querying projections belonging to its
@@ -3716,6 +3750,17 @@ surface ProjectionQuery {
         -- it, rather than parsing a blob. How a schema becomes a concrete
         -- GraphQL type, and field/argument naming with it, stays deferred
         -- (see the scope header's exclusions).
+        --
+        -- key names which instance of the projection to answer from, and
+        -- is optional for the reason it is optional in the rule: a
+        -- projection holding one shared value is queried without one, so
+        -- its callers see no change from this argument existing at all. A
+        -- projection holding many - one row per customer, one per course
+        -- - is read by naming the row wanted. Which keys exist is decided
+        -- by the fold that built them, per event (see the project() note
+        -- above the rules), not declared at registration, so nothing here
+        -- enumerates them: this surface answers for the key it is given
+        -- and exposes no listing of the rest.
         --
         -- wait_for_sequence is the read-your-writes lever and the only
         -- thing that distinguishes an async projection from a sync one

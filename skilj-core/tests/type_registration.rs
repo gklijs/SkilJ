@@ -3,10 +3,10 @@
 //! pass (docs/architecture.md §9): `RegisterEventType`/
 //! `RegisterCommandType`, and the schema-validation black boxes both rely
 //! on - `valid_tag_mappings`/`valid_sensitive_fields`/
-//! `schema_is_backwards_compatible` - real (for flat, bare-field-name
-//! schemas; see `resolve_field`'s own doc comment for the dotted-path
-//! elaboration left deferred) rather than the `todo!()` stubs every
-//! earlier pass left them as.
+//! `schema_is_backwards_compatible` - real for both a bare field name and
+//! a two-segment dotted path into a named nested shape (see
+//! `resolve_field`'s own doc comment) rather than the `todo!()` stubs
+//! every earlier pass left them as.
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
 //! filtered to this pair of rules' 20 total obligations): 20 of 20 - both

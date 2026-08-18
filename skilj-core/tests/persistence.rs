@@ -37,6 +37,7 @@ use skilj_core::access_control::{
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, AccessTokenKind, Pool};
 use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{
     AckMode, BoundedContext, BoundedContextStatus, CommandType, CursorUpdate, EncryptionKeyStatus,
     Event, EventOrigin, EventType, ReadCursor,
@@ -1478,5 +1479,118 @@ fn get_active_data_key_is_none_for_a_destroyed_key() {
                 .unwrap()
                 .is_none()
         );
+    });
+}
+
+// --- list_active_data_keys_for_subject_value (real decrypt-on-read for
+// Projections - no `subject_key` known ahead of time) ---
+
+#[test]
+fn list_active_data_keys_for_subject_value_finds_every_namespace_for_a_subject() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([6u8; 32]);
+
+        // Two different subject_key namespaces, the same subject_value -
+        // both are real candidates for a projection instance keyed "42".
+        db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
+            .await
+            .unwrap();
+        db::get_or_create_encryption_key(&pool, &bc.name, "employee", "42", &master)
+            .await
+            .unwrap();
+        // An unrelated subject_value never matches.
+        db::get_or_create_encryption_key(&pool, &bc.name, "user", "99", &master)
+            .await
+            .unwrap();
+
+        let data_keys =
+            db::list_active_data_keys_for_subject_value(&pool, &bc.name, "42", Some(&master))
+                .await
+                .unwrap();
+        assert_eq!(data_keys.len(), 2);
+
+        // Each resolved key genuinely decrypts something sealed under its
+        // own real DataKey - proven indirectly (`DataKey` has no
+        // `PartialEq`/`Debug` by design).
+        for data_key in &data_keys {
+            let ciphertext = skilj_core::encryption::encrypt_leaf(data_key, "hello");
+            assert_eq!(
+                skilj_core::encryption::decrypt_leaf(data_key, &ciphertext).unwrap(),
+                "hello"
+            );
+        }
+    });
+}
+
+#[test]
+fn list_active_data_keys_for_subject_value_excludes_a_destroyed_key() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([7u8; 32]);
+
+        db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
+            .await
+            .unwrap();
+        db::destroy_encryption_key(&pool, &bc.name, "user", "42", test_now())
+            .await
+            .unwrap();
+
+        let data_keys =
+            db::list_active_data_keys_for_subject_value(&pool, &bc.name, "42", Some(&master))
+                .await
+                .unwrap();
+        assert!(data_keys.is_empty());
+    });
+}
+
+#[test]
+fn list_active_data_keys_for_subject_value_is_empty_for_an_unknown_subject_with_no_master_key_needed(
+) {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+
+        let data_keys = db::list_active_data_keys_for_subject_value(&pool, &bc.name, "nope", None)
+            .await
+            .unwrap();
+        assert!(data_keys.is_empty());
+    });
+}
+
+/// A subject that *does* have an active key, queried with no master key
+/// configured at all, is a real, actionable configuration error - not a
+/// silent empty result - the identical precedent
+/// `resolve_encryption_keys`/`resolve_data_keys_for_reading` already set.
+#[test]
+fn list_active_data_keys_for_subject_value_errors_when_master_key_missing_but_a_key_exists() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([8u8; 32]);
+
+        db::get_or_create_encryption_key(&pool, &bc.name, "user", "42", &master)
+            .await
+            .unwrap();
+
+        // `Vec<DataKey>` has no `Debug` (`DataKey` deliberately doesn't),
+        // so `unwrap_err()` can't be used here - matched by hand instead.
+        match db::list_active_data_keys_for_subject_value(&pool, &bc.name, "42", None).await {
+            Err(err) => assert_eq!(
+                err.code(),
+                skilj_core::encryption::Error::MasterKeyNotConfigured.code()
+            ),
+            Ok(_) => panic!("expected MasterKeyNotConfigured"),
+        }
     });
 }

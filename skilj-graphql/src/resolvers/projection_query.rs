@@ -46,18 +46,30 @@ async fn wait_until_caught_up(
     }
 }
 
-/// `projection(boundedContext: String!, name: String!, waitForSequence: Int): ProjectionResult!`
+/// `projection(boundedContext: String!, name: String!, key: String, waitForSequence: Int): ProjectionResult!`
 ///
-/// `read_projection`'s real scope this pass: returns the projection's
-/// stored state verbatim - no per-field sensitive-value decrypt/redact
-/// logic, because no event can carry `encryption_keys` yet
-/// (`protect_sensitive_fields` is still `todo!()` for its only non-empty
-/// case, the same gap `SubjectErasure` is blocked on), so no projection
-/// can contain protected content to decide about yet.
-/// `SensitiveFieldsStayProtected` is vacuously satisfied today, not
-/// broken - the identical "don't build ahead of what's wired" call
-/// Phase 2 already made for excluding `SubjectErasure` itself, for the
-/// same underlying reason.
+/// `read_projection` is real now: `sensitive_field_is_granted` (the
+/// identical two-grant test `render_event` already has, reused unchanged)
+/// decides, once per query, whether this caller is entitled to see
+/// anything decrypted for this instance's own `key` at all - if so,
+/// `db::list_active_data_keys_for_subject_value` resolves every active
+/// `EncryptionKey` for it, and `skilj_core::projections::read_projection`
+/// tries them against every string leaf in the stored state, at any
+/// depth. No `Projection.sensitive_fields` declaration anywhere - see
+/// `skilj_core::encryption::decrypt_ciphertext_leaves`'s own doc comment
+/// for why automatic detection was chosen over a declared one (a
+/// forgotten declaration would silently leak real content to every
+/// caller, regardless of grant).
+///
+/// `key` omitted defaults to `""` (the rule's own `instance_key = key ?? ""`),
+/// the single implicit instance a projection that never overrides
+/// `Projection::keys()` always has, so an existing single-value
+/// projection's own callers see no change at all from this argument
+/// existing. A key nothing has touched yet answers with
+/// `ProjectionDispatcher::default_state` (the same value a fresh instance
+/// lazily starts from) rather than a "not found" error - a customer with
+/// no purchase history yet is a legitimate, common case (§9's "keyed /
+/// multi-row Projections" pass).
 pub fn field() -> Field {
     Field::new("projection", TypeRef::named_nn("ProjectionResult"), |ctx| {
         FieldFuture::new(async move {
@@ -66,6 +78,13 @@ pub fn field() -> Field {
             let access_mapping =
                 require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
             let name = ctx.args.try_get("name")?.string()?.to_string();
+            let key = ctx
+                .args
+                .get("key")
+                .filter(|v| !v.is_null())
+                .map(|v| v.string().map(str::to_string))
+                .transpose()?
+                .unwrap_or_default();
             let wait_for_sequence = ctx
                 .args
                 .get("waitForSequence")
@@ -92,15 +111,45 @@ pub fn field() -> Field {
                 .map_err(to_graphql_error)?,
             };
 
-            let state_json =
-                skilj_core::db::get_projection_state(&state.pool, &bounded_context_name, &name)
+            let state_json = skilj_core::db::get_projection_state(
+                &state.pool,
+                &bounded_context_name,
+                &name,
+                &key,
+            )
+            .await
+            .map_err(to_graphql_error)?
+            .or_else(|| {
+                state
+                    .projection_dispatcher
+                    .default_state(&bounded_context_name, &name)
+            })
+            .unwrap_or_else(|| "{}".to_string());
+
+            // Real decrypt-on-read - automatic, no `Projection.sensitive_fields`
+            // declaration anywhere (see this field's own doc comment).
+            // Grant checked once, up front: an ungranted caller's query
+            // never needs a master key, or even a DB round trip for one,
+            // at all.
+            let data_keys =
+                if skilj_core::event_store::sensitive_field_is_granted(&access_mapping, &key) {
+                    skilj_core::db::list_active_data_keys_for_subject_value(
+                        &state.pool,
+                        &bounded_context_name,
+                        &key,
+                        state.encryption_master_key.as_ref(),
+                    )
                     .await
                     .map_err(to_graphql_error)?
-                    .unwrap_or_else(|| "{}".to_string());
+                } else {
+                    Vec::new()
+                };
+            let state_json = skilj_core::projections::read_projection(&state_json, &data_keys);
 
             let result = skilj_core::projections::query_projection(
                 &access_mapping,
                 &projection,
+                &key,
                 wait_for_sequence,
                 caught_up,
                 state_json,
@@ -120,6 +169,7 @@ pub fn field() -> Field {
         TypeRef::named_nn(TypeRef::STRING),
     ))
     .argument(InputValue::new("name", TypeRef::named_nn(TypeRef::STRING)))
+    .argument(InputValue::new("key", TypeRef::named(TypeRef::STRING)))
     .argument(InputValue::new(
         "waitForSequence",
         TypeRef::named(TypeRef::INT),
