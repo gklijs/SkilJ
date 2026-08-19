@@ -32,6 +32,20 @@ pub enum Error {
     #[error("command rejected: {reason}")]
     CommandRejected { reason: String, kind: String },
 
+    /// Only ever produced by `db::submit_command`'s own DCB-conflict
+    /// retry path (see its own doc comment) - the redispatch it runs
+    /// under the sequence row's lock finds no decider registered for a
+    /// `(bounded_context, command_type)` pair the caller's own first,
+    /// optimistic `dispatch` call just found one for. Vanishingly
+    /// unlikely in practice (plugin registration is fixed for a
+    /// process's whole lifetime), but a real possible outcome of a
+    /// second dispatch call, so a real variant rather than a panic.
+    /// `skilj-rest`/`skilj-graphql` both already have their own
+    /// first-dispatch-call equivalent of this message; kept identical
+    /// here so the two paths read the same either way.
+    #[error("this CommandType has no decide() registered in the running process")]
+    NoDeciderRegistered,
+
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -64,6 +78,7 @@ impl SkiljRejection for Error {
             Error::Bootstrap(e) => e.code(),
             Error::Encryption(e) => e.code(),
             Error::CommandRejected { kind, .. } => kind,
+            Error::NoDeciderRegistered => "no_decider_registered",
             Error::Database(_) => "database_error",
             Error::Migration(_) => "migration_error",
         }
@@ -77,6 +92,7 @@ impl SkiljRejection for Error {
             Error::Bootstrap(e) => e.message(),
             Error::Encryption(e) => e.message(),
             Error::CommandRejected { reason, .. } => reason.clone(),
+            Error::NoDeciderRegistered => self.to_string(),
             Error::Database(e) => e.to_string(),
             Error::Migration(e) => e.to_string(),
         }

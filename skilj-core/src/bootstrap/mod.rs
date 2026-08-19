@@ -8,26 +8,43 @@ use crate::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use crate::error::SkiljRejection;
 use crate::event_store::{BoundedContext, BoundedContextStatus};
 
-// TODO: the `admin`/`skilj` defaults' own `created_at`/`created_by`
-// stamping and the startup reconciliation loop itself
-// (Skilj::builder().build(), per §1.5) - the rules below (propagating
-// EventTypeAdminOperations/CommandTypeAdminOperations/TokenRevocation's
-// follow-on pass) cover `BootstrapSecret`, `ContextCreator`/
-// `SuperadminCreator`/`SystemCreator`, `CreateSuperadmin`,
-// `AddBoundedContext`, `ListBoundedContexts` and `ArchiveBoundedContext`.
-// `ADMIN_BOUNDED_CONTEXT_NAME` stands in for the literal half of the
-// `admin` default (its `created_at`/`created_by` are real recorded values
-// stamped once at first startup, per the note above the spec's Defaults
-// section - not this module's static constant to provide).
-
 /// The literal half of `default BoundedContext admin` - the one bounded
 /// context `AddBoundedContext`/`ArchiveBoundedContext` never create or
 /// archive (see `add_bounded_context`/`archive_bounded_context`'s own doc
-/// comments). Its `created_at`/`created_by` are real recorded values
-/// stamped once at SkilJ's own first startup, not spec-time constants, so
-/// they stay with the still-TODO reconciliation loop above rather than
-/// living here.
+/// comments). Its `created_at`/`created_by` are real recorded values,
+/// stamped once at SkilJ's own first startup - see `stamp_admin_bounded_context`
+/// below, not a static constant here.
 pub const ADMIN_BOUNDED_CONTEXT_NAME: &str = "admin";
+
+/// See the note above `default BoundedContext admin` in specs/skilj.allium:
+/// "both are written by SkilJ itself, at its own first startup... stamped
+/// only once: unlike the bootstrap secret, which is regenerated on every
+/// startup until it is claimed, this acts only while the values are
+/// unset, so a later restart never restamps them." `existing` is
+/// `BoundedContext{name: admin}` as already looked up by the caller
+/// (`Skilj::builder().build()`, per §1.5) - the same get-or-create lookup
+/// treatment `register_event_type`'s own `existing` gets. `None` on every
+/// startup but the process's genuine first one against this database;
+/// this function does nothing on every later one, the same "acts only
+/// while unset" guarantee the spec's own text describes. Unlike
+/// `generate_bootstrap_secret`, this doesn't depend on whether a
+/// superadmin exists yet - the spec is explicit that the two are
+/// unrelated ("It is not part of, and does not wait for, the arrival of
+/// the first superadmin Role").
+pub fn stamp_admin_bounded_context(
+    existing: Option<&BoundedContext>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<BoundedContext> {
+    if existing.is_some() {
+        return None;
+    }
+    Some(BoundedContext {
+        name: ADMIN_BOUNDED_CONTEXT_NAME.to_string(),
+        status: BoundedContextStatus::Active,
+        created_at: now,
+        created_by: ContextCreator::SystemCreator,
+    })
+}
 
 /// See `entity BootstrapSecret`.
 #[derive(Debug, Clone, PartialEq, Eq)]

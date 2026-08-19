@@ -5,7 +5,10 @@
 //! `DirectlyCreated`, rules `CreateExternalEvent`/`CreateDirectEvent`.
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
-//! filtered to this pair of surfaces' eight source constructs): 18 total.
+//! filtered to this pair of surfaces' eight source constructs): 20 total
+//! (18 from the original pass, plus rule-failure.CreateExternalEvent.4/
+//! CreateDirectEvent.4 - `valid_payload`'s own new requires clause on
+//! both rules).
 //! Uncovered this pass, with reason - see the doc comment at the bottom
 //! of this file: `surface-actor`/`surface-provides` for each surface (4),
 //! same REST-scaffolding gap as EventFetch's three uncovered obligations.
@@ -40,6 +43,9 @@ fn event_type(external_creation_allowed: bool, direct_creation_allowed: bool) ->
         direct_creation_allowed,
         system_triggered_allowed: false,
         system_triggered_schedule: None,
+        missed_occurrence_policy: None,
+        schedule_position: None,
+        last_fired_at: None,
         event_read_allowed: false,
     }
 }
@@ -87,7 +93,7 @@ fn direct_creation_token_carries_its_variant_specific_field() {
 }
 
 // ---------------------------------------------------------------------
-// rule-success.CreateExternalEvent / rule-failure.CreateExternalEvent.{1,2,3}
+// rule-success.CreateExternalEvent / rule-failure.CreateExternalEvent.{1,2,3,4}
 // / rule-entity-creation.CreateExternalEvent.1
 // / sum-type-variant.ExternalTriggered
 // ---------------------------------------------------------------------
@@ -217,6 +223,32 @@ fn create_external_event_rejects_a_revoked_token() {
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
 }
 
+/// rule-failure.CreateExternalEvent.4 - `requires: valid_payload(event_type.schema, payload)`.
+#[test]
+fn create_external_event_rejects_a_payload_that_does_not_match_the_schema() {
+    let et = EventType {
+        schema: r#"{"properties":{"amount":{"type":"number"}},"required":["amount"]}"#.into(),
+        ..event_type(true, false)
+    };
+    let adapter = external_token(TokenStatus::Active, et);
+
+    let err = event_store::create_external_event(
+        &adapter,
+        "{}".into(), // missing the required "amount" field
+        "raw".into(),
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        event_store::Error::PayloadDoesNotMatchSchema.code()
+    );
+}
+
 #[test]
 fn create_external_event_derives_real_tags_from_a_real_tag_mapping() {
     let et = EventType {
@@ -249,7 +281,7 @@ fn create_external_event_derives_real_tags_from_a_real_tag_mapping() {
 }
 
 // ---------------------------------------------------------------------
-// rule-success.CreateDirectEvent / rule-failure.CreateDirectEvent.{1,2,3}
+// rule-success.CreateDirectEvent / rule-failure.CreateDirectEvent.{1,2,3,4}
 // / rule-entity-creation.CreateDirectEvent.1 / sum-type-variant.DirectlyCreated
 // ---------------------------------------------------------------------
 
@@ -347,6 +379,30 @@ fn create_direct_event_rejects_a_revoked_token() {
     .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
+}
+
+/// rule-failure.CreateDirectEvent.4 - `requires: valid_payload(event_type.schema, payload)`.
+#[test]
+fn create_direct_event_rejects_a_payload_that_does_not_match_the_schema() {
+    let et = EventType {
+        schema: r#"{"properties":{"amount":{"type":"number"}},"required":["amount"]}"#.into(),
+        ..event_type(false, true)
+    };
+    let adapter = direct_token(TokenStatus::Active, et);
+
+    let err = event_store::create_direct_event(
+        &adapter,
+        r#"{"amount":"not a number"}"#.into(),
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        event_store::Error::PayloadDoesNotMatchSchema.code()
+    );
 }
 
 // ---------------------------------------------------------------------

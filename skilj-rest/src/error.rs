@@ -100,6 +100,13 @@ fn status_for(err: &CoreError) -> StatusCode {
             EventStoreError::TriggeredEventNotInBoundedContext => StatusCode::FORBIDDEN,
             EventStoreError::InvalidTagMapping => StatusCode::BAD_REQUEST,
             EventStoreError::InvalidSensitiveField => StatusCode::BAD_REQUEST,
+            EventStoreError::PayloadDoesNotMatchSchema => StatusCode::BAD_REQUEST,
+            // Not reachable over REST today - RegisterEventType is
+            // GraphQL-only (TypeRegistration) - but matched explicitly
+            // rather than left to the wildcard below, the same "each
+            // variant mapped by what it actually means" reasoning this
+            // whole match already follows.
+            EventStoreError::MissingScheduleOrPolicy => StatusCode::BAD_REQUEST,
             EventStoreError::SensitiveFieldTagOverlap => StatusCode::BAD_REQUEST,
             EventStoreError::SchemaIncompatible => StatusCode::CONFLICT,
             EventStoreError::TagMappingKeyDropped => StatusCode::CONFLICT,
@@ -123,6 +130,11 @@ fn status_for(err: &CoreError) -> StatusCode {
         // defensive fallback (`process_command` itself still returns this
         // variant if handed one directly), never reached in practice.
         CoreError::CommandRejected { .. } => StatusCode::OK,
+        // `db::submit_command`'s own DCB-conflict retry path only - see
+        // that variant's own doc comment. The same status
+        // `RestError::NoDeciderRegistered` already gives the first,
+        // optimistic `dispatch` call's identical `None` outcome.
+        CoreError::NoDeciderRegistered => StatusCode::INTERNAL_SERVER_ERROR,
         CoreError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // A migration failure is a startup-time concern (Skilj::builder().build())
         // - no request ever reaches a route handler while it's unresolved,

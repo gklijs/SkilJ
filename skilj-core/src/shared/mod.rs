@@ -116,6 +116,31 @@ pub fn generate_token_secret() -> String {
     )
 }
 
+/// Hashes the `secret` half of an `AccessToken` for storage - see the
+/// REST token presentation note above the surfaces in the spec: "the
+/// secret half is then verified against that row's stored hash... Both
+/// the hashing scheme and the comparison are black boxes here, the same
+/// register as generate_token_secret and generate_token_id: the spec
+/// owns that the secret is never stored or compared in plaintext, not
+/// which primitive does it." `generate_token_secret` already gives 244
+/// bits of CSPRNG randomness (see its own doc comment) - high-entropy,
+/// unlike a user-chosen password - so a plain cryptographic hash
+/// (SHA-256, via `ring`, already a dependency for `encryption`) is the
+/// appropriate primitive: brute-forcing a 244-bit secret back out of its
+/// hash is infeasible regardless of how fast the hash is, and a slow
+/// password KDF (bcrypt/argon2/scrypt) would only add latency to every
+/// request's auth check for no security benefit. Base64-encoded
+/// (`base64::engine::general_purpose::STANDARD`), the same encoding
+/// `encryption::encrypt` already uses for its own opaque byte output.
+/// Deterministic (no per-secret salt) - safe here specifically because
+/// the input is never a low-entropy human-chosen value a rainbow table
+/// could target, unlike a password hash.
+pub fn hash_secret(secret: &str) -> String {
+    use base64::Engine;
+    let digest = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+}
+
 /// See the `secret_matches` note above `rule CreateSuperadmin`: compares
 /// two secrets in time that depends only on their lengths, never on where
 /// they first differ, so a failed presentation leaks nothing about how

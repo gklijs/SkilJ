@@ -328,6 +328,39 @@ fn command_trigger_accepts_and_persists_triggered_events() {
     });
 }
 
+/// Real end-to-end proof of the drift audit's #10 fix (`valid_payload` -
+/// see project memory `skilj-drift-audit-2026-08-18`): the request body
+/// is decoded as generic JSON at the wire layer (`CommandTriggerRequest.
+/// payload: serde_json::Value`), so a wrong-typed field like this one
+/// reaches `authorise_command_trigger`'s own new `valid_payload` guard
+/// rather than failing to deserialize earlier - proving the rejection is
+/// real over the actual REST surface, not just at the pure-function
+/// layer `skilj-core/tests/command_processing.rs` already covers.
+#[test]
+fn command_trigger_rejects_a_payload_that_does_not_match_the_schema_with_400() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, _pool, _bc_name) = setup().await;
+        let router = skilj.rest_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/commands/trigger")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"payload":{"amount":"not a number"}}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "payload_does_not_match_schema");
+    });
+}
+
 /// Proof, over the real REST surface (not just `skilj-core`'s pure
 /// `derive_tags` unit tests), that a bounded context registering a real
 /// `tag_mappings` entry and then triggering a matching command no longer

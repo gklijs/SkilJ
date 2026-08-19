@@ -3,17 +3,30 @@
 //! plus a `projections(boundedContext:)` query satisfying the surface's
 //! own `exposes: for projection in bounded_context.projections` (see
 //! `gql_types::ProjectionWithRebuild`'s own doc comment for why a
-//! projection's rebuild is modelled as a nullable field there, not a
-//! list, despite the spec's own loop phrasing). `AdminAccess`-gated -
+//! projection's rebuilds are modelled as two nullable fields there, not a
+//! list, despite the spec's own loop phrasing) and a
+//! `scheduledEventTypes(boundedContext:)` query satisfying `exposes: for
+//! scheduled_type in bounded_context.event_types where
+//! system_triggered_allowed = true`. `AdminAccess`-gated -
 //! `require_admin_mapping` resolves the actor; every pure function this
 //! module calls re-checks the grant's status/level/scope for real.
+//!
+//! `RegisterProjection`/`RebuildProjection`/`DiscardProjectionRebuild`
+//! each look up `staged` as `ProjectionRebuild{..., status: pending}` per
+//! their own `let` in specs/skilj.allium - never `building`, which
+//! `db::get_projection_rebuild`'s own `status` parameter makes explicit
+//! at every call site below rather than leaving it to an unfiltered
+//! lookup's luck.
 
-use super::{not_found, parse_sensitive_fields, parse_tag_mappings, require_admin_mapping};
+use super::{
+    not_found, parse_missed_occurrence_policy, parse_sensitive_fields, parse_tag_mappings,
+    require_admin_mapping,
+};
 use crate::error::to_graphql_error;
 use crate::gql_types::{ProjectionRegistrationResult, ProjectionWithRebuild};
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
-use skilj_core::projections::ProjectionRegistration;
+use skilj_core::projections::{ProjectionRebuildStatus, ProjectionRegistration};
 
 /// `registerEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [TagMappingInput!]!, sensitiveFields: [SensitiveFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String): EventType!`
 pub fn register_event_type_field() -> Field {
@@ -38,6 +51,14 @@ pub fn register_event_type_field() -> Field {
                 .filter(|v| !v.is_null())
                 .map(|v| v.string().map(str::to_string))
                 .transpose()?;
+            let missed_occurrence_policy = match ctx
+                .args
+                .get("missedOccurrencePolicy")
+                .filter(|v| !v.is_null())
+            {
+                Some(v) => Some(parse_missed_occurrence_policy(v.enum_name()?)),
+                None => None,
+            };
 
             let bounded_context =
                 skilj_core::db::get_bounded_context(&state.pool, &bounded_context_name)
@@ -60,8 +81,10 @@ pub fn register_event_type_field() -> Field {
                 direct_creation_allowed,
                 system_triggered_allowed,
                 system_triggered_schedule,
+                missed_occurrence_policy,
                 event_read_allowed,
                 existing.as_ref(),
+                chrono::Utc::now(),
             )
             .map_err(to_graphql_error)?;
             skilj_core::db::upsert_event_type(&state.pool, registration.event_type())
@@ -109,6 +132,10 @@ pub fn register_event_type_field() -> Field {
     .argument(InputValue::new(
         "systemTriggeredSchedule",
         TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "missedOccurrencePolicy",
+        TypeRef::named("MissedOccurrencePolicy"),
     ))
 }
 
@@ -228,6 +255,7 @@ pub fn register_projection_field() -> Field {
                     &state.pool,
                     &bounded_context_name,
                     &name,
+                    ProjectionRebuildStatus::Pending,
                 )
                 .await
                 .map_err(to_graphql_error)?;
@@ -260,7 +288,8 @@ pub fn register_projection_field() -> Field {
                             outcome: "CREATED",
                             projection: Some(ProjectionWithRebuild {
                                 projection,
-                                rebuild: None,
+                                pending_rebuild: None,
+                                building_rebuild: None,
                             }),
                             rebuild: None,
                         }
@@ -273,7 +302,8 @@ pub fn register_projection_field() -> Field {
                             outcome: "RECONCILED_TRIVIALLY",
                             projection: Some(ProjectionWithRebuild {
                                 projection,
-                                rebuild: None,
+                                pending_rebuild: None,
+                                building_rebuild: None,
                             }),
                             rebuild: None,
                         }
@@ -333,6 +363,7 @@ pub fn rebuild_projection_field() -> Field {
                     &state.pool,
                     &bounded_context_name,
                     &name,
+                    ProjectionRebuildStatus::Pending,
                 )
                 .await
                 .map_err(to_graphql_error)?;
@@ -343,7 +374,12 @@ pub fn rebuild_projection_field() -> Field {
                     staged.as_ref(),
                 )
                 .map_err(to_graphql_error)?;
-                skilj_core::db::upsert_projection_rebuild(&state.pool, &rebuild)
+                // Not `upsert_projection_rebuild` - this is a status
+                // *transition* (pending becoming building), not a
+                // same-status restage; see
+                // `transition_projection_rebuild_to_building`'s own doc
+                // comment for why that distinction matters.
+                skilj_core::db::transition_projection_rebuild_to_building(&state.pool, &rebuild)
                     .await
                     .map_err(to_graphql_error)?;
 
@@ -383,6 +419,7 @@ pub fn discard_projection_rebuild_field() -> Field {
                     &state.pool,
                     &bounded_context_name,
                     &name,
+                    ProjectionRebuildStatus::Pending,
                 )
                 .await
                 .map_err(to_graphql_error)?;
@@ -397,6 +434,7 @@ pub fn discard_projection_rebuild_field() -> Field {
                     &state.pool,
                     &bounded_context_name,
                     &name,
+                    ProjectionRebuildStatus::Pending,
                 )
                 .await
                 .map_err(to_graphql_error)?;
@@ -435,19 +473,64 @@ pub fn projections_field() -> Field {
 
                 let mut with_rebuilds = Vec::with_capacity(projections.len());
                 for projection in projections {
-                    let rebuild = skilj_core::db::get_projection_rebuild(
+                    let pending_rebuild = skilj_core::db::get_projection_rebuild(
                         &state.pool,
                         &bounded_context_name,
                         &projection.name,
+                        ProjectionRebuildStatus::Pending,
+                    )
+                    .await
+                    .map_err(to_graphql_error)?;
+                    let building_rebuild = skilj_core::db::get_projection_rebuild(
+                        &state.pool,
+                        &bounded_context_name,
+                        &projection.name,
+                        ProjectionRebuildStatus::Building,
                     )
                     .await
                     .map_err(to_graphql_error)?;
                     with_rebuilds.push(FieldValue::owned_any(ProjectionWithRebuild {
                         projection,
-                        rebuild,
+                        pending_rebuild,
+                        building_rebuild,
                     }));
                 }
                 Ok(Some(FieldValue::list(with_rebuilds)))
+            })
+        },
+    )
+    .argument(InputValue::new(
+        "boundedContext",
+        TypeRef::named_nn(TypeRef::STRING),
+    ))
+}
+
+/// `scheduledEventTypes(boundedContext: String!): [EventType!]!` -
+/// satisfies `TypeRegistration`'s own `exposes: for scheduled_type in
+/// bounded_context.event_types where system_triggered_allowed = true`
+/// (`@guarantee ScheduleStateIsShared`'s own admin visibility: policy,
+/// `lastFiredAt`, `schedulePosition`, all already on `EventType` itself -
+/// see `gql_types::event_type_object` - so this is only ever the
+/// filtered listing, nothing new on the type).
+pub fn scheduled_event_types_field() -> Field {
+    Field::new(
+        "scheduledEventTypes",
+        TypeRef::named_nn_list_nn("EventType"),
+        |ctx| {
+            FieldFuture::new(async move {
+                let state = ctx.data::<GraphqlState>()?;
+                let bounded_context_name =
+                    ctx.args.try_get("boundedContext")?.string()?.to_string();
+                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+
+                let scheduled =
+                    skilj_core::db::list_scheduled_event_types(&state.pool, &bounded_context_name)
+                        .await
+                        .map_err(to_graphql_error)?;
+
+                Ok(Some(FieldValue::list(
+                    scheduled.into_iter().map(FieldValue::owned_any),
+                )))
             })
         },
     )

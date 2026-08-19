@@ -20,9 +20,10 @@
 use skilj_core::access_control::{AccessLevel, JwksCache, Role};
 use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
+use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{Error as EventStoreError, Event, EventBroadcaster};
 use skilj_core::plugin::{BoundedContextEvent, CommandDispatcher};
-use skilj_core::projections::ProjectionRegistration;
+use skilj_core::projections::{ProjectionRebuildStatus, ProjectionRegistration};
 use skilj_core::shared::CommandDecision;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,6 +59,11 @@ pub struct Skilj {
     /// ProjectionDispatcher>` without `Skilj` itself needing to live
     /// behind an `Arc`.
     projections: Arc<HashMap<(String, String), RegisteredProjection>>,
+    /// `Arc`-wrapped for the identical reason `command_types`/`projections`
+    /// are - `event_dispatcher()` hands out a cheap `Arc<dyn
+    /// EventDispatcher>`, and the background scheduler task spawned in
+    /// `.build()` holds its own clone for the process's lifetime.
+    event_types: Arc<HashMap<(String, String), RegisteredEventType>>,
     /// `bootstrap::generate_bootstrap_secret`'s output, computed once at
     /// `.build()` time and printed then too (see `SkiljBuilder::build`) -
     /// `None` once an active superadmin already exists
@@ -90,6 +96,15 @@ pub struct Skilj {
     /// two" treatment `command_dispatcher`/`projection_dispatcher`
     /// already get.
     event_broadcaster: EventBroadcaster,
+    /// The in-memory per-bounded-context event cache (drift audit
+    /// finding #8) - see `skilj_core::event_cache`'s own module doc
+    /// comment for the full design. One shared, process-wide cache,
+    /// constructed and warmed once in `.build()`, handed to both
+    /// `rest_router()` and `graphql_router()` - the same "one instance,
+    /// not two" treatment `event_broadcaster` already gets, and for the
+    /// identical reason: every commit needs to reach the one cache every
+    /// read consults, regardless of which surface produced it.
+    event_cache: EventCache,
 }
 
 /// `CommandDispatcher`'s own implementer - a thin wrapper around the
@@ -169,6 +184,22 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
     }
 }
 
+/// `EventDispatcher`'s own implementer - same shape and reasoning as
+/// `Dispatcher`/`ProjectionDispatcherImpl` above, over the `event_types`
+/// registry instead.
+struct EventDispatcherImpl {
+    event_types: Arc<HashMap<(String, String), RegisteredEventType>>,
+}
+
+impl skilj_core::plugin::EventDispatcher for EventDispatcherImpl {
+    fn scheduled_payload(&self, bounded_context: &str, event_type: &str) -> Option<String> {
+        let registered = self
+            .event_types
+            .get(&(bounded_context.to_string(), event_type.to_string()))?;
+        Some((registered.scheduled_payload)())
+    }
+}
+
 impl Skilj {
     pub fn builder(database_url: impl Into<String>) -> SkiljBuilder {
         SkiljBuilder {
@@ -180,9 +211,11 @@ impl Skilj {
             command_types: HashMap::new(),
             projections: HashMap::new(),
             async_projection_poll_interval: std::time::Duration::from_millis(500),
+            scheduler_poll_interval: std::time::Duration::from_secs(1),
             projection_query_wait_timeout: std::time::Duration::from_secs(5),
             encryption_master_key: None,
             event_broadcast_capacity: 1024,
+            event_cache_warm_up_count: 1000,
         }
     }
 
@@ -212,6 +245,17 @@ impl Skilj {
         })
     }
 
+    /// The type-erased `EventDispatcher` this `Skilj` hands the
+    /// background scheduler task `.build()` spawns - `db::
+    /// fire_system_event`'s own bridge into a bounded context's
+    /// registered `EventType::scheduled_payload()`. Same cheap-`Arc`-clone
+    /// reasoning as `command_dispatcher()`/`projection_dispatcher()`.
+    pub fn event_dispatcher(&self) -> Arc<dyn skilj_core::plugin::EventDispatcher> {
+        Arc::new(EventDispatcherImpl {
+            event_types: self.event_types.clone(),
+        })
+    }
+
     /// The freshly-generated `BootstrapSecret`, printed once to stderr at
     /// `.build()` time (see `SkiljBuilder::build`) and held here too -
     /// for a consuming application that wants it available in-process
@@ -235,6 +279,7 @@ impl Skilj {
             self.projection_dispatcher(),
             self.encryption_master_key.clone(),
             self.event_broadcaster.clone(),
+            self.event_cache.clone(),
         )
     }
 
@@ -272,6 +317,7 @@ impl Skilj {
             projection_query_wait_timeout: self.projection_query_wait_timeout,
             encryption_master_key: self.encryption_master_key.clone(),
             event_broadcaster: self.event_broadcaster.clone(),
+            event_cache: self.event_cache.clone(),
         };
         skilj_graphql::router(state).await
     }
@@ -288,12 +334,19 @@ pub struct ReconciliationReport {
     pub skipped_no_access: Vec<String>,
 }
 
+/// `Dispatcher`'s own `EventDispatcher::scheduled_payload` closure -
+/// `T::scheduled_payload()` boxed and JSON-serialised, the identical
+/// no-runtime-captures-beyond-the-`Box` shape `DeciderFn`/`ProjectFn`
+/// already have. Only ever called (via `db::fire_system_event`) once an
+/// occurrence is already confirmed eligible - see `EventType::
+/// scheduled_payload`'s own doc comment on why it's safe for this to
+/// call straight through to a method that panics if never overridden.
+type ScheduledPayloadFn = Box<dyn Fn() -> String + Send + Sync>;
+
 /// A `.event_type::<T>()` call's own captured data - everything
 /// `register_event_type` needs except the caller-supplied `access_mapping`/
 /// `bounded_context`/`existing`, which reconciliation resolves at
-/// `.build()` time, not registration time. `system_triggered_allowed`/
-/// `system_triggered_schedule` stay hard-defaulted (`false`/`None`) per
-/// §1.7 - no scheduler exists yet to consult them.
+/// `.build()` time, not registration time.
 struct RegisteredEventType {
     schema: String,
     tag_mappings: Vec<skilj_core::shared::TagMapping>,
@@ -301,9 +354,19 @@ struct RegisteredEventType {
     external_creation_allowed: bool,
     direct_creation_allowed: bool,
     event_read_allowed: bool,
+    system_triggered_allowed: bool,
+    system_triggered_schedule: Option<String>,
+    missed_occurrence_policy: Option<skilj_core::event_store::MissedOccurrencePolicy>,
+    /// Called by `Dispatcher::scheduled_payload` (this module's own
+    /// `EventDispatcher` implementer), reached from the background
+    /// scheduler `SkiljBuilder::build()` spawns, through `db::
+    /// fire_system_event`.
+    scheduled_payload: ScheduledPayloadFn,
 }
 
-fn registered_event_type<T: EventType>() -> RegisteredEventType {
+/// `T: 'static` for the same reason `registered_command_type` needs it -
+/// lets the boxed `scheduled_payload` closure satisfy `+ 'static`.
+fn registered_event_type<T: EventType + 'static>() -> RegisteredEventType {
     let schema = schemars::schema_for!(T::Payload);
     RegisteredEventType {
         schema: serde_json::to_string(&schema).expect("JSON Schema serialization is infallible"),
@@ -312,6 +375,13 @@ fn registered_event_type<T: EventType>() -> RegisteredEventType {
         external_creation_allowed: T::external_creation_allowed(),
         direct_creation_allowed: T::direct_creation_allowed(),
         event_read_allowed: T::event_read_allowed(),
+        system_triggered_allowed: T::system_triggered_allowed(),
+        system_triggered_schedule: T::system_triggered_schedule(),
+        missed_occurrence_policy: T::missed_occurrence_policy(),
+        scheduled_payload: Box::new(|| {
+            serde_json::to_string(&T::scheduled_payload())
+                .expect("JSON serialization of Payload is infallible")
+        }),
     }
 }
 
@@ -483,9 +553,11 @@ pub struct SkiljBuilder {
     command_types: HashMap<(String, String), RegisteredCommandType>,
     projections: HashMap<(String, String), RegisteredProjection>,
     async_projection_poll_interval: std::time::Duration,
+    scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcast_capacity: usize,
+    event_cache_warm_up_count: usize,
 }
 
 impl SkiljBuilder {
@@ -505,7 +577,7 @@ impl SkiljBuilder {
         )
     }
 
-    pub fn event_type<T: EventType>(mut self) -> Self {
+    pub fn event_type<T: EventType + 'static>(mut self) -> Self {
         let bc = self.current_bounded_context();
         self.event_types
             .insert((bc, T::NAME.to_string()), registered_event_type::<T>());
@@ -564,6 +636,20 @@ impl SkiljBuilder {
         self
     }
 
+    /// How often the background scheduler task `.build()` spawns checks
+    /// every `system_triggered_allowed` `EventType`, across every
+    /// bounded context, for a due occurrence - `rule CreateSystemEvent`'s
+    /// own wake mechanism, the `EventType` equivalent of
+    /// `async_projection_poll_interval` above. Defaults to 1s -
+    /// deliberately below a `cron` schedule's own finest grain (whole
+    /// seconds), so no occurrence is ever more than one tick late. A
+    /// caller with only minute-grained schedules can widen this to cut
+    /// idle polling cost.
+    pub fn scheduler_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.scheduler_poll_interval = interval;
+        self
+    }
+
     /// How long `ProjectionQuery`'s `waitForSequence` argument blocks
     /// before failing with a distinguishable timeout, when the projection
     /// hasn't caught up to the requested sequence yet - see
@@ -605,6 +691,20 @@ impl SkiljBuilder {
         self
     }
 
+    /// The in-memory per-bounded-context event cache's own warm-up fetch
+    /// size (drift audit finding #8) - the spec's own "a configurable
+    /// count that defaults to 1000... a library/runtime configuration
+    /// knob set when the process starts, not a registered or
+    /// admin-managed value", the identical register
+    /// `scheduler_poll_interval`/`async_projection_poll_interval` already
+    /// live in. Also the steady-state cap every bounded context's own
+    /// window is held to afterward - see `skilj_core::event_cache`'s own
+    /// module doc comment for why those are the same number.
+    pub fn event_cache_warm_up_count(mut self, count: usize) -> Self {
+        self.event_cache_warm_up_count = count;
+        self
+    }
+
     /// Runs the startup reconciliation loop automatically (§1.5). Returns
     /// `Err` only for a genuine registration rejection (e.g. an
     /// incompatible schema change) - a bounded context the reconciliation
@@ -613,6 +713,45 @@ impl SkiljBuilder {
     pub async fn build(self) -> Result<(Skilj, ReconciliationReport), skilj_core::Error> {
         let pool = skilj_core::db::connect(&self.database_url).await?;
         skilj_core::db::migrate(&pool).await?;
+
+        // `default BoundedContext admin`'s own `created_at`/`created_by`
+        // stamping - unconditional, every startup, and independent of
+        // whether a superadmin exists yet (see
+        // `bootstrap::stamp_admin_bounded_context`'s own doc comment). A
+        // no-op on every startup but the process's genuine first one
+        // against this database.
+        //
+        // Check-then-insert isn't atomic across two *separate* startups -
+        // a real, ordinary scenario for this line specifically, not a
+        // contrived one: several replicas of the same service, each
+        // calling `.build()` against one shared database at deploy time,
+        // can genuinely race here. If the insert fails, re-checking
+        // rather than assuming failure is what tells "someone else's
+        // concurrent build() already won this race" (benign - the row
+        // exists either way, which is all this cares about) apart from a
+        // real error (the row still doesn't exist, so whatever failed the
+        // insert is a genuine problem worth propagating).
+        let existing_admin_context = skilj_core::db::get_bounded_context(
+            &pool,
+            skilj_core::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME,
+        )
+        .await?;
+        if let Some(admin_context) = skilj_core::bootstrap::stamp_admin_bounded_context(
+            existing_admin_context.as_ref(),
+            chrono::Utc::now(),
+        ) {
+            if let Err(e) = skilj_core::db::insert_bounded_context(&pool, &admin_context).await {
+                if skilj_core::db::get_bounded_context(
+                    &pool,
+                    skilj_core::bootstrap::ADMIN_BOUNDED_CONTEXT_NAME,
+                )
+                .await?
+                .is_none()
+                {
+                    return Err(e);
+                }
+            }
+        }
 
         // Needed unconditionally now, not only when a reconciliation role
         // is configured - `generate_bootstrap_secret` below needs the
@@ -637,7 +776,14 @@ impl SkiljBuilder {
             )?
             .clone();
 
-            reconcile_event_types(&pool, &role, &self.event_types, &mut report).await?;
+            reconcile_event_types(
+                &pool,
+                &role,
+                &self.event_types,
+                &mut report,
+                chrono::Utc::now(),
+            )
+            .await?;
             reconcile_command_types(&pool, &role, &self.command_types, &mut report).await?;
             reconcile_projections(&pool, &role, &self.projections, &mut report).await?;
         }
@@ -653,15 +799,31 @@ impl SkiljBuilder {
         let projection_query_wait_timeout = self.projection_query_wait_timeout;
         let encryption_master_key = self.encryption_master_key;
         let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
+
+        // The in-memory per-bounded-context event cache (drift audit
+        // finding #8) - warmed here, before the first request can be
+        // served, for every bounded context that exists yet (the same
+        // `db::list_bounded_contexts` iteration the scheduler/async-
+        // projection tasks below already use). A bounded context created
+        // later starts its own window from empty on first touch -
+        // `EventCache::append`/`try_events_after`'s own doc comments -
+        // which is already correct, not a gap this loop needs to cover.
+        let event_cache = EventCache::new(self.event_cache_warm_up_count);
+        for bc in skilj_core::db::list_bounded_contexts(&pool).await? {
+            event_cache.warm(&pool, &bc.name).await?;
+        }
+
         let skilj = Skilj {
             pool,
             command_types: Arc::new(self.command_types),
             projections: Arc::new(self.projections),
+            event_types: Arc::new(self.event_types),
             bootstrap_secret,
             identity_provider,
             projection_query_wait_timeout,
             encryption_master_key,
             event_broadcaster,
+            event_cache,
         };
 
         // The single shared background task backing §8 item 6's async
@@ -708,7 +870,159 @@ impl SkiljBuilder {
             }
         });
 
+        // The background scheduler backing `rule CreateSystemEvent`/
+        // `rule SkipMissedOccurrences` - one shared task, not one per
+        // bounded context or event type, for the same reasons the async
+        // projection task above is; detached, runs for the process's
+        // lifetime, same as that task too. Its very first tick, run
+        // immediately rather than after the first sleep (identical
+        // reasoning to the poll task above), already covers what a
+        // separate "startup catch-up pass" would: `scheduler_tick`'s own
+        // backlog check (see its doc comment) runs on every tick, first
+        // one included, so a `skip`-policy type this process finds
+        // already behind on its very first look is caught up right then,
+        // not held for a second tick.
+        let scheduler_pool = skilj.pool.clone();
+        let scheduler_projection_dispatcher = skilj.projection_dispatcher();
+        let scheduler_event_dispatcher = skilj.event_dispatcher();
+        let scheduler_broadcaster = skilj.event_broadcaster.clone();
+        let scheduler_event_cache = skilj.event_cache.clone();
+        let scheduler_encryption_master_key = skilj.encryption_master_key.clone();
+        let scheduler_interval = self.scheduler_poll_interval;
+        tokio::spawn(async move {
+            loop {
+                scheduler_tick(
+                    &scheduler_pool,
+                    scheduler_projection_dispatcher.as_ref(),
+                    scheduler_event_dispatcher.as_ref(),
+                    &scheduler_broadcaster,
+                    &scheduler_event_cache,
+                    scheduler_encryption_master_key.as_ref(),
+                    chrono::Utc::now(),
+                )
+                .await;
+                tokio::time::sleep(scheduler_interval).await;
+            }
+        });
+
         Ok((skilj, report))
+    }
+}
+
+/// One scheduler tick, across every active bounded context - `rule
+/// CreateSystemEvent`/`rule SkipMissedOccurrences`'s own wake mechanism,
+/// factored out of `SkiljBuilder::build`'s spawned task so its control
+/// flow (nested loops, several early-`continue`s) doesn't have to live
+/// inside a `tokio::spawn` closure. For each `system_triggered_allowed`
+/// `EventType` `db::list_scheduled_event_types` returns, computes the
+/// earliest occurrence its own `schedule_position` hasn't accounted for
+/// yet (`next_occurrence_after(schedule, position)`) and, if it's due
+/// (`occurrence_at <= now`):
+///
+///   - under `skip`, first checks whether a *second* occurrence is also
+///     already due (`nothing_later_is_due` - the identical computation
+///     `event_store::create_system_event`'s own eligibility gate makes
+///     internally) - a real backlog, which `skip` can only ever resolve
+///     by jumping straight to `now` (`db::skip_missed_occurrences_for_event_type`),
+///     never by firing occurrence by occurrence (that would violate
+///     `no_gap` the moment more than one is overdue);
+///   - otherwise, attempts to fire it via `db::fire_system_event`, which
+///     re-derives eligibility for real under its own row lock - this
+///     function's own checks are a cheap, non-authoritative pre-filter
+///     only, the same "peek here, re-check under lock there" split
+///     `submit_command` already uses.
+///
+/// A database error at any step is logged and that step skipped, not
+/// propagated - there is no caller here to propagate it *to*; the next
+/// tick tries again, the same tolerance `catch_up_bounded_context`'s own
+/// poll task already has for its own errors.
+async fn scheduler_tick(
+    pool: &Pool,
+    projection_dispatcher: &dyn skilj_core::plugin::ProjectionDispatcher,
+    event_dispatcher: &dyn skilj_core::plugin::EventDispatcher,
+    broadcaster: &EventBroadcaster,
+    event_cache: &EventCache,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
+        Ok(bcs) => bcs,
+        Err(e) => {
+            eprintln!("skilj: scheduler failed to list bounded contexts: {e}");
+            return;
+        }
+    };
+    for bc in &bounded_contexts {
+        if bc.status != skilj_core::event_store::BoundedContextStatus::Active {
+            continue;
+        }
+        let scheduled = match skilj_core::db::list_scheduled_event_types(pool, &bc.name).await {
+            Ok(scheduled) => scheduled,
+            Err(e) => {
+                eprintln!(
+                    "skilj: scheduler failed to list scheduled event types for {:?}: {e}",
+                    bc.name
+                );
+                continue;
+            }
+        };
+        for et in &scheduled {
+            let (Some(schedule), Some(policy), Some(position)) = (
+                &et.system_triggered_schedule,
+                et.missed_occurrence_policy,
+                et.schedule_position,
+            ) else {
+                continue;
+            };
+            let Some(occurrence_at) =
+                skilj_core::event_store::next_occurrence_after(schedule, position)
+            else {
+                continue;
+            };
+            if occurrence_at > now {
+                continue;
+            }
+
+            let nothing_later_is_due =
+                skilj_core::event_store::next_occurrence_after(schedule, occurrence_at)
+                    .is_none_or(|next| next > now);
+
+            if policy == skilj_core::event_store::MissedOccurrencePolicy::Skip
+                && !nothing_later_is_due
+            {
+                if let Err(e) = skilj_core::db::skip_missed_occurrences_for_event_type(
+                    pool, &bc.name, &et.name, now,
+                )
+                .await
+                {
+                    eprintln!(
+                        "skilj: SkipMissedOccurrences failed for {}/{}: {e}",
+                        bc.name, et.name
+                    );
+                }
+                continue;
+            }
+
+            if let Err(e) = skilj_core::db::fire_system_event(
+                pool,
+                projection_dispatcher,
+                event_dispatcher,
+                broadcaster,
+                event_cache,
+                &bc.name,
+                &et.name,
+                occurrence_at,
+                now,
+                encryption_master_key,
+            )
+            .await
+            {
+                eprintln!(
+                    "skilj: CreateSystemEvent failed for {}/{}: {e}",
+                    bc.name, et.name
+                );
+            }
+        }
     }
 }
 
@@ -731,20 +1045,44 @@ async fn active_admin_mapping(
     )
 }
 
+/// The first two steps every `reconcile_*` function below shares, byte
+/// for byte - resolve the target `BoundedContext` and the reconciliation
+/// role's own admin mapping on it, `None` (a skip, not an error) if
+/// either is missing. Real duplication, but a plain function extraction,
+/// not a generic one: each `reconcile_*` function's own register/persist
+/// steps diverge too much (different `register_*` pure function
+/// signatures, different persistence shapes) for a shared generic to
+/// actually save more than this shared prefix already does.
+async fn resolve_bounded_context_and_admin_mapping(
+    pool: &Pool,
+    role_id: &str,
+    bounded_context_name: &str,
+) -> skilj_core::error::Result<
+    Option<(
+        skilj_core::event_store::BoundedContext,
+        skilj_core::access_control::RoleAccessMapping,
+    )>,
+> {
+    let Some(bc) = skilj_core::db::get_bounded_context(pool, bounded_context_name).await? else {
+        return Ok(None);
+    };
+    let Some(mapping) = active_admin_mapping(pool, role_id, bounded_context_name).await? else {
+        return Ok(None);
+    };
+    Ok(Some((bc, mapping)))
+}
+
 async fn reconcile_event_types(
     pool: &Pool,
     role: &Role,
     event_types: &HashMap<(String, String), RegisteredEventType>,
     report: &mut ReconciliationReport,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), skilj_core::Error> {
     for ((bounded_context_name, name), registered) in event_types {
         let key = format!("{bounded_context_name}/{name}");
-        let Some(bc) = skilj_core::db::get_bounded_context(pool, bounded_context_name).await?
-        else {
-            report.skipped_no_access.push(key);
-            continue;
-        };
-        let Some(mapping) = active_admin_mapping(pool, &role.id, bounded_context_name).await?
+        let Some((bc, mapping)) =
+            resolve_bounded_context_and_admin_mapping(pool, &role.id, bounded_context_name).await?
         else {
             report.skipped_no_access.push(key);
             continue;
@@ -760,10 +1098,12 @@ async fn reconcile_event_types(
             registered.sensitive_fields.clone(),
             registered.external_creation_allowed,
             registered.direct_creation_allowed,
-            false,
-            None,
+            registered.system_triggered_allowed,
+            registered.system_triggered_schedule.clone(),
+            registered.missed_occurrence_policy,
             registered.event_read_allowed,
             existing.as_ref(),
+            now,
         )?;
         skilj_core::db::upsert_event_type(pool, registration.event_type()).await?;
         report.registered.push(key);
@@ -779,12 +1119,8 @@ async fn reconcile_command_types(
 ) -> Result<(), skilj_core::Error> {
     for ((bounded_context_name, name), registered) in command_types {
         let key = format!("{bounded_context_name}/{name}");
-        let Some(bc) = skilj_core::db::get_bounded_context(pool, bounded_context_name).await?
-        else {
-            report.skipped_no_access.push(key);
-            continue;
-        };
-        let Some(mapping) = active_admin_mapping(pool, &role.id, bounded_context_name).await?
+        let Some((bc, mapping)) =
+            resolve_bounded_context_and_admin_mapping(pool, &role.id, bounded_context_name).await?
         else {
             report.skipped_no_access.push(key);
             continue;
@@ -836,12 +1172,8 @@ async fn reconcile_projections(
 ) -> Result<(), skilj_core::Error> {
     for ((bounded_context_name, name), registered) in projections {
         let key = format!("{bounded_context_name}/{name}");
-        let Some(bc) = skilj_core::db::get_bounded_context(pool, bounded_context_name).await?
-        else {
-            report.skipped_no_access.push(key);
-            continue;
-        };
-        let Some(mapping) = active_admin_mapping(pool, &role.id, bounded_context_name).await?
+        let Some((bc, mapping)) =
+            resolve_bounded_context_and_admin_mapping(pool, &role.id, bounded_context_name).await?
         else {
             report.skipped_no_access.push(key);
             continue;
@@ -858,8 +1190,17 @@ async fn reconcile_projections(
         };
 
         let existing = skilj_core::db::get_projection(pool, bounded_context_name, name).await?;
-        let staged =
-            skilj_core::db::get_projection_rebuild(pool, bounded_context_name, name).await?;
+        // RegisterProjection's own `staged` is always the pending row -
+        // see `skilj-graphql`'s `resolvers::type_registration`'s own
+        // module doc comment for why every lookup here is explicit about
+        // it now.
+        let staged = skilj_core::db::get_projection_rebuild(
+            pool,
+            bounded_context_name,
+            name,
+            ProjectionRebuildStatus::Pending,
+        )
+        .await?;
         let bounded_context_events =
             skilj_core::db::list_events_for_bounded_context(pool, bounded_context_name).await?;
 

@@ -48,10 +48,10 @@ use skilj_core::access_control::{
 };
 use skilj_core::db::{self, AccessTokenKind, Pool};
 use skilj_core::encryption::EncryptionMasterKey;
-use skilj_core::event_store::{self, AckMode, Event, EventBroadcaster, EventType};
+use skilj_core::event_cache::EventCache;
+use skilj_core::event_store::{self, AckMode, Event, EventBroadcaster};
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
-use skilj_core::shared::{secret_matches, CommandDecision, Filter, FilterOperator};
-use std::collections::HashMap;
+use skilj_core::shared::{hash_secret, secret_matches, Filter, FilterOperator};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -61,6 +61,7 @@ struct AppState {
     projection_dispatcher: Arc<dyn ProjectionDispatcher>,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcaster: EventBroadcaster,
+    event_cache: EventCache,
 }
 
 pub fn router(
@@ -69,6 +70,7 @@ pub fn router(
     projection_dispatcher: Arc<dyn ProjectionDispatcher>,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcaster: EventBroadcaster,
+    event_cache: EventCache,
 ) -> Router {
     Router::new()
         .route("/v1/events/external", post(post_events_external))
@@ -83,12 +85,19 @@ pub fn router(
             projection_dispatcher,
             encryption_master_key,
             event_broadcaster,
+            event_cache,
         })
 }
 
 // --- token resolution: BearerCredential -> the concrete AccessToken variant a route needs ---
 //
-// Each of these tells three outcomes apart: no AccessToken has this id at
+// One generic `resolve_token::<T>` replaces what were four near-identical
+// functions (one per `AccessToken` variant) differing only in which
+// `AccessTokenKind`/`db::get_*_token` getter/struct type they closed
+// over - real duplication, but a plain-Rust-generics fit, not a macro
+// one: `TokenLookup` names the one axis each variant actually differs on.
+//
+// Each call tells three outcomes apart: no AccessToken has this id at
 // all, one does but of a different AccessTokenKind (403 - wrong variant),
 // or one does, the kind matches, but the presented secret doesn't
 // (folded into the same "unrecognised credential" 401 as "no such id" -
@@ -97,82 +106,82 @@ pub fn router(
 // whether this token is actually allowed to do what the route is asking
 // (active, opted in, right bounded context) is left to the skilj-core
 // rule the handler calls next - not this layer's job.
+//
+// `token.secret()` as loaded from `T::get` is `hash_secret`'s output (see
+// AccessToken.secret), never the plaintext - so the presented half of the
+// credential is hashed here too before `secret_matches` ever compares the
+// two, always comparing hash against hash.
 
-async fn resolve_external_event_token(
-    state: &AppState,
-    credential: &BearerCredential,
-) -> Result<ExternalEventToken, RestError> {
-    match db::access_token_kind(&state.pool, &credential.id).await? {
-        None => Err(RestError::UnrecognisedCredential),
-        Some(AccessTokenKind::ExternalEvent) => {
-            let token = db::get_external_event_token(&state.pool, &credential.id)
-                .await?
-                .expect(
-                    "access_token_kind said ExternalEvent, get_external_event_token found none",
-                );
-            if secret_matches(&credential.secret, &token.secret) {
-                Ok(token)
-            } else {
-                Err(RestError::UnrecognisedCredential)
-            }
-        }
-        Some(_) => Err(RestError::WrongTokenVariant),
+/// One `AccessToken` variant's own `AccessTokenKind` tag, `db::get_*_token`
+/// getter, and `secret` accessor - the whole of what `resolve_token`
+/// needs to be generic over.
+trait TokenLookup: Sized {
+    const KIND: AccessTokenKind;
+
+    async fn get(pool: &Pool, id: &str) -> skilj_core::error::Result<Option<Self>>;
+
+    fn secret(&self) -> &str;
+}
+
+impl TokenLookup for ExternalEventToken {
+    const KIND: AccessTokenKind = AccessTokenKind::ExternalEvent;
+
+    async fn get(pool: &Pool, id: &str) -> skilj_core::error::Result<Option<Self>> {
+        db::get_external_event_token(pool, id).await
+    }
+
+    fn secret(&self) -> &str {
+        &self.secret
     }
 }
 
-async fn resolve_direct_creation_token(
-    state: &AppState,
-    credential: &BearerCredential,
-) -> Result<DirectCreationToken, RestError> {
-    match db::access_token_kind(&state.pool, &credential.id).await? {
-        None => Err(RestError::UnrecognisedCredential),
-        Some(AccessTokenKind::DirectCreation) => {
-            let token = db::get_direct_creation_token(&state.pool, &credential.id)
-                .await?
-                .expect(
-                    "access_token_kind said DirectCreation, get_direct_creation_token found none",
-                );
-            if secret_matches(&credential.secret, &token.secret) {
-                Ok(token)
-            } else {
-                Err(RestError::UnrecognisedCredential)
-            }
-        }
-        Some(_) => Err(RestError::WrongTokenVariant),
+impl TokenLookup for DirectCreationToken {
+    const KIND: AccessTokenKind = AccessTokenKind::DirectCreation;
+
+    async fn get(pool: &Pool, id: &str) -> skilj_core::error::Result<Option<Self>> {
+        db::get_direct_creation_token(pool, id).await
+    }
+
+    fn secret(&self) -> &str {
+        &self.secret
     }
 }
 
-async fn resolve_event_read_token(
-    state: &AppState,
-    credential: &BearerCredential,
-) -> Result<EventReadToken, RestError> {
-    match db::access_token_kind(&state.pool, &credential.id).await? {
-        None => Err(RestError::UnrecognisedCredential),
-        Some(AccessTokenKind::EventRead) => {
-            let token = db::get_event_read_token(&state.pool, &credential.id)
-                .await?
-                .expect("access_token_kind said EventRead, get_event_read_token found none");
-            if secret_matches(&credential.secret, &token.secret) {
-                Ok(token)
-            } else {
-                Err(RestError::UnrecognisedCredential)
-            }
-        }
-        Some(_) => Err(RestError::WrongTokenVariant),
+impl TokenLookup for EventReadToken {
+    const KIND: AccessTokenKind = AccessTokenKind::EventRead;
+
+    async fn get(pool: &Pool, id: &str) -> skilj_core::error::Result<Option<Self>> {
+        db::get_event_read_token(pool, id).await
+    }
+
+    fn secret(&self) -> &str {
+        &self.secret
     }
 }
 
-async fn resolve_command_token(
+impl TokenLookup for CommandToken {
+    const KIND: AccessTokenKind = AccessTokenKind::Command;
+
+    async fn get(pool: &Pool, id: &str) -> skilj_core::error::Result<Option<Self>> {
+        db::get_command_token(pool, id).await
+    }
+
+    fn secret(&self) -> &str {
+        &self.secret
+    }
+}
+
+async fn resolve_token<T: TokenLookup>(
     state: &AppState,
     credential: &BearerCredential,
-) -> Result<CommandToken, RestError> {
+) -> Result<T, RestError> {
     match db::access_token_kind(&state.pool, &credential.id).await? {
         None => Err(RestError::UnrecognisedCredential),
-        Some(AccessTokenKind::Command) => {
-            let token = db::get_command_token(&state.pool, &credential.id)
+        Some(kind) if kind == T::KIND => {
+            let token = T::get(&state.pool, &credential.id)
                 .await?
-                .expect("access_token_kind said Command, get_command_token found none");
-            if secret_matches(&credential.secret, &token.secret) {
+                .expect("access_token_kind matched T::KIND, so T::get finding none is a real bug");
+            if secret_matches(&hash_secret(&credential.secret), token.secret()) {
                 Ok(token)
             } else {
                 Err(RestError::UnrecognisedCredential)
@@ -362,49 +371,26 @@ async fn post_events_external(
     credential: BearerCredential,
     Json(body): Json<ExternalEventRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let token = resolve_external_event_token(&state, &credential).await?;
-    let next_seq = db::next_sequence(&state.pool, &token.event_type.bounded_context.name).await?;
+    let token = resolve_token::<ExternalEventToken>(&state, &credential).await?;
     let payload = serde_json::to_string(&body.payload)
         .expect("serde_json::Value serialization is infallible");
 
-    // `protect_sensitive_fields`'s own pre-resolution step - see
-    // `db::resolve_encryption_keys`'s own doc comment. A no-op unless
-    // `token.event_type.sensitive_fields` actually names a subject this
-    // payload carries.
-    let bounded_context_name = token.event_type.bounded_context.name.clone();
-    let mut resolved = HashMap::new();
-    db::resolve_encryption_keys(
+    // `next_sequence`'s own lock, `create_external_event`'s pure
+    // construction, and the insert all happen inside one transaction
+    // now - see `db::create_and_insert_external_event`'s own doc
+    // comment for why a rejection here no longer burns a sequence
+    // number the way it used to.
+    let event = db::create_and_insert_external_event(
         &state.pool,
-        &bounded_context_name,
-        &token.event_type.sensitive_fields,
-        &payload,
-        state.encryption_master_key.as_ref(),
-        &mut resolved,
-    )
-    .await?;
-
-    let event = event_store::create_external_event(
+        state.projection_dispatcher.as_ref(),
+        &state.event_broadcaster,
+        &state.event_cache,
         &token,
         payload,
         body.source_content,
         body.source_context,
-        next_seq,
         Utc::now(),
-        |subject_key, subject_value| {
-            let (key, _, data_key) = resolved
-                .get(&(subject_key.to_string(), subject_value.to_string()))
-                .expect("resolve_encryption_keys pre-resolved every subject sensitive_field_subjects named");
-            (key.clone(), data_key.clone())
-        },
-    )?;
-    let encryption_key_ids = db::encryption_key_ids(&event.encryption_keys, &resolved);
-    db::insert_event_and_update_sync_projections(
-        &state.pool,
-        &event,
-        None,
-        state.projection_dispatcher.as_ref(),
-        &encryption_key_ids,
-        &state.event_broadcaster,
+        state.encryption_master_key.as_ref(),
     )
     .await?;
 
@@ -421,43 +407,21 @@ async fn post_events_direct(
     credential: BearerCredential,
     Json(body): Json<DirectEventRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let token = resolve_direct_creation_token(&state, &credential).await?;
-    let next_seq = db::next_sequence(&state.pool, &token.event_type.bounded_context.name).await?;
+    let token = resolve_token::<DirectCreationToken>(&state, &credential).await?;
     let payload = serde_json::to_string(&body.payload)
         .expect("serde_json::Value serialization is infallible");
 
-    let bounded_context_name = token.event_type.bounded_context.name.clone();
-    let mut resolved = HashMap::new();
-    db::resolve_encryption_keys(
+    // See `post_events_external`'s own comment -
+    // `db::create_and_insert_direct_event`'s identical fix.
+    let event = db::create_and_insert_direct_event(
         &state.pool,
-        &bounded_context_name,
-        &token.event_type.sensitive_fields,
-        &payload,
-        state.encryption_master_key.as_ref(),
-        &mut resolved,
-    )
-    .await?;
-
-    let event = event_store::create_direct_event(
+        state.projection_dispatcher.as_ref(),
+        &state.event_broadcaster,
+        &state.event_cache,
         &token,
         payload,
-        next_seq,
         Utc::now(),
-        |subject_key, subject_value| {
-            let (key, _, data_key) = resolved
-                .get(&(subject_key.to_string(), subject_value.to_string()))
-                .expect("resolve_encryption_keys pre-resolved every subject sensitive_field_subjects named");
-            (key.clone(), data_key.clone())
-        },
-    )?;
-    let encryption_key_ids = db::encryption_key_ids(&event.encryption_keys, &resolved);
-    db::insert_event_and_update_sync_projections(
-        &state.pool,
-        &event,
-        None,
-        state.projection_dispatcher.as_ref(),
-        &encryption_key_ids,
-        &state.event_broadcaster,
+        state.encryption_master_key.as_ref(),
     )
     .await?;
 
@@ -475,11 +439,13 @@ async fn get_events(
     Query(query): Query<EventsQuery>,
 ) -> Result<impl IntoResponse, RestError> {
     let filters = parse_filter_params(&query.filter)?;
-    let token = resolve_event_read_token(&state, &credential).await?;
-    let events = db::list_events(
+    let token = resolve_token::<EventReadToken>(&state, &credential).await?;
+    let events = db::list_events_cached(
         &state.pool,
+        &state.event_cache,
         &token.event_type.bounded_context.name,
         &token.event_type.name,
+        query.after.unwrap_or(-1),
     )
     .await?;
 
@@ -501,7 +467,7 @@ async fn get_events_consume(
     Query(query): Query<ConsumeQuery>,
 ) -> Result<impl IntoResponse, RestError> {
     let filters = parse_filter_params(&query.filter)?;
-    let token = resolve_event_read_token(&state, &credential).await?;
+    let token = resolve_token::<EventReadToken>(&state, &credential).await?;
     let ack_mode = match query.mode.as_deref() {
         None => None,
         Some("auto") => Some(AckMode::AutoAdvance),
@@ -514,10 +480,12 @@ async fn get_events_consume(
     };
 
     let existing_cursor = db::get_read_cursor(&state.pool, &token).await?;
-    let events = db::list_events(
+    let events = db::list_events_cached(
         &state.pool,
+        &state.event_cache,
         &token.event_type.bounded_context.name,
         &token.event_type.name,
+        existing_cursor.as_ref().map(|c| c.sequence).unwrap_or(-1),
     )
     .await?;
 
@@ -541,7 +509,7 @@ async fn post_events_consume_ack(
     credential: BearerCredential,
     Json(body): Json<AckRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let token = resolve_event_read_token(&state, &credential).await?;
+    let token = resolve_token::<EventReadToken>(&state, &credential).await?;
     let cursor = db::get_read_cursor(&state.pool, &token).await?;
 
     let (sequence, updated_at) =
@@ -556,21 +524,26 @@ async fn post_commands_trigger(
     credential: BearerCredential,
     Json(body): Json<CommandTriggerRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let token = resolve_command_token(&state, &credential).await?;
+    let token = resolve_token::<CommandToken>(&state, &credential).await?;
     let payload = serde_json::to_string(&body.payload)
         .expect("serde_json::Value serialization is infallible");
 
     let authorised = event_store::authorise_command_trigger(&token, payload)?;
     let bounded_context_name = authorised.command_type.bounded_context.name.clone();
 
-    // consistency_boundary_and_matching_events' own `matching_events` is
-    // what decide() itself needs - process_command below recomputes the
-    // identical thing internally for the command it stores, per its own
-    // doc comment (decide() may run more than once per submission under
-    // the optimistic-then-locked retry pattern, so this isn't wasted
-    // work, it's the two calls' own separate concerns).
-    let bounded_context_events =
-        db::list_events_for_bounded_context(&state.pool, &bounded_context_name).await?;
+    // The optimistic, unlocked half: read matching events and call
+    // dispatch() once, same as always - see the note above the rules in
+    // specs/skilj.allium ("reading matching events and running decide()
+    // beforehand does not [need the lock]"). `db::submit_command` below
+    // is what re-checks this under `next_sequence`'s own lock and
+    // redispatches if a DCB conflict actually happened in between.
+    let bounded_context_events = db::list_events_for_bounded_context_cached(
+        &state.pool,
+        &state.event_cache,
+        &bounded_context_name,
+        -1,
+    )
+    .await?;
     let consistency_tags =
         event_store::derive_tags(&authorised.command_type.tag_mappings, &authorised.payload);
     let (_boundary, matching_events) = event_store::consistency_boundary_and_matching_events(
@@ -589,120 +562,39 @@ async fn post_commands_trigger(
         Some(Ok(decision)) => decision,
     };
 
-    let event_specs = match decision {
-        CommandDecision::Rejected { reason, kind } => {
-            // §5.4/§7.3: a legitimate business outcome, not an HTTP
-            // error - process_command itself is never called on this
-            // branch (it would turn this into an Err(CommandRejected)).
-            return Ok(Json(CommandTriggerResponse {
-                accepted: false,
-                triggered_event_sequences: None,
-                rejection_reason: Some(reason),
-                rejection_kind: Some(kind),
-            }));
-        }
-        CommandDecision::Accepted { events } => events,
-    };
-
-    // process_command's own `resolve_event_type`/`next_sequence` are
-    // plain sync closures (see its own doc comment: decide() and
-    // everything downstream of it stays I/O-free) - so every EventType
-    // lookup and sequence allocation this call will need happens first,
-    // here, and the closures below just index into what's already
-    // in hand.
-    let mut event_types_by_name: HashMap<String, EventType> = HashMap::new();
-    for spec in &event_specs {
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            event_types_by_name.entry(spec.event_type.clone())
-        {
-            if let Some(et) =
-                db::get_event_type(&state.pool, &bounded_context_name, &spec.event_type).await?
-            {
-                entry.insert(et);
-            }
-        }
-    }
-    let mut sequences = Vec::with_capacity(event_specs.len());
-    for _ in 0..event_specs.len() {
-        sequences.push(db::next_sequence(&state.pool, &bounded_context_name).await?);
-    }
-    let mut sequences = sequences.into_iter();
-
-    // `protect_sensitive_fields`'s own pre-resolution step, for the
-    // command's own payload *and* every accepted event spec's - see
-    // `db::resolve_encryption_keys`'s own doc comment on why this
-    // accumulates into one shared map rather than resolving each
-    // separately: a subject the command and one of its own events both
-    // name must resolve to the identical `EncryptionKey`.
-    let mut resolved = HashMap::new();
-    db::resolve_encryption_keys(
+    let outcome = db::submit_command(
         &state.pool,
-        &bounded_context_name,
-        &authorised.command_type.sensitive_fields,
-        &authorised.payload,
-        state.encryption_master_key.as_ref(),
-        &mut resolved,
-    )
-    .await?;
-    for spec in &event_specs {
-        if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
-            let spec_payload = spec.payload.to_string();
-            db::resolve_encryption_keys(
-                &state.pool,
-                &bounded_context_name,
-                &event_type.sensitive_fields,
-                &spec_payload,
-                state.encryption_master_key.as_ref(),
-                &mut resolved,
-            )
-            .await?;
-        }
-    }
-
-    let result = event_store::process_command(
+        state.dispatcher.as_ref(),
+        state.projection_dispatcher.as_ref(),
+        &state.event_broadcaster,
+        &state.event_cache,
         &authorised.command_type,
         &authorised.payload,
         &authorised.client_id,
         &bounded_context_events,
-        CommandDecision::Accepted {
-            events: event_specs,
-        },
-        |name| event_types_by_name.get(name).cloned(),
-        || {
-            sequences.next().expect(
-                "process_command called next_sequence more times than there are accepted events",
-            )
-        },
+        &consistency_tags,
+        decision,
+        state.encryption_master_key.as_ref(),
         Utc::now(),
-        |subject_key, subject_value| {
-            let (key, _, data_key) = resolved
-                .get(&(subject_key.to_string(), subject_value.to_string()))
-                .expect("resolve_encryption_keys pre-resolved every subject sensitive_field_subjects named");
-            (key.clone(), data_key.clone())
+    )
+    .await?;
+
+    Ok(Json(match outcome {
+        // §5.4/§7.3: a legitimate business outcome, not an HTTP error -
+        // whether this was the first decision or a DCB-conflict retry
+        // inside submit_command, a rejection renders identically either
+        // way.
+        db::SubmitCommandOutcome::Rejected { reason, kind } => CommandTriggerResponse {
+            accepted: false,
+            triggered_event_sequences: None,
+            rejection_reason: Some(reason),
+            rejection_kind: Some(kind),
         },
-    )?;
-
-    let command_key_ids = db::encryption_key_ids(&result.command.encryption_keys, &resolved);
-    let command_id = db::insert_command(&state.pool, &result.command, &command_key_ids).await?;
-    let mut triggered_event_sequences = Vec::with_capacity(result.events.len());
-    for event in &result.events {
-        let event_key_ids = db::encryption_key_ids(&event.encryption_keys, &resolved);
-        db::insert_event_and_update_sync_projections(
-            &state.pool,
-            event,
-            Some(command_id),
-            state.projection_dispatcher.as_ref(),
-            &event_key_ids,
-            &state.event_broadcaster,
-        )
-        .await?;
-        triggered_event_sequences.push(event.sequence);
-    }
-
-    Ok(Json(CommandTriggerResponse {
-        accepted: true,
-        triggered_event_sequences: Some(triggered_event_sequences),
-        rejection_reason: None,
-        rejection_kind: None,
+        db::SubmitCommandOutcome::Accepted { events, .. } => CommandTriggerResponse {
+            accepted: true,
+            triggered_event_sequences: Some(events.iter().map(|e| e.sequence).collect()),
+            rejection_reason: None,
+            rejection_kind: None,
+        },
     }))
 }

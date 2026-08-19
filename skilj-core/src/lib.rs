@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod db;
 pub mod encryption;
 pub mod error;
+pub mod event_cache;
 pub mod event_store;
 pub mod plugin;
 pub mod projections;

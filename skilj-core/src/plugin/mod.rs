@@ -2,7 +2,7 @@
 //! own code touches directly. See docs/architecture.md §1 for the full
 //! reasoning behind this shape.
 
-use crate::event_store::Event;
+use crate::event_store::{Event, MissedOccurrencePolicy};
 use crate::shared::{CommandDecision, SensitiveField, TagMapping};
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Serialize};
@@ -38,8 +38,14 @@ pub trait BoundedContextEvent: Sized {
     /// passes this bounded context's own events), so `None` is a
     /// defensive case, not a designed-for one. `Some(Err(..))` when the
     /// stored payload doesn't deserialize into the matched variant's
-    /// payload type - reachable today, since nothing yet validates a
-    /// payload against `EventType.schema` at write time.
+    /// payload type - narrower than it used to be (an externally- or
+    /// directly-created event's own payload is now schema-checked before
+    /// it's ever stored), but still reachable: a command-triggered or
+    /// system-triggered event's payload came from `decide()`/
+    /// `scheduled_payload`, which are never schema-checked at all (see
+    /// the note above `entity CommandType`'s "Payload schema shape" in
+    /// specs/skilj.allium), and even a schema-valid payload can still be
+    /// stricter than the compiled Rust type expects.
     fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>>;
 }
 
@@ -129,6 +135,72 @@ pub trait EventType {
     fn event_read_allowed() -> bool {
         false
     }
+
+    /// Opt-in: `rule CreateSystemEvent`'s own gate, `EventType.
+    /// system_triggered_allowed`. `false` by default, like every other
+    /// creation-path flag on this trait - a type that never overrides
+    /// this three plus `system_triggered_schedule`/`missed_occurrence_policy`
+    /// is never scheduled at all, so `scheduled_payload` below is never
+    /// called for it.
+    fn system_triggered_allowed() -> bool {
+        false
+    }
+
+    /// The 7-field Quartz-dialect cron expression (`cron` crate) the
+    /// scheduler evaluates - required, and checked at registration time
+    /// (see `Error::MissingScheduleOrPolicy`), when
+    /// `system_triggered_allowed()` is `true`. `None` otherwise.
+    fn system_triggered_schedule() -> Option<String> {
+        None
+    }
+
+    /// See `enum MissedOccurrencePolicy`. Deliberately no default that
+    /// silently picks one policy over another - the user's own call on
+    /// this: "either way can be potentially dangerous", so a type opting
+    /// into scheduling must say which it means, explicitly, by
+    /// overriding this method; `register_event_type`'s own guard rejects
+    /// registration outright if this is still `None` while
+    /// `system_triggered_allowed()` is `true`.
+    fn missed_occurrence_policy() -> Option<MissedOccurrencePolicy> {
+        None
+    }
+
+    /// `scheduled_payload(event_type)` - the black box `rule
+    /// CreateSystemEvent` names. Called at most once per eligible
+    /// occurrence (see `event_store::create_system_event`'s own doc
+    /// comment on why it's never called for one that's about to be
+    /// rejected), never for a type that isn't `system_triggered_allowed`.
+    /// Panics if reached without being overridden - a type opting into
+    /// scheduling without ever producing a payload for it is a genuine
+    /// programming error, not a runtime condition to handle gracefully.
+    fn scheduled_payload() -> Self::Payload {
+        unimplemented!(
+            "{}::scheduled_payload() must be overridden - this event type is registered with \
+             system_triggered_allowed() = true, so the scheduler needs a payload for every \
+             occurrence it fires",
+            Self::NAME
+        )
+    }
+}
+
+/// Type-erased access to a bounded context's own `EventType::
+/// scheduled_payload()`, for the background scheduler in `db::
+/// fire_system_event` - the `EventType` equivalent of `CommandDispatcher`/
+/// `ProjectionDispatcher` above `Skilj` implements over its own compiled-in
+/// registry.
+pub trait EventDispatcher: Send + Sync {
+    /// `scheduled_payload()`'s own output, JSON-serialised - `None` when
+    /// no `(bounded_context, event_type)` pair matches anything
+    /// registered in this process, the same "pair isn't registered at
+    /// all" convention `CommandDispatcher::dispatch`/`ProjectionDispatcher::
+    /// keys` already use. A genuine misconfiguration when it happens for
+    /// a type the database itself marks `system_triggered_allowed` (see
+    /// `@guarantee ScheduleStateIsShared`'s own expectation that every
+    /// instance in a cluster registers the same scheduled types) -
+    /// `db::fire_system_event`'s caller treats it as a skip, not a panic,
+    /// the same tolerance `catch_up_bounded_context` already extends to
+    /// an unregistered projection dispatcher.
+    fn scheduled_payload(&self, bounded_context: &str, event_type: &str) -> Option<String>;
 }
 
 /// One projection a bounded context registers.

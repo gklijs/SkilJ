@@ -61,12 +61,15 @@ pub fn query_events_field() -> Field {
                     .map(|v| v.i64())
                     .transpose()?;
 
-                let bounded_context_events = skilj_core::db::list_events_for_bounded_context(
-                    &state.pool,
-                    &bounded_context_name,
-                )
-                .await
-                .map_err(to_graphql_error)?;
+                let bounded_context_events =
+                    skilj_core::db::list_events_for_bounded_context_cached(
+                        &state.pool,
+                        &state.event_cache,
+                        &bounded_context_name,
+                        after_sequence.unwrap_or(-1),
+                    )
+                    .await
+                    .map_err(to_graphql_error)?;
 
                 // Decrypt-on-read's own pre-resolution step - scoped to
                 // events matching the caller's own `eventTypes` argument
@@ -143,10 +146,14 @@ pub fn count_events_field() -> Field {
             }
             let tags = parse_tags(ctx.args.get("tags"))?;
 
-            let bounded_context_events =
-                skilj_core::db::list_events_for_bounded_context(&state.pool, &bounded_context_name)
-                    .await
-                    .map_err(to_graphql_error)?;
+            let bounded_context_events = skilj_core::db::list_events_for_bounded_context_cached(
+                &state.pool,
+                &state.event_cache,
+                &bounded_context_name,
+                -1,
+            )
+            .await
+            .map_err(to_graphql_error)?;
 
             let count = skilj_core::event_store::count_events(
                 &access_mapping,
@@ -180,11 +187,15 @@ pub fn inspect_event_field() -> Field {
                 require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
             let sequence = ctx.args.try_get("sequence")?.i64()?;
 
-            let event =
-                skilj_core::db::get_event_by_sequence(&state.pool, &bounded_context_name, sequence)
-                    .await
-                    .map_err(to_graphql_error)?
-                    .ok_or_else(|| not_found("Event", &sequence.to_string()))?;
+            let event = skilj_core::db::get_event_by_sequence_cached(
+                &state.pool,
+                &state.event_cache,
+                &bounded_context_name,
+                sequence,
+            )
+            .await
+            .map_err(to_graphql_error)?
+            .ok_or_else(|| not_found("Event", &sequence.to_string()))?;
 
             let mut data_keys = std::collections::HashMap::new();
             resolve_read_data_keys(

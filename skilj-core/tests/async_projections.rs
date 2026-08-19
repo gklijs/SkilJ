@@ -186,6 +186,9 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str) -> EventT
         direct_creation_allowed: true,
         system_triggered_allowed: false,
         system_triggered_schedule: None,
+        missed_occurrence_policy: None,
+        schedule_position: None,
+        last_fired_at: None,
         event_read_allowed: true,
     };
     db::upsert_event_type(pool, &et).await.unwrap();
@@ -348,23 +351,64 @@ fn a_building_rebuild_replays_from_the_start_and_promotes_once_caught_up() {
             .await
             .unwrap();
 
+        // A coexisting pending rebuild, staged alongside the building one
+        // rather than disturbing it (UniqueRebuildPerProjectionAndStatus's
+        // own "deliberate case") - promotion below must leave this one
+        // alone.
+        let pending = ProjectionRebuild {
+            schema_version: 3,
+            status: ProjectionRebuildStatus::Pending,
+            caught_up_to: None,
+            ..rebuild.clone()
+        };
+        db::upsert_projection_rebuild(&pool, &pending)
+            .await
+            .unwrap();
+
         let last_seq = insert_plain_event(&pool, &bc, &et, 5).await;
 
         db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
             .await
             .unwrap();
 
-        // Promoted: no rebuild row left, and the live projection now
-        // carries the rebuild's own schema/version and the state folded
-        // from both events (20 + 5), not just the one folded after
-        // staging - "starts from nothing" replaying the whole history,
-        // not resuming the live projection's own prior progress.
-        assert!(
-            db::get_projection_rebuild(&pool, &bc.name, "AccountBalance")
-                .await
-                .unwrap()
-                .is_none()
+        // Promoted: no *building* rebuild row left, and the live
+        // projection now carries the rebuild's own schema/version and the
+        // state folded from both events (20 + 5), not just the one folded
+        // after staging - "starts from nothing" replaying the whole
+        // history, not resuming the live projection's own prior progress.
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Building
+        )
+        .await
+        .unwrap()
+        .is_none());
+        // The coexisting pending rebuild survives the promotion untouched
+        // - compared field-by-field, not via a whole-struct `assert_eq!`,
+        // since `pending.projection` (embedded, captured before this
+        // promotion ran) is now stale on its own `schema_version`/
+        // `caught_up_to` - `get_projection_rebuild` always re-attaches the
+        // *live*, current `Projection` row, which promotion just changed.
+        let reloaded_pending = db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Pending,
+        )
+        .await
+        .unwrap()
+        .expect("the coexisting pending rebuild must survive promotion");
+        assert_eq!(reloaded_pending.schema, pending.schema);
+        assert_eq!(reloaded_pending.schema_version, pending.schema_version);
+        assert_eq!(
+            reloaded_pending.consumed_event_types,
+            pending.consumed_event_types
         );
+        assert_eq!(reloaded_pending.sync, pending.sync);
+        assert_eq!(reloaded_pending.caught_up_to, pending.caught_up_to);
+        assert_eq!(reloaded_pending.status, pending.status);
 
         let promoted = db::get_projection(&pool, &bc.name, "AccountBalance")
             .await

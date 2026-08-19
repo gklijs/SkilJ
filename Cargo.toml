@@ -11,8 +11,9 @@ members = [
 # See docs/architecture.md for why each crate exists and what it owns.
 # skilj-core   - the domain engine; zero web-framework dependency (§3.1, §3.2)
 # skilj-graphql - the GraphQL surface, independently usable (§3.1, §3.3, §5)
-# skilj-macros  - the one deliberate proc-macro exception to §1.3's
-#                 no-macros plugin API; #[requires_role(...)] only (§1.3.1)
+# skilj-macros  - two narrowly-scoped proc-macros, neither reopening
+#                 §1.3's no-macros-for-the-plugin-API decision:
+#                 #[requires_role(...)] (§1.3.1) and gql_object! (§1.3.2)
 # skilj-rest    - the REST surface, independently usable (§3.1, §3.3, §7)
 # skilj         - a thin facade depending on all three, for the common case (§3.1)
 

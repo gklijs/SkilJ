@@ -23,18 +23,24 @@ use crate::shared::{
     CommandDecision, Filter, FilterOperator, Metadata, SensitiveField, Tag, TagMapping,
 };
 
-// TODO: the in-memory per-bounded-context event cache
-// (`query_events`/`count_events`/`create_all_events_subscription`/
-// `create_event_type_subscription` below take a full `Event` snapshot as
-// a stand-in - see their own doc comments); and most of this crate's
-// remaining black boxes (the non-empty-list branches of
-// `protect_sensitive_fields`/`derive_tags`/`render_event`/`render_command`
-// below - `EncryptionKey` provisioning specifically, not yet needed by
-// `forget_subject`'s own destruction-only scope - and `resolve_field`'s
-// dotted-path branch - see its own comment). `Event.sequence` and every
-// field/argument derived from it are `i64` - see docs/architecture.md
-// §2.2.1 - not `i32`, to avoid the overflow risk that decision exists to
-// close.
+// The in-memory per-bounded-context event cache the spec describes
+// (drift audit finding #8, closed 2026-08-19) lives in `crate::
+// event_cache` - `db::list_events_cached`/
+// `list_events_for_bounded_context_cached`/`get_event_by_sequence_cached`
+// are what `query_events`/`count_events`/`fetch_events`/`consume_events`/
+// `process_command`'s own callers now read through instead of an
+// unconditional Postgres load; `query_events`/`count_events` below still
+// just take `bounded_context_events: &[Event]` as a caller-supplied
+// snapshot, unchanged - which snapshot that is (cache-served or a
+// Postgres fallback) is entirely the caller's own concern, the same
+// "pure function, I/O resolved before the call" split every other rule
+// in this module already follows. `create_all_events_subscription`/
+// `create_event_type_subscription` take the identical shape of snapshot
+// but are deliberately NOT wired to the cache - see `crate::event_cache`'s
+// own module doc comment for which four rule-groups are and aren't.
+// `Event.sequence` and every field/argument derived from it are `i64` -
+// see docs/architecture.md §2.2.1 - not `i32`, to avoid the overflow
+// risk that decision exists to close.
 //
 // `EventType`, `Event`, `ReadCursor`, `AckMode` and the `FetchEvents`/
 // `ConsumeEvents`/`AcknowledgeEvents` rules were a first cut, added while
@@ -117,6 +123,16 @@ pub struct BoundedContext {
     pub created_by: crate::bootstrap::ContextCreator,
 }
 
+/// See `enum MissedOccurrencePolicy`. No `Default` impl, deliberately -
+/// see that type's own doc comment on why this library never picks one
+/// on a bounded context's behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissedOccurrencePolicy {
+    Skip,
+    FireOnce,
+    ReplayBacklog,
+}
+
 /// See `entity EventType`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventType {
@@ -128,14 +144,34 @@ pub struct EventType {
     pub sensitive_fields: Vec<SensitiveField>,
     pub external_creation_allowed: bool,
     pub direct_creation_allowed: bool,
-    /// See `EventOrigin::SystemTriggered`'s registration opt-in - added
-    /// propagating `RegisterEventType`, alongside `system_triggered_schedule`
-    /// below. Neither is read by any rule propagated so far
-    /// (`EventOrigin::SystemTriggered` itself - the scheduler that would
-    /// consult them - is still `// TODO`, see this module's own doc
-    /// comment).
+    /// See `EventOrigin::SystemTriggered`'s registration opt-in, and
+    /// `rule CreateSystemEvent`/`rule SkipMissedOccurrences`, the real
+    /// scheduler mechanism these fields drive.
     pub system_triggered_allowed: bool,
     pub system_triggered_schedule: Option<String>,
+    /// What this type owes for an occurrence of its own schedule that
+    /// passed while nothing was watching for it - `None` for a type that
+    /// hasn't opted into scheduling (nothing to choose), mandatory the
+    /// moment it has (see `register_event_type`'s own
+    /// `MissingScheduleOrPolicy` guard and invariant
+    /// `ScheduledTypeIsFullyConfigured`). No default, anywhere - see
+    /// `MissedOccurrencePolicy`'s own doc comment.
+    pub missed_occurrence_policy: Option<MissedOccurrencePolicy>,
+    /// How far this type's schedule has been accounted for: every
+    /// occurrence at or before this instant has either produced an event
+    /// or been deliberately passed over, and none of them is considered
+    /// again. An instant, not an occurrence index - see `create_system_event`'s
+    /// own doc comment for why that's what lets a later schedule-string
+    /// change not reopen anything. `None` exactly when
+    /// `missed_occurrence_policy` is `None`.
+    pub schedule_position: Option<chrono::DateTime<chrono::Utc>>,
+    /// The occurrence instant of the most recent occurrence of this
+    /// type's schedule that actually produced an event - not the wall
+    /// clock of the write, which is already on that event's own
+    /// `Metadata.created_at` (see `create_system_event`'s own doc
+    /// comment). `None` until the first one fires; never reset by
+    /// switching scheduling off.
+    pub last_fired_at: Option<chrono::DateTime<chrono::Utc>>,
     pub event_read_allowed: bool,
 }
 
@@ -333,6 +369,21 @@ pub enum Error {
     #[error("this schema change is not backwards compatible")]
     SchemaIncompatible,
 
+    /// See `rule RegisterEventType`'s own note on scheduling being
+    /// "opted into whole": `requires: system_triggered_allowed = true
+    /// implies (system_triggered_schedule != null and
+    /// missed_occurrence_policy != null)`. A real new rejection this
+    /// pass introduced - a registration with `system_triggered_allowed:
+    /// true` and no schedule used to be silently accepted (and simply
+    /// never fired); it no longer is, since the same "no default" reasoning
+    /// that now requires a policy would be incoherent if it left the
+    /// schedule itself still optional.
+    #[error(
+        "a scheduled EventType must declare both system_triggered_schedule and \
+         missed_occurrence_policy - neither has a default"
+    )]
+    MissingScheduleOrPolicy,
+
     #[error("this filter is invalid for its field's declared type")]
     InvalidFilter,
 
@@ -384,6 +435,15 @@ pub enum Error {
     #[error("this CommandType is not opted into REST triggering")]
     RestTriggerNotAllowed,
 
+    /// `valid_payload(schema, payload)` rejected a caller-supplied
+    /// payload at the one of four boundary crossings that checks it -
+    /// see the note above `entity CommandType`'s "Payload schema shape"
+    /// for why `decide()`'s `EventSpec`s and `scheduled_payload`'s own
+    /// output are deliberately not covered by this variant; those are an
+    /// obligation on the implementer, never runtime-checked.
+    #[error("this payload does not validate against its type's registered schema")]
+    PayloadDoesNotMatchSchema,
+
     /// Not spec-modeled: the spec's own `ProcessCommand` assumes `decide()`
     /// only ever names an `EventType` its bounded context actually
     /// registered - a plugin-author responsibility, not a case the spec
@@ -398,10 +458,19 @@ pub enum Error {
     /// right above: a command payload, or a stored `Event`'s own payload,
     /// didn't deserialize into the compiled binary's typed
     /// `CommandType::Payload`/`BoundedContextEvent`-implementing enum
-    /// variant. Reachable today since nothing yet validates a payload
-    /// against `EventType.schema`/`CommandType.schema` at write time -
-    /// see docs/architecture.md §1.6/§1.7 for where this is raised (the
-    /// `skilj` facade's decide()-dispatch bridge).
+    /// variant. `valid_payload`/`PayloadDoesNotMatchSchema` closes this
+    /// for a caller-supplied payload that's outright schema-invalid, but
+    /// this stays reachable for the narrower gap `valid_payload` was
+    /// never meant to cover: the compiled Rust type can still be
+    /// *stricter* than the registered JSON Schema (e.g. an
+    /// `#[serde(deny_unknown_fields)]`, a numeric type narrower than
+    /// `"number"`, an enum whose variants the schema's own `"string"`
+    /// doesn't enumerate), and a `decide()`/`scheduled_payload`-produced
+    /// payload is never schema-checked at all (see the note above
+    /// `entity CommandType`'s "Payload schema shape") - so this remains a
+    /// real, unaddressed decode failure mode for a plugin-authored
+    /// payload specifically. See docs/architecture.md §1.6/§1.7 for where
+    /// this is raised (the `skilj` facade's decide()-dispatch bridge).
     #[error("stored payload did not decode into its expected type: {0}")]
     PayloadDecodeFailed(String),
 }
@@ -411,6 +480,7 @@ impl SkiljRejection for Error {
         match self {
             Error::BoundedContextArchived => "bounded_context_archived",
             Error::SchemaIncompatible => "schema_incompatible",
+            Error::MissingScheduleOrPolicy => "missing_schedule_or_policy",
             Error::InvalidFilter => "invalid_filter",
             Error::InvalidTagMapping => "invalid_tag_mapping",
             Error::SensitiveFieldTagOverlap => "sensitive_field_tag_overlap",
@@ -428,6 +498,7 @@ impl SkiljRejection for Error {
             Error::ExternalCreationNotAllowed => "external_creation_not_allowed",
             Error::DirectCreationNotAllowed => "direct_creation_not_allowed",
             Error::RestTriggerNotAllowed => "rest_trigger_not_allowed",
+            Error::PayloadDoesNotMatchSchema => "payload_does_not_match_schema",
             Error::UnregisteredEventType(_) => "unregistered_event_type",
             Error::PayloadDecodeFailed(_) => "payload_decode_failed",
         }
@@ -751,6 +822,34 @@ pub fn valid_sensitive_fields(schema: &str, sensitive_fields: &[SensitiveField])
         resolve_field_kind(&properties, definitions.as_ref(), &s.field).is_some()
             && resolve_field_kind(&properties, definitions.as_ref(), &s.subject_field).is_some()
     })
+}
+
+/// Black box (see the note above `entity CommandType`'s "Payload schema
+/// shape"): does `payload`, read as JSON, validate against the JSON
+/// Schema string `schema`. Checked wherever a caller-supplied payload
+/// crosses into the system - `create_external_event`/`create_direct_event`
+/// for an event's, `authorise_command_trigger`/`authorise_command_submission`
+/// for a command's - and nowhere else: a payload produced by a bounded
+/// context's own compiled-in code (`decide()`'s `EventSpec`s,
+/// `scheduled_payload`) carries the same obligation but is never
+/// re-checked at runtime (see that note's own explanation of why). `false`
+/// for a `schema`/`payload` that doesn't even parse as JSON, or a
+/// `schema` that isn't itself a valid JSON Schema document - the same
+/// "malformed input never validates" register `schema_properties`/
+/// `schema_definitions` already use elsewhere in this module, just
+/// surfaced here as an outright rejection rather than an absent
+/// `properties`/`definitions` map.
+pub fn valid_payload(schema: &str, payload: &str) -> bool {
+    let Ok(schema_value) = serde_json::from_str::<serde_json::Value>(schema) else {
+        return false;
+    };
+    let Ok(payload_value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Ok(validator) = jsonschema::validator_for(&schema_value) else {
+        return false;
+    };
+    validator.is_valid(&payload_value)
 }
 
 /// Black box (see the note above rule `RegisterEventType`): the four-
@@ -1236,6 +1335,12 @@ impl EventTypeRegistration {
 /// lookup treatment `consume_events`' `existing_cursor` gets. Checks run
 /// in the spec's own `requires` order; the two `not exists existing or
 /// ...` guards below only fire on the update path, exactly as written.
+///
+/// `now` is new - needed to anchor `schedule_position` the moment
+/// scheduling is newly opted into (see the note above the rule: "opting
+/// in also anchors the schedule position, and only opting in does"). Every
+/// other field this function sets stays timestamp-free, so this is the
+/// one place `EventType` itself needs a clock at all.
 #[allow(clippy::too_many_arguments)]
 pub fn register_event_type(
     access_mapping: &RoleAccessMapping,
@@ -1248,8 +1353,10 @@ pub fn register_event_type(
     direct_creation_allowed: bool,
     system_triggered_allowed: bool,
     system_triggered_schedule: Option<String>,
+    missed_occurrence_policy: Option<MissedOccurrencePolicy>,
     event_read_allowed: bool,
     existing: Option<&EventType>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<EventTypeRegistration> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -1275,6 +1382,23 @@ pub fn register_event_type(
     {
         return Err(Error::SensitiveFieldTagOverlap.into());
     }
+    // Scheduling is opted into whole - a type saying it fires on a
+    // schedule has to say when *and* what a missed occurrence means, no
+    // default for either. A real new rejection: `system_triggered_allowed
+    // = true` with no schedule used to be silently accepted here and
+    // simply never fire.
+    if system_triggered_allowed
+        && (system_triggered_schedule.is_none() || missed_occurrence_policy.is_none())
+    {
+        return Err(Error::MissingScheduleOrPolicy.into());
+    }
+
+    // The one act that anchors schedule_position, whether for a brand
+    // new type or one that had scheduling switched off - see the note
+    // above the rule. Computed from the caller-supplied `existing`
+    // before it's shadowed below.
+    let scheduling_newly_enabled =
+        system_triggered_allowed && existing.is_none_or(|e| !e.system_triggered_allowed);
 
     let Some(existing) = existing else {
         return Ok(EventTypeRegistration::Created(EventType {
@@ -1288,6 +1412,9 @@ pub fn register_event_type(
             direct_creation_allowed,
             system_triggered_allowed,
             system_triggered_schedule,
+            missed_occurrence_policy,
+            schedule_position: scheduling_newly_enabled.then_some(now),
+            last_fired_at: None,
             event_read_allowed,
         }));
     };
@@ -1319,6 +1446,19 @@ pub fn register_event_type(
         direct_creation_allowed,
         system_triggered_allowed,
         system_triggered_schedule,
+        missed_occurrence_policy,
+        // Re-registration leaves the position exactly where the
+        // scheduler left it, unless this *is* the opt-in moment - a
+        // deploy must not be a way to re-fire (resetting back) or skip
+        // (resetting forward) a backlog. last_fired_at is never touched
+        // here at all: what once fired stays a fact regardless of
+        // re-registration.
+        schedule_position: if scheduling_newly_enabled {
+            Some(now)
+        } else {
+            existing.schedule_position
+        },
+        last_fired_at: existing.last_fired_at,
         event_read_allowed,
     }))
 }
@@ -2013,6 +2153,9 @@ pub fn create_external_event(
     if !event_type.external_creation_allowed {
         return Err(Error::ExternalCreationNotAllowed.into());
     }
+    if !valid_payload(&event_type.schema, &payload) {
+        return Err(Error::PayloadDoesNotMatchSchema.into());
+    }
 
     let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
     Ok(Event {
@@ -2054,6 +2197,9 @@ pub fn create_direct_event(
     if !event_type.direct_creation_allowed {
         return Err(Error::DirectCreationNotAllowed.into());
     }
+    if !valid_payload(&event_type.schema, &payload) {
+        return Err(Error::PayloadDoesNotMatchSchema.into());
+    }
 
     let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
     Ok(Event {
@@ -2071,6 +2217,147 @@ pub fn create_direct_event(
         encryption_keys: protected.encryption_keys,
         origin: EventOrigin::DirectlyCreated,
     })
+}
+
+/// `next_occurrence_after(schedule, instant)` - the single cron primitive
+/// `create_system_event`'s own guards need: the first occurrence of
+/// `schedule` strictly after `instant`. Unlike `scheduled_payload`, a real
+/// black box (implemented here, not caller-supplied) in the same register
+/// as `derive_tags`/`schema_is_backwards_compatible` - the expression
+/// grammar is mechanism, the guard built on top of it is behaviour - and
+/// deterministic in the ordinary way: the same schedule and instant always
+/// resolve to the same occurrence, which is exactly why two instances
+/// evaluating `create_system_event`'s guards independently reach the same
+/// verdict.
+///
+/// `schedule` is a 7-field Quartz-style cron expression (`sec min hour
+/// day-of-month month day-of-week year`, e.g. `"0 0 3 * * * *"` for daily
+/// at 03:00) - the `cron` crate's own dialect, not the more familiar
+/// 5-field POSIX one; `RegisterEventType`'s own `requires` doesn't
+/// validate this string's own syntax (the spec never added a
+/// `valid_schedule` black box the way it did for filters), so a
+/// malformed expression here just means this function returns `None`
+/// forever for it, the same as a schedule with no occurrence left at all
+/// - `create_system_event` never gets to reach a due occurrence, and the
+///   type is never raised.
+pub fn next_occurrence_after(
+    schedule: &str,
+    instant: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use std::str::FromStr;
+    cron::Schedule::from_str(schedule)
+        .ok()?
+        .after(&instant)
+        .next()
+}
+
+/// See `rule CreateSystemEvent`. `occurrence_at` is the instant
+/// `SystemTriggerDue` itself carries - what this event stands for, not
+/// inferred from `now` (which only ever appears in its `Metadata.created_at`,
+/// the wall clock of the write). `payload` is `scheduled_payload(event_type)`'s
+/// own already-resolved output - a `FnOnce` so the caller (the scheduler's
+/// own orchestration) only ever invokes that black box once eligibility is
+/// confirmed, never for an occurrence this function is about to reject
+/// anyway.
+///
+/// `None` when this occurrence must not produce an event - already
+/// accounted for, a policy still waiting on a later occurrence, or the
+/// type/context isn't eligible at all. Unlike `create_external_event`/
+/// `create_direct_event`, this never returns `Err`: nothing external ever
+/// calls `CreateSystemEvent` (see the note above the rule - the scheduler
+/// presents no credential and faces no actor), so there is no caller for a
+/// typed rejection to reach. `Some((event, occurrence_at))` pairs the
+/// built event with the instant both `EventType.schedule_position` and
+/// `EventType.last_fired_at` advance to - the caller's own job to persist,
+/// atomically with the event itself (see `db::fire_system_event`).
+#[allow(clippy::too_many_arguments)]
+pub fn create_system_event(
+    event_type: &EventType,
+    occurrence_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    next_sequence: i64,
+    resolve_payload: impl FnOnce() -> String,
+    resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
+) -> Option<(Event, chrono::DateTime<chrono::Utc>)> {
+    if !event_type.system_triggered_allowed {
+        return None;
+    }
+    if event_type.bounded_context.status != BoundedContextStatus::Active {
+        return None;
+    }
+    let schedule = event_type.system_triggered_schedule.as_deref()?;
+    let policy = event_type.missed_occurrence_policy?;
+    let position = event_type.schedule_position?;
+
+    // An occurrence is never fired before its own instant, and never
+    // twice: `position` is the durable, shared record of how far this
+    // type's schedule has been accounted for, so an occurrence at or
+    // behind it has already been settled - by an earlier firing, by a
+    // policy that passed it over, or by another instance a moment ago.
+    // This is what makes two instances raising the same occurrence
+    // harmless rather than a duplicate event.
+    if occurrence_at > now || occurrence_at <= position {
+        return None;
+    }
+
+    // no_gap: this occurrence is the very next one the position hasn't
+    // accounted for yet. nothing_later_is_due: no occurrence after this
+    // one has come due, so it is the whole of a backlog's tail. See the
+    // three bullets in the note above `rule CreateSystemEvent`.
+    let no_gap = next_occurrence_after(schedule, position) == Some(occurrence_at);
+    let nothing_later_is_due =
+        next_occurrence_after(schedule, occurrence_at).is_none_or(|next| next > now);
+
+    let eligible = match policy {
+        MissedOccurrencePolicy::ReplayBacklog => true,
+        MissedOccurrencePolicy::FireOnce => nothing_later_is_due,
+        MissedOccurrencePolicy::Skip => no_gap && nothing_later_is_due,
+    };
+    if !eligible {
+        return None;
+    }
+
+    let payload = resolve_payload();
+    let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
+    let event = Event {
+        bounded_context: event_type.bounded_context.clone(),
+        event_type: event_type.clone(),
+        payload: protected.payload,
+        metadata: Metadata {
+            r#type: event_type.name.clone(),
+            version: event_type.schema_version,
+            client_id: "system".to_string(),
+            created_at: now,
+        },
+        sequence: next_sequence,
+        tags: derive_tags(&event_type.tag_mappings, &payload),
+        encryption_keys: protected.encryption_keys,
+        origin: EventOrigin::SystemTriggered,
+    };
+    Some((event, occurrence_at))
+}
+
+/// See `rule SkipMissedOccurrences`. `None` when the resume is a no-op
+/// (the position is already at or past `now`) - see that rule's own note
+/// on why this makes a second instance resuming alongside the first
+/// harmless: a live cluster's position is already at or past its last
+/// occurrence, so nothing here moves it further. Like `create_system_event`,
+/// no typed rejection - `SystemScheduleResumed` reaches no surface either.
+pub fn skip_missed_occurrences(
+    event_type: &EventType,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if event_type.missed_occurrence_policy != Some(MissedOccurrencePolicy::Skip) {
+        return None;
+    }
+    if event_type.bounded_context.status != BoundedContextStatus::Active {
+        return None;
+    }
+    let position = event_type.schedule_position?;
+    if position >= now {
+        return None;
+    }
+    Some(now)
 }
 
 /// The `CommandAuthorised` fact `AuthoriseCommandSubmission`/
@@ -2102,6 +2389,9 @@ pub fn authorise_command_trigger(
     }
     if command_type.bounded_context.status != BoundedContextStatus::Active {
         return Err(Error::BoundedContextArchived.into());
+    }
+    if !valid_payload(&command_type.schema, &payload) {
+        return Err(Error::PayloadDoesNotMatchSchema.into());
     }
 
     Ok(CommandAuthorised {
@@ -2141,6 +2431,9 @@ pub fn authorise_command_submission(
     }
     if command_type.bounded_context.status != BoundedContextStatus::Active {
         return Err(Error::BoundedContextArchived.into());
+    }
+    if !valid_payload(&command_type.schema, &payload) {
+        return Err(Error::PayloadDoesNotMatchSchema.into());
     }
 
     Ok(CommandAuthorised {

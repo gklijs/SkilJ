@@ -72,6 +72,9 @@ fn event_type(name: &str) -> EventType {
         direct_creation_allowed: false,
         system_triggered_allowed: false,
         system_triggered_schedule: None,
+        missed_occurrence_policy: None,
+        schedule_position: None,
+        last_fired_at: None,
         event_read_allowed: false,
     }
 }

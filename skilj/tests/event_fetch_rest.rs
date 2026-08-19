@@ -299,3 +299,40 @@ fn get_events_rejects_a_filter_naming_an_undeclared_field_with_400() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     });
 }
+
+/// Real end-to-end regression guard for the `hash_secret`-at-rest fix
+/// (`AccessToken.secret` - "stored hashed and never compared in
+/// plaintext"): a known token `id` with any secret other than the real
+/// one is still an "unrecognised credential" 401, the same as an
+/// entirely unknown `id` - proving `resolve_event_read_token`'s
+/// `secret_matches(hash_secret(presented), token.secret)` compare (both
+/// sides hashed now `token.secret` is the DB's stored hash) actually
+/// discriminates right from wrong, not just accepting or rejecting
+/// everything by accident.
+/// `skilj-core/tests/persistence.rs`'s own round-trip tests are what
+/// prove the *storage* half - that `secret` never lands in Postgres as
+/// plaintext at all.
+#[test]
+fn get_events_rejects_a_wrong_secret_for_a_known_token_id_with_401() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, _direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+
+        let (id, real_secret) = read_credential.split_once('.').unwrap();
+        let wrong_secret = generate_token_secret();
+        assert_ne!(wrong_secret, real_secret);
+        let wrong_credential = format!("{id}.{wrong_secret}");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events")
+            .header("authorization", format!("Bearer {wrong_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    });
+}

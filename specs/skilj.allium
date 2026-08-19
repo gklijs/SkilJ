@@ -258,6 +258,22 @@ enum AccessLevel { read | write | admin }
 
 enum AckMode { auto_advance | manual_ack }
 
+-- What a scheduled EventType owes for an occurrence of its own schedule
+-- that passed while nothing was watching for it. Named rather than inline
+-- because two rules compare against it (CreateSystemEvent and
+-- SkipMissedOccurrences) and a third reconciles it (RegisterEventType).
+--
+-- There is deliberately no default value, here or anywhere else: both
+-- directions are dangerous enough that this library is not entitled to
+-- guess on a bounded context's behalf - a skipped nightly reconciliation
+-- is a day's drift nobody was told about, and a replayed backlog of a
+-- per-minute schedule is thousands of events a downstream consumer never
+-- expected. A registration that opts into scheduling without choosing is
+-- rejected rather than defaulted (see rule RegisterEventType); a
+-- registration that does not opt in is not asked to choose at all. The
+-- three are defined in full in the note above rule CreateSystemEvent.
+enum MissedOccurrencePolicy { skip | fire_once | replay_backlog }
+
 ------------------------------------------------------------
 -- Entities and Variants
 ------------------------------------------------------------
@@ -382,8 +398,9 @@ variant SystemCreator : ContextCreator {
 -- in. A
 -- schema is an opaque JSON Schema string here and is never structurally
 -- parsed at this level (see the black boxes that do parse it:
--- valid_tag_mappings, valid_sensitive_fields, valid_filters and
--- schema_is_backwards_compatible), so nothing in this file can express
+-- valid_tag_mappings, valid_sensitive_fields, valid_filters,
+-- valid_payload and schema_is_backwards_compatible), so nothing in this
+-- file can express
 -- "at most one level of nesting" as a check. A bounded context that
 -- declares a deeper schema anyway is outside the contract, and what its
 -- tags, sensitive fields and filters would mean there is undefined rather
@@ -400,6 +417,34 @@ variant SystemCreator : ContextCreator {
 -- TagMapping, SensitiveField or Filter addresses, which cannot be dropped
 -- from its shape - pinned by the valid_* existence check rather than by
 -- that contract. See that note for both halves.
+--
+-- valid_payload(schema, payload) answers the one question about an
+-- individual payload this spec does enforce: does payload, read as JSON,
+-- validate against the JSON Schema string schema. It is a black box in
+-- the same register as valid_tag_mappings, valid_sensitive_fields and
+-- valid_filters - this library owns that a payload not matching the
+-- schema its type registered is rejected outright rather than stored and
+-- discovered later by whoever reads it back, not how a JSON Schema
+-- validator walks a document. Deterministic in the ordinary way: the same
+-- schema and the same payload always give the same verdict.
+--
+-- It is checked wherever a caller-supplied payload crosses into the
+-- system, and only there: CreateExternalEvent and CreateDirectEvent for
+-- an event's payload, and AuthoriseCommandSubmission and
+-- AuthoriseCommandTrigger for a command's - at authorisation, before
+-- ProcessCommand and decide() ever see it, which is the same boundary
+-- crossing the two event rules check at. A payload produced by a bounded
+-- context's own compiled-in code carries the same obligation but is not
+-- re-checked at runtime: see decide()'s EventSpec payloads in
+-- ProcessCommand, and scheduled_payload in the note above rule
+-- CreateSystemEvent.
+--
+-- What it checks is conformance to whatever schema that type actually
+-- registered, and nothing beyond that. It says nothing about whether the
+-- schema itself stays inside the one-level-nesting cap stated above: that
+-- cap remains an expectation this spec does not enforce, so a payload
+-- matching a deeper schema is a conforming payload for that type. The two
+-- questions are independent, and this is only ever the instance one.
 
 entity CommandType {
     bounded_context: BoundedContext
@@ -477,6 +522,47 @@ entity EventType {
     system_triggered_allowed: Boolean
     system_triggered_schedule: String?     -- cron expression, evaluated by the core's own in-process
                                             -- scheduler; the core cannot rely on an OS-level cron
+
+    -- What this type owes for an occurrence that passed while nothing was
+    -- watching for it. Optional as a field because a type that has not
+    -- opted into scheduling has no use for one, and mandatory the moment
+    -- it has: a registration with system_triggered_allowed = true must
+    -- state one, and is rejected rather than defaulted when it does not
+    -- (see rule RegisterEventType and invariant
+    -- ScheduledTypeIsFullyConfigured). Read back by an admin alongside the
+    -- two positions below - see surface TypeRegistration.
+    missed_occurrence_policy: MissedOccurrencePolicy?
+
+    -- How far this type's schedule has been accounted for: every
+    -- occurrence at or before this instant has either produced an event or
+    -- been deliberately passed over, and none of them is considered again.
+    -- Not necessarily an occurrence instant itself - closing a gap under
+    -- the skip policy moves it to the moment the gap was closed (see rule
+    -- SkipMissedOccurrences).
+    --
+    -- Durable, registered state of the type rather than of a process: one
+    -- shared value per event type, exactly as Projection.caught_up_to and
+    -- ReadCursor.sequence are, and for the same reason - several instances
+    -- of the same service run against one database and must not each hold
+    -- their own idea of what has fired. Anchored to the moment scheduling
+    -- is opted into, and never reset by a later re-registration, so a
+    -- deploy is not a way to re-fire or to skip (see rule
+    -- RegisterEventType).
+    schedule_position: Timestamp?
+
+    -- The occurrence instant of the most recent occurrence of this
+    -- type's schedule that actually produced an event, and the answer to
+    -- "when did this last fire" an admin reads on surface TypeRegistration.
+    -- Null until the first one fires, and left standing when scheduling is
+    -- switched off: what once fired stays a fact.
+    --
+    -- The occurrence's instant, not the wall clock of the write. The two
+    -- differ exactly when a firing is a catch-up: an occurrence due at
+    -- 03:00 fired at 09:00 under fire_once records 03:00 here and 09:00 in
+    -- its event's Metadata.created_at. Never ahead of schedule_position,
+    -- which accounts for every occurrence this one is among (see invariant
+    -- FiredOccurrenceIsAccountedFor).
+    last_fired_at: Timestamp?
 
     -- Opt-in in the same shape as the origin permissions above, but for
     -- reading rather than writing: whether events of this type may be
@@ -1333,6 +1419,7 @@ rule CreateExternalEvent {
     requires: event_type.external_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
+    requires: valid_payload(event_type.schema, payload)
 
     let protected = protect_sensitive_fields(event_type, payload)
 
@@ -1362,6 +1449,7 @@ rule CreateDirectEvent {
     requires: event_type.direct_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
+    requires: valid_payload(event_type.schema, payload)
 
     let protected = protect_sensitive_fields(event_type, payload)
 
@@ -1382,6 +1470,256 @@ rule CreateDirectEvent {
             tags: derive_tags(event_type, payload),
             encryption_keys: protected.encryption_keys
         )
+}
+
+-- The third and last of the origins that create an Event with no command
+-- behind it, and the only origin anywhere with no caller at all: the two
+-- rules above are each driven by an adapter presenting a token, while this
+-- one is driven by SkilJ's own in-process scheduler against
+-- EventType.system_triggered_schedule. Everything downstream is identical -
+-- the same sequence assignment, the same tag derivation, the same
+-- sensitive-field protection, the same inline update of every sync
+-- projection consuming the type - because none of that ever depended on who
+-- asked.
+--
+-- What has no natural source, and is settled here rather than left
+-- implicit, is the payload. An external or direct submission carries one
+-- from its caller; a command-triggered event gets one from decide()'s own
+-- EventSpec. An occurrence of a schedule has neither, so
+-- scheduled_payload(event_type) supplies it: the plugged-in,
+-- event-type-specific producer of the payload one occurrence of that type's
+-- schedule emits, a black box in exactly the register decide() and
+-- project() are in. This library owns that an occurrence produces a
+-- genuine, correctly stamped SystemTriggered event of that type in that
+-- bounded context; the bounded context owns what the event says. It is
+-- registered the same way the rest of a bounded context's plugged-in code
+-- is - compiled into the running binary alongside the schedule that fires
+-- it (see the note above RegisterEventType) - so nothing new carries it in.
+-- Like next_sequence and generate_token_secret, and unlike valid_filters,
+-- it is not expected to return the same thing on every call: the
+-- determinism a black box has here is within one rule execution, not across
+-- occurrences. Its one obligation is that what it returns conforms to
+-- event_type.schema - the same obligation a caller-supplied payload already
+-- carries, and the same predicate states it: valid_payload(schema, payload)
+-- (see the payload schema shape note above entity CommandType). What
+-- differs is where it lands. A caller's payload is checked at the boundary
+-- it crosses, because it arrives from outside; this one crosses no
+-- boundary, so the obligation rests on the bounded context's own
+-- compiled-in code rather than on a guard in this rule - exactly as it does
+-- for the EventSpec payloads decide() returns, which ProcessCommand does
+-- not re-check either.
+--
+-- One occurrence produces exactly one event, and that is a resolution
+-- rather than an omission. A schedule names one EventType, so there is no
+-- second type for an occurrence to fan out into, and "emit only when there
+-- is something to emit" is a decision - which is what a CommandType and
+-- decide() are for. A bounded context wanting either registers a scheduled
+-- event type whose event its own code reacts to by submitting a command,
+-- and gets fan-out and conditionality from the mechanism that already has
+-- them, rather than from a second decider reachable only from a timer.
+--
+-- When an occurrence is due is deliberately not modelled here. The schedule
+-- naming which moments are due is registered domain state
+-- (EventType.system_triggered_schedule, reconciled by RegisterEventType and
+-- readable by an admin); evaluating a cron expression against a clock is
+-- the scheduler's own mechanism, the same register as the async projection
+-- consumer's polling loop or next_sequence's row lock, and nothing about
+-- the resulting event depends on it. Which occurrence is being raised is a
+-- different matter and is modelled: SystemTriggerDue carries the
+-- occurrence's own instant, so what an event stands for is stated by the
+-- trigger rather than inferred from whenever the rule happened to run. That
+-- distinction is the whole of the missed-occurrence answer below - a
+-- catch-up firing at 09:00 for an occurrence due at 03:00 records 03:00 as
+-- the occurrence it stood for and 09:00 as its Metadata.created_at, which
+-- is the only honest pair of values it has.
+--
+-- What the scheduler owes for an occurrence that passed while nothing was
+-- watching for it was the last open question in this file. It is answered
+-- here by declining to answer it on a bounded context's behalf:
+-- EventType.missed_occurrence_policy is chosen per event type at
+-- registration, with no default anywhere and no fallback - a registration
+-- that opts into scheduling without choosing is rejected outright (see the
+-- note above RegisterEventType). The three choices are guards on this rule,
+-- not scheduler trivia, and they are evaluated against durable state rather
+-- than against anything a process remembers.
+--
+-- That state is EventType.schedule_position: every occurrence at or before
+-- that instant has been accounted for - fired, or deliberately passed over
+-- - and none of them is considered again. It is a field on the registered
+-- type, so it is one shared value per event type rather than one per
+-- replica or per deploy, exactly as Projection.caught_up_to and
+-- ReadCursor.sequence are, and for the same reason: several instances of
+-- the same service run against one database and must not each hold their
+-- own idea of what has fired. A second instance raising an occurrence the
+-- first has already fired finds the position past it and produces nothing,
+-- which is what makes the duplicate raise harmless rather than a duplicate
+-- event.
+--
+-- The scheduler's own side of that contract is uniform across all three
+-- policies and stated once, here: raise every occurrence beyond the
+-- position that has come due, in ascending order, and nothing else.
+-- Interleaving two instances doing that against one position is the same
+-- concurrency problem next_sequence already has, and is answered the same
+-- way - in the database, in the transaction that advances the position and
+-- writes the event - rather than modelled as an entity here. Ascending
+-- order matters for replay_backlog alone, which is also the only policy
+-- that fires more than one occurrence of a backlog; raising a backlog out
+-- of order under it would leave the events it does write in an order the
+-- schedule never had.
+--
+-- Each policy is then a guard on whether one raised occurrence produces an
+-- event:
+--   - replay_backlog fires every occurrence beyond the position, so an
+--     outage is paid off one event per missed occurrence, in occurrence
+--     order. schedule_position and last_fired_at never diverge under it.
+--   - fire_once fires an occurrence only when no later one has come due
+--     yet, so a backlog collapses into its own last occurrence: one event,
+--     stamped with the occurrence it stood for, however long the outage.
+--     The occurrences it passed over are accounted for all the same, since
+--     the position jumps to the one that fired.
+--   - skip fires an occurrence only when the occurrence immediately before
+--     it is already accounted for and no later one has come due - that is,
+--     only when there is no gap. A gap is closed without firing, by
+--     SkipMissedOccurrences below, which is what keeps skip from being a
+--     policy that silently stops firing forever after its first outage.
+--
+-- next_occurrence_after(schedule, instant) is the single cron primitive
+-- those guards need: the first occurrence of that schedule strictly after
+-- that instant. A black box in the same register as valid_filters - the
+-- expression grammar is mechanism, the guard is behaviour - and, unlike
+-- scheduled_payload, deterministic in the ordinary way: the same schedule
+-- and instant always resolve to the same occurrence, which is exactly why
+-- two instances evaluating these guards reach the same verdict.
+--
+-- SystemTriggerDue, and SystemScheduleResumed alongside it, are therefore
+-- the triggers in this file that no surface provides, and that is correct
+-- rather than a missing surface. A surface is a boundary between two
+-- parties; the scheduler raising either of them is SkilJ's own in-process
+-- loop, on the same side of every boundary here as the code it hands the
+-- occurrence to. It presents no credential, faces no actor and is
+-- reachable by nobody - which is precisely why the guards below are the
+-- whole of the authorisation story for this origin, where the other three
+-- each have a token or a grant in front of them. A future reader should not
+-- close the checker's unreachable-trigger note by inventing a surface for
+-- either. What an admin does get is a read: surface TypeRegistration shows
+-- every scheduled type's policy and both of its positions, which is
+-- visibility into what the scheduler has done, not a way to drive it.
+--
+-- Unlike CreateExternalEvent and CreateDirectEvent, this does require an
+-- active bounded context, and the difference is deliberate rather than
+-- incidental. Those two have an admin lever of their own: revoking the
+-- token stops the writes, whatever the context's status. A scheduler
+-- presents no credential and there is none to revoke, so archiving is the
+-- only lever there is - and BoundedContext.status already says an archived
+-- context accepts no new events. Without this guard an archived context
+-- would go on minting events on a timer with nothing short of deleting it
+-- able to stop that.
+
+rule CreateSystemEvent {
+    when: SystemTriggerDue(event_type, occurrence_at)
+    requires: event_type.system_triggered_allowed = true
+    requires: event_type.system_triggered_schedule != null
+    requires: event_type.missed_occurrence_policy != null
+    requires: event_type.bounded_context.status = active
+
+    -- An occurrence is never fired before its own instant, and never
+    -- twice: schedule_position is the durable, shared record of how far
+    -- this type's schedule has been accounted for, so an occurrence at or
+    -- behind it has already been settled - by an earlier firing, by a
+    -- policy that passed it over, or by another instance a moment ago.
+    requires: occurrence_at <= now
+    requires: occurrence_at > event_type.schedule_position
+
+    -- The policy, applied. no_gap says this occurrence is the first one
+    -- the position has not accounted for; nothing_later_is_due says no
+    -- occurrence after it has come due yet, so it is the whole of the
+    -- backlog's tail. See the three bullets in the note above.
+    let no_gap =
+        next_occurrence_after(event_type.system_triggered_schedule,
+            event_type.schedule_position) = occurrence_at
+    let nothing_later_is_due =
+        next_occurrence_after(event_type.system_triggered_schedule,
+            occurrence_at) > now
+
+    requires:
+        event_type.missed_occurrence_policy = replay_backlog
+        or (event_type.missed_occurrence_policy = fire_once
+            and nothing_later_is_due)
+        or (event_type.missed_occurrence_policy = skip
+            and no_gap and nothing_later_is_due)
+
+    let payload = scheduled_payload(event_type)
+    let protected = protect_sensitive_fields(event_type, payload)
+
+    -- Sync projection updates happen inline here too - see the project()
+    -- note above the rules. client_id is the literal "system": there is no
+    -- token or Role behind this event to name - see invariant
+    -- SystemTriggeredClientIdIsSystem.
+    --
+    -- Both positions move in the same transaction as the event itself, and
+    -- both to the occurrence's instant rather than to now: what this event
+    -- stands for is the occurrence, and the wall clock of the write is
+    -- already recorded in its metadata.
+    ensures:
+        event_type.schedule_position = occurrence_at
+        event_type.last_fired_at = occurrence_at
+        SystemTriggered.created(
+            bounded_context: event_type.bounded_context,
+            event_type: event_type,
+            payload: protected.payload,
+            metadata: {
+                type: event_type.name,
+                version: event_type.schema_version,
+                client_id: "system",
+                created_at: now
+            },
+            sequence: next_sequence(event_type.bounded_context),
+            tags: derive_tags(event_type, payload),
+            encryption_keys: protected.encryption_keys
+        )
+}
+
+-- The other half of the skip policy, and the only rule in this file that
+-- advances a position without producing anything. Skip is the one choice
+-- of the three whose meaning depends on nobody having been watching: an
+-- occurrence fired two seconds late by a busy instance and an occurrence
+-- fired six hours late by a process that was down leave identical durable
+-- state behind, so no guard on CreateSystemEvent can tell them apart on
+-- its own. A scheduler becoming responsible for a type knows the
+-- difference, and this is where it says so: everything up to this moment
+-- is accounted for, none of it fired.
+--
+-- That is what "resume at the next occurrence in the future, exactly as an
+-- OS-level cron does for a machine that was off" means once it has to be
+-- durable and shared. The position moves to now rather than to the last
+-- occurrence before now, which is the same statement one instant tighter
+-- and needs no second cron primitive to compute; occurrences are compared
+-- against it, never assumed to be it.
+--
+-- It is a no-op in steady state, which is the sign it is the right shape:
+-- a live cluster's position is already at or past its last occurrence, so
+-- a second instance starting alongside the first skips nothing that the
+-- first was about to fire. It never runs for the other two policies, whose
+-- entire point is that a gap is paid off rather than closed - under those
+-- a position only ever moves by firing.
+--
+-- Monotonic, like every other advance of this position: it moves the
+-- position to the present, which no committed occurrence can be ahead of.
+-- Two instances resuming at once is therefore an interleaving with one
+-- outcome, and needs no more than the same transaction next_sequence
+-- already takes.
+
+rule SkipMissedOccurrences {
+    when: SystemScheduleResumed(event_type)
+    requires: event_type.system_triggered_allowed = true
+    requires: event_type.missed_occurrence_policy = skip
+    requires: event_type.bounded_context.status = active
+
+    -- Prevents re-firing, and makes a resume against an already-current
+    -- position the no-op it should be.
+    requires: event_type.schedule_position < now
+
+    ensures: event_type.schedule_position = now
 }
 
 -- The REST track's reason for existing beyond writing, and the raw half
@@ -1649,17 +1987,29 @@ rule QueryProjection {
         -- one row of many, or the single shared instance a projection
         -- that is never keyed holds - and the result delivered is that
         -- instance's, never the whole projection's. It takes the
-        -- whole grant rather than a single boolean because a sensitive
-        -- field decrypts under either of two independent grants, decided
-        -- per field: access_mapping.can_read_sensitive = true, or
-        -- access_mapping.role.external_subject matching that field's own
-        -- EncryptionKey.subject_value - the caller's verified IdP
-        -- identity is the subject the field is about. That is the same
-        -- two-grant test render_event applies to a subscription push;
-        -- see the note above DeliverToSubscriptions for why the
-        -- self-subject half fails closed. Deciding inside the black box
-        -- rather than post-filtering the result is deliberate - a caller
-        -- with neither grant is never handed a decrypted value to redact
+        -- whole grant rather than a single boolean because entitlement
+        -- is still decided by two independent grants -
+        -- access_mapping.can_read_sensitive = true, or
+        -- access_mapping.role.external_subject matching the subject the
+        -- content is about - but here that test is applied once, up
+        -- front, to the queried instance's own key: a projection's key
+        -- is itself a real subject value in practice (a customer id, a
+        -- user id), so the key is the subject checked. If the grant
+        -- holds, every active EncryptionKey for that one subject is
+        -- resolved and the instance's stored state is decrypted with
+        -- them, at any depth; if it does not hold, nothing is looked up
+        -- at all. There is deliberately no per-field distinction at read
+        -- time here, and no per-projection declaration of which fields
+        -- are sensitive: the instance is either checked against its own
+        -- subject's keys as one unit, or not - so nothing can leak
+        -- through a declaration someone forgot to write. That is the
+        -- contrast with render_event, which genuinely does decide per
+        -- field, each against that field's own
+        -- EncryptionKey.subject_value; see the note above
+        -- DeliverToSubscriptions for why the self-subject half fails
+        -- closed there. Deciding inside the black box rather than
+        -- post-filtering the result is deliberate - a caller with
+        -- neither grant is never handed a decrypted value to redact
         -- afterwards.
 }
 
@@ -1817,6 +2167,7 @@ rule AuthoriseCommandSubmission {
     requires: access_mapping.level in {write, admin}
     requires: access_mapping.bounded_context = command_type.bounded_context
     requires: command_type.bounded_context.status = active
+    requires: valid_payload(command_type.schema, payload)
     ensures:
         CommandAuthorised(
             command_type: command_type,
@@ -1831,6 +2182,7 @@ rule AuthoriseCommandTrigger {
     requires: token.command_type = command_type
     requires: command_type.rest_trigger_allowed = true
     requires: command_type.bounded_context.status = active
+    requires: valid_payload(command_type.schema, payload)
     ensures:
         CommandAuthorised(
             command_type: command_type,
@@ -1872,9 +2224,9 @@ rule ProcessCommand {
     -- protect_sensitive_fields encrypts, or how next_sequence takes its
     -- Postgres lock. Every other black box in this file (project(),
     -- read_projection, render_event, render_command, derive_tags, valid_filters,
-    -- valid_tag_mappings, valid_sensitive_fields, next_sequence,
-    -- generate_token_secret) is documented exactly this way; decide() is
-    -- not special enough to earn a different treatment.
+    -- valid_tag_mappings, valid_sensitive_fields, valid_payload, next_sequence,
+    -- scheduled_payload, next_occurrence_after, generate_token_secret) is
+    -- documented exactly this way; decide() is not special enough to earn a different treatment.
     let decision = decide(command_type, payload, matching_events)
     requires: decision.accepted = true
 
@@ -2590,11 +2942,50 @@ rule DeleteBoundedContext {
 -- are reconciled the same way as the origin permissions - a type is
 -- reachable over REST only because its own registration says so, never
 -- because a token happens to exist for it.
+--
+-- Scheduling is the one opt-in that is not a single flag, and it is opted
+-- into whole or not at all. A registration saying system_triggered_allowed
+-- = true must also say when the type fires and what a missed occurrence
+-- means; one that omits either is rejected here rather than completed with
+-- a value this library picked. That is deliberate and is the answer to what
+-- used to be the last open question in this file: both missed-occurrence
+-- answers can lose or duplicate real work, so choosing between them is the
+-- bounded context author's call, made once, in the same reconciliation loop
+-- that declares everything else about the type (see enum
+-- MissedOccurrencePolicy and the note above rule CreateSystemEvent).
+-- Symmetrically, a registration that does not opt in is never asked for
+-- either value - they have no meaning for a type nothing schedules, and
+-- whatever it last supplied is simply reconciled onto the type like every
+-- other declared field.
+--
+-- Opting in also anchors the schedule position, and only opting in does.
+-- EventType.schedule_position starts at the moment scheduling is first
+-- switched on, so a backlog can only ever reach back to that moment rather
+-- than to the beginning of time - without which registering a per-minute
+-- schedule under replay_backlog would owe an unbounded replay before its
+-- first real occurrence. Re-registration deliberately leaves the position
+-- alone: it is the one piece of an EventType's state a deploy must not
+-- reset, since resetting it forward would skip an outage's backlog and
+-- resetting it back would re-fire history, and a reconciliation loop
+-- submitting the same shape on every deploy would do whichever of those it
+-- was written to do, every time. Switching scheduling off and on again
+-- re-anchors, because that is the same act as opting in for the first time
+-- - the off period is not a backlog anybody is owed. last_fired_at is
+-- never reset by any of this: what once fired stays a fact, whether or not
+-- the type still fires.
+--
+-- Changing the cron expression on a scheduled type needs nothing extra, and
+-- that is a property of what the position is rather than luck. It is an
+-- instant, not an occurrence index, so "everything up to here is accounted
+-- for" survives the schedule that produced those occurrences being
+-- replaced: the new expression's occurrences after that instant are exactly
+-- the ones still owed.
 
 rule RegisterEventType {
     when: RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
         sensitive_fields, external_creation_allowed, direct_creation_allowed,
-        system_triggered_allowed, event_read_allowed, system_triggered_schedule?)
+        system_triggered_allowed, event_read_allowed, system_triggered_schedule?,
+        missed_occurrence_policy?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
@@ -2608,7 +2999,22 @@ rule RegisterEventType {
     -- note above.
     requires: not tag_mappings.any(m => sensitive_fields.any(s => s.field = m.field))
 
+    -- Scheduling is opted into whole: a type that says it fires on a
+    -- schedule has to say when, and what a missed occurrence means. No
+    -- default, so a registration missing either is rejected rather than
+    -- completed on its author's behalf - see the note above.
+    requires:
+        system_triggered_allowed = true implies
+            (system_triggered_schedule != null and missed_occurrence_policy != null)
+
     let existing = EventType{bounded_context: bounded_context, name: name}
+
+    -- The one act that anchors the schedule position: opting in, whether
+    -- for a brand new type or for one that had scheduling switched off.
+    -- Every other registration leaves the position where it is.
+    let scheduling_newly_enabled =
+        system_triggered_allowed = true
+        and (not exists existing or existing.system_triggered_allowed = false)
 
     -- Schema evolution is additive and loosening only, and a first
     -- registration has nothing to be compatible with - see the note above.
@@ -2627,6 +3033,7 @@ rule RegisterEventType {
         or existing.tag_mappings.all(m => tag_mappings.any(n => n.key = m.key))
 
     let schema_changed = exists existing and existing.schema != schema
+    let initial_schedule_position = if scheduling_newly_enabled: now else: null
 
     ensures:
         if exists existing:
@@ -2639,6 +3046,9 @@ rule RegisterEventType {
             existing.direct_creation_allowed = direct_creation_allowed
             existing.system_triggered_allowed = system_triggered_allowed
             existing.system_triggered_schedule = system_triggered_schedule
+            existing.missed_occurrence_policy = missed_occurrence_policy
+            existing.schedule_position =
+                if scheduling_newly_enabled: now else: existing.schedule_position
             existing.event_read_allowed = event_read_allowed
         else:
             EventType.created(
@@ -2652,6 +3062,9 @@ rule RegisterEventType {
                 direct_creation_allowed: direct_creation_allowed,
                 system_triggered_allowed: system_triggered_allowed,
                 system_triggered_schedule: system_triggered_schedule,
+                missed_occurrence_policy: missed_occurrence_policy,
+                schedule_position: initial_schedule_position,
+                last_fired_at: null,
                 event_read_allowed: event_read_allowed
             )
 }
@@ -3403,6 +3816,35 @@ invariant SystemTriggeredClientIdIsSystem {
         e.origin = SystemTriggered implies e.metadata.client_id = "system"
 }
 
+invariant ScheduledTypeIsFullyConfigured {
+    -- "No default, ever" as a property of stored state rather than as a
+    -- guard on one rule. A type that fires on a schedule knows when it
+    -- fires, what it owes for an occurrence nobody was watching for, and
+    -- how far its schedule has been accounted for - all three, or it is not
+    -- scheduled. RegisterEventType is what enforces the first two and
+    -- establishes the third, but stating it here makes it checkable in its
+    -- own right, so a later rule that also switches scheduling on cannot
+    -- quietly reintroduce a scheduled type with no policy and let
+    -- CreateSystemEvent decide what to do about it.
+    for t in EventTypes:
+        t.system_triggered_allowed = true implies
+            t.system_triggered_schedule != null
+            and t.missed_occurrence_policy != null
+            and t.schedule_position != null
+}
+
+invariant FiredOccurrenceIsAccountedFor {
+    -- The two positions cannot contradict each other: an occurrence that
+    -- produced an event is one the schedule position has accounted for, so
+    -- last_fired_at never runs ahead of schedule_position. They are equal
+    -- whenever the most recent occurrence to be accounted for was one that
+    -- fired - always, under replay_backlog - and diverge exactly where a
+    -- policy passed an occurrence over.
+    for t in EventTypes:
+        t.last_fired_at != null implies
+            t.schedule_position != null and t.last_fired_at <= t.schedule_position
+}
+
 invariant SystemCreatedContextIsTheAdminContext {
     -- The counterpart of the above for bounded contexts. AddBoundedContext
     -- always records the calling superadmin Role, so the system marker is
@@ -3713,15 +4155,24 @@ surface ProjectionQuery {
         -- A projection built from a field its source EventType marked
         -- sensitive stays protected exactly as the source event is:
         -- sensitivity is declared once, on the EventType, and inherited
-        -- rather than re-declared per projection. Decryption is decided
-        -- per field against the very same RoleAccessMapping this surface
-        -- faces, under either of two grants: the bounded-context-wide
+        -- rather than re-declared per projection - there is no
+        -- per-projection sensitive-field declaration to keep in step
+        -- with it, or to forget. Decryption is decided once per query
+        -- against the very same RoleAccessMapping this surface faces,
+        -- taking the queried instance's own key as the subject, under
+        -- either of two grants: the bounded-context-wide
         -- can_read_sensitive, or the caller's own verified IdP identity
-        -- matching that field's subject - a Role reading data about
-        -- itself needs no separate grant. A caller with neither is never
-        -- handed a decrypted value, not even one it is expected to
-        -- discard (see QueryProjection's guidance on read_projection).
-        -- This is the same test EventSubscription applies to a push.
+        -- matching that key - a Role reading data about itself needs no
+        -- separate grant. A caller with neither is never handed a
+        -- decrypted value, not even one it is expected to discard (see
+        -- QueryProjection's guidance on read_projection). The deliberate
+        -- limitation this carries: an instance whose own key is not
+        -- itself a real subject value - an unkeyed projection, or one
+        -- keyed on something else entirely - offers no subject for
+        -- either grant to be checked against, so none of its content
+        -- ever decrypts here, not even for a can_read_sensitive caller.
+        -- EventSubscription's push is the contrasting case: it decides
+        -- per field, each against that field's own subject.
 
     @guarantee ReadYourWritesWhenRequested
         -- A query naming a wait_for_sequence is never answered from a
@@ -4091,10 +4542,18 @@ surface TypeRegistration {
                 rebuild.schema_version
                 rebuild.caught_up_to
 
+        for scheduled_type in bounded_context.event_types where system_triggered_allowed = true:
+            scheduled_type.name
+            scheduled_type.system_triggered_schedule
+            scheduled_type.missed_occurrence_policy
+            scheduled_type.last_fired_at
+            scheduled_type.schedule_position
+
     provides:
         RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
             sensitive_fields, external_creation_allowed, direct_creation_allowed,
-            system_triggered_allowed, event_read_allowed, system_triggered_schedule?)
+            system_triggered_allowed, event_read_allowed, system_triggered_schedule?,
+            missed_occurrence_policy?)
             when bounded_context.status = active
         RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
             sensitive_fields, rest_trigger_allowed)
@@ -4114,7 +4573,20 @@ surface TypeRegistration {
         -- the boundary. The same scoping governs what this surface shows:
         -- the rebuilds visible here are those of its own context's
         -- projections, and a projection in any other context is not merely
-        -- unrebuildable but invisible.
+        -- unrebuildable but invisible. The scheduled event types shown here
+        -- are scoped identically: its own context's, and no other's.
+
+    @guarantee ScheduleStateIsShared
+        -- What an admin reads about a scheduled event type here - its
+        -- policy, when it last fired and how far its schedule has been
+        -- accounted for - is one shared answer per event type, not one per
+        -- running instance. Which replica answers the query cannot change
+        -- it, and neither can a deploy: re-registering a type leaves both
+        -- positions exactly where the scheduler left them (see the note
+        -- above rule RegisterEventType). The last-fired time is the
+        -- occurrence's own instant rather than the wall clock of the write,
+        -- so under a catch-up firing it reads as the occurrence that was
+        -- owed, which is the question an admin is actually asking.
 
     @guarantee SchemaEvolutionStaysCompatible
         -- Re-registering an EventType, CommandType or Projection with a
@@ -4203,6 +4675,33 @@ surface TypeRegistration {
         -- waiting to be made, not one nobody can unmake. Discard reaches
         -- pending rows only - a rebuild already replaying runs to
         -- promotion (see the note above the rule).
+        --
+        -- Scheduled event types are read here for the same reason and in
+        -- the same shape, rather than from a surface of their own. A
+        -- schedule is registered state of this context, declared by the
+        -- same deploy-time loop that registers everything else, and the
+        -- thing an admin needs to know about it - when it last fired - is
+        -- an outcome nobody can see from the registration alone, exactly as
+        -- a staged rebuild is. A separate surface would repeat this one's
+        -- facing, context and scoping guarantee to add a single read to the
+        -- same admin's view of the same context.
+        --
+        -- Three values per scheduled type, and each answers a different
+        -- question: missed_occurrence_policy is what this type owes for an
+        -- occurrence nobody was watching for, last_fired_at is when it last
+        -- actually produced an event, and schedule_position is how far its
+        -- schedule has been accounted for. The last two are equal in the
+        -- ordinary case and diverge exactly when a policy passed something
+        -- over, so the gap between them is the answer to "did we skip
+        -- anything, and how much" - which cannot be read off either one
+        -- alone. Types that were never opted into scheduling are left out
+        -- rather than listed with three empty values.
+        --
+        -- Read-only, deliberately. There is no action here to fire a
+        -- schedule by hand, reset a position or replay a backlog: the
+        -- scheduler faces no actor at all (see the note above rule
+        -- CreateSystemEvent), and the way to change what it does is to
+        -- change what the type declares and re-register it.
         --
         -- The active-context condition sits on the three Register* actions
         -- instead, one guard each. That is where it always belonged:
@@ -4463,8 +4962,31 @@ surface AccessManagement {
 -- Open Questions
 ------------------------------------------------------------
 
--- None. Dotted-path addressing into nested payload fields, the last
--- question standing here, is now answered in full: TagMapping.field,
+-- None. What a scheduler owes for an occurrence it was not running for,
+-- the last question standing here, is now answered - and answered by
+-- refusing to answer it once for everybody. Both directions can lose or
+-- duplicate real work, so the choice is the bounded context author's:
+-- EventType.missed_occurrence_policy is stated per event type at
+-- registration, with no default and no fallback, and a registration that
+-- opts into scheduling without choosing is rejected outright (see enum
+-- MissedOccurrencePolicy and rule RegisterEventType). It is asked for only
+-- of a type that opted in; a type nothing schedules is never asked.
+--
+-- The three choices are guards on rule CreateSystemEvent, evaluated
+-- against durable, registered state rather than against anything a process
+-- remembers: EventType.schedule_position accounts for every occurrence at
+-- or before an instant, and EventType.last_fired_at records the occurrence
+-- the most recent event stood for. One shared value each per event type,
+-- so several instances against one database agree on what has fired, a
+-- deploy neither re-fires nor skips, and an admin can read both -
+-- alongside the policy itself - on surface TypeRegistration. skip needs
+-- one thing the position cannot supply on its own, since a firing that is
+-- six hours late and one that is two seconds late leave the same state
+-- behind: rule SkipMissedOccurrences is where a resuming scheduler says
+-- which it was.
+--
+-- Dotted-path addressing into nested payload fields, the question standing
+-- here before that one, is answered in full too: TagMapping.field,
 -- SensitiveField.field/subject_field and Filter.field each accept a
 -- two-segment path, sensitivity encrypts at the leaf, and the existence
 -- check that makes an addressed field permanent resolves one level deeper

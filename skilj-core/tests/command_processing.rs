@@ -10,7 +10,10 @@
 //! fully covered here via the `CommandToken` one.
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
-//! filtered to this pass's source constructs): 25 total.
+//! filtered to this pass's source constructs): 27 total (25 from the
+//! original pass, plus rule-failure.AuthoriseCommandTrigger.5/
+//! AuthoriseCommandSubmission.5 - `valid_payload`'s own new requires
+//! clause on both rules).
 //! Uncovered/deferred, with reason - see the doc comment at the bottom of
 //! this file:
 //!   - `surface-actor`/`surface-provides.CommandTrigger` (2) - REST-
@@ -88,6 +91,9 @@ fn event_type() -> EventType {
         direct_creation_allowed: false,
         system_triggered_allowed: false,
         system_triggered_schedule: None,
+        missed_occurrence_policy: None,
+        schedule_position: None,
+        last_fired_at: None,
         event_read_allowed: false,
     }
 }
@@ -171,7 +177,7 @@ fn command_token_carries_its_variant_specific_field() {
 }
 
 // ---------------------------------------------------------------------
-// rule-success.AuthoriseCommandTrigger / rule-failure.AuthoriseCommandTrigger.{1,2,3,4}
+// rule-success.AuthoriseCommandTrigger / rule-failure.AuthoriseCommandTrigger.{1,2,3,4,5}
 // ---------------------------------------------------------------------
 
 #[test]
@@ -234,8 +240,26 @@ fn authorise_command_trigger_rejects_an_archived_bounded_context() {
     );
 }
 
+/// rule-failure.AuthoriseCommandTrigger.5 - `requires: valid_payload(command_type.schema, payload)`.
+#[test]
+fn authorise_command_trigger_rejects_a_payload_that_does_not_match_the_schema() {
+    let ct = CommandType {
+        schema: r#"{"properties":{"amount":{"type":"number"}},"required":["amount"]}"#.into(),
+        ..command_type(true, Vec::new())
+    };
+    let token = command_token(TokenStatus::Active, ct);
+
+    let err = event_store::authorise_command_trigger(&token, r#"{"amount":"not a number"}"#.into())
+        .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        event_store::Error::PayloadDoesNotMatchSchema.code()
+    );
+}
+
 // ---------------------------------------------------------------------
-// rule-success.AuthoriseCommandSubmission / rule-failure.AuthoriseCommandSubmission.{1,2,3,4}
+// rule-success.AuthoriseCommandSubmission / rule-failure.AuthoriseCommandSubmission.{1,2,3,4,5}
 // ---------------------------------------------------------------------
 
 #[test]
@@ -341,6 +365,27 @@ fn authorise_command_submission_rejects_an_archived_bounded_context() {
     assert_eq!(
         err.code(),
         event_store::Error::BoundedContextArchived.code()
+    );
+}
+
+/// rule-failure.AuthoriseCommandSubmission.5 - `requires: valid_payload(command_type.schema, payload)`.
+#[test]
+fn authorise_command_submission_rejects_a_payload_that_does_not_match_the_schema() {
+    let ct = CommandType {
+        schema: r#"{"properties":{"amount":{"type":"number"}},"required":["amount"]}"#.into(),
+        ..command_type(true, Vec::new())
+    };
+    let mapping = access_mapping(
+        RoleStatus::Active,
+        AccessLevel::Write,
+        ct.bounded_context.clone(),
+    );
+
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        event_store::Error::PayloadDoesNotMatchSchema.code()
     );
 }
 

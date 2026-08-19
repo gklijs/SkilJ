@@ -76,6 +76,7 @@ use async_graphql::ErrorExtensions;
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::db::Pool;
 use skilj_core::encryption::{DataKey, EncryptionMasterKey};
+use skilj_core::event_store::MissedOccurrencePolicy;
 use skilj_core::shared::{Filter, FilterOperator, SensitiveField, TagMapping};
 
 /// The resolved caller for every gated resolver in this crate except
@@ -246,6 +247,23 @@ pub fn parse_filters(value: &ValueAccessor) -> async_graphql::Result<Vec<Filter>
         });
     }
     Ok(filters)
+}
+
+/// `MissedOccurrencePolicy` GraphQL enum name -> domain value - the same
+/// `match ... => variant, _ => last variant` shape `parse_filters`'s own
+/// `operator` match already uses. `registerEventType`'s own
+/// `missedOccurrencePolicy` argument is the only caller - deliberately
+/// no default anywhere upstream of this (see `EventType::
+/// missed_occurrence_policy`'s own doc comment: the user's own call was
+/// "I rather not have a default"), so this only ever runs against a
+/// value the GraphQL enum type itself already validated as one of the
+/// three real names.
+pub fn parse_missed_occurrence_policy(name: &str) -> MissedOccurrencePolicy {
+    match name {
+        "SKIP" => MissedOccurrencePolicy::Skip,
+        "FIRE_ONCE" => MissedOccurrencePolicy::FireOnce,
+        _ => MissedOccurrencePolicy::ReplayBacklog,
+    }
 }
 
 /// A `String` argument this crate treats as an entity name/id lookup key

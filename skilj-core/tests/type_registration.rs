@@ -131,6 +131,9 @@ fn existing_event_type(schema: String, tag_mappings: Vec<TagMapping>) -> EventTy
         direct_creation_allowed: false,
         system_triggered_allowed: false,
         system_triggered_schedule: None,
+        missed_occurrence_policy: None,
+        schedule_position: None,
+        last_fired_at: None,
         event_read_allowed: false,
     }
 }
@@ -242,6 +245,69 @@ fn valid_sensitive_fields_rejects_a_subject_field_the_schema_does_not_declare() 
 }
 
 // ---------------------------------------------------------------------
+// valid_payload - see the "Payload schema shape" note above entity
+// CommandType in specs/skilj.allium; checked directly here, at the
+// object requires: valid_payload(...) calls it from - CreateExternalEvent.4,
+// CreateDirectEvent.4, AuthoriseCommandSubmission.5, AuthoriseCommandTrigger.5
+// each cover the caller-facing rejection shape only, not this function's
+// own edge cases.
+// ---------------------------------------------------------------------
+
+#[test]
+fn valid_payload_accepts_a_payload_matching_every_declared_field() {
+    assert!(event_store::valid_payload(
+        &schema_v1(),
+        r#"{"amount":10,"currency":"EUR"}"#
+    ));
+}
+
+#[test]
+fn valid_payload_accepts_an_optional_field_being_absent() {
+    // currency is not in schema_v1's own "required" - absent is fine.
+    assert!(event_store::valid_payload(&schema_v1(), r#"{"amount":10}"#));
+}
+
+#[test]
+fn valid_payload_rejects_a_missing_required_field() {
+    assert!(!event_store::valid_payload(
+        &schema_v1(),
+        r#"{"currency":"EUR"}"#
+    ));
+}
+
+#[test]
+fn valid_payload_rejects_a_field_of_the_wrong_type() {
+    assert!(!event_store::valid_payload(
+        &schema_v1(),
+        r#"{"amount":"not an integer"}"#
+    ));
+}
+
+#[test]
+fn valid_payload_rejects_a_malformed_payload() {
+    assert!(!event_store::valid_payload(&schema_v1(), "not json at all"));
+}
+
+#[test]
+fn valid_payload_rejects_a_malformed_schema() {
+    assert!(!event_store::valid_payload(
+        "not json at all",
+        r#"{"amount":10}"#
+    ));
+}
+
+/// No `additionalProperties: false` anywhere this spec's own payload
+/// schema shape ever declares (see the "Payload schema shape" note) - an
+/// extra field beyond what's declared is not itself a violation.
+#[test]
+fn valid_payload_allows_an_undeclared_extra_field() {
+    assert!(event_store::valid_payload(
+        &schema_v1(),
+        r#"{"amount":10,"currency":"EUR","note":"unexpected but harmless"}"#
+    ));
+}
+
+// ---------------------------------------------------------------------
 // rule-success.RegisterEventType (create path) / rule-failure.RegisterEventType.{1..7}
 // ---------------------------------------------------------------------
 
@@ -261,8 +327,10 @@ fn register_event_type_creates_a_new_type_when_none_exists() {
         false,
         false,
         None,
+        None,
         true,
         None, // no existing type
+        timestamp(0),
     )
     .unwrap();
 
@@ -294,8 +362,10 @@ fn register_event_type_rejects_a_revoked_mapping() {
         false,
         false,
         None,
+        None,
         false,
         None,
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -319,8 +389,10 @@ fn register_event_type_rejects_a_write_level_mapping() {
         false,
         false,
         None,
+        None,
         false,
         None,
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -350,8 +422,10 @@ fn register_event_type_rejects_a_bounded_context_the_mapping_is_not_scoped_to() 
         false,
         false,
         None,
+        None,
         false,
         None,
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -381,8 +455,10 @@ fn register_event_type_rejects_an_archived_bounded_context() {
         false,
         false,
         None,
+        None,
         false,
         None,
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -409,8 +485,10 @@ fn register_event_type_rejects_a_tag_mapping_naming_an_undeclared_field() {
         false,
         false,
         None,
+        None,
         false,
         None,
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -434,8 +512,10 @@ fn register_event_type_rejects_a_sensitive_field_naming_an_undeclared_field() {
         false,
         false,
         None,
+        None,
         false,
         None,
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -460,8 +540,10 @@ fn register_event_type_rejects_a_tag_mapping_and_sensitive_field_overlap() {
         false,
         false,
         None,
+        None,
         false,
         None,
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -492,8 +574,10 @@ fn register_event_type_updates_in_place_and_bumps_schema_version_when_schema_cha
         false,
         false,
         None,
+        None,
         false,
         Some(&existing),
+        timestamp(0),
     )
     .unwrap();
 
@@ -527,8 +611,10 @@ fn register_event_type_leaves_schema_version_unchanged_when_schema_is_identical(
         false,
         false,
         None,
+        None,
         false,
         Some(&existing),
+        timestamp(0),
     )
     .unwrap();
 
@@ -554,8 +640,10 @@ fn register_event_type_rejects_an_incompatible_schema_change() {
         false,
         false,
         None,
+        None,
         false,
         Some(&existing),
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -581,8 +669,10 @@ fn register_event_type_rejects_dropping_an_existing_tag_mapping_key() {
         false,
         false,
         None,
+        None,
         false,
         Some(&existing),
+        timestamp(0),
     )
     .unwrap_err();
 
@@ -608,12 +698,207 @@ fn register_event_type_allows_retargeting_a_tag_mapping_key_to_a_different_field
         false,
         false,
         None,
+        None,
         false,
         Some(&existing),
+        timestamp(0),
     )
     .unwrap();
 
     assert_eq!(result.event_type().tag_mappings[0].field, "currency");
+}
+
+// ---------------------------------------------------------------------
+// RegisterEventType's scheduling opt-in: MissedOccurrencePolicy,
+// schedule_position, last_fired_at (the missed-occurrence spec pass)
+// ---------------------------------------------------------------------
+
+#[test]
+fn register_event_type_rejects_system_triggered_allowed_with_no_schedule_or_policy() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    // Neither schedule nor policy.
+    let err = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "DailyDigest".into(),
+        schema_v1(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+        true,
+        None,
+        None,
+        false,
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        event_store::Error::MissingScheduleOrPolicy.code()
+    );
+
+    // Schedule but no policy.
+    let err = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "DailyDigest".into(),
+        schema_v1(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+        true,
+        Some("0 0 3 * * * *".into()),
+        None,
+        false,
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        event_store::Error::MissingScheduleOrPolicy.code()
+    );
+
+    // Policy but no schedule.
+    let err = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "DailyDigest".into(),
+        schema_v1(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+        true,
+        None,
+        Some(event_store::MissedOccurrencePolicy::Skip),
+        false,
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code(),
+        event_store::Error::MissingScheduleOrPolicy.code()
+    );
+}
+
+#[test]
+fn register_event_type_anchors_schedule_position_on_first_opt_in() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    let result = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "DailyDigest".into(),
+        schema_v1(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+        true,
+        Some("0 0 3 * * * *".into()),
+        Some(event_store::MissedOccurrencePolicy::ReplayBacklog),
+        false,
+        None,
+        timestamp(1000),
+    )
+    .unwrap();
+
+    let et = result.event_type();
+    assert_eq!(
+        et.missed_occurrence_policy,
+        Some(event_store::MissedOccurrencePolicy::ReplayBacklog)
+    );
+    assert_eq!(et.schedule_position, Some(timestamp(1000)));
+    assert_eq!(et.last_fired_at, None);
+}
+
+/// Re-registration with scheduling already on leaves both positions
+/// exactly where the scheduler left them - a deploy is not a way to
+/// re-fire (resetting back) or skip (resetting forward) a backlog.
+#[test]
+fn register_event_type_leaves_schedule_position_untouched_on_re_registration() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let existing = EventType {
+        system_triggered_allowed: true,
+        system_triggered_schedule: Some("0 0 3 * * * *".into()),
+        missed_occurrence_policy: Some(event_store::MissedOccurrencePolicy::Skip),
+        schedule_position: Some(timestamp(500)),
+        last_fired_at: Some(timestamp(400)),
+        ..existing_event_type(schema_v1(), Vec::new())
+    };
+
+    let result = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "OrderPlaced".into(),
+        schema_v1(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+        true,
+        Some("0 0 4 * * * *".into()), // schedule string itself may change freely
+        Some(event_store::MissedOccurrencePolicy::FireOnce), // policy may change too
+        false,
+        Some(&existing),
+        timestamp(9999), // even a much later "now" doesn't move the position
+    )
+    .unwrap();
+
+    let et = result.event_type();
+    assert_eq!(et.schedule_position, Some(timestamp(500)));
+    assert_eq!(et.last_fired_at, Some(timestamp(400)));
+    assert_eq!(
+        et.missed_occurrence_policy,
+        Some(event_store::MissedOccurrencePolicy::FireOnce)
+    );
+}
+
+/// Switching scheduling off and on again re-anchors the position - the
+/// off period is not a backlog anybody is owed.
+#[test]
+fn register_event_type_re_anchors_schedule_position_when_switched_off_and_on_again() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let existing = EventType {
+        system_triggered_allowed: false, // was switched off
+        system_triggered_schedule: None,
+        missed_occurrence_policy: None,
+        schedule_position: None,
+        last_fired_at: Some(timestamp(400)), // what once fired stays a fact
+        ..existing_event_type(schema_v1(), Vec::new())
+    };
+
+    let result = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "OrderPlaced".into(),
+        schema_v1(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+        true, // switched back on
+        Some("0 0 3 * * * *".into()),
+        Some(event_store::MissedOccurrencePolicy::Skip),
+        false,
+        Some(&existing),
+        timestamp(9999),
+    )
+    .unwrap();
+
+    let et = result.event_type();
+    assert_eq!(et.schedule_position, Some(timestamp(9999)));
+    assert_eq!(et.last_fired_at, Some(timestamp(400))); // untouched
 }
 
 // ---------------------------------------------------------------------

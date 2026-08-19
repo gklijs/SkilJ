@@ -39,7 +39,8 @@ use crate::bootstrap::ContextCreator;
 use crate::encryption::{self, DataKey, EncryptionMasterKey};
 use crate::event_store::{
     AckMode, BoundedContext, BoundedContextStatus, Command, CommandType, CursorUpdate,
-    EncryptionKey, EncryptionKeyStatus, Event, EventOrigin, EventType, ReadCursor,
+    EncryptionKey, EncryptionKeyStatus, Event, EventOrigin, EventType, MissedOccurrencePolicy,
+    ReadCursor,
 };
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use crate::shared::{Metadata, SensitiveField, Tag, TagMapping};
@@ -180,6 +181,10 @@ async fn provision_bounded_context_schema(
             direct_creation_allowed BOOLEAN NOT NULL,
             system_triggered_allowed BOOLEAN NOT NULL,
             system_triggered_schedule TEXT,
+            missed_occurrence_policy TEXT CHECK (missed_occurrence_policy IN \
+                ('skip', 'fire_once', 'replay_backlog')),
+            schedule_position TIMESTAMPTZ,
+            last_fired_at TIMESTAMPTZ,
             event_read_allowed BOOLEAN NOT NULL
         )"
     ))
@@ -291,14 +296,26 @@ async fn provision_bounded_context_schema(
     .execute(&mut **tx)
     .await?;
 
+    // `PRIMARY KEY (projection_name, status)` - not `projection_name`
+    // alone - is what actually lets a pending and a building row coexist
+    // for the same projection (invariant `UniqueRebuildPerProjectionAndStatus`'s
+    // own "at most one pending and at most one building... the two
+    // coexisting is the deliberate case"), rather than structurally
+    // capping every projection at one rebuild, full stop, regardless of
+    // status. `projection_rebuild_consumed_event_types`/
+    // `projection_rebuild_state` below both follow suit, carrying their
+    // own `status` column and FK-ing against the composite key, so a
+    // pending row's own consumed-types set and a building row's own
+    // fold-in-progress state never get mixed up when both exist at once.
     sqlx::query(&format!(
         "CREATE TABLE {schema}.projection_rebuilds (
-            projection_name TEXT PRIMARY KEY REFERENCES {schema}.projections (name),
+            projection_name TEXT NOT NULL REFERENCES {schema}.projections (name),
             schema TEXT NOT NULL,
             schema_version BIGINT NOT NULL,
             sync BOOLEAN NOT NULL,
             caught_up_to BIGINT,
-            status TEXT NOT NULL CHECK (status IN ('pending', 'building'))
+            status TEXT NOT NULL CHECK (status IN ('pending', 'building')),
+            PRIMARY KEY (projection_name, status)
         )"
     ))
     .execute(&mut **tx)
@@ -306,9 +323,12 @@ async fn provision_bounded_context_schema(
 
     sqlx::query(&format!(
         "CREATE TABLE {schema}.projection_rebuild_consumed_event_types (
-            projection_name TEXT NOT NULL REFERENCES {schema}.projection_rebuilds (projection_name),
+            projection_name TEXT NOT NULL,
+            status TEXT NOT NULL,
             event_type_name TEXT NOT NULL REFERENCES {schema}.event_types (name),
-            PRIMARY KEY (projection_name, event_type_name)
+            PRIMARY KEY (projection_name, status, event_type_name),
+            FOREIGN KEY (projection_name, status)
+                REFERENCES {schema}.projection_rebuilds (projection_name, status)
         )"
     ))
     .execute(&mut **tx)
@@ -329,11 +349,14 @@ async fn provision_bounded_context_schema(
     // have ahead of time.
     sqlx::query(&format!(
         "CREATE TABLE {schema}.projection_rebuild_state (
-            projection_name TEXT NOT NULL REFERENCES {schema}.projection_rebuilds (projection_name),
+            projection_name TEXT NOT NULL,
+            status TEXT NOT NULL,
             key TEXT NOT NULL,
             state TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL,
-            PRIMARY KEY (projection_name, key)
+            PRIMARY KEY (projection_name, status, key),
+            FOREIGN KEY (projection_name, status)
+                REFERENCES {schema}.projection_rebuilds (projection_name, status)
         )"
     ))
     .execute(&mut **tx)
@@ -416,7 +439,7 @@ async fn provision_bounded_context_schema(
         "CREATE TABLE {schema}.access_tokens (
             id TEXT PRIMARY KEY,
             kind TEXT NOT NULL CHECK (kind IN ('external_event', 'direct_creation', 'event_read', 'command')),
-            secret TEXT NOT NULL,
+            secret TEXT NOT NULL, -- hash_secret's output, never the plaintext (see AccessToken.secret)
             status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
             created_at TIMESTAMPTZ NOT NULL,
             revoked_at TIMESTAMPTZ,
@@ -693,6 +716,22 @@ pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<Boun
 
 // --- EventType ---
 
+fn missed_occurrence_policy_to_str(policy: MissedOccurrencePolicy) -> &'static str {
+    match policy {
+        MissedOccurrencePolicy::Skip => "skip",
+        MissedOccurrencePolicy::FireOnce => "fire_once",
+        MissedOccurrencePolicy::ReplayBacklog => "replay_backlog",
+    }
+}
+
+fn missed_occurrence_policy_from_str(s: &str) -> MissedOccurrencePolicy {
+    match s {
+        "fire_once" => MissedOccurrencePolicy::FireOnce,
+        "replay_backlog" => MissedOccurrencePolicy::ReplayBacklog,
+        _ => MissedOccurrencePolicy::Skip,
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct EventTypeRow {
     name: String,
@@ -704,6 +743,9 @@ struct EventTypeRow {
     direct_creation_allowed: bool,
     system_triggered_allowed: bool,
     system_triggered_schedule: Option<String>,
+    missed_occurrence_policy: Option<String>,
+    schedule_position: Option<DateTime<Utc>>,
+    last_fired_at: Option<DateTime<Utc>>,
     event_read_allowed: bool,
 }
 
@@ -720,6 +762,12 @@ impl EventTypeRow {
             direct_creation_allowed: self.direct_creation_allowed,
             system_triggered_allowed: self.system_triggered_allowed,
             system_triggered_schedule: self.system_triggered_schedule,
+            missed_occurrence_policy: self
+                .missed_occurrence_policy
+                .as_deref()
+                .map(missed_occurrence_policy_from_str),
+            schedule_position: self.schedule_position,
+            last_fired_at: self.last_fired_at,
             event_read_allowed: self.event_read_allowed,
         }
     }
@@ -727,7 +775,8 @@ impl EventTypeRow {
 
 const EVENT_TYPE_COLUMNS: &str = "name, schema, schema_version, tag_mappings, sensitive_fields, \
     external_creation_allowed, direct_creation_allowed, system_triggered_allowed, \
-    system_triggered_schedule, event_read_allowed";
+    system_triggered_schedule, missed_occurrence_policy, schedule_position, last_fired_at, \
+    event_read_allowed";
 
 /// Upsert, not insert-only - `RegisterEventType`'s own create-or-update
 /// shape (see `event_store::register_event_type`), though no surface
@@ -737,7 +786,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     let schema = schema_ident(&et.bounded_context.name);
     sqlx::query(&format!(
         "INSERT INTO {schema}.event_types ({EVENT_TYPE_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
             tag_mappings = EXCLUDED.tag_mappings, sensitive_fields = EXCLUDED.sensitive_fields, \
@@ -745,6 +794,9 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
             direct_creation_allowed = EXCLUDED.direct_creation_allowed, \
             system_triggered_allowed = EXCLUDED.system_triggered_allowed, \
             system_triggered_schedule = EXCLUDED.system_triggered_schedule, \
+            missed_occurrence_policy = EXCLUDED.missed_occurrence_policy, \
+            schedule_position = EXCLUDED.schedule_position, \
+            last_fired_at = EXCLUDED.last_fired_at, \
             event_read_allowed = EXCLUDED.event_read_allowed"
     ))
     .bind(&et.name)
@@ -756,6 +808,12 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     .bind(et.direct_creation_allowed)
     .bind(et.system_triggered_allowed)
     .bind(&et.system_triggered_schedule)
+    .bind(
+        et.missed_occurrence_policy
+            .map(missed_occurrence_policy_to_str),
+    )
+    .bind(et.schedule_position)
+    .bind(et.last_fired_at)
     .bind(et.event_read_allowed)
     .execute(pool)
     .await?;
@@ -778,6 +836,201 @@ pub async fn get_event_type(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| r.into_domain(bc)))
+}
+
+/// Every `EventType` in `bounded_context` currently opted into
+/// scheduling (`system_triggered_allowed = true`) - the background
+/// scheduler's own discovery query each tick, and `TypeRegistration`'s
+/// `scheduledEventTypes` GraphQL query (`@guarantee ScheduleStateIsShared`'s
+/// own admin visibility) both read from this. Ordered by `name` for
+/// stable output. `[]`, not an error, for an unknown `bounded_context` -
+/// the same "nothing to show" treatment `list_projections_for_bounded_context`
+/// gives it.
+pub async fn list_scheduled_event_types(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<EventType>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(Vec::new());
+    };
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<EventTypeRow> = sqlx::query_as(&format!(
+        "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types \
+         WHERE system_triggered_allowed = true ORDER BY name"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.into_domain(bc.clone()))
+        .collect())
+}
+
+/// `rule CreateSystemEvent`'s own atomic whole, and `SequenceIsGaplessPerBoundedContext`'s
+/// enforcement for a fired occurrence - locks `event_type_name`'s own
+/// `event_types` row (`SELECT ... FOR UPDATE`), re-derives eligibility
+/// against the now-locked, up-to-date `schedule_position`/`last_fired_at`
+/// (another instance may have already advanced them since the caller's
+/// own `list_scheduled_event_types` read - see `@guarantee
+/// ScheduleStateIsShared`), and only then allocates a sequence number and
+/// inserts - the same "peek, lock, re-check, single commit" shape
+/// `submit_command` uses for `bounded_context.sequence`, adapted to one
+/// `event_types` row instead. `event_dispatcher.scheduled_payload` is
+/// resolved *before* the lock, deliberately: it's arbitrary caller code
+/// (unlike `decide()`/`project()`, §1.1 never promised it's cheap or
+/// I/O-free), so it must never run while this row's lock is held - that
+/// would block every other writer to this event type for however long it
+/// takes. `Ok(None)` when there is nothing to fire: the occurrence turned
+/// out to be ineligible once the lock confirmed the fresh position (not
+/// an error - exactly the race this locking exists to make harmless), or
+/// this process's own `EventDispatcher` has no `scheduled_payload`
+/// producer registered for the type at all (a genuine misconfiguration,
+/// tolerated the same way `catch_up_bounded_context` tolerates an
+/// unregistered projection dispatcher - logged and skipped by the
+/// caller, not propagated as an `Err`).
+#[allow(clippy::too_many_arguments)]
+pub async fn fire_system_event(
+    pool: &Pool,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    event_dispatcher: &dyn crate::plugin::EventDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    event_type_name: &str,
+    occurrence_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<Option<Event>> {
+    let Some(unlocked_event_type) = get_event_type(pool, bounded_context, event_type_name).await?
+    else {
+        return Ok(None);
+    };
+    let Some(payload) = event_dispatcher.scheduled_payload(bounded_context, event_type_name) else {
+        return Ok(None);
+    };
+
+    let mut resolved = std::collections::HashMap::new();
+    resolve_encryption_keys(
+        pool,
+        bounded_context,
+        &unlocked_event_type.sensitive_fields,
+        &payload,
+        encryption_master_key,
+        &mut resolved,
+    )
+    .await?;
+
+    let schema = schema_ident(bounded_context);
+    let mut tx = pool.begin().await?;
+    let row: Option<EventTypeRow> = sqlx::query_as(&format!(
+        "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = $1 FOR UPDATE"
+    ))
+    .bind(event_type_name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let event_type = row.into_domain(unlocked_event_type.bounded_context);
+
+    // Allocated inside `tx`, after the lock above - if `create_system_event`
+    // below rejects the occurrence, `tx` is dropped without committing
+    // (the early `return Ok(None)`), rolling this allocation back too, so
+    // no sequence number is ever burned on an occurrence that didn't
+    // actually fire.
+    let next_seq = next_sequence(&mut *tx, bounded_context).await?;
+    let Some((event, new_position)) = crate::event_store::create_system_event(
+        &event_type,
+        occurrence_at,
+        now,
+        next_seq,
+        || payload,
+        |subject_key, subject_value| {
+            let (key, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect(
+                    "resolve_encryption_keys pre-resolved every subject sensitive_field_subjects \
+                     named",
+                );
+            (key.clone(), data_key.clone())
+        },
+    ) else {
+        return Ok(None);
+    };
+
+    let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
+    insert_event_and_update_sync_projections_in_tx(
+        pool,
+        &mut tx,
+        &event,
+        None,
+        projection_dispatcher,
+        &encryption_key_ids,
+    )
+    .await?;
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.event_types SET schedule_position = $1, last_fired_at = $2 WHERE name = $3"
+    ))
+    .bind(new_position)
+    .bind(new_position)
+    .bind(event_type_name)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    broadcaster.publish(&event);
+    event_cache.append(&event).await;
+
+    Ok(Some(event))
+}
+
+/// `rule SkipMissedOccurrences`'s own atomic whole - locks the same
+/// `event_types` row `fire_system_event` does, re-derives eligibility
+/// against the locked, up-to-date `schedule_position` (a second instance
+/// resuming alongside the first is exactly the harmless race this lock
+/// makes a no-op - see `event_store::skip_missed_occurrences`'s own doc
+/// comment), and persists the advanced position alone: unlike
+/// `fire_system_event`, no event is produced and `last_fired_at` never
+/// moves (`FiredOccurrenceIsAccountedFor` only ever relates it to
+/// occurrences that actually fired). `Ok(None)` when the resume turns out
+/// to be a no-op once the lock is held.
+pub async fn skip_missed_occurrences_for_event_type(
+    pool: &Pool,
+    bounded_context: &str,
+    event_type_name: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<Option<DateTime<Utc>>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(None);
+    };
+    let schema = schema_ident(bounded_context);
+    let mut tx = pool.begin().await?;
+    let row: Option<EventTypeRow> = sqlx::query_as(&format!(
+        "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = $1 FOR UPDATE"
+    ))
+    .bind(event_type_name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let event_type = row.into_domain(bc);
+
+    let Some(new_position) = crate::event_store::skip_missed_occurrences(&event_type, now) else {
+        return Ok(None);
+    };
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.event_types SET schedule_position = $1 WHERE name = $2"
+    ))
+    .bind(new_position)
+    .bind(event_type_name)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(Some(new_position))
 }
 
 // --- CommandType ---
@@ -1280,16 +1533,21 @@ const COMMAND_COLUMNS: &str = "command_type_name, payload, metadata_type, metada
 /// `get_or_create_encryption_key`'s own returned `id`s for
 /// `command.encryption_keys` - see `insert_event_and_update_sync_projections`'s
 /// own doc comment on why the domain struct alone isn't enough to link
-/// the join rows. A real transaction now (previously a single statement),
-/// so the command row and its own `command_encryption_keys` rows commit
-/// or fail together.
+/// the join rows.
+///
+/// Takes an already-open `tx` rather than opening/committing its own
+/// (previously the latter) - `ProcessCommand`'s own REST/GraphQL call
+/// sites now share one outer transaction across `next_sequence`'s lock,
+/// this insert, and every triggered `Event`'s own insert, so the command
+/// row and every one of the events it triggered commit or roll back
+/// together - see `DynamicConsistencyBoundaryHonoured` and the note above
+/// the rules in specs/skilj.allium.
 pub async fn insert_command(
-    pool: &Pool,
+    tx: &mut Transaction<'_, Postgres>,
     command: &Command,
     encryption_key_ids: &[i64],
 ) -> crate::error::Result<i64> {
     let schema = schema_ident(&command.bounded_context.name);
-    let mut tx = pool.begin().await?;
     let (id,): (i64,) = sqlx::query_as(&format!(
         "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id"
@@ -1302,7 +1560,7 @@ pub async fn insert_command(
     .bind(command.metadata.created_at)
     .bind(Json(&command.consistency_tags))
     .bind(command.consistency_boundary)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     for encryption_key_id in encryption_key_ids {
@@ -1312,11 +1570,10 @@ pub async fn insert_command(
         ))
         .bind(id)
         .bind(encryption_key_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
-    tx.commit().await?;
     Ok(id)
 }
 
@@ -1497,7 +1754,10 @@ async fn get_or_create_projection_state_for_update(
 /// `get_or_create_projection_state_for_update`'s own twin for
 /// `projection_rebuild_state` - see that function's own doc comment for
 /// the "no-op write, purely to acquire the lock" reasoning, identical
-/// here.
+/// here. `status` is always `'building'` inline, not a parameter - a
+/// pending row is never folded (only `catch_up_bounded_context`'s own
+/// `building_rebuilds` walk reaches this function at all), so there is no
+/// other status any real caller could mean.
 async fn get_or_create_projection_rebuild_state_for_update(
     executor: impl sqlx::PgExecutor<'_>,
     schema: &str,
@@ -1506,9 +1766,9 @@ async fn get_or_create_projection_rebuild_state_for_update(
     default_state_json: &str,
 ) -> crate::error::Result<String> {
     let (state,): (String,) = sqlx::query_as(&format!(
-        "INSERT INTO {schema}.projection_rebuild_state (projection_name, key, state, updated_at) \
-         VALUES ($1, $2, $3, now()) \
-         ON CONFLICT (projection_name, key) DO UPDATE SET \
+        "INSERT INTO {schema}.projection_rebuild_state (projection_name, status, key, state, \
+         updated_at) VALUES ($1, 'building', $2, $3, now()) \
+         ON CONFLICT (projection_name, status, key) DO UPDATE SET \
          state = {schema}.projection_rebuild_state.state \
          RETURNING state"
     ))
@@ -1559,8 +1819,11 @@ pub async fn get_projection_rebuild_state(
     key: &str,
 ) -> crate::error::Result<Option<String>> {
     let schema = schema_ident(bounded_context);
+    // Always the `'building'` row - see `get_or_create_projection_rebuild_state_for_update`'s
+    // own doc comment for why no other status is meaningful here.
     let row: Option<(String,)> = sqlx::query_as(&format!(
-        "SELECT state FROM {schema}.projection_rebuild_state WHERE projection_name = $1 AND key = $2"
+        "SELECT state FROM {schema}.projection_rebuild_state \
+         WHERE projection_name = $1 AND status = 'building' AND key = $2"
     ))
     .bind(projection_name)
     .bind(key)
@@ -1673,21 +1936,96 @@ fn projection_rebuild_status_from_str(s: &str) -> ProjectionRebuildStatus {
 const PROJECTION_REBUILD_COLUMNS: &str =
     "projection_name, schema, schema_version, sync, caught_up_to, status";
 
-/// Upsert, matching `RegisterProjection`'s own "restaging replaces the
-/// pending row" semantics (see the migration's own doc comment on why
-/// `projection_rebuilds` is keyed 1:1 by projection rather than a
-/// synthetic id). Note that `register_projection`'s own struct-update
-/// construction (`ProjectionRebuild { caught_up_to: None, ..staged.clone() }`)
-/// sets `caught_up_to` back to `None` on *every* call this makes,
-/// including a restage of a row already `building` - `rebuild.status`
-/// alone doesn't change, but any progress `catch_up_bounded_context` had
-/// already made toward the old `schema`/`consumed_event_types` is
-/// invalidated the moment this is called. This function doesn't touch
-/// `projection_rebuild_state` itself - `catch_up_bounded_context` is what
-/// notices `caught_up_to = None` and resets that row, using whatever the
-/// *current* dispatcher considers the default (see
-/// `ProjectionDispatcher::default_state`'s own doc comment for why it,
-/// not this function, has to be the one deciding that value).
+/// `consumed_event_types`/`replace_consumed_event_types` above's own twin
+/// for `projection_rebuild_consumed_event_types` - not built on those
+/// generic helpers directly, since that table now carries a `status`
+/// column the plain `projections`/`projection_consumed_event_types` pair
+/// never needed (see `provision_bounded_context_schema`'s own doc comment
+/// on why: a pending row and a building row each need their own
+/// consumed-types set, never mixed up).
+async fn rebuild_consumed_event_types(
+    pool: &Pool,
+    bounded_context: &str,
+    projection_name: &str,
+    status: ProjectionRebuildStatus,
+) -> crate::error::Result<Vec<EventType>> {
+    let schema = schema_ident(bounded_context);
+    let names: Vec<(String,)> = sqlx::query_as(&format!(
+        "SELECT event_type_name FROM {schema}.projection_rebuild_consumed_event_types \
+         WHERE projection_name = $1 AND status = $2"
+    ))
+    .bind(projection_name)
+    .bind(projection_rebuild_status_to_str(status))
+    .fetch_all(pool)
+    .await?;
+
+    let mut event_types = Vec::with_capacity(names.len());
+    for (event_type_name,) in names {
+        let et = get_event_type(pool, bounded_context, &event_type_name)
+            .await?
+            .expect(
+                "projection_rebuild_consumed_event_types join row references an event_types \
+                 row that no longer exists",
+            );
+        event_types.push(et);
+    }
+    Ok(event_types)
+}
+
+async fn replace_rebuild_consumed_event_types(
+    pool: &Pool,
+    bounded_context: &str,
+    projection_name: &str,
+    status: ProjectionRebuildStatus,
+    event_types: &[EventType],
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let status = projection_rebuild_status_to_str(status);
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
+         WHERE projection_name = $1 AND status = $2"
+    ))
+    .bind(projection_name)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    for et in event_types {
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.projection_rebuild_consumed_event_types \
+             (projection_name, status, event_type_name) VALUES ($1,$2,$3)"
+        ))
+        .bind(projection_name)
+        .bind(status)
+        .bind(&et.name)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Upsert **within `rebuild.status`'s own row** - matching
+/// `RegisterProjection`'s own "restaging replaces the pending row"
+/// semantics (`ON CONFLICT (projection_name, status)`, not
+/// `projection_name` alone - see `provision_bounded_context_schema`'s own
+/// doc comment on why one projection can have both a pending and a
+/// building row at once). Never call this to persist a *status
+/// transition* (pending becoming building) - that would leave the old
+/// row behind as a stale duplicate under its own now-wrong status instead
+/// of replacing it; see `transition_projection_rebuild_to_building` for
+/// that case, the only one `rebuild_projection`'s own output is ever fed
+/// into.
+///
+/// Note that `register_projection`'s own struct-update construction
+/// (`ProjectionRebuild { caught_up_to: None, ..staged.clone() }`) sets
+/// `caught_up_to` back to `None` on every restage - any progress
+/// `catch_up_bounded_context` had already made toward the old
+/// `schema`/`consumed_event_types` is invalidated the moment this is
+/// called. This function doesn't touch `projection_rebuild_state` itself,
+/// since `catch_up_bounded_context` is what notices `caught_up_to = None`
+/// and resets that row, using whatever the *current* dispatcher considers
+/// the default (see `ProjectionDispatcher::default_state`'s own doc
+/// comment for why it, not this function, has to be the one deciding
+/// that value).
 pub async fn upsert_projection_rebuild(
     pool: &Pool,
     rebuild: &ProjectionRebuild,
@@ -1696,9 +2034,9 @@ pub async fn upsert_projection_rebuild(
     sqlx::query(&format!(
         "INSERT INTO {schema}.projection_rebuilds ({PROJECTION_REBUILD_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6) \
-         ON CONFLICT (projection_name) DO UPDATE SET \
+         ON CONFLICT (projection_name, status) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
-            sync = EXCLUDED.sync, caught_up_to = EXCLUDED.caught_up_to, status = EXCLUDED.status"
+            sync = EXCLUDED.sync, caught_up_to = EXCLUDED.caught_up_to"
     ))
     .bind(&rebuild.projection.name)
     .bind(&rebuild.schema)
@@ -1708,24 +2046,113 @@ pub async fn upsert_projection_rebuild(
     .bind(projection_rebuild_status_to_str(rebuild.status))
     .execute(pool)
     .await?;
-    replace_consumed_event_types(
+    replace_rebuild_consumed_event_types(
         pool,
         &rebuild.projection.bounded_context.name,
-        "projection_rebuild_consumed_event_types",
         &rebuild.projection.name,
+        rebuild.status,
         &rebuild.consumed_event_types,
     )
     .await
 }
 
-/// `None` when this projection has no pending/building rebuild staged -
+/// Persists `rebuild_projection`'s own output - a pending row transitioning
+/// to building, per `rule RebuildProjection`'s `ensures: staged.status =
+/// building`. One transaction: the old `(projection_name, 'pending')` row
+/// and its own join rows are deleted, and the new `(projection_name,
+/// 'building')` row (`rebuild`, already carrying `status: Building`) is
+/// inserted in their place - never both left behind as if this were two
+/// independent rows, and never a window in which neither exists if this
+/// fails partway. `ON CONFLICT (projection_name, status) DO UPDATE` on the
+/// insert half is defensive, not the expected path: `RebuildProjection`'s
+/// own `requires: staged.status = pending` doesn't check for an
+/// *already*-building row, so a caller triggering it while one is still
+/// replaying re-stages the build under the freshly toggled row rather
+/// than erroring - still at most one building row afterward, satisfying
+/// `UniqueRebuildPerProjectionAndStatus` either way.
+pub async fn transition_projection_rebuild_to_building(
+    pool: &Pool,
+    rebuild: &ProjectionRebuild,
+) -> crate::error::Result<()> {
+    debug_assert_eq!(
+        rebuild.status,
+        ProjectionRebuildStatus::Building,
+        "transition_projection_rebuild_to_building's own rebuild must already carry status: \
+         Building - rebuild_projection's own output does"
+    );
+    let mut tx = pool.begin().await?;
+    let schema = schema_ident(&rebuild.projection.bounded_context.name);
+    let pending = projection_rebuild_status_to_str(ProjectionRebuildStatus::Pending);
+
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
+         WHERE projection_name = $1 AND status = $2"
+    ))
+    .bind(&rebuild.projection.name)
+    .bind(pending)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.projection_rebuilds WHERE projection_name = $1 AND status = $2"
+    ))
+    .bind(&rebuild.projection.name)
+    .bind(pending)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.projection_rebuilds ({PROJECTION_REBUILD_COLUMNS}) \
+         VALUES ($1,$2,$3,$4,$5,$6) \
+         ON CONFLICT (projection_name, status) DO UPDATE SET \
+            schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
+            sync = EXCLUDED.sync, caught_up_to = EXCLUDED.caught_up_to"
+    ))
+    .bind(&rebuild.projection.name)
+    .bind(&rebuild.schema)
+    .bind(rebuild.schema_version)
+    .bind(rebuild.sync)
+    .bind(rebuild.caught_up_to)
+    .bind(projection_rebuild_status_to_str(rebuild.status))
+    .execute(&mut *tx)
+    .await?;
+    let building = projection_rebuild_status_to_str(rebuild.status);
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
+         WHERE projection_name = $1 AND status = $2"
+    ))
+    .bind(&rebuild.projection.name)
+    .bind(building)
+    .execute(&mut *tx)
+    .await?;
+    for et in &rebuild.consumed_event_types {
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.projection_rebuild_consumed_event_types \
+             (projection_name, status, event_type_name) VALUES ($1,$2,$3)"
+        ))
+        .bind(&rebuild.projection.name)
+        .bind(building)
+        .bind(&et.name)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `None` when this projection has no rebuild staged *at this `status`* -
 /// the `staged` parameter `register_projection`/`rebuild_projection`/
 /// `discard_projection_rebuild` each expect "as already looked up by the
-/// caller" (see their own doc comments).
+/// caller" (see their own doc comments) is always the *pending* row per
+/// the spec's own `let staged = ProjectionRebuild{projection: ...,
+/// status: pending}` in every one of those three rules -
+/// `catch_up_bounded_context` is the one caller that asks for `Building`
+/// instead.
 pub async fn get_projection_rebuild(
     pool: &Pool,
     bounded_context: &str,
     projection_name: &str,
+    status: ProjectionRebuildStatus,
 ) -> crate::error::Result<Option<ProjectionRebuild>> {
     let Some(projection) = get_projection(pool, bounded_context, projection_name).await? else {
         return Ok(None);
@@ -1733,9 +2160,10 @@ pub async fn get_projection_rebuild(
     let schema = schema_ident(bounded_context);
     let Some(row): Option<ProjectionRebuildRow> = sqlx::query_as(&format!(
         "SELECT {PROJECTION_REBUILD_COLUMNS} FROM {schema}.projection_rebuilds \
-         WHERE projection_name = $1"
+         WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(projection_rebuild_status_to_str(status))
     .fetch_optional(pool)
     .await?
     else {
@@ -1745,13 +2173,8 @@ pub async fn get_projection_rebuild(
         row.projection_name, projection_name,
         "projection_rebuilds row matched the WHERE clause but its own projection_name column disagrees"
     );
-    let consumed = consumed_event_types(
-        pool,
-        bounded_context,
-        "projection_rebuild_consumed_event_types",
-        projection_name,
-    )
-    .await?;
+    let consumed =
+        rebuild_consumed_event_types(pool, bounded_context, projection_name, status).await?;
     Ok(Some(ProjectionRebuild {
         projection,
         schema: row.schema,
@@ -1766,23 +2189,33 @@ pub async fn get_projection_rebuild(
 /// Persists `discard_projection_rebuild`'s outcome - the spec's own
 /// `ensures` is a deletion (`not exists staged`), which that pure
 /// function can't perform itself (see its own doc comment); this is the
-/// caller-side deletion it hands back to.
+/// caller-side deletion it hands back to. `status` is always `Pending` in
+/// practice - `DiscardProjectionRebuild`'s own `staged` is a pending row
+/// by definition (see `rule DiscardProjectionRebuild`'s `let`) - but a
+/// real parameter rather than hardcoded, matching `get_projection_rebuild`'s
+/// own shape, since the caller (not this function) is what already knows
+/// which row `discard_projection_rebuild`'s own `staged` argument was.
 pub async fn delete_projection_rebuild(
     pool: &Pool,
     bounded_context: &str,
     projection_name: &str,
+    status: ProjectionRebuildStatus,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
+    let status = projection_rebuild_status_to_str(status);
     sqlx::query(&format!(
-        "DELETE FROM {schema}.projection_rebuild_consumed_event_types WHERE projection_name = $1"
+        "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
+         WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(status)
     .execute(pool)
     .await?;
     sqlx::query(&format!(
-        "DELETE FROM {schema}.projection_rebuilds WHERE projection_name = $1"
+        "DELETE FROM {schema}.projection_rebuilds WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(status)
     .execute(pool)
     .await?;
     Ok(())
@@ -1953,12 +2386,27 @@ pub async fn revoke_active_role_access_mapping(
 /// at provisioning time (see `provision_bounded_context_schema`), so this
 /// is a plain `UPDATE` - no more insert-if-missing step needed now that a
 /// bounded context can't exist at all without one.
-pub async fn next_sequence(pool: &Pool, bounded_context: &str) -> crate::error::Result<i64> {
+///
+/// Generic over `sqlx::PgExecutor` rather than `&Pool` specifically -
+/// every real call site now passes `&mut *tx` from an already-open
+/// transaction, so this row's own lock is held for that whole
+/// transaction rather than released the instant this one statement's
+/// implicit autocommit finishes (see the note above the rules: "locked
+/// ... as part of the same transaction that inserts the new Command/
+/// Event rows, then incremented and released on commit" - the gaplessness
+/// guarantee this gives depends on that, not on this function alone). A
+/// bare `&Pool` still works too (autocommit, the pre-fix behaviour) -
+/// every direct `db::next_sequence(&pool, ...)` test call keeps compiling
+/// unchanged.
+pub async fn next_sequence<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<i64> {
     let schema = schema_ident(bounded_context);
     let (next,): (i64,) = sqlx::query_as(&format!(
         "UPDATE {schema}.sequence SET next_value = next_value + 1 RETURNING next_value"
     ))
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(next)
 }
@@ -2073,9 +2521,11 @@ impl EventRow {
 /// Every `Event` currently stored for one `(bounded_context, event_type)`
 /// pair, ordered by `sequence` - the full-snapshot parameter
 /// `fetch_events`/`consume_events` each expect (see their own doc
-/// comments), loaded for real here instead of the in-memory cache the
-/// spec's own note describes (still unmodelled - see `event_store`'s
-/// module doc comment).
+/// comments). `list_events_cached` below is what their own real REST
+/// call sites use instead (`crate::event_cache`'s own module doc
+/// comment); this function is its unconditional-load fallback, and
+/// still used directly wherever the whole type's history is genuinely
+/// wanted regardless of recency.
 pub async fn list_events(
     pool: &Pool,
     bounded_context: &str,
@@ -2303,6 +2753,172 @@ pub async fn get_event_by_sequence(
     }))
 }
 
+/// The most recent `limit` events of a whole bounded context, ascending
+/// by `sequence` - `event_cache::EventCache::warm`'s own fetch, and the
+/// only place this module issues a `DESC ... LIMIT` query at all (every
+/// other listing function loads a range in ascending order directly).
+pub async fn list_recent_events_for_bounded_context(
+    pool: &Pool,
+    bounded_context: &str,
+    limit: usize,
+) -> crate::error::Result<Vec<Event>> {
+    let bc = get_bounded_context(pool, bounded_context).await?.expect(
+        "list_recent_events_for_bounded_context: bounded_context row must exist for any event \
+         referencing it",
+    );
+
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<EventRowAnyType> = sqlx::query_as(&format!(
+        "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
+         metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
+         origin_source_context, origin_command_id FROM {schema}.events \
+         ORDER BY sequence DESC LIMIT $1"
+    ))
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+
+    let mut event_types: std::collections::HashMap<String, EventType> =
+        std::collections::HashMap::new();
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !event_types.contains_key(&row.event_type_name) {
+            let et = get_event_type(pool, bounded_context, &row.event_type_name)
+                .await?
+                .expect("events row references an event_types row that no longer exists");
+            event_types.insert(row.event_type_name.clone(), et);
+        }
+        let origin = event_origin_from_row(
+            pool,
+            bounded_context,
+            &row.origin_kind,
+            row.origin_source_content,
+            row.origin_source_context,
+            row.origin_command_id,
+        )
+        .await?;
+        events.push(Event {
+            bounded_context: bc.clone(),
+            event_type: event_types[&row.event_type_name].clone(),
+            payload: row.payload,
+            metadata: Metadata {
+                r#type: row.metadata_type,
+                version: row.metadata_version,
+                client_id: row.metadata_client_id,
+                created_at: row.metadata_created_at,
+            },
+            sequence: row.sequence,
+            tags: row.tags.0,
+            encryption_keys: Vec::new(),
+            origin,
+        });
+    }
+    // The query above fetched newest-first to make LIMIT cheap - reverse
+    // back to the ascending order every other listing function, and
+    // EventCache's own window, expects.
+    events.reverse();
+    Ok(events)
+}
+
+/// The type-scoped, `after_sequence`-bounded twin of `list_events` above -
+/// `list_events_cached`'s own fallback path, so falling back to Postgres
+/// doesn't itself load more than the request actually needs.
+pub async fn list_events_from(
+    pool: &Pool,
+    bounded_context: &str,
+    event_type_name: &str,
+    after_sequence: i64,
+) -> crate::error::Result<Vec<Event>> {
+    let bc = get_bounded_context(pool, bounded_context).await?.expect(
+        "list_events_from: bounded_context row must exist for any event_type referencing it",
+    );
+    let et = get_event_type(pool, bounded_context, event_type_name)
+        .await?
+        .expect("list_events_from: event_type row must exist for any event referencing it");
+
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<EventRow> = sqlx::query_as(&format!(
+        "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
+         metadata_created_at, tags, origin_kind, origin_source_content, origin_source_context, \
+         origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \
+         ORDER BY sequence"
+    ))
+    .bind(event_type_name)
+    .bind(after_sequence)
+    .fetch_all(pool)
+    .await?;
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        events.push(row.into_domain(pool, bc.clone(), et.clone()).await?);
+    }
+    Ok(events)
+}
+
+/// `FetchEvents`/`ConsumeEvents`'s own real read path - see
+/// `crate::event_cache`'s own module doc comment for the full design.
+/// Tries the cache first; `list_events_from` above is the fallback, so a
+/// coverage miss still only loads what the request actually needs, not
+/// the whole type's history.
+pub async fn list_events_cached(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    event_type_name: &str,
+    after_sequence: i64,
+) -> crate::error::Result<Vec<Event>> {
+    match cache
+        .try_events_after(pool, bounded_context, after_sequence)
+        .await?
+    {
+        Some(events) => Ok(events
+            .into_iter()
+            .filter(|e| e.event_type.name == event_type_name)
+            .collect()),
+        None => list_events_from(pool, bounded_context, event_type_name, after_sequence).await,
+    }
+}
+
+/// `ProcessCommand`'s own DCB pre-check and `QueryEvents`/`CountEvents`'s
+/// own real read path - see `crate::event_cache`'s own module doc
+/// comment for the full design. `after_sequence: -1` asks for full
+/// history (`ProcessCommand`'s pre-check and `CountEvents`, neither of
+/// which has an `after_sequence` of their own); `list_events_for_bounded_context`/
+/// `list_events_for_bounded_context_from` (both already existed, reused
+/// unchanged) are the fallback for either case respectively.
+pub async fn list_events_for_bounded_context_cached(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    after_sequence: i64,
+) -> crate::error::Result<Vec<Event>> {
+    match cache
+        .try_events_after(pool, bounded_context, after_sequence)
+        .await?
+    {
+        Some(events) => Ok(events),
+        None if after_sequence < 0 => list_events_for_bounded_context(pool, bounded_context).await,
+        None => list_events_for_bounded_context_from(pool, bounded_context, after_sequence).await,
+    }
+}
+
+/// `InspectEvent`'s own real read path - see `crate::event_cache`'s own
+/// module doc comment for the full design.
+pub async fn get_event_by_sequence_cached(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    sequence: i64,
+) -> crate::error::Result<Option<Event>> {
+    match cache
+        .try_event_by_sequence(pool, bounded_context, sequence)
+        .await?
+    {
+        Some(event) => Ok(Some(event)),
+        None => get_event_by_sequence(pool, bounded_context, sequence).await,
+    }
+}
+
 /// `command_id` must be `Some` exactly when `event.origin` is
 /// `CommandTriggered`, and `None` otherwise - the caller's own
 /// `insert_command(pool, &result.command)` (returning the new row's id)
@@ -2397,23 +3013,68 @@ pub async fn insert_event_and_update_sync_projections(
     dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     encryption_key_ids: &[i64],
     broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+) -> crate::error::Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_event_and_update_sync_projections_in_tx(
+        pool,
+        &mut tx,
+        event,
+        command_id,
+        dispatcher,
+        encryption_key_ids,
+    )
+    .await?;
+    tx.commit().await?;
+
+    // EventSubscription's own real-time delivery - after the commit, not
+    // before: a subscriber must never see an event that could still have
+    // rolled back (see EventBroadcaster's own doc comment for why this
+    // is the one choke point every event-creation call site already
+    // shares).
+    broadcaster.publish(event);
+    event_cache.append(event).await;
+
+    Ok(())
+}
+
+/// The transactional core of `insert_event_and_update_sync_projections`
+/// above, split out so `next_sequence`'s own lock, this event's insert,
+/// and (for `ProcessCommand`) the triggering `Command`'s own insert can
+/// all share one already-open transaction instead of each getting their
+/// own - see the note above the rules in specs/skilj.allium: "a single
+/// row per bounded context... is locked... as part of the same
+/// transaction that inserts the new Command/Event rows, then incremented
+/// and released on commit." Neither commits `tx` nor broadcasts - both
+/// stay the caller's job, exactly once, after every event in a single
+/// submission (a `ProcessCommand` call can trigger several) has been
+/// folded in. `pool` is still needed alongside `tx`, only for
+/// `list_projections_for_bounded_context`'s own metadata-only read -
+/// deliberately not run through `tx` (see that call's own comment
+/// below): which projections exist and are `sync` doesn't change
+/// mid-request, so it isn't part of what this transaction needs to stay
+/// atomic with.
+pub async fn insert_event_and_update_sync_projections_in_tx(
+    pool: &Pool,
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+    command_id: Option<i64>,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    encryption_key_ids: &[i64],
 ) -> crate::error::Result<()> {
     let bounded_context = &event.bounded_context.name;
     let schema = schema_ident(bounded_context);
 
-    // Metadata only - read before opening the transaction, the same
-    // "small, admin-managed list, not worth locking" treatment
-    // `list_projections_for_bounded_context`'s own callers already give
-    // it elsewhere. Which projections exist and are `sync` doesn't
-    // change mid-request.
+    // Metadata only - read outside `tx`, the same "small, admin-managed
+    // list, not worth locking" treatment `list_projections_for_bounded_context`'s
+    // own callers already give it elsewhere.
     let sync_projections: Vec<_> = list_projections_for_bounded_context(pool, bounded_context)
         .await?
         .into_iter()
         .filter(|p| p.sync)
         .collect();
 
-    let mut tx = pool.begin().await?;
-    insert_event(&mut *tx, event, command_id).await?;
+    insert_event(&mut **tx, event, command_id).await?;
 
     // `event.encryption_keys`' own `id`s aren't carried on the domain
     // struct (it has none, matching `entity EncryptionKey` itself) -
@@ -2428,7 +3089,7 @@ pub async fn insert_event_and_update_sync_projections(
         ))
         .bind(event.sequence)
         .bind(encryption_key_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -2448,7 +3109,7 @@ pub async fn insert_event_and_update_sync_projections(
 
         for key in &keys {
             let current_state = get_or_create_projection_state_for_update(
-                &mut *tx,
+                &mut **tx,
                 &schema,
                 &projection.name,
                 key,
@@ -2474,7 +3135,7 @@ pub async fn insert_event_and_update_sync_projections(
             .bind(&new_state)
             .bind(&projection.name)
             .bind(key)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
 
@@ -2483,20 +3144,413 @@ pub async fn insert_event_and_update_sync_projections(
         ))
         .bind(event.sequence)
         .bind(&projection.name)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// `CreateExternalEvent`'s own atomic whole: `next_sequence`'s row lock,
+/// `event_store::create_external_event`'s pure construction (which needs
+/// that lock's own allocated sequence baked into the `Event` it builds),
+/// and the insert itself, all inside one transaction - `skilj-rest`'s
+/// `post_events_external` handler used to run these three steps
+/// unlocked/separately-transacted; a rejection from
+/// `create_external_event` (`TokenNotActive`/`ExternalCreationNotAllowed`)
+/// after `next_sequence` had already run on the bare pool used to burn a
+/// sequence number for an event that was never written -
+/// `SequenceIsGaplessPerBoundedContext`'s actual bug. Here, that same
+/// rejection instead rolls `tx` back before it ever commits, so the
+/// allocation never happened as far as any other reader can tell.
+/// `resolve_encryption_keys` still runs on `pool`, before `tx` opens -
+/// unchanged from the pre-fix ordering, since `EncryptionKey`
+/// provisioning's own transactionality is a separate, already-tracked
+/// gap (the drift audit's own finding on it), not something this pass
+/// changes. Not callable from anywhere but `skilj-rest` today (no
+/// GraphQL surface offers `CreateExternalEvent`), but lives here rather
+/// than in that crate per docs/architecture.md §3.1/§3.2: `skilj-core`
+/// is the only crate that owns the database driver, so no other crate
+/// ever opens a `Transaction` itself.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_and_insert_external_event(
+    pool: &Pool,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    adapter: &ExternalEventToken,
+    payload: String,
+    source_content: String,
+    source_context: Option<String>,
+    now: DateTime<Utc>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<Event> {
+    let bounded_context_name = adapter.event_type.bounded_context.name.clone();
+
+    let mut resolved = std::collections::HashMap::new();
+    resolve_encryption_keys(
+        pool,
+        &bounded_context_name,
+        &adapter.event_type.sensitive_fields,
+        &payload,
+        encryption_master_key,
+        &mut resolved,
+    )
+    .await?;
+
+    let mut tx = pool.begin().await?;
+    let next_seq = next_sequence(&mut *tx, &bounded_context_name).await?;
+    let event = crate::event_store::create_external_event(
+        adapter,
+        payload,
+        source_content,
+        source_context,
+        next_seq,
+        now,
+        |subject_key, subject_value| {
+            let (key, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect(
+                    "resolve_encryption_keys pre-resolved every subject sensitive_field_subjects \
+                     named",
+                );
+            (key.clone(), data_key.clone())
+        },
+    )?;
+    let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
+    insert_event_and_update_sync_projections_in_tx(
+        pool,
+        &mut tx,
+        &event,
+        None,
+        projection_dispatcher,
+        &encryption_key_ids,
+    )
+    .await?;
+    tx.commit().await?;
+    broadcaster.publish(&event);
+    event_cache.append(&event).await;
+
+    Ok(event)
+}
+
+/// `CreateDirectEvent`'s own twin of `create_and_insert_external_event`
+/// above - same reasoning, same fix, only the adapter type and the
+/// absent `source_content`/`source_context` differ.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_and_insert_direct_event(
+    pool: &Pool,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    adapter: &DirectCreationToken,
+    payload: String,
+    now: DateTime<Utc>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<Event> {
+    let bounded_context_name = adapter.event_type.bounded_context.name.clone();
+
+    let mut resolved = std::collections::HashMap::new();
+    resolve_encryption_keys(
+        pool,
+        &bounded_context_name,
+        &adapter.event_type.sensitive_fields,
+        &payload,
+        encryption_master_key,
+        &mut resolved,
+    )
+    .await?;
+
+    let mut tx = pool.begin().await?;
+    let next_seq = next_sequence(&mut *tx, &bounded_context_name).await?;
+    let event = crate::event_store::create_direct_event(
+        adapter,
+        payload,
+        next_seq,
+        now,
+        |subject_key, subject_value| {
+            let (key, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect(
+                    "resolve_encryption_keys pre-resolved every subject sensitive_field_subjects \
+                     named",
+                );
+            (key.clone(), data_key.clone())
+        },
+    )?;
+    let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
+    insert_event_and_update_sync_projections_in_tx(
+        pool,
+        &mut tx,
+        &event,
+        None,
+        projection_dispatcher,
+        &encryption_key_ids,
+    )
+    .await?;
+    tx.commit().await?;
+    broadcaster.publish(&event);
+    event_cache.append(&event).await;
+
+    Ok(event)
+}
+
+/// What `submit_command` below settles on - either governs a real insert
+/// (`Accepted`, already persisted by the time this returns) or a
+/// legitimate business rejection (`Rejected`, nothing persisted at all).
+/// `ProcessCommand`'s own two `CommandDecision` outcomes, but carrying
+/// the *actual* result - which may differ from the caller's own
+/// optimistic `dispatch` call if a DCB conflict forced a retry, see
+/// `submit_command`'s own doc comment.
+#[derive(Debug)]
+pub enum SubmitCommandOutcome {
+    Accepted {
+        // Boxed for the same reason `EventOrigin::CommandTriggered`'s own
+        // `command` field is - `Command` is large enough next to
+        // `Rejected`'s two `String`s that clippy's `large_enum_variant`
+        // flags it otherwise.
+        command: Box<Command>,
+        events: Vec<Event>,
+    },
+    Rejected {
+        reason: String,
+        kind: String,
+    },
+}
+
+/// The shared "locked half" of `ProcessCommand` - `skilj-rest`'s
+/// `post_commands_trigger` and `skilj-graphql`'s `submitCommand` both
+/// delegate to this once authorisation is done and `initial_decision` -
+/// `dispatch`'s own first, optimistic, unlocked call against
+/// `bounded_context_events` - is already in hand. Implements the
+/// optimistic-then-locked pattern the note above the rules in
+/// specs/skilj.allium describes: "Only the final re-check and insert
+/// need the lock; reading matching events and running decide()
+/// beforehand does not."
+///
+/// Opens one transaction and locks `bounded_context`'s own `sequence`
+/// row up front - `SELECT ... FOR UPDATE`, peeking its current value
+/// rather than `next_sequence`'s own increment-and-return, since how
+/// many sequence numbers this submission ends up needing isn't known
+/// until the decision that finally governs it is. If that peek shows
+/// more has been committed than `bounded_context_events` (the caller's
+/// own optimistic read) already reflected, and at least one of those new
+/// arrivals matches `consistency_tags`, that is the DCB conflict this
+/// lock exists to catch (see `DynamicConsistencyBoundaryHonoured`):
+/// `dispatch` is called again, now with a `matching_events` set that
+/// includes the new arrival, and the fresh decision it returns supersedes
+/// `initial_decision`. At most one such retry is ever needed - once the
+/// lock is held, nothing else can commit to this bounded context until
+/// this transaction ends (see the note above the rules: "no concurrent
+/// committer for the same bounded context can be interleaved while the
+/// row is locked"), so there is nothing further this call could miss.
+///
+/// Whichever decision ends up governing, `event_store::process_command`,
+/// `insert_command`, and `insert_event_and_update_sync_projections_in_tx`
+/// (once per triggered event) all run inside that same transaction and
+/// share its one commit; a rejection (initial or retried) instead leaves
+/// `tx` uncommitted - dropped with nothing but the read-only peek lock
+/// ever taken, the same implicit-rollback-on-drop every early `?` return
+/// elsewhere in this module already relies on. Either way,
+/// `SequenceIsGaplessPerBoundedContext` holds for real: any failure
+/// anywhere in this function (a rejection, an unregistered event type, a
+/// database error) rolls the whole transaction back, sequence allocation
+/// included, rather than burning a sequence number on a write that never
+/// lands - the actual bug this function exists to close.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_command(
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    bounded_context_events: &[Event],
+    consistency_tags: &[Tag],
+    initial_decision: crate::shared::CommandDecision,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<SubmitCommandOutcome> {
+    let bounded_context_name = command_type.bounded_context.name.clone();
+    let schema = schema_ident(&bounded_context_name);
+    let original_highest = bounded_context_events
+        .iter()
+        .map(|e| e.sequence)
+        .max()
+        .unwrap_or(-1);
+
+    let mut tx = pool.begin().await?;
+    let (locked_highest,): (i64,) = sqlx::query_as(&format!(
+        "SELECT next_value FROM {schema}.sequence FOR UPDATE"
+    ))
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let mut final_decision = initial_decision;
+    let mut final_bounded_context_events = bounded_context_events.to_vec();
+
+    if locked_highest > original_highest {
+        // Something committed between the caller's own optimistic read
+        // and this lock - but only a match on our own consistency_tags
+        // is an actual DCB conflict; an unrelated event elsewhere in the
+        // same bounded context changes nothing dispatch() would see, so
+        // redispatching over it would be pure waste.
+        let delta =
+            list_events_for_bounded_context_from(pool, &bounded_context_name, original_highest)
+                .await?;
+        let conflict = delta
+            .iter()
+            .any(|e| consistency_tags.iter().any(|t| e.tags.contains(t)));
+        if conflict {
+            final_bounded_context_events.extend(delta);
+            final_bounded_context_events.sort_by_key(|e| e.sequence);
+            let (_boundary, matching_events) =
+                crate::event_store::consistency_boundary_and_matching_events(
+                    &final_bounded_context_events,
+                    consistency_tags,
+                );
+            final_decision = match dispatcher.dispatch(
+                &bounded_context_name,
+                &command_type.name,
+                payload,
+                &matching_events,
+            ) {
+                None => return Err(crate::error::Error::NoDeciderRegistered),
+                Some(Err(e)) => return Err(e),
+                Some(Ok(d)) => d,
+            };
+        }
+    }
+
+    let event_specs = match final_decision {
+        crate::shared::CommandDecision::Rejected { reason, kind } => {
+            return Ok(SubmitCommandOutcome::Rejected { reason, kind });
+        }
+        crate::shared::CommandDecision::Accepted { events } => events,
+    };
+
+    // process_command's own resolve_event_type/next_sequence stay plain
+    // sync closures (decide() and everything downstream is I/O-free per
+    // §1.1) - every EventType lookup and sequence allocation this call
+    // will need happens first, here, against the *final* event_specs
+    // (the redispatched ones, if a retry happened above).
+    let mut event_types_by_name: std::collections::HashMap<String, EventType> =
+        std::collections::HashMap::new();
+    for spec in &event_specs {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            event_types_by_name.entry(spec.event_type.clone())
+        {
+            if let Some(et) = get_event_type(pool, &bounded_context_name, &spec.event_type).await? {
+                entry.insert(et);
+            }
+        }
+    }
+
+    // Allocated inside `tx`, after the lock above - `next_sequence`'s
+    // row lock is already held, so these UPDATEs proceed immediately,
+    // and a failure anywhere below (an unregistered event type,
+    // encryption resolution, the inserts themselves) rolls every one of
+    // them back with the rest of this transaction.
+    let mut sequences = Vec::with_capacity(event_specs.len());
+    for _ in 0..event_specs.len() {
+        sequences.push(next_sequence(&mut *tx, &bounded_context_name).await?);
+    }
+    let mut sequences = sequences.into_iter();
+
+    // protect_sensitive_fields' own pre-resolution step, for the
+    // command's own payload *and* every final event spec's - see
+    // `resolve_encryption_keys`'s own doc comment. Runs against `pool`,
+    // not `tx` - EncryptionKey provisioning staying outside this
+    // transaction is an existing, separately-tracked gap (see the drift
+    // audit's own finding on it), not something this pass changes.
+    let mut resolved = std::collections::HashMap::new();
+    resolve_encryption_keys(
+        pool,
+        &bounded_context_name,
+        &command_type.sensitive_fields,
+        payload,
+        encryption_master_key,
+        &mut resolved,
+    )
+    .await?;
+    for spec in &event_specs {
+        if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
+            let spec_payload = spec.payload.to_string();
+            resolve_encryption_keys(
+                pool,
+                &bounded_context_name,
+                &event_type.sensitive_fields,
+                &spec_payload,
+                encryption_master_key,
+                &mut resolved,
+            )
+            .await?;
+        }
+    }
+
+    let result = crate::event_store::process_command(
+        command_type,
+        payload,
+        client_id,
+        &final_bounded_context_events,
+        crate::shared::CommandDecision::Accepted {
+            events: event_specs,
+        },
+        |name| event_types_by_name.get(name).cloned(),
+        || {
+            sequences.next().expect(
+                "process_command called next_sequence more times than there are accepted events",
+            )
+        },
+        now,
+        |subject_key, subject_value| {
+            let (key, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect(
+                    "resolve_encryption_keys pre-resolved every subject sensitive_field_subjects \
+                     named",
+                );
+            (key.clone(), data_key.clone())
+        },
+    )?;
+
+    // Command and every one of its triggered events, in the one
+    // transaction `tx` has held since the lock above -
+    // DynamicConsistencyBoundaryHonoured's actual enforcement: a failure
+    // partway through this loop rolls the command insert back too,
+    // rather than leaving a persisted Command with only some of its
+    // events.
+    let command_key_ids = encryption_key_ids(&result.command.encryption_keys, &resolved);
+    let command_id = insert_command(&mut tx, &result.command, &command_key_ids).await?;
+    for event in &result.events {
+        let event_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
+        insert_event_and_update_sync_projections_in_tx(
+            pool,
+            &mut tx,
+            event,
+            Some(command_id),
+            projection_dispatcher,
+            &event_key_ids,
+        )
         .await?;
     }
 
     tx.commit().await?;
 
     // EventSubscription's own real-time delivery - after the commit, not
-    // before: a subscriber must never see an event that could still have
-    // rolled back (see EventBroadcaster's own doc comment for why this
-    // is the one choke point every event-creation call site already
-    // shares).
-    broadcaster.publish(event);
+    // before, the same rule `insert_event_and_update_sync_projections`
+    // itself already follows.
+    for event in &result.events {
+        broadcaster.publish(event);
+        event_cache.append(event).await;
+    }
 
-    Ok(())
+    Ok(SubmitCommandOutcome::Accepted {
+        command: Box::new(result.command),
+        events: result.events,
+    })
 }
 
 /// The background half of §8 item 6: one poll tick, for one bounded
@@ -2544,12 +3598,15 @@ pub async fn catch_up_bounded_context(
     let async_projections: Vec<_> = all_projections.iter().filter(|p| !p.sync).collect();
     let mut building_rebuilds = Vec::new();
     for projection in &all_projections {
-        if let Some(rebuild) =
-            get_projection_rebuild(pool, bounded_context, &projection.name).await?
+        if let Some(rebuild) = get_projection_rebuild(
+            pool,
+            bounded_context,
+            &projection.name,
+            ProjectionRebuildStatus::Building,
+        )
+        .await?
         {
-            if rebuild.status == ProjectionRebuildStatus::Building {
-                building_rebuilds.push(rebuild);
-            }
+            building_rebuilds.push(rebuild);
         }
     }
 
@@ -2560,7 +3617,8 @@ pub async fn catch_up_bounded_context(
     for rebuild in &building_rebuilds {
         if rebuild.caught_up_to.is_none() {
             sqlx::query(&format!(
-                "DELETE FROM {schema}.projection_rebuild_state WHERE projection_name = $1"
+                "DELETE FROM {schema}.projection_rebuild_state \
+                 WHERE projection_name = $1 AND status = 'building'"
             ))
             .bind(&rebuild.projection.name)
             .execute(pool)
@@ -2679,7 +3737,7 @@ pub async fn catch_up_bounded_context(
 
                 sqlx::query(&format!(
                     "UPDATE {schema}.projection_rebuild_state SET state = $1, updated_at = now() \
-                     WHERE projection_name = $2 AND key = $3"
+                     WHERE projection_name = $2 AND status = 'building' AND key = $3"
                 ))
                 .bind(&new_state)
                 .bind(&rebuild.projection.name)
@@ -2688,8 +3746,15 @@ pub async fn catch_up_bounded_context(
                 .await?;
             }
 
+            // `AND status = 'building'` - not just `projection_name` -
+            // matters for real now that a coexisting pending row can
+            // share that same `projection_name`: without it, this would
+            // also stamp the pending row's own `caught_up_to`, which
+            // means nothing for a row that is never folded and must stay
+            // `None` until it is promoted or discarded.
             sqlx::query(&format!(
-                "UPDATE {schema}.projection_rebuilds SET caught_up_to = $1 WHERE projection_name = $2"
+                "UPDATE {schema}.projection_rebuilds SET caught_up_to = $1 \
+                 WHERE projection_name = $2 AND status = 'building'"
             ))
             .bind(event.sequence)
             .bind(&rebuild.projection.name)
@@ -2701,9 +3766,14 @@ pub async fn catch_up_bounded_context(
     }
 
     for rebuild in &building_rebuilds {
-        let current = get_projection_rebuild(pool, bounded_context, &rebuild.projection.name)
-            .await?
-            .expect("a building rebuild this function just loaded can't have vanished mid-tick");
+        let current = get_projection_rebuild(
+            pool,
+            bounded_context,
+            &rebuild.projection.name,
+            ProjectionRebuildStatus::Building,
+        )
+        .await?
+        .expect("a building rebuild this function just loaded can't have vanished mid-tick");
         if current.caught_up_to.unwrap_or(-1) == latest {
             promote_projection_rebuild(pool, bounded_context, &rebuild.projection.name).await?;
         }
@@ -2731,12 +3801,21 @@ pub async fn promote_projection_rebuild(
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     let mut tx = pool.begin().await?;
+    // Every rebuild-side statement below is scoped to `status = 'building'`
+    // - promotion only ever ends the building row. A coexisting pending
+    // row (the deliberate case `UniqueRebuildPerProjectionAndStatus`
+    // names - a non-trivial registration that arrived mid-build) must
+    // survive this call untouched: it is still waiting on its own future
+    // `RebuildProjection` trigger, unrelated to whichever build just
+    // finished.
+    let building = projection_rebuild_status_to_str(ProjectionRebuildStatus::Building);
 
     let rebuild_row: ProjectionRebuildRow = sqlx::query_as(&format!(
         "SELECT {PROJECTION_REBUILD_COLUMNS} FROM {schema}.projection_rebuilds \
-         WHERE projection_name = $1"
+         WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(building)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -2761,9 +3840,11 @@ pub async fn promote_projection_rebuild(
     sqlx::query(&format!(
         "INSERT INTO {schema}.projection_consumed_event_types (projection_name, event_type_name) \
          SELECT projection_name, event_type_name \
-         FROM {schema}.projection_rebuild_consumed_event_types WHERE projection_name = $1"
+         FROM {schema}.projection_rebuild_consumed_event_types \
+         WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(building)
     .execute(&mut *tx)
     .await?;
 
@@ -2786,28 +3867,33 @@ pub async fn promote_projection_rebuild(
     sqlx::query(&format!(
         "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
          SELECT projection_name, key, state, updated_at \
-         FROM {schema}.projection_rebuild_state WHERE projection_name = $1"
+         FROM {schema}.projection_rebuild_state WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(building)
     .execute(&mut *tx)
     .await?;
 
     sqlx::query(&format!(
-        "DELETE FROM {schema}.projection_rebuild_state WHERE projection_name = $1"
+        "DELETE FROM {schema}.projection_rebuild_state WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(building)
     .execute(&mut *tx)
     .await?;
     sqlx::query(&format!(
-        "DELETE FROM {schema}.projection_rebuild_consumed_event_types WHERE projection_name = $1"
+        "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
+         WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(building)
     .execute(&mut *tx)
     .await?;
     sqlx::query(&format!(
-        "DELETE FROM {schema}.projection_rebuilds WHERE projection_name = $1"
+        "DELETE FROM {schema}.projection_rebuilds WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
+    .bind(building)
     .execute(&mut *tx)
     .await?;
 
@@ -2973,7 +4059,11 @@ pub async fn revoke_access_token(
 /// Writes the token's full row into its own context's schema, then the
 /// global index entry that makes it findable by `id` alone - in that
 /// order, so a failure partway leaves an unreachable orphan row rather
-/// than a dangling index entry pointing at nothing.
+/// than a dangling index entry pointing at nothing. `secret` is the
+/// caller's plaintext (`generate_token_secret`'s own output, still held
+/// in memory by the caller to hand back once) - only `hash_secret`'s
+/// output of it is ever written, per `AccessToken.secret`'s own "stored
+/// hashed and never compared in plaintext" text.
 #[allow(clippy::too_many_arguments)]
 async fn insert_access_token_row(
     pool: &Pool,
@@ -2993,7 +4083,7 @@ async fn insert_access_token_row(
     ))
     .bind(id)
     .bind(kind.as_str())
-    .bind(secret)
+    .bind(crate::shared::hash_secret(secret))
     .bind(token_status_to_str(status))
     .bind(created_at)
     .bind(revoked_at)
@@ -3061,7 +4151,8 @@ pub async fn insert_event_read_token(
 /// a `CommandToken` fills `command_type_name` instead of the
 /// `event_type_name` every other variant does (see the migration's own
 /// `access_tokens` `CHECK` constraint), and the same insert-row-then-index
-/// ordering.
+/// ordering. `token.secret` is hashed before storage the same way
+/// `insert_access_token_row` does.
 pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::error::Result<()> {
     let schema = schema_ident(&token.command_type.bounded_context.name);
     sqlx::query(&format!(
@@ -3070,7 +4161,7 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
     ))
     .bind(&token.id)
     .bind(AccessTokenKind::Command.as_str())
-    .bind(&token.secret)
+    .bind(crate::shared::hash_secret(&token.secret))
     .bind(token_status_to_str(token.status))
     .bind(token.created_at)
     .bind(token.revoked_at)

@@ -184,6 +184,9 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
         direct_creation_allowed: true,
         system_triggered_allowed: false,
         system_triggered_schedule: None,
+        missed_occurrence_policy: None,
+        schedule_position: None,
+        last_fired_at: None,
         event_read_allowed: true,
     };
     db::upsert_event_type(pool, &et).await.unwrap();
@@ -487,8 +490,21 @@ fn round_trips_an_external_event_token_and_its_kind() {
         );
         let loaded = db::get_external_event_token(&pool, &token.id)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(loaded, Some(token));
+        // `secret` is stored hashed (`hash_secret`), never round-tripped as
+        // the plaintext it was inserted with - see AccessToken.secret.
+        assert_eq!(
+            loaded.secret,
+            skilj_core::shared::hash_secret(&token.secret)
+        );
+        assert_eq!(
+            loaded,
+            ExternalEventToken {
+                secret: loaded.secret.clone(),
+                ..token
+            }
+        );
     });
 }
 
@@ -518,8 +534,22 @@ fn round_trips_a_direct_creation_token() {
         );
         let loaded = db::get_direct_creation_token(&pool, &token.id)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(loaded, Some(token));
+        // See `round_trips_an_external_event_token_and_its_kind` - `secret`
+        // is stored hashed, not round-tripped as the plaintext it was
+        // inserted with.
+        assert_eq!(
+            loaded.secret,
+            skilj_core::shared::hash_secret(&token.secret)
+        );
+        assert_eq!(
+            loaded,
+            DirectCreationToken {
+                secret: loaded.secret.clone(),
+                ..token
+            }
+        );
     });
 }
 
@@ -546,8 +576,24 @@ fn round_trips_a_revoked_event_read_token() {
             db::access_token_kind(&pool, &token.id).await.unwrap(),
             Some(AccessTokenKind::EventRead)
         );
-        let loaded = db::get_event_read_token(&pool, &token.id).await.unwrap();
-        assert_eq!(loaded, Some(token));
+        let loaded = db::get_event_read_token(&pool, &token.id)
+            .await
+            .unwrap()
+            .unwrap();
+        // See `round_trips_an_external_event_token_and_its_kind` - `secret`
+        // is stored hashed, not round-tripped as the plaintext it was
+        // inserted with.
+        assert_eq!(
+            loaded.secret,
+            skilj_core::shared::hash_secret(&token.secret)
+        );
+        assert_eq!(
+            loaded,
+            EventReadToken {
+                secret: loaded.secret.clone(),
+                ..token
+            }
+        );
     });
 }
 
@@ -1096,9 +1142,14 @@ fn round_trips_a_projection_rebuild() {
             .await
             .unwrap();
 
-        let loaded = db::get_projection_rebuild(&pool, &bc.name, &projection.name)
-            .await
-            .unwrap();
+        let loaded = db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            &projection.name,
+            ProjectionRebuildStatus::Pending,
+        )
+        .await
+        .unwrap();
         assert_eq!(loaded, Some(rebuild));
     });
 }
@@ -1121,15 +1172,20 @@ fn get_projection_rebuild_is_none_when_none_staged() {
         };
         db::upsert_projection(&pool, &projection).await.unwrap();
 
-        let loaded = db::get_projection_rebuild(&pool, &bc.name, &projection.name)
-            .await
-            .unwrap();
+        let loaded = db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            &projection.name,
+            ProjectionRebuildStatus::Pending,
+        )
+        .await
+        .unwrap();
         assert_eq!(loaded, None);
     });
 }
 
 #[test]
-fn upsert_projection_rebuild_restages_in_place() {
+fn upsert_projection_rebuild_restages_in_place_when_status_is_unchanged() {
     runtime().block_on(async {
         let Some(pool) = test_pool().await else {
             return;
@@ -1156,8 +1212,9 @@ fn upsert_projection_rebuild_restages_in_place() {
         };
         db::upsert_projection_rebuild(&pool, &first).await.unwrap();
 
+        // A real restage, `RegisterProjection`'s own repeat-while-still-pending
+        // case - same status, new schema_version.
         let restaged = ProjectionRebuild {
-            status: ProjectionRebuildStatus::Building,
             schema_version: 3,
             ..first
         };
@@ -1165,11 +1222,187 @@ fn upsert_projection_rebuild_restages_in_place() {
             .await
             .unwrap();
 
-        let loaded = db::get_projection_rebuild(&pool, &bc.name, &projection.name)
+        let loaded = db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            &projection.name,
+            ProjectionRebuildStatus::Pending,
+        )
+        .await
+        .unwrap();
+        // One row, not two - restaging at the same status replaces it in place.
+        assert_eq!(loaded, Some(restaged));
+    });
+}
+
+#[test]
+fn a_pending_and_a_building_rebuild_coexist_for_the_same_projection() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+
+        // The deliberate case UniqueRebuildPerProjectionAndStatus names:
+        // a build already replaying under an older staged definition...
+        let building = ProjectionRebuild {
+            projection: projection.clone(),
+            schema: r#"{"properties":{"v2":{"type":"number"}}}"#.to_string(),
+            schema_version: 2,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: Some(5),
+            status: ProjectionRebuildStatus::Building,
+        };
+        db::upsert_projection_rebuild(&pool, &building)
             .await
             .unwrap();
-        // One row, not two - restaging replaces it in place.
-        assert_eq!(loaded, Some(restaged));
+        // ...and a newer registration arriving mid-build, staged alongside
+        // it rather than disturbing it.
+        let pending = ProjectionRebuild {
+            projection: projection.clone(),
+            schema: r#"{"properties":{"v3":{"type":"number"}}}"#.to_string(),
+            schema_version: 3,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: None,
+            status: ProjectionRebuildStatus::Pending,
+        };
+        db::upsert_projection_rebuild(&pool, &pending)
+            .await
+            .unwrap();
+
+        // Both are independently retrievable by their own status - the
+        // whole point of the fix (`projection_rebuilds`' own PRIMARY KEY
+        // is now `(projection_name, status)`, not `projection_name` alone).
+        assert_eq!(
+            db::get_projection_rebuild(
+                &pool,
+                &bc.name,
+                &projection.name,
+                ProjectionRebuildStatus::Building
+            )
+            .await
+            .unwrap(),
+            Some(building)
+        );
+        assert_eq!(
+            db::get_projection_rebuild(
+                &pool,
+                &bc.name,
+                &projection.name,
+                ProjectionRebuildStatus::Pending
+            )
+            .await
+            .unwrap(),
+            Some(pending)
+        );
+
+        // Discarding the pending one leaves the building one untouched.
+        db::delete_projection_rebuild(
+            &pool,
+            &bc.name,
+            &projection.name,
+            ProjectionRebuildStatus::Pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db::get_projection_rebuild(
+                &pool,
+                &bc.name,
+                &projection.name,
+                ProjectionRebuildStatus::Pending
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            &projection.name,
+            ProjectionRebuildStatus::Building
+        )
+        .await
+        .unwrap()
+        .is_some());
+    });
+}
+
+#[test]
+fn transition_projection_rebuild_to_building_replaces_the_pending_row() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: unique_name("projection"),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: false,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+        let pending = ProjectionRebuild {
+            projection: projection.clone(),
+            schema: "{}".to_string(),
+            schema_version: 2,
+            consumed_event_types: vec![et],
+            sync: false,
+            caught_up_to: None,
+            status: ProjectionRebuildStatus::Pending,
+        };
+        db::upsert_projection_rebuild(&pool, &pending)
+            .await
+            .unwrap();
+
+        let building = ProjectionRebuild {
+            status: ProjectionRebuildStatus::Building,
+            ..pending
+        };
+        db::transition_projection_rebuild_to_building(&pool, &building)
+            .await
+            .unwrap();
+
+        // The pending row is gone - not a second row alongside the new
+        // building one.
+        assert_eq!(
+            db::get_projection_rebuild(
+                &pool,
+                &bc.name,
+                &projection.name,
+                ProjectionRebuildStatus::Pending
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            db::get_projection_rebuild(
+                &pool,
+                &bc.name,
+                &projection.name,
+                ProjectionRebuildStatus::Building
+            )
+            .await
+            .unwrap(),
+            Some(building)
+        );
     });
 }
 
@@ -1204,13 +1437,23 @@ fn delete_projection_rebuild_removes_it() {
             .await
             .unwrap();
 
-        db::delete_projection_rebuild(&pool, &bc.name, &projection.name)
-            .await
-            .unwrap();
+        db::delete_projection_rebuild(
+            &pool,
+            &bc.name,
+            &projection.name,
+            ProjectionRebuildStatus::Pending,
+        )
+        .await
+        .unwrap();
 
-        let loaded = db::get_projection_rebuild(&pool, &bc.name, &projection.name)
-            .await
-            .unwrap();
+        let loaded = db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            &projection.name,
+            ProjectionRebuildStatus::Pending,
+        )
+        .await
+        .unwrap();
         assert_eq!(loaded, None);
     });
 }

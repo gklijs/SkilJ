@@ -229,6 +229,9 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str) -> EventT
         direct_creation_allowed: true,
         system_triggered_allowed: false,
         system_triggered_schedule: None,
+        missed_occurrence_policy: None,
+        schedule_position: None,
+        last_fired_at: None,
         event_read_allowed: true,
     };
     db::upsert_event_type(pool, &et).await.unwrap();
@@ -297,6 +300,7 @@ fn a_consumed_event_updates_both_state_and_caught_up_to() {
             &TestDispatcher,
             &[],
             &skilj_core::event_store::EventBroadcaster::new(16),
+            &skilj_core::event_cache::EventCache::new(1000),
         )
         .await
         .unwrap();
@@ -343,6 +347,7 @@ fn an_unconsumed_event_advances_caught_up_to_but_touches_no_instance() {
             &TestDispatcher,
             &[],
             &skilj_core::event_store::EventBroadcaster::new(16),
+            &skilj_core::event_cache::EventCache::new(1000),
         )
         .await
         .unwrap();
@@ -381,6 +386,9 @@ fn a_transfer_event_updates_both_accounts_own_row_from_one_fold() {
             direct_creation_allowed: true,
             system_triggered_allowed: false,
             system_triggered_schedule: None,
+            missed_occurrence_policy: None,
+            schedule_position: None,
+            last_fired_at: None,
             event_read_allowed: true,
         };
         db::upsert_event_type(&pool, &et).await.unwrap();
@@ -409,6 +417,7 @@ fn a_transfer_event_updates_both_accounts_own_row_from_one_fold() {
             &TestDispatcher,
             &[],
             &skilj_core::event_store::EventBroadcaster::new(16),
+            &skilj_core::event_cache::EventCache::new(1000),
         )
         .await
         .unwrap();
@@ -457,6 +466,7 @@ fn two_sync_projections_both_update_from_one_event() {
             &TestDispatcher,
             &[],
             &skilj_core::event_store::EventBroadcaster::new(16),
+            &skilj_core::event_cache::EventCache::new(1000),
         )
         .await
         .unwrap();

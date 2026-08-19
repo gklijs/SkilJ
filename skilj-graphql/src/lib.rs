@@ -17,6 +17,7 @@ use async_graphql::dynamic::Schema;
 use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
 use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::EventBroadcaster;
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
 use std::sync::Arc;
@@ -64,6 +65,13 @@ pub struct GraphqlState {
     /// `projection_dispatcher` above are: one shared, process-wide
     /// broadcaster, not a second one.
     pub event_broadcaster: EventBroadcaster,
+    /// `QueryEvents`/`CountEvents`/`InspectEvent`'s and `submitCommand`'s
+    /// own DCB pre-check's real read path (drift audit finding #8) - the
+    /// identical `EventCache` `Skilj::rest_router()` hands its own
+    /// event-creation and `FetchEvents`/`ConsumeEvents` routes, reused
+    /// here for the same reason `event_broadcaster` above is: one
+    /// shared, process-wide cache, not a second one.
+    pub event_cache: EventCache,
 }
 
 /// Builds the schema from `state` and mounts it as a fresh `axum::Router`

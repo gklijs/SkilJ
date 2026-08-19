@@ -139,6 +139,35 @@ fn generate_bootstrap_secret_is_none_once_an_active_superadmin_exists() {
     assert!(secret.is_none());
 }
 
+/// `stamp_admin_bounded_context` - the drift audit's #4 fix (see project
+/// memory `skilj-drift-audit-2026-08-18`): `default BoundedContext admin`'s
+/// own `created_at`/`created_by`, real recorded values a static default
+/// can't provide, stamped once at SkilJ's own first startup. `None`
+/// existing (this database's genuine first startup) produces the row,
+/// `SystemCreator`-owned, at exactly the `now` passed in - independent of
+/// whether any superadmin exists yet, unlike `generate_bootstrap_secret`
+/// above.
+#[test]
+fn stamp_admin_bounded_context_produces_the_row_on_a_genuine_first_startup() {
+    let stamped = bootstrap::stamp_admin_bounded_context(None, timestamp(1000)).unwrap();
+    assert_eq!(stamped.name, bootstrap::ADMIN_BOUNDED_CONTEXT_NAME);
+    assert_eq!(stamped.status, BoundedContextStatus::Active);
+    assert_eq!(stamped.created_at, timestamp(1000));
+    assert_eq!(stamped.created_by, ContextCreator::SystemCreator);
+}
+
+/// "acts only while the values are unset, so a later restart never
+/// restamps them" (the note above `default BoundedContext admin` in
+/// specs/skilj.allium): a later startup's own `now` is never used,
+/// whatever `existing` already carries.
+#[test]
+fn stamp_admin_bounded_context_is_none_once_the_row_already_exists() {
+    let already_stamped = admin_bounded_context();
+    let restamp_attempt =
+        bootstrap::stamp_admin_bounded_context(Some(&already_stamped), timestamp(9999));
+    assert!(restamp_attempt.is_none());
+}
+
 #[test]
 fn superadmin_creator_carries_its_variant_specific_field() {
     let role = superadmin(RoleStatus::Active);

@@ -74,23 +74,26 @@ directly in a unit test with no framework wiring — and holds up if a
 derive macro gets layered on top later without changing the underlying
 shape.
 
-**Decided: no macros for now.** Ship the plain trait shape first,
-hand-written. A derive/attribute macro to cut per-type boilerplate
-(`#[skilj::command_type]` or similar) is worth revisiting once real usage
-shows what's actually tedious — designing it now, before any type has
-been written by hand, risks locking in the wrong ergonomics.
+**Decided: no macros for the plugin API itself.** Ship the plain trait
+shape first, hand-written. A derive/attribute macro to cut per-type
+boilerplate (`#[skilj::command_type]` or similar) is worth revisiting
+once real usage shows what's actually tedious — designing it now, before
+any type has been written by hand, risks locking in the wrong
+ergonomics. This scoping matters: §1.3.1/§1.3.2 below are both real
+proc-macros that exist in this codebase now, but neither reopens *this*
+decision — `EventType`/`CommandType`/`Projection` impls are still
+entirely hand-written trait code, with no codegen step of their own.
 
-### 1.3.1 The one exception: `#[requires_role(...)]`
+### 1.3.1 `#[requires_role(...)]`
 
 A `CommandType` can declare an extra, caller-facing role-name gate on top
 of the ordinary write-level `RoleAccessMapping` check — some commands
 need to be restricted to a specific role beyond "anyone with write access
 to this bounded context." The user asked for this to read as an
 annotation on the command's own declaration, not a trait method its
-author has to remember to override, so — deliberately, as the one named
-exception to §1.3's "no macros for now" — it's a real `#[proc_macro_attribute]`,
-`skilj-macros::requires_role`, applied directly above the `impl
-CommandType for ...` block:
+author has to remember to override, so it's a real
+`#[proc_macro_attribute]`, `skilj-macros::requires_role`, applied
+directly above the `impl CommandType for ...` block:
 
 ```rust
 #[requires_role("treasury_officer")]
@@ -132,6 +135,56 @@ Two things worth being explicit about:
   and can't enforce that; it's a caller-managed convention layered on
   top, the same register as choosing sensible `EventType`/`CommandType`
   names in the first place.
+
+### 1.3.2 `gql_object!` — internal wire-type codegen, a different register entirely
+
+A second `skilj-macros` proc-macro, `#[proc_macro] gql_object!`, added
+later once `skilj-graphql/src/gql_types.rs` had grown to ~20 hand-written
+`async_graphql::dynamic::Object` builders, each just a repetitive
+`Object::new("X").field(scalar_field("name", type, |x| expr))...` chain
+— genuinely declarative data dressed up as procedural code, not a case
+§1.3's caution about designing prematurely applied to at all (the
+tedium here was real and already visible, not speculative). A field
+declares its own kind and is spliced into the matching
+`scalar_field`/`object_field`/`list_field` helper call:
+
+```rust
+pub fn role_object() -> Object {
+    gql_object!(Role => "Role" {
+        scalar "id": TypeRef::named_nn(TypeRef::ID) => |r| Value::from(r.id.clone()),
+        scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |r| optional_timestamp(r.revoked_at),
+        object "role": TypeRef::named_nn("Role") => |m| Some(m.role.clone()),
+        list "tagMappings": TypeRef::named_nn_list_nn("TagMapping") => |et| et.tag_mappings.clone(),
+    })
+}
+```
+
+Worth being explicit about how this differs from §1.3.1, not just that
+both are proc-macros:
+
+- **A different crate, a different audience.** `requires_role` sits in
+  `skilj-core`'s own plugin API — a library *consumer* writes it.
+  `gql_object!` is used only inside `skilj-graphql`'s own
+  `gql_types.rs`, generating the identical `Object`/`Field` values a
+  hand-written call already built; no plugin author ever sees or writes
+  it. §1.3's "no macros for the plugin API" is untouched by this either
+  way.
+- **Why not `async_graphql`'s own `#[derive(SimpleObject)]`?**
+  `gql_types.rs`'s own module doc comment already answers this: this
+  version of `async-graphql` has no bridge from that derive macro's
+  static output into the `dynamic::Schema` this codebase assembles at
+  runtime from plugin registrations (§5.1). `gql_object!` is a bespoke
+  local replacement for that missing bridge, not a reimplementation of
+  something upstream already offered.
+- **Real syntax-tree work, not `macro_rules!`.** Each field's closure is
+  written bare (`|r| ...`, no `: &Role`) - `gql_object!` parses it as a
+  real `syn::ExprClosure` and splices the type ascription into its one
+  parameter itself, since plain type inference can't resolve a bare
+  closure passed to a generic `Fn(&T) -> _` parameter. That's real
+  syntax-tree manipulation, past what `macro_rules!` token-matching can
+  express - the same "needs actual inspection, not just substitution"
+  reasoning `requires_role`'s own `impl CommandType for ...` check
+  already relies on.
 
 ### 1.4 `matching_events` is a generated per-bounded-context enum
 
@@ -254,8 +307,11 @@ pub trait BoundedContextEvent: Sized {
     /// ever passes this bounded context's own events), so `None` is a
     /// defensive case, not a designed-for one. `Some(Err(..))` when the
     /// stored payload doesn't deserialize into the matched variant's
-    /// payload type - reachable today, since nothing yet validates a
-    /// payload against `EventType.schema` at write time.
+    /// payload type - narrower than it used to be (an externally- or
+    /// directly-created event's own payload is now schema-checked before
+    /// it's ever stored), but still reachable: a command-triggered or
+    /// system-triggered event's payload came from `decide()`/
+    /// `scheduled_payload`, which are never schema-checked at all.
     fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>>;
 }
 ```
@@ -1730,9 +1786,20 @@ needed on the write side at all: `project()` already receives the raw
 event today (nothing decrypts before folding), so an author copying a
 source event's own sensitive field straight into projection state,
 unchanged, automatically produces real, protectable ciphertext.
-**No spec change was needed** - `SensitiveFieldsStayProtected`'s existing
-text never described a mechanism, only an outcome, and this delivers
-that outcome for real, exactly as already written. Crypto-shredding
+**Believed at the time that no spec change was needed** - the call above
+was that `SensitiveFieldsStayProtected`'s existing text never described a
+mechanism, only an outcome, and this delivers that outcome for real,
+exactly as already written. **That call turned out to be wrong, caught by
+a later drift audit (see project memory `skilj-drift-audit-2026-08-18`,
+finding #9)**: the prose above `rule QueryProjection` and `ProjectionQuery`'s
+own copy of `SensitiveFieldsStayProtected` both did describe a mechanism -
+decryption decided *per field*, each against that field's own
+`EncryptionKey.subject_value`, mirroring `render_event`/`render_command`
+literally - which is not what shipped here. What shipped decides once per
+query, against the queried instance's own `key` as the subject, not per
+field at all. Both spots were fixed for real in a follow-up `allium:tend`
+pass once the discrepancy was found, rather than left as a stale claim -
+see that finding's own write-up for the corrected wording. Crypto-shredding
 falls out for free too: `ForgetSubject` destroying the `EncryptionKey`
 means the query-time lookup simply stops finding it, so the same stored
 ciphertext in projection state becomes permanently undecryptable there

@@ -8,6 +8,7 @@ description = "SkilJ's GraphQL surface: a unified async-graphql::dynamic schema 
 
 [dependencies]
 skilj-core.workspace = true
+skilj-macros.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

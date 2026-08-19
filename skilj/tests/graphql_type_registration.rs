@@ -349,7 +349,7 @@ fn full_type_registration_lifecycle_end_to_end() {
             "mutation($bc: String!, $name: String!) { \
                 registerProjection(boundedContext: $bc, name: $name, schema: \"{\\\"properties\\\":{}}\", \
                     consumedEventTypes: [\"MoneyDeposited\"], sync: false) { \
-                    outcome projection { name schemaVersion sync rebuild { status } } \
+                    outcome projection { name schemaVersion sync pendingRebuild { status } buildingRebuild { status } } \
                 } \
             }",
             json!({ "bc": bc_name, "name": "AccountBalance" }),
@@ -361,7 +361,8 @@ fn full_type_registration_lifecycle_end_to_end() {
             response["data"]["registerProjection"]["projection"]["name"],
             "AccountBalance"
         );
-        assert!(response["data"]["registerProjection"]["projection"]["rebuild"].is_null());
+        assert!(response["data"]["registerProjection"]["projection"]["pendingRebuild"].is_null());
+        assert!(response["data"]["registerProjection"]["projection"]["buildingRebuild"].is_null());
 
         // Re-registering with a changed schema stages a rebuild instead of
         // updating in place.
@@ -386,7 +387,7 @@ fn full_type_registration_lifecycle_end_to_end() {
         let response = graphql_request(
             &router,
             Some(&jwt),
-            "query($bc: String!) { projections(boundedContext: $bc) { name rebuild { status } } }",
+            "query($bc: String!) { projections(boundedContext: $bc) { name pendingRebuild { status } buildingRebuild { status } } }",
             json!({ "bc": bc_name }),
         )
         .await;
@@ -396,7 +397,8 @@ fn full_type_registration_lifecycle_end_to_end() {
             .iter()
             .find(|p| p["name"] == "AccountBalance")
             .unwrap();
-        assert_eq!(listed["rebuild"]["status"], "PENDING");
+        assert_eq!(listed["pendingRebuild"]["status"], "PENDING");
+        assert!(listed["buildingRebuild"].is_null());
 
         // rebuildProjection moves it to building.
         let response = graphql_request(
@@ -408,6 +410,69 @@ fn full_type_registration_lifecycle_end_to_end() {
         .await;
         assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
         assert_eq!(response["data"]["rebuildProjection"]["status"], "BUILDING");
+
+        // The pending row is gone - rebuildProjection moved it to building,
+        // not left a stale duplicate behind under its old status (see
+        // `db::transition_projection_rebuild_to_building`'s own doc
+        // comment).
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { projections(boundedContext: $bc) { name pendingRebuild { status } buildingRebuild { status } } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        let projections = response["data"]["projections"].as_array().unwrap();
+        let listed = projections
+            .iter()
+            .find(|p| p["name"] == "AccountBalance")
+            .unwrap();
+        assert!(listed["pendingRebuild"].is_null());
+        assert_eq!(listed["buildingRebuild"]["status"], "BUILDING");
+
+        // The deliberate coexisting case (UniqueRebuildPerProjectionAndStatus's
+        // own "a non-trivial registration arriving mid-build stages
+        // alongside the build rather than disturbing it"): registering a
+        // further schema change while AccountBalance's rebuild is still
+        // BUILDING must stage a brand new PENDING row, not touch the
+        // building one.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                registerProjection(boundedContext: $bc, name: $name, schema: \"{\\\"properties\\\":{\\\"count\\\":{\\\"type\\\":\\\"number\\\"}}}\", \
+                    consumedEventTypes: [\"MoneyDeposited\"], sync: false) { \
+                    outcome rebuild { status schemaVersion } \
+                } \
+            }",
+            json!({ "bc": bc_name, "name": "AccountBalance" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["registerProjection"]["outcome"], "REBUILD_STAGED");
+        assert_eq!(response["data"]["registerProjection"]["rebuild"]["status"], "PENDING");
+        // 2, not 3 - `new_schema_version` is always `existing.schema_version
+        // + 1` off the *live* Projection (still version 1; nothing has
+        // promoted yet in this test), not off the building rebuild's own
+        // staged version.
+        assert_eq!(response["data"]["registerProjection"]["rebuild"]["schemaVersion"], 2);
+
+        // Both rows are now live at once, each independently visible.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { projections(boundedContext: $bc) { name pendingRebuild { status schemaVersion } buildingRebuild { status } } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        let projections = response["data"]["projections"].as_array().unwrap();
+        let listed = projections
+            .iter()
+            .find(|p| p["name"] == "AccountBalance")
+            .unwrap();
+        assert_eq!(listed["pendingRebuild"]["status"], "PENDING");
+        assert_eq!(listed["pendingRebuild"]["schemaVersion"], 2);
+        assert_eq!(listed["buildingRebuild"]["status"], "BUILDING");
 
         // createExternalEventToken / createDirectCreationToken / createEventReadToken.
         let response = graphql_request(
@@ -469,11 +534,8 @@ fn full_type_registration_lifecycle_end_to_end() {
         assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
         assert_eq!(response["data"]["revokeToken"]["status"], "REVOKED");
 
-        // discardProjectionRebuild - a fresh, separate projection (not the
-        // one `rebuildProjection` already moved to `BUILDING` above -
-        // re-registering that one would inherit its in-progress status
-        // rather than starting a new `PENDING` rebuild, a `register_projection`
-        // subtlety this test deliberately sidesteps rather than exercises).
+        // discardProjectionRebuild - a fresh, separate projection, its own
+        // clean pending-then-discard scenario.
         let response = graphql_request(
             &router,
             Some(&jwt),
@@ -514,7 +576,7 @@ fn full_type_registration_lifecycle_end_to_end() {
         let response = graphql_request(
             &router,
             Some(&jwt),
-            "query($bc: String!) { projections(boundedContext: $bc) { name rebuild { status } } }",
+            "query($bc: String!) { projections(boundedContext: $bc) { name pendingRebuild { status } } }",
             json!({ "bc": bc_name }),
         )
         .await;
@@ -523,6 +585,6 @@ fn full_type_registration_lifecycle_end_to_end() {
             .iter()
             .find(|p| p["name"] == "MonthlyReport")
             .unwrap();
-        assert!(listed["rebuild"].is_null());
+        assert!(listed["pendingRebuild"].is_null());
     });
 }

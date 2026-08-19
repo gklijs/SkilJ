@@ -1,11 +1,13 @@
 //! `surface CommandSubmission` - `submitCommand`, the GraphQL/Role
-//! counterpart to `CommandTrigger`'s REST/`CommandToken` path (both
-//! converge on `process_command`). Mirrors `skilj-rest`'s own
+//! counterpart to `CommandTrigger`'s REST/`CommandToken` path. Both
+//! resolve their own authorisation and run `dispatch`'s first,
+//! optimistic call here, then converge on the identical shared
+//! `skilj_core::db::submit_command` (see its own doc comment) for
+//! everything from there on: the DCB conflict re-check under
+//! `next_sequence`'s own lock, the possible redispatch, and the atomic
+//! `process_command` + insert. Mirrors `skilj-rest`'s own
 //! `post_commands_trigger` handler almost exactly
-//! (`skilj-rest/src/routes/mod.rs`) - same pre-resolve-`EventType`s/
-//! pre-allocate-`sequence`s-before-calling-`process_command` pattern,
-//! since `process_command`'s own closures stay synchronous by design
-//! (§1.1: `decide()` and everything downstream of it is I/O-free).
+//! (`skilj-rest/src/routes/mod.rs`) up to that point.
 //!
 //! `WriteAccess`-gated, not `AdminAccess`: unlike every other Phase 2/3
 //! resolver, the mapping lookup here has **no level filter** -
@@ -31,9 +33,6 @@ use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::ErrorExtensions;
 use chrono::Utc;
-use skilj_core::event_store::EventType;
-use skilj_core::shared::CommandDecision;
-use std::collections::HashMap;
 
 fn insufficient_role_error(required: &str) -> async_graphql::Error {
     async_graphql::Error::new(format!(
@@ -105,12 +104,15 @@ pub fn submit_command_field() -> Field {
                     Some(_) => {}
                 }
 
-                let bounded_context_events = skilj_core::db::list_events_for_bounded_context(
-                    &state.pool,
-                    &bounded_context_name,
-                )
-                .await
-                .map_err(to_graphql_error)?;
+                let bounded_context_events =
+                    skilj_core::db::list_events_for_bounded_context_cached(
+                        &state.pool,
+                        &state.event_cache,
+                        &bounded_context_name,
+                        -1,
+                    )
+                    .await
+                    .map_err(to_graphql_error)?;
                 let consistency_tags = skilj_core::event_store::derive_tags(
                     &authorised.command_type.tag_mappings,
                     &authorised.payload,
@@ -132,141 +134,54 @@ pub fn submit_command_field() -> Field {
                     Some(Ok(decision)) => decision,
                 };
 
-                let event_specs = match decision {
-                    CommandDecision::Rejected { reason, kind } => {
-                        // §5.4/§7.3: a legitimate business outcome, not
-                        // a GraphQL error - process_command itself is
-                        // never called on this branch.
-                        return Ok(Some(FieldValue::owned_any(SubmitCommandResult {
+                // The optimistic, unlocked half ends here - `decision`
+                // above is dispatch()'s own first call. skilj_core::db::
+                // submit_command below re-checks this under
+                // next_sequence's own lock and redispatches if a DCB
+                // conflict actually happened in between (see its own doc
+                // comment) before persisting anything.
+                let outcome = skilj_core::db::submit_command(
+                    &state.pool,
+                    state.dispatcher.as_ref(),
+                    state.projection_dispatcher.as_ref(),
+                    &state.event_broadcaster,
+                    &state.event_cache,
+                    &authorised.command_type,
+                    &authorised.payload,
+                    &authorised.client_id,
+                    &bounded_context_events,
+                    &consistency_tags,
+                    decision,
+                    state.encryption_master_key.as_ref(),
+                    Utc::now(),
+                )
+                .await
+                .map_err(to_graphql_error)?;
+
+                Ok(Some(FieldValue::owned_any(match outcome {
+                    // §5.4/§7.3: a legitimate business outcome, not a
+                    // GraphQL error - whether this was the first
+                    // decision or a DCB-conflict retry inside
+                    // submit_command, a rejection renders identically
+                    // either way.
+                    skilj_core::db::SubmitCommandOutcome::Rejected { reason, kind } => {
+                        SubmitCommandResult {
                             accepted: false,
                             triggered_event_sequences: None,
                             rejection_reason: Some(reason),
                             rejection_kind: Some(kind),
-                        })));
-                    }
-                    CommandDecision::Accepted { events } => events,
-                };
-
-                // process_command's own resolve_event_type/next_sequence
-                // are plain sync closures (decide() and everything
-                // downstream stays I/O-free per §1.1) - every EventType
-                // lookup and sequence allocation happens first, here.
-                let mut event_types_by_name: HashMap<String, EventType> = HashMap::new();
-                for spec in &event_specs {
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        event_types_by_name.entry(spec.event_type.clone())
-                    {
-                        if let Some(et) = skilj_core::db::get_event_type(
-                            &state.pool,
-                            &bounded_context_name,
-                            &spec.event_type,
-                        )
-                        .await
-                        .map_err(to_graphql_error)?
-                        {
-                            entry.insert(et);
                         }
                     }
-                }
-                let mut sequences = Vec::with_capacity(event_specs.len());
-                for _ in 0..event_specs.len() {
-                    sequences.push(
-                        skilj_core::db::next_sequence(&state.pool, &bounded_context_name)
-                            .await
-                            .map_err(to_graphql_error)?,
-                    );
-                }
-                let mut sequences = sequences.into_iter();
-
-                // protect_sensitive_fields' own pre-resolution step, for
-                // the command's own payload *and* every accepted event
-                // spec's - see `db::resolve_encryption_keys`'s own doc
-                // comment (mirrors `skilj-rest`'s own `post_commands_trigger`
-                // handler exactly).
-                let mut resolved = HashMap::new();
-                skilj_core::db::resolve_encryption_keys(
-                    &state.pool,
-                    &bounded_context_name,
-                    &authorised.command_type.sensitive_fields,
-                    &authorised.payload,
-                    state.encryption_master_key.as_ref(),
-                    &mut resolved,
-                )
-                .await
-                .map_err(to_graphql_error)?;
-                for spec in &event_specs {
-                    if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
-                        let spec_payload = spec.payload.to_string();
-                        skilj_core::db::resolve_encryption_keys(
-                            &state.pool,
-                            &bounded_context_name,
-                            &event_type.sensitive_fields,
-                            &spec_payload,
-                            state.encryption_master_key.as_ref(),
-                            &mut resolved,
-                        )
-                        .await
-                        .map_err(to_graphql_error)?;
+                    skilj_core::db::SubmitCommandOutcome::Accepted { events, .. } => {
+                        SubmitCommandResult {
+                            accepted: true,
+                            triggered_event_sequences: Some(
+                                events.iter().map(|e| e.sequence).collect(),
+                            ),
+                            rejection_reason: None,
+                            rejection_kind: None,
+                        }
                     }
-                }
-
-                let result: skilj_core::event_store::ProcessCommandResult =
-                    skilj_core::event_store::process_command(
-                        &authorised.command_type,
-                        &authorised.payload,
-                        &authorised.client_id,
-                        &bounded_context_events,
-                        CommandDecision::Accepted {
-                            events: event_specs,
-                        },
-                        |name| event_types_by_name.get(name).cloned(),
-                        || {
-                            sequences.next().expect(
-                                "process_command called next_sequence more times than there are \
-                                 accepted events",
-                            )
-                        },
-                        Utc::now(),
-                        |subject_key, subject_value| {
-                            let (key, _, data_key) = resolved
-                                .get(&(subject_key.to_string(), subject_value.to_string()))
-                                .expect(
-                                    "resolve_encryption_keys pre-resolved every subject \
-                                     sensitive_field_subjects named",
-                                );
-                            (key.clone(), data_key.clone())
-                        },
-                    )
-                    .map_err(to_graphql_error)?;
-
-                let command_key_ids =
-                    skilj_core::db::encryption_key_ids(&result.command.encryption_keys, &resolved);
-                let command_id =
-                    skilj_core::db::insert_command(&state.pool, &result.command, &command_key_ids)
-                        .await
-                        .map_err(to_graphql_error)?;
-                let mut triggered_event_sequences = Vec::with_capacity(result.events.len());
-                for event in &result.events {
-                    let event_key_ids =
-                        skilj_core::db::encryption_key_ids(&event.encryption_keys, &resolved);
-                    skilj_core::db::insert_event_and_update_sync_projections(
-                        &state.pool,
-                        event,
-                        Some(command_id),
-                        state.projection_dispatcher.as_ref(),
-                        &event_key_ids,
-                        &state.event_broadcaster,
-                    )
-                    .await
-                    .map_err(to_graphql_error)?;
-                    triggered_event_sequences.push(event.sequence);
-                }
-
-                Ok(Some(FieldValue::owned_any(SubmitCommandResult {
-                    accepted: true,
-                    triggered_event_sequences: Some(triggered_event_sequences),
-                    rejection_reason: None,
-                    rejection_kind: None,
                 })))
             })
         },

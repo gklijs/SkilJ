@@ -2,12 +2,18 @@
 //! `Role`, `BoundedContext` (+ its nested `ContextCreator`/
 //! `RoleAccessMapping`), the three enums, and `CreatedSuperadmin` (the
 //! deliberately narrower payload `createSuperadmin` itself returns - see
-//! its own doc comment). Every one of these is built directly against
+//! its own doc comment). Every one of these is built against
 //! `async_graphql::dynamic`'s own `Object`/`Field`/`Enum` API (§5.1) -
 //! there is no bridge from `#[derive(SimpleObject)]`-style static types
-//! into a `dynamic::Schema` in this version of `async-graphql`, so
-//! nothing here uses derive macros at all, unlike `skilj-core::plugin`'s
-//! own `schemars`-derived payload schemas.
+//! into a `dynamic::Schema` in this version of `async-graphql`, so this
+//! module can't use *that* derive macro the way `skilj-core::plugin`'s
+//! own `schemars`-derived payload schemas do. Most `Object` builders
+//! below use `skilj_macros::gql_object!` instead (docs/architecture.md
+//! §1.3.2) - a bespoke local macro filling the gap that missing bridge
+//! leaves, not a reimplementation of it; a few with a field shape it
+//! doesn't cover (a nullable list of plain scalars, say) stay hand-built
+//! against `scalar_field`/`object_field`/`list_field` directly, or a raw
+//! `Field::new(...)` for the rare field neither covers.
 //!
 //! Every object's fields resolve synchronously off an already-loaded
 //! Rust value (`ctx.parent_value.try_downcast_ref::<T>()`) rather than
@@ -29,10 +35,11 @@ use skilj_core::access_control::{
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{
     BoundedContext, BoundedContextStatus, CommandType, EncryptionKey, EncryptionKeyStatus,
-    EventType,
+    EventType, MissedOccurrencePolicy,
 };
 use skilj_core::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use skilj_core::shared::{SensitiveField, TagMapping};
+use skilj_macros::gql_object;
 
 /// A scalar (or nullable-scalar) field resolved synchronously from the
 /// parent value alone - the common case for every leaf field below.
@@ -139,47 +146,40 @@ pub fn bounded_context_status_enum() -> async_graphql::dynamic::Enum {
         .item("ARCHIVED")
 }
 
+/// `enum MissedOccurrencePolicy` - `registerEventType`'s own
+/// `missedOccurrencePolicy` argument type, and `EventType.
+/// missedOccurrencePolicy`'s own output type below. See
+/// `resolvers::parse_missed_occurrence_policy` for the input-side
+/// mapping and `missed_occurrence_policy_name` for the output-side one.
+pub fn missed_occurrence_policy_enum() -> async_graphql::dynamic::Enum {
+    async_graphql::dynamic::Enum::new("MissedOccurrencePolicy")
+        .item("SKIP")
+        .item("FIRE_ONCE")
+        .item("REPLAY_BACKLOG")
+}
+
+pub fn missed_occurrence_policy_name(policy: MissedOccurrencePolicy) -> &'static str {
+    match policy {
+        MissedOccurrencePolicy::Skip => "SKIP",
+        MissedOccurrencePolicy::FireOnce => "FIRE_ONCE",
+        MissedOccurrencePolicy::ReplayBacklog => "REPLAY_BACKLOG",
+    }
+}
+
 /// `entity Role`, minus the relationship projection `access_mappings`
 /// (resolved separately, per surface, the same "caller resolves it, not
 /// a stored field" treatment every relationship projection gets
 /// elsewhere in this codebase).
 pub fn role_object() -> Object {
-    Object::new("Role")
-        .field(scalar_field(
-            "id",
-            TypeRef::named_nn(TypeRef::ID),
-            |r: &Role| Value::from(r.id.clone()),
-        ))
-        .field(scalar_field(
-            "externalSubject",
-            TypeRef::named_nn(TypeRef::STRING),
-            |r: &Role| Value::from(r.external_subject.clone()),
-        ))
-        .field(scalar_field(
-            "name",
-            TypeRef::named_nn(TypeRef::STRING),
-            |r: &Role| Value::from(r.name.clone()),
-        ))
-        .field(scalar_field(
-            "superadmin",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |r: &Role| Value::from(r.superadmin),
-        ))
-        .field(scalar_field(
-            "status",
-            TypeRef::named_nn("RoleStatus"),
-            |r: &Role| Value::from(role_status_name(r.status)),
-        ))
-        .field(scalar_field(
-            "createdAt",
-            TypeRef::named_nn(TypeRef::STRING),
-            |r: &Role| Value::from(r.created_at.to_rfc3339()),
-        ))
-        .field(scalar_field(
-            "revokedAt",
-            TypeRef::named(TypeRef::STRING),
-            |r: &Role| optional_timestamp(r.revoked_at),
-        ))
+    gql_object!(Role => "Role" {
+        scalar "id": TypeRef::named_nn(TypeRef::ID) => |r| Value::from(r.id.clone()),
+        scalar "externalSubject": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.external_subject.clone()),
+        scalar "name": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.name.clone()),
+        scalar "superadmin": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.superadmin),
+        scalar "status": TypeRef::named_nn("RoleStatus") => |r| Value::from(role_status_name(r.status)),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.created_at.to_rfc3339()),
+        scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |r| optional_timestamp(r.revoked_at),
+    })
 }
 
 /// `createSuperadmin`'s own deliberately narrow return type -
@@ -188,22 +188,11 @@ pub fn role_object() -> Object {
 /// type rather than reusing `Role` so that guarantee is structural, not
 /// a convention a resolver could accidentally violate by returning more.
 pub fn created_superadmin_object() -> Object {
-    Object::new("CreatedSuperadmin")
-        .field(scalar_field(
-            "id",
-            TypeRef::named_nn(TypeRef::ID),
-            |r: &Role| Value::from(r.id.clone()),
-        ))
-        .field(scalar_field(
-            "name",
-            TypeRef::named_nn(TypeRef::STRING),
-            |r: &Role| Value::from(r.name.clone()),
-        ))
-        .field(scalar_field(
-            "externalSubject",
-            TypeRef::named_nn(TypeRef::STRING),
-            |r: &Role| Value::from(r.external_subject.clone()),
-        ))
+    gql_object!(Role => "CreatedSuperadmin" {
+        scalar "id": TypeRef::named_nn(TypeRef::ID) => |r| Value::from(r.id.clone()),
+        scalar "name": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.name.clone()),
+        scalar "externalSubject": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.external_subject.clone()),
+    })
 }
 
 /// `entity RoleAccessMapping`, minus `bounded_context` - every place
@@ -211,27 +200,12 @@ pub fn created_superadmin_object() -> Object {
 /// belongs to (see `surface BoundedContextDirectory`'s own `exposes`
 /// list, which never repeats it either).
 pub fn role_access_mapping_object() -> Object {
-    Object::new("RoleAccessMapping")
-        .field(object_field(
-            "role",
-            TypeRef::named_nn("Role"),
-            |m: &RoleAccessMapping| Some(m.role.clone()),
-        ))
-        .field(scalar_field(
-            "level",
-            TypeRef::named_nn("AccessLevel"),
-            |m: &RoleAccessMapping| Value::from(access_level_name(m.level)),
-        ))
-        .field(scalar_field(
-            "canReadSensitive",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |m: &RoleAccessMapping| Value::from(m.can_read_sensitive),
-        ))
-        .field(scalar_field(
-            "status",
-            TypeRef::named_nn("RoleStatus"),
-            |m: &RoleAccessMapping| Value::from(role_status_name(m.status)),
-        ))
+    gql_object!(RoleAccessMapping => "RoleAccessMapping" {
+        object "role": TypeRef::named_nn("Role") => |m| Some(m.role.clone()),
+        scalar "level": TypeRef::named_nn("AccessLevel") => |m| Value::from(access_level_name(m.level)),
+        scalar "canReadSensitive": TypeRef::named_nn(TypeRef::BOOLEAN) => |m| Value::from(m.can_read_sensitive),
+        scalar "status": TypeRef::named_nn("RoleStatus") => |m| Value::from(role_status_name(m.status)),
+    })
 }
 
 /// `entity ContextCreator`. `kind` stands in for the Rust sum type's own
@@ -239,25 +213,18 @@ pub fn role_access_mapping_object() -> Object {
 /// the Rust side already gives it - see `ContextCreator`'s own doc
 /// comment); `role` is present only for `SUPERADMIN`.
 pub fn context_creator_object() -> Object {
-    Object::new("ContextCreator")
-        .field(scalar_field(
-            "kind",
-            TypeRef::named_nn(TypeRef::STRING),
-            |c: &ContextCreator| {
-                Value::from(match c {
-                    ContextCreator::SuperadminCreator { .. } => "SUPERADMIN",
-                    ContextCreator::SystemCreator => "SYSTEM",
-                })
-            },
-        ))
-        .field(object_field(
-            "role",
-            TypeRef::named("Role"),
-            |c: &ContextCreator| match c {
-                ContextCreator::SuperadminCreator { role } => Some(role.clone()),
-                ContextCreator::SystemCreator => None,
-            },
-        ))
+    gql_object!(ContextCreator => "ContextCreator" {
+        scalar "kind": TypeRef::named_nn(TypeRef::STRING) => |c| {
+            Value::from(match c {
+                ContextCreator::SuperadminCreator { .. } => "SUPERADMIN",
+                ContextCreator::SystemCreator => "SYSTEM",
+            })
+        },
+        object "role": TypeRef::named("Role") => |c| match c {
+            ContextCreator::SuperadminCreator { role } => Some(role.clone()),
+            ContextCreator::SystemCreator => None,
+        },
+    })
 }
 
 /// `BoundedContext` plus its own currently-active `RoleAccessMapping`s -
@@ -274,34 +241,15 @@ pub struct BoundedContextWithMappings {
 /// `entity BoundedContext`, plus the `access_mappings` relationship
 /// `surface BoundedContextDirectory`'s own `exposes` list asks for.
 pub fn bounded_context_object() -> Object {
-    Object::new("BoundedContext")
-        .field(scalar_field(
-            "name",
-            TypeRef::named_nn(TypeRef::STRING),
-            |bc: &BoundedContextWithMappings| Value::from(bc.context.name.clone()),
-        ))
-        .field(scalar_field(
-            "status",
-            TypeRef::named_nn("BoundedContextStatus"),
-            |bc: &BoundedContextWithMappings| {
-                Value::from(bounded_context_status_name(bc.context.status))
-            },
-        ))
-        .field(scalar_field(
-            "createdAt",
-            TypeRef::named_nn(TypeRef::STRING),
-            |bc: &BoundedContextWithMappings| Value::from(bc.context.created_at.to_rfc3339()),
-        ))
-        .field(object_field(
-            "createdBy",
-            TypeRef::named_nn("ContextCreator"),
-            |bc: &BoundedContextWithMappings| Some(bc.context.created_by.clone()),
-        ))
-        .field(list_field(
-            "accessMappings",
-            TypeRef::named_nn_list_nn("RoleAccessMapping"),
-            |bc: &BoundedContextWithMappings| bc.access_mappings.clone(),
-        ))
+    gql_object!(BoundedContextWithMappings => "BoundedContext" {
+        scalar "name": TypeRef::named_nn(TypeRef::STRING) => |bc| Value::from(bc.context.name.clone()),
+        scalar "status": TypeRef::named_nn("BoundedContextStatus") => |bc| {
+            Value::from(bounded_context_status_name(bc.context.status))
+        },
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |bc| Value::from(bc.context.created_at.to_rfc3339()),
+        object "createdBy": TypeRef::named_nn("ContextCreator") => |bc| Some(bc.context.created_by.clone()),
+        list "accessMappings": TypeRef::named_nn_list_nn("RoleAccessMapping") => |bc| bc.access_mappings.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -340,17 +288,10 @@ pub fn projection_rebuild_status_enum() -> Enum {
 /// field-for-field, plain scalars only - no bridge needed between the two
 /// beyond `resolvers::type_registration`'s own parsing.
 pub fn tag_mapping_object() -> Object {
-    Object::new("TagMapping")
-        .field(scalar_field(
-            "key",
-            TypeRef::named_nn(TypeRef::STRING),
-            |t: &TagMapping| Value::from(t.key.clone()),
-        ))
-        .field(scalar_field(
-            "field",
-            TypeRef::named_nn(TypeRef::STRING),
-            |t: &TagMapping| Value::from(t.field.clone()),
-        ))
+    gql_object!(TagMapping => "TagMapping" {
+        scalar "key": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.key.clone()),
+        scalar "field": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.field.clone()),
+    })
 }
 
 pub fn tag_mapping_input() -> InputObject {
@@ -362,22 +303,11 @@ pub fn tag_mapping_input() -> InputObject {
 /// `value SensitiveField`. See `tag_mapping_object`'s own doc comment -
 /// same input/output split.
 pub fn sensitive_field_object() -> Object {
-    Object::new("SensitiveField")
-        .field(scalar_field(
-            "field",
-            TypeRef::named_nn(TypeRef::STRING),
-            |s: &SensitiveField| Value::from(s.field.clone()),
-        ))
-        .field(scalar_field(
-            "subjectKey",
-            TypeRef::named_nn(TypeRef::STRING),
-            |s: &SensitiveField| Value::from(s.subject_key.clone()),
-        ))
-        .field(scalar_field(
-            "subjectField",
-            TypeRef::named_nn(TypeRef::STRING),
-            |s: &SensitiveField| Value::from(s.subject_field.clone()),
-        ))
+    gql_object!(SensitiveField => "SensitiveField" {
+        scalar "field": TypeRef::named_nn(TypeRef::STRING) => |s| Value::from(s.field.clone()),
+        scalar "subjectKey": TypeRef::named_nn(TypeRef::STRING) => |s| Value::from(s.subject_key.clone()),
+        scalar "subjectField": TypeRef::named_nn(TypeRef::STRING) => |s| Value::from(s.subject_field.clone()),
+    })
 }
 
 pub fn sensitive_field_input() -> InputObject {
@@ -398,188 +328,93 @@ pub fn sensitive_field_input() -> InputObject {
 /// treatment every relationship projection gets elsewhere in this
 /// codebase.
 pub fn event_type_object() -> Object {
-    Object::new("EventType")
-        .field(scalar_field(
-            "name",
-            TypeRef::named_nn(TypeRef::STRING),
-            |et: &EventType| Value::from(et.name.clone()),
-        ))
-        .field(scalar_field(
-            "schema",
-            TypeRef::named_nn(TypeRef::STRING),
-            |et: &EventType| Value::from(et.schema.clone()),
-        ))
-        .field(scalar_field(
-            "schemaVersion",
-            TypeRef::named_nn(TypeRef::INT),
-            |et: &EventType| Value::from(et.schema_version),
-        ))
-        .field(list_field(
-            "tagMappings",
-            TypeRef::named_nn_list_nn("TagMapping"),
-            |et: &EventType| et.tag_mappings.clone(),
-        ))
-        .field(list_field(
-            "sensitiveFields",
-            TypeRef::named_nn_list_nn("SensitiveField"),
-            |et: &EventType| et.sensitive_fields.clone(),
-        ))
-        .field(scalar_field(
-            "externalCreationAllowed",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |et: &EventType| Value::from(et.external_creation_allowed),
-        ))
-        .field(scalar_field(
-            "directCreationAllowed",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |et: &EventType| Value::from(et.direct_creation_allowed),
-        ))
-        .field(scalar_field(
-            "systemTriggeredAllowed",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |et: &EventType| Value::from(et.system_triggered_allowed),
-        ))
-        .field(scalar_field(
-            "systemTriggeredSchedule",
-            TypeRef::named(TypeRef::STRING),
-            |et: &EventType| match &et.system_triggered_schedule {
-                Some(s) => Value::from(s.clone()),
-                None => Value::Null,
-            },
-        ))
-        .field(scalar_field(
-            "eventReadAllowed",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |et: &EventType| Value::from(et.event_read_allowed),
-        ))
+    gql_object!(EventType => "EventType" {
+        scalar "name": TypeRef::named_nn(TypeRef::STRING) => |et| Value::from(et.name.clone()),
+        scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |et| Value::from(et.schema.clone()),
+        scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |et| Value::from(et.schema_version),
+        list "tagMappings": TypeRef::named_nn_list_nn("TagMapping") => |et| et.tag_mappings.clone(),
+        list "sensitiveFields": TypeRef::named_nn_list_nn("SensitiveField") => |et| et.sensitive_fields.clone(),
+        scalar "externalCreationAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.external_creation_allowed),
+        scalar "directCreationAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.direct_creation_allowed),
+        scalar "systemTriggeredAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.system_triggered_allowed),
+        scalar "systemTriggeredSchedule": TypeRef::named(TypeRef::STRING) => |et| match &et.system_triggered_schedule {
+            Some(s) => Value::from(s.clone()),
+            None => Value::Null,
+        },
+        scalar "missedOccurrencePolicy": TypeRef::named("MissedOccurrencePolicy") => |et| match et.missed_occurrence_policy {
+            Some(policy) => Value::from(missed_occurrence_policy_name(policy)),
+            None => Value::Null,
+        },
+        scalar "schedulePosition": TypeRef::named(TypeRef::STRING) => |et| optional_timestamp(et.schedule_position),
+        scalar "lastFiredAt": TypeRef::named(TypeRef::STRING) => |et| optional_timestamp(et.last_fired_at),
+        scalar "eventReadAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.event_read_allowed),
+    })
 }
 
 /// `entity CommandType`, same treatment as `event_type_object` above.
 pub fn command_type_object() -> Object {
-    Object::new("CommandType")
-        .field(scalar_field(
-            "name",
-            TypeRef::named_nn(TypeRef::STRING),
-            |ct: &CommandType| Value::from(ct.name.clone()),
-        ))
-        .field(scalar_field(
-            "schema",
-            TypeRef::named_nn(TypeRef::STRING),
-            |ct: &CommandType| Value::from(ct.schema.clone()),
-        ))
-        .field(scalar_field(
-            "schemaVersion",
-            TypeRef::named_nn(TypeRef::INT),
-            |ct: &CommandType| Value::from(ct.schema_version),
-        ))
-        .field(list_field(
-            "tagMappings",
-            TypeRef::named_nn_list_nn("TagMapping"),
-            |ct: &CommandType| ct.tag_mappings.clone(),
-        ))
-        .field(list_field(
-            "sensitiveFields",
-            TypeRef::named_nn_list_nn("SensitiveField"),
-            |ct: &CommandType| ct.sensitive_fields.clone(),
-        ))
-        .field(scalar_field(
-            "restTriggerAllowed",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |ct: &CommandType| Value::from(ct.rest_trigger_allowed),
-        ))
+    gql_object!(CommandType => "CommandType" {
+        scalar "name": TypeRef::named_nn(TypeRef::STRING) => |ct| Value::from(ct.name.clone()),
+        scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |ct| Value::from(ct.schema.clone()),
+        scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |ct| Value::from(ct.schema_version),
+        list "tagMappings": TypeRef::named_nn_list_nn("TagMapping") => |ct| ct.tag_mappings.clone(),
+        list "sensitiveFields": TypeRef::named_nn_list_nn("SensitiveField") => |ct| ct.sensitive_fields.clone(),
+        scalar "restTriggerAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |ct| Value::from(ct.rest_trigger_allowed),
+    })
 }
 
 /// `entity ProjectionRebuild`.
 pub fn projection_rebuild_object() -> Object {
-    Object::new("ProjectionRebuild")
-        .field(scalar_field(
-            "schema",
-            TypeRef::named_nn(TypeRef::STRING),
-            |r: &ProjectionRebuild| Value::from(r.schema.clone()),
-        ))
-        .field(scalar_field(
-            "schemaVersion",
-            TypeRef::named_nn(TypeRef::INT),
-            |r: &ProjectionRebuild| Value::from(r.schema_version),
-        ))
-        .field(list_field(
-            "consumedEventTypes",
-            TypeRef::named_nn_list_nn("EventType"),
-            |r: &ProjectionRebuild| r.consumed_event_types.clone(),
-        ))
-        .field(scalar_field(
-            "sync",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |r: &ProjectionRebuild| Value::from(r.sync),
-        ))
-        .field(scalar_field(
-            "caughtUpTo",
-            TypeRef::named(TypeRef::INT),
-            |r: &ProjectionRebuild| match r.caught_up_to {
-                Some(seq) => Value::from(seq),
-                None => Value::Null,
-            },
-        ))
-        .field(scalar_field(
-            "status",
-            TypeRef::named_nn("ProjectionRebuildStatus"),
-            |r: &ProjectionRebuild| Value::from(projection_rebuild_status_name(r.status)),
-        ))
+    gql_object!(ProjectionRebuild => "ProjectionRebuild" {
+        scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.schema.clone()),
+        scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |r| Value::from(r.schema_version),
+        list "consumedEventTypes": TypeRef::named_nn_list_nn("EventType") => |r| r.consumed_event_types.clone(),
+        scalar "sync": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.sync),
+        scalar "caughtUpTo": TypeRef::named(TypeRef::INT) => |r| match r.caught_up_to {
+            Some(seq) => Value::from(seq),
+            None => Value::Null,
+        },
+        scalar "status": TypeRef::named_nn("ProjectionRebuildStatus") => |r| Value::from(projection_rebuild_status_name(r.status)),
+    })
 }
 
-/// `entity Projection`. `rebuild` is nullable - `ProjectionRebuild` is
-/// keyed 1:1 by `(bounded_context, projection_name)` (see the migration's
-/// own doc comment), so despite the spec's own `exposes: ... for rebuild
-/// in projection.rebuilds` loop phrasing, there is never more than one at
-/// a time; modelled here as a nullable field rather than a list, the
-/// wire-shape simplification `TypeRegistration`'s own guidance explicitly
-/// leaves open ("deliberately coarse on the wire contract").
+/// `entity Projection`. `pending_rebuild`/`building_rebuild` are two
+/// nullable fields, not the spec's own `exposes: ... for rebuild in
+/// projection.rebuilds` loop phrasing rendered as a `[ProjectionRebuild!]!`
+/// list - invariant `UniqueRebuildPerProjectionAndStatus` caps
+/// `rebuilds` at exactly one per status, never an open-ended set, so a
+/// list would just be an unindexed, always-length-≤2 collection a caller
+/// has to search for the row it actually wants. Two named fields say
+/// which is which for free - the same "deliberately coarse on the wire
+/// contract" simplification `TypeRegistration`'s own guidance already
+/// sanctions elsewhere. (Previously a single `rebuild` field, on the
+/// wrong assumption that `ProjectionRebuild` was keyed 1:1 by
+/// `(bounded_context, projection_name)` - the drift audit's own finding
+/// on `UniqueRebuildPerProjectionAndStatus`'s "the two coexisting is the
+/// deliberate case" catching that a pending and a building rebuild can
+/// be live at once, which the old single field had no way to show both
+/// of.)
 #[derive(Clone)]
 pub struct ProjectionWithRebuild {
     pub projection: Projection,
-    pub rebuild: Option<ProjectionRebuild>,
+    pub pending_rebuild: Option<ProjectionRebuild>,
+    pub building_rebuild: Option<ProjectionRebuild>,
 }
 
 pub fn projection_object() -> Object {
-    Object::new("Projection")
-        .field(scalar_field(
-            "name",
-            TypeRef::named_nn(TypeRef::STRING),
-            |p: &ProjectionWithRebuild| Value::from(p.projection.name.clone()),
-        ))
-        .field(scalar_field(
-            "schema",
-            TypeRef::named_nn(TypeRef::STRING),
-            |p: &ProjectionWithRebuild| Value::from(p.projection.schema.clone()),
-        ))
-        .field(scalar_field(
-            "schemaVersion",
-            TypeRef::named_nn(TypeRef::INT),
-            |p: &ProjectionWithRebuild| Value::from(p.projection.schema_version),
-        ))
-        .field(list_field(
-            "consumedEventTypes",
-            TypeRef::named_nn_list_nn("EventType"),
-            |p: &ProjectionWithRebuild| p.projection.consumed_event_types.clone(),
-        ))
-        .field(scalar_field(
-            "sync",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |p: &ProjectionWithRebuild| Value::from(p.projection.sync),
-        ))
-        .field(scalar_field(
-            "caughtUpTo",
-            TypeRef::named(TypeRef::INT),
-            |p: &ProjectionWithRebuild| match p.projection.caught_up_to {
-                Some(seq) => Value::from(seq),
-                None => Value::Null,
-            },
-        ))
-        .field(object_field(
-            "rebuild",
-            TypeRef::named("ProjectionRebuild"),
-            |p: &ProjectionWithRebuild| p.rebuild.clone(),
-        ))
+    gql_object!(ProjectionWithRebuild => "Projection" {
+        scalar "name": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.projection.name.clone()),
+        scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.projection.schema.clone()),
+        scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |p| Value::from(p.projection.schema_version),
+        list "consumedEventTypes": TypeRef::named_nn_list_nn("EventType") => |p| p.projection.consumed_event_types.clone(),
+        scalar "sync": TypeRef::named_nn(TypeRef::BOOLEAN) => |p| Value::from(p.projection.sync),
+        scalar "caughtUpTo": TypeRef::named(TypeRef::INT) => |p| match p.projection.caught_up_to {
+            Some(seq) => Value::from(seq),
+            None => Value::Null,
+        },
+        object "pendingRebuild": TypeRef::named("ProjectionRebuild") => |p| p.pending_rebuild.clone(),
+        object "buildingRebuild": TypeRef::named("ProjectionRebuild") => |p| p.building_rebuild.clone(),
+    })
 }
 
 /// `RegisterProjection`'s own three-way outcome
@@ -595,22 +430,11 @@ pub struct ProjectionRegistrationResult {
 }
 
 pub fn projection_registration_result_object() -> Object {
-    Object::new("ProjectionRegistrationResult")
-        .field(scalar_field(
-            "outcome",
-            TypeRef::named_nn(TypeRef::STRING),
-            |r: &ProjectionRegistrationResult| Value::from(r.outcome),
-        ))
-        .field(object_field(
-            "projection",
-            TypeRef::named("Projection"),
-            |r: &ProjectionRegistrationResult| r.projection.clone(),
-        ))
-        .field(object_field(
-            "rebuild",
-            TypeRef::named("ProjectionRebuild"),
-            |r: &ProjectionRegistrationResult| r.rebuild.clone(),
-        ))
+    gql_object!(ProjectionRegistrationResult => "ProjectionRegistrationResult" {
+        scalar "outcome": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.outcome),
+        object "projection": TypeRef::named("Projection") => |r| r.projection.clone(),
+        object "rebuild": TypeRef::named("ProjectionRebuild") => |r| r.rebuild.clone(),
+    })
 }
 
 /// One `Object` per `AccessToken` variant, sharing the same base fields
@@ -723,17 +547,10 @@ pub fn tag_input() -> InputObject {
 /// sequence travels with it now), so `(i64, String)` is this object's
 /// parent value directly - no wrapper struct needed.
 pub fn queried_event_object() -> Object {
-    Object::new("QueriedEvent")
-        .field(scalar_field(
-            "sequence",
-            TypeRef::named_nn(TypeRef::INT),
-            |e: &(i64, String)| Value::from(e.0),
-        ))
-        .field(scalar_field(
-            "payload",
-            TypeRef::named_nn(TypeRef::STRING),
-            |e: &(i64, String)| Value::from(e.1.clone()),
-        ))
+    gql_object!((i64, String) => "QueriedEvent" {
+        scalar "sequence": TypeRef::named_nn(TypeRef::INT) => |e| Value::from(e.0),
+        scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.1.clone()),
+    })
 }
 
 /// `entity Event`'s `origin` field - a flat "kind + nullable per-variant
@@ -744,55 +561,36 @@ pub fn queried_event_object() -> Object {
 pub fn event_origin_object() -> Object {
     use skilj_core::event_store::EventOrigin;
 
-    Object::new("EventOrigin")
-        .field(scalar_field(
-            "kind",
-            TypeRef::named_nn(TypeRef::STRING),
-            |o: &EventOrigin| {
-                Value::from(match o {
-                    EventOrigin::ExternalTriggered { .. } => "EXTERNAL_TRIGGERED",
-                    EventOrigin::DirectlyCreated => "DIRECTLY_CREATED",
-                    EventOrigin::SystemTriggered => "SYSTEM_TRIGGERED",
-                    EventOrigin::CommandTriggered { .. } => "COMMAND_TRIGGERED",
-                })
-            },
-        ))
-        .field(scalar_field(
-            "sourceContent",
-            TypeRef::named(TypeRef::STRING),
-            |o: &EventOrigin| match o {
-                EventOrigin::ExternalTriggered { source_content, .. } => {
-                    Value::from(source_content.clone())
-                }
-                _ => Value::Null,
-            },
-        ))
-        .field(scalar_field(
-            "sourceContext",
-            TypeRef::named(TypeRef::STRING),
-            |o: &EventOrigin| match o {
-                EventOrigin::ExternalTriggered { source_context, .. } => {
-                    optional_string(source_context.clone())
-                }
-                _ => Value::Null,
-            },
-        ))
-        .field(object_field(
-            "triggeringCommandType",
-            TypeRef::named("CommandType"),
-            |o: &EventOrigin| match o {
-                EventOrigin::CommandTriggered { command } => Some(command.command_type.clone()),
-                _ => None,
-            },
-        ))
-        .field(scalar_field(
-            "triggeringCommandPayload",
-            TypeRef::named(TypeRef::STRING),
-            |o: &EventOrigin| match o {
-                EventOrigin::CommandTriggered { command } => Value::from(command.payload.clone()),
-                _ => Value::Null,
-            },
-        ))
+    gql_object!(EventOrigin => "EventOrigin" {
+        scalar "kind": TypeRef::named_nn(TypeRef::STRING) => |o| {
+            Value::from(match o {
+                EventOrigin::ExternalTriggered { .. } => "EXTERNAL_TRIGGERED",
+                EventOrigin::DirectlyCreated => "DIRECTLY_CREATED",
+                EventOrigin::SystemTriggered => "SYSTEM_TRIGGERED",
+                EventOrigin::CommandTriggered { .. } => "COMMAND_TRIGGERED",
+            })
+        },
+        scalar "sourceContent": TypeRef::named(TypeRef::STRING) => |o| match o {
+            EventOrigin::ExternalTriggered { source_content, .. } => {
+                Value::from(source_content.clone())
+            }
+            _ => Value::Null,
+        },
+        scalar "sourceContext": TypeRef::named(TypeRef::STRING) => |o| match o {
+            EventOrigin::ExternalTriggered { source_context, .. } => {
+                optional_string(source_context.clone())
+            }
+            _ => Value::Null,
+        },
+        object "triggeringCommandType": TypeRef::named("CommandType") => |o| match o {
+            EventOrigin::CommandTriggered { command } => Some(command.command_type.clone()),
+            _ => None,
+        },
+        scalar "triggeringCommandPayload": TypeRef::named(TypeRef::STRING) => |o| match o {
+            EventOrigin::CommandTriggered { command } => Value::from(command.payload.clone()),
+            _ => Value::Null,
+        },
+    })
 }
 
 fn optional_string(s: Option<String>) -> Value {
@@ -808,17 +606,10 @@ fn optional_string(s: Option<String>) -> Value {
 pub fn event_meta_object() -> Object {
     use skilj_core::event_store::Event;
 
-    Object::new("EventMeta")
-        .field(scalar_field(
-            "createdAt",
-            TypeRef::named_nn(TypeRef::STRING),
-            |e: &Event| Value::from(e.metadata.created_at.to_rfc3339()),
-        ))
-        .field(object_field(
-            "origin",
-            TypeRef::named_nn("EventOrigin"),
-            |e: &Event| Some(e.origin.clone()),
-        ))
+    gql_object!(Event => "EventMeta" {
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.metadata.created_at.to_rfc3339()),
+        object "origin": TypeRef::named_nn("EventOrigin") => |e| Some(e.origin.clone()),
+    })
 }
 
 /// `rule InspectEvent`'s own `ensures` - `event` and `rendered_payload`
@@ -830,17 +621,10 @@ pub struct InspectedEventData {
 }
 
 pub fn inspected_event_object() -> Object {
-    Object::new("InspectedEvent")
-        .field(object_field(
-            "event",
-            TypeRef::named_nn("EventMeta"),
-            |i: &InspectedEventData| Some(i.event.clone()),
-        ))
-        .field(scalar_field(
-            "renderedPayload",
-            TypeRef::named_nn(TypeRef::STRING),
-            |i: &InspectedEventData| Value::from(i.rendered_payload.clone()),
-        ))
+    gql_object!(InspectedEventData => "InspectedEvent" {
+        object "event": TypeRef::named_nn("EventMeta") => |i| Some(i.event.clone()),
+        scalar "renderedPayload": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.rendered_payload.clone()),
+    })
 }
 
 /// `SubmitCommand`'s own response shape - docs/architecture.md §5.4's
@@ -856,36 +640,29 @@ pub struct SubmitCommandResult {
 }
 
 pub fn submit_command_payload_object() -> Object {
-    Object::new("SubmitCommandPayload")
-        .field(scalar_field(
-            "accepted",
-            TypeRef::named_nn(TypeRef::BOOLEAN),
-            |r: &SubmitCommandResult| Value::from(r.accepted),
-        ))
-        .field(Field::new(
-            "triggeredEventSequences",
-            TypeRef::named_list(TypeRef::INT),
-            |ctx: ResolverContext| {
-                FieldFuture::new(async move {
-                    let parent = ctx.parent_value.try_downcast_ref::<SubmitCommandResult>()?;
-                    Ok(parent.triggered_event_sequences.as_ref().map(|sequences| {
-                        FieldValue::list(
-                            sequences.iter().map(|s| FieldValue::value(Value::from(*s))),
-                        )
-                    }))
-                })
-            },
-        ))
-        .field(scalar_field(
-            "rejectionReason",
-            TypeRef::named(TypeRef::STRING),
-            |r: &SubmitCommandResult| optional_string(r.rejection_reason.clone()),
-        ))
-        .field(scalar_field(
-            "rejectionKind",
-            TypeRef::named(TypeRef::STRING),
-            |r: &SubmitCommandResult| optional_string(r.rejection_kind.clone()),
-        ))
+    // `triggeredEventSequences` is a nullable *list of scalars* -
+    // `scalar_field`/`object_field`/`list_field` (and so `gql_object!`
+    // itself) only cover a bare scalar, a nullable nested object, and a
+    // non-null list of nested objects; a nullable list of plain `Int`s
+    // fits none of the three, so this one field stays a hand-written
+    // `Field::new(...)`, appended after the macro-generated ones below.
+    gql_object!(SubmitCommandResult => "SubmitCommandPayload" {
+        scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
+        scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_reason.clone()),
+        scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
+    })
+    .field(Field::new(
+        "triggeredEventSequences",
+        TypeRef::named_list(TypeRef::INT),
+        |ctx: ResolverContext| {
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_downcast_ref::<SubmitCommandResult>()?;
+                Ok(parent.triggered_event_sequences.as_ref().map(|sequences| {
+                    FieldValue::list(sequences.iter().map(|s| FieldValue::value(Value::from(*s))))
+                }))
+            })
+        },
+    ))
 }
 
 pub fn encryption_key_status_name(status: EncryptionKeyStatus) -> &'static str {
@@ -907,32 +684,13 @@ pub fn encryption_key_status_enum() -> Enum {
 /// never crosses this boundary at all, see `skilj_core::encryption`'s own
 /// doc comment.
 pub fn encryption_key_object() -> Object {
-    Object::new("EncryptionKey")
-        .field(scalar_field(
-            "subjectKey",
-            TypeRef::named_nn(TypeRef::STRING),
-            |k: &EncryptionKey| Value::from(k.subject_key.clone()),
-        ))
-        .field(scalar_field(
-            "subjectValue",
-            TypeRef::named_nn(TypeRef::STRING),
-            |k: &EncryptionKey| Value::from(k.subject_value.clone()),
-        ))
-        .field(scalar_field(
-            "status",
-            TypeRef::named_nn("EncryptionKeyStatus"),
-            |k: &EncryptionKey| Value::from(encryption_key_status_name(k.status)),
-        ))
-        .field(scalar_field(
-            "createdAt",
-            TypeRef::named_nn(TypeRef::STRING),
-            |k: &EncryptionKey| Value::from(k.created_at.to_rfc3339()),
-        ))
-        .field(scalar_field(
-            "destroyedAt",
-            TypeRef::named(TypeRef::STRING),
-            |k: &EncryptionKey| optional_timestamp(k.destroyed_at),
-        ))
+    gql_object!(EncryptionKey => "EncryptionKey" {
+        scalar "subjectKey": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.subject_key.clone()),
+        scalar "subjectValue": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.subject_value.clone()),
+        scalar "status": TypeRef::named_nn("EncryptionKeyStatus") => |k| Value::from(encryption_key_status_name(k.status)),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.created_at.to_rfc3339()),
+        scalar "destroyedAt": TypeRef::named(TypeRef::STRING) => |k| optional_timestamp(k.destroyed_at),
+    })
 }
 
 /// `value Filter`'s own `operator` field. `resolvers::event_subscription`'s
