@@ -17,7 +17,7 @@
 //! and this bounded context's raw `Event`s into `T::decide()`. See
 //! `RegisteredCommandType`'s own doc comment for the closure itself.
 
-use skilj_core::access_control::{AccessLevel, JwksCache, Role};
+use skilj_core::access_control::{AccessLevel, JwksCache, RevocationBroadcaster, Role};
 use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
 use skilj_core::event_cache::EventCache;
@@ -96,6 +96,15 @@ pub struct Skilj {
     /// two" treatment `command_dispatcher`/`projection_dispatcher`
     /// already get.
     event_broadcaster: EventBroadcaster,
+    /// `EventSubscription`'s own second broadcast channel (drift audit
+    /// finding #4) - see `access_control::RevocationBroadcaster`'s own
+    /// doc comment for the full design. One shared, process-wide
+    /// instance, the same "constructed once in `.build()`, handed to
+    /// `graphql_router()`" treatment `event_broadcaster` gets (`rest_router()`
+    /// has no use for it - `AccessManagement`, the only surface that
+    /// publishes to it, and `EventSubscription`, the only surface that
+    /// subscribes, are both GraphQL-only).
+    revocation_broadcaster: RevocationBroadcaster,
     /// The in-memory per-bounded-context event cache (drift audit
     /// finding #8) - see `skilj_core::event_cache`'s own module doc
     /// comment for the full design. One shared, process-wide cache,
@@ -269,9 +278,8 @@ impl Skilj {
 
     /// `skilj-rest`'s routes, mounted onto a fresh `axum::Router` - see
     /// docs/architecture.md §7. A caller wanting the REST and GraphQL
-    /// surfaces combined merges this with the eventual GraphQL router
-    /// (§8 item 5, not built yet) however `axum::Router::merge`/`nest`
-    /// suits their own application.
+    /// surfaces combined merges this with `graphql_router()` however
+    /// `axum::Router::merge`/`nest` suits their own application.
     pub fn rest_router(&self) -> axum::Router {
         skilj_rest::router(
             self.pool.clone(),
@@ -317,6 +325,7 @@ impl Skilj {
             projection_query_wait_timeout: self.projection_query_wait_timeout,
             encryption_master_key: self.encryption_master_key.clone(),
             event_broadcaster: self.event_broadcaster.clone(),
+            revocation_broadcaster: self.revocation_broadcaster.clone(),
             event_cache: self.event_cache.clone(),
         };
         skilj_graphql::router(state).await
@@ -768,6 +777,13 @@ impl SkiljBuilder {
             );
         }
 
+        // Taken here, ahead of the `Skilj` struct itself further down, so
+        // the same `Arc` (cheap to clone) can back both the reconciliation
+        // dispatcher below - needed for `needs_history_fold` (drift audit
+        // finding #3) - and the field `Skilj` is built with at the bottom
+        // of this function.
+        let projections = Arc::new(self.projections);
+
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
             let role = skilj_core::access_control::resolve_role_by_external_subject(
@@ -785,7 +801,17 @@ impl SkiljBuilder {
             )
             .await?;
             reconcile_command_types(&pool, &role, &self.command_types, &mut report).await?;
-            reconcile_projections(&pool, &role, &self.projections, &mut report).await?;
+            let reconciliation_dispatcher = ProjectionDispatcherImpl {
+                projections: projections.clone(),
+            };
+            reconcile_projections(
+                &pool,
+                &role,
+                &projections,
+                &mut report,
+                &reconciliation_dispatcher,
+            )
+            .await?;
         }
 
         let identity_provider = self.identity_provider.map(|config| {
@@ -799,6 +825,7 @@ impl SkiljBuilder {
         let projection_query_wait_timeout = self.projection_query_wait_timeout;
         let encryption_master_key = self.encryption_master_key;
         let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
+        let revocation_broadcaster = RevocationBroadcaster::new();
 
         // The in-memory per-bounded-context event cache (drift audit
         // finding #8) - warmed here, before the first request can be
@@ -816,13 +843,14 @@ impl SkiljBuilder {
         let skilj = Skilj {
             pool,
             command_types: Arc::new(self.command_types),
-            projections: Arc::new(self.projections),
+            projections,
             event_types: Arc::new(self.event_types),
             bootstrap_secret,
             identity_provider,
             projection_query_wait_timeout,
             encryption_master_key,
             event_broadcaster,
+            revocation_broadcaster,
             event_cache,
         };
 
@@ -909,33 +937,71 @@ impl SkiljBuilder {
     }
 }
 
+/// A generous bound on how many occurrences one event type's own backlog
+/// gets raised in a single `scheduler_tick`, not a correctness
+/// requirement - without one, an event type owed a truly enormous
+/// `replay_backlog` after a long outage could block this tick, shared by
+/// every other bounded context and event type, for as long as fully
+/// catching it up takes. Occurrences beyond this cap are simply left for
+/// the next tick, which resumes from wherever the real, shared position
+/// actually landed - the same "recent window, not a hard limit on
+/// correctness" register `EventCache`'s own `capacity` is in, which is
+/// also where this exact number comes from.
+const MAX_OCCURRENCES_PER_TICK: usize = 1000;
+
 /// One scheduler tick, across every active bounded context - `rule
 /// CreateSystemEvent`/`rule SkipMissedOccurrences`'s own wake mechanism,
 /// factored out of `SkiljBuilder::build`'s spawned task so its control
 /// flow (nested loops, several early-`continue`s) doesn't have to live
-/// inside a `tokio::spawn` closure. For each `system_triggered_allowed`
-/// `EventType` `db::list_scheduled_event_types` returns, computes the
-/// earliest occurrence its own `schedule_position` hasn't accounted for
-/// yet (`next_occurrence_after(schedule, position)`) and, if it's due
-/// (`occurrence_at <= now`):
+/// inside a `tokio::spawn` closure.
+///
+/// For each `system_triggered_allowed` `EventType` `db::
+/// list_scheduled_event_types` returns, raises every occurrence its own
+/// `schedule_position` hasn't accounted for yet that is already due, in
+/// ascending order, up to `MAX_OCCURRENCES_PER_TICK` - the spec's own
+/// "the scheduler's own side of that contract is uniform across all
+/// three policies... raise every occurrence beyond the position that has
+/// come due, in ascending order, and nothing else" (the note above
+/// `rule CreateSystemEvent`), not just the single earliest one. A local,
+/// tick-scoped `cursor` walks this search forward - `next_occurrence_after`
+/// would otherwise recompute the identical earliest occurrence forever,
+/// since only a *successful* fire ever advances the real, shared
+/// position - without writing anywhere itself; only `db::fire_system_event`/
+/// `skip_missed_occurrences_for_event_type` ever touch the real
+/// `schedule_position`. This is what lets `fire_once` genuinely reach a
+/// backlog's own last occurrence within one tick, rather than being
+/// offered the same, correctly-rejected earliest one on every future
+/// tick too (the earlier version of this function's own bug: it only
+/// ever raised the first occurrence, so a `fire_once` type more than one
+/// occurrence behind could never fire again).
+///
+/// Each raised occurrence is handled per policy:
 ///
 ///   - under `skip`, first checks whether a *second* occurrence is also
 ///     already due (`nothing_later_is_due` - the identical computation
 ///     `event_store::create_system_event`'s own eligibility gate makes
 ///     internally) - a real backlog, which `skip` can only ever resolve
 ///     by jumping straight to `now` (`db::skip_missed_occurrences_for_event_type`),
-///     never by firing occurrence by occurrence (that would violate
-///     `no_gap` the moment more than one is overdue);
+///     never by raising occurrence by occurrence (every one but the
+///     last would just be correctly rejected for a gap anyway, per
+///     `no_gap`) - and stops raising further occurrences for this event
+///     type this tick either way, the same "closed without firing"
+///     `SkipMissedOccurrences` itself is;
 ///   - otherwise, attempts to fire it via `db::fire_system_event`, which
 ///     re-derives eligibility for real under its own row lock - this
 ///     function's own checks are a cheap, non-authoritative pre-filter
 ///     only, the same "peek here, re-check under lock there" split
-///     `submit_command` already uses.
+///     `submit_command` already uses. `replay_backlog` fires every
+///     occurrence in turn; `fire_once` correctly rejects every one but
+///     the backlog's own last, which the `cursor` walking forward is
+///     what actually lets it reach.
 ///
-/// A database error at any step is logged and that step skipped, not
-/// propagated - there is no caller here to propagate it *to*; the next
-/// tick tries again, the same tolerance `catch_up_bounded_context`'s own
-/// poll task already has for its own errors.
+/// A database error at any step is logged and that event type's own
+/// remaining backlog abandoned for this tick (not the whole function -
+/// other bounded contexts/event types still get their own turn), the
+/// same tolerance `catch_up_bounded_context`'s own poll task already has
+/// for its own errors; the next tick tries again from wherever the real
+/// position landed.
 async fn scheduler_tick(
     pool: &Pool,
     projection_dispatcher: &dyn skilj_core::plugin::ProjectionDispatcher,
@@ -967,60 +1033,71 @@ async fn scheduler_tick(
             }
         };
         for et in &scheduled {
-            let (Some(schedule), Some(policy), Some(position)) = (
+            let (Some(schedule), Some(policy), Some(initial_position)) = (
                 &et.system_triggered_schedule,
                 et.missed_occurrence_policy,
                 et.schedule_position,
             ) else {
                 continue;
             };
-            let Some(occurrence_at) =
-                skilj_core::event_store::next_occurrence_after(schedule, position)
-            else {
-                continue;
-            };
-            if occurrence_at > now {
-                continue;
-            }
 
-            let nothing_later_is_due =
-                skilj_core::event_store::next_occurrence_after(schedule, occurrence_at)
-                    .is_none_or(|next| next > now);
+            let mut cursor = initial_position;
+            for _ in 0..MAX_OCCURRENCES_PER_TICK {
+                let Some(occurrence_at) =
+                    skilj_core::event_store::next_occurrence_after(schedule, cursor)
+                else {
+                    break;
+                };
+                if occurrence_at > now {
+                    break;
+                }
 
-            if policy == skilj_core::event_store::MissedOccurrencePolicy::Skip
-                && !nothing_later_is_due
-            {
-                if let Err(e) = skilj_core::db::skip_missed_occurrences_for_event_type(
-                    pool, &bc.name, &et.name, now,
+                let nothing_later_is_due =
+                    skilj_core::event_store::next_occurrence_after(schedule, occurrence_at)
+                        .is_none_or(|next| next > now);
+
+                if policy == skilj_core::event_store::MissedOccurrencePolicy::Skip
+                    && !nothing_later_is_due
+                {
+                    if let Err(e) = skilj_core::db::skip_missed_occurrences_for_event_type(
+                        pool, &bc.name, &et.name, now,
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "skilj: SkipMissedOccurrences failed for {}/{}: {e}",
+                            bc.name, et.name
+                        );
+                    }
+                    break;
+                }
+
+                if let Err(e) = skilj_core::db::fire_system_event(
+                    pool,
+                    projection_dispatcher,
+                    event_dispatcher,
+                    broadcaster,
+                    event_cache,
+                    &bc.name,
+                    &et.name,
+                    occurrence_at,
+                    now,
+                    encryption_master_key,
                 )
                 .await
                 {
                     eprintln!(
-                        "skilj: SkipMissedOccurrences failed for {}/{}: {e}",
+                        "skilj: CreateSystemEvent failed for {}/{}: {e}",
                         bc.name, et.name
                     );
+                    break;
                 }
-                continue;
-            }
 
-            if let Err(e) = skilj_core::db::fire_system_event(
-                pool,
-                projection_dispatcher,
-                event_dispatcher,
-                broadcaster,
-                event_cache,
-                &bc.name,
-                &et.name,
-                occurrence_at,
-                now,
-                encryption_master_key,
-            )
-            .await
-            {
-                eprintln!(
-                    "skilj: CreateSystemEvent failed for {}/{}: {e}",
-                    bc.name, et.name
-                );
+                // Whether this occurrence actually produced an event
+                // (`fire_once` rejects every one but a backlog's own
+                // last) or not, this tick's own search has to move past
+                // it - see this function's own doc comment for why.
+                cursor = occurrence_at;
             }
         }
     }
@@ -1169,6 +1246,7 @@ async fn reconcile_projections(
     role: &Role,
     projections: &HashMap<(String, String), RegisteredProjection>,
     report: &mut ReconciliationReport,
+    dispatcher: &dyn skilj_core::plugin::ProjectionDispatcher,
 ) -> Result<(), skilj_core::Error> {
     for ((bounded_context_name, name), registered) in projections {
         let key = format!("{bounded_context_name}/{name}");
@@ -1216,8 +1294,10 @@ async fn reconcile_projections(
             &bounded_context_events,
         )?;
         match registration {
-            ProjectionRegistration::Created(projection)
-            | ProjectionRegistration::ReconciledTrivially(projection) => {
+            ProjectionRegistration::Created {
+                projection,
+                needs_history_fold,
+            } => {
                 skilj_core::db::upsert_projection(pool, &projection).await?;
                 // No `projection_state` seeding here anymore (§9's
                 // "keyed / multi-row Projections" pass) - a projection's
@@ -1225,7 +1305,23 @@ async fn reconcile_projections(
                 // them, so every instance's own row is created lazily,
                 // on first touch, the same uniform path whether this
                 // projection ever uses a real key or stays on the
-                // implicit single one.
+                // implicit single one. `needs_history_fold` (drift audit
+                // finding #3) is the one exception: a first-time sync
+                // projection with pre-existing matching history is
+                // folded immediately, right here, rather than waiting on
+                // any lazy touch that will never come for events already
+                // committed before this registration.
+                if needs_history_fold {
+                    skilj_core::db::fold_history_into_new_sync_projection(
+                        pool,
+                        &projection,
+                        dispatcher,
+                    )
+                    .await?;
+                }
+            }
+            ProjectionRegistration::ReconciledTrivially(projection) => {
+                skilj_core::db::upsert_projection(pool, &projection).await?;
             }
             ProjectionRegistration::RebuildStaged(rebuild) => {
                 skilj_core::db::upsert_projection_rebuild(pool, &rebuild).await?;

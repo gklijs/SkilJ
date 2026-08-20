@@ -5,10 +5,11 @@
 //! `DirectlyCreated`, rules `CreateExternalEvent`/`CreateDirectEvent`.
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
-//! filtered to this pair of surfaces' eight source constructs): 20 total
-//! (18 from the original pass, plus rule-failure.CreateExternalEvent.4/
-//! CreateDirectEvent.4 - `valid_payload`'s own new requires clause on
-//! both rules).
+//! filtered to this pair of surfaces' ten source constructs): 22 total
+//! (18 from the original pass, plus rule-failure.CreateExternalEvent.4/5
+//! and CreateDirectEvent.4/5 - `valid_payload`'s own requires clause on
+//! both rules, renumbered to .5 once the drift audit's P4 batch added
+//! `event_type.bounded_context.status = active` at .4 on each).
 //! Uncovered this pass, with reason - see the doc comment at the bottom
 //! of this file: `surface-actor`/`surface-provides` for each surface (4),
 //! same REST-scaffolding gap as EventFetch's three uncovered obligations.
@@ -93,7 +94,7 @@ fn direct_creation_token_carries_its_variant_specific_field() {
 }
 
 // ---------------------------------------------------------------------
-// rule-success.CreateExternalEvent / rule-failure.CreateExternalEvent.{1,2,3,4}
+// rule-success.CreateExternalEvent / rule-failure.CreateExternalEvent.{1,2,3,4,5}
 // / rule-entity-creation.CreateExternalEvent.1
 // / sum-type-variant.ExternalTriggered
 // ---------------------------------------------------------------------
@@ -223,7 +224,31 @@ fn create_external_event_rejects_a_revoked_token() {
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
 }
 
-/// rule-failure.CreateExternalEvent.4 - `requires: valid_payload(event_type.schema, payload)`.
+/// rule-failure.CreateExternalEvent.4 - `requires: event_type.bounded_context.status = active`.
+#[test]
+fn create_external_event_rejects_an_archived_bounded_context() {
+    let mut et = event_type(true, false);
+    et.bounded_context.status = BoundedContextStatus::Archived;
+    let adapter = external_token(TokenStatus::Active, et);
+
+    let err = event_store::create_external_event(
+        &adapter,
+        "{}".into(),
+        "raw".into(),
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        event_store::Error::BoundedContextArchived.code()
+    );
+}
+
+/// rule-failure.CreateExternalEvent.5 - `requires: valid_payload(event_type.schema, payload)`.
 #[test]
 fn create_external_event_rejects_a_payload_that_does_not_match_the_schema() {
     let et = EventType {
@@ -281,7 +306,7 @@ fn create_external_event_derives_real_tags_from_a_real_tag_mapping() {
 }
 
 // ---------------------------------------------------------------------
-// rule-success.CreateDirectEvent / rule-failure.CreateDirectEvent.{1,2,3,4}
+// rule-success.CreateDirectEvent / rule-failure.CreateDirectEvent.{1,2,3,4,5}
 // / rule-entity-creation.CreateDirectEvent.1 / sum-type-variant.DirectlyCreated
 // ---------------------------------------------------------------------
 
@@ -381,7 +406,25 @@ fn create_direct_event_rejects_a_revoked_token() {
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
 }
 
-/// rule-failure.CreateDirectEvent.4 - `requires: valid_payload(event_type.schema, payload)`.
+/// rule-failure.CreateDirectEvent.4 - `requires: event_type.bounded_context.status = active`.
+#[test]
+fn create_direct_event_rejects_an_archived_bounded_context() {
+    let mut et = event_type(false, true);
+    et.bounded_context.status = BoundedContextStatus::Archived;
+    let adapter = direct_token(TokenStatus::Active, et);
+
+    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
+        unreachable!("no sensitive fields in this test")
+    })
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        event_store::Error::BoundedContextArchived.code()
+    );
+}
+
+/// rule-failure.CreateDirectEvent.5 - `requires: valid_payload(event_type.schema, payload)`.
 #[test]
 fn create_direct_event_rejects_a_payload_that_does_not_match_the_schema() {
     let et = EventType {

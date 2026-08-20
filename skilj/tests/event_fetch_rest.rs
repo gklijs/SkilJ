@@ -260,6 +260,66 @@ fn get_events_filter_param_narrows_results_for_real_over_rest() {
     });
 }
 
+/// Drift audit finding #8 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): `surface EventFetch`'s own `exposes:
+/// event_type.name/schema/schema_version` had no REST route returning
+/// `schema`/`schema_version` at all - only the bare name, per delivered
+/// event. Checks both `FetchEvents` and `ConsumeEvents`, since the fix
+/// touches both responses independently.
+#[test]
+fn get_events_and_consume_expose_the_real_event_type_schema() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+
+        deposit(&router, &direct_credential, 5).await;
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events")
+            .header("authorization", format!("Bearer {read_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["eventTypeName"], "MoneyDeposited");
+        assert_eq!(json["eventTypeSchemaVersion"], 1);
+        let schema = json["eventTypeSchema"].as_str().unwrap();
+        assert!(
+            schema.contains("amount"),
+            "the real MoneyDepositedPayload schema must be returned, not a placeholder: {schema}"
+        );
+
+        let request = Request::builder()
+            .method("GET")
+            // mode=auto - a brand new cursor must state its own mode
+            // (rule-failure.ConsumeEvents.4), and this token has never
+            // consumed before.
+            .uri("/v1/events/consume?mode=auto")
+            .header("authorization", format!("Bearer {read_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["eventTypeName"], "MoneyDeposited");
+        assert_eq!(json["eventTypeSchemaVersion"], 1);
+        assert!(json["eventTypeSchema"].as_str().unwrap().contains("amount"));
+    });
+}
+
 #[test]
 fn get_events_rejects_a_malformed_filter_param_with_400() {
     runtime().block_on(async {

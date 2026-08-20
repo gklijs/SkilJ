@@ -14,6 +14,7 @@ pub mod resolvers;
 pub mod schema;
 
 use async_graphql::dynamic::Schema;
+use skilj_core::access_control::RevocationBroadcaster;
 use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
 use skilj_core::encryption::EncryptionMasterKey;
@@ -65,6 +66,13 @@ pub struct GraphqlState {
     /// `projection_dispatcher` above are: one shared, process-wide
     /// broadcaster, not a second one.
     pub event_broadcaster: EventBroadcaster,
+    /// `EventSubscription`'s own second broadcast channel (drift audit
+    /// finding #4) - see `access_control::RevocationBroadcaster`'s own
+    /// doc comment for the full design: `resolvers::access_management`
+    /// publishes here on every real revocation, `resolvers::event_subscription`
+    /// closes a matching live connection the instant one arrives, rather
+    /// than only at its own next delivered event.
+    pub revocation_broadcaster: RevocationBroadcaster,
     /// `QueryEvents`/`CountEvents`/`InspectEvent`'s and `submitCommand`'s
     /// own DCB pre-check's real read path (drift audit finding #8) - the
     /// identical `EventCache` `Skilj::rest_router()` hands its own

@@ -260,9 +260,9 @@ pub trait Projection {
 }
 
 /// Type-erased dispatch to a bounded context's own typed `decide()` -
-/// what `CommandTrigger`'s REST handler (and, once built, GraphQL's
-/// `CommandSubmission` resolver) calls through to actually process a
-/// command. Lives here, as a trait, rather than `skilj-rest`/
+/// what `CommandTrigger`'s REST handler and GraphQL's `CommandSubmission`
+/// resolver both call through to actually process a command. Lives here,
+/// as a trait, rather than `skilj-rest`/
 /// `skilj-graphql` reaching into whichever crate happens to build the
 /// concrete registry (`skilj`'s `SkiljBuilder`, today): both surface
 /// crates already depend on `skilj-core`, so this is the natural shared

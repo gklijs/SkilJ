@@ -1,11 +1,15 @@
-//! `surface ProjectionQuery` - the one field, `projection`. `ReadAccess`-
-//! gated (any active level - `require_read_mapping`, not
+//! `surface ProjectionQuery` - `projection` (the data) and
+//! `projectionSchema` (the declared shape, drift audit finding #9 -
+//! 2026-08-20, see project memory `skilj-drift-audit-2026-08-20`). Both
+//! `ReadAccess`-gated (any active level - `require_read_mapping`, not
 //! `require_admin_mapping`). See `crate::projection_types` for how the
 //! `ProjectionResult` union and its per-projection member types are
-//! generated.
+//! generated (`projection`'s own concern - `projectionSchema` doesn't
+//! touch it at all, see that field's own doc comment).
 
 use super::{not_found, require_read_mapping};
 use crate::error::to_graphql_error;
+use crate::gql_types::ProjectionWithRebuild;
 use crate::projection_types::graphql_type_name;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -174,4 +178,52 @@ pub fn field() -> Field {
         "waitForSequence",
         TypeRef::named(TypeRef::INT),
     ))
+}
+
+/// `projectionSchema(boundedContext: String!, name: String!): Projection` -
+/// `ProjectionQuery`'s own `exposes: projection.name/schema/schema_version`
+/// (drift audit finding #9, 2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): before this field existed, the only
+/// way to see a `Projection`'s own declared schema was `TypeRegistration`'s
+/// `projections` query, `AdminAccess`-gated - a strictly stronger grant
+/// than `ProjectionQuery`'s own `facing access_mapping: ReadAccess`
+/// promises, so a plain read-level caller genuinely could not reach this
+/// data through any surface at all, contradicting the spec's own contract.
+///
+/// Reuses the already-registered `"Projection"` GraphQL object type
+/// unchanged (`gql_types::projection_object`) rather than inventing a
+/// second one - the type itself is generic over any caller's own grant
+/// level; only which resolver a query goes through decides what's
+/// reachable. `pendingRebuild`/`buildingRebuild` are always `null` here,
+/// deliberately: rebuild status is `TypeRegistration`'s own concern, not
+/// named in `ProjectionQuery`'s own `exposes` clause, so a `ReadAccess`
+/// caller querying those two fields through this field gets nothing
+/// rather than a second, narrower gate response readers would have to
+/// reason about differently from `projections`' own.
+pub fn schema_field() -> Field {
+    Field::new("projectionSchema", TypeRef::named("Projection"), |ctx| {
+        FieldFuture::new(async move {
+            let state = ctx.data::<GraphqlState>()?;
+            let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
+            require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+            let name = ctx.args.try_get("name")?.string()?.to_string();
+
+            let projection =
+                skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)
+                    .await
+                    .map_err(to_graphql_error)?
+                    .ok_or_else(|| not_found("Projection", &name))?;
+
+            Ok(Some(FieldValue::owned_any(ProjectionWithRebuild {
+                projection,
+                pending_rebuild: None,
+                building_rebuild: None,
+            })))
+        })
+    })
+    .argument(InputValue::new(
+        "boundedContext",
+        TypeRef::named_nn(TypeRef::STRING),
+    ))
+    .argument(InputValue::new("name", TypeRef::named_nn(TypeRef::STRING)))
 }

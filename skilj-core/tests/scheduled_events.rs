@@ -334,3 +334,22 @@ fn skip_missed_occurrences_rejects_an_inactive_bounded_context() {
         None
     );
 }
+
+/// Drift audit finding #10 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): `rule SkipMissedOccurrences`'s own
+/// first `requires` clause - not reachable from the real scheduler today
+/// (`list_scheduled_event_types` already filters to this flag before
+/// `skip_missed_occurrences_for_event_type` is ever called), but the pure
+/// function itself must still encode it, the same standard every other
+/// rule's own pure function in this module is held to.
+#[test]
+fn skip_missed_occurrences_rejects_an_event_type_not_opted_into_scheduling() {
+    let et = EventType {
+        system_triggered_allowed: false,
+        ..scheduled_event_type(MissedOccurrencePolicy::Skip, timestamp(1000), None)
+    };
+    assert_eq!(
+        event_store::skip_missed_occurrences(&et, timestamp(5000)),
+        None
+    );
+}

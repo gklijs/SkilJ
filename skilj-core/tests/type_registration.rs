@@ -244,6 +244,33 @@ fn valid_sensitive_fields_rejects_a_subject_field_the_schema_does_not_declare() 
     ));
 }
 
+/// Drift audit finding #2 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): a non-string `field` used to be
+/// accepted, and `protect_sensitive_fields` would silently replace it
+/// with a ciphertext *string*, corrupting the payload's own declared
+/// type. `amount` is `schema_v1`'s own `integer` field.
+#[test]
+fn valid_sensitive_fields_rejects_an_integer_field() {
+    assert!(!event_store::valid_sensitive_fields(
+        &schema_v1(),
+        &[sensitive_field("amount", "currency")]
+    ));
+}
+
+/// Same finding, the `ListOfScalar` half - a whole list was accepted and
+/// then silently collapsed into one ciphertext string wholesale
+/// (`protect_sensitive_fields`'s own `v.to_string()` fallback serialising
+/// the array first), not encrypted element-wise.
+#[test]
+fn valid_sensitive_fields_rejects_a_list_field() {
+    let schema =
+        r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"}}}}"#;
+    assert!(!event_store::valid_sensitive_fields(
+        schema,
+        &[sensitive_field("tags", "tags")]
+    ));
+}
+
 // ---------------------------------------------------------------------
 // valid_payload - see the "Payload schema shape" note above entity
 // CommandType in specs/skilj.allium; checked directly here, at the
@@ -308,7 +335,33 @@ fn valid_payload_allows_an_undeclared_extra_field() {
 }
 
 // ---------------------------------------------------------------------
-// rule-success.RegisterEventType (create path) / rule-failure.RegisterEventType.{1..7}
+// valid_schema - drift audit finding #16 (2026-08-20, see project memory
+// skilj-drift-audit-2026-08-20)
+// ---------------------------------------------------------------------
+
+#[test]
+fn valid_schema_accepts_a_real_schema() {
+    assert!(event_store::valid_schema(&schema_v1()));
+}
+
+#[test]
+fn valid_schema_rejects_malformed_json() {
+    assert!(!event_store::valid_schema("not json at all"));
+}
+
+/// Well-formed JSON, but not a valid JSON Schema document - the case
+/// `valid_tag_mappings`/`valid_sensitive_fields` alone never caught when
+/// a type declared neither, since both short-circuit `true` on empty
+/// input without ever calling `jsonschema::validator_for` at all.
+#[test]
+fn valid_schema_rejects_json_that_is_not_a_valid_json_schema() {
+    assert!(!event_store::valid_schema(
+        r#"{"type": "not_a_real_json_schema_type"}"#
+    ));
+}
+
+// ---------------------------------------------------------------------
+// rule-success.RegisterEventType (create path) / rule-failure.RegisterEventType.{1..9}
 // ---------------------------------------------------------------------
 
 #[test]
@@ -468,7 +521,39 @@ fn register_event_type_rejects_an_archived_bounded_context() {
     );
 }
 
-/// rule-failure.RegisterEventType.5 - `requires: valid_tag_mappings(schema, tag_mappings)`.
+/// rule-failure.RegisterEventType.5 - `requires: valid_schema(schema)`.
+/// Drift audit finding #16 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): the actual regression this closes -
+/// no `tag_mappings` and no `sensitive_fields` at all, the one
+/// combination that used to let a malformed schema through unrejected,
+/// since both validators short-circuit `true` on empty input.
+#[test]
+fn register_event_type_rejects_a_malformed_schema_even_with_no_tag_mappings_or_sensitive_fields() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    let err = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "OrderPlaced".into(),
+        "not json at all".into(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        false,
+        false,
+        None,
+        None,
+        true,
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), event_store::Error::InvalidSchema.code());
+}
+
+/// rule-failure.RegisterEventType.6 - `requires: valid_tag_mappings(schema, tag_mappings)`.
 #[test]
 fn register_event_type_rejects_a_tag_mapping_naming_an_undeclared_field() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
@@ -495,7 +580,7 @@ fn register_event_type_rejects_a_tag_mapping_naming_an_undeclared_field() {
     assert_eq!(err.code(), event_store::Error::InvalidTagMapping.code());
 }
 
-/// rule-failure.RegisterEventType.6 - `requires: valid_sensitive_fields(schema, sensitive_fields)`.
+/// rule-failure.RegisterEventType.7 - `requires: valid_sensitive_fields(schema, sensitive_fields)`.
 #[test]
 fn register_event_type_rejects_a_sensitive_field_naming_an_undeclared_field() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
@@ -522,7 +607,7 @@ fn register_event_type_rejects_a_sensitive_field_naming_an_undeclared_field() {
     assert_eq!(err.code(), event_store::Error::InvalidSensitiveField.code());
 }
 
-/// rule-failure.RegisterEventType.7 - a `TagMapping` and a `SensitiveField`
+/// rule-failure.RegisterEventType.8 - a `TagMapping` and a `SensitiveField`
 /// may not name the same field.
 #[test]
 fn register_event_type_rejects_a_tag_mapping_and_sensitive_field_overlap() {
@@ -554,7 +639,7 @@ fn register_event_type_rejects_a_tag_mapping_and_sensitive_field_overlap() {
 }
 
 // ---------------------------------------------------------------------
-// rule-success.RegisterEventType (update path) / rule-failure.RegisterEventType.{8,9}
+// rule-success.RegisterEventType (update path) / rule-failure.RegisterEventType.{10,11}
 // ---------------------------------------------------------------------
 
 #[test]
@@ -621,7 +706,7 @@ fn register_event_type_leaves_schema_version_unchanged_when_schema_is_identical(
     assert_eq!(result.event_type().schema_version, 1);
 }
 
-/// rule-failure.RegisterEventType.8 - `not exists existing or
+/// rule-failure.RegisterEventType.10 - `not exists existing or
 /// schema_is_backwards_compatible(existing.schema, schema)`.
 #[test]
 fn register_event_type_rejects_an_incompatible_schema_change() {
@@ -650,7 +735,7 @@ fn register_event_type_rejects_an_incompatible_schema_change() {
     assert_eq!(err.code(), event_store::Error::SchemaIncompatible.code());
 }
 
-/// rule-failure.RegisterEventType.9 - `not exists existing or
+/// rule-failure.RegisterEventType.11 - `not exists existing or
 /// existing.tag_mappings.all(m => tag_mappings.any(n => n.key = m.key))`.
 #[test]
 fn register_event_type_rejects_dropping_an_existing_tag_mapping_key() {
@@ -713,6 +798,13 @@ fn register_event_type_allows_retargeting_a_tag_mapping_key_to_a_different_field
 // schedule_position, last_fired_at (the missed-occurrence spec pass)
 // ---------------------------------------------------------------------
 
+/// rule-failure.RegisterEventType.9 - `requires: system_triggered_allowed
+/// = true implies (system_triggered_schedule != null and
+/// missed_occurrence_policy != null)`. Unlabeled until now - a
+/// pre-existing gap in this file's own numbering, found and fixed while
+/// relabeling around it for drift audit finding #16's own `valid_schema`
+/// insertion (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`).
 #[test]
 fn register_event_type_rejects_system_triggered_allowed_with_no_schedule_or_policy() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
@@ -903,7 +995,7 @@ fn register_event_type_re_anchors_schedule_position_when_switched_off_and_on_aga
 
 // ---------------------------------------------------------------------
 // rule-success.RegisterCommandType (create + update paths) /
-// rule-failure.RegisterCommandType.{1..9}
+// rule-failure.RegisterCommandType.{1..10}
 // ---------------------------------------------------------------------
 //
 // Same shape and requires-clauses as RegisterEventType above (see
@@ -1036,7 +1128,33 @@ fn register_command_type_rejects_an_archived_bounded_context() {
     );
 }
 
-/// rule-failure.RegisterCommandType.5
+/// rule-failure.RegisterCommandType.5 - `requires: valid_schema(schema)`.
+/// Drift audit finding #16 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`) - `register_command_type`'s own copy
+/// of the same regression `register_event_type`'s equivalent test above
+/// closes.
+#[test]
+fn register_command_type_rejects_a_malformed_schema_even_with_no_tag_mappings_or_sensitive_fields()
+{
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    let err = event_store::register_command_type(
+        &mapping,
+        &bc,
+        "PlaceOrder".into(),
+        "not json at all".into(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), event_store::Error::InvalidSchema.code());
+}
+
+/// rule-failure.RegisterCommandType.6
 #[test]
 fn register_command_type_rejects_a_tag_mapping_naming_an_undeclared_field() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
@@ -1057,7 +1175,7 @@ fn register_command_type_rejects_a_tag_mapping_naming_an_undeclared_field() {
     assert_eq!(err.code(), event_store::Error::InvalidTagMapping.code());
 }
 
-/// rule-failure.RegisterCommandType.6
+/// rule-failure.RegisterCommandType.7
 #[test]
 fn register_command_type_rejects_a_sensitive_field_naming_an_undeclared_field() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
@@ -1078,7 +1196,7 @@ fn register_command_type_rejects_a_sensitive_field_naming_an_undeclared_field() 
     assert_eq!(err.code(), event_store::Error::InvalidSensitiveField.code());
 }
 
-/// rule-failure.RegisterCommandType.7
+/// rule-failure.RegisterCommandType.8
 #[test]
 fn register_command_type_rejects_a_tag_mapping_and_sensitive_field_overlap() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
@@ -1129,7 +1247,7 @@ fn register_command_type_updates_in_place_and_bumps_schema_version_when_schema_c
     }
 }
 
-/// rule-failure.RegisterCommandType.8
+/// rule-failure.RegisterCommandType.9
 #[test]
 fn register_command_type_rejects_an_incompatible_schema_change() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
@@ -1151,7 +1269,7 @@ fn register_command_type_rejects_an_incompatible_schema_change() {
     assert_eq!(err.code(), event_store::Error::SchemaIncompatible.code());
 }
 
-/// rule-failure.RegisterCommandType.9
+/// rule-failure.RegisterCommandType.10
 #[test]
 fn register_command_type_rejects_dropping_an_existing_tag_mapping_key() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);

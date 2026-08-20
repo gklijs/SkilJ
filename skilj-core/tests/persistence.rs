@@ -822,6 +822,60 @@ fn update_role_persists_a_revocation() {
     });
 }
 
+/// `db::revoke_role_and_mappings` - the drift audit's P4 batch fix:
+/// `RevokeRole`'s own role-update-plus-mapping-cascade used to run as
+/// separate autocommit statements; this proves the real, single-call
+/// replacement leaves every active mapping revoked alongside the role
+/// itself, in the one call `access_management.rs::revoke_role_field` now
+/// makes instead of its own hand-rolled loop.
+#[test]
+fn revoke_role_and_mappings_revokes_the_role_and_every_active_mapping_together() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let role = seed_role(&pool, false).await;
+        let bc_a = seed_bounded_context(&pool).await;
+        let bc_b = seed_bounded_context(&pool).await;
+        let mapping_a =
+            seed_active_role_access_mapping(&pool, &role, &bc_a, AccessLevel::Admin).await;
+        let mapping_b =
+            seed_active_role_access_mapping(&pool, &role, &bc_b, AccessLevel::Write).await;
+
+        let revoked_at = test_now();
+        let revoked_role = Role {
+            status: RoleStatus::Revoked,
+            revoked_at: Some(revoked_at),
+            ..role.clone()
+        };
+        let revoked_mappings: Vec<_> = [mapping_a, mapping_b]
+            .into_iter()
+            .map(|m| RoleAccessMapping {
+                status: RoleStatus::Revoked,
+                revoked_at: Some(revoked_at),
+                ..m
+            })
+            .collect();
+
+        db::revoke_role_and_mappings(&pool, &revoked_role, &revoked_mappings)
+            .await
+            .unwrap();
+
+        let loaded_role = db::get_role(&pool, &role.id).await.unwrap();
+        assert_eq!(loaded_role, Some(revoked_role));
+        for bc in [&bc_a, &bc_b] {
+            let loaded_mapping = db::get_active_role_access_mapping(&pool, &role.id, &bc.name)
+                .await
+                .unwrap();
+            assert_eq!(
+                loaded_mapping, None,
+                "mapping for {:?} must no longer be active",
+                bc.name
+            );
+        }
+    });
+}
+
 #[test]
 fn round_trips_an_active_role_access_mapping() {
     runtime().block_on(async {

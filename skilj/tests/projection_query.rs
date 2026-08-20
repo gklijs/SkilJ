@@ -675,6 +675,199 @@ fn projection_query_end_to_end() {
     });
 }
 
+/// Drift audit finding #9 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): `ProjectionQuery`'s own `exposes:
+/// projection.name/schema/schema_version` had no route reachable at
+/// `ReadAccess` level - only `TypeRegistration`'s `AdminAccess`-gated
+/// `projections` query returned this data. Checks the new
+/// `projectionSchema` field directly: reachable by a plain `ReadAccess`
+/// grant (the fix), still rejects a caller with no grant at all, and
+/// still rejects an unknown projection name.
+#[test]
+fn projection_schema_end_to_end() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+
+        let admin_mapping = RoleAccessMapping {
+            role: admin_role.clone(),
+            bounded_context: bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &admin_mapping)
+            .await
+            .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<WithdrawMoney>()
+            .projection::<AccountBalance>()
+            .reconciliation_role(admin_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let admin_jwt = sign_jwt(&admin_role.external_subject);
+        let router = skilj.graphql_router().await.unwrap();
+
+        let query = "query($bc: String!, $name: String!) { \
+            projectionSchema(boundedContext: $bc, name: $name) { \
+                name schema schemaVersion \
+            } \
+        }";
+
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            query,
+            json!({ "bc": bc_name, "name": "AccountBalance" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["projectionSchema"]["name"],
+            "AccountBalance"
+        );
+        assert_eq!(response["data"]["projectionSchema"]["schemaVersion"], 1);
+        let schema = response["data"]["projectionSchema"]["schema"]
+            .as_str()
+            .unwrap();
+        assert!(
+            schema.contains("total"),
+            "the real AccountBalanceState schema must be returned: {schema}"
+        );
+
+        // A plain Read-level grant reaches this too - the fix itself:
+        // ProjectionQuery faces ReadAccess, not AdminAccess.
+        let reader_subject = unique_name("reader");
+        let reader_role = Role {
+            id: generate_token_id(),
+            external_subject: reader_subject.clone(),
+            name: "Reader".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &reader_role)
+            .await
+            .unwrap();
+        let reader_mapping = RoleAccessMapping {
+            role: reader_role,
+            bounded_context: bc.clone(),
+            level: AccessLevel::Read,
+            can_read_sensitive: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &reader_mapping)
+            .await
+            .unwrap();
+        let reader_jwt = sign_jwt(&reader_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&reader_jwt),
+            query,
+            json!({ "bc": bc_name, "name": "AccountBalance" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["projectionSchema"]["name"],
+            "AccountBalance"
+        );
+
+        // No grant at all - still rejected.
+        let stranger_subject = unique_name("stranger");
+        let stranger_role = Role {
+            id: generate_token_id(),
+            external_subject: stranger_subject.clone(),
+            name: "Stranger".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &stranger_role)
+            .await
+            .unwrap();
+        let stranger_jwt = sign_jwt(&stranger_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&stranger_jwt),
+            query,
+            json!({ "bc": bc_name, "name": "AccountBalance" }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "grant_not_active"
+        );
+
+        // An unknown projection name.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            query,
+            json!({ "bc": bc_name, "name": "NoSuchProjection" }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "Projection_not_found"
+        );
+    });
+}
+
 /// §9's own "keyed / multi-row Projections" pass, end-to-end: three real
 /// `ItemPurchased` events (two for `"alice"`, one for `"bob"`), each
 /// customer's own row queried independently, a never-touched key

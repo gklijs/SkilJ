@@ -79,20 +79,21 @@ pub fn revoke_role_field() -> Field {
             )
             .map_err(to_graphql_error)?;
 
-            skilj_core::db::update_role(&state.pool, &revoked_role)
+            skilj_core::db::revoke_role_and_mappings(&state.pool, &revoked_role, &revoked_mappings)
                 .await
                 .map_err(to_graphql_error)?;
+
+            // RevocationClosesTheConnection's push half (drift audit
+            // finding #4) - one notification per mapping this cascade
+            // just revoked, since each may back a live EventSubscription
+            // in its own bounded context.
             for mapping in &revoked_mappings {
-                skilj_core::db::revoke_active_role_access_mapping(
-                    &state.pool,
-                    &role_id,
-                    &mapping.bounded_context.name,
-                    mapping
-                        .revoked_at
-                        .expect("revoke_role always stamps revoked_at on every mapping it returns"),
-                )
-                .await
-                .map_err(to_graphql_error)?;
+                state
+                    .revocation_broadcaster
+                    .publish(skilj_core::access_control::RevokedMapping {
+                        role_id: mapping.role.id.clone(),
+                        bounded_context: mapping.bounded_context.name.clone(),
+                    });
             }
 
             Ok(Some(FieldValue::owned_any(revoked_role)))
@@ -210,6 +211,16 @@ pub fn revoke_role_access_mapping_field() -> Field {
                 )
                 .await
                 .map_err(to_graphql_error)?;
+
+                // RevocationClosesTheConnection's push half (drift audit
+                // finding #4) - see revoke_role_field's own identical call
+                // above.
+                state
+                    .revocation_broadcaster
+                    .publish(skilj_core::access_control::RevokedMapping {
+                        role_id: role_id.clone(),
+                        bounded_context: bounded_context_name.clone(),
+                    });
 
                 Ok(Some(FieldValue::owned_any(revoked)))
             })

@@ -242,6 +242,7 @@ async fn provision_bounded_context_schema(
     sqlx::query(&format!(
         "CREATE TABLE {schema}.commands (
             id BIGSERIAL PRIMARY KEY,
+            external_id TEXT NOT NULL UNIQUE,
             command_type_name TEXT NOT NULL REFERENCES {schema}.command_types (name),
             payload TEXT NOT NULL,
             metadata_type TEXT NOT NULL,
@@ -560,8 +561,14 @@ pub async fn list_roles(pool: &Pool) -> crate::error::Result<Vec<Role>> {
 
 /// Persists whatever `revoke_role`/`create_superadmin` (or any future
 /// rule) produced - a full-row overwrite by `id`, not an upsert; the row
-/// must already exist (`insert_role` already ran).
-pub async fn update_role(pool: &Pool, role: &Role) -> crate::error::Result<()> {
+/// must already exist (`insert_role` already ran). `impl PgExecutor`,
+/// the same "works on `&Pool` autocommit or inside a caller's own open
+/// `Transaction`" treatment `next_sequence` already gets - `revoke_role_and_mappings`
+/// below is what needs the latter.
+pub async fn update_role<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    role: &Role,
+) -> crate::error::Result<()> {
     sqlx::query(
         "UPDATE roles SET external_subject = $1, name = $2, superadmin = $3, status = $4, \
          created_at = $5, revoked_at = $6 WHERE id = $7",
@@ -573,7 +580,7 @@ pub async fn update_role(pool: &Pool, role: &Role) -> crate::error::Result<()> {
     .bind(role.created_at)
     .bind(role.revoked_at)
     .bind(&role.id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -1486,6 +1493,7 @@ pub async fn destroy_encryption_key(
 
 #[derive(sqlx::FromRow)]
 struct CommandRow {
+    external_id: String,
     command_type_name: String,
     payload: String,
     metadata_type: String,
@@ -1506,6 +1514,7 @@ impl CommandRow {
             .await?
             .expect("commands row references a command_types row that no longer exists");
         Ok(Command {
+            id: self.external_id,
             bounded_context: command_type.bounded_context.clone(),
             command_type,
             payload: self.payload,
@@ -1522,12 +1531,22 @@ impl CommandRow {
     }
 }
 
-const COMMAND_COLUMNS: &str = "command_type_name, payload, metadata_type, metadata_version, \
-    metadata_client_id, metadata_created_at, consistency_tags, consistency_boundary";
+// `external_id` - not `id`, this table's own internal `BIGSERIAL` primary
+// key, purely an FK-linking detail `insert_command` returns separately
+// and never surfaces on `Command` itself - is `Command.id` (drift audit
+// finding #12): a real, `generate_token_id()`-assigned identity, added so
+// `fetch_commands`'s own `triggered_event` lookup can match a specific
+// command precisely rather than by whole-struct content equality.
+const COMMAND_COLUMNS: &str = "external_id, command_type_name, payload, metadata_type, \
+    metadata_version, metadata_client_id, metadata_created_at, consistency_tags, \
+    consistency_boundary";
 
-/// Insert-only, unlike every `upsert_*` above - a `Command` has no
-/// identity to update against (see the migration's own doc comment on
-/// `commands`), so every call is a new row. Returns the new row's `id`,
+/// Insert-only, unlike every `upsert_*` above - re-registration/promotion
+/// don't apply to a `Command`, so every call is a new row, even though it
+/// now has a real identity of its own (`Command.id`, drift audit finding
+/// #12 - not this row's internal `BIGSERIAL id`, returned separately
+/// below and never surfaced on the domain struct - see the migration's
+/// own doc comment on `commands`). Returns the new row's internal `id`,
 /// needed to link the `Event`s `process_command` produced back to it (see
 /// `insert_event`'s own `command_id` parameter). `encryption_key_ids` is
 /// `get_or_create_encryption_key`'s own returned `id`s for
@@ -1550,8 +1569,9 @@ pub async fn insert_command(
     let schema = schema_ident(&command.bounded_context.name);
     let (id,): (i64,) = sqlx::query_as(&format!(
         "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id"
     ))
+    .bind(&command.id)
     .bind(&command.command_type.name)
     .bind(&command.payload)
     .bind(&command.metadata.r#type)
@@ -2356,9 +2376,10 @@ pub async fn list_active_role_access_mappings_for_role(
 /// cascade) outcome directly, by the same unambiguous `(role_id,
 /// bounded_context, status = 'active')` triple `get_active_role_access_mapping`
 /// reads by - safe without needing a synthetic id, since at most one row
-/// can ever match (see the migration's own partial unique index).
-pub async fn revoke_active_role_access_mapping(
-    pool: &Pool,
+/// can ever match (see the migration's own partial unique index). `impl
+/// PgExecutor` - same reasoning as `update_role`'s own doc comment.
+pub async fn revoke_active_role_access_mapping<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     role_id: &str,
     bounded_context: &str,
     revoked_at: DateTime<Utc>,
@@ -2370,8 +2391,41 @@ pub async fn revoke_active_role_access_mapping(
     .bind(revoked_at)
     .bind(role_id)
     .bind(bounded_context)
-    .execute(pool)
+    .execute(executor)
     .await?;
+    Ok(())
+}
+
+/// `rule RevokeRole`'s own atomic whole - the role's own status update
+/// and every one of its now-`revoked` `RoleAccessMapping`s, in one
+/// transaction (drift audit P4 batch: this used to run as N+1 separate
+/// autocommit statements - `update_role` then one `revoke_active_role_access_mapping`
+/// per mapping - so a crash or a database error partway through could
+/// leave a role revoked with some of its own mappings still active, or
+/// the reverse. Mirrors the "one transaction, single commit" shape
+/// `submit_command` already establishes for the identical reason -
+/// `RevokedRoleImpliesMappingsRevoked` now holds for real, not just when
+/// nothing goes wrong partway through.
+pub async fn revoke_role_and_mappings(
+    pool: &Pool,
+    role: &Role,
+    mappings: &[RoleAccessMapping],
+) -> crate::error::Result<()> {
+    let mut tx = pool.begin().await?;
+    update_role(&mut *tx, role).await?;
+    for mapping in mappings {
+        let revoked_at = mapping
+            .revoked_at
+            .expect("revoke_role always stamps revoked_at on every mapping it returns");
+        revoke_active_role_access_mapping(
+            &mut *tx,
+            &role.id,
+            &mapping.bounded_context.name,
+            revoked_at,
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3051,9 +3105,15 @@ pub async fn insert_event_and_update_sync_projections(
 /// folded in. `pool` is still needed alongside `tx`, only for
 /// `list_projections_for_bounded_context`'s own metadata-only read -
 /// deliberately not run through `tx` (see that call's own comment
-/// below): which projections exist and are `sync` doesn't change
-/// mid-request, so it isn't part of what this transaction needs to stay
-/// atomic with.
+/// below). This read is safe on the bare pool specifically *because*
+/// every event-insert path already holds `next_sequence`'s own lock on
+/// this bounded context's `sequence` row by the time it runs, and
+/// `promote_projection_rebuild` - the one place a projection's own
+/// `sync` flag can flip mid-flight - takes that identical lock before it
+/// can promote (drift audit finding #6, see project memory
+/// `skilj-drift-audit-2026-08-20`, and that function's own doc comment):
+/// the two can never interleave, so by the time this plain read runs
+/// there is no possible half-visible state to see.
 pub async fn insert_event_and_update_sync_projections_in_tx(
     pool: &Pool,
     tx: &mut Transaction<'_, Postgres>,
@@ -3164,10 +3224,12 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
 /// rejection instead rolls `tx` back before it ever commits, so the
 /// allocation never happened as far as any other reader can tell.
 /// `resolve_encryption_keys` still runs on `pool`, before `tx` opens -
-/// unchanged from the pre-fix ordering, since `EncryptionKey`
-/// provisioning's own transactionality is a separate, already-tracked
-/// gap (the drift audit's own finding on it), not something this pass
-/// changes. Not callable from anywhere but `skilj-rest` today (no
+/// deliberately, not a gap: see the note above the rules in
+/// specs/skilj.allium for why `EncryptionKey` provisioning is resolved
+/// before a write's own transaction rather than inside it (real work -
+/// a master-key wrap, a round trip - that shouldn't extend how long a
+/// row lock like `next_sequence`'s own is held). Not callable from
+/// anywhere but `skilj-rest` today (no
 /// GraphQL surface offers `CreateExternalEvent`), but lives here rather
 /// than in that crate per docs/architecture.md §3.1/§3.2: `skilj-core`
 /// is the only crate that owns the database driver, so no other crate
@@ -3462,9 +3524,11 @@ pub async fn submit_command(
     // protect_sensitive_fields' own pre-resolution step, for the
     // command's own payload *and* every final event spec's - see
     // `resolve_encryption_keys`'s own doc comment. Runs against `pool`,
-    // not `tx` - EncryptionKey provisioning staying outside this
-    // transaction is an existing, separately-tracked gap (see the drift
-    // audit's own finding on it), not something this pass changes.
+    // not `tx`, deliberately - EncryptionKey provisioning staying
+    // outside this transaction is exactly the same "don't hold the
+    // sequence row lock across a master-key wrap" reasoning
+    // `create_and_insert_external_event`'s own doc comment gives, doubly
+    // so here since this is the lock `submit_command` itself holds.
     let mut resolved = std::collections::HashMap::new();
     resolve_encryption_keys(
         pool,
@@ -3491,6 +3555,7 @@ pub async fn submit_command(
     }
 
     let result = crate::event_store::process_command(
+        crate::shared::generate_token_id(),
         command_type,
         payload,
         client_id,
@@ -3775,11 +3840,113 @@ pub async fn catch_up_bounded_context(
         .await?
         .expect("a building rebuild this function just loaded can't have vanished mid-tick");
         if current.caught_up_to.unwrap_or(-1) == latest {
-            promote_projection_rebuild(pool, bounded_context, &rebuild.projection.name).await?;
+            // A cheap fast-path filter, not the authoritative check
+            // anymore (drift audit finding #6) - `promote_projection_rebuild`
+            // re-verifies for real under its own lock, so a `false`
+            // return here is an expected, self-correcting outcome (a new
+            // event landed in the gap between this snapshot and that
+            // lock) rather than something this caller needs to react to;
+            // the next tick retries.
+            let _ =
+                promote_projection_rebuild(pool, bounded_context, &rebuild.projection.name).await?;
         }
     }
 
     Ok(())
+}
+
+/// `RegisterProjection`'s own synchronous counterpart to
+/// `catch_up_bounded_context`'s async walk - drift audit finding #3
+/// (2026-08-20, see project memory `skilj-drift-audit-2026-08-20` and
+/// `ProjectionRegistration::Created`'s own `needs_history_fold` doc
+/// comment). Called exactly once, immediately after `upsert_projection`,
+/// whenever `register_projection` reports `needs_history_fold: true` -
+/// never for a re-registration (that path already goes through
+/// `RebuildStaged`/`promote_projection_rebuild` instead) and never for an
+/// async projection (`catch_up_bounded_context`'s own periodic walk
+/// already backfills those correctly, `caught_up_to.unwrap_or(-1)`
+/// treating a freshly created row exactly like a stale one).
+///
+/// Walks every event the bounded context has ever committed, not just
+/// ones matching `projection.consumed_event_types` - the same "let the
+/// dispatcher decide" shape `catch_up_bounded_context` itself uses, so
+/// this can never disagree with what the async path would have produced
+/// had the projection been async instead. One transaction per event,
+/// same as `catch_up_bounded_context`'s own per-event loop; this only
+/// ever runs once, at first-time registration, so the cost is paid once
+/// per projection, not on every poll tick.
+///
+/// Returns the given `Projection` with `caught_up_to` set to the highest
+/// sequence folded - always `Some` when this is called at all, since the
+/// caller only calls it when `needs_history_fold` was true, which itself
+/// requires at least one matching event to exist.
+pub async fn fold_history_into_new_sync_projection(
+    pool: &Pool,
+    projection: &Projection,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+) -> crate::error::Result<Projection> {
+    let bounded_context = &projection.bounded_context.name;
+    let schema = schema_ident(bounded_context);
+    let events = list_events_for_bounded_context(pool, bounded_context).await?;
+    let default_state_json = dispatcher
+        .default_state(bounded_context, &projection.name)
+        .unwrap_or_default();
+
+    let mut caught_up_to = None;
+    for event in &events {
+        let mut tx = pool.begin().await?;
+
+        let keys = dispatcher
+            .keys(bounded_context, &projection.name, event)
+            .unwrap_or_default();
+        for key in &keys {
+            let current_state = get_or_create_projection_state_for_update(
+                &mut *tx,
+                &schema,
+                &projection.name,
+                key,
+                &default_state_json,
+            )
+            .await?;
+
+            let new_state = match dispatcher.project(
+                bounded_context,
+                &projection.name,
+                &current_state,
+                event,
+                key,
+            ) {
+                Some(result) => result?,
+                None => current_state,
+            };
+
+            sqlx::query(&format!(
+                "UPDATE {schema}.projection_state SET state = $1, updated_at = now() \
+                 WHERE projection_name = $2 AND key = $3"
+            ))
+            .bind(&new_state)
+            .bind(&projection.name)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(&format!(
+            "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
+        ))
+        .bind(event.sequence)
+        .bind(&projection.name)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        caught_up_to = Some(event.sequence);
+    }
+
+    Ok(Projection {
+        caught_up_to,
+        ..projection.clone()
+    })
 }
 
 /// Promotes a `building` `ProjectionRebuild` that has caught up to its
@@ -3794,13 +3961,44 @@ pub async fn catch_up_bounded_context(
 /// rebuild the dispatcher never once resolved (see `catch_up_bounded_context`'s
 /// own doc comment) still promotes on schedule; its `projection_rebuild_state`
 /// row, if one was ever written, is copied as-is - `"{}"` included.
+///
+/// Drift audit finding #6 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): the caller's own `caught_up_to ==
+/// latest` pre-check is only a snapshot taken before this call, not a
+/// lock - without one, a new event could commit in the gap between that
+/// check and this function's own writes, invisible to both sides
+/// forever after (never folded into the rebuild, which this promotes
+/// away from `building` before it can be; never folded inline either,
+/// since the live projection was still `sync = false` when it arrived).
+/// Closed the same way `submit_command`'s own DCB re-check is: locking
+/// the bounded context's `{schema}.sequence` row first
+/// (`SELECT ... FOR UPDATE`, the identical query, since `next_value`
+/// already *is* the latest committed sequence per
+/// `SequenceIsGaplessPerBoundedContext` - no separate lookup needed),
+/// then re-verifying eligibility under that lock rather than trusting
+/// the pre-lock snapshot. This is also what makes
+/// `insert_event_and_update_sync_projections_in_tx`'s own
+/// `sync_projections` read safe to leave running on the bare pool,
+/// outside its own `tx` - see that function's doc comment: every
+/// event-insert path already takes this exact lock before reaching that
+/// read, so once promotion takes it too, the two can never interleave.
 pub async fn promote_projection_rebuild(
     pool: &Pool,
     bounded_context: &str,
     projection_name: &str,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<bool> {
     let schema = schema_ident(bounded_context);
     let mut tx = pool.begin().await?;
+
+    // The lock this whole fix hinges on - see this function's own doc
+    // comment. A read-only peek, not `next_sequence`'s increment: this
+    // never allocates a sequence number of its own.
+    let (locked_highest,): (i64,) = sqlx::query_as(&format!(
+        "SELECT next_value FROM {schema}.sequence FOR UPDATE"
+    ))
+    .fetch_one(&mut *tx)
+    .await?;
+
     // Every rebuild-side statement below is scoped to `status = 'building'`
     // - promotion only ever ends the building row. A coexisting pending
     // row (the deliberate case `UniqueRebuildPerProjectionAndStatus`
@@ -3818,6 +4016,16 @@ pub async fn promote_projection_rebuild(
     .bind(building)
     .fetch_one(&mut *tx)
     .await?;
+
+    if rebuild_row.caught_up_to.unwrap_or(-1) != locked_highest {
+        // A new event committed after this bounded context's last fold
+        // pass but before this lock was acquired - promoting now would
+        // strand it. Defer: the next catch_up_bounded_context tick folds
+        // it into this still-building rebuild and retries promotion
+        // then. `tx` drops here, rolling back the no-op peek lock -
+        // nothing was written, nothing to undo.
+        return Ok(false);
+    }
 
     sqlx::query(&format!(
         "UPDATE {schema}.projections SET schema = $1, schema_version = $2, sync = $3, \
@@ -3898,7 +4106,7 @@ pub async fn promote_projection_rebuild(
     .await?;
 
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 // --- AccessToken (three of its four variants - see this module's own doc comment) ---

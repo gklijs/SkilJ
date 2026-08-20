@@ -486,6 +486,77 @@ fn submit_command_does_not_redispatch_for_an_unrelated_concurrent_event() {
     });
 }
 
+/// Drift audit finding #12 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): `Command.id` (real now, replacing
+/// whole-struct equality as `fetch_commands`' own identity) round-trips
+/// through a real insert - not just constructible in memory, the way the
+/// pure-function tests in `command_processing.rs`/`command_query.rs`
+/// alone would prove.
+#[test]
+fn submit_command_persists_a_real_command_id_that_round_trips() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+
+        let payload = r#"{"order_id":"A"}"#;
+        let initial_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+
+        let outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "client-1",
+            &[],
+            &[],
+            initial_decision,
+            None,
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        let SubmitCommandOutcome::Accepted { command, events } = outcome else {
+            panic!("this submission has no reason to be rejected");
+        };
+        assert!(!command.id.is_empty());
+        // Every triggered event's own origin embeds the exact same id -
+        // the same value fetch_commands' own triggered_event lookup now
+        // compares against.
+        for event in &events {
+            match &event.origin {
+                EventOrigin::CommandTriggered { command: origin } => {
+                    assert_eq!(origin.id, command.id);
+                }
+                _ => panic!("every event submit_command produces here is command-triggered"),
+            }
+        }
+
+        // Re-fetched from a fresh query, not the in-memory value this
+        // call already returned - proves the id actually persisted, not
+        // just that the domain struct in hand still carries what it was
+        // built with.
+        let reloaded = db::list_commands_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].id, command.id);
+    });
+}
+
 #[test]
 fn submit_command_leaves_no_sequence_gap_when_process_command_fails() {
     runtime().block_on(async {

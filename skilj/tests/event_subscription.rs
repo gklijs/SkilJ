@@ -609,6 +609,222 @@ fn event_subscription_end_to_end() {
     });
 }
 
+const REVOKE_ROLE_ACCESS_MAPPING_MUTATION: &str = "\
+    mutation($roleId: ID!, $bc: String!) { \
+        revokeRoleAccessMapping(roleId: $roleId, boundedContext: $bc) { status } \
+    }";
+
+/// Drift audit finding #4 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): before the push half of
+/// `RevocationClosesTheConnection` existed, a revoked subscription in a
+/// bounded context that stayed quiet - no event ever arriving - would
+/// have stayed open indefinitely, since the only re-check ran per
+/// delivered event. This test's whole point is that no event is ever
+/// submitted after the revocation - the connection has to close on its
+/// own, promptly, or this fails on timeout.
+#[test]
+fn revoking_via_graphql_closes_a_quiet_subscription_without_waiting_for_an_event() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        // A real Superadmin, direct-inserted the same way
+        // `admin_context_bootstrap.rs` does - `revokeRoleAccessMapping`
+        // is `require_active_superadmin`-gated, distinct from every
+        // `RoleAccessMapping`-level actor the rest of this file's own
+        // fixtures use.
+        let superadmin_subject = unique_name("superadmin");
+        let superadmin_role = Role {
+            id: generate_token_id(),
+            external_subject: superadmin_subject.clone(),
+            name: "Superadmin".to_string(),
+            superadmin: true,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &superadmin_role)
+            .await
+            .unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: admin_role.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let reader_subject = unique_name("reader");
+        let reader_role = Role {
+            id: generate_token_id(),
+            external_subject: reader_subject.clone(),
+            name: "Reader".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &reader_role)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: reader_role.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Read,
+                can_read_sensitive: false,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<DepositMoney>()
+            .reconciliation_role(admin_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let superadmin_jwt = sign_jwt(&superadmin_role.external_subject);
+        let reader_jwt = sign_jwt(&reader_role.external_subject);
+
+        let router = skilj.graphql_router().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind an ephemeral port for the GraphQL test listener");
+        let addr = listener.local_addr().unwrap();
+        let serve_router = router.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, serve_router)
+                .await
+                .expect("the GraphQL test listener stopped unexpectedly");
+        });
+
+        let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
+        ws_send_json(
+            &mut ws,
+            json!({
+                "type": "connection_init",
+                "payload": { "Authorization": format!("Bearer {reader_jwt}") },
+            }),
+        )
+        .await;
+        let ack = ws_recv_json(&mut ws).await;
+        assert_eq!(ack["type"], "connection_ack");
+
+        ws_send_json(
+            &mut ws,
+            json!({
+                "id": "1",
+                "type": "subscribe",
+                "payload": {
+                    "query": "subscription($bc: String!) { \
+                        allEvents(boundedContext: $bc) { sequence payload } \
+                    }",
+                    "variables": { "bc": bc_name },
+                },
+            }),
+        )
+        .await;
+
+        // Nothing arrives yet - the subscription is genuinely quiet, not
+        // merely "hasn't been given a chance to receive anything."
+        assert!(
+            ws_try_recv_json(&mut ws, Duration::from_millis(300))
+                .await
+                .is_none(),
+            "no event has been submitted yet - nothing should arrive"
+        );
+
+        // Revoke through the real GraphQL mutation - not
+        // `db::revoke_active_role_access_mapping` directly, the way the
+        // end-to-end test above does - specifically so the push
+        // notification this resolver now publishes actually fires. No
+        // event is submitted after this, ever: the connection has to
+        // close on its own.
+        let response = graphql_request(
+            &router,
+            Some(&superadmin_jwt),
+            REVOKE_ROLE_ACCESS_MAPPING_MUTATION,
+            json!({ "roleId": reader_role.id, "bc": bc_name }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["revokeRoleAccessMapping"]["status"],
+            "REVOKED"
+        );
+
+        let closing = ws_try_recv_json(&mut ws, Duration::from_secs(2))
+            .await
+            .expect(
+                "the connection must close on its own, promptly, with no event ever \
+                 submitted after the revocation",
+            );
+        assert_eq!(closing["id"], "1");
+        assert_eq!(closing["type"], "next");
+        assert_eq!(
+            closing["payload"]["errors"][0]["extensions"]["code"],
+            "grant_not_active"
+        );
+
+        let complete = ws_recv_json(&mut ws).await;
+        assert_eq!(complete["id"], "1");
+        assert_eq!(complete["type"], "complete");
+    });
+}
+
 /// `eventsByType(filters: [...])` actually narrows a live push - real
 /// `valid_filters`/`matches_filters` (this pass), not the eager
 /// `filters_not_supported_error()` rejection every `filters` argument hit

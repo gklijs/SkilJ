@@ -2,10 +2,12 @@
 //! docs/architecture.md §4) into `async_graphql`'s own `Error`, carrying
 //! `code()` as the `code` extension - §5.4's shared error shape, the
 //! same `code()`/`message()` trait `skilj-rest::error` renders through
-//! for REST (§4.2, §7.5). `CommandRejected` isn't specially handled here,
-//! since that split (rejections as typed data, not an error) is
-//! `CommandSubmission`-specific, Phase 3, not built yet; nothing in
-//! Phase 1 can ever produce one.
+//! for REST (§4.2, §7.5). `CommandRejected` isn't specially handled here
+//! at all, and never will be: `resolvers::command_submission` matches
+//! `db::SubmitCommandOutcome::{Accepted, Rejected}` directly, as plain
+//! typed data on the success path, before this conversion ever gets a
+//! chance to run - a business rejection is `SubmitCommandPayload`'s own
+//! `accepted: false` field, not a GraphQL error at all.
 
 use async_graphql::ErrorExtensions;
 use skilj_core::error::SkiljRejection;

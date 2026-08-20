@@ -28,7 +28,7 @@ use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use skilj_core::projections::{ProjectionRebuildStatus, ProjectionRegistration};
 
-/// `registerEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [TagMappingInput!]!, sensitiveFields: [SensitiveFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String): EventType!`
+/// `registerEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [TagMappingInput!]!, sensitiveFields: [SensitiveFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: MissedOccurrencePolicy): EventType!`
 pub fn register_event_type_field() -> Field {
     Field::new("registerEventType", TypeRef::named_nn("EventType"), |ctx| {
         FieldFuture::new(async move {
@@ -280,10 +280,24 @@ pub fn register_projection_field() -> Field {
                 .map_err(to_graphql_error)?;
 
                 let result = match registration {
-                    ProjectionRegistration::Created(projection) => {
+                    ProjectionRegistration::Created {
+                        projection,
+                        needs_history_fold,
+                    } => {
                         skilj_core::db::upsert_projection(&state.pool, &projection)
                             .await
                             .map_err(to_graphql_error)?;
+                        let projection = if needs_history_fold {
+                            skilj_core::db::fold_history_into_new_sync_projection(
+                                &state.pool,
+                                &projection,
+                                state.projection_dispatcher.as_ref(),
+                            )
+                            .await
+                            .map_err(to_graphql_error)?
+                        } else {
+                            projection
+                        };
                         ProjectionRegistrationResult {
                             outcome: "CREATED",
                             projection: Some(ProjectionWithRebuild {

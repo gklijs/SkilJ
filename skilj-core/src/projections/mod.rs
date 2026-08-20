@@ -126,7 +126,30 @@ pub struct ProjectionRebuild {
 /// needs either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionRegistration {
-    Created(Projection),
+    Created {
+        projection: Projection,
+        /// `true` only for a first-time registration where `sync` is
+        /// true and the bounded context already has committed events
+        /// for at least one of `consumed_event_types` - drift audit
+        /// finding #3 (2026-08-20, see project memory
+        /// `skilj-drift-audit-2026-08-20`): a sync projection has no
+        /// periodic catch-up of its own (`db::catch_up_bounded_context`
+        /// filters to `!p.sync`, deliberately - a sync projection is
+        /// meant to be kept current inline, by
+        /// `insert_event_and_update_sync_projections`, not polled), so
+        /// without this flag a brand-new sync projection registered
+        /// into a context with pre-existing matching history would
+        /// permanently miss it: nothing ever folds it in, since only
+        /// *future* events reach the sync inline path. The caller must
+        /// respond by folding that history in immediately, before the
+        /// projection is considered caught up - see
+        /// `db::fold_history_into_new_sync_projection`. Safe to do
+        /// synchronously, unlike a re-registration's `RebuildStaged`
+        /// two-step (stage now, replay later, promote atomically): a
+        /// brand-new projection has no live readers yet to protect from
+        /// an in-progress fold.
+        needs_history_fold: bool,
+    },
     RebuildStaged(ProjectionRebuild),
     ReconciledTrivially(Projection),
 }
@@ -165,6 +188,22 @@ pub fn register_projection(
     if bounded_context.status != BoundedContextStatus::Active {
         return Err(crate::event_store::Error::BoundedContextArchived.into());
     }
+    // Drift audit finding #16's own follow-up (2026-08-20, see project
+    // memory `skilj-drift-audit-2026-08-20`): RegisterProjection had no
+    // schema check at all, unlike RegisterEventType/RegisterCommandType -
+    // not even the vacuous kind those two had before this same finding's
+    // fix, since this rule never had a `valid_tag_mappings`/
+    // `valid_sensitive_fields` pair to begin with. Worse than what the
+    // finding originally covered: a projection's schema has no
+    // `valid_payload`-style backstop later either (its real consumer is
+    // the generated GraphQL type, not a runtime payload check), so a
+    // malformed one could persist indefinitely with no eventual
+    // rejection at all. Reuses `event_store::Error::InvalidSchema` rather
+    // than a duplicate variant here, the same cross-module reuse
+    // `BoundedContextArchived` just above already does.
+    if !crate::event_store::valid_schema(&schema) {
+        return Err(crate::event_store::Error::InvalidSchema.into());
+    }
     if !consumed_event_types
         .iter()
         .all(|et| &et.bounded_context == bounded_context)
@@ -173,15 +212,22 @@ pub fn register_projection(
     }
 
     let Some(existing) = existing else {
-        return Ok(ProjectionRegistration::Created(Projection {
-            bounded_context: bounded_context.clone(),
-            name,
-            schema,
-            schema_version: 1,
-            consumed_event_types,
-            sync,
-            caught_up_to: None,
-        }));
+        let needs_history_fold = sync
+            && consumed_event_types
+                .iter()
+                .any(|et| bounded_context_events.iter().any(|e| &e.event_type == et));
+        return Ok(ProjectionRegistration::Created {
+            projection: Projection {
+                bounded_context: bounded_context.clone(),
+                name,
+                schema,
+                schema_version: 1,
+                consumed_event_types,
+                sync,
+                caught_up_to: None,
+            },
+            needs_history_fold,
+        });
     };
 
     if !crate::event_store::schema_is_backwards_compatible(&existing.schema, &schema) {

@@ -1,10 +1,14 @@
 //! `surface CommandQuery` - `fetchCommands`. `AdminAccess`-gated. Plain
 //! `after`/`before` timestamp arguments and a flat `[String!]!` back,
 //! not a Relay connection - `fetch_commands` pages by timestamp, not a
-//! sequence/id cursor (`Command` carries no exposed id at all), so a
-//! literal `edges{node,cursor}`/`pageInfo` envelope doesn't naturally
-//! fit it the way `EventQuery`'s genuine sequence cursor does (confirmed
-//! with the user - see the Phase 3 plan).
+//! sequence/id cursor: `Command` gained a real `id` (drift audit finding
+//! #12, 2026-08-20, see project memory `skilj-drift-audit-2026-08-20`),
+//! but it's never surfaced on this wire - added purely to make
+//! `FetchCommands`'s own `triggered_event` lookup an identity comparison
+//! rather than a structural one, not as a client-facing cursor - so a
+//! literal `edges{node,cursor}`/`pageInfo` envelope still doesn't
+//! naturally fit this surface the way `EventQuery`'s genuine sequence
+//! cursor does (confirmed with the user - see the Phase 3 plan).
 
 use super::{not_found, require_admin_mapping, resolve_read_data_keys};
 use crate::error::to_graphql_error;

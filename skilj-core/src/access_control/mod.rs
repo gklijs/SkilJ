@@ -507,7 +507,7 @@ pub fn resolve_role_by_external_subject<'a>(
 /// `generate_token_id()` already produced - not this function's to
 /// generate, the same caller-supplied-black-box-output treatment
 /// `next_sequence` gets elsewhere in this codebase (`generate_token_id`
-/// is still `// TODO` itself - see `crate::shared`). `existing_roles` is
+/// is real, in `crate::shared`, a plain UUIDv4). `existing_roles` is
 /// every `Role` this engine currently knows of, for the
 /// `UniqueActiveExternalSubject` check - a full-snapshot parameter, the
 /// same shape `consistency_boundary_and_matching_events` takes `Event`s
@@ -633,6 +633,74 @@ pub fn revoke_role_access_mapping(
     })
 }
 
+/// One now-inactive `RoleAccessMapping`, identified the same way a live
+/// `EventSubscription` connection already scopes itself - `role_id` plus
+/// `bounded_context` name, never the full entity. `RevocationBroadcaster`'s
+/// own publish payload.
+#[derive(Debug, Clone)]
+pub struct RevokedMapping {
+    pub role_id: String,
+    pub bounded_context: String,
+}
+
+/// `EventSubscription`'s own second broadcast channel, alongside
+/// `event_store::EventBroadcaster` - drift audit finding #4 (2026-08-20,
+/// see project memory `skilj-drift-audit-2026-08-20`). Fixes
+/// `RevocationClosesTheConnection`'s real gap: the per-delivered-event
+/// re-check `resolvers::event_subscription` already did only ever ran
+/// when an event happened to arrive, so a subscription in a bounded
+/// context that had gone quiet stayed open indefinitely after its own
+/// grant was revoked - exactly the scenario that guarantee's own spec
+/// text exists to rule out ("the caller would wait on it indefinitely
+/// believing itself current"). This is the push half of the fix: every
+/// site that revokes a `RoleAccessMapping` - `revoke_role_and_mappings`'s
+/// own cascade and `revoke_active_role_access_mapping` directly, both in
+/// `skilj-graphql/src/resolvers/access_management.rs` - publishes here
+/// right after the revocation is durably committed, and both subscription
+/// resolvers `tokio::select!` against it alongside their own
+/// `EventBroadcaster` receiver, closing the instant a notification names
+/// their own `(role_id, bounded_context)` rather than waiting for the
+/// next matching event. The identical "same choke point, one shared
+/// process-wide instance, silently-ignored `SendError` when nobody's
+/// listening" shape `EventBroadcaster` already establishes - see its own
+/// doc comment, not repeated here.
+///
+/// Revocations are rare and low-volume compared to events, so unlike
+/// `EventBroadcaster`'s own `capacity` this has no builder-configurable
+/// knob - a fixed, generous capacity is enough headroom that a lagged
+/// receiver is already an exceptional case, handled defensively (a direct
+/// database re-check, not assumed-still-active) rather than tuned around.
+#[derive(Clone)]
+pub struct RevocationBroadcaster(tokio::sync::broadcast::Sender<RevokedMapping>);
+
+impl RevocationBroadcaster {
+    pub fn new() -> Self {
+        let (sender, _receiver) = tokio::sync::broadcast::channel(256);
+        Self(sender)
+    }
+
+    /// A fresh, independent receiver - one call per live GraphQL
+    /// subscription, the same as `EventBroadcaster::subscribe`.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RevokedMapping> {
+        self.0.subscribe()
+    }
+
+    /// Called once per revoked `RoleAccessMapping`, right after that
+    /// revocation is durably committed - see this type's own doc comment
+    /// for the two real call sites. A `SendError` (zero receivers
+    /// currently subscribed) is the expected steady state, not a
+    /// failure - identical reasoning to `EventBroadcaster::publish`.
+    pub fn publish(&self, revoked: RevokedMapping) {
+        let _ = self.0.send(revoked);
+    }
+}
+
+impl Default for RevocationBroadcaster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `access_mapping.status = active`/`access_mapping.level = admin` -
 /// shared by every `Create*Token` rule below and by `revoke_token`, all
 /// four of which require this exact pair (see
@@ -651,8 +719,7 @@ fn require_active_admin(access_mapping: &RoleAccessMapping) -> crate::error::Res
 /// See `rule CreateExternalEventToken`. `id`/`secret` are the caller's own
 /// `generate_token_id()`/`generate_token_secret()` output - not this
 /// function's to generate, the same treatment `create_role`'s `id` gets
-/// (see its own doc comment; `generate_token_secret` is still `// TODO` -
-/// see `crate::shared`).
+/// (see its own doc comment; both are real, in `crate::shared`).
 pub fn create_external_event_token(
     access_mapping: &RoleAccessMapping,
     event_type: &crate::event_store::EventType,

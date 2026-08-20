@@ -588,3 +588,117 @@ fn full_type_registration_lifecycle_end_to_end() {
         assert!(listed["pendingRebuild"].is_null());
     });
 }
+
+/// Real end-to-end proof of the 2026-08-20 drift audit's #2 fix
+/// (`valid_sensitive_fields` used to accept a non-string leaf, and
+/// `protect_sensitive_fields` would then silently replace it with a
+/// ciphertext *string* on every write, corrupting the payload's own
+/// declared type - see project memory `skilj-drift-audit-2026-08-20`).
+/// `amount` is declared `"type":"number"` in this schema - a
+/// `sensitiveFields` entry naming it must now be rejected at
+/// registration, before any write ever has the chance to corrupt
+/// anything.
+#[test]
+fn register_event_type_rejects_a_sensitive_field_on_a_non_string_leaf() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                registerEventType(boundedContext: $bc, name: $name, \
+                    schema: \"{\\\"properties\\\":{\\\"amount\\\":{\\\"type\\\":\\\"number\\\"},\\\"account_id\\\":{\\\"type\\\":\\\"string\\\"}}}\", \
+                    tagMappings: [], \
+                    sensitiveFields: [{field: \"amount\", subjectKey: \"account\", subjectField: \"account_id\"}], \
+                    externalCreationAllowed: true, directCreationAllowed: true, systemTriggeredAllowed: false, \
+                    eventReadAllowed: true) { name } \
+            }",
+            json!({ "bc": bc_name, "name": "MoneyDeposited" }),
+        )
+        .await;
+
+        assert!(response.get("data").is_none() || response["data"]["registerEventType"].is_null());
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "invalid_sensitive_field"
+        );
+    });
+}
+
+/// Drift audit finding #16 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): before `valid_schema`, this exact
+/// registration - a malformed schema, no `tagMappings`, no
+/// `sensitiveFields` - would have silently succeeded, since neither
+/// existing validator ever inspects the schema when both lists are
+/// empty.
+#[test]
+fn register_event_type_rejects_a_malformed_schema_with_no_tag_mappings_or_sensitive_fields() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                registerEventType(boundedContext: $bc, name: $name, \
+                    schema: \"not json at all\", \
+                    tagMappings: [], \
+                    sensitiveFields: [], \
+                    externalCreationAllowed: true, directCreationAllowed: true, systemTriggeredAllowed: false, \
+                    eventReadAllowed: true) { name } \
+            }",
+            json!({ "bc": bc_name, "name": "MoneyDeposited" }),
+        )
+        .await;
+
+        assert!(response.get("data").is_none() || response["data"]["registerEventType"].is_null());
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "invalid_schema"
+        );
+    });
+}
+
+/// Drift audit finding #16's own follow-up (2026-08-20, see project
+/// memory `skilj-drift-audit-2026-08-20`): `registerProjection` had no
+/// schema check at all before this - worse than `registerEventType`/
+/// `registerCommandType`'s own previously-vacuous pair, since a
+/// projection's schema has no `valid_payload`-style backstop later
+/// either.
+#[test]
+fn register_projection_rejects_a_malformed_schema() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                registerProjection(boundedContext: $bc, name: $name, \
+                    schema: \"not json at all\", \
+                    consumedEventTypes: [], sync: false) { outcome } \
+            }",
+            json!({ "bc": bc_name, "name": "AccountBalance" }),
+        )
+        .await;
+
+        assert!(response.get("data").is_none() || response["data"]["registerProjection"].is_null());
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "invalid_schema"
+        );
+    });
+}

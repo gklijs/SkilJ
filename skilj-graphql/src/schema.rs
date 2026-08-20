@@ -63,7 +63,8 @@ pub async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
         .field(resolvers::event_query::query_events_field())
         .field(resolvers::event_query::count_events_field())
         .field(resolvers::event_query::inspect_event_field())
-        .field(resolvers::command_query::fetch_commands_field());
+        .field(resolvers::command_query::fetch_commands_field())
+        .field(resolvers::projection_query::schema_field());
     if projection_types.is_some() {
         query = query.field(resolvers::projection_query::field());
     }

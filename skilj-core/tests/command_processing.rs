@@ -401,6 +401,7 @@ fn process_command_accepts_and_creates_the_command_and_its_triggered_events() {
     let mut next_seq = 10i64;
 
     let result = event_store::process_command(
+        skilj_core::shared::generate_token_id(),
         &ct,
         r#"{"amount":10}"#,
         "trigger-adapter",
@@ -451,6 +452,7 @@ fn process_command_calls_next_sequence_once_per_triggered_event_in_order() {
     let mut next_seq = 100i64;
 
     let result = event_store::process_command(
+        skilj_core::shared::generate_token_id(),
         &ct,
         "{}",
         "trigger-adapter",
@@ -492,6 +494,7 @@ fn process_command_surfaces_a_rejected_decision_verbatim() {
     let ct = command_type(true, Vec::new());
 
     let err = event_store::process_command(
+        skilj_core::shared::generate_token_id(),
         &ct,
         "{}",
         "trigger-adapter",
@@ -520,6 +523,7 @@ fn process_command_rejects_an_event_spec_naming_an_unregistered_event_type() {
     let ct = command_type(true, Vec::new());
 
     let err = event_store::process_command(
+        skilj_core::shared::generate_token_id(),
         &ct,
         "{}",
         "trigger-adapter",
@@ -629,6 +633,7 @@ fn command_consistency_tags_are_empty_when_the_command_type_declares_no_tag_mapp
     let ct = command_type(true, Vec::new());
 
     let result = event_store::process_command(
+        skilj_core::shared::generate_token_id(),
         &ct,
         "{}",
         "trigger-adapter",
@@ -655,6 +660,7 @@ fn command_consistency_tags_are_derived_for_real_from_a_real_tag_mapping() {
     );
 
     let result = event_store::process_command(
+        skilj_core::shared::generate_token_id(),
         &ct,
         r#"{"account_id":"A"}"#,
         "trigger-adapter",
@@ -685,6 +691,7 @@ fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
     );
 
     let first = event_store::process_command(
+        skilj_core::shared::generate_token_id(),
         &ct,
         r#"{"account_id":"A"}"#,
         "trigger-adapter",

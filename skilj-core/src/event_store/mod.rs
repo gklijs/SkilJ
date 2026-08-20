@@ -109,10 +109,11 @@ pub enum BoundedContextStatus {
 }
 
 /// See `entity BoundedContext`. `created_at`/`created_by` were added
-/// propagating `BoundedContextCreation`/`BoundedContextDirectory` (the
-/// `admin`/`skilj` defaults' own `created_at`/`created_by` stay with the
-/// still-TODO startup reconciliation loop - see `crate::bootstrap`'s own
-/// doc comment). The relationship projections (`event_types`, `commands`,
+/// propagating `BoundedContextCreation`/`BoundedContextDirectory` - the
+/// `admin` default's own `created_at`/`created_by` are stamped for real
+/// at startup by `bootstrap::stamp_admin_bounded_context` (see its own
+/// doc comment, including the concurrent-startup race fix). The
+/// relationship projections (`event_types`, `commands`,
 /// ...) are omitted, the same "caller resolves it, not a stored field"
 /// treatment every other relationship projection in this codebase gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +228,18 @@ pub struct ProtectedPayload {
 /// them as `ProcessCommandResult::events`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
+    /// SkilJ's own internal identifier, generated at creation via
+    /// `generate_token_id()` - the same "distinct, internal, not a
+    /// credential" register `Role.id`/`AccessToken.id` already occupy
+    /// (see their own doc comments). Added to close drift audit finding
+    /// #12 (2026-08-20, see project memory `skilj-drift-audit-2026-08-20`):
+    /// `fetch_commands`'s own `triggered_event` lookup used to match by
+    /// whole-`Command` equality, reconstructing identity from content
+    /// rather than having a real one to compare - a distinct concept from
+    /// `commands.id`, this struct's own DB row's internal `BIGSERIAL`
+    /// primary key (still unexposed here, purely an FK-linking detail -
+    /// see `db::insert_command`'s own doc comment).
+    pub id: String,
     pub bounded_context: BoundedContext,
     pub command_type: CommandType,
     pub payload: String,
@@ -245,8 +258,10 @@ pub struct Command {
 /// See `Event.origin`'s sum type. `SystemTriggered` is a placeholder with
 /// no fields yet - per the spec it has no variant-specific fields at all,
 /// so this placeholder is already its final shape (see
-/// `SystemTriggeredClientIdIsSystem`, still to propagate, for the
-/// `metadata.client_id` constraint that comes with it). `CommandTriggered`
+/// `SystemTriggeredClientIdIsSystem` for the `metadata.client_id`
+/// constraint that comes with it - enforced, not just declared:
+/// `create_system_event` stamps `client_id: "system"` unconditionally on
+/// every occurrence it raises). `CommandTriggered`
 /// boxes its `Command` - `Command` is by far this enum's largest variant
 /// payload (it embeds a whole `CommandType`), and every `Event` carries
 /// an `EventOrigin` regardless of which variant, so leaving it unboxed
@@ -387,6 +402,21 @@ pub enum Error {
     #[error("this filter is invalid for its field's declared type")]
     InvalidFilter,
 
+    /// Drift audit finding #16 (2026-08-20, see project memory
+    /// `skilj-drift-audit-2026-08-20`): a registered `schema` used to go
+    /// unvalidated at registration time whenever a type declared no
+    /// `tag_mappings` and no `sensitive_fields` - both `valid_tag_mappings`/
+    /// `valid_sensitive_fields` short-circuit `true` on empty input,
+    /// never calling `schema_properties`/`jsonschema::validator_for` at
+    /// all in that case, so a genuinely malformed schema (unparseable
+    /// JSON, or JSON that isn't a valid JSON Schema document) silently
+    /// "succeeded" at registration and only ever surfaced later, on the
+    /// first real write, via `PayloadDoesNotMatchSchema` - confusing at
+    /// the point a caller would actually see it, and far from where the
+    /// real mistake was made. `valid_schema` closes this unconditionally.
+    #[error("this schema is not well-formed JSON Schema")]
+    InvalidSchema,
+
     #[error("this tag mapping names a field the schema doesn't declare")]
     InvalidTagMapping,
 
@@ -482,6 +512,7 @@ impl SkiljRejection for Error {
             Error::SchemaIncompatible => "schema_incompatible",
             Error::MissingScheduleOrPolicy => "missing_schedule_or_policy",
             Error::InvalidFilter => "invalid_filter",
+            Error::InvalidSchema => "invalid_schema",
             Error::InvalidTagMapping => "invalid_tag_mapping",
             Error::SensitiveFieldTagOverlap => "sensitive_field_tag_overlap",
             Error::InvalidSensitiveField => "invalid_sensitive_field",
@@ -783,6 +814,26 @@ fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Black box (see the note above rule `RegisterEventType`): a registered
+/// `schema` is well-formed JSON Schema - drift audit finding #16
+/// (2026-08-20, see project memory `skilj-drift-audit-2026-08-20`).
+/// Unconditional, unlike `valid_tag_mappings`/`valid_sensitive_fields`:
+/// those only ever inspect `schema` as a side effect of checking a
+/// non-empty `tag_mappings`/`sensitive_fields` list, so a type declaring
+/// neither previously registered a garbage `schema` unrejected - this
+/// closes that gap regardless of what else the registration declares.
+/// The identical check `valid_payload` already runs against `schema`
+/// itself (`serde_json::from_str` for well-formed JSON,
+/// `jsonschema::validator_for` for well-formed JSON Schema specifically -
+/// a schema that parses as JSON but isn't valid JSON Schema, e.g. a
+/// `"type"` value that isn't a recognised keyword, is rejected here too).
+pub fn valid_schema(schema: &str) -> bool {
+    let Ok(schema_value) = serde_json::from_str::<serde_json::Value>(schema) else {
+        return false;
+    };
+    jsonschema::validator_for(&schema_value).is_ok()
+}
+
 /// Black box (see the note above rule `RegisterEventType`): "every
 /// `TagMapping.field` names a field the schema declares" - covers both a
 /// bare field name and a two-segment dotted path into a named nested
@@ -808,8 +859,22 @@ pub fn valid_tag_mappings(schema: &str, tag_mappings: &[TagMapping]) -> bool {
 }
 
 /// Black box (see the note above rule `RegisterEventType`): the same
-/// existence-and-shape check as `valid_tag_mappings` above, for both
-/// `SensitiveField.field` and `SensitiveField.subject_field`.
+/// existence-and-shape check as `valid_tag_mappings` above for
+/// `SensitiveField.subject_field` (any scalar or list-of-scalar leaf,
+/// identically - `subject_field` is only ever read, never encrypted, so
+/// nothing about its own declared type constrains what it can be).
+/// `SensitiveField.field` - the leaf `protect_sensitive_fields` actually
+/// replaces with ciphertext - is narrower: `FieldKind::Scalar { json_type:
+/// "string", .. }` only, not any scalar and not `ListOfScalar`. This is
+/// not an arbitrary restriction: ciphertext is fundamentally string-shaped
+/// (`crate::encryption::encrypt_leaf`'s own output), so a leaf whose
+/// declared type isn't already `"string"` cannot hold it and still
+/// conform to its own schema - "a scalar keeps the same declared type
+/// whether it holds plaintext or ciphertext" (the payload schema shape
+/// note above `entity CommandType`) is only ever true for a leaf that was
+/// a string to begin with. Encrypting a non-string leaf in place, or a
+/// whole list at once (both accepted here before this fix), silently
+/// broke every downstream typed decode instead.
 pub fn valid_sensitive_fields(schema: &str, sensitive_fields: &[SensitiveField]) -> bool {
     if sensitive_fields.is_empty() {
         return true;
@@ -819,8 +884,13 @@ pub fn valid_sensitive_fields(schema: &str, sensitive_fields: &[SensitiveField])
     };
     let definitions = schema_definitions(schema);
     sensitive_fields.iter().all(|s| {
-        resolve_field_kind(&properties, definitions.as_ref(), &s.field).is_some()
-            && resolve_field_kind(&properties, definitions.as_ref(), &s.subject_field).is_some()
+        matches!(
+            resolve_field_kind(&properties, definitions.as_ref(), &s.field),
+            Some(FieldKind::Scalar {
+                json_type: "string",
+                ..
+            })
+        ) && resolve_field_kind(&properties, definitions.as_ref(), &s.subject_field).is_some()
     })
 }
 
@@ -1206,10 +1276,10 @@ pub fn sensitive_field_is_granted(access_mapping: &RoleAccessMapping, subject_va
 }
 
 /// Black box (see the note above rule `DeliverToSubscriptions`, reused by
-/// `QueryEvents`/`CountEvents`/`InspectEvent` and `read_projection`'s own
-/// event-side counterpart - `read_projection` itself stays deferred, see
-/// docs/architecture.md's own write-up of this pass for why). Real now,
-/// both branches: per `sensitive_fields` entry, `sensitive_field_is_granted`
+/// `QueryEvents`/`CountEvents`/`InspectEvent` and by `crate::projections::
+/// read_projection` too - see its own doc comment for its real, since
+/// implemented, once-per-query treatment). Real now, both branches: per
+/// `sensitive_fields` entry, `sensitive_field_is_granted`
 /// decides whether to even attempt a decrypt; `resolve_data_key` (the
 /// caller's own pre-resolved closure, the identical "impure resolution,
 /// pure decision" split `resolve_key` already has on the write side) is
@@ -1370,6 +1440,9 @@ pub fn register_event_type(
     if bounded_context.status != BoundedContextStatus::Active {
         return Err(Error::BoundedContextArchived.into());
     }
+    if !valid_schema(&schema) {
+        return Err(Error::InvalidSchema.into());
+    }
     if !valid_tag_mappings(&schema, &tag_mappings) {
         return Err(Error::InvalidTagMapping.into());
     }
@@ -1505,6 +1578,9 @@ pub fn register_command_type(
     if bounded_context.status != BoundedContextStatus::Active {
         return Err(Error::BoundedContextArchived.into());
     }
+    if !valid_schema(&schema) {
+        return Err(Error::InvalidSchema.into());
+    }
     if !valid_tag_mappings(&schema, &tag_mappings) {
         return Err(Error::InvalidTagMapping.into());
     }
@@ -1593,12 +1669,12 @@ pub fn forget_subject(
     })
 }
 
-/// See `rule QueryEvents`. `bounded_context_events` is every `Event` this
-/// engine currently knows of for `access_mapping.bounded_context` - the
-/// same full-snapshot treatment `consistency_boundary_and_matching_events`
-/// takes `Event`s in, standing in for the in-memory per-bounded-context
-/// event cache the spec's own note describes (not modelled itself - see
-/// this module's own doc comment). An empty `event_types`/`tags` means
+/// See `rule QueryEvents`. `bounded_context_events` is every `Event`
+/// matching what this call needs, the same full-snapshot shape
+/// `consistency_boundary_and_matching_events` takes `Event`s in - real
+/// callers source it via `db::list_events_for_bounded_context_cached`
+/// (`crate::event_cache`'s own module doc comment has the full design),
+/// not an unconditional Postgres load. An empty `event_types`/`tags` means
 /// "no restriction", per the spec's own convention - not a vacuous case,
 /// so both are checked with `is_empty()`/`is_none()` rather than treated
 /// as "matches nothing".
@@ -1730,9 +1806,13 @@ pub fn inspect_event(
 /// candidate's own membership in it is exactly "does `triggered_event`'s
 /// `origin` name this candidate" - already answerable from
 /// `EventOrigin::CommandTriggered`'s own boxed `Command` field, with no
-/// second collection required. Returns rendered payloads only, the same
-/// "deliberately coarse on the wire contract" choice `query_events` makes
-/// for `EventsQueried.events` - see its own doc comment.
+/// second collection required. Matched by `Command.id` specifically
+/// (drift audit finding #12, 2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`) - not whole-struct equality, which
+/// used to stand in for identity here before `Command` had a real one.
+/// Returns rendered payloads only, the same "deliberately coarse on the
+/// wire contract" choice `query_events` makes for `EventsQueried.events`
+/// - see its own doc comment.
 pub fn fetch_commands(
     access_mapping: &RoleAccessMapping,
     command_types: &[CommandType],
@@ -1766,7 +1846,7 @@ pub fn fetch_commands(
         .filter(|c| before.is_none_or(|b| c.metadata.created_at <= b))
         .filter(|c| {
             triggered_event.is_none_or(|te| match &te.origin {
-                EventOrigin::CommandTriggered { command } => command.as_ref() == *c,
+                EventOrigin::CommandTriggered { command } => command.id == c.id,
                 _ => false,
             })
         })
@@ -2153,6 +2233,9 @@ pub fn create_external_event(
     if !event_type.external_creation_allowed {
         return Err(Error::ExternalCreationNotAllowed.into());
     }
+    if event_type.bounded_context.status != BoundedContextStatus::Active {
+        return Err(Error::BoundedContextArchived.into());
+    }
     if !valid_payload(&event_type.schema, &payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
     }
@@ -2196,6 +2279,9 @@ pub fn create_direct_event(
     let event_type = &adapter.event_type;
     if !event_type.direct_creation_allowed {
         return Err(Error::DirectCreationNotAllowed.into());
+    }
+    if event_type.bounded_context.status != BoundedContextStatus::Active {
+        return Err(Error::BoundedContextArchived.into());
     }
     if !valid_payload(&event_type.schema, &payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
@@ -2347,6 +2433,18 @@ pub fn skip_missed_occurrences(
     event_type: &EventType,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
+    // Drift audit finding #10 (2026-08-20, see project memory
+    // `skilj-drift-audit-2026-08-20`): `rule SkipMissedOccurrences`'s own
+    // first `requires` clause, missing here until this fix. Not reachable
+    // from the real scheduler today - `list_scheduled_event_types` already
+    // filters to this flag before this function is ever called - but a
+    // pure function should faithfully encode every one of its rule's
+    // `requires` clauses regardless of what its current callers happen to
+    // pre-filter, the same standard every other pure function in this
+    // module is held to.
+    if !event_type.system_triggered_allowed {
+        return None;
+    }
     if event_type.missed_occurrence_policy != Some(MissedOccurrencePolicy::Skip) {
         return None;
     }
@@ -2500,15 +2598,12 @@ pub struct ProcessCommandResult {
 /// See `rule ProcessCommand`. Split from `AuthoriseCommandSubmission`/
 /// `AuthoriseCommandTrigger` above at exactly the spec's own boundary -
 /// `when: CommandAuthorised(...)` - so this one function serves both
-/// authorisation paths; only `AuthoriseCommandTrigger`'s (the REST/
-/// `CommandToken` one) is implemented so far. `AuthoriseCommandSubmission`
-/// (the GraphQL/`RoleAccessMapping` one) needs `access_control::Role`/
-/// `RoleAccessMapping`/`AccessLevel`, none of which exist yet - a
-/// materially larger chunk of work than adding one more token variant was,
-/// so it's deferred to its own pass rather than folded into this one;
-/// `process_command` itself doesn't care which authorisation path produced
-/// its `command_type`/`payload`/`client_id` input, so nothing here blocks
-/// on that.
+/// authorisation paths: `AuthoriseCommandTrigger` (REST/`CommandToken`)
+/// and `AuthoriseCommandSubmission` (GraphQL/`RoleAccessMapping`) are both
+/// fully implemented, each in `resolvers::command_submission`/
+/// `skilj-rest`'s own `post_commands_trigger` respectively - this function
+/// itself doesn't care which one produced its `command_type`/`payload`/
+/// `client_id` input, and never has to know.
 ///
 /// `decision` is already-computed, not called from inside this function:
 /// invoking the right bounded context's own typed `CommandType::decide()`
@@ -2518,13 +2613,13 @@ pub struct ProcessCommandResult {
 /// interface" (see the note above the rule), so resolving it isn't this
 /// pure function's job. Same reasoning for `resolve_event_type`: turning
 /// `decision`'s `EventSpec.event_type: String` names back into full
-/// `EventType`s is a bounded-context-scoped registry lookup
-/// (`RegisterEventType`'s own registry, not yet propagated), supplied by
-/// the caller. `next_sequence` is called once per accepted event, in
-/// order - the same Postgres-lock-backed, caller-supplied value as
-/// `create_external_event`/`create_direct_event`'s.
+/// `EventType`s is a bounded-context-scoped registry lookup - real now,
+/// `db::get_event_type` - supplied by the caller since resolving it is
+/// I/O, not this pure function's own job. `next_sequence` is called once
+/// per accepted event, in order - the same Postgres-lock-backed,
+/// caller-supplied value as `create_external_event`/`create_direct_event`'s.
 ///
-/// Nine parameters because this function's own scope is genuinely that
+/// Ten parameters because this function's own scope is genuinely that
 /// wide - it's `ProcessCommand`'s entire `let`/`ensures` body, not
 /// something a smaller grouping would simplify without inventing a
 /// struct that exists only to satisfy the lint. `resolve_key` is
@@ -2532,9 +2627,15 @@ pub struct ProcessCommandResult {
 /// through unchanged to both of this function's own call sites below (the
 /// command's payload, and each accepted event spec's) - a command and an
 /// event naming the same subject resolve to the very same `EncryptionKey`
-/// this way, exactly as the spec requires.
+/// this way, exactly as the spec requires. `id` is `Command.id`'s own
+/// already-resolved `generate_token_id()` output (drift audit finding
+/// #12), caller-supplied the same way `next_sequence`'s own values are -
+/// this function has no way to generate one itself, the same "black box
+/// resolved outside, handed in" treatment every id-bearing entity's own
+/// pure constructor gets (see `access_control::create_role`).
 #[allow(clippy::too_many_arguments)]
 pub fn process_command(
+    id: String,
     command_type: &CommandType,
     payload: &str,
     client_id: &str,
@@ -2558,6 +2659,7 @@ pub fn process_command(
 
     let protected = protect_sensitive_fields(&command_type.sensitive_fields, payload, &resolve_key);
     let command = Command {
+        id,
         bounded_context: command_type.bounded_context.clone(),
         command_type: command_type.clone(),
         payload: protected.payload,

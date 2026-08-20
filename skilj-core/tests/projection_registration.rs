@@ -167,7 +167,7 @@ fn projection_rebuild_caught_up_to_accepts_null_and_non_null() {
 }
 
 // ---------------------------------------------------------------------
-// rule-success.RegisterProjection (create path) / rule-failure.RegisterProjection.{1..5}
+// rule-success.RegisterProjection (create path) / rule-failure.RegisterProjection.{1..6}
 // ---------------------------------------------------------------------
 
 #[test]
@@ -190,12 +190,89 @@ fn register_projection_creates_a_new_projection_when_none_exists() {
     .unwrap();
 
     match result {
-        ProjectionRegistration::Created(p) => {
+        ProjectionRegistration::Created {
+            projection: p,
+            needs_history_fold,
+        } => {
             assert_eq!(p.name, "OrderSummary");
             assert_eq!(p.schema_version, 1);
             assert_eq!(p.consumed_event_types, consumed);
             assert!(!p.sync);
             assert_eq!(p.caught_up_to, None);
+            assert!(!needs_history_fold);
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+}
+
+/// Drift audit finding #3 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): a first-time *sync* registration into
+/// a bounded context that already has matching committed history must be
+/// flagged for an immediate fold - `sync = false` (the test above) never
+/// sets this, and neither does `sync = true` with no matching history
+/// (the test below), only the combination of both.
+#[test]
+fn register_projection_flags_a_history_fold_for_a_first_time_sync_registration_with_history() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let order_placed = event_type("OrderPlaced");
+    let consumed = vec![order_placed.clone()];
+    let history = vec![event(order_placed)];
+
+    let result = projections::register_projection(
+        &mapping,
+        &bc,
+        "OrderSummary".into(),
+        "{}".into(),
+        consumed,
+        true,
+        None,
+        None,
+        &history,
+    )
+    .unwrap();
+
+    match result {
+        ProjectionRegistration::Created {
+            projection,
+            needs_history_fold,
+        } => {
+            assert!(projection.sync);
+            assert_eq!(projection.caught_up_to, None); // set later, by the actual fold
+            assert!(needs_history_fold);
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+}
+
+/// The same first-time sync registration, but with no matching history at
+/// all (an unrelated event type's history doesn't count) - no fold is
+/// needed, since there is nothing to fold.
+#[test]
+fn register_projection_does_not_flag_a_history_fold_when_sync_but_no_matching_history() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let consumed = vec![event_type("OrderPlaced")];
+    let unrelated_history = vec![event(event_type("ShipmentSent"))];
+
+    let result = projections::register_projection(
+        &mapping,
+        &bc,
+        "OrderSummary".into(),
+        "{}".into(),
+        consumed,
+        true,
+        None,
+        None,
+        &unrelated_history,
+    )
+    .unwrap();
+
+    match result {
+        ProjectionRegistration::Created {
+            needs_history_fold, ..
+        } => {
+            assert!(!needs_history_fold);
         }
         other => panic!("expected Created, got {other:?}"),
     }
@@ -304,7 +381,33 @@ fn register_projection_rejects_an_archived_bounded_context() {
     );
 }
 
-/// rule-failure.RegisterProjection.5 - `requires: consumed_event_types.all(et
+/// rule-failure.RegisterProjection.5 - `requires: valid_schema(schema)`.
+/// Drift audit finding #16's own follow-up (2026-08-20, see project
+/// memory `skilj-drift-audit-2026-08-20`): `RegisterProjection` had no
+/// schema check at all before this, unlike `RegisterEventType`/
+/// `RegisterCommandType`'s own (previously vacuous) pair.
+#[test]
+fn register_projection_rejects_a_malformed_schema() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    let err = projections::register_projection(
+        &mapping,
+        &bc,
+        "OrderSummary".into(),
+        "not json at all".into(),
+        Vec::new(),
+        false,
+        None,
+        None,
+        &[],
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), event_store::Error::InvalidSchema.code());
+}
+
+/// rule-failure.RegisterProjection.6 - `requires: consumed_event_types.all(et
 /// => et.bounded_context = bounded_context)`.
 #[test]
 fn register_projection_rejects_a_consumed_event_type_from_another_bounded_context() {

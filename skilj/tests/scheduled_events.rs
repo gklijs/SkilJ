@@ -61,6 +61,27 @@ impl EventType for HeartBeat {
     }
 }
 
+struct OnceBeat;
+
+impl EventType for OnceBeat {
+    type Payload = HeartBeatPayload;
+    const NAME: &'static str = "OnceBeat";
+    fn system_triggered_allowed() -> bool {
+        true
+    }
+    fn system_triggered_schedule() -> Option<String> {
+        Some(EVERY_SECOND.to_string())
+    }
+    fn missed_occurrence_policy() -> Option<MissedOccurrencePolicy> {
+        Some(MissedOccurrencePolicy::FireOnce)
+    }
+    fn scheduled_payload() -> Self::Payload {
+        HeartBeatPayload {
+            beat: "ping".to_string(),
+        }
+    }
+}
+
 struct SkippyBeat;
 
 impl EventType for SkippyBeat {
@@ -345,6 +366,113 @@ fn skip_policy_resolves_a_real_backlog_without_replaying_it() {
             events.len() <= 5,
             "skip policy must not replay a backlog: got {} events for a ~10s gap",
             events.len()
+        );
+    });
+}
+
+/// Real end-to-end proof of the 2026-08-20 drift audit's #1 fix (`fire_once`
+/// permanently stalling after any backlog - see project memory
+/// `skilj-drift-audit-2026-08-20`): before the fix, `scheduler_tick` only
+/// ever raised the single *earliest* unaccounted occurrence per tick, so
+/// once a `fire_once` type fell more than one occurrence behind,
+/// `create_system_event`'s own `nothing_later_is_due` guard correctly
+/// rejected that same earliest occurrence forever - `schedule_position`
+/// never advanced, and the type never fired again for the rest of the
+/// process's lifetime. This simulates exactly that: a real, multi-second
+/// backlog, then proves the scheduler both fires (once) and, just as
+/// importantly, keeps advancing afterward rather than getting stuck.
+#[test]
+fn fire_once_resolves_a_real_backlog_into_its_own_last_occurrence_and_does_not_stall() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = setup(&pool).await;
+
+        let (_skilj, report) = Skilj::builder(database_url)
+            .bounded_context(bc_name.clone())
+            .event_type::<OnceBeat>()
+            .reconciliation_role(external_subject)
+            .scheduler_poll_interval(std::time::Duration::from_millis(150))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        // Simulate a real outage: force `schedule_position` back to 10s
+        // ago, well past several of this schedule's own occurrences - the
+        // same backlog-simulation `skip_policy_resolves_a_real_backlog_without_replaying_it`
+        // above uses, but under `fire_once` this time.
+        let mut event_type = db::get_event_type(&pool, &bc_name, "OnceBeat")
+            .await
+            .unwrap()
+            .unwrap();
+        let backlog_start = Utc::now() - chrono::Duration::seconds(10);
+        event_type.schedule_position = Some(backlog_start);
+        db::upsert_event_type(&pool, &event_type).await.unwrap();
+
+        // Give the scheduler several ticks to resolve the backlog - if
+        // the bug this test guards against ever regresses, this loop
+        // simply times out with `schedule_position` still stuck at
+        // `backlog_start`, never advancing at all.
+        let mut caught_up = None;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let current = db::get_event_type(&pool, &bc_name, "OnceBeat")
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(position) = current.schedule_position {
+                if position > backlog_start + chrono::Duration::seconds(5) {
+                    caught_up = Some(position);
+                    break;
+                }
+            }
+        }
+        assert!(
+            caught_up.is_some(),
+            "schedule_position never advanced past the simulated backlog - fire_once stalled"
+        );
+
+        // The whole point of fire_once: exactly one event for the entire
+        // ~10-occurrence-wide backlog (its own last occurrence), not zero
+        // (the stall bug) and not the whole backlog (that's replay_backlog's
+        // own job) - a handful more may have legitimately come due since,
+        // given the poll interval and margin above, but the backlog itself
+        // collapses to one.
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert!(
+            !events.is_empty(),
+            "fire_once must produce at least the backlog's own collapsed event - got none"
+        );
+        assert!(
+            events.len() <= 5,
+            "fire_once must not replay a backlog: got {} events for a ~10s gap",
+            events.len()
+        );
+
+        // And, critically, it must not be stuck: waiting for one more
+        // legitimate occurrence past the point already reached proves the
+        // scheduler is still making real, ongoing progress, not just that
+        // the one backlog jump above happened to succeed once.
+        let after_catch_up = caught_up.unwrap();
+        let mut advanced_again = false;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let current = db::get_event_type(&pool, &bc_name, "OnceBeat")
+                .await
+                .unwrap()
+                .unwrap();
+            if current.schedule_position.unwrap() > after_catch_up {
+                advanced_again = true;
+                break;
+            }
+        }
+        assert!(
+            advanced_again,
+            "fire_once stalled again after resolving the initial backlog"
         );
     });
 }

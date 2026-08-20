@@ -9,14 +9,16 @@
 //! own Excludes list rules out multi-instance deployment entirely).
 //!
 //! Both fields share one shape: resolve the caller/access mapping/target
-//! `EventType`(s) up front, so a genuinely unauthorised subscribe attempt
-//! fails immediately rather than opening a stream that never delivers;
-//! build the initial `Subscription` value via
+//! `EventType`(s) up front; `state.event_broadcaster.subscribe()` next -
+//! see the comment at that exact call site (drift audit finding #4,
+//! 2026-08-20) for why it comes *before* the `bounded_context_events`
+//! snapshot read just after it, not the reverse; build the initial
+//! `Subscription` value from that snapshot via
 //! `event_store::create_all_events_subscription`/`create_event_type_subscription`
 //! (the pure rule, unchanged); then hand back an `asynk_strim::try_stream_fn`
-//! stream that pulls from `state.event_broadcaster.subscribe()` for as
-//! long as the connection lives, re-running `deliver_to_subscriptions`
-//! (also unchanged) per delivered event against a *freshly refetched*
+//! stream that pulls from the already-subscribed receiver for as long as
+//! the connection lives, re-running `deliver_to_subscriptions` (also
+//! unchanged) per delivered event against a *freshly refetched*
 //! `access_mapping` - never the snapshot captured at subscribe time (see
 //! below). `filters` is real wire-shape (matching
 //! `CreateEventTypeSubscription`'s own signature faithfully) and real
@@ -33,11 +35,17 @@
 //!   duplicates, no gaps... a transport-level disconnect is... the only
 //!   signal" one was missed): falling behind ends the stream rather than
 //!   silently skipping ahead.
-//! - a live-refetched `access_mapping` no longer active -
-//!   `RevocationClosesTheConnection`: checked fresh, per delivered event,
-//!   against the database, never against the mapping snapshot captured
-//!   at subscribe time, so a mid-stream revocation stops delivery at the
-//!   next matching event, not at the next reconnect.
+//! - `RevocationClosesTheConnection`, via two independent paths (drift
+//!   audit finding #4, 2026-08-20 - the first of these used to be the
+//!   only one, which meant a revoked subscription in an otherwise-quiet
+//!   bounded context stayed open indefinitely; see
+//!   `revocation_closes_connection`'s own doc comment): a live-refetched
+//!   `access_mapping` no longer active on the next delivered event -
+//!   checked fresh against the database, never against the mapping
+//!   snapshot captured at subscribe time - and, independently of any
+//!   event ever arriving at all, a matching notification from
+//!   `state.revocation_broadcaster`, published the instant
+//!   `resolvers::access_management` actually revokes the mapping.
 
 use super::{not_found, parse_filters, require_read_mapping, resolve_read_data_keys};
 use crate::error::to_graphql_error;
@@ -56,6 +64,53 @@ fn subscription_lagged_error(skipped: u64) -> async_graphql::Error {
          reconnect and, if needed, catch up via queryEvents/countEvents first"
     ))
     .extend_with(|_, ext| ext.set("code", "subscription_lagged"))
+}
+
+/// `RevocationClosesTheConnection`'s push half (drift audit finding #4,
+/// see project memory `skilj-drift-audit-2026-08-20`) - both subscription
+/// loops below `tokio::select!` against `state.revocation_broadcaster`
+/// alongside their own `EventBroadcaster` receiver, and route whatever
+/// they get from it through here. Doesn't replace the pre-existing
+/// per-delivered-event re-check just below each call site - that one
+/// still does real, separate work (a fresh `access_mapping` for
+/// decrypt-on-read, e.g. a `can_read_sensitive` flip that isn't a
+/// revocation at all) - this only adds the orthogonal "nothing has to
+/// arrive for a revocation to close the connection" path that check
+/// alone couldn't cover.
+///
+/// `Ok(true)`: close now, this notification named our own
+/// `(role_id, bounded_context)`. `Ok(false)`: not ours, or nothing to act
+/// on yet - keep looping. `Err`: a real I/O failure while re-checking a
+/// lagged receiver, ready to `yield_error` as-is.
+async fn revocation_closes_connection(
+    pool: &skilj_core::db::Pool,
+    role_id: &str,
+    bounded_context_name: &str,
+    revoked: Result<skilj_core::access_control::RevokedMapping, RecvError>,
+) -> Result<bool, async_graphql::Error> {
+    match revoked {
+        Ok(revoked) => {
+            Ok(revoked.role_id == role_id && revoked.bounded_context == bounded_context_name)
+        }
+        Err(RecvError::Lagged(_)) => {
+            // May have missed a notification meant for us - a lagged
+            // broadcast receiver gives no way to tell which ones, so the
+            // only safe response is a direct, authoritative re-check
+            // against the database rather than assuming either way.
+            let still_active =
+                skilj_core::db::get_active_role_access_mapping(pool, role_id, bounded_context_name)
+                    .await
+                    .map_err(to_graphql_error)?
+                    .is_some();
+            Ok(!still_active)
+        }
+        // No more revocation notifications will ever arrive on this
+        // receiver - not fatal on its own, the per-delivered-event
+        // re-check below still catches a revocation whenever the next
+        // matching event happens to arrive, the same guarantee this
+        // connection had before this push mechanism existed at all.
+        Err(RecvError::Closed) => Ok(false),
+    }
 }
 
 /// `allEvents(boundedContext: String!, eventTypes: [String!], fromSequence: Int): QueriedEvent!`
@@ -86,6 +141,30 @@ pub fn all_events_field() -> SubscriptionField {
                 .map(|v| v.i64())
                 .transpose()?;
 
+            // Subscribed *before* the snapshot read just below, not after
+            // (drift audit finding #7, 2026-08-20 - see project memory
+            // `skilj-drift-audit-2026-08-20`) - this receiver's own doc
+            // comment on `EventBroadcaster::subscribe` says it plainly:
+            // "each see every event published after they were created".
+            // An event committed in the gap between this call and the
+            // snapshot read is now guaranteed to be either already in
+            // that snapshot (and so already reflected in
+            // `bounded_context_events`) or delivered live through `rx`
+            // instead - not both: `deliver_to_subscriptions`'s own
+            // `s.starting_sequence() < event.sequence` filter already
+            // excludes anything at or below `from_sequence`, and
+            // `from_sequence` here is computed as the snapshot's own
+            // highest sequence, so an event the snapshot already
+            // includes can never also be delivered live as a duplicate.
+            // Subscribing *after* the snapshot, the old order, left a
+            // real gap the other way: an event landing in that same
+            // window postdated the snapshot (so `from_sequence` didn't
+            // cover it) but predated this receiver's own creation (so
+            // the broadcaster's fan-out, which only reaches receivers
+            // that already existed at publish time, never delivered it
+            // either) - silently missed, on both sides at once.
+            let mut rx = state.event_broadcaster.subscribe();
+
             let bounded_context_events =
                 skilj_core::db::list_events_for_bounded_context(&state.pool, &bounded_context_name)
                     .await
@@ -105,9 +184,29 @@ pub fn all_events_field() -> SubscriptionField {
 
             Ok(asynk_strim::try_stream_fn(move |mut yielder| async move {
                 let mut current = Subscription::AllEventsSubscription(Box::new(initial));
-                let mut rx = state.event_broadcaster.subscribe();
+                let mut revocation_rx = state.revocation_broadcaster.subscribe();
                 loop {
-                    match rx.recv().await {
+                  let event = tokio::select! {
+                    revoked = revocation_rx.recv() => {
+                        match revocation_closes_connection(&state.pool, &role_id, &bounded_context_name, revoked).await {
+                            Ok(true) => {
+                                yielder
+                                    .yield_error(to_graphql_error(
+                                        skilj_core::access_control::Error::GrantNotActive,
+                                    ))
+                                    .await;
+                                return Ok(());
+                            }
+                            Ok(false) => continue,
+                            Err(err) => {
+                                yielder.yield_error(err).await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    event = rx.recv() => event,
+                  };
+                    match event {
                         Ok(event) => {
                             if event.bounded_context.name != bounded_context_name {
                                 continue;
@@ -226,6 +325,11 @@ pub fn events_by_type_field() -> SubscriptionField {
                 .map(|v| v.i64())
                 .transpose()?;
 
+            // Subscribed before the snapshot read just below - see
+            // `all_events_field`'s own identical comment for why (drift
+            // audit finding #7).
+            let mut rx = state.event_broadcaster.subscribe();
+
             let bounded_context_events =
                 skilj_core::db::list_events_for_bounded_context(&state.pool, &bounded_context_name)
                     .await
@@ -246,9 +350,29 @@ pub fn events_by_type_field() -> SubscriptionField {
 
             Ok(asynk_strim::try_stream_fn(move |mut yielder| async move {
                 let mut current = Subscription::EventTypeSubscription(Box::new(initial));
-                let mut rx = state.event_broadcaster.subscribe();
+                let mut revocation_rx = state.revocation_broadcaster.subscribe();
                 loop {
-                    match rx.recv().await {
+                  let event = tokio::select! {
+                    revoked = revocation_rx.recv() => {
+                        match revocation_closes_connection(&state.pool, &role_id, &bounded_context_name, revoked).await {
+                            Ok(true) => {
+                                yielder
+                                    .yield_error(to_graphql_error(
+                                        skilj_core::access_control::Error::GrantNotActive,
+                                    ))
+                                    .await;
+                                return Ok(());
+                            }
+                            Ok(false) => continue,
+                            Err(err) => {
+                                yielder.yield_error(err).await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    event = rx.recv() => event,
+                  };
+                    match event {
                         Ok(event) => {
                             if event.bounded_context.name != bounded_context_name {
                                 continue;

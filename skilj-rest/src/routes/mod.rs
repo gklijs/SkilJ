@@ -266,16 +266,32 @@ impl From<&Event> for EventDto {
     }
 }
 
+/// `event_type_*` - drift audit finding #8 (2026-08-20, see project
+/// memory `skilj-drift-audit-2026-08-20`): `surface EventFetch`'s own
+/// `exposes: event_type.name/schema/schema_version` had no REST route
+/// returning `schema`/`schema_version` at all, only the bare name
+/// (`EventDto.event_type`, per delivered event). Top-level here, not
+/// repeated per event: `TokenScopedToEventType` already means every
+/// event in one response shares the same `EventType`, since a token is
+/// scoped to exactly one - the schema can't vary within a response, so
+/// naming it once matches that invariant instead of fighting it.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EventsResponse {
     events: Vec<EventDto>,
     next_cursor: Option<String>,
+    event_type_name: String,
+    event_type_schema: String,
+    event_type_schema_version: i64,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ConsumeResponse {
     events: Vec<EventDto>,
+    event_type_name: String,
+    event_type_schema: String,
+    event_type_schema_version: i64,
 }
 
 #[derive(Deserialize)]
@@ -458,6 +474,9 @@ async fn get_events(
     Ok(Json(EventsResponse {
         events: matched.iter().map(EventDto::from).collect(),
         next_cursor,
+        event_type_name: token.event_type.name.clone(),
+        event_type_schema: token.event_type.schema.clone(),
+        event_type_schema_version: token.event_type.schema_version,
     }))
 }
 
@@ -501,6 +520,9 @@ async fn get_events_consume(
 
     Ok(Json(ConsumeResponse {
         events: result.served.iter().map(EventDto::from).collect(),
+        event_type_name: token.event_type.name.clone(),
+        event_type_schema: token.event_type.schema.clone(),
+        event_type_schema_version: token.event_type.schema_version,
     }))
 }
 

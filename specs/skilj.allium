@@ -186,21 +186,20 @@ value EventSpec {
 
 value CommandDecision {
     accepted: Boolean
-    events: List<EventSpec>      -- ignored when accepted = false
+    events: List<EventSpec>      -- the events to append; read only when accepted = true
     rejection_reason: String?    -- domain-specific explanation from the decider; surfaced verbatim
                                   -- to the caller when accepted = false. Producing a
                                   -- meaningful message here is the decider's responsibility - it
                                   -- needs domain knowledge this library doesn't have.
     rejection_kind: String?      -- machine-readable label for what kind of rejection this is, set by
-                                  -- the decider alongside rejection_reason and, like it, effectively
-                                  -- required whenever accepted = false (and ignored otherwise, the
-                                  -- same as events). It exists because a caller - typically a UI
-                                  -- reached over GraphQL - needs to branch on the kind of rejection
-                                  -- programmatically, e.g. to decide whether to offer a retry, and
-                                  -- must not have to parse the free-text English of rejection_reason
-                                  -- to do it. A command that would push an account balance below zero
-                                  -- is a business-rule rejection a decider might tag
-                                  -- "insufficient_balance", distinct in kind from some other
+                                  -- the decider alongside rejection_reason and always together with
+                                  -- it (see the shape note below). It exists because a caller - a UI
+                                  -- reached over GraphQL, typically - needs to branch on the kind of
+                                  -- rejection programmatically, e.g. to decide whether to offer a
+                                  -- retry, and must not have to parse the free-text English of
+                                  -- rejection_reason to do it. A command that would push an account
+                                  -- balance below zero is a business-rule rejection a decider might
+                                  -- tag "insufficient_balance", distinct in kind from some other
                                   -- rejection the same decider can produce, even though both arrive
                                   -- as a plain message today.
                                   --
@@ -220,6 +219,49 @@ value CommandDecision {
                                   -- exact wire shape stays deferred with the rest of the wire
                                   -- contract - see the scope header's exclusions, and the same
                                   -- framing above rule QueryProjection.
+
+    -- Shape. These four fields are two shapes, not four independent
+    -- values. Exactly one of the following holds of every decision
+    -- decide() returns:
+    --
+    --   accepted = true   events carries the events to append, possibly
+    --                     empty. rejection_reason and rejection_kind are
+    --                     both null; no caller may read either.
+    --   accepted = false  rejection_reason and rejection_kind are both
+    --                     non-null - always the two together, never one
+    --                     without the other - and both are surfaced to the
+    --                     caller. events is ignored; no caller may read it.
+    --
+    -- Nothing else is a well-formed decision. A rejection carrying a
+    -- reason but no kind is exactly as malformed as one carrying neither:
+    -- the pair is one unit, because a caller that can only read English
+    -- prose cannot branch, which is the whole reason rejection_kind
+    -- exists. So a caller may rely on rejection_kind being present
+    -- whenever accepted = false, with no null check and no fallback, and
+    -- must never rely on it otherwise.
+    --
+    -- The type does not enforce that pairing, and cannot. The `?` on both
+    -- rejection fields means "does not apply in the other case", not
+    -- "optional within its own case" - a distinction a value type in this
+    -- language has no way to draw, since its fields are one flat list with
+    -- no discriminator to hang presence off. Sum types here are entity
+    -- machinery: a discriminator field over separately declared
+    -- `variant X : BaseEntity` shapes, as AccessToken.purpose and
+    -- Event.origin both use. A decision has no identity, no lifecycle and
+    -- no stored form, so promoting it to an entity purely to buy a
+    -- discriminator would misrepresent it considerably more than this flat
+    -- shape understates it. The pairing is therefore an obligation on
+    -- decide(), written down here and unchecked, in the same register as
+    -- the rest of that plugin contract - see rule ProcessCommand, where
+    -- decide() is deliberately a prose contract rather than a formally
+    -- specified interface.
+    --
+    -- An implementation is free to model this as a real two-case sum, with
+    -- the rejection fields mandatory and non-optional in the rejection
+    -- case and absent entirely from the acceptance case; skilj's own does.
+    -- That is a faithful refinement of what is written here - it can
+    -- represent every well-formed decision and no malformed one - not a
+    -- divergence from it.
 }
 
 value SensitiveField {
@@ -399,7 +441,8 @@ variant SystemCreator : ContextCreator {
 -- schema is an opaque JSON Schema string here and is never structurally
 -- parsed at this level (see the black boxes that do parse it:
 -- valid_tag_mappings, valid_sensitive_fields, valid_filters,
--- valid_payload and schema_is_backwards_compatible), so nothing in this
+-- valid_schema, valid_payload and schema_is_backwards_compatible), so
+-- nothing in this
 -- file can express
 -- "at most one level of nesting" as a check. A bounded context that
 -- declares a deeper schema anyway is outside the contract, and what its
@@ -427,6 +470,10 @@ variant SystemCreator : ContextCreator {
 -- discovered later by whoever reads it back, not how a JSON Schema
 -- validator walks a document. Deterministic in the ordinary way: the same
 -- schema and the same payload always give the same verdict.
+--
+-- Its schema-only half is valid_schema(schema), which asks whether schema
+-- is a usable JSON Schema at all, with nothing to validate against it -
+-- see the note above rule RegisterEventType.
 --
 -- It is checked wherever a caller-supplied payload crosses into the
 -- system, and only there: CreateExternalEvent and CreateDirectEvent for
@@ -791,6 +838,15 @@ entity EncryptionKey {
 }
 
 entity Command {
+    id: String                             -- SkilJ's own internal identifier, assigned at creation and
+                                            -- never derived from the command's content, so a stored
+                                            -- Command can be pointed at as itself rather than
+                                            -- reconstructed from whatever it happens to contain. That is
+                                            -- what makes FetchCommands's triggered_event lookup exact: a
+                                            -- CommandTriggered event names the Command behind it, and
+                                            -- matching that against a candidate is an identity
+                                            -- comparison, so two commands carrying identical payload,
+                                            -- metadata, tags and boundary stay distinct.
     bounded_context: BoundedContext
     command_type: CommandType
     payload: String                        -- JSON-encoded command data, conforms to command_type.schema
@@ -1168,10 +1224,23 @@ default SystemCreator skilj = { }
 -- and, for the command's own payload, in ProcessCommand, follows a
 -- similar pattern: it get-or-creates the EncryptionKey for each subject
 -- a sensitive field in type.sensitive_fields references (each key
--- provisioned exactly once, in the same transaction as the event's or
--- command's own insert), then returns the payload with those fields'
--- values replaced by ciphertext plus the keys used. A no-op - unchanged
--- payload, empty key set - when sensitive_fields is empty.
+-- provisioned exactly once - the get-or-create is genuinely idempotent,
+-- protected by the schema's own partial unique index over the active
+-- key for a bounded_context, subject_key and subject_value, so two
+-- concurrent provisionings for one subject can never leave two rows),
+-- then returns the payload with those fields' values replaced by
+-- ciphertext plus the keys used. That provisioning is resolved before
+-- the write's own transaction opens rather than inside it, and
+-- deliberately so: a master-key wrap and a database round trip are
+-- real work, and doing them while already holding the sequence row
+-- lock above would make every other concurrent writer to the same
+-- bounded context wait for them, for no correctness benefit. The one
+-- consequence is benign: a write that later fails or rolls back for an
+-- unrelated reason leaves the key it provisioned behind - real and
+-- active, but referenced by nothing, and so readable through by
+-- nothing either - until the next write for that same subject finds
+-- it rather than provisioning another. A no-op - unchanged payload,
+-- empty key set - when sensitive_fields is empty.
 --
 -- "Those fields" includes a SensitiveField.field written as a two-segment
 -- dotted path (see the payload schema shape note above entity
@@ -1419,6 +1488,7 @@ rule CreateExternalEvent {
     requires: event_type.external_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
+    requires: event_type.bounded_context.status = active
     requires: valid_payload(event_type.schema, payload)
 
     let protected = protect_sensitive_fields(event_type, payload)
@@ -1449,6 +1519,7 @@ rule CreateDirectEvent {
     requires: event_type.direct_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
+    requires: event_type.bounded_context.status = active
     requires: valid_payload(event_type.schema, payload)
 
     let protected = protect_sensitive_fields(event_type, payload)
@@ -2212,8 +2283,10 @@ rule ProcessCommand {
     -- Its contract is the whole of CommandDecision: on acceptance, the
     -- events to append; on rejection, both rejection_reason (the
     -- human-readable explanation) and rejection_kind (the machine-readable
-    -- label a caller branches on) - see CommandDecision for why the latter
-    -- stays an opaque String rather than an enum this library enumerates.
+    -- label a caller branches on), never one without the other. See the
+    -- shape note on CommandDecision for exactly which fields a decider
+    -- owes in each case, and why that pairing is an obligation on decide()
+    -- rather than something the value type itself can enforce.
     --
     -- Resolved: that plugin boundary stays a prose contract here, not a
     -- formally specified interface. Whether the implementation expresses
@@ -2243,6 +2316,7 @@ rule ProcessCommand {
     -- and its events - see the project() note above the rules.
     ensures:
         let command = Command.created(
+            id: generate_token_id(),
             bounded_context: command_type.bounded_context,
             command_type: command_type,
             payload: protected.payload,
@@ -2777,6 +2851,46 @@ rule DeleteBoundedContext {
 -- registration whose tag_mappings or sensitive_fields fail the check is
 -- rejected outright, exactly as an invalid filter is.
 --
+-- valid_schema(schema) is the unconditional member of that family, and
+-- the reason it is needed is that neither of the two above is. Each is
+-- satisfied vacuously by an empty tag_mappings or sensitive_fields, so
+-- each only ever reads schema as a side effect of checking something
+-- declared against it. A registration declaring neither therefore reached
+-- no schema check at all, and could register a string that is not
+-- well-formed JSON, let alone a usable JSON Schema. Such a registration
+-- was still rejected eventually - by valid_payload, on the first write of
+-- that type - but only later, and at a different call from the one that
+-- made the mistake.
+--
+-- valid_schema asks the one question about a schema that has an answer
+-- with no payload to hand: schema reads as well-formed JSON, and is
+-- itself a valid JSON Schema. It is the same check valid_payload already
+-- performs on schema before validating anything against it, minus the
+-- payload - so a schema valid_schema accepts is exactly a schema
+-- valid_payload can use, and the rejection lands at the registration its
+-- author can still see. It says nothing about any payload; conformance
+-- remains valid_payload's job. A black box in the same register as the
+-- rest of the family: this library owns that an unusable schema is
+-- rejected at registration time, not how a JSON Schema document is parsed
+-- and compiled.
+--
+-- RegisterProjection is the third rule that asks it, and the one that
+-- needed it most. A projection declares no tag_mappings and no
+-- sensitive_fields at all, so it never had even the vacuous pair to read
+-- its schema as a side effect - it reached no schema check whatsoever.
+-- Nor is there a later call to catch the mistake: a projection's schema
+-- is consumed by the generated GraphQL type, not by any payload write, so
+-- valid_payload never sees it and the "rejected eventually" consolation
+-- above does not apply. An unusable schema registered there would surface
+-- as a broken generated type, at no call in particular. Registration is
+-- the only place the question can be asked, which is where it now is.
+--
+-- It is checked before valid_tag_mappings and valid_sensitive_fields on
+-- RegisterEventType and RegisterCommandType, because whether a named
+-- field exists in a schema is only a meaningful question once the schema
+-- is one. On RegisterProjection, which declares neither, it is simply the
+-- first schema-related guard the rule reaches.
+--
 -- schema_is_backwards_compatible(existing_schema, schema) is the third
 -- black box of that family, and the one that makes schema evolution a
 -- rule rather than an intention. All three registration rules carried
@@ -2990,6 +3104,7 @@ rule RegisterEventType {
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+    requires: valid_schema(schema)
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
 
@@ -3076,6 +3191,7 @@ rule RegisterCommandType {
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+    requires: valid_schema(schema)
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
 
@@ -3191,6 +3307,23 @@ rule RegisterCommandType {
 -- its existing content, at its existing position, under its existing
 -- schema. A rebuild is a second, private fold that nothing reads until it
 -- is complete, not a projection taken offline in view of its callers.
+--
+-- A first-time registration stages nothing and rebuilds nothing, but it is
+-- not unconditionally blank either. Registering a sync projection into a
+-- bounded context that already holds events of a type it consumes folds
+-- that history in there and then, before the registration is complete, and
+-- the new Projection is created already caught up to its context's latest
+-- committed sequence. The asymmetry with an async projection is real
+-- rather than incidental: an async one is folded forward by a background
+-- consumer that reads a null caught_up_to as "start from the beginning",
+-- so pre-existing history reaches it on the first tick no matter when it
+-- was registered, whereas a sync projection is only ever updated by the
+-- transaction committing an event it consumes and so has no mechanism at
+-- all for events that predate it. Doing this inline needs none of the
+-- staging machinery above, and for a reason that machinery makes explicit:
+-- staging exists to keep a live projection answering under its old
+-- definition while a replay runs, and a projection nobody has been able to
+-- query yet has no such reader to protect.
 
 rule RegisterProjection {
     when: RegisterProjection(access_mapping, bounded_context, name, schema,
@@ -3199,6 +3332,7 @@ rule RegisterProjection {
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
     requires: bounded_context.status = active
+    requires: valid_schema(schema)
 
     -- Every EventType a projection consumes must belong to the same
     -- bounded context: a projection is built from its own context's
@@ -3242,6 +3376,30 @@ rule RegisterProjection {
 
     let becoming_sync = exists existing and existing.sync = false and sync = true
 
+    -- Every event this bounded context has ever committed, named once
+    -- because the first-time case below needs both whether it holds
+    -- anything relevant and where it currently ends. Expressed as a
+    -- filter() rather than "Events where bounded_context = bounded_context"
+    -- only because the trigger parameter shares the field's name; it means
+    -- exactly what that projection would have meant.
+    let context_events = filter(Events, e => e.bounded_context = bounded_context)
+
+    -- A first-time registration is not always a blank one. An async
+    -- projection created into a context that already has history needs no
+    -- special treatment: caught_up_to = null means "start from the
+    -- beginning" to the background consumer, which folds that history in
+    -- on its very first tick regardless of when the projection was
+    -- registered. A sync projection has no such consumer - it is only ever
+    -- updated inline, by the transaction that commits an event it consumes
+    -- - so nothing would ever go back for events committed before it
+    -- existed, and it would sit at null until some new event of a consumed
+    -- type happened to arrive. This names that case; the ensures below is
+    -- what closes it.
+    let first_time_sync_has_history =
+        not exists existing
+        and sync
+        and consumed_event_types.any(et => context_events.any(e => e.event_type = et))
+
     let rebuild_needed =
         exists existing
         and (schema_changed or consumed_change_has_history or becoming_sync)
@@ -3261,7 +3419,24 @@ rule RegisterProjection {
                 schema_version: 1,
                 consumed_event_types: consumed_event_types,
                 sync: sync,
-                caught_up_to: null
+                -- The bounded context's latest committed sequence, not
+                -- merely the latest one of a consumed type: the history is
+                -- folded through the same black-box project() an async
+                -- projection's consumer uses, which likewise advances
+                -- caught_up_to past every event it walks whether or not
+                -- the projection consumed it (see the note above the
+                -- rules). Anything less would leave a sync projection
+                -- declared caught up while committed events in its own
+                -- context sat ahead of it, which is precisely what
+                -- SyncProjectionNeverLags forbids. Folded in full before
+                -- this registration is considered complete, and safe to do
+                -- inline here specifically because a brand-new projection
+                -- has no live readers to protect from a fold in progress -
+                -- unlike RebuildProjection's stage/replay/promote, which
+                -- exists because a live Projection does have them.
+                caught_up_to:
+                    if first_time_sync_has_history: highest_sequence(context_events)
+                    else: null
             )
         else if rebuild_needed:
             if exists staged:

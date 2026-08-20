@@ -268,6 +268,7 @@ fn command_type_with_sensitive_field() -> CommandType {
 fn command_with_real_ciphertext(data_key: &encryption::DataKey) -> Command {
     let ciphertext = encryption::encrypt_leaf(data_key, "person@example.com");
     Command {
+        id: "cmd-1".into(),
         bounded_context: bounded_context(),
         command_type: command_type_with_sensitive_field(),
         payload: format!(r#"{{"email":"{ciphertext}","user_id":"42"}}"#),

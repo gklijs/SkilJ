@@ -18,10 +18,11 @@
 //! (`CommandQuery`), `command_submission` (`CommandSubmission` - see its
 //! own doc comment for why this is the highest-value of the three:
 //! `CommandDispatcher::required_role`, §1.3.1, finally gets a real
-//! caller). `ProjectionQuery`/`EventSubscription` stay out of Phase 3 -
+//! caller). `ProjectionQuery`/`EventSubscription` stayed out of Phase 3 -
 //! both were blocked on genuine prerequisites at the time (`project()`
-//! didn't exist; there's still no event-delivery mechanism for
-//! `EventSubscription`).
+//! didn't exist yet; neither did an event-delivery mechanism for
+//! `EventSubscription`) - both are built now, each its own later pass,
+//! described just below.
 //!
 //! `projection_query` (`ProjectionQuery`) is its own later pass, once
 //! `project()` existed both sync and async (§8 item 6) - see

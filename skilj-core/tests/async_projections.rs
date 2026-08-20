@@ -245,6 +245,38 @@ async fn insert_plain_event(pool: &Pool, bc: &BoundedContext, et: &EventType, am
     seq
 }
 
+/// Unlike `insert_plain_event` above, this goes through the *locked*
+/// production shape every real event-creation call site uses
+/// (`create_and_insert_direct_event` etc.) - `next_sequence` and the
+/// event's own insert share one transaction, so the bounded context's
+/// `sequence` row stays locked for the whole call, not just the
+/// increment. Needed by the concurrency test below, which specifically
+/// needs that lock actually held for its own race against
+/// `promote_projection_rebuild` to be real - drift audit finding #6's
+/// fix depends entirely on both sides taking it.
+async fn insert_event_via_the_locked_path(
+    pool: &Pool,
+    bc: &BoundedContext,
+    et: &EventType,
+    amount: i64,
+) -> i64 {
+    let mut tx = pool.begin().await.unwrap();
+    let seq = db::next_sequence(&mut *tx, &bc.name).await.unwrap();
+    let e = event(bc, et, seq, amount);
+    db::insert_event_and_update_sync_projections_in_tx(
+        pool,
+        &mut tx,
+        &e,
+        None,
+        &TestDispatcher,
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    seq
+}
+
 #[test]
 fn a_cold_start_catch_up_folds_every_existing_event() {
     runtime().block_on(async {
@@ -424,5 +456,182 @@ fn a_building_rebuild_replays_from_the_start_and_promotes_once_caught_up() {
                 .unwrap(),
             Some("25".to_string())
         );
+    });
+}
+
+/// Drift audit finding #6 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): a rebuild whose own `caught_up_to`
+/// no longer matches the bounded context's real latest sequence -
+/// because a new event committed after the fold pass that produced it -
+/// must defer promotion rather than strand that event. Constructs the
+/// stale state directly (a real `catch_up_bounded_context` fold pass
+/// would take an extra tick to reach the same point; asserting on
+/// `promote_projection_rebuild`'s own return value directly is a more
+/// exact proof of the deferral logic itself than routing through that
+/// extra layer), then proves the deferred rebuild is not stuck forever -
+/// the very next tick folds the new event in and promotes for real.
+#[test]
+fn promotion_defers_instead_of_stranding_an_event_committed_after_the_fold_pass() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        let existing = seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+
+        let first_seq = insert_plain_event(&pool, &bc, &et, 20).await;
+
+        // A building rebuild already fully caught up to first_seq -
+        // exactly what catch_up_bounded_context's own fold loop would
+        // have just produced, immediately eligible for promotion.
+        // sync: true - this is specifically the async->sync promotion
+        // finding #6 is about; ProjectionRebuild.sync is the target state
+        // to promote *to*, not a description of the rebuild's own nature.
+        let rebuild = ProjectionRebuild {
+            projection: existing,
+            schema: r#"{"properties":{"total":{"type":"integer"}}}"#.to_string(),
+            schema_version: 2,
+            consumed_event_types: vec![et.clone()],
+            sync: true,
+            caught_up_to: Some(first_seq),
+            status: ProjectionRebuildStatus::Building,
+        };
+        db::upsert_projection_rebuild(&pool, &rebuild)
+            .await
+            .unwrap();
+
+        // The race: a second event commits after that fold pass, before
+        // promotion runs.
+        let second_seq = insert_plain_event(&pool, &bc, &et, 5).await;
+
+        let promoted = db::promote_projection_rebuild(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap();
+        assert!(
+            !promoted,
+            "promotion must defer, not strand second_seq's own event"
+        );
+
+        // Deferred, not lost: the building rebuild survives untouched,
+        // and the live projection is still async - neither side silently
+        // dropped the new event.
+        let still_building = db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Building,
+        )
+        .await
+        .unwrap()
+        .expect("a deferred promotion must leave the building rebuild in place");
+        assert_eq!(still_building.caught_up_to, Some(first_seq));
+        let still_async = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!still_async.sync);
+
+        // The next tick: folds second_seq into the still-building
+        // rebuild, then promotes for real - self-correcting, not stuck.
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Building
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let promoted_projection = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(promoted_projection.sync);
+        assert_eq!(promoted_projection.caught_up_to, Some(second_seq));
+        // Position only, deliberately - this test's own rebuild fixture
+        // starts from a synthetic caught_up_to rather than a real fold
+        // pass, so its own projection_rebuild_state was never seeded to
+        // match; state-fold correctness after a real replay is already
+        // covered by a_building_rebuild_replays_from_the_start_and_promotes_once_caught_up
+        // above. What this test proves is that caught_up_to ends up
+        // exactly at second_seq, not stranded at first_seq.
+    });
+}
+
+/// The same finding, proven under a genuine concurrent race rather than
+/// a hand-sequenced one - `tokio::join!`, the same real-concurrency
+/// pattern `admin_context_bootstrap.rs`'s own
+/// `two_concurrent_builds_against_a_fresh_database_both_succeed` uses.
+/// Whichever side actually wins the bounded context's own `sequence` row
+/// lock varies run to run - that's real, uncontrolled scheduling, not
+/// something this test tries to pin - but the *final* state must be
+/// identical either way: fully promoted, fully caught up, nothing
+/// stranded. A follow-up `catch_up_bounded_context` call after the race
+/// (standing in for "the next scheduled tick", exactly like the deferral
+/// test above) is what makes that true regardless of which side won -
+/// without the fix, this would only converge on one of the two possible
+/// orderings, not both.
+#[test]
+fn a_real_concurrent_event_and_promotion_never_strand_the_event() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        let existing = seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+
+        let first_seq = insert_plain_event(&pool, &bc, &et, 20).await;
+
+        let rebuild = ProjectionRebuild {
+            projection: existing,
+            schema: r#"{"properties":{"total":{"type":"integer"}}}"#.to_string(),
+            schema_version: 2,
+            consumed_event_types: vec![et.clone()],
+            sync: true,
+            caught_up_to: Some(first_seq),
+            status: ProjectionRebuildStatus::Building,
+        };
+        db::upsert_projection_rebuild(&pool, &rebuild)
+            .await
+            .unwrap();
+
+        let (second_seq, promoted) = tokio::join!(
+            insert_event_via_the_locked_path(&pool, &bc, &et, 5),
+            db::promote_projection_rebuild(&pool, &bc.name, "AccountBalance"),
+        );
+        // Whichever side won, this must not have errored - a real `Err`
+        // here (as opposed to `Ok(false)`, the legitimate "deferred"
+        // outcome) would be a genuine failure worth surfacing, not
+        // something to silently swallow.
+        promoted.unwrap();
+
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Building
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let final_projection = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(final_projection.sync);
+        // Position only, deliberately - see the deferral test above's own
+        // identical comment for why (a synthetic caught_up_to, not a real
+        // fold pass, backs this fixture's rebuild).
+        assert_eq!(final_projection.caught_up_to, Some(second_seq));
     });
 }

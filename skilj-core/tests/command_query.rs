@@ -87,6 +87,12 @@ fn event_type(name: &str) -> EventType {
 
 fn command(command_type: CommandType, payload: &str, created_at_secs: i64) -> Command {
     Command {
+        // Deterministic, unique per distinct payload used in this file's
+        // own fixtures - real identity now backs the triggered_event
+        // lookup (drift audit finding #12), so tests that need two
+        // otherwise-identical commands told apart construct an explicit
+        // override rather than relying on this default colliding or not.
+        id: format!("cmd-{payload}"),
         bounded_context: bounded_context(BoundedContextStatus::Active),
         command_type,
         payload: payload.into(),
@@ -276,6 +282,48 @@ fn fetch_commands_filters_by_triggered_event() {
     .unwrap();
 
     assert_eq!(rendered, vec!["the-one".to_string()]);
+}
+
+/// Drift audit finding #12 (2026-08-20, see project memory
+/// `skilj-drift-audit-2026-08-20`): the reverse lookup used to match by
+/// whole-`Command` equality, so two field-identical-but-distinct commands
+/// were indistinguishable to it. Now that `Command.id` is real, two
+/// commands with byte-identical content but different ids must still be
+/// told apart correctly - the one the triggered_event's own origin
+/// actually names, not "whichever content-identical row happens to be
+/// first."
+#[test]
+fn fetch_commands_filters_by_triggered_event_even_when_another_command_has_identical_content() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let ct = command_type("PlaceOrder");
+    let base = command(ct, "same-content", 0);
+    let target_command = Command {
+        id: "cmd-target".into(),
+        ..base.clone()
+    };
+    let decoy_command = Command {
+        id: "cmd-decoy".into(),
+        ..base
+    };
+    let triggered_event = event_triggered_by(target_command.clone());
+    // The decoy first, so a content-based match (the old bug) would have
+    // returned it instead - order alone doesn't save this test.
+    let commands = vec![decoy_command, target_command];
+
+    let rendered = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        Some(&triggered_event),
+        &commands,
+        |_, _| unreachable!(),
+    )
+    .unwrap();
+
+    // Exactly one match, not two - the decoy's identical content must not
+    // also satisfy the lookup.
+    assert_eq!(rendered, vec!["same-content".to_string()]);
 }
 
 /// Supplying `triggered_event` alongside a command_types/time filter its
