@@ -6,6 +6,7 @@ members = [
     "skilj-macros",
     "skilj-rest",
     "skilj",
+    "skilj-demo",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -16,6 +17,10 @@ members = [
 #                 #[requires_role(...)] (§1.3.1) and gql_object! (§1.3.2)
 # skilj-rest    - the REST surface, independently usable (§3.1, §3.3, §7)
 # skilj         - a thin facade depending on all three, for the common case (§3.1)
+# skilj-demo    - a worked example built on `skilj`: two bounded contexts
+#                 (see skilj-demo/src/lib.rs), runnable as a real server and
+#                 exercised as an integration-test suite against a real
+#                 Postgres - not part of the library itself.
 
 [workspace.package]
 version = "0.1.0"
@@ -56,3 +61,4 @@ skilj-core = { path = "skilj-core" }
 skilj-graphql = { path = "skilj-graphql" }
 skilj-macros = { path = "skilj-macros" }
 skilj-rest = { path = "skilj-rest" }
+skilj = { path = "skilj" }

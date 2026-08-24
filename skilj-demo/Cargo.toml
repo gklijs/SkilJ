@@ -1,0 +1,27 @@
+[package]
+name = "skilj-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Worked example built on `skilj`: two bounded contexts (banking, courses) showing what the dynamic consistency boundary buys over classic per-aggregate event sourcing. Not part of the library - see src/lib.rs."
+publish = false
+
+[dependencies]
+skilj.workspace = true
+skilj-core.workspace = true
+tokio.workspace = true
+axum.workspace = true
+chrono.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+postgresql_embedded = "0.21.0"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"

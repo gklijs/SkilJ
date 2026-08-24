@@ -1679,7 +1679,7 @@ async fn consumed_event_types(
 }
 
 async fn replace_consumed_event_types(
-    pool: &Pool,
+    executor: &mut sqlx::PgConnection,
     bounded_context: &str,
     join_table: &str,
     projection_name: &str,
@@ -1690,7 +1690,7 @@ async fn replace_consumed_event_types(
         "DELETE FROM {schema}.{join_table} WHERE projection_name = $1"
     ))
     .bind(projection_name)
-    .execute(pool)
+    .execute(&mut *executor)
     .await?;
     for et in event_types {
         sqlx::query(&format!(
@@ -1698,7 +1698,7 @@ async fn replace_consumed_event_types(
         ))
         .bind(projection_name)
         .bind(&et.name)
-        .execute(pool)
+        .execute(&mut *executor)
         .await?;
     }
     Ok(())
@@ -1710,8 +1710,25 @@ const PROJECTION_COLUMNS: &str = "name, schema, schema_version, sync, caught_up_
 /// projection's `projection_consumed_event_types` join rows wholesale
 /// (simpler and plenty fast enough for a small, admin-managed list than
 /// diffing old vs. new membership).
+///
+/// Both statements run inside one transaction, not back-to-back on the
+/// bare pool: two concurrent `upsert_projection` calls for the same
+/// `projection.name` (e.g. a rolling deploy's two instances reconciling
+/// at once, or - what actually surfaced this, see `skilj-demo`'s test
+/// suite - two `#[test]`s racing to register the same projection) used
+/// to each run their own `DELETE` then `INSERT` directly against `pool`
+/// with no lock between them, so both could pass the `DELETE` before
+/// either reached its `INSERT`, then both try to insert the identical
+/// `(projection_name, event_type_name)` row and one loses to
+/// `projection_consumed_event_types_pkey`. Wrapping the row upsert and
+/// the join-table replace in a single transaction fixes this for free:
+/// the `INSERT ... ON CONFLICT (name) DO UPDATE` against `projections`
+/// takes (and, on the losing side, waits on) that row's lock for the
+/// rest of the transaction, so a second concurrent call can't reach its
+/// own `DELETE`/`INSERT` pair until the first has committed.
 pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::error::Result<()> {
     let schema = schema_ident(&projection.bounded_context.name);
+    let mut tx = pool.begin().await?;
     sqlx::query(&format!(
         "INSERT INTO {schema}.projections ({PROJECTION_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5) \
@@ -1724,16 +1741,18 @@ pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::e
     .bind(projection.schema_version)
     .bind(projection.sync)
     .bind(projection.caught_up_to)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     replace_consumed_event_types(
-        pool,
+        &mut *tx,
         &projection.bounded_context.name,
         "projection_consumed_event_types",
         &projection.name,
         &projection.consumed_event_types,
     )
-    .await
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Get-or-create-with-lock for one projection instance's own
