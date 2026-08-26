@@ -1,22 +1,29 @@
-//! Two proc-macros, both scoped narrowly to a single, genuinely
+//! Three proc-macros, each scoped narrowly to a single, genuinely
 //! mechanical piece of boilerplate rather than a general codegen layer -
-//! see docs/architecture.md §1.3/§1.3.1 for the full design note behind
-//! each:
+//! see docs/architecture.md §1.3/§1.3.1/§1.3.3 for the full design note
+//! behind each:
 //!
 //! - `#[requires_role("name")]`, applied directly above a `CommandType`
 //!   impl to declare an extra caller-facing role-name gate -
 //!   `skilj-core`'s plugin API.
+//! - `#[auto_register]`, applied directly above an `EventType`/
+//!   `CommandType`/`Projection` impl so it registers itself onto a
+//!   `skilj::SkiljBuilder` without an explicit `.event_type::<T>()`/
+//!   `.command_type::<T>()`/`.projection::<T>()` call - `skilj`'s own
+//!   facade layer, unlike the other two (see this macro's own doc
+//!   comment for why it can't live at the `skilj-core` plugin-API level
+//!   the way `requires_role` does).
 //! - `gql_object!(...)`, replacing the repetitive `Object::new(...).field(scalar_field(...))...`
 //!   chains `skilj-graphql`'s own static `dynamic::Object` builders would
 //!   otherwise hand-write one field at a time - `skilj-graphql`'s own
 //!   wire-type layer.
 //!
-//! Both are real `#[proc_macro]`/`#[proc_macro_attribute]`s, not
+//! All three are real `#[proc_macro]`/`#[proc_macro_attribute]`s, not
 //! `macro_rules!`, for the same reason: better error spans and the
-//! ability to actually inspect the syntax tree (checking `requires_role`
-//! sits on a `CommandType` impl; splicing `gql_object!`'s own field list
-//! into three different helper-function calls depending on each field's
-//! declared kind).
+//! ability to actually inspect the syntax tree (checking `requires_role`/
+//! `auto_register` sit on the right kind of impl; splicing `gql_object!`'s
+//! own field list into three different helper-function calls depending on
+//! each field's declared kind).
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -65,6 +72,147 @@ pub fn requires_role(attr: TokenStream, item: TokenStream) -> TokenStream {
         .push(syn::ImplItem::Fn(required_role_method));
 
     quote! { #item_impl }.into()
+}
+
+/// Applied directly above `impl EventType for X { ... }` / `impl
+/// CommandType for X { ... }` / `impl Projection for X { ... }`, this
+/// makes `X` register itself onto any `skilj::SkiljBuilder` that calls
+/// `.auto_register()` - no explicit `.event_type::<X>()`/`.command_type::<X>()`/
+/// `.projection::<X>()` call needed.
+///
+/// Takes an optional single expression argument - `#[auto_register(EXPR)]`
+/// injects `const BOUNDED_CONTEXT: &'static str = EXPR;` into the impl
+/// block, exactly as if it had been hand-written there. This is the
+/// pattern a bounded-context module with its own `pub const
+/// BOUNDED_CONTEXT` (`skilj-demo`'s `banking.rs`/`courses.rs`, say) uses
+/// to scope every type in the file without repeating a whole const
+/// declaration per type:
+///
+/// ```rust,ignore
+/// pub const BOUNDED_CONTEXT: &str = "banking";
+///
+/// #[auto_register(BOUNDED_CONTEXT)]
+/// impl EventType for MoneyDeposited {
+///     type Payload = MoneyDepositedPayload;
+///     const NAME: &'static str = "MoneyDeposited";
+///     // ...
+/// }
+/// ```
+///
+/// `EXPR` is spliced verbatim, so it's not limited to a bare path - any
+/// expression valid as a `const` initializer works. Bare `#[auto_register]`
+/// (no argument) is unchanged: the impl's own `BOUNDED_CONTEXT` is left
+/// exactly as written, falling back to the trait's own default
+/// (`plugin::DEFAULT_BOUNDED_CONTEXT`, "default") if it's not overridden
+/// by hand either. Writing both - the argument *and* a hand-written
+/// `const BOUNDED_CONTEXT` in the impl body - is a compile error (a
+/// duplicate item), not silently one-or-the-other.
+///
+/// Expands to the impl block plus the optional injected const (if any),
+/// followed by one `inventory::submit!` registering a small
+/// `fn(SkiljBuilder) -> SkiljBuilder` closure - `X::BOUNDED_CONTEXT` (see
+/// that const's own doc comment on `EventType`/`CommandType`/`Projection`,
+/// `skilj-core`) scopes the registration, so a type never overriding it
+/// lands under `plugin::DEFAULT_BOUNDED_CONTEXT` ("default") with zero
+/// other configuration anywhere. `SkiljBuilder::auto_register()` folds
+/// every submitted closure across the whole linked binary, in whatever
+/// order `inventory` iterates them in - order never matters, since each
+/// closure only ever inserts its own `(bounded_context, NAME)` entry.
+///
+/// **Facade-only, unlike `requires_role`.** `requires_role` expands to a
+/// trait-method override alone, so it works against `skilj-core`'s plugin
+/// API directly, no `skilj` dependency needed. This macro's whole point is
+/// registering onto `skilj::SkiljBuilder` - the emitted `inventory::submit!`
+/// necessarily names `skilj`'s own `EventTypeRegistrar`/`CommandTypeRegistrar`/
+/// `ProjectionRegistrar` types (via `::skilj::...` absolute paths, so a
+/// consuming crate needs only its existing `skilj` dependency, not a
+/// direct one on `inventory` too - `skilj` re-exports the crate for
+/// exactly this). A consumer using `skilj-core` directly, without the
+/// `skilj` facade, can't use this attribute - the same boundary that
+/// consumer already accepts by hand-rolling its own `CommandDispatcher`/
+/// `ProjectionDispatcher`/`EventDispatcher` (see those traits' own doc
+/// comments in `skilj-core::plugin`).
+///
+/// Only sanity-checked to be sitting on an `impl ... for ...` block whose
+/// trait path's last segment is literally `EventType`/`CommandType`/
+/// `Projection` - the same best-effort diagnostic `requires_role` makes
+/// for `CommandType`, not a real type check.
+#[proc_macro_attribute]
+pub fn auto_register(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let bounded_context_expr = if attr.is_empty() {
+        None
+    } else {
+        Some(parse_macro_input!(attr as Expr))
+    };
+    let mut item_impl = parse_macro_input!(item as ItemImpl);
+
+    if let Some(expr) = bounded_context_expr {
+        let already_overridden = item_impl.items.iter().any(|item| {
+            matches!(item, syn::ImplItem::Const(c) if c.ident == "BOUNDED_CONTEXT")
+        });
+        if already_overridden {
+            return syn::Error::new_spanned(
+                &item_impl,
+                "#[auto_register(...)] was given a bounded-context argument, but this impl \
+                 already declares its own `const BOUNDED_CONTEXT` - remove one or the other",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let const_item: syn::ImplItemConst = syn::parse_quote! {
+            const BOUNDED_CONTEXT: &'static str = #expr;
+        };
+        item_impl.items.push(syn::ImplItem::Const(const_item));
+    }
+
+    let trait_name = item_impl
+        .trait_
+        .as_ref()
+        .and_then(|(_, path, _)| path.segments.last())
+        .map(|segment| segment.ident.to_string());
+
+    let self_ty = &item_impl.self_ty;
+    let registration = match trait_name.as_deref() {
+        Some("EventType") => quote! {
+            ::skilj::inventory::submit! {
+                ::skilj::EventTypeRegistrar(|b| {
+                    b.bounded_context(<#self_ty as ::skilj_core::plugin::EventType>::BOUNDED_CONTEXT)
+                        .event_type::<#self_ty>()
+                })
+            }
+        },
+        Some("CommandType") => quote! {
+            ::skilj::inventory::submit! {
+                ::skilj::CommandTypeRegistrar(|b| {
+                    b.bounded_context(<#self_ty as ::skilj_core::plugin::CommandType>::BOUNDED_CONTEXT)
+                        .command_type::<#self_ty>()
+                })
+            }
+        },
+        Some("Projection") => quote! {
+            ::skilj::inventory::submit! {
+                ::skilj::ProjectionRegistrar(|b| {
+                    b.bounded_context(<#self_ty as ::skilj_core::plugin::Projection>::BOUNDED_CONTEXT)
+                        .projection::<#self_ty>()
+                })
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(
+                &item_impl,
+                "#[auto_register] only belongs on an `impl EventType for ...` / `impl \
+                 CommandType for ...` / `impl Projection for ...` block",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    quote! {
+        #item_impl
+        #registration
+    }
+    .into()
 }
 
 /// One of `scalar`/`object`/`list` - which of `gql_types.rs`'s own

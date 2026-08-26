@@ -74,15 +74,17 @@ directly in a unit test with no framework wiring — and holds up if a
 derive macro gets layered on top later without changing the underlying
 shape.
 
-**Decided: no macros for the plugin API itself.** Ship the plain trait
-shape first, hand-written. A derive/attribute macro to cut per-type
-boilerplate (`#[skilj::command_type]` or similar) is worth revisiting
-once real usage shows what's actually tedious — designing it now, before
-any type has been written by hand, risks locking in the wrong
-ergonomics. This scoping matters: §1.3.1/§1.3.2 below are both real
-proc-macros that exist in this codebase now, but neither reopens *this*
-decision — `EventType`/`CommandType`/`Projection` impls are still
-entirely hand-written trait code, with no codegen step of their own.
+**Decided: no macros for the plugin API itself, until asked.** Ship the
+plain trait shape first, hand-written. A derive/attribute macro to cut
+per-type boilerplate (`#[skilj::command_type]` or similar) is worth
+revisiting once real usage shows what's actually tedious — designing it
+now, before any type has been written by hand, risks locking in the wrong
+ergonomics. §1.3.1/§1.3.2 below are both real proc-macros that predate any
+revisit of this decision, and neither reopens it on their own —
+`EventType`/`CommandType`/`Projection` impls stayed entirely hand-written
+trait code through both, with no codegen step of their own. §1.3.3 is the
+one exception: a real per-type codegen macro over these traits, added
+later, once asked for directly (see that section for the full reasoning).
 
 ### 1.3.1 `#[requires_role(...)]`
 
@@ -185,6 +187,128 @@ both are proc-macros:
   express - the same "needs actual inspection, not just substitution"
   reasoning `requires_role`'s own `impl CommandType for ...` check
   already relies on.
+
+### 1.3.3 `#[auto_register]` + `BOUNDED_CONTEXT` — reopening §1.3's "no macros" call, deliberately
+
+Unlike §1.3.1/§1.3.2, this one *does* reopen §1.3's original "no macros for
+the plugin API itself" decision — at the user's own explicit request, not
+a call this codebase made unilaterally. The user was told directly that
+§1.3.1/§1.3.2 were both scoped to not reopen it, and chose to do so anyway
+(the same register the 2026-08-19 pass that added `gql_object!` already
+set a precedent for: revisit deliberately, when asked, not speculatively).
+
+Two small, independent additions, both purely additive — nothing about
+existing `SkiljBuilder` usage (`skilj-demo`'s own `banking`/`courses`
+modules included) changes unless a type opts in:
+
+**`BOUNDED_CONTEXT`, a new defaulted associated const** on `EventType`/
+`CommandType`/`Projection` (`skilj-core::plugin`), alongside the existing
+`NAME`:
+
+```rust
+const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT; // "default"
+```
+
+A multi-context app overrides it the same way `skilj-demo`'s `banking.rs`/
+`courses.rs` already declare a module-level `pub const BOUNDED_CONTEXT`,
+pointing the associated const at that module const — in practice, always
+via `#[auto_register(BOUNDED_CONTEXT)]`'s shorthand argument (below)
+rather than a hand-written `const BOUNDED_CONTEXT = ...` line inside every
+impl. This is consulted in exactly one place — `SkiljBuilder::
+auto_register()` below — and nowhere else; manual `.bounded_context(name)
+.event_type::<T>()` chaining ignores it entirely.
+
+**`SkiljBuilder` itself now defaults `current_bounded_context` to
+`DEFAULT_BOUNDED_CONTEXT`** rather than requiring a `.bounded_context(...)`
+call before the first `.event_type::<T>()`/`.command_type::<T>()`/
+`.projection::<T>()` (which used to panic otherwise). A single-bounded-
+context app can now skip `.bounded_context(...)` entirely and every
+manually-chained registration lands under `"default"`.
+
+**`#[auto_register]`**, a third `skilj-macros` proc-macro, applied above
+an `impl EventType for X`/`impl CommandType for X`/`impl Projection for X`
+block:
+
+```rust
+#[auto_register]
+impl EventType for MoneyDeposited {
+    type Payload = MoneyDepositedPayload;
+    const NAME: &'static str = "MoneyDeposited";
+    // BOUNDED_CONTEXT left at its default ("default"), or overridden as above
+}
+```
+
+expands to the impl block unchanged, plus one `inventory::submit!` (the
+`inventory` crate — typed, `ctor`-based distributed plugin registration;
+new workspace dependency, re-exported as `skilj::inventory` so a
+`#[auto_register]`-using crate needs only its existing `skilj` dependency)
+registering a small `fn(SkiljBuilder) -> SkiljBuilder` closure that does
+exactly `b.bounded_context(X::BOUNDED_CONTEXT).event_type::<X>()`.
+`SkiljBuilder::auto_register()` folds every closure `inventory` collected
+across the whole linked binary into `self` — order doesn't matter, since
+each closure only ever inserts its own `(bounded_context, NAME)` entry,
+same as any other builder call. A minimal single-bounded-context app can
+now be as little as:
+
+**Shorthand argument for the common multi-context case**:
+`#[auto_register(EXPR)]` injects `const BOUNDED_CONTEXT: &'static str =
+EXPR;` into the impl block itself, so a bounded-context module never has
+to spell out a full const declaration per type — only the one module-level
+`pub const BOUNDED_CONTEXT` a file like `skilj-demo`'s `banking.rs`
+already declares, referenced once per type via the argument alone:
+
+```rust
+pub const BOUNDED_CONTEXT: &str = "banking";
+
+#[auto_register(BOUNDED_CONTEXT)]
+impl EventType for MoneyDeposited {
+    type Payload = MoneyDepositedPayload;
+    const NAME: &'static str = "MoneyDeposited";
+    // ...
+}
+```
+
+`EXPR` is spliced verbatim into the injected const's initializer, so
+anything valid there works, not just a bare path. Combining the argument
+with a hand-written `const BOUNDED_CONTEXT` inside the same impl is a
+macro-time compile error (a clear diagnostic instead of a confusing
+"duplicate associated const" from the compiler after expansion) — pick
+one or the other, never both.
+
+```rust
+let (skilj, _report) = Skilj::builder(database_url)
+    .auto_register()
+    .reconciliation_role(external_subject)
+    .build()
+    .await?;
+```
+
+with no `.bounded_context(...)`/`.event_type::<T>()`/`.command_type::<T>()`/
+`.projection::<T>()` calls anywhere, as long as every plugin type in the
+binary is `#[auto_register]`-tagged.
+
+**Facade-only, unlike `requires_role`.** `requires_role` expands to a
+trait-method override alone, so a `skilj-core`-only consumer (no `skilj`
+facade) can use it directly. `#[auto_register]`'s whole point is
+registering onto `skilj::SkiljBuilder`, so its expansion necessarily names
+`skilj`'s own `EventTypeRegistrar`/`CommandTypeRegistrar`/
+`ProjectionRegistrar` marker types — a `skilj-core`-only consumer can't use
+this attribute, the same boundary that consumer already accepts by
+hand-rolling its own `CommandDispatcher`/`ProjectionDispatcher`/
+`EventDispatcher` (§1.7's own note on this).
+
+Auto-registration and manual chaining are fully interoperable within one
+`SkiljBuilder` — a bounded context can mix `#[auto_register]`-tagged types
+with manually `.event_type::<T>()`-chained ones freely; `.auto_register()`
+can be called before, after, or interleaved with manual calls.
+
+Deliberately *not* changed by this pass: reconciliation itself (§1.5) is
+untouched — a `#[auto_register]`-tagged type still needs the
+reconciliation role to hold an active admin `RoleAccessMapping` on its own
+`BOUNDED_CONTEXT` before it registers for real, exactly like manual
+registration already requires; auto-registration only removes the
+per-type `.event_type::<T>()` call, not the access-control gate around
+what that call is allowed to do.
 
 ### 1.4 `matching_events` is a generated per-bounded-context enum
 
@@ -2069,3 +2193,288 @@ anywhere today.
 `/allium:propagate`, scoped to one representative surface at a time,
 remains the right tool once code lands that a surface's obligations
 haven't been checked against yet.
+
+## 10. OpenTelemetry tracing, logging, and metrics
+
+Added in a later pass: real distributed tracing across the HTTP surfaces,
+the domain engine, and the two background tasks, exported as
+OpenTelemetry via OTLP/HTTP. Not spec-driven (`specs/skilj.allium` has no
+tracing entity), so this section - not an obligations table - is its
+record.
+
+**Init ownership: library crates never install a subscriber.**
+`skilj-core`/`skilj-rest`/`skilj-graphql`/`skilj` only ever emit
+`tracing` spans/events - none of them call `tracing_subscriber::registry().init()`
+or anything like it. Standard Rust library practice (the same reason
+`axum`/`sqlx`/`reqwest` themselves only emit `tracing`): a library that
+installs a global subscriber takes that decision away from whatever
+process embeds it. `skilj-demo/src/bin/server.rs`'s `init_telemetry` is
+the reference example of what a real consuming application does instead
+- always a console `fmt` layer (`RUST_LOG`, default `info`), and, only
+when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an `opentelemetry-otlp`
+HTTP/protobuf exporter feeding `tracing-opentelemetry`'s layer too. This
+also fixes the crate boundary: `skilj-core`, `skilj-rest`, and
+`skilj-graphql` depend only on `tracing` plus the lightweight
+`opentelemetry`/`opentelemetry-http`/`tracing-opentelemetry` *bridge*
+crates (API-level - extracting/injecting W3C `traceparent` headers and
+attaching that context to the current `tracing::Span`); the
+`opentelemetry_sdk`/`opentelemetry-otlp`/`tracing-subscriber` stack that
+actually builds an exporter is `skilj-demo`-only.
+
+**OTLP/HTTP, not gRPC.** Reuses the `reqwest`-based HTTP stack already in
+the workspace instead of adding `tonic`/`prost`/`hyper` as a second,
+heavier RPC stack (§2.1's own reasoning for picking `axum`, applied
+again here). One consequence accepted rather than fought:
+`opentelemetry-otlp`'s `reqwest-client` feature pulls a newer `reqwest`
+major version than the workspace's own pinned one, so `skilj-demo`'s
+dependency tree carries both - cosmetic duplication, not a version
+conflict, and confined to that one leaf crate.
+
+**Instrumentation depth**, roughly outside-in:
+
+- `skilj-rest`/`skilj-graphql` each mount one hand-rolled
+  `axum::middleware::from_fn` (`trace_request` - identical logic
+  duplicated in both, since no crate they already share would justify a
+  new one) that builds one request-level span per call, extracts an
+  incoming `traceparent`/`tracestate` pair via
+  `opentelemetry::global::get_text_map_propagator`, and sets it as that
+  span's parent *before* the span is ever entered. That ordering matters:
+  `tracing-opentelemetry`'s `OpenTelemetrySpanExt::set_parent` only
+  succeeds before a span's first `enter` (it returns
+  `Err(AlreadyStarted)` afterwards, silently ignored here - a safe no-op
+  when the consuming app never registers a real propagator, which is the
+  common case). This is why `tower_http::trace::TraceLayer` isn't used
+  for this: it creates and enters its own span internally, with no hook
+  to set the parent first, so the two don't compose safely. A safe no-op
+  either way when no propagator is registered.
+- `skilj-graphql`'s schema builder (`schema::build`) registers
+  `async_graphql::extensions::Tracing` - async-graphql's own built-in
+  extension, wrapping every resolved field across all 17 resolver modules
+  in a span automatically, so none of them need hand-written
+  instrumentation. Deliberately the plain, `tracing`-backed `Tracing`,
+  not `extensions::OpenTelemetry` (which talks to the OTel SDK directly)
+  - keeps `skilj-graphql` on the same "emit via `tracing` only" boundary
+  every other library crate here keeps.
+- `skilj-core::db`'s ~77 functions each get `#[tracing::instrument(skip_all)]`
+  - mechanical, one pattern throughout. `skip_all` rather than capturing
+  arguments: several take a `&Pool`/`&mut PgConnection` (no useful
+  `Debug`) or a raw JSON payload (which may hold a `sensitive_fields`
+  value - the span attribute stream is exactly the kind of place that
+  shouldn't leak one). Functions carrying a `bounded_context: &str` (or
+  `projection_name`/`command_type`/`event_type`/`name`) parameter get
+  that field explicitly instead, since it's cheap, structured, and
+  genuinely useful for correlating a trace to a bounded context.
+  `event_store::process_command` and `db::submit_command` - the domain
+  engine's own real entry points (§1) - get explicit `bounded_context`/
+  `command_type` fields the same way, since `command_type: &CommandType`
+  isn't itself a `&str` the mechanical pass could pick up.
+- `skilj`'s two background `tokio::spawn` loops (the async-projection
+  poller and the scheduler) each wrap one tick's work in a
+  `tracing::info_span!("async_projection_tick" | "scheduler_tick")` via
+  `Instrument::instrument` - trace roots, since there's no HTTP request
+  for either to inherit a parent from. Their pre-existing `eprintln!`
+  error paths became `tracing::warn!` calls at the same time, for
+  consistency; `SkiljBuilder::build`'s own one-time bootstrap-secret
+  `eprintln!` (§1.5) stays as-is, deliberately - a secret an operator
+  must see regardless of `RUST_LOG`/exporter configuration is exactly the
+  kind of output that shouldn't route through a filterable log level.
+
+**Logs, a second OTel signal, added in a later pass.** Traces above
+answer "what happened during this request/tick"; logs answer "what did
+the process say" - OpenTelemetry treats them as genuinely separate
+signals with their own exporters, not one unified into the other.
+Rather than adding new call sites anywhere, `skilj-demo`'s
+`init_telemetry` bridges the `tracing::info!`/`warn!` events already in
+the codebase (§ above) into OTel's Logs signal too, via
+`opentelemetry-appender-tracing`'s `OpenTelemetryTracingBridge` -
+another `tracing_subscriber::Layer`, stacked alongside the trace layer
+and the console `fmt` layer, all three gated by the same top-level
+`EnvFilter`. Each exported `LogRecord` automatically carries its
+enclosing span's trace/span id, so a log line and the trace it happened
+inside correlate in the collector without any extra plumbing. Its own
+`SdkLoggerProvider` + OTLP/HTTP log exporter mirror the trace pipeline's
+shape exactly (`opentelemetry-otlp`'s `logs` feature, alongside the
+already-enabled `trace` one) - same `OTEL_EXPORTER_OTLP_ENDPOINT` gate,
+same "only `skilj-demo` builds an exporter or installs a subscriber"
+boundary library crates never cross (§ above). No test added
+specifically for this: unlike the parent-propagation question §'s
+`tracing_middleware.rs` test needed the real SDK to answer, "does this
+bridge convert `tracing` events to `LogRecords`" is `opentelemetry-appender-tracing`'s
+own tested behavior, not this codebase's.
+
+**Metrics, the third OTel signal, added in a still-later pass.** Same
+crate boundary as traces/logs: library crates record measurements
+through `opentelemetry::global::meter(...)` (the API crate, already a
+dependency everywhere `tracing`/context-propagation is used) - never the
+SDK/exporter, which is `skilj-demo`-only, same as always. Five
+instruments, each a module-level `LazyLock<Counter<_>>`/`LazyLock<Histogram<_>>`
+next to its call site (no shared metrics module, matching how tracing
+instrumentation was added directly at each call site too):
+`http.server.request.duration` (the OTel HTTP semantic-convention name,
+not `skilj.`-prefixed) in both `skilj-rest`/`skilj-graphql`'s
+`trace_request`; `skilj.commands.processed` (by `bounded_context`/
+`command_type`/`outcome`) at `db::submit_command`'s two return points;
+`skilj.events.appended` (by `bounded_context`/`event_type`); and
+`skilj.background_task.tick.duration`/`skilj.background_task.errors` (by
+`task`, plus a `reason` slug for the latter) in `skilj`'s two background
+loops.
+
+`skilj.events.appended` deliberately does *not* live inside
+`insert_event` itself, despite that being the one function every
+event-creation path funnels through exactly once (tempting, since it
+would mean a single call site instead of five) - `insert_event` runs
+inside a transaction its own caller might still roll back afterwards
+(sync-projection folding failing, an encryption-key join insert failing,
+etc.), and counting there would over-count on any such rollback. Instead
+it lives at each of the five `broadcaster.publish(event)` call sites
+across `skilj-core::db` - the same "only after `tx.commit()` succeeds"
+checkpoint those calls themselves already exist to enforce (see e.g.
+`insert_event_and_update_sync_projections`'s own doc comment), via a
+small shared `record_event_appended` helper so the five sites don't each
+duplicate the `KeyValue` construction.
+
+A real correctness trap, caught by reading `opentelemetry::global::meter()`'s
+own doc comment rather than assumed: unlike the trace/log bridges (wired
+to a concrete provider once, directly, inside `init_telemetry`),
+`global::meter()` **snapshot-binds** to whichever `MeterProvider` is
+globally registered at first call - "if the global `MeterProvider` is
+changed after getting `Meter` instances from these calls, the `Meter`
+instances returned will not reflect the change." Since every instrument
+above is a `LazyLock`, it's only ever actually created the first time a
+metric is recorded (the first command processed, the first HTTP
+request) - safe only because `init_telemetry()`, which calls
+`opentelemetry::global::set_meter_provider(...)`, is already `main`'s
+very first statement, strictly before anything that could touch an
+instrument runs. Every `LazyLock` instrument's own doc comment calls
+this out; a future reordering of `main()` would silently turn every
+metric into a permanent no-op.
+
+`skilj-demo`'s metrics pipeline (`opentelemetry_otlp::MetricExporter` →
+`PeriodicReader` → `SdkMeterProvider`) isn't a `tracing_subscriber` layer
+at all, unlike the trace/log ones - metrics aren't `tracing` events, so
+there's nothing to add to the `.with(...)` chain; recording happens
+directly through each `Counter`/`Histogram` handle. Also nothing printed
+to console when no collector is configured (unlike logs, there's no
+sensible "print a histogram to stdout" fallback) - this pipeline is
+simply inactive without one, the same as traces already are.
+
+**A packaging bug this pass's own smoke test caught, not assumed fixed:**
+`opentelemetry-otlp`'s default (non-`experimental_*`) batch processors/
+periodic reader each run their own dedicated OS thread, not a Tokio
+task - the very first real export attempt (triggered almost immediately,
+by the SDK's own internal `otel_info!`/`otel_error!` log messages
+reaching the log bridge) panicked with "there is no reactor running,
+must be called from the context of a Tokio 1.x runtime". The cause:
+`opentelemetry-otlp`'s `reqwest-client` feature (the *async* reqwest
+client) needs a Tokio reactor to make its HTTP call, which that
+dedicated background thread never has. `opentelemetry-otlp`'s own
+default feature set already pairs `http-proto` with
+`reqwest-blocking-client` instead - a deviation from that default worth
+reverting outright, not a case for reaching into the SDK's separate (and
+still `experimental_*`-feature-gated) async-runtime batch processor
+variants. Fixed by switching the workspace's `opentelemetry-otlp`
+dependency to `reqwest-blocking-client`; re-run confirmed a graceful
+`BatchLogProcessor.ExportError` (no real collector at the smoke test's
+endpoint) rather than a panic.
+
+**Tests, no OTel collector needed.** Each crate boundary gets one
+representative test using an in-process capturing `tracing_subscriber::Layer`
+(duplicated per file rather than factored into shared test-support code,
+matching this repository's existing "each test file owns its own
+fixtures" convention - see e.g. `skilj/tests/auto_register.rs`'s own
+provisioning harness): `skilj-core/tests/tracing_instrumentation.rs`
+(`process_command`'s own fields), `skilj-rest/tests/tracing_middleware.rs`
+(a full `opentelemetry_sdk` + `tracing-opentelemetry` stack backed by
+`opentelemetry_sdk`'s own `testing` in-process exporter feature, proving
+a `traceparent` header actually continues that trace rather than
+starting a fresh root - the one test here that needed the real SDK, not
+just the capturing layer, since "did the parent propagate" is an OTel-
+level question), `skilj-graphql/tests/tracing_extension.rs` (a
+standalone two-field schema proving `Tracing` traces an Object-returning
+field and skips a scalar-returning one), and
+`skilj/tests/tracing_background_tasks.rs` (a real `.build()` against a
+real Postgres, short poll intervals, asserting both tick spans fire).
+
+Metrics get the identical treatment, one file per crate boundary, using
+`opentelemetry_sdk::metrics::InMemoryMetricExporter` (feature `testing`)
++ a real `SdkMeterProvider` + `force_flush()` instead of waiting out the
+periodic export interval: `skilj-core/tests/metrics_instrumentation.rs`
+(`insert_event_and_update_sync_projections` records `skilj.events.appended`
+with the right `bounded_context`/`event_type` attributes),
+`skilj-rest/tests/metrics_middleware.rs` (a request through `router()`
+records `http.server.request.duration` with the right method/route
+attributes - `skilj-graphql` skipped its own copy here, identical
+`trace_request` code already covered), and
+`skilj/tests/metrics_background_tasks.rs` (reuses
+`tracing_background_tasks.rs`'s own harness, asserting both background
+loops' `skilj.background_task.tick.duration` data points appear).
+
+### 10.1 Four smaller follow-ups
+
+Four further, smaller observability gaps, closed in the same later pass:
+
+**Span/log error semantics.** Neither `skilj-rest` nor `skilj-graphql`'s
+`trace_request` previously marked a request's own span as errored, or
+logged anything at `error!` - a 500 and a 200 looked identical in a
+collector except for a plain `status` attribute. Both now check
+`status.is_server_error()` (5xx is always a genuine, unexpected
+server-side failure here - a business rejection renders as 200, and
+auth/validation failures as 4xx, per §5.4/§7.5) and, when true, record
+`tracing-opentelemetry`'s own well-known `otel.status_description` field
+(not `OpenTelemetrySpanExt::set_status` directly - see the note below)
+and emit `tracing::error!`, which both prints regardless of a `warn`-or-
+higher `RUST_LOG` filter and exports as an error-severity log record via
+the same bridge every other event already goes through. Verified in
+`skilj-rest/tests/tracing_middleware.rs` (extended, not a new file):
+asserts the span named `"request"` - not the first `SpanData` off the
+export channel, which turned out to be `db::access_token_kind`'s own
+nested `#[tracing::instrument]` span, closing first - has `Status::Error`.
+
+*A real dead end worth recording*: `OpenTelemetrySpanExt::set_status`
+called directly appeared to silently do nothing in that same test, which
+first looked like a genuine library limitation (`AlreadyStarted`-style,
+matching the earlier `set_parent` finding). It wasn't - once the test
+was fixed to read the right span, both the direct `set_status` call and
+the field-based route should work equally well. The field-based one
+(`otel.status_description`) is what's actually shipped, since it's the
+mechanism `tracing-opentelemetry` itself documents for a status set well
+after span creation, and it's the one this pass's test actually
+exercises - not because the other one was proven broken.
+
+**Graceful shutdown.** `skilj-demo`'s `axum::serve` previously ran with
+no shutdown hook at all - a `SIGINT`/`SIGTERM` just killed the process,
+silently dropping whatever was still sitting in each OTel batch
+processor's buffer. `main` now passes `shutdown_signal()` (waits on
+`Ctrl+C`, plus `SIGTERM` on Unix) to `.with_graceful_shutdown(...)`, and
+calls a new `TelemetryProviders::shutdown()` - flushing/tearing down all
+three providers, logging (not propagating) any failure - once
+`axum::serve` returns. Verified for real, not just built: a real
+Postgres (started by hand from the `postgresql_embedded`-cached binary,
+same libxml2/`LD_LIBRARY_PATH` workaround as always), the actual compiled
+`server` binary launched as a subprocess, a live request confirmed
+against it, then `SIGTERM` - exits promptly both with no
+`OTEL_EXPORTER_OTLP_ENDPOINT` set, and with one set to an unreachable
+collector (confirms the shutdown path doesn't hang waiting on a flush
+that can't succeed - each provider's own `shutdown()` call fails
+gracefully, logged as a `WARN`, not a hang or a panic).
+
+**JWKS fetch instrumented.** `access_control::JwksCache::refetch` - the
+one `reqwest` call in `skilj-core` outside the OTel context-propagation
+middleware itself - had no span of its own, so a slow or failing JWKS
+fetch was invisible inside whatever span called `verify_and_extract_subject`.
+Now `#[tracing::instrument(skip_all, fields(jwks_endpoint = %self.jwks_endpoint))]`,
+the same mechanical treatment `skilj-core::db`'s own functions already
+got.
+
+**Trace id in error responses.** Both `skilj-rest::error::ErrorBody`
+(REST) and `skilj-graphql::error::to_graphql_error` (the one conversion
+every resolver's own rejection goes through) now include the current
+span's OTel trace id - `trace_id` (REST, `#[serde(skip_serializing_if)]`)
+/ `traceId` (GraphQL, a `code`-alongside extension) - so a caller
+escalating a failure can quote back the exact trace a support engineer
+would look up. `None`/omitted, not a string of zeroes, when no real
+`tracing-opentelemetry` layer is installed (`TraceId::INVALID` filtered
+out explicitly) - the common case for either crate used standalone, or
+`skilj-demo` run without `OTEL_EXPORTER_OTLP_ENDPOINT` set. Same small
+`current_trace_id()` helper duplicated in both crates, matching
+`trace_request`'s own precedent for why.

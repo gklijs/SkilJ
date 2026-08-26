@@ -14,6 +14,7 @@ pub mod resolvers;
 pub mod schema;
 
 use async_graphql::dynamic::Schema;
+use opentelemetry::metrics::Histogram;
 use skilj_core::access_control::RevocationBroadcaster;
 use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
@@ -22,7 +23,19 @@ use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::EventBroadcaster;
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+/// See `skilj-core::db`'s own `meter()`/`LazyLock` doc comment for the
+/// `global::meter()` snapshot-binding caveat this is subject to too -
+/// only ever touched from inside `trace_request` below.
+static REQUEST_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    opentelemetry::global::meter("skilj-graphql")
+        .f64_histogram("http.server.request.duration")
+        .with_unit("s")
+        .with_description("Duration of HTTP requests served by skilj-graphql.")
+        .build()
+});
 
 /// Everything a GraphQL request needs, baked into the schema's own
 /// global `.data()` at `router()` time (see `schema::build`'s own doc
@@ -104,7 +117,78 @@ pub async fn router(state: GraphqlState) -> skilj_core::error::Result<axum::Rout
             "/graphql",
             axum::routing::post(graphql_handler).get(graphql_ws_handler),
         )
+        .layer(axum::middleware::from_fn(trace_request))
         .with_state((schema, state)))
+}
+
+/// One request-level span per GraphQL call (both the `POST` query/mutation
+/// path and the WS upgrade), its parent set from an incoming W3C
+/// `traceparent`/`tracestate` header pair if present - a safe no-op when
+/// the consuming application never registers a real propagator.
+/// Identical to `skilj-rest::routes::trace_request`; see that one's doc
+/// comment for the full reasoning, including why this is a hand-rolled
+/// `axum::middleware::from_fn` rather than `tower_http::trace::TraceLayer`.
+/// Duplicated rather than shared since there's no crate both `skilj-rest`
+/// and `skilj-graphql` already depend on that this small a helper would
+/// justify adding.
+async fn trace_request(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use tracing::Instrument;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&opentelemetry_http::HeaderExtractor(request.headers()))
+    });
+    // Captured as owned values before `request` moves into `next.run(...)`
+    // below - see `skilj-rest::routes::trace_request`'s own doc comment
+    // on why `http.route` is the bare path.
+    let method = request.method().to_string();
+    let route = request.uri().path().to_string();
+    let span = tracing::info_span!(
+        "request",
+        method = %request.method(),
+        uri = %request.uri(),
+        status = tracing::field::Empty,
+        // See `skilj-rest::routes::trace_request`'s own doc comment for
+        // why this well-known field name, not `OpenTelemetrySpanExt::set_status`
+        // directly.
+        otel.status_description = tracing::field::Empty,
+    );
+    // `Err` here just means no `tracing-opentelemetry` layer is installed
+    // in this process - nothing to propagate into, so nothing to do.
+    let _ = span.set_parent(parent_cx);
+
+    async move {
+        let start = std::time::Instant::now();
+        let response = next.run(request).await;
+        let status = response.status();
+        let span = tracing::Span::current();
+        span.record("status", status.as_u16());
+        // Limited value on the `POST /graphql` path specifically -
+        // `async_graphql_axum::GraphQLResponse` always renders as HTTP
+        // 200 regardless of GraphQL-level errors, per the GraphQL-over-
+        // HTTP convention (§5.4's own "a rejection renders identically"
+        // treatment extends the same idea to real errors) - but still
+        // correct for the WS upgrade path, and costs nothing when it
+        // never fires.
+        if status.is_server_error() {
+            span.record("otel.status_description", status.to_string());
+            tracing::error!(status = status.as_u16(), "request failed with a server error");
+        }
+        REQUEST_DURATION.record(
+            start.elapsed().as_secs_f64(),
+            &[
+                opentelemetry::KeyValue::new("http.request.method", method),
+                opentelemetry::KeyValue::new("http.route", route),
+                opentelemetry::KeyValue::new("http.response.status_code", status.as_u16() as i64),
+            ],
+        );
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 /// Resolves the caller (`auth::resolve_role`) before ever executing the

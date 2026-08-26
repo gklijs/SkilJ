@@ -11,6 +11,22 @@
 //! yet, and each run mints its own fresh admin `Role` and `CommandToken`s
 //! rather than reusing a previous run's.
 //!
+//! **Also the reference example for tracing, logging, and metrics.**
+//! `skilj-core`/`skilj-rest`/`skilj-graphql`/`skilj` only ever emit
+//! `tracing` spans/events and record measurements through
+//! `opentelemetry::global::meter(...)` - none of them install a
+//! subscriber or a `MeterProvider` (see docs/architecture.md's tracing
+//! section). `init_telemetry` below is where a real consuming app
+//! actually does that: always a console `fmt` layer, and - only when
+//! `OTEL_EXPORTER_OTLP_ENDPOINT` is set - all three OpenTelemetry signals
+//! over OTLP/HTTP: trace spans via `tracing-opentelemetry`'s layer, every
+//! `tracing::info!`/`warn!`/etc. event *also* exported as a correlated
+//! OTel log record via `opentelemetry-appender-tracing`'s bridge, and the
+//! counters/histograms already recorded throughout the codebase exported
+//! as OTel metrics - no new call sites needed anywhere for any of the
+//! three, since they all instrument code that already exists. `cargo
+//! run` works with no collector present either way.
+//!
 //! **The bootstrap below is a shortcut, not the intended production
 //! flow.** It seeds a `Role`/`RoleAccessMapping` directly via
 //! `skilj_core::db`, the same way every end-to-end test in this
@@ -48,8 +64,190 @@ const BOUNDED_CONTEXTS: &[&str] = &[
     skilj_demo::courses::BOUNDED_CONTEXT,
 ];
 
+/// The three OTel SDK providers `init_telemetry` builds when
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set - held by `main` for the
+/// process's lifetime purely so none is dropped early (dropping any one
+/// tears down its own exporter). Three separate signals, three separate
+/// providers/exporters/processors - OpenTelemetry doesn't unify trace,
+/// log, and metric export the way it does for the `tracing` layers
+/// consuming all three.
+struct TelemetryProviders {
+    tracer_provider: opentelemetry_sdk::trace::SdkTracerProvider,
+    logger_provider: opentelemetry_sdk::logs::SdkLoggerProvider,
+    meter_provider: opentelemetry_sdk::metrics::SdkMeterProvider,
+}
+
+impl TelemetryProviders {
+    /// Flushes and tears down all three exporters, in `main`'s own
+    /// graceful-shutdown path (`shutdown_signal` below) - without this,
+    /// a `SIGINT`/`SIGTERM` just drops the process (and everything still
+    /// sitting in each batch processor's buffer, unexported) the instant
+    /// `axum::serve` returns. Each provider's own `.shutdown()` blocks
+    /// until its buffered data is flushed or its own internal timeout
+    /// elapses; a failure here is logged, not propagated - there's
+    /// nothing a demo binary's own exit path could usefully do about a
+    /// flush that didn't fully succeed beyond saying so.
+    fn shutdown(&self) {
+        if let Err(e) = self.tracer_provider.shutdown() {
+            tracing::warn!(error = %e, "failed to shut down the trace provider");
+        }
+        if let Err(e) = self.logger_provider.shutdown() {
+            tracing::warn!(error = %e, "failed to shut down the log provider");
+        }
+        if let Err(e) = self.meter_provider.shutdown() {
+            tracing::warn!(error = %e, "failed to shut down the meter provider");
+        }
+    }
+}
+
+/// Waits for `SIGINT` (`Ctrl+C`) or, on Unix, `SIGTERM` - `axum::serve`'s
+/// own `with_graceful_shutdown` future (see `main`), so an operator
+/// killing the process (or `docker stop`, systemd, etc., which send
+/// `SIGTERM`) still gets in-flight requests drained and telemetry
+/// flushed, rather than just cut off. `SIGTERM` handling is Unix-only -
+/// there's no equivalent signal to wait for elsewhere, so `ctrl_c` alone
+/// covers it there.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install a Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install a SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received");
+}
+
+/// Installs the process-wide `tracing` subscriber - always a console
+/// `fmt` layer (`RUST_LOG`, defaulting to `info`), and, only when
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, two more layers stacked on top:
+///
+/// - `tracing-opentelemetry`'s layer, backed by an OTLP/HTTP span
+///   exporter, plus a registered W3C `TraceContextPropagator` (what
+///   `skilj-rest`/`skilj-graphql`'s own `trace_request` middleware needs
+///   something real to parse);
+/// - `opentelemetry-appender-tracing`'s `OpenTelemetryTracingBridge`,
+///   backed by its own OTLP/HTTP *log* exporter (a separate OTel signal
+///   from spans) - every `tracing::info!`/`warn!`/etc. event already in
+///   the codebase becomes a log record here too, automatically carrying
+///   its enclosing span's trace/span id for correlation in the
+///   collector. No change needed anywhere else: this bridges events that
+///   already exist, the same ones the console layer already prints.
+///
+/// A third, separate pipeline - not a `tracing_subscriber` layer, since
+/// metrics aren't `tracing` events - registers the OTLP/HTTP metrics
+/// exporter as the global `MeterProvider`
+/// (`opentelemetry::global::set_meter_provider`), which is what makes
+/// every `Counter`/`Histogram` already recorded throughout the codebase
+/// (`skilj-core::db::submit_command`/`insert_event`, `skilj-rest`/
+/// `skilj-graphql`'s `trace_request`, `skilj`'s two background loops)
+/// actually export. **This must happen before any of those instruments
+/// is first used** - `opentelemetry::global::meter()`'s own doc comment
+/// warns that a `Meter` obtained before the provider changes will never
+/// reflect a later change. Safe here only because `init_telemetry` is
+/// already `main`'s very first statement - see each instrument's own
+/// `LazyLock` doc comment (e.g. `skilj-core::db::meter`) and
+/// docs/architecture.md's tracing section for the invariant this relies
+/// on.
+///
+/// `env_filter` is registered first, ahead of the `tracing_subscriber`
+/// layers - in `tracing-subscriber`, a callsite's enabled/disabled
+/// decision is global to the whole subscriber stack, not per-layer, so
+/// this is what makes `RUST_LOG` gate the trace/log OTLP exporters too,
+/// not just the console. It has no bearing on the separate metrics
+/// pipeline, which isn't `tracing`-driven at all.
+fn init_telemetry() -> Option<TelemetryProviders> {
+    use tracing_subscriber::prelude::*;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+        return None;
+    }
+
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name("skilj-demo")
+        .build();
+
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .build()
+        .expect("OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP span exporter \
+                 shouldn't fail this early (no network call happens yet)");
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter)
+        .with_resource(resource.clone())
+        .build();
+
+    opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let tracer = opentelemetry::trace::TracerProvider::tracer(&tracer_provider, "skilj-demo");
+    let otel_trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    let log_exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_http()
+        .build()
+        .expect("OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP log exporter \
+                 shouldn't fail this early (no network call happens yet)");
+    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_batch_exporter(log_exporter)
+        .with_resource(resource.clone())
+        .build();
+    let otel_log_layer =
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(otel_trace_layer)
+        .with(otel_log_layer)
+        .init();
+
+    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .build()
+        .expect("OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP metric exporter \
+                 shouldn't fail this early (no network call happens yet)");
+    let metric_reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_reader(metric_reader)
+        .with_resource(resource)
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    Some(TelemetryProviders {
+        tracer_provider,
+        logger_provider,
+        meter_provider,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let telemetry = init_telemetry();
+
     let database_url = std::env::var("DATABASE_URL").expect(
         "DATABASE_URL must be set, e.g. postgres://user:pass@localhost:5432/skilj_demo",
     );
@@ -73,7 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
-            println!("created bounded context {name:?}");
+            tracing::info!(bounded_context = %name, "created bounded context");
         }
     }
 
@@ -111,11 +309,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .reconciliation_role(external_subject)
         .build()
         .await?;
-    println!("reconciliation: registered {:?}", report.registered);
+    tracing::info!(registered = ?report.registered, "reconciliation complete");
     if !report.skipped_no_access.is_empty() {
-        println!(
-            "reconciliation: skipped, no access yet: {:?}",
-            report.skipped_no_access
+        tracing::warn!(
+            skipped = ?report.skipped_no_access,
+            "reconciliation: skipped, no access yet"
         );
     }
 
@@ -141,6 +339,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Utc::now(),
         )?;
         db::insert_command_token(&pool, &token).await?;
+        tracing::info!(
+            bounded_context = %bounded_context,
+            command_type = %command_type_name,
+            "minted command token"
+        );
         println!("  {bounded_context}/{command_type_name}: {}.{}", token.id, token.secret);
     }
 
@@ -156,6 +359,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          \x20      -d '{{\"payload\":{{\"account_id\":\"a1\",\"amount\":100}}}}' \\\n\
          \x20      http://localhost:{port}/v1/commands/trigger"
     );
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown();
+    }
+
     Ok(())
 }

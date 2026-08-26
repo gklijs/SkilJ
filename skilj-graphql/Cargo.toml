@@ -18,3 +18,10 @@ async-graphql.workspace = true
 async-graphql-axum.workspace = true
 arc-swap.workspace = true
 asynk-strim.workspace = true
+tracing.workspace = true
+opentelemetry.workspace = true
+opentelemetry-http.workspace = true
+tracing-opentelemetry.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

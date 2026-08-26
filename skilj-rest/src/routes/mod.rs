@@ -28,11 +28,19 @@
 
 use crate::auth::BearerCredential;
 use crate::error::RestError;
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use opentelemetry::global;
+use opentelemetry::metrics::Histogram;
+use opentelemetry::KeyValue;
+use opentelemetry_http::HeaderExtractor;
+use std::sync::LazyLock;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 // `axum::extract::Query` doesn't support a repeated `filter=`/`filter=`
 // query param deserializing into `Vec<String>` (`serde_urlencoded`, which
 // it's built on, has no sequence support for query strings) - found via
@@ -54,6 +62,18 @@ use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
 use skilj_core::shared::{hash_secret, secret_matches, Filter, FilterOperator};
 use std::sync::Arc;
 
+/// See `skilj-core::db`'s own `meter()`/`LazyLock` doc comment for the
+/// `global::meter()` snapshot-binding caveat this is subject to too -
+/// only ever touched from inside `trace_request` below, strictly after a
+/// real consuming app's `init_telemetry` has already run.
+static REQUEST_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    opentelemetry::global::meter("skilj-rest")
+        .f64_histogram("http.server.request.duration")
+        .with_unit("s")
+        .with_description("Duration of HTTP requests served by skilj-rest.")
+        .build()
+});
+
 #[derive(Clone)]
 struct AppState {
     pool: Pool,
@@ -62,6 +82,88 @@ struct AppState {
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
+}
+
+/// One request-level span per REST call, its parent set from an incoming
+/// W3C `traceparent`/`tracestate` header pair if present - so a trace
+/// that starts in an upstream caller continues through this request
+/// rather than restarting here. A safe no-op when the consuming
+/// application never registers a real propagator (`opentelemetry::global`'s
+/// default is a no-op propagator) - this crate never registers one
+/// itself; only the consuming application does (see docs/architecture.md's
+/// tracing section for the crate boundary this keeps).
+///
+/// Deliberately hand-rolled rather than `tower_http::trace::TraceLayer`:
+/// `OpenTelemetrySpanExt::set_parent` only works *before* a span is ever
+/// entered (it errors with `AlreadyStarted` afterwards, per its own doc
+/// comment), and `TraceLayer` creates *and enters* its own span
+/// internally with no hook to set the parent first - the two don't
+/// compose safely. Here, the span is built and its parent set before
+/// `.instrument()` ever polls (thus enters) it for the first time.
+async fn trace_request(request: Request, next: Next) -> Response {
+    let parent_cx = global::get_text_map_propagator(|propagator| {
+        propagator.extract(&HeaderExtractor(request.headers()))
+    });
+    // Captured as owned values before `request` moves into `next.run(...)`
+    // below - `http.route` deliberately the bare path, not the full URI
+    // with query string: every route in this crate is a fixed string
+    // (§7.2), so the path alone is already low-cardinality, which a raw
+    // query string wouldn't be.
+    let method = request.method().to_string();
+    let route = request.uri().path().to_string();
+    let span = tracing::info_span!(
+        "request",
+        method = %request.method(),
+        uri = %request.uri(),
+        status = tracing::field::Empty,
+        // `tracing-opentelemetry`'s own well-known field name
+        // (`SPAN_STATUS_DESCRIPTION_FIELD`) - recording it is what sets
+        // this span's OTel status to `Error` with this description, via
+        // `on_record`'s `SpanAttributeVisitor`. Verified against a real
+        // `SdkTracerProvider` in `tests/tracing_middleware.rs` - not
+        // `OpenTelemetrySpanExt::set_status` directly (which should also
+        // work, but this field-based route is what the crate itself
+        // documents for a status set well after span creation, and is
+        // the one actually exercised by that test).
+        otel.status_description = tracing::field::Empty,
+    );
+    // `Err` here just means no `tracing-opentelemetry` layer is installed
+    // in this process (the common case for `skilj-rest` used standalone,
+    // or `skilj-demo` run without `OTEL_EXPORTER_OTLP_ENDPOINT` set) -
+    // nothing to propagate into, so nothing to do.
+    let _ = span.set_parent(parent_cx);
+
+    async move {
+        let start = std::time::Instant::now();
+        let response = next.run(request).await;
+        let status = response.status();
+        let span = tracing::Span::current();
+        span.record("status", status.as_u16());
+        // A 4xx is an expected, well-modelled outcome here - business
+        // rejections render as 200 (§5.4/§7.5), auth/validation failures
+        // as 4xx, so a 5xx is the one status class that's always a
+        // genuine, unexpected server-side failure. Marked on the span
+        // (so a collector's "show me errored traces" query finds it) and
+        // logged at `error!` (so it's both console-visible regardless of
+        // an operator's `RUST_LOG` filter for lower levels, and exported
+        // as an error-severity OTel log record via the same bridge every
+        // other `tracing` event already goes through).
+        if status.is_server_error() {
+            span.record("otel.status_description", status.to_string());
+            tracing::error!(status = status.as_u16(), "request failed with a server error");
+        }
+        REQUEST_DURATION.record(
+            start.elapsed().as_secs_f64(),
+            &[
+                KeyValue::new("http.request.method", method),
+                KeyValue::new("http.route", route),
+                KeyValue::new("http.response.status_code", status.as_u16() as i64),
+            ],
+        );
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 pub fn router(
@@ -79,6 +181,7 @@ pub fn router(
         .route("/v1/events/consume", get(get_events_consume))
         .route("/v1/events/consume/ack", post(post_events_consume_ack))
         .route("/v1/commands/trigger", post(post_commands_trigger))
+        .layer(middleware::from_fn(trace_request))
         .with_state(AppState {
             pool,
             dispatcher,
@@ -541,6 +644,10 @@ async fn post_events_consume_ack(
     Ok(Json(EmptyResponse {}))
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(bounded_context = tracing::field::Empty, command_type = tracing::field::Empty)
+)]
 async fn post_commands_trigger(
     State(state): State<AppState>,
     credential: BearerCredential,
@@ -552,6 +659,9 @@ async fn post_commands_trigger(
 
     let authorised = event_store::authorise_command_trigger(&token, payload)?;
     let bounded_context_name = authorised.command_type.bounded_context.name.clone();
+    let span = tracing::Span::current();
+    span.record("bounded_context", bounded_context_name.as_str());
+    span.record("command_type", authorised.command_type.name.as_str());
 
     // The optimistic, unlocked half: read matching events and call
     // dispatch() once, same as always - see the note above the rules in

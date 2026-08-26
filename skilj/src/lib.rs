@@ -17,6 +17,8 @@
 //! and this bounded context's raw `Event`s into `T::decide()`. See
 //! `RegisteredCommandType`'s own doc comment for the closure itself.
 
+use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::KeyValue;
 use skilj_core::access_control::{AccessLevel, JwksCache, RevocationBroadcaster, Role};
 use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
@@ -27,10 +29,46 @@ use skilj_core::projections::{ProjectionRebuildStatus, ProjectionRegistration};
 use skilj_core::shared::CommandDecision;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use tracing::Instrument;
 
+/// See `skilj-core::db`'s own `meter()`/`LazyLock` doc comment for the
+/// `global::meter()` snapshot-binding caveat both instruments below are
+/// subject to - only ever touched from inside the two background loops
+/// `SkiljBuilder::build` spawns, strictly after a real consuming app's
+/// `init_telemetry` has already run.
+static BACKGROUND_TASK_TICK_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    opentelemetry::global::meter("skilj")
+        .f64_histogram("skilj.background_task.tick.duration")
+        .with_unit("s")
+        .with_description("Duration of one tick of a skilj background task.")
+        .build()
+});
+
+static BACKGROUND_TASK_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    opentelemetry::global::meter("skilj")
+        .u64_counter("skilj.background_task.errors")
+        .with_description("Errors encountered by a skilj background task.")
+        .build()
+});
+
+/// Re-exported so a crate using `#[auto_register]` (whose expansion emits
+/// `::skilj::inventory::submit! { ... }`) needs only its existing `skilj`
+/// dependency - not a direct one on `inventory` too. Not meant to be used
+/// directly by hand-written code; `SkiljBuilder::auto_register()` is the
+/// intended entry point.
+pub use inventory;
 pub use skilj_core::access_control::{IdpConfig, SigningAlgorithm};
 pub use skilj_core::encryption::EncryptionMasterKey;
-pub use skilj_core::plugin::{requires_role, CommandType, EventType, Projection};
+pub use skilj_core::plugin::{
+    requires_role, CommandType, EventType, Projection, DEFAULT_BOUNDED_CONTEXT,
+};
+/// See `skilj_macros::auto_register`'s own doc comment - unlike
+/// `requires_role` above, this one is facade-specific (its expansion
+/// names `EventTypeRegistrar`/`CommandTypeRegistrar`/`ProjectionRegistrar`
+/// below), so it's re-exported here rather than through
+/// `skilj_core::plugin`.
+pub use skilj_macros::auto_register;
 
 /// `Skilj`'s own bundle of an `IdpConfig` and the `JwksCache` verifying
 /// against it - built once, at `.build()` time, and held for the
@@ -213,7 +251,7 @@ impl Skilj {
     pub fn builder(database_url: impl Into<String>) -> SkiljBuilder {
         SkiljBuilder {
             database_url: database_url.into(),
-            current_bounded_context: None,
+            current_bounded_context: skilj_core::plugin::DEFAULT_BOUNDED_CONTEXT.to_string(),
             reconciliation_role: None,
             identity_provider: None,
             event_types: HashMap::new(),
@@ -553,9 +591,30 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
     }
 }
 
+/// One `#[auto_register]`-tagged `EventType` impl's own contribution -
+/// the type-erased equivalent of one
+/// `.bounded_context(T::BOUNDED_CONTEXT).event_type::<T>()` call, as a
+/// plain `fn` pointer (no captures needed, so no `Box<dyn Fn>`). `inventory`
+/// collects one of these per macro-tagged impl linked into the binary;
+/// `SkiljBuilder::auto_register()` folds every one of them into `self`.
+/// See `skilj_macros::auto_register`'s own doc comment for what emits
+/// these.
+pub struct EventTypeRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
+inventory::collect!(EventTypeRegistrar);
+
+/// See `EventTypeRegistrar` above - same shape and reasoning, for
+/// `#[auto_register]` over a `CommandType` impl.
+pub struct CommandTypeRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
+inventory::collect!(CommandTypeRegistrar);
+
+/// See `EventTypeRegistrar` above - same shape and reasoning, for
+/// `#[auto_register]` over a `Projection` impl.
+pub struct ProjectionRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
+inventory::collect!(ProjectionRegistrar);
+
 pub struct SkiljBuilder {
     database_url: String,
-    current_bounded_context: Option<String>,
+    current_bounded_context: String,
     reconciliation_role: Option<String>,
     identity_provider: Option<IdpConfig>,
     event_types: HashMap<(String, String), RegisteredEventType>,
@@ -572,18 +631,39 @@ pub struct SkiljBuilder {
 impl SkiljBuilder {
     /// Every `event_type`/`command_type`/`projection` call following this
     /// one registers against `name`, until the next `bounded_context`
-    /// call changes it.
+    /// call changes it. Optional for a single-bounded-context app: every
+    /// `SkiljBuilder` already starts scoped to `plugin::DEFAULT_BOUNDED_CONTEXT`
+    /// ("default"), so skipping this call entirely registers everything
+    /// there.
     pub fn bounded_context(mut self, name: impl Into<String>) -> Self {
-        self.current_bounded_context = Some(name.into());
+        self.current_bounded_context = name.into();
         self
     }
 
     fn current_bounded_context(&self) -> String {
-        self.current_bounded_context.clone().expect(
-            "SkiljBuilder: .event_type::<T>()/.command_type::<T>()/.projection::<T>() called \
-             before .bounded_context(...) - every one of those calls registers against the \
-             most recently named bounded context",
-        )
+        self.current_bounded_context.clone()
+    }
+
+    /// Applies every `#[auto_register]`-tagged `EventType`/`CommandType`/
+    /// `Projection` impl linked into this binary (`skilj_macros::
+    /// auto_register`'s own doc comment) - each one registers itself
+    /// under its own `T::BOUNDED_CONTEXT`, independent of whatever
+    /// `.bounded_context(...)` last set on `self`. Purely additive: safe
+    /// to call before, after, or interleaved with manual
+    /// `.event_type::<T>()`/`.command_type::<T>()`/`.projection::<T>()`
+    /// calls, since every path only ever inserts an entry by its own
+    /// `(bounded_context, NAME)` key, the same as any other builder call.
+    pub fn auto_register(mut self) -> Self {
+        for registrar in inventory::iter::<EventTypeRegistrar> {
+            self = (registrar.0)(self);
+        }
+        for registrar in inventory::iter::<CommandTypeRegistrar> {
+            self = (registrar.0)(self);
+        }
+        for registrar in inventory::iter::<ProjectionRegistrar> {
+            self = (registrar.0)(self);
+        }
+        self
     }
 
     pub fn event_type<T: EventType + 'static>(mut self) -> Self {
@@ -869,31 +949,56 @@ impl SkiljBuilder {
         let poll_dispatcher = skilj.projection_dispatcher();
         tokio::spawn(async move {
             loop {
-                match skilj_core::db::list_bounded_contexts(&poll_pool).await {
-                    Ok(bounded_contexts) => {
-                        for bc in bounded_contexts {
-                            if let Err(e) = skilj_core::db::catch_up_bounded_context(
-                                &poll_pool,
-                                &bc.name,
-                                poll_dispatcher.as_ref(),
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "skilj: async projection catch-up failed for bounded \
-                                     context {:?}: {e}",
-                                    bc.name
-                                );
+                let start = std::time::Instant::now();
+                // One span per tick, a trace root - there's no HTTP
+                // request for this to inherit a parent from.
+                async {
+                    match skilj_core::db::list_bounded_contexts(&poll_pool).await {
+                        Ok(bounded_contexts) => {
+                            for bc in bounded_contexts {
+                                if let Err(e) = skilj_core::db::catch_up_bounded_context(
+                                    &poll_pool,
+                                    &bc.name,
+                                    poll_dispatcher.as_ref(),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        bounded_context = %bc.name,
+                                        error = %e,
+                                        "async projection catch-up failed"
+                                    );
+                                    BACKGROUND_TASK_ERRORS.add(
+                                        1,
+                                        &[
+                                            KeyValue::new("task", "async_projection"),
+                                            KeyValue::new("reason", "catch_up_failed"),
+                                        ],
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "skilj: async projection catch-up failed to list bounded \
-                             contexts: {e}"
-                        );
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "async projection catch-up failed to list bounded contexts"
+                            );
+                            BACKGROUND_TASK_ERRORS.add(
+                                1,
+                                &[
+                                    KeyValue::new("task", "async_projection"),
+                                    KeyValue::new("reason", "list_bounded_contexts_failed"),
+                                ],
+                            );
+                        }
                     }
                 }
+                .instrument(tracing::info_span!("async_projection_tick"))
+                .await;
+                BACKGROUND_TASK_TICK_DURATION.record(
+                    start.elapsed().as_secs_f64(),
+                    &[KeyValue::new("task", "async_projection")],
+                );
                 tokio::time::sleep(poll_interval).await;
             }
         });
@@ -919,6 +1024,7 @@ impl SkiljBuilder {
         let scheduler_interval = self.scheduler_poll_interval;
         tokio::spawn(async move {
             loop {
+                let start = std::time::Instant::now();
                 scheduler_tick(
                     &scheduler_pool,
                     scheduler_projection_dispatcher.as_ref(),
@@ -928,7 +1034,14 @@ impl SkiljBuilder {
                     scheduler_encryption_master_key.as_ref(),
                     chrono::Utc::now(),
                 )
+                // One span per tick, a trace root - same reasoning as
+                // the async projection task above.
+                .instrument(tracing::info_span!("scheduler_tick"))
                 .await;
+                BACKGROUND_TASK_TICK_DURATION.record(
+                    start.elapsed().as_secs_f64(),
+                    &[KeyValue::new("task", "scheduler")],
+                );
                 tokio::time::sleep(scheduler_interval).await;
             }
         });
@@ -1014,7 +1127,14 @@ async fn scheduler_tick(
     let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
         Ok(bcs) => bcs,
         Err(e) => {
-            eprintln!("skilj: scheduler failed to list bounded contexts: {e}");
+            tracing::warn!(error = %e, "scheduler failed to list bounded contexts");
+            BACKGROUND_TASK_ERRORS.add(
+                1,
+                &[
+                    KeyValue::new("task", "scheduler"),
+                    KeyValue::new("reason", "list_bounded_contexts_failed"),
+                ],
+            );
             return;
         }
     };
@@ -1025,9 +1145,17 @@ async fn scheduler_tick(
         let scheduled = match skilj_core::db::list_scheduled_event_types(pool, &bc.name).await {
             Ok(scheduled) => scheduled,
             Err(e) => {
-                eprintln!(
-                    "skilj: scheduler failed to list scheduled event types for {:?}: {e}",
-                    bc.name
+                tracing::warn!(
+                    bounded_context = %bc.name,
+                    error = %e,
+                    "scheduler failed to list scheduled event types"
+                );
+                BACKGROUND_TASK_ERRORS.add(
+                    1,
+                    &[
+                        KeyValue::new("task", "scheduler"),
+                        KeyValue::new("reason", "list_scheduled_event_types_failed"),
+                    ],
                 );
                 continue;
             }
@@ -1064,9 +1192,18 @@ async fn scheduler_tick(
                     )
                     .await
                     {
-                        eprintln!(
-                            "skilj: SkipMissedOccurrences failed for {}/{}: {e}",
-                            bc.name, et.name
+                        tracing::warn!(
+                            bounded_context = %bc.name,
+                            event_type = %et.name,
+                            error = %e,
+                            "SkipMissedOccurrences failed"
+                        );
+                        BACKGROUND_TASK_ERRORS.add(
+                            1,
+                            &[
+                                KeyValue::new("task", "scheduler"),
+                                KeyValue::new("reason", "skip_missed_occurrences_failed"),
+                            ],
                         );
                     }
                     break;
@@ -1086,9 +1223,18 @@ async fn scheduler_tick(
                 )
                 .await
                 {
-                    eprintln!(
-                        "skilj: CreateSystemEvent failed for {}/{}: {e}",
-                        bc.name, et.name
+                    tracing::warn!(
+                        bounded_context = %bc.name,
+                        event_type = %et.name,
+                        error = %e,
+                        "CreateSystemEvent failed"
+                    );
+                    BACKGROUND_TASK_ERRORS.add(
+                        1,
+                        &[
+                            KeyValue::new("task", "scheduler"),
+                            KeyValue::new("reason", "create_system_event_failed"),
+                        ],
                     );
                     break;
                 }

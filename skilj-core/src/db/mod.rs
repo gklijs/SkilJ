@@ -45,8 +45,62 @@ use crate::event_store::{
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use crate::shared::{Metadata, SensitiveField, Tag, TagMapping};
 use chrono::{DateTime, Utc};
+use opentelemetry::metrics::{Counter, Meter};
+use opentelemetry::KeyValue;
 use sqlx::types::Json;
 use sqlx::{Postgres, Transaction};
+use std::sync::LazyLock;
+
+/// This crate's own OTel instrumentation scope. `opentelemetry::global::meter(...)`
+/// **snapshot-binds** to whichever `MeterProvider` is globally registered
+/// at the moment it's first called (its own doc comment says so
+/// explicitly) - unlike the `tracing`/`tracing-opentelemetry` bridge,
+/// which is wired to a concrete provider once, inside the consuming
+/// app's own `init_telemetry`. Every instrument below is a `LazyLock`,
+/// so this is only ever called the first time a metric is actually
+/// recorded (the first command processed, the first event appended) -
+/// always strictly after a real consuming app's `main()` has already
+/// called `opentelemetry::global::set_meter_provider(...)`, since that
+/// has to happen before `.build()` even runs. If a future change ever
+/// moves telemetry init to *after* `Skilj::builder(...).build()`, this
+/// silently goes back to recording into a no-op meter forever - see
+/// docs/architecture.md's tracing section.
+fn meter() -> &'static Meter {
+    static METER: LazyLock<Meter> = LazyLock::new(|| opentelemetry::global::meter("skilj-core"));
+    &METER
+}
+
+static COMMANDS_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_counter("skilj.commands.processed")
+        .with_description("Commands processed by ProcessCommand, by outcome.")
+        .build()
+});
+
+static EVENTS_APPENDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_counter("skilj.events.appended")
+        .with_description("Events appended to the event store.")
+        .build()
+});
+
+/// Called at each of this module's five `broadcaster.publish(event)` call
+/// sites, never inside `insert_event` itself - `insert_event` runs inside
+/// a still-open transaction its own caller might yet roll back (a later
+/// step in the same transaction failing), while `publish` is only ever
+/// reached after `tx.commit()` succeeds (see e.g.
+/// `insert_event_and_update_sync_projections`'s own doc comment: "after
+/// the commit, not before"). Counting at `insert_event` itself would
+/// over-count on any such rollback.
+fn record_event_appended(event: &Event) {
+    EVENTS_APPENDED.add(
+        1,
+        &[
+            KeyValue::new("bounded_context", event.bounded_context.name.clone()),
+            KeyValue::new("event_type", event.event_type.name.clone()),
+        ],
+    );
+}
 
 /// An opaque handle to the connection pool - re-exported so `skilj-rest`/
 /// `skilj-graphql` can hold one without depending on `sqlx` directly
@@ -55,6 +109,7 @@ use sqlx::{Postgres, Transaction};
 /// database driver.
 pub type Pool = sqlx::PgPool;
 
+#[tracing::instrument(skip_all)]
 pub async fn connect(database_url: &str) -> Result<Pool, sqlx::Error> {
     sqlx::PgPool::connect(database_url).await
 }
@@ -64,6 +119,7 @@ pub async fn connect(database_url: &str) -> Result<Pool, sqlx::Error> {
 /// `skilj-core` owns its schema this way. Only ever touches the global
 /// tables - per-bounded-context schemas are provisioned separately, see
 /// `provision_bounded_context_schema`.
+#[tracing::instrument(skip_all)]
 pub async fn migrate(pool: &Pool) -> Result<(), sqlx::migrate::MigrateError> {
     sqlx::migrate!("./migrations").run(pool).await
 }
@@ -478,6 +534,7 @@ async fn provision_bounded_context_schema(
 /// `bootstrap::delete_bounded_context` check (superadmin, `archived`,
 /// not `admin`) is the caller's job to run first - this function trusts
 /// it already has.
+#[tracing::instrument(skip_all, fields(name = %name))]
 pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<()> {
     let schema = schema_ident(name);
     let mut tx = pool.begin().await?;
@@ -521,6 +578,7 @@ impl RoleRow {
 
 const ROLE_COLUMNS: &str = "id, external_subject, name, superadmin, status, created_at, revoked_at";
 
+#[tracing::instrument(skip_all)]
 pub async fn insert_role(pool: &Pool, role: &Role) -> crate::error::Result<()> {
     sqlx::query(&format!(
         "INSERT INTO roles ({ROLE_COLUMNS}) VALUES ($1,$2,$3,$4,$5,$6,$7)"
@@ -537,6 +595,7 @@ pub async fn insert_role(pool: &Pool, role: &Role) -> crate::error::Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn get_role(pool: &Pool, id: &str) -> crate::error::Result<Option<Role>> {
     let row: Option<RoleRow> =
         sqlx::query_as(&format!("SELECT {ROLE_COLUMNS} FROM roles WHERE id = $1"))
@@ -552,6 +611,7 @@ pub async fn get_role(pool: &Pool, id: &str) -> crate::error::Result<Option<Role
 /// and admin-managed, unlike `Event`/`Command`, so an unscoped list is
 /// the right shape here - no per-bounded-context narrowing to do, since
 /// a `Role` isn't scoped to one.
+#[tracing::instrument(skip_all)]
 pub async fn list_roles(pool: &Pool) -> crate::error::Result<Vec<Role>> {
     let rows: Vec<RoleRow> = sqlx::query_as(&format!("SELECT {ROLE_COLUMNS} FROM roles"))
         .fetch_all(pool)
@@ -565,6 +625,7 @@ pub async fn list_roles(pool: &Pool) -> crate::error::Result<Vec<Role>> {
 /// the same "works on `&Pool` autocommit or inside a caller's own open
 /// `Transaction`" treatment `next_sequence` already gets - `revoke_role_and_mappings`
 /// below is what needs the latter.
+#[tracing::instrument(skip_all)]
 pub async fn update_role<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     role: &Role,
@@ -606,6 +667,7 @@ const BOUNDED_CONTEXT_COLUMNS: &str =
 /// no registry row or vice versa. Callers (test fixtures included) don't
 /// need to know any of this happens; the signature is unchanged from
 /// before schema-per-context existed.
+#[tracing::instrument(skip_all)]
 pub async fn insert_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate::error::Result<()> {
     let (kind, role_id) = match &bc.created_by {
         ContextCreator::SystemCreator => ("system", None),
@@ -635,6 +697,7 @@ pub async fn insert_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate::
 /// of creation" framing, and there is no rename). Distinct from
 /// `insert_bounded_context`, which provisions a brand new schema - this
 /// touches only the registry row of one that already exists.
+#[tracing::instrument(skip_all, fields(name = %name))]
 pub async fn update_bounded_context_status(
     pool: &Pool,
     name: &str,
@@ -673,6 +736,7 @@ fn bounded_context_from_row(row: BoundedContextRow, role: Option<Role>) -> Bound
     }
 }
 
+#[tracing::instrument(skip_all, fields(name = %name))]
 pub async fn get_bounded_context(
     pool: &Pool,
     name: &str,
@@ -701,6 +765,7 @@ pub async fn get_bounded_context(
 /// expects (see its own doc comment: unrestricted, same full-snapshot
 /// treatment `list_roles`/`list_role_access_mappings` get). Backs the
 /// `BoundedContextDirectory` surface's `boundedContexts` query.
+#[tracing::instrument(skip_all)]
 pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<BoundedContext>> {
     let rows: Vec<BoundedContextRow> = sqlx::query_as(&format!(
         "SELECT {BOUNDED_CONTEXT_COLUMNS} FROM bounded_contexts"
@@ -789,6 +854,7 @@ const EVENT_TYPE_COLUMNS: &str = "name, schema, schema_version, tag_mappings, se
 /// shape (see `event_store::register_event_type`), though no surface
 /// calls this yet this pass; used directly by tests/seeding until
 /// `RegisterEventType` itself has a GraphQL route in front of it.
+#[tracing::instrument(skip_all)]
 pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Result<()> {
     let schema = schema_ident(&et.bounded_context.name);
     sqlx::query(&format!(
@@ -827,6 +893,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     Ok(())
 }
 
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_event_type(
     pool: &Pool,
     bounded_context: &str,
@@ -853,6 +920,7 @@ pub async fn get_event_type(
 /// stable output. `[]`, not an error, for an unknown `bounded_context` -
 /// the same "nothing to show" treatment `list_projections_for_bounded_context`
 /// gives it.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_scheduled_event_types(
     pool: &Pool,
     bounded_context: &str,
@@ -896,6 +964,7 @@ pub async fn list_scheduled_event_types(
 /// unregistered projection dispatcher - logged and skipped by the
 /// caller, not propagated as an `Err`).
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn fire_system_event(
     pool: &Pool,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
@@ -987,6 +1056,7 @@ pub async fn fire_system_event(
 
     tx.commit().await?;
     broadcaster.publish(&event);
+    record_event_appended(&event);
     event_cache.append(&event).await;
 
     Ok(Some(event))
@@ -1002,6 +1072,7 @@ pub async fn fire_system_event(
 /// moves (`FiredOccurrenceIsAccountedFor` only ever relates it to
 /// occurrences that actually fired). `Ok(None)` when the resume turns out
 /// to be a no-op once the lock is held.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn skip_missed_occurrences_for_event_type(
     pool: &Pool,
     bounded_context: &str,
@@ -1070,6 +1141,7 @@ const COMMAND_TYPE_COLUMNS: &str =
     "name, schema, schema_version, tag_mappings, sensitive_fields, rest_trigger_allowed";
 
 /// See `upsert_event_type` above - same shape and reasoning.
+#[tracing::instrument(skip_all)]
 pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error::Result<()> {
     let schema = schema_ident(&ct.bounded_context.name);
     sqlx::query(&format!(
@@ -1091,6 +1163,7 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     Ok(())
 }
 
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_command_type(
     pool: &Pool,
     bounded_context: &str,
@@ -1165,6 +1238,7 @@ const ENCRYPTION_KEY_COLUMNS: &str =
 /// already has. The caller needs `id` to link `event_encryption_keys`/
 /// `command_encryption_keys` join rows once the event/command itself is
 /// inserted.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_or_create_encryption_key(
     pool: &Pool,
     bounded_context: &str,
@@ -1250,6 +1324,7 @@ fn unwrap_row(
 /// identical "empty is a no-op" register `protect_sensitive_fields`
 /// itself is in. `master_key: None` with something to resolve is a real,
 /// actionable configuration error, not a silent skip.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn resolve_encryption_keys(
     pool: &Pool,
     bounded_context: &str,
@@ -1304,6 +1379,7 @@ pub async fn resolve_encryption_keys(
 /// provisioned) simply isn't inserted into `resolved` - `render_event`/
 /// `render_command`'s own `resolve_data_key` closure sees `None` for it,
 /// the correct crypto-shredding outcome, not an error.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn resolve_data_keys_for_reading(
     pool: &Pool,
     bounded_context: &str,
@@ -1349,6 +1425,7 @@ pub async fn resolve_data_keys_for_reading(
 /// `Command.encryption_keys`) - re-keyed back into `resolved` by
 /// `(subject_key, subject_value)`, the only identity `EncryptionKey`
 /// itself carries.
+#[tracing::instrument(skip_all)]
 pub fn encryption_key_ids(
     used: &[EncryptionKey],
     resolved: &std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
@@ -1386,6 +1463,7 @@ async fn get_active_encryption_key_row(
 /// (§SubjectErasure's `context key: EncryptionKey where ... status =
 /// active`). No key material - `get_or_create_encryption_key` is the only
 /// function that ever needs (and returns) that.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_active_encryption_key(
     pool: &Pool,
     bounded_context: &str,
@@ -1410,6 +1488,7 @@ pub async fn get_active_encryption_key(
 /// `ForgetSubject`" identically, matching `resolve_data_keys_for_reading`'s
 /// own doc comment for why that's correct crypto-shredding behaviour, not
 /// a gap.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_active_data_key(
     pool: &Pool,
     bounded_context: &str,
@@ -1439,6 +1518,7 @@ pub async fn get_active_data_key(
 /// configuration error `resolve_encryption_keys`/`resolve_data_keys_for_reading`
 /// already raise for the same underlying reason - confirmed with the
 /// user before building real decrypt-on-read at all.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_active_data_keys_for_subject_value(
     pool: &Pool,
     bounded_context: &str,
@@ -1468,6 +1548,7 @@ pub async fn list_active_data_keys_for_subject_value(
 /// Scoped to `status = 'active'` in the `WHERE` clause purely
 /// defensively, since the pure rule already rejects an inactive key
 /// before this is ever called.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn destroy_encryption_key(
     pool: &Pool,
     bounded_context: &str,
@@ -1561,6 +1642,7 @@ const COMMAND_COLUMNS: &str = "external_id, command_type_name, payload, metadata
 /// row and every one of the events it triggered commit or roll back
 /// together - see `DynamicConsistencyBoundaryHonoured` and the note above
 /// the rules in specs/skilj.allium.
+#[tracing::instrument(skip_all)]
 pub async fn insert_command(
     tx: &mut Transaction<'_, Postgres>,
     command: &Command,
@@ -1597,6 +1679,7 @@ pub async fn insert_command(
     Ok(id)
 }
 
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_command_by_id(
     pool: &Pool,
     bounded_context: &str,
@@ -1620,6 +1703,7 @@ pub async fn get_command_by_id(
 /// expects (same treatment `list_events_for_bounded_context` gets for
 /// `Event`), added propagating `skilj-graphql`'s `CommandQuery` resolver
 /// (Phase 3).
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_commands_for_bounded_context(
     pool: &Pool,
     bounded_context: &str,
@@ -1726,6 +1810,7 @@ const PROJECTION_COLUMNS: &str = "name, schema, schema_version, sync, caught_up_
 /// takes (and, on the losing side, waits on) that row's lock for the
 /// rest of the transaction, so a second concurrent call can't reach its
 /// own `DELETE`/`INSERT` pair until the first has committed.
+#[tracing::instrument(skip_all)]
 pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::error::Result<()> {
     let schema = schema_ident(&projection.bounded_context.name);
     let mut tx = pool.begin().await?;
@@ -1826,6 +1911,7 @@ async fn get_or_create_projection_rebuild_state_for_update(
 /// error; `resolvers::projection_query` falls back to
 /// `ProjectionDispatcher::default_state` for it, the same value a fresh
 /// instance would lazily start from).
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_projection_state(
     pool: &Pool,
     bounded_context: &str,
@@ -1851,6 +1937,7 @@ pub async fn get_projection_state(
 /// `get_projection_state` above - for tests and anything else wanting to
 /// read this row directly outside the consumer's own row-locked
 /// transaction.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_projection_rebuild_state(
     pool: &Pool,
     bounded_context: &str,
@@ -1871,6 +1958,7 @@ pub async fn get_projection_rebuild_state(
     Ok(row.map(|(state,)| state))
 }
 
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_projection(
     pool: &Pool,
     bounded_context: &str,
@@ -1912,6 +2000,7 @@ pub async fn get_projection(
 /// bounded_context.projections`. Same per-row `consumed_event_types`
 /// resolution `get_projection` does, just for every row in the context's
 /// own `projections` table rather than one name.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_projections_for_bounded_context(
     pool: &Pool,
     bounded_context: &str,
@@ -2065,6 +2154,7 @@ async fn replace_rebuild_consumed_event_types(
 /// the default (see `ProjectionDispatcher::default_state`'s own doc
 /// comment for why it, not this function, has to be the one deciding
 /// that value).
+#[tracing::instrument(skip_all)]
 pub async fn upsert_projection_rebuild(
     pool: &Pool,
     rebuild: &ProjectionRebuild,
@@ -2109,6 +2199,7 @@ pub async fn upsert_projection_rebuild(
 /// replaying re-stages the build under the freshly toggled row rather
 /// than erroring - still at most one building row afterward, satisfying
 /// `UniqueRebuildPerProjectionAndStatus` either way.
+#[tracing::instrument(skip_all)]
 pub async fn transition_projection_rebuild_to_building(
     pool: &Pool,
     rebuild: &ProjectionRebuild,
@@ -2187,6 +2278,7 @@ pub async fn transition_projection_rebuild_to_building(
 /// status: pending}` in every one of those three rules -
 /// `catch_up_bounded_context` is the one caller that asks for `Building`
 /// instead.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_projection_rebuild(
     pool: &Pool,
     bounded_context: &str,
@@ -2234,6 +2326,7 @@ pub async fn get_projection_rebuild(
 /// real parameter rather than hardcoded, matching `get_projection_rebuild`'s
 /// own shape, since the caller (not this function) is what already knows
 /// which row `discard_projection_rebuild`'s own `staged` argument was.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn delete_projection_rebuild(
     pool: &Pool,
     bounded_context: &str,
@@ -2305,6 +2398,7 @@ impl RoleAccessMappingRow {
 const ROLE_ACCESS_MAPPING_COLUMNS: &str =
     "role_id, bounded_context, level, can_read_sensitive, status, created_at, revoked_at";
 
+#[tracing::instrument(skip_all)]
 pub async fn insert_role_access_mapping(
     pool: &Pool,
     mapping: &RoleAccessMapping,
@@ -2332,6 +2426,7 @@ pub async fn insert_role_access_mapping(
 /// `revoke_role_access_mapping`'s own lookup). The partial unique index
 /// on `(role_id, bounded_context) WHERE status = 'active'` guarantees at
 /// most one row can ever match.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_active_role_access_mapping(
     pool: &Pool,
     role_id: &str,
@@ -2355,6 +2450,7 @@ pub async fn get_active_role_access_mapping(
 /// not - the full-snapshot parameter `grant_role_access_mapping`'s own
 /// `existing_mappings` expects (see its doc comment). Same "small,
 /// admin-managed, unscoped is fine" reasoning as `list_roles`.
+#[tracing::instrument(skip_all)]
 pub async fn list_role_access_mappings(
     pool: &Pool,
 ) -> crate::error::Result<Vec<RoleAccessMapping>> {
@@ -2373,6 +2469,7 @@ pub async fn list_role_access_mappings(
 /// Every currently-*active* `RoleAccessMapping` for one `Role` - the
 /// `active_mappings` parameter `revoke_role` expects (see its own doc
 /// comment: "as already looked up by the caller").
+#[tracing::instrument(skip_all)]
 pub async fn list_active_role_access_mappings_for_role(
     pool: &Pool,
     role_id: &str,
@@ -2397,6 +2494,7 @@ pub async fn list_active_role_access_mappings_for_role(
 /// reads by - safe without needing a synthetic id, since at most one row
 /// can ever match (see the migration's own partial unique index). `impl
 /// PgExecutor` - same reasoning as `update_role`'s own doc comment.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn revoke_active_role_access_mapping<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     role_id: &str,
@@ -2425,6 +2523,7 @@ pub async fn revoke_active_role_access_mapping<'e>(
 /// `submit_command` already establishes for the identical reason -
 /// `RevokedRoleImpliesMappingsRevoked` now holds for real, not just when
 /// nothing goes wrong partway through.
+#[tracing::instrument(skip_all)]
 pub async fn revoke_role_and_mappings(
     pool: &Pool,
     role: &Role,
@@ -2471,6 +2570,7 @@ pub async fn revoke_role_and_mappings(
 /// bare `&Pool` still works too (autocommit, the pre-fix behaviour) -
 /// every direct `db::next_sequence(&pool, ...)` test call keeps compiling
 /// unchanged.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn next_sequence<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     bounded_context: &str,
@@ -2490,6 +2590,7 @@ pub async fn next_sequence<'e>(
 /// since the last tick) costs one small aggregate query, not a full event
 /// reload - `list_events_for_bounded_context_from` only ever runs once
 /// this comes back higher than everything that still needs catching up.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn latest_sequence(
     pool: &Pool,
     bounded_context: &str,
@@ -2599,6 +2700,7 @@ impl EventRow {
 /// comment); this function is its unconditional-load fallback, and
 /// still used directly wherever the whole type's history is genuinely
 /// wanted regardless of recency.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events(
     pool: &Pool,
     bounded_context: &str,
@@ -2652,6 +2754,7 @@ struct EventRowAnyType {
 /// row's `EventType` isn't known ahead of the query, so each distinct
 /// `event_type_name` seen is resolved once and cached for the rest of
 /// this call rather than reloaded per row.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_for_bounded_context(
     pool: &Pool,
     bounded_context: &str,
@@ -2713,6 +2816,7 @@ pub async fn list_events_for_bounded_context(
 /// shape (still used as-is by `process_command`'s consistency-boundary
 /// resolution - unrelated, unchanged). Same per-row resolution as that
 /// function, just with a `WHERE` clause and a starting point.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_for_bounded_context_from(
     pool: &Pool,
     bounded_context: &str,
@@ -2775,6 +2879,7 @@ pub async fn list_events_for_bounded_context_from(
 /// (`context event: Event`), added propagating `skilj-graphql`'s
 /// `EventQuery` resolver (Phase 3). `None` when no event in this bounded
 /// context has that sequence.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_event_by_sequence(
     pool: &Pool,
     bounded_context: &str,
@@ -2830,6 +2935,7 @@ pub async fn get_event_by_sequence(
 /// by `sequence` - `event_cache::EventCache::warm`'s own fetch, and the
 /// only place this module issues a `DESC ... LIMIT` query at all (every
 /// other listing function loads a range in ascending order directly).
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_recent_events_for_bounded_context(
     pool: &Pool,
     bounded_context: &str,
@@ -2896,6 +3002,7 @@ pub async fn list_recent_events_for_bounded_context(
 /// The type-scoped, `after_sequence`-bounded twin of `list_events` above -
 /// `list_events_cached`'s own fallback path, so falling back to Postgres
 /// doesn't itself load more than the request actually needs.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_from(
     pool: &Pool,
     bounded_context: &str,
@@ -2933,6 +3040,7 @@ pub async fn list_events_from(
 /// Tries the cache first; `list_events_from` above is the fallback, so a
 /// coverage miss still only loads what the request actually needs, not
 /// the whole type's history.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_cached(
     pool: &Pool,
     cache: &crate::event_cache::EventCache,
@@ -2959,6 +3067,7 @@ pub async fn list_events_cached(
 /// which has an `after_sequence` of their own); `list_events_for_bounded_context`/
 /// `list_events_for_bounded_context_from` (both already existed, reused
 /// unchanged) are the fallback for either case respectively.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_for_bounded_context_cached(
     pool: &Pool,
     cache: &crate::event_cache::EventCache,
@@ -2977,6 +3086,7 @@ pub async fn list_events_for_bounded_context_cached(
 
 /// `InspectEvent`'s own real read path - see `crate::event_cache`'s own
 /// module doc comment for the full design.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_event_by_sequence_cached(
     pool: &Pool,
     cache: &crate::event_cache::EventCache,
@@ -2997,6 +3107,7 @@ pub async fn get_event_by_sequence_cached(
 /// `insert_command(pool, &result.command)` (returning the new row's id)
 /// runs first for a `ProcessCommandResult`, then this is called once per
 /// produced `Event` with that same id.
+#[tracing::instrument(skip_all)]
 pub async fn insert_event<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     event: &Event,
@@ -3079,6 +3190,7 @@ pub async fn insert_event<'e>(
 /// note above the rules: "advances that projection's own caught_up_to...
 /// either way") - `dispatcher.project()` itself is what decides whether
 /// the *state* changes; this function always bumps the position.
+#[tracing::instrument(skip_all)]
 pub async fn insert_event_and_update_sync_projections(
     pool: &Pool,
     event: &Event,
@@ -3106,6 +3218,7 @@ pub async fn insert_event_and_update_sync_projections(
     // is the one choke point every event-creation call site already
     // shares).
     broadcaster.publish(event);
+    record_event_appended(event);
     event_cache.append(event).await;
 
     Ok(())
@@ -3133,6 +3246,7 @@ pub async fn insert_event_and_update_sync_projections(
 /// `skilj-drift-audit-2026-08-20`, and that function's own doc comment):
 /// the two can never interleave, so by the time this plain read runs
 /// there is no possible half-visible state to see.
+#[tracing::instrument(skip_all)]
 pub async fn insert_event_and_update_sync_projections_in_tx(
     pool: &Pool,
     tx: &mut Transaction<'_, Postgres>,
@@ -3254,6 +3368,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
 /// is the only crate that owns the database driver, so no other crate
 /// ever opens a `Transaction` itself.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all)]
 pub async fn create_and_insert_external_event(
     pool: &Pool,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
@@ -3310,6 +3425,7 @@ pub async fn create_and_insert_external_event(
     .await?;
     tx.commit().await?;
     broadcaster.publish(&event);
+    record_event_appended(&event);
     event_cache.append(&event).await;
 
     Ok(event)
@@ -3319,6 +3435,7 @@ pub async fn create_and_insert_external_event(
 /// above - same reasoning, same fix, only the adapter type and the
 /// absent `source_content`/`source_context` differ.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all)]
 pub async fn create_and_insert_direct_event(
     pool: &Pool,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
@@ -3371,6 +3488,7 @@ pub async fn create_and_insert_direct_event(
     .await?;
     tx.commit().await?;
     broadcaster.publish(&event);
+    record_event_appended(&event);
     event_cache.append(&event).await;
 
     Ok(event)
@@ -3439,6 +3557,13 @@ pub enum SubmitCommandOutcome {
 /// included, rather than burning a sequence number on a write that never
 /// lands - the actual bug this function exists to close.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        bounded_context = %command_type.bounded_context.name,
+        command_type = %command_type.name,
+    )
+)]
 pub async fn submit_command(
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
@@ -3507,6 +3632,14 @@ pub async fn submit_command(
 
     let event_specs = match final_decision {
         crate::shared::CommandDecision::Rejected { reason, kind } => {
+            COMMANDS_PROCESSED.add(
+                1,
+                &[
+                    KeyValue::new("bounded_context", command_type.bounded_context.name.clone()),
+                    KeyValue::new("command_type", command_type.name.clone()),
+                    KeyValue::new("outcome", "rejected"),
+                ],
+            );
             return Ok(SubmitCommandOutcome::Rejected { reason, kind });
         }
         crate::shared::CommandDecision::Accepted { events } => events,
@@ -3628,8 +3761,18 @@ pub async fn submit_command(
     // itself already follows.
     for event in &result.events {
         broadcaster.publish(event);
+        record_event_appended(event);
         event_cache.append(event).await;
     }
+
+    COMMANDS_PROCESSED.add(
+        1,
+        &[
+            KeyValue::new("bounded_context", command_type.bounded_context.name.clone()),
+            KeyValue::new("command_type", command_type.name.clone()),
+            KeyValue::new("outcome", "accepted"),
+        ],
+    );
 
     Ok(SubmitCommandOutcome::Accepted {
         command: Box::new(result.command),
@@ -3670,6 +3813,7 @@ pub async fn submit_command(
 /// `default_state()` did - the same "position always advances, state
 /// only changes when the dispatcher can" treatment sync projections
 /// already get from `insert_event_and_update_sync_projections` above.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn catch_up_bounded_context(
     pool: &Pool,
     bounded_context: &str,
@@ -3899,6 +4043,7 @@ pub async fn catch_up_bounded_context(
 /// sequence folded - always `Some` when this is called at all, since the
 /// caller only calls it when `needs_history_fold` was true, which itself
 /// requires at least one matching event to exist.
+#[tracing::instrument(skip_all)]
 pub async fn fold_history_into_new_sync_projection(
     pool: &Pool,
     projection: &Projection,
@@ -4001,6 +4146,7 @@ pub async fn fold_history_into_new_sync_projection(
 /// outside its own `tx` - see that function's doc comment: every
 /// event-insert path already takes this exact lock before reaching that
 /// read, so once promotion takes it too, the two can never interleave.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn promote_projection_rebuild(
     pool: &Pool,
     bounded_context: &str,
@@ -4240,6 +4386,7 @@ async fn fetch_access_token_row(
 
 /// See `AccessTokenKind`'s own doc comment - the one lookup `skilj-rest`'s
 /// auth layer needs before deciding 401 vs 403.
+#[tracing::instrument(skip_all)]
 pub async fn access_token_kind(
     pool: &Pool,
     id: &str,
@@ -4260,6 +4407,7 @@ pub async fn access_token_kind(
 /// `id` that resolves to nothing - unreachable in practice, since the
 /// caller already loaded this exact row to build the `AccessToken` it
 /// passed to `revoke_token` in the first place.
+#[tracing::instrument(skip_all)]
 pub async fn revoke_access_token(
     pool: &Pool,
     id: &str,
@@ -4320,6 +4468,7 @@ async fn insert_access_token_row(
     insert_token_index(pool, id, bounded_context).await
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn insert_external_event_token(
     pool: &Pool,
     token: &ExternalEventToken,
@@ -4338,6 +4487,7 @@ pub async fn insert_external_event_token(
     .await
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn insert_direct_creation_token(
     pool: &Pool,
     token: &DirectCreationToken,
@@ -4356,6 +4506,7 @@ pub async fn insert_direct_creation_token(
     .await
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn insert_event_read_token(
     pool: &Pool,
     token: &EventReadToken,
@@ -4380,6 +4531,7 @@ pub async fn insert_event_read_token(
 /// `access_tokens` `CHECK` constraint), and the same insert-row-then-index
 /// ordering. `token.secret` is hashed before storage the same way
 /// `insert_access_token_row` does.
+#[tracing::instrument(skip_all)]
 pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::error::Result<()> {
     let schema = schema_ident(&token.command_type.bounded_context.name);
     sqlx::query(&format!(
@@ -4402,6 +4554,7 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
 /// isn't kind `external_event` - callers that need to tell those two
 /// apart (for the 401-vs-403 split - see `AccessTokenKind`'s own doc
 /// comment) call `access_token_kind` first.
+#[tracing::instrument(skip_all)]
 pub async fn get_external_event_token(
     pool: &Pool,
     id: &str,
@@ -4431,6 +4584,7 @@ pub async fn get_external_event_token(
 
 /// See `get_external_event_token`'s own doc comment - same shape and
 /// `None` reasoning.
+#[tracing::instrument(skip_all)]
 pub async fn get_direct_creation_token(
     pool: &Pool,
     id: &str,
@@ -4460,6 +4614,7 @@ pub async fn get_direct_creation_token(
 
 /// See `get_external_event_token`'s own doc comment - same shape and
 /// `None` reasoning.
+#[tracing::instrument(skip_all)]
 pub async fn get_event_read_token(
     pool: &Pool,
     id: &str,
@@ -4490,6 +4645,7 @@ pub async fn get_event_read_token(
 /// See `get_external_event_token`'s own doc comment - same shape and
 /// `None` reasoning, resolving `command_type_name` against
 /// `command_types` instead of `event_type_name` against `event_types`.
+#[tracing::instrument(skip_all)]
 pub async fn get_command_token(
     pool: &Pool,
     id: &str,
@@ -4531,6 +4687,7 @@ struct ReadCursorRow {
 /// so its own `event_type.bounded_context.name`) by the time this is
 /// called - token resolution (which does need the index) already
 /// happened first, in `get_event_read_token` above.
+#[tracing::instrument(skip_all)]
 pub async fn get_read_cursor(
     pool: &Pool,
     token: &EventReadToken,
@@ -4572,6 +4729,7 @@ async fn upsert_read_cursor(pool: &Pool, cursor: &ReadCursor) -> crate::error::R
 /// token's `ReadCursor` - see `CursorUpdate`'s own doc comment for why
 /// that decision and this persistence step are two separate functions
 /// (the pure/no-I/O split every rule in this crate keeps).
+#[tracing::instrument(skip_all)]
 pub async fn apply_cursor_update(
     pool: &Pool,
     token: &EventReadToken,
@@ -4602,6 +4760,7 @@ pub async fn apply_cursor_update(
 /// itself only returns the new `(sequence, updated_at)` pair (it has no
 /// `CursorUpdate` variant of its own; see its doc comment), so there's no
 /// enum to dispatch on the way `apply_cursor_update` above does.
+#[tracing::instrument(skip_all)]
 pub async fn record_acknowledgement(
     pool: &Pool,
     token: &EventReadToken,

@@ -2634,6 +2634,13 @@ pub struct ProcessCommandResult {
 /// resolved outside, handed in" treatment every id-bearing entity's own
 /// pure constructor gets (see `access_control::create_role`).
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        bounded_context = %command_type.bounded_context.name,
+        command_type = %command_type.name,
+    )
+)]
 pub fn process_command(
     id: String,
     command_type: &CommandType,

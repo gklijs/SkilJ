@@ -19,5 +19,23 @@ use skilj_core::error::SkiljRejection;
 /// as an extension, silently dropping half of §5.4's error shape.
 pub fn to_graphql_error(rejection: impl SkiljRejection) -> async_graphql::Error {
     let code = rejection.code().to_string();
-    async_graphql::Error::new(rejection.message()).extend_with(|_, ext| ext.set("code", code))
+    let trace_id = current_trace_id();
+    async_graphql::Error::new(rejection.message()).extend_with(|_, ext| {
+        ext.set("code", code);
+        if let Some(trace_id) = &trace_id {
+            ext.set("traceId", trace_id.as_str());
+        }
+    })
+}
+
+/// See `skilj-rest::error`'s identical copy for the full reasoning -
+/// duplicated rather than shared, same as `trace_request`, since there's
+/// no crate both `skilj-rest` and `skilj-graphql` already depend on that
+/// this small a helper would justify adding.
+fn current_trace_id() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let trace_id = tracing::Span::current().context().span().span_context().trace_id();
+    (trace_id != opentelemetry::trace::TraceId::INVALID).then(|| trace_id.to_string())
 }

@@ -14,3 +14,16 @@ serde_json.workspace = true
 axum.workspace = true
 axum-extra.workspace = true
 chrono.workspace = true
+tracing.workspace = true
+opentelemetry.workspace = true
+opentelemetry-http.workspace = true
+tracing-opentelemetry.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+sqlx.workspace = true
+tower = { version = "0.5", features = ["util"] }
+# `testing` feature only, for the in-process span exporter
+# (`opentelemetry_sdk::testing::trace`) the tracing-middleware test uses
+# instead of a real OTLP collector.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

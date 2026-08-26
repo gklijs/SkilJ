@@ -21,6 +21,11 @@ ring.workspace = true
 base64.workspace = true
 skilj-macros.workspace = true
 cron = "0.17.0"
+tracing.workspace = true
+# API-only - records measurements through `opentelemetry::global::meter(...)`.
+# No SDK/exporter dependency here; see docs/architecture.md's tracing
+# section for the crate boundary.
+opentelemetry.workspace = true
 # `default-features = false` - the resolve-file/resolve-http/reqwest/tls
 # features are all about following remote/local $ref URIs a schema might
 # reference; every schema this crate ever validates is one bounded
@@ -37,3 +42,11 @@ proptest.workspace = true
 # web-framework dependency for real, non-test, use (docs/architecture.md
 # §3.2) since this is dev-only.
 axum.workspace = true
+# Only to build a small in-process span-capturing `Layer` for the
+# tracing tests below - no subscriber is ever installed by non-test
+# code, per the crate's own "emit via `tracing` only" boundary.
+tracing-subscriber.workspace = true
+# `testing` feature only, for the in-process metrics exporter
+# (`opentelemetry_sdk::metrics::InMemoryMetricExporter`) the metrics
+# test uses instead of a real OTLP collector.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

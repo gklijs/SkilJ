@@ -44,7 +44,7 @@ jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 axum = "0.8"
 axum-extra = { version = "0.10", features = ["query"] }
-async-graphql = "7"
+async-graphql = { version = "7", features = ["tracing"] }
 async-graphql-axum = "7"
 arc-swap = "1"
 proptest = "1"
@@ -55,6 +55,52 @@ asynk-strim = "0.1"
 syn = "2"
 quote = "1"
 proc-macro2 = "1"
+# Tracing: library crates (skilj-core/skilj-rest/skilj-graphql/skilj)
+# only ever emit `tracing` spans/events and depend on the lightweight
+# `opentelemetry`/`opentelemetry-http`/`tracing-opentelemetry` *bridge*
+# crates (API-level - extracting/injecting W3C traceparent headers and
+# attaching that context to the current `tracing::Span`) - never the
+# `opentelemetry_sdk`/`opentelemetry-otlp`/`tracing-subscriber` stack
+# that actually builds an exporter and installs a global subscriber,
+# which is skilj-demo-only, as the reference example of what a real
+# consuming app wires up. See docs/architecture.md's tracing section.
+#
+# No `tower-http` `TraceLayer`, deliberately: `tracing-opentelemetry`
+# only lets a span's parent be set *before* that span is ever entered
+# (`OpenTelemetrySpanExt::set_parent` errors with `AlreadyStarted`
+# afterwards) - `TraceLayer` creates and enters its own span internally,
+# with no hook to set the parent first, so the two don't compose safely.
+# Each REST/GraphQL router instead has one hand-rolled `axum::middleware::
+# from_fn` (`trace_request`) that extracts the header, builds the span,
+# sets its parent, and only then instruments the rest of the request with
+# it - see `skilj-rest::routes::trace_request`'s own doc comment.
+tracing = "0.1"
+opentelemetry = "0.32"
+opentelemetry-http = "0.32"
+tracing-opentelemetry = "0.33"
+# skilj-demo only, from here down
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry_sdk = { version = "0.32" }
+# `reqwest-blocking-client`, not `reqwest-client`: the SDK's own default
+# batch processors/periodic reader each run their own dedicated OS
+# thread, not a Tokio task - the exporter's `async fn export()` still
+# needs to actually make its HTTP call from that plain thread, which
+# only reqwest's *blocking* client can do without a Tokio reactor
+# present. Confirmed the hard way: `reqwest-client` (async) compiles
+# fine but panics the first time anything is actually exported ("there
+# is no reactor running"), since none of those background threads are
+# themselves Tokio tasks. `opentelemetry-otlp`'s own default feature set
+# already pairs `http-proto` with `reqwest-blocking-client` for exactly
+# this reason - this was a deviation from that default worth reverting,
+# not a case for reaching into the SDK's separate (and still
+# `experimental_*`-feature-gated) async-runtime batch processor variants.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs", "metrics"] }
+# Bridges `tracing::info!`/`warn!`/etc. events into OpenTelemetry's own
+# *Logs* signal (a second, separate OTLP pipeline from the trace spans
+# above) - see docs/architecture.md's tracing section. No new call sites
+# needed anywhere: every `tracing` event already in the codebase is what
+# this exports.
+opentelemetry-appender-tracing = "0.32"
 
 # Path dependencies between skilj's own crates
 skilj-core = { path = "skilj-core" }

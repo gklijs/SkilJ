@@ -14,7 +14,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use skilj::{CommandType, EventType, Projection, SkiljBuilder};
+use skilj::{auto_register, CommandType, EventType, Projection};
 use skilj_core::event_store::Event;
 use skilj_core::plugin::BoundedContextEvent;
 use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
@@ -38,6 +38,7 @@ pub struct MoneyDepositedPayload {
 
 pub struct MoneyDeposited;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl EventType for MoneyDeposited {
     type Payload = MoneyDepositedPayload;
     const NAME: &'static str = "MoneyDeposited";
@@ -54,6 +55,7 @@ pub struct MoneyWithdrawnPayload {
 
 pub struct MoneyWithdrawn;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl EventType for MoneyWithdrawn {
     type Payload = MoneyWithdrawnPayload;
     const NAME: &'static str = "MoneyWithdrawn";
@@ -86,10 +88,12 @@ impl BoundedContextEvent for BankingEvent {
 }
 
 fn balance_of(matching_events: &[BankingEvent]) -> i64 {
-    matching_events.iter().fold(0i64, |balance, event| match event {
-        BankingEvent::MoneyDeposited(p) => balance + p.amount,
-        BankingEvent::MoneyWithdrawn(p) => balance - p.amount,
-    })
+    matching_events
+        .iter()
+        .fold(0i64, |balance, event| match event {
+            BankingEvent::MoneyDeposited(p) => balance + p.amount,
+            BankingEvent::MoneyWithdrawn(p) => balance - p.amount,
+        })
 }
 
 // --- commands ---
@@ -102,6 +106,7 @@ pub struct DepositMoneyPayload {
 
 pub struct DepositMoney;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl CommandType for DepositMoney {
     type Payload = DepositMoneyPayload;
     type Event = BankingEvent;
@@ -139,6 +144,7 @@ pub struct WithdrawMoneyPayload {
 
 pub struct WithdrawMoney;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl CommandType for WithdrawMoney {
     type Payload = WithdrawMoneyPayload;
     type Event = BankingEvent;
@@ -196,6 +202,7 @@ pub struct AccountBalanceState {
 /// just triggered, no polling delay.
 pub struct AccountBalance;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl Projection for AccountBalance {
     type State = AccountBalanceState;
     type Event = BankingEvent;
@@ -218,17 +225,4 @@ impl Projection for AccountBalance {
             BankingEvent::MoneyWithdrawn(p) => state.balance -= p.amount,
         }
     }
-}
-
-/// Registers this bounded context's event/command/projection types onto
-/// `builder`, scoped by `.bounded_context(BOUNDED_CONTEXT)` - see
-/// `lib.rs`'s own `register()`.
-pub fn register(builder: SkiljBuilder) -> SkiljBuilder {
-    builder
-        .bounded_context(BOUNDED_CONTEXT)
-        .event_type::<MoneyDeposited>()
-        .event_type::<MoneyWithdrawn>()
-        .command_type::<DepositMoney>()
-        .command_type::<WithdrawMoney>()
-        .projection::<AccountBalance>()
 }

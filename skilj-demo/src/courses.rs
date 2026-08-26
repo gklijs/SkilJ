@@ -27,7 +27,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use skilj::{CommandType, EventType, Projection, SkiljBuilder};
+use skilj::{auto_register, CommandType, EventType, Projection};
 use skilj_core::event_store::Event;
 use skilj_core::plugin::BoundedContextEvent;
 use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
@@ -69,6 +69,7 @@ pub struct CourseOpenedPayload {
 
 pub struct CourseOpened;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl EventType for CourseOpened {
     type Payload = CourseOpenedPayload;
     const NAME: &'static str = "CourseOpened";
@@ -85,6 +86,7 @@ pub struct StudentEnrolledPayload {
 
 pub struct StudentEnrolled;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl EventType for StudentEnrolled {
     type Payload = StudentEnrolledPayload;
     const NAME: &'static str = "StudentEnrolled";
@@ -105,6 +107,7 @@ pub struct StudentUnenrolledPayload {
 
 pub struct StudentUnenrolled;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl EventType for StudentUnenrolled {
     type Payload = StudentUnenrolledPayload;
     const NAME: &'static str = "StudentUnenrolled";
@@ -204,6 +207,7 @@ pub struct OpenCoursePayload {
 
 pub struct OpenCourse;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl CommandType for OpenCourse {
     type Payload = OpenCoursePayload;
     type Event = CoursesEvent;
@@ -247,6 +251,7 @@ pub struct EnrollStudentInCoursePayload {
 
 pub struct EnrollStudentInCourse;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl CommandType for EnrollStudentInCourse {
     type Payload = EnrollStudentInCoursePayload;
     type Event = CoursesEvent;
@@ -320,6 +325,7 @@ pub struct DropCoursePayload {
 
 pub struct DropCourse;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl CommandType for DropCourse {
     type Payload = DropCoursePayload;
     type Event = CoursesEvent;
@@ -364,6 +370,7 @@ pub struct CourseRosterState {
 /// Keyed by `course_id`.
 pub struct CourseRoster;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl Projection for CourseRoster {
     type State = CourseRosterState;
     type Event = CoursesEvent;
@@ -402,6 +409,7 @@ pub struct StudentScheduleState {
 /// Keyed by `student_id`.
 pub struct StudentSchedule;
 
+#[auto_register(BOUNDED_CONTEXT)]
 impl Projection for StudentSchedule {
     type State = StudentScheduleState;
     type Event = CoursesEvent;
@@ -426,20 +434,4 @@ impl Projection for StudentSchedule {
             CoursesEvent::StudentUnenrolled(p) => state.course_ids.retain(|c| c != &p.course_id),
         }
     }
-}
-
-/// Registers this bounded context's event/command/projection types onto
-/// `builder`, scoped by `.bounded_context(BOUNDED_CONTEXT)` - see
-/// `lib.rs`'s own `register()`.
-pub fn register(builder: SkiljBuilder) -> SkiljBuilder {
-    builder
-        .bounded_context(BOUNDED_CONTEXT)
-        .event_type::<CourseOpened>()
-        .event_type::<StudentEnrolled>()
-        .event_type::<StudentUnenrolled>()
-        .command_type::<OpenCourse>()
-        .command_type::<EnrollStudentInCourse>()
-        .command_type::<DropCourse>()
-        .projection::<CourseRoster>()
-        .projection::<StudentSchedule>()
 }

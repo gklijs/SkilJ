@@ -24,8 +24,12 @@
 //!   emit atomic with no saga at all. `skilj-demo/tests/courses.rs`
 //!   proves this under real concurrency, not just logically.
 //!
-//! Both modules expose a `register(builder) -> builder` that chains their
-//! own `.bounded_context(...)` onto a `skilj::SkiljBuilder` - see
+//! Every event/command/projection type in both modules is
+//! `#[skilj::auto_register(BOUNDED_CONTEXT)]`-tagged (docs/architecture.md
+//! §1.3.3), scoped to its own bounded context by that one macro argument -
+//! each module declares its own `pub const BOUNDED_CONTEXT` exactly once,
+//! at the top of the file, and the argument just points back at it; no
+//! per-type `const BOUNDED_CONTEXT = ...` override anywhere - see
 //! [`register`] below, `src/bin/server.rs` (a real runnable server), and
 //! `tests/banking.rs`/`tests/courses.rs` (the integration-test suite that
 //! doubles as this crate's own proof it behaves as documented).
@@ -33,10 +37,12 @@
 pub mod banking;
 pub mod courses;
 
-/// Registers both bounded contexts onto `builder`, in one place, so the
-/// runnable server and the test suite can't drift from each other on
-/// what gets registered - see each module's own `register()` for the
-/// per-context detail.
+/// Registers both bounded contexts onto `builder` in one call - every
+/// `#[auto_register]`-tagged type in this crate finds its own bounded
+/// context via its own `BOUNDED_CONTEXT` override, so there's nothing
+/// left for this function to do per-module the way it used to (chaining
+/// `banking::register`/`courses::register`, each scoping the builder by
+/// hand via `.bounded_context(...)`).
 pub fn register(builder: skilj::SkiljBuilder) -> skilj::SkiljBuilder {
-    courses::register(banking::register(builder))
+    builder.auto_register()
 }

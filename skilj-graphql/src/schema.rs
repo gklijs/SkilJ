@@ -148,6 +148,14 @@ pub async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
         builder = builder.register(union);
     }
 
+    // Wraps every resolved field, across all 17 resolver modules, in a
+    // `tracing` span - the `tracing`-backed extension, deliberately not
+    // `async_graphql::extensions::OpenTelemetry` (which talks to the OTel
+    // SDK directly), so this crate stays on the same "emit via `tracing`
+    // only" boundary every other library crate here keeps. See
+    // docs/architecture.md's tracing section.
+    builder = builder.extension(async_graphql::extensions::Tracing);
+
     Ok(builder.data(state).finish().expect(
         "every type registered above this point is fixed at compile time; every one \
          registered from projection_types is named via projection_types::graphql_type_name, \

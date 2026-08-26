@@ -14,6 +14,15 @@ use serde::{de::DeserializeOwned, Serialize};
 /// requires_role}`, not a direct dependency on `skilj-macros` itself.
 pub use skilj_macros::requires_role;
 
+/// The fallback every plugin trait's `BOUNDED_CONTEXT` associated const
+/// carries - see that const's own doc comment on `EventType`/
+/// `CommandType`/`Projection`. Also what `skilj::SkiljBuilder::builder()`
+/// seeds `current_bounded_context` with, so a single-bounded-context app
+/// never has to call `.bounded_context(...)` at all: every `.event_type::<T>()`/
+/// `.command_type::<T>()`/`.projection::<T>()` call registers under this
+/// name until something changes it.
+pub const DEFAULT_BOUNDED_CONTEXT: &str = "default";
+
 /// Bridges a raw, type-erased `event_store::Event` into the
 /// strongly-typed, hand-written per-bounded-context event enum
 /// `decide()`/`project()` pattern-match over (§1.4's `BankingEvent`, say),
@@ -70,6 +79,21 @@ pub trait CommandType {
 
     const NAME: &'static str;
 
+    /// Which bounded context `skilj::SkiljBuilder::auto_register()`
+    /// registers this command type under - see `skilj_macros::auto_register`'s
+    /// own doc comment for the `#[auto_register]` attribute that reads
+    /// this. Irrelevant to manual `.bounded_context(name).command_type::<T>()`
+    /// chaining, which ignores this const entirely and keeps working
+    /// exactly as before.
+    ///
+    /// Defaults to `DEFAULT_BOUNDED_CONTEXT` ("default"), so a
+    /// single-bounded-context app never has to override this at all. A
+    /// multi-context app points it at its own module-level
+    /// `BOUNDED_CONTEXT` const (the same one `skilj-demo`'s `banking`/
+    /// `courses` modules already declare), e.g.
+    /// `const BOUNDED_CONTEXT: &'static str = BOUNDED_CONTEXT;`.
+    const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT;
+
     fn tag_mappings() -> Vec<TagMapping> {
         Vec::new()
     }
@@ -115,6 +139,11 @@ pub trait EventType {
     type Payload: Serialize + DeserializeOwned + JsonSchema;
 
     const NAME: &'static str;
+
+    /// See `CommandType::BOUNDED_CONTEXT`'s own doc comment - identical
+    /// role and default here, for `skilj::SkiljBuilder::auto_register()`'s
+    /// `EventType` side.
+    const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT;
 
     fn tag_mappings() -> Vec<TagMapping> {
         Vec::new()
@@ -216,6 +245,11 @@ pub trait Projection {
     type Event: BoundedContextEvent;
 
     const NAME: &'static str;
+
+    /// See `CommandType::BOUNDED_CONTEXT`'s own doc comment - identical
+    /// role and default here, for `skilj::SkiljBuilder::auto_register()`'s
+    /// `Projection` side.
+    const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT;
 
     /// The `EventType::NAME`s this projection actually folds - `RegisterProjection`'s
     /// own `consumed_event_types`. No default: unlike `tag_mappings()`/

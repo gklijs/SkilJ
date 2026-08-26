@@ -10,15 +10,26 @@ description = "SkilJ: a Rust library for building event-sourced, DDD-style appli
 skilj-core.workspace = true
 skilj-graphql.workspace = true
 skilj-rest.workspace = true
+skilj-macros.workspace = true
 tokio.workspace = true
 axum.workspace = true
 chrono.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
+# `SkiljBuilder::auto_register()`'s own collection mechanism - see
+# `skilj_macros::auto_register`'s doc comment. Re-exported (`pub use
+# inventory;` in src/lib.rs) so a consuming crate's `#[auto_register]`
+# expansion resolves `::skilj::inventory::submit!` off its existing
+# `skilj` dependency alone, without adding this crate directly.
+inventory = "0.3"
+tracing.workspace = true
+opentelemetry.workspace = true
 
 [dev-dependencies]
 postgresql_embedded = "0.21.0"
 serde.workspace = true
+tracing-subscriber.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken.workspace = true

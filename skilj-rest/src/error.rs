@@ -20,6 +20,28 @@ use skilj_core::Error as CoreError;
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+    /// The current request's OTel trace id, hex-encoded, for a caller to
+    /// quote back when escalating - `None` when no real
+    /// `tracing-opentelemetry` layer is installed (this crate used
+    /// standalone, or `skilj-demo` run without
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` set), in which case there's no real
+    /// trace to point at. `#[serde(skip_serializing_if)]` rather than
+    /// always emitting `"trace_id":null` - the field simply isn't there
+    /// when it isn't meaningful.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+}
+
+/// See `skilj-graphql::error`'s identical copy for the full reasoning -
+/// duplicated rather than shared, same as `trace_request`, since there's
+/// no crate both `skilj-rest` and `skilj-graphql` already depend on that
+/// this small a helper would justify adding.
+fn current_trace_id() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let trace_id = tracing::Span::current().context().span().span_context().trace_id();
+    (trace_id != opentelemetry::trace::TraceId::INVALID).then(|| trace_id.to_string())
 }
 
 /// A REST-facing error: either a `skilj_core::Error` on its way through
@@ -179,6 +201,14 @@ impl IntoResponse for RestError {
                 "this CommandType has no decide() registered in the running process".to_string(),
             ),
         };
-        (status, Json(ErrorBody { code, message })).into_response()
+        (
+            status,
+            Json(ErrorBody {
+                code,
+                message,
+                trace_id: current_trace_id(),
+            }),
+        )
+            .into_response()
     }
 }

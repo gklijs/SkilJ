@@ -405,6 +405,7 @@ impl JwksCache {
         Ok(self.keys.read().await.get(kid).cloned())
     }
 
+    #[tracing::instrument(skip_all, fields(jwks_endpoint = %self.jwks_endpoint))]
     async fn refetch(&self) -> crate::error::Result<()> {
         let jwks: jsonwebtoken::jwk::JwkSet = self
             .client
