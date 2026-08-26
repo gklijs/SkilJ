@@ -23,6 +23,10 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-appender-tracing.workspace = true
+# Only for `server.rs`'s own local JWKS/IdP shortcut - signs a demo JWT
+# with a fixed test keypair so `cargo run` has *some* GraphQL-usable
+# Role credential out of the box. See that file's own doc comment.
+jsonwebtoken.workspace = true
 
 [dev-dependencies]
 postgresql_embedded = "0.21.0"

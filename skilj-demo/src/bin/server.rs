@@ -39,14 +39,126 @@
 //! everything past that - creating bounded contexts, granting access -
 //! happens over the GraphQL admin console (docs/architecture.md §6,
 //! `entity AccessManagement`).
+//!
+//! **Also a real `identity_provider`, for the same shortcut reason.**
+//! GraphQL's Role-based auth (`skilj-graphql::auth::verify_jwt_to_role`)
+//! always requires a JWT verified against a configured IdP - there is no
+//! bypass, by design (`entity AccessManagement`'s whole point is that
+//! SkilJ never authenticates callers itself). Without one, nothing could
+//! ever call GraphQL as the seeded admin `Role` above - only the REST
+//! `CommandToken`s below would work. `serve_local_jwks`/`sign_jwt` spin
+//! up a tiny local JWKS endpoint signing with a fixed, publicly-known
+//! test RSA keypair (the same one `skilj/tests/graphql_admin_console.rs`
+//! already uses) - never a real secret, since this only ever answers
+//! requests from this same process's own loopback interface. A real
+//! deployment points `.identity_provider(...)` at its own actual IdP
+//! instead; this is `cargo run`'s own "so there's something to try
+//! GraphQL with at all" shortcut, printed alongside the command tokens
+//! below.
 
 use chrono::Utc;
-use skilj::Skilj;
+use jsonwebtoken::{EncodingKey, Header};
+use serde_json::json;
+use skilj::{IdpConfig, Skilj, SigningAlgorithm};
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
 use skilj_core::shared::{generate_token_id, generate_token_secret};
+
+// --- local JWKS/IdP shortcut - see this file's own doc comment above ---
+//
+// The exact same fixed test RSA keypair `skilj/tests/graphql_admin_console.rs`
+// and `skilj-core/tests/jwt_verification.rs` already use - never a real
+// secret (see the doc comment above), so reusing it here rather than
+// generating a fresh one is simpler with no downside.
+
+const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDPHVFsUHiWXSbG
+/TCig1cTQHNT6FnoYoZtMEjvDiQArsOL/dFoM9pmGRM9CfEtQGNum4TsimPtgJec
+awfdPnW0uJCRlIF9wGmYdh2mYNBKw8jqxwp664Gd5uqH5L6A4pN8bfGO7+2niD6p
+8t0cNeyYOd0PusbAEDcpzCUZmr6KQyM5i8/wk5oO98gntp+ZpMjUZabAD6R8DyhM
+IZmV645jo5NPJG7zuSz+3dmKkNY0/GXz8YwvZ2swqmmOANRZHHfN1vgP2ycK02WZ
+4yihx6EiuQCDseddBw+xit9KSvSq6GwmwnV1qVpMVNlSGGOeVX7v7JQ3z/BNbQ85
+5p6s/FjhAgMBAAECggEAFu8fKghLIhNUjOpSbVxv0vDrFFqBQitOyV50ZQxCzlSL
+0L+dZZWAVJfoOnUUYLdli0TrVioI4K7Bmw97AnO9IvLhB03TfPJGfxxtMhQ8XFsL
+r3u03GGhq7N7OusIcUslm7ys5/AHd+qtTbJX65zJAx49LVW4VmI1SYqSfSBWgway
+8uGYaXyCfwuxQ+xB4fQd6llm/+9dqS+U36LVSMWgEmVjceorYFhPVLfuX4A1wHjF
+mDl40AwPBqzVbOIzFDMDikk4heFi6wlt6N3LGDtyBUUuzEg5TBhyiirvNvTjW+4V
+Z4MZs3tez+IqM0+F4EsgAEQUU12YQxa4lobm8/zgZQKBgQD81FMzymNR6xWhUSwY
+4RtkVntfMBOMp1rVGcVyBxOLKxEXF6ctk2rV38krfUI50h/lWzrbpl+zJvEe8D1H
+vZjYj28sL3wf0CSnPYUeGANTxrW1dTiz1HVzzChfbAEWj3fsVrlghNcnHBkDDhqz
+L/rPEfp//fB0SyLAEAJt87cgFwKBgQDRtjtH1gIkGn5GCS3u0FAbxV+qrUlTvu4t
+Di1GcEw32jootQQSMZN1PxEvLuehaBlaASEL2OZzZlQ4q60LV1Jisvd7wqv5EYnG
+o+sKtrCS5iXKfkxqTmg+JS7OZazggyvgBnv4GXT0US6/G4nw7C9JaS2jyOvPGIPS
+K8dsWDIxxwKBgQCgr4FBxTticPqKUECqf0cdeilm0fNazXJZRcvLMNwm8vQlrQ6/
+VJXt4BDG5xEUFovXBShfOVpRTkqo0x7fXYyq9l49wuAsh+kDsYHNIo3azMvny9yB
+zmHnerWeD9KROBWLy4J96W+kl6L94hTuFWxd9psyhX4xKx+m2YXxw5d7eQKBgFB2
+I86PHOkvRQ2oDfiX8nSFSQxaSk0Yb5fX3aUuBwBS+YeO1E4KuXH9zaEV1QeHwlpX
+Ho/GG71hIKVRsSYtzc1Sr0PL0GHSydLuJ4tHxv3F0fAcf0M2bCaT656DQk4t5dKh
+ikUJt2baEx59+XH3nLkE4t75gwhFdqZX5775I+EXAoGAfnpHlLZdGW48rl9Cl887
+hRDjXDm/gP/ljCrvxxiWselEgaLj2o4NiT28QAfq7KgtOIpAeLAGzIBP6vkE7KFp
+nAF+t4gRpooXXSI5oXCBcGI9a26q68UV3iDEmQGiP8kVHOsdzcOKY0qk1ulNAIV4
+fU919gnTKorSq3FdV6zGZ8s=
+-----END PRIVATE KEY-----
+";
+const TEST_MODULUS_N: &str = "zx1RbFB4ll0mxv0wooNXE0BzU-hZ6GKGbTBI7w4kAK7Di_3RaDPaZhkTPQnxLUBjbpuE7Ipj7YCXnGsH3T51tLiQkZSBfcBpmHYdpmDQSsPI6scKeuuBnebqh-S-gOKTfG3xju_tp4g-qfLdHDXsmDndD7rGwBA3KcwlGZq-ikMjOYvP8JOaDvfIJ7afmaTI1GWmwA-kfA8oTCGZleuOY6OTTyRu87ks_t3ZipDWNPxl8_GML2drMKppjgDUWRx3zdb4D9snCtNlmeMoocehIrkAg7HnXQcPsYrfSkr0quhsJsJ1dalaTFTZUhhjnlV-7-yUN8_wTW0POeaerPxY4Q";
+const TEST_EXPONENT_E: &str = "AQAB";
+const TEST_KID: &str = "test-key-1";
+const TEST_ISSUER: &str = "https://idp.example.test/";
+
+/// Spins up a tiny local JWKS-serving `axum` server on an ephemeral
+/// loopback port, detached for the process's lifetime (same "runs
+/// forever, no shutdown API this pass" treatment `skilj`'s own
+/// background tasks get) - returns its `/jwks.json` URL, ready to hand
+/// to `IdpConfig::new`.
+async fn serve_local_jwks() -> String {
+    let jwks = json!({
+        "keys": [{
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": TEST_KID,
+            "n": TEST_MODULUS_N,
+            "e": TEST_EXPONENT_E,
+        }]
+    });
+    let app = axum::Router::new().route(
+        "/jwks.json",
+        axum::routing::get(move || {
+            let jwks = jwks.clone();
+            async move { axum::Json(jwks) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind an ephemeral port for the local JWKS server");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener always has a local address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("the local JWKS server stopped unexpectedly");
+    });
+    format!("http://{addr}/jwks.json")
+}
+
+/// Signs a JWT for `subject`, with the matching private half of
+/// `serve_local_jwks`'s own keypair - stands in for whatever a real
+/// external IdP's own login flow would hand back.
+fn sign_jwt(subject: &str) -> String {
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some(TEST_KID.to_string());
+    let claims = json!({
+        "sub": subject,
+        "iss": TEST_ISSUER,
+        "exp": (Utc::now() + chrono::Duration::hours(1)).timestamp(),
+    });
+    let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
+        .expect("the test private key PEM is well-formed");
+    jsonwebtoken::encode(&header, &claims, &key).expect("signing a well-formed JWT never fails")
+}
 
 /// `(bounded_context, command_type_name)` for every command this demo
 /// wants a REST `CommandToken` printed for - kept as one list so main()
@@ -305,8 +417,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mappings.push(mapping);
     }
 
+    let jwks_url = serve_local_jwks().await;
     let (skilj, report) = skilj_demo::register(Skilj::builder(database_url))
         .reconciliation_role(external_subject)
+        .identity_provider(IdpConfig::new(
+            jwks_url.parse().expect("serve_local_jwks's own URL is always well-formed"),
+            TEST_ISSUER,
+            SigningAlgorithm::Rs256,
+        ))
         .build()
         .await?;
     tracing::info!(registered = ?report.registered, "reconciliation complete");
@@ -316,6 +434,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "reconciliation: skipped, no access yet"
         );
     }
+
+    println!(
+        "\nGraphQL Role credential (send as `authorization: Bearer <jwt>`, or in a \
+         graphql-transport-ws `connection_init` payload the same way):"
+    );
+    println!("  {}", sign_jwt(&role.external_subject));
 
     println!("\ncommand tokens (send as `authorization: Bearer <id>.<secret>`):");
     for (bounded_context, command_type_name) in COMMAND_TYPES {

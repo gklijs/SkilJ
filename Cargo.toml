@@ -7,6 +7,7 @@ members = [
     "skilj-rest",
     "skilj",
     "skilj-demo",
+    "skilj-tui",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -21,6 +22,10 @@ members = [
 #                 (see skilj-demo/src/lib.rs), runnable as a real server and
 #                 exercised as an integration-test suite against a real
 #                 Postgres - not part of the library itself.
+# skilj-tui     - a Ratatui operator console: a GraphQL *client*, zero
+#                 dependency on any other skilj crate (§11) - speaks the
+#                 wire protocol only, the same "independently usable"
+#                 spirit §3.1 gives the surface crates, from the other side.
 
 [workspace.package]
 version = "0.1.0"
@@ -55,6 +60,12 @@ asynk-strim = "0.1"
 syn = "2"
 quote = "1"
 proc-macro2 = "1"
+# skilj-tui only
+ratatui = "0.30"
+crossterm = "0.29"
+clap = { version = "4", features = ["derive", "env"] }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 # Tracing: library crates (skilj-core/skilj-rest/skilj-graphql/skilj)
 # only ever emit `tracing` spans/events and depend on the lightweight
 # `opentelemetry`/`opentelemetry-http`/`tracing-opentelemetry` *bridge*

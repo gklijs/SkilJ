@@ -2478,3 +2478,111 @@ out explicitly) - the common case for either crate used standalone, or
 `skilj-demo` run without `OTEL_EXPORTER_OTLP_ENDPOINT` set. Same small
 `current_trace_id()` helper duplicated in both crates, matching
 `trace_request`'s own precedent for why.
+
+## 11. `skilj-tui` - a Ratatui operator console
+
+A sixth workspace member, added later: an interactive console for
+browsing events, submitting commands, and inspecting projections against
+a running `skilj` deployment - the one thing this project had no UI for
+at all before this.
+
+**Ratatui, not a web/native GUI.** Matches the project's single-language,
+minimal-dependency ethos (the same reasoning that picked OTLP/HTTP over
+gRPC to avoid a second RPC stack), and the actual use case - an
+operator/debugging console, not a consumer-facing app - is exactly what
+tools like `k9s`/`lazydocker` already prove this shape suits.
+
+**GraphQL, not REST.** `skilj-rest`'s own doc comment already settles
+this: REST is "for narrowly-scoped `AccessToken`-holding callers... never
+for general application access, which is what `skilj-graphql` is for"
+(§7.1). GraphQL also already has a working `EventSubscription` over
+`graphql-transport-ws` - REST's own event access is poll-only.
+
+**`skilj-tui` depends on no other `skilj-*` crate.** It only ever speaks
+the wire protocol - the same "independently usable" spirit §3.1 gives
+`skilj-graphql`/`skilj-rest`, from the client side this time. It never
+talks to an IdP itself either: endpoint, bearer token, and bounded
+context are all supplied up front (flag or env var -
+`SKILJ_GRAPHQL_URL`/`SKILJ_TOKEN`/`SKILJ_BOUNDED_CONTEXT`), the same
+credential presented however `curl -H 'authorization: Bearer <jwt>'`
+already would be. Two real gaps this surfaced, both closed rather than
+silently worked around:
+
+- `skilj-graphql::auth::verify_jwt_to_role` always requires a JWT
+  verified against a configured IdP - no bypass - and `skilj-demo`'s
+  server never called `.identity_provider(...)`, so **GraphQL Role-based
+  auth didn't work against `skilj-demo` at all** before this pass (only
+  REST's `CommandToken` flow did). Fixed in `skilj-demo/src/bin/server.rs`:
+  `serve_local_jwks`/`sign_jwt` spin up a tiny local JWKS endpoint
+  signing with the same fixed, publicly-known test RSA keypair
+  `skilj/tests/graphql_admin_console.rs` already uses (never a real
+  secret - loopback-only), and the seeded admin `Role` now gets a real
+  signed JWT printed alongside the REST command tokens already printed.
+  Verified against a real Postgres, not just built: `skilj-demo/tests/graphql_auth.rs`
+  proves the local JWKS server + signed JWT actually authenticates a real
+  `queryEvents` GraphQL call end to end.
+- `queryEvents`/`fetchCommands`/`submitCommand`/`projection` are all
+  `AdminAccess`-gated, which the *same* Admin-level `RoleAccessMapping`
+  `skilj-demo`'s server already creates covers - only `boundedContexts`
+  (the cross-context directory) needs superadmin. So v1 skips that
+  directory browse entirely: the operator names the bounded context they
+  want (a flag), the same way they already have to know it to use a REST
+  command token today - no superadmin credential needed anywhere.
+
+**`projection(...): ProjectionResult!` is a GraphQL union** - one
+concrete member type per registered projection, generated at runtime
+from that projection's own JSON Schema (`skilj-graphql::projection_types::build`).
+There is no generic `{ state: String }` shape to ask for, and this crate
+has no prior knowledge of any bounded context's schema to hand-write a
+selection set against. `src/projection_query.rs` resolves this with two
+round trips, driven entirely by the wire protocol itself - never by
+replicating the server's own internal type-naming scheme
+(`graphql_type_name`'s `"{bc}_{projection}"` format is an implementation
+detail, not part of the wire contract): first ask for just `__typename`
+(the server always answers with which concrete union member a given
+result actually is), then introspect *that* type's own fields
+(`__type(name: ...)`) and build a selection set from them - recursing one
+level into any nested `OBJECT` field, capped so a pathological or
+self-referential shape can't recurse forever - then re-run the query for
+real with that selection set. Verified against both a local mock server
+(`tests/projection_query.rs`, including the one-level-of-nesting case)
+and a real running `skilj-demo` server by hand (confirming the exact
+hand-written query strings this module and `app.rs` use match the real
+schema - `queryEvents`'s and `submitCommand`'s own field/argument names
+included, and catching one real mismatch this way: `allEvents`'s
+`QueriedEvent` has no `eventType` field, only `sequence`/`payload` - the
+schema-builder source alone didn't make that obvious).
+
+**No schema-driven command/event forms in v1** - there is no GraphQL
+query today that lists registered command/event types with their JSON
+Schema (only `projections`/`scheduledEventTypes` are listable that way).
+Raw JSON payload entry instead (the Commands tab), the same "don't build
+ahead of what's wired" discipline `SubjectErasure` followed earlier - a
+real, useful follow-up once such a query surface exists, not a silently
+missing feature.
+
+**Structure**: `src/graphql.rs` (the client - `Client::request` for
+queries/mutations, `spawn_subscription` for the `graphql-transport-ws`
+protocol, adapted from the test-only client fixture already proven in
+`skilj/tests/event_subscription.rs` into something this crate depends on
+for real), `src/app.rs` (state + update logic - one `mpsc::channel<AppEvent>`
+fed by the terminal-input reader thread, the Live Events subscription
+task, and whichever ad hoc query/mutation task the user most recently
+triggered), `src/ui.rs` (rendering, reads `App`, never mutates it),
+`src/cli.rs` (the `clap`-derived config). Split into `src/lib.rs` +
+`src/main.rs` (unusual for a `[[bin]]`-only crate) purely so
+`tests/*.rs` can exercise `graphql`/`projection_query` directly - a
+binary target alone has nothing integration tests can import.
+
+**GraphQL responses are handled as raw `serde_json::Value`, indexed
+dynamically** - not a codegen client (`graphql_client`/`cynic`), since
+the schema is dynamic and grows per bounded context, so there's no fixed
+schema file to codegen a typed client against. The same style every test
+in the rest of this workspace already uses for GraphQL responses.
+
+**Deliberately deferred past v1, named rather than silently skipped**:
+schema-driven command/event forms (above); the superadmin bounded-context
+directory browse and any admin-console operations (role/access
+management, type registration) - a distinct `AdminAccess`-vs-`Superadmin`
+concern from the "operate one bounded context" core this v1 targets; an
+in-app IdP login flow (v1 only ever takes a bearer token as config).
