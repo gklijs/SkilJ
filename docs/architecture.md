@@ -2194,6 +2194,38 @@ anywhere today.
 remains the right tool once code lands that a surface's obligations
 haven't been checked against yet.
 
+## 10. Dynamic Consistency Boundary (DCB) alignment
+
+skilj's own consistency mechanism - `Tag`s on events, a command's
+`consistency_tags` deriving a `consistency_boundary` and
+`matching_events` set that `decide()` is evaluated against (§1) - is,
+structurally, an implementation of the **Dynamic Consistency Boundary
+(DCB)** pattern: a named, actively-discussed approach in the event-
+sourcing community, introduced by Sara Pellegrini, with a dedicated
+site, specification, and community at [dcb.events](https://dcb.events/).
+Worth saying explicitly, for a reader who already knows DCB from
+elsewhere - not a rename of anything here, and not a claim of wire/API
+compatibility. The DCB [specification](https://dcb.events/specification/)
+itself is deliberately language/implementation-agnostic
+("implementations are not required to use the same terms or
+function/field names — as long as they offer equivalent functionality"),
+so what follows is a mapping, not a migration:
+
+| DCB term (from the [spec](https://dcb.events/specification/)) | skilj's own term | Note |
+|---|---|---|
+| `Event { type, data, tags }` | `Event { event_type, payload, tags: Vec<Tag> }` | DCB's `tags` are opaque strings (conventionally `"key:value"`); skilj's `Tag { key, value: Option<String> }` (`skilj-core/src/shared/mod.rs`) is structured, not opaque - same purpose, different representation |
+| `Query { items: [{ types?, tags? }] }` | `consistency_tags` (derived per command/event via `TagMapping`/`derive_tags`) | skilj never builds an explicit `Query` object; the equivalent selection is computed directly from the payload's own tag mappings |
+| `read(query) -> SequencedEvents` | `consistency_boundary_and_matching_events(bounded_context_events, consistency_tags) -> (Option<i64>, Vec<Event>)` (`skilj-core/src/event_store/mod.rs`) | Same "read the relevant slice before deciding" ordering DCB requires; skilj computes the boundary (highest matching sequence) in the same pass |
+| `append(events, condition?)`, `AppendCondition { failIfEventsMatch, after }` | the DCB-conflict recheck inside `db::submit_command` (re-run the read under `next_sequence`'s own row lock, redispatch `decide()` on change) | Mechanistically different: DCB's own model is one declarative condition passed to a single atomic append; skilj gets the identical guarantee via a Postgres row lock plus optimistic-read-then-locked-recheck-and-retry instead of a condition object |
+| the "decision model" (an app-level concept the spec deliberately leaves out of scope) | `CommandType::decide()` | Named independently in skilj's own Allium spec, not borrowed from DCB - same role the DCB examples describe |
+
+Two other Rust event stores - Tephra and Disintegrate - already appear
+in DCB's own [implementation list](https://dcb.events/resources/libraries/)
+- worth knowing about as neighbors, not a comparison to relitigate here.
+Whether to list skilj there too is tracked separately in
+`docs/open-source-todo.md`, gated on this repository actually being
+public - a link to a private repo serves no one who'd read that list.
+
 ## 10. OpenTelemetry tracing, logging, and metrics
 
 Added in a later pass: real distributed tracing across the HTTP surfaces,
