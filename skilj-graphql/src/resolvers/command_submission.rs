@@ -151,6 +151,7 @@ pub fn submit_command_field() -> Field {
                     &authorised.client_id,
                     &bounded_context_events,
                     &consistency_tags,
+                    &matching_events,
                     decision,
                     state.encryption_master_key.as_ref(),
                     Utc::now(),
@@ -164,12 +165,19 @@ pub fn submit_command_field() -> Field {
                     // decision or a DCB-conflict retry inside
                     // submit_command, a rejection renders identically
                     // either way.
-                    skilj_core::db::SubmitCommandOutcome::Rejected { reason, kind } => {
+                    skilj_core::db::SubmitCommandOutcome::Rejected { reason, kind, matching_events } => {
                         SubmitCommandResult {
                             accepted: false,
                             triggered_event_sequences: None,
                             rejection_reason: Some(reason),
                             rejection_kind: Some(kind),
+                            // Codeberg issue #7's DCB conflict visualizer -
+                            // Some even when empty (a rejection whose
+                            // decider didn't reject *because* of a
+                            // conflict still had a real, if empty, set to
+                            // decide from) - None is reserved for
+                            // "accepted, not applicable" below.
+                            matching_events: Some(matching_events),
                         }
                     }
                     skilj_core::db::SubmitCommandOutcome::Accepted { events, .. } => {
@@ -180,6 +188,7 @@ pub fn submit_command_field() -> Field {
                             ),
                             rejection_reason: None,
                             rejection_kind: None,
+                            matching_events: None,
                         }
                     }
                 })))

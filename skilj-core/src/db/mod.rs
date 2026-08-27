@@ -3653,6 +3653,15 @@ pub enum SubmitCommandOutcome {
     Rejected {
         reason: String,
         kind: String,
+        // Codeberg issue #7's DCB conflict visualizer: the tag-scoped
+        // event set `decide()` actually evaluated against for *this*
+        // rejection - the caller-supplied `matching_events` parameter
+        // below for an ordinary rejection, or the freshly-recomputed
+        // set from this function's own DCB-conflict redispatch branch
+        // if that's what produced it (never the caller's now-stale
+        // pre-lock one in that case) - see this function's own doc
+        // comment.
+        matching_events: Vec<Event>,
     },
 }
 
@@ -3714,6 +3723,7 @@ pub async fn submit_command(
     client_id: &str,
     bounded_context_events: &[Event],
     consistency_tags: &[Tag],
+    matching_events: &[Event],
     initial_decision: crate::shared::CommandDecision,
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
@@ -3735,6 +3745,12 @@ pub async fn submit_command(
 
     let mut final_decision = initial_decision;
     let mut final_bounded_context_events = bounded_context_events.to_vec();
+    // Codeberg issue #7: starts as the caller's own pre-lock set,
+    // overwritten below only if a DCB conflict forced a redispatch -
+    // whichever one actually produced `final_decision` is the one a
+    // rejection reports (see `SubmitCommandOutcome::Rejected`'s own doc
+    // comment).
+    let mut final_matching_events = matching_events.to_vec();
 
     if locked_highest > original_highest {
         // Something committed between the caller's own optimistic read
@@ -3751,7 +3767,7 @@ pub async fn submit_command(
         if conflict {
             final_bounded_context_events.extend(delta);
             final_bounded_context_events.sort_by_key(|e| e.sequence);
-            let (_boundary, matching_events) =
+            let (_boundary, redispatch_matching_events) =
                 crate::event_store::consistency_boundary_and_matching_events(
                     &final_bounded_context_events,
                     consistency_tags,
@@ -3760,12 +3776,13 @@ pub async fn submit_command(
                 &bounded_context_name,
                 &command_type.name,
                 payload,
-                &matching_events,
+                &redispatch_matching_events,
             ) {
                 None => return Err(crate::error::Error::NoDeciderRegistered),
                 Some(Err(e)) => return Err(e),
                 Some(Ok(d)) => d,
             };
+            final_matching_events = redispatch_matching_events;
         }
     }
 
@@ -3779,7 +3796,11 @@ pub async fn submit_command(
                     KeyValue::new("outcome", "rejected"),
                 ],
             );
-            return Ok(SubmitCommandOutcome::Rejected { reason, kind });
+            return Ok(SubmitCommandOutcome::Rejected {
+                reason,
+                kind,
+                matching_events: final_matching_events,
+            });
         }
         crate::shared::CommandDecision::Accepted { events } => events,
     };

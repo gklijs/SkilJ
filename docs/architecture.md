@@ -2892,3 +2892,116 @@ what comes back; and a genuine interactive run in a real `tmux` pty
 bounded context, cycled through all five tabs, confirmed the sensitive
 field rendered as ciphertext on screen (not just in the test assertion),
 and quit cleanly with `q`.
+
+## 15. `skilj-tui` debugging enhancements (Codeberg issue #7)
+
+Four independently shippable additions to §11's console, picked up right
+after §13 landed (one of them was blocked on it). **One correction to
+the issue's own framing, found while implementing, not assumed**: it
+describes all four as "no architectural change" - true for three of
+them, but the DCB conflict visualizer needed a real, small three-crate
+change (`skilj-core`/`skilj-graphql`/the spec), not just a `skilj-tui`
+client change - see its own write-up below for why.
+
+**DCB conflict visualizer.** `command_submission.rs`'s resolver already
+computed `matching_events` (`event_store::consistency_boundary_and_matching_events`)
+to make the dispatch decision, but discarded it -
+`SubmitCommandOutcome::Rejected` carried only `{ reason, kind }`.
+`submit_command` (`skilj-core/src/db/mod.rs`) gained one new parameter,
+`matching_events: &[Event]` - both real call sites already computed this
+value immediately before calling it, so this is threading an
+already-computed value through, not new computation. Tracked internally
+as `final_matching_events`, overwritten by the freshly-recomputed set
+inside the function's own DCB-conflict redispatch branch, so a rejection
+born from a conflict-triggered redispatch reports the *final* matching
+set that actually governed it, never the caller's now-stale pre-lock
+one - covered by extending the existing
+`submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict` test
+(`skilj-core/tests/submit_command.rs`) with exactly that assertion.
+`skilj-graphql` gained a new `MatchingEvent` object
+(`sequence`/`eventTypeName`/`payload` - deliberately narrower than
+`Event` itself, enough to debug a conflict without inventing a bigger
+wire type) and `SubmitCommandResult.matchingEvents: Option<Vec<Event>>` -
+`Some` only on rejection, mirroring `rejectionReason`/`rejectionKind`'s
+own existing "only populated on the relevant outcome" convention.
+`skilj-rest`'s own response shape stays unchanged - out of scope per
+§7.1, the new parameter just gets computed and dropped there.
+`specs/skilj.allium`'s `CommandSubmission` surface gained a `@guidance`
+paragraph (not a fabricated `exposes:` entry - `matching_events` is a
+rule-local computed value, not a stored entity field, so `@guidance` is
+the honest construct here) recording that a rejection now surfaces the
+same `matching_events` `rule ProcessCommand` already defines, scoped to
+rejection only, GraphQL-only. Verified against a real running
+`skilj-demo` server, not just the unit-level assertion: deposited into
+account "a1", then attempted an overdraft withdrawal - the real
+rejection's `matchingEvents` showed the exact `MoneyDeposited` event
+`decide()` actually saw.
+
+**Time-travel projection viewer.** `projection_query::fetch` gained
+`wait_for_sequence: Option<i64>`, threaded into both its own query
+strings as `waitForSequence: $wait` - `ProjectionQuery`'s own field
+already accepted this server-side, so this is wiring an existing
+capability into the client, genuinely no server change.
+`ProjectionsTab`/`ProjectionField` gained a third, Tab-cycled field,
+parsed as `i64` at submit time (empty = no wait, an unparseable value
+blocks submission with an inline error). **Naming honesty, not the
+issue's own words verbatim**: the field's own UI label reads "at least
+as fresh as sequence N", not "as of sequence N" -
+`waitForSequence` is a freshness guarantee (don't answer before the
+projection has caught up to at least this sequence), not a historical
+snapshot; a projection that has already moved past it returns *current*
+state, not state frozen at that instant.
+
+**Search/filter on the Live Events feed.** A `/`-to-enter-filter-mode
+convention (matching `less`/`vim`'s own well-known search key), not
+always-on free text - Live Events was the one tab where every key fell
+through unhandled before this, and always-on entry would have reopened
+the exact digit-tab-switch conflict this session's own issue #8 pass
+already found and fixed for Commands (a filter like "42" would jump to
+Query Events mid-type). `/` sets `live_events_filter_active`; while
+active, typed characters edit `live_events_filter` and `Enter`/`Esc`
+both exit back to normal browsing (and normal digit-based tab
+switching). Filtering itself is a pure view concern (`ui::draw_live_events`
+substring-matches, case-insensitive, against each event's own compact
+JSON rendering) - no server round trip, `App` keeps every event
+regardless of what's currently filtered.
+
+**Syntax-highlighted JSON rendering.** New `skilj-tui/src/json_style.rs` -
+walks a `serde_json::Value` and produces styled `ratatui::text::Line`s
+(distinct colours for object keys, string/number/bool/null values, and
+punctuation) instead of the previous plain
+`serde_json::to_string_pretty`/`.to_string()`, replacing every one of
+`ui.rs`'s old `pretty`/`pretty_compact` call sites. Leaf tokens
+(strings/numbers/bools/null) are rendered via `serde_json::to_string` on
+that one value - reusing `serde_json`'s own already-correct escaping
+rather than hand-rolling a string-escaper, exactly the kind of thing
+that quietly mis-renders a payload containing a `"` or `\n`. Pure and
+unit-tested (token → style mapping), the same discipline `form.rs`'s own
+schema classifier already holds itself to.
+
+**A real, pre-existing bug this pass's own tests caught, not shipped**:
+the first draft suppressed digit-based tab-switching for the *entire*
+Projections tab (needed once `waitForSequence` made every field there
+inherently digit-capable) with no way back at all - every one of
+Projections' three fields is always focused, unlike Commands' own
+Picking/Form split, so there was no picker sub-state with no free text
+to fall back to. A `slash_enters_filter_mode...` test's own sibling,
+written to check the *equivalent* case for Projections, caught the trap
+before it shipped. Fixed by giving `Esc` a real job on that tab: leave
+it entirely, back to Live Events - the same "Esc backs out of whatever's
+intercepting keys" role it already plays for Commands' form and Live
+Events' filter, just with nowhere shallower to back out *to* on this
+particular tab.
+
+Verified: `skilj-core/tests/submit_command.rs`'s extended assertion,
+`skilj-tui/src/json_style.rs`'s and `skilj-tui/src/form.rs`'s own unit
+tests, `skilj-tui/tests/debugging_enhancements.rs`'s `App`-level tests
+(filter mode, the extended digit fix, `waitForSequence` parsing),
+`skilj-tui/tests/projection_query.rs`'s extended mock-server coverage of
+the `wait` variable, `allium check` clean after the spec edit, and a
+real interactive `tmux` pty run against a live `skilj-demo` server
+(same no-TTY-in-this-sandbox precedent as §14) - a genuine DCB conflict
+triggered and its real matching event shown, the Live Events filter
+shown hiding/showing events live, `waitForSequence: 0` shown returning
+current state rather than hanging, and real ANSI colour codes confirmed
+in the captured pane output (not just present in the test suite).

@@ -149,12 +149,18 @@ pub struct CommandsTab {
 pub enum ProjectionField {
     Name,
     Key,
+    // Codeberg issue #7's time-travel projection viewer -
+    // `projection_query::fetch`'s own `wait_for_sequence` param, see its
+    // doc comment for why this is a freshness guarantee, not a
+    // historical snapshot.
+    WaitForSequence,
 }
 
 pub struct ProjectionsTab {
     pub focus: ProjectionField,
     pub name: TextInput,
     pub key: TextInput,
+    pub wait_for_sequence: TextInput,
     pub result: Option<Value>,
     pub error: Option<String>,
     pub loading: bool,
@@ -168,6 +174,8 @@ pub struct App {
 
     pub live_events: VecDeque<Value>,
     pub live_connected: bool,
+    pub live_events_filter: TextInput,
+    pub live_events_filter_active: bool,
 
     pub query_events: QueryEventsTab,
     pub commands: CommandsTab,
@@ -186,6 +194,8 @@ impl App {
             status: None,
             live_events: VecDeque::new(),
             live_connected: false,
+            live_events_filter: TextInput::default(),
+            live_events_filter_active: false,
             query_events: QueryEventsTab {
                 types: Vec::new(),
                 checked: HashSet::new(),
@@ -208,6 +218,7 @@ impl App {
                 focus: ProjectionField::Name,
                 name: TextInput::default(),
                 key: TextInput::default(),
+                wait_for_sequence: TextInput::default(),
                 result: None,
                 error: None,
                 loading: false,
@@ -306,9 +317,15 @@ impl App {
 
         // Esc backs out of a sub-view first - Commands' generated form,
         // back to its type picker (cheaply, from the list already
-        // fetched, not a refetch) - and only quits the app when there's
-        // no such view to back out of. Ctrl+C above always quits
-        // regardless of what's focused.
+        // fetched, not a refetch), Live Events' own filter-compose mode,
+        // or Projections' own always-focused fields (all three fields
+        // there accept digits now that `WaitForSequence` exists, so
+        // every state on that tab intercepts them - unlike Commands,
+        // Projections has no "picker" sub-state with no free text to
+        // fall back to, so Esc's own job here is to leave the tab
+        // entirely, back to Live Events, rather than clear one flag) -
+        // and only quits the app when there's no such view to back out
+        // of. Ctrl+C above always quits regardless of what's focused.
         if key.code == KeyCode::Esc {
             if let Tab::Commands = self.tab {
                 if matches!(self.commands.stage, CommandsStage::Form { .. }) {
@@ -316,30 +333,41 @@ impl App {
                     return;
                 }
             }
+            if self.tab == Tab::LiveEvents && self.live_events_filter_active {
+                self.live_events_filter_active = false;
+                return;
+            }
+            if self.tab == Tab::Projections {
+                self.tab = Tab::LiveEvents;
+                return;
+            }
             self.should_quit = true;
             return;
         }
 
         // Digits switch the main tab regardless of what's focused
-        // in-tab - true for every tab except Commands' own generated
-        // form (Codeberg issue #8): a schema-driven `Widget::Number`/
-        // `Widget::Text` field can legitimately contain any digit (an
-        // `amount` payload field, an `account_id` like "acc-1"), so
-        // digits there must reach the focused field instead of jumping
-        // tabs - the same reason `ProjectionsTab`'s free-text fields
-        // would have this identical issue if a projection name/key ever
-        // needed a digit, a pre-existing gap this pass doesn't touch
-        // (out of scope - issue #8 is Commands/Query Events only).
-        // Commands' *picker* stage has no text entry at all (Up/Down/
-        // Enter/`r` only), so digits stay safe to switch tabs there,
-        // same as Query Events' now-checklist-only (never free-text)
-        // picker. Switching into Query Events/Commands for the first
-        // time (or after a stage reset with nothing loaded) kicks off
-        // that tab's own type-list fetch - `r` refreshes it manually
-        // afterward.
-        let editing_generated_form =
-            self.tab == Tab::Commands && matches!(self.commands.stage, CommandsStage::Form { .. });
-        if !editing_generated_form {
+        // in-tab - true for every tab except one with real free-text
+        // entry live right now: Commands' own generated form (Codeberg
+        // issue #8) and Projections' three fields (issue #7's own
+        // `waitForSequence` addition made this a real, not just latent,
+        // gap there too - see `ProjectionField::WaitForSequence`'s own
+        // doc comment). A schema-driven `Widget::Number`/`Widget::Text`
+        // field, or a projection key like "acc-1"/a sequence number, can
+        // legitimately contain any digit, so digits there must reach the
+        // focused field instead of jumping tabs. Commands' *picker*
+        // stage has no text entry at all (Up/Down/Enter/`r` only), so
+        // digits stay safe to switch tabs there, same as Query Events'
+        // now-checklist-only (never free-text) picker and Live Events'
+        // own `/`-gated filter (issue #7 - inactive unless composing,
+        // see the filter-mode check below). Switching into Query Events/
+        // Commands for the first time (or after a stage reset with
+        // nothing loaded) kicks off that tab's own type-list fetch - `r`
+        // refreshes it manually afterward.
+        let editing_free_text = (self.tab == Tab::Commands
+            && matches!(self.commands.stage, CommandsStage::Form { .. }))
+            || self.tab == Tab::Projections
+            || (self.tab == Tab::LiveEvents && self.live_events_filter_active);
+        if !editing_free_text {
             match key.code {
                 KeyCode::Char('1') => return self.tab = Tab::LiveEvents,
                 KeyCode::Char('2') => {
@@ -364,10 +392,37 @@ impl App {
         }
 
         match self.tab {
-            Tab::LiveEvents => {}
+            Tab::LiveEvents => self.handle_live_events_key(key),
             Tab::QueryEvents => self.handle_query_events_key(key),
             Tab::Commands => self.handle_commands_key(key),
             Tab::Projections => self.handle_projections_key(key),
+        }
+    }
+
+    // --- Live Events: `/`-gated substring filter (Codeberg issue #7) ---
+
+    /// `/` enters filter-compose mode (matching `less`/`vim`'s own
+    /// well-known search key) rather than always-on free text - the
+    /// latter would reopen the exact digit-tab-switch conflict issue #8
+    /// already found and fixed for Commands (a filter like "42" would
+    /// jump to Query Events mid-type). Backspace/`Char` edit the filter
+    /// while active; `Enter`/`Esc` (handled at the top of `handle_key`)
+    /// both exit compose mode back to normal browsing - `Enter` doesn't
+    /// need to "run" anything since filtering is live, client-side, no
+    /// round trip (`ui::draw_live_events` reads `live_events_filter`
+    /// directly on every frame).
+    fn handle_live_events_key(&mut self, key: KeyEvent) {
+        if !self.live_events_filter_active {
+            if key.code == KeyCode::Char('/') {
+                self.live_events_filter_active = true;
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Enter => self.live_events_filter_active = false,
+            KeyCode::Backspace => self.live_events_filter.backspace(),
+            KeyCode::Char(c) => self.live_events_filter.push(c),
+            _ => {}
         }
     }
 
@@ -601,6 +656,7 @@ impl App {
                     "mutation($bc: String!, $type: String!, $payload: String!) { \
                         submitCommand(boundedContext: $bc, commandTypeName: $type, payload: $payload) { \
                             accepted rejectionReason rejectionKind triggeredEventSequences \
+                            matchingEvents { sequence eventTypeName payload } \
                         } \
                     }",
                     serde_json::json!({ "bc": bounded_context, "type": type_name, "payload": payload_str }),
@@ -615,7 +671,8 @@ impl App {
             KeyCode::Tab => {
                 self.projections.focus = match self.projections.focus {
                     ProjectionField::Name => ProjectionField::Key,
-                    ProjectionField::Key => ProjectionField::Name,
+                    ProjectionField::Key => ProjectionField::WaitForSequence,
+                    ProjectionField::WaitForSequence => ProjectionField::Name,
                 };
             }
             KeyCode::Enter => self.submit_projection(),
@@ -629,6 +686,7 @@ impl App {
         match self.projections.focus {
             ProjectionField::Name => &mut self.projections.name,
             ProjectionField::Key => &mut self.projections.key,
+            ProjectionField::WaitForSequence => &mut self.projections.wait_for_sequence,
         }
     }
 
@@ -639,6 +697,19 @@ impl App {
             return;
         }
         let key = self.projections.key.value.trim().to_string();
+        let wait_for_sequence_str = self.projections.wait_for_sequence.value.trim().to_string();
+        let wait_for_sequence = if wait_for_sequence_str.is_empty() {
+            None
+        } else {
+            match wait_for_sequence_str.parse::<i64>() {
+                Ok(seq) => Some(seq),
+                Err(_) => {
+                    self.projections.error =
+                        Some(format!("{wait_for_sequence_str:?} is not a valid sequence number"));
+                    return;
+                }
+            }
+        };
         self.projections.loading = true;
         self.projections.error = None;
         let client = self.client.clone();
@@ -646,7 +717,14 @@ impl App {
         let bounded_context = self.bounded_context.clone();
         tokio::spawn(async move {
             let key = if key.is_empty() { None } else { Some(key.as_str()) };
-            let result = crate::projection_query::fetch(&client, &bounded_context, &name, key).await;
+            let result = crate::projection_query::fetch(
+                &client,
+                &bounded_context,
+                &name,
+                key,
+                wait_for_sequence,
+            )
+            .await;
             let _ = tx.send(AppEvent::ProjectionResult(result));
         });
     }

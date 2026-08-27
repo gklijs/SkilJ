@@ -3,6 +3,7 @@
 
 use crate::app::{App, CommandsStage, ProjectionField, Tab};
 use crate::form::Widget as FormWidget;
+use crate::json_style;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -47,20 +48,46 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Yellow)), area);
 }
 
+/// Codeberg issue #7: `/` enters filter-compose mode (see
+/// `App::handle_live_events_key`'s own doc comment for why), substring-
+/// matched case-insensitively against each event's own compact JSON
+/// rendering - client-side only, no server round trip.
 fn draw_live_events(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    let filter_style = if app.live_events_filter_active {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let filter_title = if app.live_events_filter_active {
+        "Filter (substring) - Enter/Esc to stop editing"
+    } else {
+        "Filter - / to edit"
+    };
+    let filter_box = Paragraph::new(app.live_events_filter.value.as_str()).block(
+        Block::default().borders(Borders::ALL).border_style(filter_style).title(filter_title),
+    );
+    frame.render_widget(filter_box, chunks[0]);
+
     let connected = if app.live_connected { "connected" } else { "connecting..." };
+    let filter = app.live_events_filter.value.to_lowercase();
     let items: Vec<ListItem> = app
         .live_events
         .iter()
         .rev()
-        .map(|event| ListItem::new(pretty_compact(event)))
+        .filter(|event| filter.is_empty() || json_style::compact_plain(event).to_lowercase().contains(&filter))
+        .map(|event| ListItem::new(json_style::compact(event)))
         .collect();
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .title(format!("Live Events ({connected}) - newest first")),
     );
-    frame.render_widget(list, area);
+    frame.render_widget(list, chunks[1]);
 }
 
 /// Codeberg issue #8: a real multi-select checklist over
@@ -105,12 +132,7 @@ fn draw_query_events(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.query_events.query_loading {
         Paragraph::new("running...")
     } else {
-        let lines: Vec<Line> = app
-            .query_events
-            .results
-            .iter()
-            .map(|e| Line::from(pretty_compact(e)))
-            .collect();
+        let lines: Vec<Line> = app.query_events.results.iter().map(json_style::compact).collect();
         Paragraph::new(lines)
     };
     frame.render_widget(
@@ -210,7 +232,7 @@ fn draw_commands_form(
     } else if loading {
         Paragraph::new("submitting...")
     } else if let Some(result) = result {
-        Paragraph::new(pretty(result))
+        Paragraph::new(json_style::pretty(result))
     } else {
         Paragraph::new("Enter to submit")
     };
@@ -223,7 +245,12 @@ fn draw_commands_form(
 fn draw_projections(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
         .split(area);
 
     let name_style = focus_style(app.projections.focus == ProjectionField::Name);
@@ -231,7 +258,7 @@ fn draw_projections(frame: &mut Frame, app: &App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(name_style)
-            .title("Projection name - Tab to switch field"),
+            .title("Projection name - Tab to switch field, Esc to leave this tab"),
     );
     frame.render_widget(name_input, chunks[0]);
 
@@ -240,22 +267,34 @@ fn draw_projections(frame: &mut Frame, app: &App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(key_style)
-            .title("Key (empty = default instance) - Enter to run"),
+            .title("Key (empty = default instance)"),
     );
     frame.render_widget(key_input, chunks[1]);
+
+    // Codeberg issue #7's time-travel projection viewer - see
+    // `projection_query::fetch`'s own doc comment for why the title says
+    // "at least as fresh as", not "as of".
+    let wait_style = focus_style(app.projections.focus == ProjectionField::WaitForSequence);
+    let wait_input = Paragraph::new(app.projections.wait_for_sequence.value.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(wait_style)
+            .title("At least as fresh as sequence (empty = no wait) - Enter to run"),
+    );
+    frame.render_widget(wait_input, chunks[2]);
 
     let body = if let Some(err) = &app.projections.error {
         Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red))
     } else if app.projections.loading {
         Paragraph::new("running...")
     } else if let Some(result) = &app.projections.result {
-        Paragraph::new(pretty(result))
+        Paragraph::new(json_style::pretty(result))
     } else {
         Paragraph::new("")
     };
     frame.render_widget(
         body.wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("State")),
-        chunks[2],
+        chunks[3],
     );
 }
 
@@ -267,10 +306,3 @@ fn focus_style(focused: bool) -> Style {
     }
 }
 
-fn pretty(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-}
-
-fn pretty_compact(value: &serde_json::Value) -> String {
-    value.to_string()
-}

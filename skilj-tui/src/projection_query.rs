@@ -38,19 +38,31 @@ const INTROSPECT_TYPE_QUERY: &str = "query($name: String!) { \
     } \
 }";
 
+/// Codeberg issue #7's own naming honesty note: `wait_for_sequence` is a
+/// *freshness* guarantee - "don't answer before the projection has
+/// caught up to at least this sequence" - not a historical snapshot. If
+/// the projection has already moved past it, the caller gets *current*
+/// state, not state frozen at that instant (see `ProjectionsField`'s own
+/// UI label, which says "at least as fresh as", never "as of", for
+/// exactly this reason).
 pub async fn fetch(
     client: &Client,
     bounded_context: &str,
     name: &str,
     key: Option<&str>,
+    wait_for_sequence: Option<i64>,
 ) -> Result<Value, ClientError> {
     let key_value = key.map(|k| Value::String(k.to_string())).unwrap_or(Value::Null);
-    let variables = json!({ "bc": bounded_context, "name": name, "key": key_value });
+    let wait_value = wait_for_sequence.map(Value::from).unwrap_or(Value::Null);
+    let variables =
+        json!({ "bc": bounded_context, "name": name, "key": key_value, "wait": wait_value });
 
     let typename_response = client
         .request(
-            "query($bc: String!, $name: String!, $key: String) { \
-                projection(boundedContext: $bc, name: $name, key: $key) { __typename } \
+            "query($bc: String!, $name: String!, $key: String, $wait: Int) { \
+                projection(boundedContext: $bc, name: $name, key: $key, waitForSequence: $wait) { \
+                    __typename \
+                } \
             }",
             variables.clone(),
         )
@@ -67,8 +79,8 @@ pub async fn fetch(
     }
 
     let query = format!(
-        "query($bc: String!, $name: String!, $key: String) {{ \
-            projection(boundedContext: $bc, name: $name, key: $key) {{ \
+        "query($bc: String!, $name: String!, $key: String, $wait: Int) {{ \
+            projection(boundedContext: $bc, name: $name, key: $key, waitForSequence: $wait) {{ \
                 __typename ... on {type_name} {{ {selection} }} \
             }} \
         }}"

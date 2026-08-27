@@ -9,5 +9,6 @@ pub mod app;
 pub mod cli;
 pub mod form;
 pub mod graphql;
+pub mod json_style;
 pub mod projection_query;
 pub mod ui;

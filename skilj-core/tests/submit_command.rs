@@ -395,6 +395,9 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
             "client-1",
             &bounded_context_events,
             &consistency_tags,
+            // The caller's own pre-lock matching_events - empty, same as
+            // the `&[]` the initial dispatch() call above already used.
+            &[],
             initial_decision,
             None,
             test_now(),
@@ -407,8 +410,13 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
         // produce; the stale first Accepted decision never governs.
         assert_eq!(dispatcher.call_count(), 2);
         match outcome {
-            SubmitCommandOutcome::Rejected { kind, .. } => {
+            SubmitCommandOutcome::Rejected { kind, matching_events, .. } => {
                 assert_eq!(kind, "already_shipped");
+                // Codeberg issue #7: the *final*, post-redispatch matching
+                // set - the concurrent writer's own event - not the
+                // caller's stale, empty pre-lock one.
+                assert_eq!(matching_events.len(), 1);
+                assert_eq!(matching_events[0].tags[0].value.as_deref(), Some("A"));
             }
             SubmitCommandOutcome::Accepted { .. } => {
                 panic!("a genuine DCB conflict was not caught - stale decision was used")
@@ -462,6 +470,9 @@ fn submit_command_does_not_redispatch_for_an_unrelated_concurrent_event() {
             "client-1",
             &bounded_context_events,
             &consistency_tags,
+            // Caller's own pre-lock matching_events - empty, matching
+            // bounded_context_events above.
+            &[],
             initial_decision,
             None,
             test_now(),
@@ -520,6 +531,7 @@ fn submit_command_persists_a_real_command_id_that_round_trips() {
             &ct,
             payload,
             "client-1",
+            &[],
             &[],
             &[],
             initial_decision,
@@ -588,6 +600,7 @@ fn submit_command_leaves_no_sequence_gap_when_process_command_fails() {
             "client-1",
             &[],
             &[],
+            &[],
             initial_decision,
             None,
             test_now(),
@@ -643,6 +656,7 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
             &ct,
             payload,
             "client-1",
+            &[],
             &[],
             &[],
             initial_decision,

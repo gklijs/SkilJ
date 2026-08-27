@@ -4673,6 +4673,18 @@ surface CommandSubmission {
         -- by that Role's RoleAccessMapping. The token-authenticated way
         -- to trigger the same command over REST is CommandTrigger; both
         -- converge on ProcessCommand.
+        --
+        -- A rejection also returns the matching_events rule ProcessCommand
+        -- itself computed and handed to decide() - the same "fresh at
+        -- commit time" set that rule's own note describes, not a
+        -- snapshot from an earlier read, so a caller debugging an
+        -- unexpected rejection sees exactly what decide() saw. Scoped to
+        -- a rejection only - an accepted submission's own matching_events
+        -- isn't a further question the caller needs answered, since
+        -- acceptance already tells them what happened. CommandTrigger's
+        -- own REST response does not carry this: that surface stays
+        -- narrowly scoped to an automated caller acting on an outcome,
+        -- not debugging one.
 }
 
 surface CommandTrigger {

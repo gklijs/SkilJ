@@ -553,6 +553,24 @@ pub fn queried_event_object() -> Object {
     })
 }
 
+/// `SubmitCommandResult.matchingEvents`' own per-row shape (Codeberg
+/// issue #7's DCB conflict visualizer) - a real `Event`, not
+/// `QueriedEvent`'s `(i64, String)` pair, since `eventTypeName` matters
+/// here in a way it doesn't for `queryEvents` (a caller there already
+/// filtered by event type; a rejection's matching set can span several).
+/// Deliberately narrow - `sequence`/`eventTypeName`/`payload` only,
+/// enough to actually debug a conflict without inventing a bigger wire
+/// type than the issue asks for.
+pub fn matching_event_object() -> Object {
+    use skilj_core::event_store::Event;
+
+    gql_object!(Event => "MatchingEvent" {
+        scalar "sequence": TypeRef::named_nn(TypeRef::INT) => |e| Value::from(e.sequence),
+        scalar "eventTypeName": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.event_type.name.clone()),
+        scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.payload.clone()),
+    })
+}
+
 /// `entity Event`'s `origin` field - a flat "kind + nullable per-variant
 /// fields" shape, the same treatment `ContextCreator` already got in
 /// Phase 1, not a GraphQL union: nothing here needs the return type
@@ -637,15 +655,21 @@ pub struct SubmitCommandResult {
     pub triggered_event_sequences: Option<Vec<i64>>,
     pub rejection_reason: Option<String>,
     pub rejection_kind: Option<String>,
+    // Codeberg issue #7's DCB conflict visualizer - `Some` only on
+    // rejection (see the resolver's own construction of this struct for
+    // why `Accepted` gets `None`), the tag-scoped set `decide()`
+    // actually evaluated against for the rejection that governed.
+    pub matching_events: Option<Vec<skilj_core::event_store::Event>>,
 }
 
 pub fn submit_command_payload_object() -> Object {
-    // `triggeredEventSequences` is a nullable *list of scalars* -
+    // `triggeredEventSequences` is a nullable *list of scalars*, and
+    // `matchingEvents` a nullable *list of objects* -
     // `scalar_field`/`object_field`/`list_field` (and so `gql_object!`
     // itself) only cover a bare scalar, a nullable nested object, and a
-    // non-null list of nested objects; a nullable list of plain `Int`s
-    // fits none of the three, so this one field stays a hand-written
-    // `Field::new(...)`, appended after the macro-generated ones below.
+    // non-null list of nested objects; neither shape fits, so both stay
+    // hand-written `Field::new(...)`s, appended after the macro-generated
+    // ones below.
     gql_object!(SubmitCommandResult => "SubmitCommandPayload" {
         scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
         scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_reason.clone()),
@@ -659,6 +683,18 @@ pub fn submit_command_payload_object() -> Object {
                 let parent = ctx.parent_value.try_downcast_ref::<SubmitCommandResult>()?;
                 Ok(parent.triggered_event_sequences.as_ref().map(|sequences| {
                     FieldValue::list(sequences.iter().map(|s| FieldValue::value(Value::from(*s))))
+                }))
+            })
+        },
+    ))
+    .field(Field::new(
+        "matchingEvents",
+        TypeRef::named_list("MatchingEvent"),
+        |ctx: ResolverContext| {
+            FieldFuture::new(async move {
+                let parent = ctx.parent_value.try_downcast_ref::<SubmitCommandResult>()?;
+                Ok(parent.matching_events.as_ref().map(|events| {
+                    FieldValue::list(events.iter().cloned().map(FieldValue::owned_any))
                 }))
             })
         },

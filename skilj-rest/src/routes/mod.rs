@@ -705,6 +705,7 @@ async fn post_commands_trigger(
         &authorised.client_id,
         &bounded_context_events,
         &consistency_tags,
+        &matching_events,
         decision,
         state.encryption_master_key.as_ref(),
         Utc::now(),
@@ -716,7 +717,11 @@ async fn post_commands_trigger(
         // whether this was the first decision or a DCB-conflict retry
         // inside submit_command, a rejection renders identically either
         // way.
-        db::SubmitCommandOutcome::Rejected { reason, kind } => CommandTriggerResponse {
+        // `matching_events` (Codeberg issue #7's DCB conflict visualizer)
+        // stays a `skilj-tui`/GraphQL-only debugging affordance - out of
+        // scope for REST's narrower, machine-caller-facing wire shape
+        // (§7.1) - so it's computed and immediately dropped here.
+        db::SubmitCommandOutcome::Rejected { reason, kind, .. } => CommandTriggerResponse {
             accepted: false,
             triggered_event_sequences: None,
             rejection_reason: Some(reason),
