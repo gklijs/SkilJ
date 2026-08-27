@@ -13,7 +13,6 @@ pub mod projection_types;
 pub mod resolvers;
 pub mod schema;
 
-use async_graphql::dynamic::Schema;
 use opentelemetry::metrics::Histogram;
 use skilj_core::access_control::RevocationBroadcaster;
 use skilj_core::bootstrap::BootstrapSecret;
@@ -95,13 +94,11 @@ pub struct GraphqlState {
     pub event_cache: EventCache,
 }
 
-/// Builds the schema from `state` and mounts it as a fresh `axum::Router`
-/// at `/graphql` - the one real caller is `Skilj::graphql_router()`.
-/// `async`, returning `Result`, since `schema::build` now needs to list
-/// every registered projection to generate `ProjectionQuery`'s own
-/// per-projection types (§5.1) - a real I/O failure mode `schema::build`'s
-/// own `.expect(...)` deliberately doesn't cover (that stays for a
-/// genuine schema-shape bug, never a runtime condition).
+/// Mounts a fresh `axum::Router` at `/graphql` against an already-built
+/// `registry` - the one real caller is `Skilj::graphql_router()`, which
+/// shares the one `SchemaRegistry` `SkiljBuilder::build()` built (and
+/// `skilj::cross_instance` keeps rebuilding) rather than building a new
+/// one per call, so every call sees the same live-updating schema.
 ///
 /// One path, method-routed: `POST` still goes to `graphql_handler`
 /// (queries/mutations); `GET` with the right `Upgrade`/`Sec-WebSocket-Protocol`
@@ -110,15 +107,17 @@ pub struct GraphqlState {
 /// `Service` depending on method" case, confirmed against the installed
 /// crate source, not improvised. A GraphQL client's own protocol
 /// negotiation picks the right one; nothing here needs a second path.
-pub async fn router(state: GraphqlState) -> skilj_core::error::Result<axum::Router> {
-    let schema = schema::build(state.clone()).await?;
+pub async fn router(
+    registry: Arc<schema::SchemaRegistry>,
+    state: GraphqlState,
+) -> skilj_core::error::Result<axum::Router> {
     Ok(axum::Router::new()
         .route(
             "/graphql",
             axum::routing::post(graphql_handler).get(graphql_ws_handler),
         )
         .layer(axum::middleware::from_fn(trace_request))
-        .with_state((schema, state)))
+        .with_state((registry, state)))
 }
 
 /// One request-level span per GraphQL call (both the `POST` query/mutation
@@ -175,7 +174,10 @@ async fn trace_request(
         // never fires.
         if status.is_server_error() {
             span.record("otel.status_description", status.to_string());
-            tracing::error!(status = status.as_u16(), "request failed with a server error");
+            tracing::error!(
+                status = status.as_u16(),
+                "request failed with a server error"
+            );
         }
         REQUEST_DURATION.record(
             start.elapsed().as_secs_f64(),
@@ -200,10 +202,18 @@ async fn trace_request(
 /// the same "a wrong credential is a hard stop" treatment `skilj-rest`'s
 /// own bearer extractor gives a malformed one.
 async fn graphql_handler(
-    axum::extract::State((schema, state)): axum::extract::State<(Schema, GraphqlState)>,
+    axum::extract::State((registry, state)): axum::extract::State<(
+        Arc<schema::SchemaRegistry>,
+        GraphqlState,
+    )>,
     headers: axum::http::HeaderMap,
     req: async_graphql_axum::GraphQLRequest,
 ) -> async_graphql_axum::GraphQLResponse {
+    // The live schema, read fresh for this one request - a concurrent
+    // `SchemaRegistry::rebuild` (another registration change, on this
+    // instance or another) never affects a request already in flight,
+    // since this is an `Arc` snapshot, not a lock.
+    let schema = registry.current();
     let response = match auth::resolve_role(&headers, state.identity.as_ref(), &state.pool).await {
         Ok(role) => schema.execute(req.into_inner().data(role)).await,
         Err(err) => async_graphql::Response::from_errors(vec![
@@ -228,10 +238,19 @@ async fn graphql_handler(
 /// own `Err` path - the same "wrong credential is a hard stop" treatment
 /// `graphql_handler` already gives the header case.
 async fn graphql_ws_handler(
-    axum::extract::State((schema, state)): axum::extract::State<(Schema, GraphqlState)>,
+    axum::extract::State((registry, state)): axum::extract::State<(
+        Arc<schema::SchemaRegistry>,
+        GraphqlState,
+    )>,
     protocol: async_graphql_axum::GraphQLProtocol,
     upgrade: axum::extract::WebSocketUpgrade,
 ) -> impl axum::response::IntoResponse {
+    // `Schema` is `Clone`-cheap (its own doc comment: internally
+    // `Arc`-wrapped) - a subscription's whole lifetime uses whichever
+    // schema was live at connection time, the same "one snapshot, no
+    // torn reads" treatment `graphql_handler` gets, just held for
+    // longer.
+    let schema = (*registry.current()).clone();
     upgrade
         .protocols(async_graphql::http::ALL_WEBSOCKET_PROTOCOLS)
         .on_upgrade(move |socket| {

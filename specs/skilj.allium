@@ -2,7 +2,7 @@
 -- skilj.allium
 
 -- Scope: SkilJ, a Rust library for building event-sourced, DDD-style
---   applications backed by a single-instance Postgres database, exposing
+--   applications backed by a single shared Postgres database, exposing
 --   two clearly separated callers: a GraphQL surface for admin and
 --   website consumers, and a REST surface for machine callers.
 -- Includes: Bounded contexts, Commands, Events and their possible
@@ -61,7 +61,25 @@
 --     key storage) - protect_sensitive_fields is a black box, consistent
 --     with how AccessToken.secret generation and JWT signature
 --     verification are already treated
---   - Multi-instance / distributed deployment
+--   - Distributed-systems machinery: partitioning or sharding of a
+--     bounded context's stream, consensus, leader election, cross-region
+--     replication, and instance discovery or a service registry. What is
+--     no longer excluded with it is the one deployment shape this
+--     library is actually expected to run in: several stateless
+--     instances behind a load balancer, all of them symmetric and all
+--     sharing exactly one Postgres database. Real-time push completeness
+--     across those instances - a committed event, a revocation and a
+--     registration change each reaching every instance rather than only
+--     the one that handled the call - and the cross-instance schema
+--     consistency that follows from it are in scope, and specified as
+--     guarantees rather than as a mechanism (see EventSubscription's
+--     DeliverySpansInstances and TypeRegistration's
+--     RegistrationReachesEveryInstance). What stays excluded is
+--     everything that would require instances to know about each other
+--     at all: nothing here elects, discovers, addresses or partitions
+--     across them, and an instance reaches every other only through the
+--     shared database, which remains the only shared infrastructure this
+--     library assumes
 --   - The GraphQL wire contract itself, beyond identity resolution and
 --     the surfaces specified here: how a Projection.schema becomes a
 --     concrete GraphQL type, field and argument naming, paging and error
@@ -2799,7 +2817,10 @@ rule DeleteBoundedContext {
 -- Rust type and projection definitions themselves - a black box here, the
 -- same as decide() and protect_sensitive_fields) and registers each one
 -- against its bounded context. Re-registering an unchanged shape is a
--- no-op, so the loop can run on every startup.
+-- no-op, so the loop can run on every startup, and on every instance:
+-- what one instance registers is registered for all of them, so the
+-- others' passes find the shape already there and change nothing (see
+-- TypeRegistration's RegistrationReachesEveryInstance).
 --
 -- The loop registers a bounded context's EventTypes before its
 -- CommandTypes (and, structurally already guaranteed by RegisterProjection
@@ -4467,6 +4488,35 @@ surface EventSubscription {
         -- to is left unseen either: delivery stops at the revocation,
         -- which is the same instant the entitlement does.
 
+    @guarantee DeliverySpansInstances
+        -- Which instance a load balancer put this connection on is
+        -- neither something the caller has to know nor something that can
+        -- narrow what it hears. An event committed on any instance is
+        -- delivered to every matching live subscription on every instance,
+        -- and a revocation applied on any instance closes matching
+        -- subscriptions on every instance - the same close, carrying the
+        -- same distinguishable reason, as if the revocation had arrived
+        -- here (see RevocationClosesTheConnection). The instances are
+        -- symmetric and reach each other only through the one Postgres
+        -- database they share; none of them discovers, elects or
+        -- addresses another (see the scope header's exclusions).
+        --
+        -- Reaching another instance is at most once, exactly as delivery
+        -- to the caller is (see DeliveryIsAtMostOnce), and a reach that
+        -- does not arrive is a lateness rather than a correctness
+        -- failure, because Postgres stays the source of truth throughout
+        -- and nothing here is decided from what an instance remembers.
+        -- For an event, what is lost is promptness on this instance's
+        -- live feed and nothing else: the event is committed, readable
+        -- over FetchEvents, QueryEvents and QueryProjection, and picked
+        -- up by the caller's own reconnect handoff from the last sequence
+        -- it received. For a revocation, delivery has already stopped
+        -- regardless - every delivery re-checks the grant's durable
+        -- status live rather than trusting a snapshot (see the note above
+        -- DeliverToSubscriptions) - so what a lost reach delays is the
+        -- reasoned close, leaving a revoked connection open and silent
+        -- until it drops rather than leaking anything to it.
+
     @guarantee SensitiveFieldsStayProtected
         -- A sensitive field is delivered decrypted only when the
         -- receiving access_mapping is entitled to it: either
@@ -4762,6 +4812,30 @@ surface TypeRegistration {
         -- occurrence's own instant rather than the wall clock of the write,
         -- so under a catch-up firing it reads as the occurrence that was
         -- owed, which is the question an admin is actually asking.
+
+    @guarantee RegistrationReachesEveryInstance
+        -- A registration is a fact about the bounded context, not about
+        -- whichever instance the call happened to land on. An EventType,
+        -- CommandType or Projection registered anywhere becomes
+        -- submittable, queryable and subscribable on every instance, with
+        -- no restart and no redeploy of the others - and the same holds
+        -- for a bounded context created, archived or deleted elsewhere
+        -- (see BoundedContextCreation, BoundedContextArchival and
+        -- BoundedContextDeletion). So an admin never has to know or
+        -- arrange which instance a load balancer sent the call to, and a
+        -- reconciliation loop running on one instance is not registering
+        -- for that instance alone (see the note above RegisterEventType).
+        --
+        -- Reached the same way EventSubscription's DeliverySpansInstances
+        -- is, and with the same limits: through the one shared Postgres
+        -- database and nothing else, with symmetric instances that never
+        -- address each other, and at most once. Registered state is
+        -- durable before any instance is told about it, so an instance
+        -- that misses the notice is behind rather than wrong - it serves
+        -- the types it already knows correctly, rejects the new one as
+        -- unregistered rather than mishandling it, and comes into line as
+        -- soon as it reads registered state again, at its next startup
+        -- reconciliation pass at the latest.
 
     @guarantee SchemaEvolutionStaysCompatible
         -- Re-registering an EventType, CommandType or Projection with a

@@ -86,14 +86,17 @@ pub fn revoke_role_field() -> Field {
             // RevocationClosesTheConnection's push half (drift audit
             // finding #4) - one notification per mapping this cascade
             // just revoked, since each may back a live EventSubscription
-            // in its own bounded context.
+            // in its own bounded context. `notify_revocation` alongside
+            // it is the same push's cross-instance half (`@guarantee
+            // DeliverySpansInstances`) - see `skilj_core::cross_instance`'s
+            // own module doc comment.
             for mapping in &revoked_mappings {
-                state
-                    .revocation_broadcaster
-                    .publish(skilj_core::access_control::RevokedMapping {
-                        role_id: mapping.role.id.clone(),
-                        bounded_context: mapping.bounded_context.name.clone(),
-                    });
+                let revoked = skilj_core::access_control::RevokedMapping {
+                    role_id: mapping.role.id.clone(),
+                    bounded_context: mapping.bounded_context.name.clone(),
+                };
+                state.revocation_broadcaster.publish(revoked.clone());
+                skilj_core::db::notify_revocation(&state.pool, &revoked).await;
             }
 
             Ok(Some(FieldValue::owned_any(revoked_role)))
@@ -213,14 +216,16 @@ pub fn revoke_role_access_mapping_field() -> Field {
                 .map_err(to_graphql_error)?;
 
                 // RevocationClosesTheConnection's push half (drift audit
-                // finding #4) - see revoke_role_field's own identical call
-                // above.
+                // finding #4), plus its cross-instance half - see
+                // revoke_role_field's own identical call above.
+                let revoked_mapping = skilj_core::access_control::RevokedMapping {
+                    role_id: role_id.clone(),
+                    bounded_context: bounded_context_name.clone(),
+                };
                 state
                     .revocation_broadcaster
-                    .publish(skilj_core::access_control::RevokedMapping {
-                        role_id: role_id.clone(),
-                        bounded_context: bounded_context_name.clone(),
-                    });
+                    .publish(revoked_mapping.clone());
+                skilj_core::db::notify_revocation(&state.pool, &revoked_mapping).await;
 
                 Ok(Some(FieldValue::owned_any(revoked)))
             })

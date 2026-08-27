@@ -152,6 +152,17 @@ pub struct Skilj {
     /// identical reason: every commit needs to reach the one cache every
     /// read consults, regardless of which surface produced it.
     event_cache: EventCache,
+    /// The live GraphQL schema (Codeberg issue #2; `@guarantee
+    /// RegistrationReachesEveryInstance` in specs/skilj.allium) - built
+    /// once in `.build()`, the same "one shared, process-wide thing"
+    /// register `event_broadcaster`/`revocation_broadcaster`/`event_cache`
+    /// already live in, but kept rebuildable: the background task
+    /// `.build()` spawns (see `cross_instance` below) calls
+    /// `SchemaRegistry::rebuild` on every `skilj_registration_changed`
+    /// notification, from this process's own registration mutations or
+    /// another instance's. `Arc`-wrapped so both `graphql_router()` and
+    /// that background task can hold a cheap clone.
+    schema_registry: Arc<skilj_graphql::schema::SchemaRegistry>,
 }
 
 /// `CommandDispatcher`'s own implementer - a thin wrapper around the
@@ -343,12 +354,25 @@ impl Skilj {
     /// last of which mounts a GraphQL-over-websocket handler on the same
     /// `/graphql` path (see `skilj_graphql::router`'s own doc comment).
     ///
-    /// `async`, returning `Result`: building `ProjectionQuery`'s own
-    /// per-projection GraphQL types (§5.1) means `schema::build` now
-    /// makes real database calls, a failure mode this signature needs to
-    /// carry - see `skilj_graphql::router`'s own doc comment.
+    /// `async`, returning `Result` for symmetry with `skilj_graphql::router`'s
+    /// own signature - building this `GraphqlState`/mounting the router
+    /// is itself infallible today (the schema behind it was already
+    /// built in `.build()`, not here - see `schema_registry`'s own doc
+    /// comment), but nothing about `graphql_router`'s own contract
+    /// promises that stays true forever.
     pub async fn graphql_router(&self) -> skilj_core::error::Result<axum::Router> {
-        let state = skilj_graphql::GraphqlState {
+        skilj_graphql::router(Arc::clone(&self.schema_registry), self.graphql_state()).await
+    }
+
+    /// `GraphqlState`'s one real constructor - `graphql_router()`'s own
+    /// call site, plus `.build()`'s (to build the initial
+    /// `SchemaRegistry` before `Skilj` even exists to call
+    /// `graphql_router()` on) and `cross_instance`'s dispatch loop's (to
+    /// rebuild it later). Factored out rather than duplicated three
+    /// times, unlike `command_dispatcher()`/`projection_dispatcher()`
+    /// above, which only ever had the one caller each.
+    fn graphql_state(&self) -> skilj_graphql::GraphqlState {
+        skilj_graphql::GraphqlState {
             pool: self.pool.clone(),
             bootstrap_secret: self.bootstrap_secret.clone(),
             identity: self
@@ -365,8 +389,7 @@ impl Skilj {
             event_broadcaster: self.event_broadcaster.clone(),
             revocation_broadcaster: self.revocation_broadcaster.clone(),
             event_cache: self.event_cache.clone(),
-        };
-        skilj_graphql::router(state).await
+        }
     }
 }
 
@@ -858,11 +881,15 @@ impl SkiljBuilder {
         }
 
         // Taken here, ahead of the `Skilj` struct itself further down, so
-        // the same `Arc` (cheap to clone) can back both the reconciliation
-        // dispatcher below - needed for `needs_history_fold` (drift audit
-        // finding #3) - and the field `Skilj` is built with at the bottom
-        // of this function.
+        // the same `Arc`s (cheap to clone) can back both the
+        // reconciliation dispatcher below - needed for
+        // `needs_history_fold` (drift audit finding #3) - and the fields
+        // `Skilj` is built with at the bottom of this function.
+        // `command_types` is additionally needed to build the initial
+        // `GraphqlState`/`SchemaRegistry` further down, before `Skilj`
+        // itself exists to hand out `command_dispatcher()`.
         let projections = Arc::new(self.projections);
+        let command_types = Arc::new(self.command_types);
 
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
@@ -880,7 +907,7 @@ impl SkiljBuilder {
                 chrono::Utc::now(),
             )
             .await?;
-            reconcile_command_types(&pool, &role, &self.command_types, &mut report).await?;
+            reconcile_command_types(&pool, &role, &command_types, &mut report).await?;
             let reconciliation_dispatcher = ProjectionDispatcherImpl {
                 projections: projections.clone(),
             };
@@ -920,9 +947,40 @@ impl SkiljBuilder {
             event_cache.warm(&pool, &bc.name).await?;
         }
 
+        // The initial GraphQL schema (Codeberg issue #2; `@guarantee
+        // RegistrationReachesEveryInstance`) - built here, ahead of
+        // `Skilj` itself, the same "can't call `self.graphql_state()`
+        // before `self` exists" reasoning `reconciliation_dispatcher`
+        // above already works around, applied to the whole `GraphqlState`
+        // this time rather than just one dispatcher.
+        let schema_registry = Arc::new(
+            skilj_graphql::schema::SchemaRegistry::build(skilj_graphql::GraphqlState {
+                pool: pool.clone(),
+                bootstrap_secret: bootstrap_secret.clone(),
+                identity: identity_provider
+                    .as_ref()
+                    .map(|ip| skilj_graphql::auth::Identity {
+                        config: ip.config.clone(),
+                        cache: Arc::clone(&ip.cache),
+                    }),
+                dispatcher: Arc::new(Dispatcher {
+                    command_types: command_types.clone(),
+                }),
+                projection_dispatcher: Arc::new(ProjectionDispatcherImpl {
+                    projections: projections.clone(),
+                }),
+                projection_query_wait_timeout,
+                encryption_master_key: encryption_master_key.clone(),
+                event_broadcaster: event_broadcaster.clone(),
+                revocation_broadcaster: revocation_broadcaster.clone(),
+                event_cache: event_cache.clone(),
+            })
+            .await?,
+        );
+
         let skilj = Skilj {
             pool,
-            command_types: Arc::new(self.command_types),
+            command_types,
             projections,
             event_types: Arc::new(self.event_types),
             bootstrap_secret,
@@ -932,6 +990,7 @@ impl SkiljBuilder {
             event_broadcaster,
             revocation_broadcaster,
             event_cache,
+            schema_registry,
         };
 
         // The single shared background task backing §8 item 6's async
@@ -1043,6 +1102,129 @@ impl SkiljBuilder {
                     &[KeyValue::new("task", "scheduler")],
                 );
                 tokio::time::sleep(scheduler_interval).await;
+            }
+        });
+
+        // Cross-instance push completeness (Codeberg issue #2;
+        // `@guarantee DeliverySpansInstances`/`RegistrationReachesEveryInstance`
+        // in specs/skilj.allium) - one more shared background task,
+        // spawned the same "one task, detached, runs for the process's
+        // lifetime" way as the two above. Connects its own dedicated
+        // `PgListener` (see `skilj_core::cross_instance::Listener`'s own
+        // module doc comment for the full design) and, for each message
+        // received, dispatches into the one local destination that
+        // message is really about: an `EventAppended` pointer is
+        // refetched and republished into this instance's own
+        // `EventBroadcaster` - `EventSubscription`'s live subscribers
+        // here don't distinguish an event committed on this instance
+        // from one committed on another, they're already reading through
+        // the same broadcaster either way. `Revoked` republishes into
+        // `RevocationBroadcaster` the identical way. `RegistrationChanged`
+        // rebuilds and swaps `schema_registry`.
+        //
+        // `Listener::connect` itself is retried in a loop (unlike
+        // `recv()`, which `sqlx::postgres::PgListener` already retries
+        // internally - see that type's own doc comment) - otherwise a
+        // Postgres outage right at startup would leave this instance
+        // permanently deaf to every other instance's writes for the rest
+        // of its life, rather than just until the database comes back.
+        let cross_instance_pool = skilj.pool.clone();
+        let cross_instance_event_broadcaster = skilj.event_broadcaster.clone();
+        let cross_instance_revocation_broadcaster = skilj.revocation_broadcaster.clone();
+        let cross_instance_schema_registry = Arc::clone(&skilj.schema_registry);
+        let cross_instance_state = skilj.graphql_state();
+        tokio::spawn(async move {
+            let mut listener = loop {
+                match skilj_core::cross_instance::Listener::connect(&cross_instance_pool).await {
+                    Ok(listener) => break listener,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "cross-instance listener failed to connect, retrying"
+                        );
+                        BACKGROUND_TASK_ERRORS.add(
+                            1,
+                            &[
+                                KeyValue::new("task", "cross_instance"),
+                                KeyValue::new("reason", "connect_failed"),
+                            ],
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            };
+            loop {
+                let message = match listener
+                    .recv()
+                    .instrument(tracing::info_span!("cross_instance_recv"))
+                    .await
+                {
+                    Ok(message) => message,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "cross-instance listener error, retrying");
+                        BACKGROUND_TASK_ERRORS.add(
+                            1,
+                            &[
+                                KeyValue::new("task", "cross_instance"),
+                                KeyValue::new("reason", "recv_failed"),
+                            ],
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                match message {
+                    skilj_core::cross_instance::Message::EventAppended {
+                        bounded_context,
+                        sequence,
+                    } => {
+                        // The plain, uncached read - deliberately, not
+                        // `get_event_by_sequence_cached`. This refetch
+                        // races with the original write path's own
+                        // `event_cache.append(&event)` (this instance's
+                        // own self-`NOTIFY` can be received before that
+                        // `.await` continuation resumes), and
+                        // `EventCache::try_event_by_sequence`'s own
+                        // `freshen()` backfill has no dedup against a
+                        // concurrent direct `append()` for the identical
+                        // event - going through the cache here could
+                        // double-append it. A one-shot read triggered by
+                        // a notification has no repeated-read benefit to
+                        // gain from the cache anyway, so there's nothing
+                        // this trades away.
+                        match skilj_core::db::get_event_by_sequence(
+                            &cross_instance_pool,
+                            &bounded_context,
+                            sequence,
+                        )
+                        .await
+                        {
+                            Ok(Some(event)) => cross_instance_event_broadcaster.publish(&event),
+                            // Already gone by the time this instance
+                            // looked - a deleted bounded context, most
+                            // plausibly. Nothing to deliver, not an
+                            // error.
+                            Ok(None) => {}
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                bounded_context = %bounded_context,
+                                sequence,
+                                "cross-instance event refetch failed"
+                            ),
+                        }
+                    }
+                    skilj_core::cross_instance::Message::Revoked(revoked) => {
+                        cross_instance_revocation_broadcaster.publish(revoked);
+                    }
+                    skilj_core::cross_instance::Message::RegistrationChanged => {
+                        if let Err(err) = cross_instance_schema_registry
+                            .rebuild(cross_instance_state.clone())
+                            .await
+                        {
+                            tracing::warn!(error = %err, "cross-instance schema rebuild failed");
+                        }
+                    }
+                }
             }
         });
 

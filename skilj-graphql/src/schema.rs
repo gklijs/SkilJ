@@ -1,14 +1,21 @@
 //! Builds the one unified GraphQL schema - see docs/architecture.md
-//! §5.1. `build()` is still only ever called once, at
-//! `Skilj::graphql_router()` time, even now that `ProjectionQuery` gives
-//! it genuinely data-dependent content (`projection_types::build`) -
-//! `SchemaRegistry` below stays a stub, deliberately (see the plan at
-//! `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`): a
-//! projection registered after `graphql_router()` was called won't gain
-//! a `ProjectionResult` member until the process restarts. It becomes
-//! real once something actually needs the schema to reflect registration
-//! changes live, without a restart (§5.1's own "rebuilds the entire
-//! schema from scratch behind `ArcSwap<Schema>`").
+//! §5.1. [`SchemaRegistry`] is the live, rebuildable holder of it:
+//! `skilj::SkiljBuilder::build()` builds one up front and every
+//! `Skilj::graphql_router()` call shares it, and
+//! `skilj::cross_instance`'s dispatch loop calls
+//! [`SchemaRegistry::rebuild`] whenever a `skilj_registration_changed`
+//! `NOTIFY` arrives - from this process's own registration mutations
+//! (every one of which also `NOTIFY`s itself, see `db::
+//! notify_registration_changed`'s own doc comment) or another instance's.
+//! The two cases are indistinguishable on purpose and handled
+//! identically: a projection registered anywhere becomes queryable
+//! everywhere, without a restart, matching `@guarantee
+//! RegistrationReachesEveryInstance` in specs/skilj.allium. This also
+//! fixes the same-process version of the identical gap this module used
+//! to carry as a known limitation ("a projection registered after
+//! `graphql_router()` was called won't gain a `ProjectionResult` member
+//! until the process restarts") - multi-instance deployment was simply
+//! the trigger for finally building it.
 
 use crate::gql_types;
 use crate::projection_types;
@@ -18,42 +25,65 @@ use arc_swap::ArcSwap;
 use async_graphql::dynamic::{Object, Schema, Subscription};
 use std::sync::Arc;
 
+/// Holds the live schema behind an `ArcSwap`, so a request in flight
+/// keeps using whichever `Arc<Schema>` it already loaded even if
+/// [`rebuild`](SchemaRegistry::rebuild) swaps in a new one concurrently -
+/// no lock a request has to wait on, no torn reads.
 pub struct SchemaRegistry {
     current: ArcSwap<Schema>,
 }
 
 impl SchemaRegistry {
+    /// Builds the initial schema - `SkiljBuilder::build()`'s own call
+    /// site (`skilj/src/lib.rs`), the same "one shared, process-wide
+    /// thing, constructed once in `.build()`" register
+    /// `event_broadcaster`/`revocation_broadcaster`/`event_cache`
+    /// already live in.
+    pub async fn build(state: GraphqlState) -> skilj_core::error::Result<Self> {
+        let schema = build(state).await?;
+        Ok(Self {
+            current: ArcSwap::from_pointee(schema),
+        })
+    }
+
+    /// The live schema - `graphql_handler`/`graphql_ws_handler`'s own
+    /// per-request read, never cached beyond one request.
     pub fn current(&self) -> Arc<Schema> {
         self.current.load_full()
     }
 
-    // TODO (Phase 3): build(), walking every registered bounded context's
-    // EventType/CommandType/Projection JSON Schemas into
-    // async_graphql::dynamic::Object/Field/TypeRef definitions (§5.1),
-    // nested under a per-bounded-context field on Query/Mutation/
-    // Subscription (§5.2), and rebuild()/swap() called whenever
-    // registration changes.
+    /// Rebuilds from scratch and atomically swaps in the result. `state`
+    /// is passed fresh by the caller each time rather than stored on
+    /// `Self` - nothing here needs to remember it between calls, and
+    /// storing it would just be a second copy of what every caller
+    /// already holds (`Skilj` itself, via `skilj::cross_instance`'s
+    /// dispatch loop).
+    pub async fn rebuild(&self, state: GraphqlState) -> skilj_core::error::Result<()> {
+        let schema = build(state).await?;
+        self.current.store(Arc::new(schema));
+        Ok(())
+    }
 }
 
-/// Builds the real schema - see this module's own doc comment for why
-/// this is a plain function today, not `SchemaRegistry::build()`. `state`
-/// is baked into the schema's own global `.data()` (not per-request -
-/// `pool`/`bootstrap_secret`/`identity` never change once built), so
-/// every resolver reaches it via `ctx.data::<GraphqlState>()`. The
-/// per-request caller `Role` is the one thing that *does* vary per
-/// request - `graphql_handler` injects that separately, via
+/// Builds one schema value from scratch - [`SchemaRegistry::build`]/
+/// [`SchemaRegistry::rebuild`]'s shared implementation, not called
+/// directly from outside this module. `state` is baked into the
+/// schema's own global `.data()` (not per-request - `pool`/
+/// `bootstrap_secret`/`identity` never change once built), so every
+/// resolver reaches it via `ctx.data::<GraphqlState>()`. The per-request
+/// caller `Role` is the one thing that *does* vary per request -
+/// `graphql_handler` injects that separately, via
 /// `async_graphql::Request::data`, not here.
 ///
 /// `async`, returning `Result`: `ProjectionQuery`'s own per-projection
 /// types (`crate::projection_types::build`) need to list every
 /// registered projection across every bounded context, a real query this
-/// function didn't need to make before - built once, here, not
-/// rebuilt when registration changes later (§5.1's aspirational
-/// `SchemaRegistry` stays a stub - see its own doc comment). `None` from
-/// `projection_types::build` (nothing registered anywhere yet) omits the
-/// `projection` field and the `ProjectionResult` union entirely, rather
-/// than registering an invalid zero-member union.
-pub async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
+/// function makes every time it runs - cheap enough to pay again on
+/// every rebuild, not worth caching separately from the schema it feeds.
+/// `None` (nothing registered anywhere yet) omits the `projection` field
+/// and the `ProjectionResult` union entirely, rather than registering an
+/// invalid zero-member union.
+async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
     let projection_types = projection_types::build(&state.pool).await?;
 
     let mut query = Object::new("Query")

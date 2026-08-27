@@ -12,6 +12,7 @@
 
 pub mod access_control;
 pub mod bootstrap;
+pub mod cross_instance;
 pub mod db;
 pub mod encryption;
 pub mod error;

@@ -102,6 +102,84 @@ fn record_event_appended(event: &Event) {
     );
 }
 
+/// `crate::cross_instance`'s sending half for the `skilj_events` channel -
+/// called alongside `record_event_appended`, at the same five call sites,
+/// for the identical "only after the commit" reason. Every listening
+/// instance (including this one) fetches the real event and republishes
+/// it into its own local `EventBroadcaster` - see `crate::cross_instance`'s
+/// own module doc comment for the full design. A `NOTIFY` failure is
+/// logged and swallowed, never propagated: the event it accompanies
+/// already committed, and this channel is a pure liveliness signal - a
+/// missed notification self-heals via the same DB-backed catch-up path a
+/// same-process lagged subscriber already takes, per `@guarantee
+/// DeliverySpansInstances` in specs/skilj.allium.
+async fn notify_event_appended(pool: &Pool, event: &Event) {
+    let payload = serde_json::json!({
+        "bounded_context": event.bounded_context.name,
+        "sequence": event.sequence,
+    })
+    .to_string();
+    if let Err(err) = sqlx::query("SELECT pg_notify('skilj_events', $1)")
+        .bind(payload)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            error = %err,
+            "NOTIFY skilj_events failed - other instances may miss this event's live push \
+             until their next poll-based read"
+        );
+    }
+}
+
+/// `crate::cross_instance`'s sending half for the `skilj_registration_changed`
+/// channel - called from the six DB-layer functions that change what the
+/// GraphQL schema needs to expose (`upsert_event_type`/`upsert_command_type`/
+/// `upsert_projection`/`insert_bounded_context`/`update_bounded_context_status`/
+/// `hard_delete_bounded_context`). No payload: which exact type or bounded
+/// context changed doesn't matter, every listener reacts identically (a
+/// full schema rebuild) - see `crate::cross_instance`'s own module doc
+/// comment. Same "log and swallow, never propagate" treatment as
+/// `notify_event_appended` and for the identical reason.
+async fn notify_registration_changed(pool: &Pool) {
+    if let Err(err) = sqlx::query("SELECT pg_notify('skilj_registration_changed', '')")
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            error = %err,
+            "NOTIFY skilj_registration_changed failed - other instances' GraphQL schema may \
+             lag until their next registration change or restart"
+        );
+    }
+}
+
+/// `crate::cross_instance`'s sending half for the `skilj_revocations`
+/// channel - `skilj-graphql`'s `access_management` resolvers are the only
+/// two callers (alongside their own `RevocationBroadcaster::publish`),
+/// hence `pub`: this is the one `notify_*` helper reached from outside
+/// this module, since revocation, unlike event/registration writes, is
+/// driven entirely from the GraphQL layer with no `db::` choke point of
+/// its own to hook. Same "log and swallow" treatment as its siblings.
+pub async fn notify_revocation(pool: &Pool, mapping: &crate::access_control::RevokedMapping) {
+    let payload = serde_json::json!({
+        "role_id": mapping.role_id,
+        "bounded_context": mapping.bounded_context,
+    })
+    .to_string();
+    if let Err(err) = sqlx::query("SELECT pg_notify('skilj_revocations', $1)")
+        .bind(payload)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            error = %err,
+            "NOTIFY skilj_revocations failed - other instances may miss this revocation's live \
+             push until their next direct database re-check"
+        );
+    }
+}
+
 /// An opaque handle to the connection pool - re-exported so `skilj-rest`/
 /// `skilj-graphql` can hold one without depending on `sqlx` directly
 /// themselves, the same crate-boundary reasoning docs/architecture.md
@@ -546,6 +624,7 @@ pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::erro
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    notify_registration_changed(pool).await;
     Ok(())
 }
 
@@ -687,6 +766,7 @@ pub async fn insert_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate::
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    notify_registration_changed(pool).await;
     Ok(())
 }
 
@@ -708,6 +788,7 @@ pub async fn update_bounded_context_status(
         .bind(name)
         .execute(pool)
         .await?;
+    notify_registration_changed(pool).await;
     Ok(())
 }
 
@@ -890,6 +971,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     .bind(et.event_read_allowed)
     .execute(pool)
     .await?;
+    notify_registration_changed(pool).await;
     Ok(())
 }
 
@@ -1057,6 +1139,7 @@ pub async fn fire_system_event(
     tx.commit().await?;
     broadcaster.publish(&event);
     record_event_appended(&event);
+    notify_event_appended(pool, &event).await;
     event_cache.append(&event).await;
 
     Ok(Some(event))
@@ -1160,6 +1243,7 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     .bind(ct.rest_trigger_allowed)
     .execute(pool)
     .await?;
+    notify_registration_changed(pool).await;
     Ok(())
 }
 
@@ -1837,6 +1921,7 @@ pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::e
     )
     .await?;
     tx.commit().await?;
+    notify_registration_changed(pool).await;
     Ok(())
 }
 
@@ -3219,6 +3304,7 @@ pub async fn insert_event_and_update_sync_projections(
     // shares).
     broadcaster.publish(event);
     record_event_appended(event);
+    notify_event_appended(pool, event).await;
     event_cache.append(event).await;
 
     Ok(())
@@ -3426,6 +3512,7 @@ pub async fn create_and_insert_external_event(
     tx.commit().await?;
     broadcaster.publish(&event);
     record_event_appended(&event);
+    notify_event_appended(pool, &event).await;
     event_cache.append(&event).await;
 
     Ok(event)
@@ -3489,6 +3576,7 @@ pub async fn create_and_insert_direct_event(
     tx.commit().await?;
     broadcaster.publish(&event);
     record_event_appended(&event);
+    notify_event_appended(pool, &event).await;
     event_cache.append(&event).await;
 
     Ok(event)
@@ -3762,6 +3850,7 @@ pub async fn submit_command(
     for event in &result.events {
         broadcaster.publish(event);
         record_event_appended(event);
+        notify_event_appended(pool, event).await;
         event_cache.append(event).await;
     }
 

@@ -36,6 +36,10 @@ fn current_trace_id() -> Option<String> {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-    let trace_id = tracing::Span::current().context().span().span_context().trace_id();
+    let trace_id = tracing::Span::current()
+        .context()
+        .span()
+        .span_context()
+        .trace_id();
     (trace_id != opentelemetry::trace::TraceId::INVALID).then(|| trace_id.to_string())
 }

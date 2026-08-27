@@ -2618,3 +2618,130 @@ directory browse and any admin-console operations (role/access
 management, type registration) - a distinct `AdminAccess`-vs-`Superadmin`
 concern from the "operate one bounded context" core this v1 targets; an
 in-app IdP login flow (v1 only ever takes a bearer token as config).
+
+## 12. Cross-instance push completeness (Codeberg issue #2)
+
+**A deliberate reversal, not a drift fix.** §10's own `EventBroadcaster`
+writeup and the async-projection poller's writeup both cite the spec's
+former blanket "Multi-instance / distributed deployment" exclusion as
+the reason real-time delivery was single-process, in-memory only. That
+exclusion has since been narrowed (`specs/skilj.allium`'s `Excludes`
+list, and the two new guarantees `@guarantee DeliverySpansInstances`/
+`@guarantee RegistrationReachesEveryInstance`) - confirmed explicitly
+with the user before touching either the spec or the code, since it
+reverses a decision made (and re-confirmed) twice before. What stays
+excluded: partitioning/sharding, consensus, leader election,
+cross-region replication, instance discovery/service registry. What's
+now in scope: real-time push completeness and schema consistency for a
+set of symmetric, stateless instances sharing one Postgres database -
+nothing more.
+
+**Investigated before designing, not assumed**: whether this needs
+instances to discover each other, whether a read/write instance split is
+needed, and whether the existing in-memory event cache and the "old
+command" concern needed new handling.
+
+- **No discovery needed.** Postgres `LISTEN`/`NOTIFY` is itself a pure
+  connection-mediated broker - every instance opens its own listening
+  connection and Postgres delivers to all of them. This is also already
+  this codebase's own pattern for multi-instance safety elsewhere: the
+  scheduler's `@guarantee ScheduleStateIsShared` and the admin
+  `BoundedContext` seeding race fix both use `SELECT ... FOR UPDATE` row
+  locking, not peer discovery.
+- **No read/write split needed.** Every existing multi-instance
+  mechanism (the two above, plus the DCB append-conflict recheck in
+  `submit_command`) is already symmetric - any instance can write,
+  coordinated purely through Postgres transactions/locks.
+  `LISTEN`/`NOTIFY` is equally symmetric.
+- **The event cache was already correct.** `skilj-core/src/event_cache.rs`
+  was already built multi-instance-safe (its own doc comment, from an
+  earlier drift-audit finding): every read compares its own highest
+  known sequence against a fresh `db::latest_sequence` and fills the gap
+  before answering. Nothing new needed here.
+- **"Old commands" turned out not to be a real risk, but the GraphQL
+  schema was.** Every real dispatch/submission call site
+  (`db::submit_command` itself, plus the `command_submission`/
+  `command_type_admin_operations`/`command_query` resolvers) already
+  calls `db::get_command_type` fresh from Postgres on every request - no
+  in-memory `CommandType` cache exists anywhere to go stale. The
+  genuinely stale-prone in-memory cache was `skilj-graphql`'s
+  `SchemaRegistry` (§5.1's own `ArcSwap<Schema>`), which had stayed a
+  deliberate stub since Phase 6 (§9's writeup): "a projection registered
+  after `graphql_router()` was called won't gain a `ProjectionResult`
+  member until the process restarts." Multi-instance deployment was
+  simply the trigger for finally building it - which also fixes the
+  same-process version of that exact gap as a side effect.
+
+**The mechanism**: one shared background task per `Skilj` instance
+(`SkiljBuilder::build()` spawns it alongside the scheduler and
+async-projection poller), holding one `sqlx::postgres::PgListener`
+(`skilj_core::cross_instance::Listener`) subscribed to three channels:
+
+1. `skilj_events` - `NOTIFY`'d from the same five `db::` call sites
+   `record_event_appended`/`EventBroadcaster::publish` already share
+   (`db::notify_event_appended`), right after commit. Payload is a
+   pointer (`bounded_context`+`sequence`), not the full event - well
+   under Postgres's 8000-byte cap, and every subscriber already
+   re-fetches/renders the real event via the DB-backed path anyway. On
+   receipt, the listener fetches the event with the plain, **uncached**
+   `db::get_event_by_sequence` and republishes it into the local
+   `EventBroadcaster`.
+2. `skilj_revocations` - `NOTIFY`'d from `access_management`'s two
+   `RevocationBroadcaster::publish` call sites (`db::notify_revocation`).
+   On receipt, republishes the `RevokedMapping` into the local
+   `RevocationBroadcaster`.
+3. `skilj_registration_changed` - `NOTIFY`'d (`db::notify_registration_changed`,
+   no payload - a bare "go check" signal) from the six `db::` functions
+   that change what the schema needs to expose
+   (`upsert_event_type`/`upsert_command_type`/`upsert_projection`/
+   `insert_bounded_context`/`update_bounded_context_status`/
+   `hard_delete_bounded_context`). On receipt, rebuilds and swaps the
+   schema via `SchemaRegistry::rebuild`.
+
+**A real bug this surfaced during verification, worth recording**: the
+first version of the event-refetch path used
+`db::get_event_by_sequence_cached` (routing through `EventCache`) rather
+than the plain uncached read. That raced with the *original* write
+path's own `event_cache.append(&event)` call for the identical
+just-committed event - this instance's own self-`NOTIFY` can be received
+and dispatched before that `.await` continuation resumes -
+and `EventCache::try_event_by_sequence`'s own `freshen()` backfill has no
+dedup against a concurrent direct `append()`, so the same event could
+land in the cache twice. Caught by `skilj/tests/event_fetch_rest.rs`'s
+own filter test going flaky (not deterministic - only sometimes
+duplicated), traced to the exact race by re-running it against a
+persistent (non-embedded) Postgres where the timing never lined up, then
+reproducing and confirming the duplicate payload directly. Fixed by
+switching the cross-instance refetch to the uncached read, which has no
+reason to touch the cache at all - it is a one-shot read with no
+repeated-read benefit to gain from caching in the first place.
+
+**Not built, and explicitly not needed**: `SchemaRegistry` itself
+already existed as a stub (`ArcSwap<Schema>`); this pass gave it real
+`build`/`rebuild` methods and changed `skilj_graphql::router` and both
+its handlers (`graphql_handler`/`graphql_ws_handler`) to read the live
+schema per-request from an `Arc<SchemaRegistry>` rather than a schema
+value baked into `axum` state once. `SkiljBuilder::build()` now builds
+this registry itself (using the same `Dispatcher`/`ProjectionDispatcherImpl`
+construction the reconciliation pass already needs *before* `Skilj`
+itself exists to hand out `command_dispatcher()`), so `graphql_router()`
+just shares it rather than building a schema per call.
+
+**No `SkiljBuilder` opt-in toggle** - always-on, resolving the proposal's
+own open question this way: nothing else in `SkiljBuilder` gates
+correctness-affecting behavior behind an opt-in, and one extra idle
+Postgres connection per instance is cheap.
+
+**Verified end-to-end, not just unit-level**:
+`skilj/tests/cross_instance.rs` runs two real `Skilj` instances, each
+its own `axum::serve` listener with its own full set of background
+tasks, sharing one Postgres database - and proves, in one flow, that (1)
+a command submitted on instance A delivers to a live `allEvents`
+subscription connected to instance B, (2) a revocation performed on
+instance A closes a *quiet* subscription on instance B (one that never
+sees another event - the only way to prove the push path, not the
+per-delivery re-check, closed it), and (3) a `Projection` registered on
+instance A becomes queryable on instance B's own GraphQL schema (checked
+via `__type(name: "Query") { fields { name } }` introspection, polled
+briefly since the rebuild is asynchronous) without instance B ever
+restarting.
