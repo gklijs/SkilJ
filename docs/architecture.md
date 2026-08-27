@@ -2585,13 +2585,54 @@ included, and catching one real mismatch this way: `allEvents`'s
 `QueriedEvent` has no `eventType` field, only `sequence`/`payload` - the
 schema-builder source alone didn't make that obvious).
 
-**No schema-driven command/event forms in v1** - there is no GraphQL
-query today that lists registered command/event types with their JSON
-Schema (only `projections`/`scheduledEventTypes` are listable that way).
-Raw JSON payload entry instead (the Commands tab), the same "don't build
-ahead of what's wired" discipline `SubjectErasure` followed earlier - a
-real, useful follow-up once such a query surface exists, not a silently
-missing feature.
+**Schema-driven command/event forms landed (Codeberg issue #8)**, once
+§13's `eventTypes`/`commandTypes` queries gave this crate something to
+build one from - the v1 gap this same section used to name is closed,
+not just narrowed. The Commands tab's free-text type name became a real
+picker over `commandTypes(boundedContext)`; picking one runs
+`form::fields_from_schema` (new `src/form.rs`, pure/I/O-free - the
+schema already came back with the type, no extra round trip) over that
+type's own JSON Schema and replaces v1's raw-JSON payload entry with a
+generated form. The Query Events tab's comma-separated free text became
+the identical picker pattern over `eventTypes`, but a multi-select
+checklist (`Space` toggles, `Enter` runs) rather than single-select,
+since `queryEvents` takes several types at once.
+
+Field classification (verified against real `schemars` 0.8 output via a
+throwaway probe crate, never assumed): a bare or `Option`-wrapped
+`"string"`/`"integer"`/`"number"` becomes a text/number input;
+`"boolean"` becomes a real toggle (`Space`), not typed text; everything
+else - `"object"`/`"array"`, or a bare `"$ref"` (schemars' identical
+encoding for both a one-level-nested object *and* a unit enum) - falls
+back to a raw-JSON input for that one field, deliberately not following
+the `$ref` to tell the two apart (real extra work for a niche win; the
+issue's own scope note allows this fallback "at least initially").
+
+A real, pre-existing bug this surfaced rather than introduced: the
+global "digits switch tabs" handling (`handle_key`) fired unconditionally,
+so typing a digit into any free-text field - including v1's own raw-JSON
+payload box - would jump tabs mid-keystroke. Latent and easy to miss
+with v1's fields (nobody happened to type a payload starting with a
+digit in testing), but the new `Widget::Number`/`Widget::Text` fields
+make it immediately and severely visible (an `amount` field *is* digits).
+Fixed by suppressing the global digit-switch specifically while editing
+Commands' generated form (`Esc` first backs out to the picker, cheaply,
+from the list already fetched - then digits switch tabs again); every
+other tab's picker-only interaction (no free text at all, post-#8) stays
+unaffected, and `ProjectionsTab`'s own free-text fields keep the
+identical latent gap, out of scope for this pass.
+
+Verified two ways: `src/form.rs`'s own unit tests (real `schema_for!`-
+shaped fixture JSON, transcribed from the probe crate) for classification
+and payload assembly, `tests/schema_driven_forms.rs` for the `App`-level
+picker/form/checklist flow (including the digit-typing regression, driven
+entirely through `App::handle` the same way `main.rs`'s loop would); and
+a genuine interactive run in a real `tmux` pty (this sandbox has no TTY,
+same `skilj-inspector` precedent as §14) against a real `skilj-demo`
+server - picked `DepositMoney`, typed `a12`/`250` into its generated
+fields (digits included, confirming the fix live), submitted, got a real
+`"accepted": true`, then toggled `MoneyDeposited` in the Query Events
+checklist and confirmed the just-created event came back.
 
 **Structure**: `src/graphql.rs` (the client - `Client::request` for
 queries/mutations, `spawn_subscription` for the `graphql-transport-ws`
@@ -2613,11 +2654,12 @@ schema file to codegen a typed client against. The same style every test
 in the rest of this workspace already uses for GraphQL responses.
 
 **Deliberately deferred past v1, named rather than silently skipped**:
-schema-driven command/event forms (above); the superadmin bounded-context
-directory browse and any admin-console operations (role/access
-management, type registration) - a distinct `AdminAccess`-vs-`Superadmin`
-concern from the "operate one bounded context" core this v1 targets; an
-in-app IdP login flow (v1 only ever takes a bearer token as config).
+the superadmin bounded-context directory browse and any admin-console
+operations (role/access management, type registration) - a distinct
+`AdminAccess`-vs-`Superadmin` concern from the "operate one bounded
+context" core this v1 targets; an in-app IdP login flow (v1 only ever
+takes a bearer token as config). Schema-driven command/event forms used
+to be listed here too - closed by Codeberg issue #8, see above.
 
 ## 12. Cross-instance push completeness (Codeberg issue #2)
 

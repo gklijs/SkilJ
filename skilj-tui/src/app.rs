@@ -2,10 +2,11 @@
 //! halves of the usual ratatui `loop { draw(&model); model = update(model, event) }`
 //! shape. `ui.rs` is the "view" half, reading this but never mutating it.
 
+use crate::form;
 use crate::graphql::{Client, ClientError};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -61,32 +62,87 @@ pub enum AppEvent {
     Term(TermEvent),
     LiveEvent(Result<Value, ClientError>),
     QueryEventsResult(Result<Value, ClientError>),
+    QueryEventsTypesResult(Result<Value, ClientError>),
     CommandResult(Result<Value, ClientError>),
+    CommandTypesResult(Result<Value, ClientError>),
     ProjectionResult(Result<Value, ClientError>),
 }
 
 const MAX_LIVE_EVENTS: usize = 200;
 
-pub struct QueryEventsTab {
-    pub event_types: TextInput,
-    pub results: Vec<Value>,
-    pub error: Option<String>,
-    pub loading: bool,
+/// One row of a `commandTypes`/`eventTypes` result - name plus the raw
+/// JSON Schema string `form::fields_from_schema` builds a form from
+/// (Commands) or nothing further needed for (Query Events, which only
+/// ever needs the name to query by).
+#[derive(Debug, Clone)]
+pub struct TypeOption {
+    pub name: String,
+    pub schema: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandField {
-    TypeName,
-    Payload,
+fn parse_type_options(data: &Value, field: &str) -> Vec<TypeOption> {
+    data.get(field)
+        .and_then(Value::as_array)
+        .map(|types| {
+            types
+                .iter()
+                .filter_map(|t| {
+                    let name = t.get("name")?.as_str()?.to_string();
+                    let schema = t.get("schema").and_then(Value::as_str).unwrap_or("").to_string();
+                    Some(TypeOption { name, schema })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Query Events - Codeberg issue #8: the free-text, comma-separated
+/// `event_types` field became a real picker over `eventTypes(boundedContext)`
+/// (§13/Codeberg issue #6's "5a"). One flat struct rather than a
+/// `CommandsTab`-style two-stage enum: picking which types to include and
+/// seeing the last query's results are never mutually exclusive views
+/// the way Commands' picker/form are - both stay visible together, the
+/// same layout the old text-field-plus-results split already had.
+pub struct QueryEventsTab {
+    pub types: Vec<TypeOption>,
+    pub checked: HashSet<usize>,
+    pub list_selected: usize,
+    pub types_loading: bool,
+    pub types_error: Option<String>,
+    pub results: Vec<Value>,
+    pub query_error: Option<String>,
+    pub query_loading: bool,
+}
+
+/// Commands - Codeberg issue #8. Picking a type and filling in its
+/// generated form are mutually exclusive views (unlike Query Events'
+/// picker+results, which coexist), so this is a real two-stage enum:
+/// `Picking` a real, registered command type, then a `Form` generated
+/// from that type's own schema (`form::fields_from_schema`) replaces
+/// v1's raw-JSON payload entry.
+pub enum CommandsStage {
+    Picking {
+        types: Vec<TypeOption>,
+        list_selected: usize,
+        loading: bool,
+        error: Option<String>,
+    },
+    Form {
+        // Carried over from `Picking` at pick time (never re-fetched) -
+        // see `commands_form_back_to_picking`'s own doc comment.
+        types: Vec<TypeOption>,
+        list_selected: usize,
+        type_name: String,
+        fields: Vec<form::Field>,
+        focus: usize,
+        result: Option<Value>,
+        error: Option<String>,
+        loading: bool,
+    },
 }
 
 pub struct CommandsTab {
-    pub focus: CommandField,
-    pub type_name: TextInput,
-    pub payload: TextInput,
-    pub result: Option<Value>,
-    pub error: Option<String>,
-    pub loading: bool,
+    pub stage: CommandsStage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,18 +187,22 @@ impl App {
             live_events: VecDeque::new(),
             live_connected: false,
             query_events: QueryEventsTab {
-                event_types: TextInput::default(),
+                types: Vec::new(),
+                checked: HashSet::new(),
+                list_selected: 0,
+                types_loading: false,
+                types_error: None,
                 results: Vec::new(),
-                error: None,
-                loading: false,
+                query_error: None,
+                query_loading: false,
             },
             commands: CommandsTab {
-                focus: CommandField::TypeName,
-                type_name: TextInput::default(),
-                payload: TextInput::default(),
-                result: None,
-                error: None,
-                loading: false,
+                stage: CommandsStage::Picking {
+                    types: Vec::new(),
+                    list_selected: 0,
+                    loading: false,
+                    error: None,
+                },
             },
             projections: ProjectionsTab {
                 focus: ProjectionField::Name,
@@ -175,7 +235,7 @@ impl App {
                 self.status = Some(format!("live events: {e}"));
             }
             AppEvent::QueryEventsResult(result) => {
-                self.query_events.loading = false;
+                self.query_events.query_loading = false;
                 match result {
                     Ok(data) => {
                         self.query_events.results = data
@@ -183,19 +243,46 @@ impl App {
                             .and_then(Value::as_array)
                             .cloned()
                             .unwrap_or_default();
-                        self.query_events.error = None;
+                        self.query_events.query_error = None;
                     }
-                    Err(e) => self.query_events.error = Some(e.to_string()),
+                    Err(e) => self.query_events.query_error = Some(e.to_string()),
+                }
+            }
+            AppEvent::QueryEventsTypesResult(result) => {
+                self.query_events.types_loading = false;
+                match result {
+                    Ok(data) => {
+                        self.query_events.types = parse_type_options(&data, "eventTypes");
+                        self.query_events.checked.clear();
+                        self.query_events.list_selected = 0;
+                        self.query_events.types_error = None;
+                    }
+                    Err(e) => self.query_events.types_error = Some(e.to_string()),
                 }
             }
             AppEvent::CommandResult(result) => {
-                self.commands.loading = false;
-                match result {
-                    Ok(data) => {
-                        self.commands.result = data.get("submitCommand").cloned();
-                        self.commands.error = None;
+                if let CommandsStage::Form { loading, error, result: slot, .. } = &mut self.commands.stage {
+                    *loading = false;
+                    match result {
+                        Ok(data) => {
+                            *slot = data.get("submitCommand").cloned();
+                            *error = None;
+                        }
+                        Err(e) => *error = Some(e.to_string()),
                     }
-                    Err(e) => self.commands.error = Some(e.to_string()),
+                }
+            }
+            AppEvent::CommandTypesResult(result) => {
+                if let CommandsStage::Picking { types, list_selected, loading, error } = &mut self.commands.stage {
+                    *loading = false;
+                    match result {
+                        Ok(data) => {
+                            *types = parse_type_options(&data, "commandTypes");
+                            *list_selected = 0;
+                            *error = None;
+                        }
+                        Err(e) => *error = Some(e.to_string()),
+                    }
                 }
             }
             AppEvent::ProjectionResult(result) => {
@@ -217,19 +304,63 @@ impl App {
             return;
         }
 
-        // Digits switch the main tab regardless of what's focused
-        // in-tab - editable fields here are plain text, not numeric, so
-        // there's no real ambiguity to worry about.
-        match key.code {
-            KeyCode::Char('1') => return self.tab = Tab::LiveEvents,
-            KeyCode::Char('2') => return self.tab = Tab::QueryEvents,
-            KeyCode::Char('3') => return self.tab = Tab::Commands,
-            KeyCode::Char('4') => return self.tab = Tab::Projections,
-            KeyCode::Esc => {
-                self.should_quit = true;
-                return;
+        // Esc backs out of a sub-view first - Commands' generated form,
+        // back to its type picker (cheaply, from the list already
+        // fetched, not a refetch) - and only quits the app when there's
+        // no such view to back out of. Ctrl+C above always quits
+        // regardless of what's focused.
+        if key.code == KeyCode::Esc {
+            if let Tab::Commands = self.tab {
+                if matches!(self.commands.stage, CommandsStage::Form { .. }) {
+                    self.commands_form_back_to_picking();
+                    return;
+                }
             }
-            _ => {}
+            self.should_quit = true;
+            return;
+        }
+
+        // Digits switch the main tab regardless of what's focused
+        // in-tab - true for every tab except Commands' own generated
+        // form (Codeberg issue #8): a schema-driven `Widget::Number`/
+        // `Widget::Text` field can legitimately contain any digit (an
+        // `amount` payload field, an `account_id` like "acc-1"), so
+        // digits there must reach the focused field instead of jumping
+        // tabs - the same reason `ProjectionsTab`'s free-text fields
+        // would have this identical issue if a projection name/key ever
+        // needed a digit, a pre-existing gap this pass doesn't touch
+        // (out of scope - issue #8 is Commands/Query Events only).
+        // Commands' *picker* stage has no text entry at all (Up/Down/
+        // Enter/`r` only), so digits stay safe to switch tabs there,
+        // same as Query Events' now-checklist-only (never free-text)
+        // picker. Switching into Query Events/Commands for the first
+        // time (or after a stage reset with nothing loaded) kicks off
+        // that tab's own type-list fetch - `r` refreshes it manually
+        // afterward.
+        let editing_generated_form =
+            self.tab == Tab::Commands && matches!(self.commands.stage, CommandsStage::Form { .. });
+        if !editing_generated_form {
+            match key.code {
+                KeyCode::Char('1') => return self.tab = Tab::LiveEvents,
+                KeyCode::Char('2') => {
+                    self.tab = Tab::QueryEvents;
+                    if self.query_events.types.is_empty() && !self.query_events.types_loading {
+                        self.fetch_event_types();
+                    }
+                    return;
+                }
+                KeyCode::Char('3') => {
+                    self.tab = Tab::Commands;
+                    if let CommandsStage::Picking { types, loading, .. } = &self.commands.stage {
+                        if types.is_empty() && !*loading {
+                            self.fetch_command_types();
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Char('4') => return self.tab = Tab::Projections,
+                _ => {}
+            }
         }
 
         match self.tab {
@@ -240,31 +371,63 @@ impl App {
         }
     }
 
+    // --- Query Events: a checklist over real eventTypes, replacing v1's
+    //     free-text comma-separated field (Codeberg issue #8) ---
+
     fn handle_query_events_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Up => {
+                self.query_events.list_selected = self.query_events.list_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let len = self.query_events.types.len();
+                if len > 0 && self.query_events.list_selected + 1 < len {
+                    self.query_events.list_selected += 1;
+                }
+            }
+            KeyCode::Char(' ') => {
+                let idx = self.query_events.list_selected;
+                if idx < self.query_events.types.len() && !self.query_events.checked.remove(&idx) {
+                    self.query_events.checked.insert(idx);
+                }
+            }
+            KeyCode::Char('r') => self.fetch_event_types(),
             KeyCode::Enter => self.submit_query_events(),
-            KeyCode::Backspace => self.query_events.event_types.backspace(),
-            KeyCode::Char(c) => self.query_events.event_types.push(c),
             _ => {}
         }
+    }
+
+    fn fetch_event_types(&mut self) {
+        self.query_events.types_loading = true;
+        self.query_events.types_error = None;
+        let client = self.client.clone();
+        let tx = self.events_tx.clone();
+        let bounded_context = self.bounded_context.clone();
+        tokio::spawn(async move {
+            let result = client
+                .request(
+                    "query($bc: String!) { eventTypes(boundedContext: $bc) { name schema } }",
+                    serde_json::json!({ "bc": bounded_context }),
+                )
+                .await;
+            let _ = tx.send(AppEvent::QueryEventsTypesResult(result));
+        });
     }
 
     fn submit_query_events(&mut self) {
         let event_types: Vec<Value> = self
             .query_events
-            .event_types
-            .value
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| Value::String(s.to_string()))
+            .checked
+            .iter()
+            .filter_map(|&i| self.query_events.types.get(i))
+            .map(|t| Value::String(t.name.clone()))
             .collect();
         if event_types.is_empty() {
-            self.query_events.error = Some("enter at least one event type (comma-separated)".into());
+            self.query_events.query_error = Some("select at least one event type (Space to toggle)".into());
             return;
         }
-        self.query_events.loading = true;
-        self.query_events.error = None;
+        self.query_events.query_loading = true;
+        self.query_events.query_error = None;
         let client = self.client.clone();
         let tx = self.events_tx.clone();
         let bounded_context = self.bounded_context.clone();
@@ -281,45 +444,154 @@ impl App {
         });
     }
 
+    // --- Commands: pick a real, registered command type, then fill in
+    //     the form generated from its own schema (Codeberg issue #8) ---
+
     fn handle_commands_key(&mut self, key: KeyEvent) {
+        match &self.commands.stage {
+            CommandsStage::Picking { .. } => self.handle_commands_picking_key(key),
+            CommandsStage::Form { .. } => self.handle_commands_form_key(key),
+        }
+    }
+
+    fn handle_commands_picking_key(&mut self, key: KeyEvent) {
+        let CommandsStage::Picking { types, list_selected, .. } = &mut self.commands.stage else {
+            return;
+        };
         match key.code {
-            KeyCode::Tab => {
-                self.commands.focus = match self.commands.focus {
-                    CommandField::TypeName => CommandField::Payload,
-                    CommandField::Payload => CommandField::TypeName,
-                };
+            KeyCode::Up => *list_selected = list_selected.saturating_sub(1),
+            KeyCode::Down => {
+                if !types.is_empty() && *list_selected + 1 < types.len() {
+                    *list_selected += 1;
+                }
             }
-            KeyCode::Enter => self.submit_command(),
-            KeyCode::Backspace => self.commands_focused_field().backspace(),
-            KeyCode::Char(c) => self.commands_focused_field().push(c),
+            KeyCode::Enter => self.pick_command_type(),
+            KeyCode::Char('r') => self.fetch_command_types(),
             _ => {}
         }
     }
 
-    fn commands_focused_field(&mut self) -> &mut TextInput {
-        match self.commands.focus {
-            CommandField::TypeName => &mut self.commands.type_name,
-            CommandField::Payload => &mut self.commands.payload,
+    fn fetch_command_types(&mut self) {
+        if let CommandsStage::Picking { loading, error, .. } = &mut self.commands.stage {
+            *loading = true;
+            *error = None;
+        }
+        let client = self.client.clone();
+        let tx = self.events_tx.clone();
+        let bounded_context = self.bounded_context.clone();
+        tokio::spawn(async move {
+            let result = client
+                .request(
+                    "query($bc: String!) { commandTypes(boundedContext: $bc) { name schema } }",
+                    serde_json::json!({ "bc": bounded_context }),
+                )
+                .await;
+            let _ = tx.send(AppEvent::CommandTypesResult(result));
+        });
+    }
+
+    /// Enter on a picked row - generates the form from that type's own
+    /// schema (`form::fields_from_schema`, no extra round trip: the
+    /// schema already came back with the type list) and carries `types`/
+    /// `list_selected` into `Form` too, so `commands_form_back_to_picking`
+    /// can restore the picker without a refetch.
+    fn pick_command_type(&mut self) {
+        let CommandsStage::Picking { types, list_selected, .. } = &self.commands.stage else {
+            return;
+        };
+        let Some(picked) = types.get(*list_selected) else {
+            return;
+        };
+        let type_name = picked.name.clone();
+        let fields = form::fields_from_schema(&picked.schema);
+        let types = types.clone();
+        let list_selected = *list_selected;
+        self.commands.stage = CommandsStage::Form {
+            types,
+            list_selected,
+            type_name,
+            fields,
+            focus: 0,
+            result: None,
+            error: None,
+            loading: false,
+        };
+    }
+
+    fn commands_form_back_to_picking(&mut self) {
+        let CommandsStage::Form { types, list_selected, .. } = &self.commands.stage else {
+            return;
+        };
+        self.commands.stage = CommandsStage::Picking {
+            types: types.clone(),
+            list_selected: *list_selected,
+            loading: false,
+            error: None,
+        };
+    }
+
+    fn handle_commands_form_key(&mut self, key: KeyEvent) {
+        let CommandsStage::Form { fields, focus, .. } = &mut self.commands.stage else {
+            return;
+        };
+        match key.code {
+            KeyCode::Tab => {
+                if !fields.is_empty() {
+                    *focus = (*focus + 1) % fields.len();
+                }
+            }
+            KeyCode::Enter => self.submit_command(),
+            KeyCode::Backspace => {
+                if let Some(field) = fields.get_mut(*focus) {
+                    match &mut field.widget {
+                        form::Widget::Text(s) | form::Widget::Number(s) | form::Widget::RawJson(s) => {
+                            s.pop();
+                        }
+                        form::Widget::Bool(_) => {}
+                    }
+                }
+            }
+            // Space toggles a focused boolean field; for every other
+            // widget it's an ordinary character (a raw-JSON or string
+            // value may legitimately contain one).
+            KeyCode::Char(' ') => {
+                if let Some(field) = fields.get_mut(*focus) {
+                    match &mut field.widget {
+                        form::Widget::Bool(b) => *b = !*b,
+                        form::Widget::Text(s) | form::Widget::Number(s) | form::Widget::RawJson(s) => {
+                            s.push(' ');
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(field) = fields.get_mut(*focus) {
+                    if let form::Widget::Text(s) | form::Widget::Number(s) | form::Widget::RawJson(s) =
+                        &mut field.widget
+                    {
+                        s.push(c);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     fn submit_command(&mut self) {
-        let type_name = self.commands.type_name.value.trim().to_string();
-        if type_name.is_empty() {
-            self.commands.error = Some("enter a command type name".into());
+        let CommandsStage::Form { type_name, fields, loading, error, .. } = &mut self.commands.stage else {
             return;
-        }
-        let payload_str = if self.commands.payload.value.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            self.commands.payload.value.clone()
         };
-        if let Err(e) = serde_json::from_str::<Value>(&payload_str) {
-            self.commands.error = Some(format!("payload is not valid JSON: {e}"));
-            return;
-        }
-        self.commands.loading = true;
-        self.commands.error = None;
+        let payload = match form::assemble_payload(fields) {
+            Ok(payload) => payload,
+            Err(e) => {
+                *error = Some(e);
+                return;
+            }
+        };
+        *loading = true;
+        *error = None;
+        let type_name = type_name.clone();
+        let payload_str = payload.to_string();
         let client = self.client.clone();
         let tx = self.events_tx.clone();
         let bounded_context = self.bounded_context.clone();

@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod form;
 pub mod graphql;
 pub mod projection_query;
 pub mod ui;
