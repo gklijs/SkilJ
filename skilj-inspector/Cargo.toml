@@ -1,0 +1,23 @@
+[package]
+name = "skilj-inspector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A read-only Ratatui console that connects directly to Postgres, for browsing a skilj deployment's schemas/events/projection state when skilj-graphql itself isn't running. See docs/architecture.md §14. Unlike skilj-tui (a pure GraphQL client), this depends on skilj-core directly - raw Postgres access is the whole point."
+
+[dependencies]
+skilj-core.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+clap.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+postgresql_embedded = "0.21.0"
+serde_json.workspace = true
+
+[[bin]]
+name = "skilj-inspector"
+path = "src/main.rs"

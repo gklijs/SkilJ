@@ -8,6 +8,7 @@ members = [
     "skilj",
     "skilj-demo",
     "skilj-tui",
+    "skilj-inspector",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -26,6 +27,11 @@ members = [
 #                 dependency on any other skilj crate (§11) - speaks the
 #                 wire protocol only, the same "independently usable"
 #                 spirit §3.1 gives the surface crates, from the other side.
+# skilj-inspector - a second, deliberately different Ratatui console
+#                 (§14): raw, read-only Postgres access for when
+#                 skilj-graphql itself isn't running, so it depends on
+#                 skilj-core directly rather than staying a wire client -
+#                 the opposite trade-off from skilj-tui, made on purpose.
 
 [workspace.package]
 version = "0.1.0"

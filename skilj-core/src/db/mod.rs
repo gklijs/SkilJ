@@ -1023,6 +1023,57 @@ pub async fn list_scheduled_event_types(
         .collect())
 }
 
+/// Every `EventType` registered in `bounded_context`, unfiltered -
+/// `TypeRegistration`'s own `eventTypes` GraphQL query (Codeberg issue
+/// #6's "5a": the self-describing surface `skilj-tui`'s Commands/Query
+/// Events tabs need to offer a real type picker instead of a name typed
+/// by hand). Same shape as `list_scheduled_event_types` immediately
+/// above, minus its `WHERE system_triggered_allowed = true` filter -
+/// every type, not just the scheduled subset. Ordered by `name`, `[]`
+/// for an unknown `bounded_context`, same reasoning as its sibling.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_event_types_for_bounded_context(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<EventType>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(Vec::new());
+    };
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<EventTypeRow> = sqlx::query_as(&format!(
+        "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types ORDER BY name"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.into_domain(bc.clone()))
+        .collect())
+}
+
+/// `CommandType`'s own equivalent of `list_event_types_for_bounded_context`
+/// immediately above - identical reasoning, `TypeRegistration`'s
+/// `commandTypes` GraphQL query.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_command_types_for_bounded_context(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<CommandType>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(Vec::new());
+    };
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<CommandTypeRow> = sqlx::query_as(&format!(
+        "SELECT {COMMAND_TYPE_COLUMNS} FROM {schema}.command_types ORDER BY name"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.into_domain(bc.clone()))
+        .collect())
+}
+
 /// `rule CreateSystemEvent`'s own atomic whole, and `SequenceIsGaplessPerBoundedContext`'s
 /// enforcement for a fired occurrence - locks `event_type_name`'s own
 /// `event_types` row (`SELECT ... FOR UPDATE`), re-derives eligibility

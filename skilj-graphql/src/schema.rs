@@ -90,6 +90,8 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
         .field(resolvers::bounded_context_directory::field())
         .field(resolvers::type_registration::projections_field())
         .field(resolvers::type_registration::scheduled_event_types_field())
+        .field(resolvers::type_registration::event_types_field())
+        .field(resolvers::type_registration::command_types_field())
         .field(resolvers::event_query::query_events_field())
         .field(resolvers::event_query::count_events_field())
         .field(resolvers::event_query::inspect_event_field())

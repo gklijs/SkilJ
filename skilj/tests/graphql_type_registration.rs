@@ -702,3 +702,94 @@ fn register_projection_rejects_a_malformed_schema() {
         );
     });
 }
+
+/// Codeberg issue #6's "5a" - the self-describing GraphQL surface a real
+/// command/event type picker needs, closing the gap `scheduledEventTypes`
+/// alone left (only the scheduled subset was ever listable). `eventTypes`/
+/// `commandTypes` return every registered type in the bounded context,
+/// unfiltered.
+#[test]
+fn event_types_and_command_types_list_every_registered_type() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        // Nothing registered yet - both queries return an empty list, not
+        // an error, same "nothing to show" treatment `scheduledEventTypes`/
+        // `projections` already give an unregistered bounded context.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { eventTypes(boundedContext: $bc) { name } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["eventTypes"], json!([]));
+
+        // Gating: no caller at all is rejected before anything runs, same
+        // as every other AdminAccess-gated field on this surface.
+        let response = graphql_request(
+            &router,
+            None,
+            "query($bc: String!) { eventTypes(boundedContext: $bc) { name } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(response["errors"][0]["extensions"]["code"], "unauthenticated");
+
+        graphql_request(
+            &router,
+            Some(&jwt),
+            REGISTER_EVENT_TYPE_MUTATION,
+            json!({ "bc": bc_name, "name": "MoneyDeposited" }),
+        )
+        .await;
+        graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                registerCommandType(boundedContext: $bc, name: $name, schema: \"{}\", \
+                    tagMappings: [], sensitiveFields: [], restTriggerAllowed: true) { name } \
+            }",
+            json!({ "bc": bc_name, "name": "WithdrawMoney" }),
+        )
+        .await;
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { \
+                eventTypes(boundedContext: $bc) { \
+                    name schemaVersion tagMappings { key field } externalCreationAllowed \
+                } \
+            }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let event_types = response["data"]["eventTypes"].as_array().unwrap();
+        assert_eq!(event_types.len(), 1);
+        assert_eq!(event_types[0]["name"], "MoneyDeposited");
+        assert_eq!(event_types[0]["tagMappings"][0]["key"], "account");
+        assert_eq!(event_types[0]["externalCreationAllowed"], true);
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { \
+                commandTypes(boundedContext: $bc) { name schemaVersion restTriggerAllowed } \
+            }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let command_types = response["data"]["commandTypes"].as_array().unwrap();
+        assert_eq!(command_types.len(), 1);
+        assert_eq!(command_types[0]["name"], "WithdrawMoney");
+        assert_eq!(command_types[0]["restTriggerAllowed"], true);
+    });
+}

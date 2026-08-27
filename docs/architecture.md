@@ -2745,3 +2745,108 @@ instance A becomes queryable on instance B's own GraphQL schema (checked
 via `__type(name: "Query") { fields { name } }` introspection, polled
 briefly since the rebuild is asynchronous) without instance B ever
 restarting.
+
+## 13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (Codeberg issue #6, "5a")
+
+`TypeRegistration`'s `projections`/`scheduledEventTypes` queries already
+let a caller discover what's registered without already knowing its
+name; `eventTypes(boundedContext: String!)`/`commandTypes(boundedContext:
+String!)` close the identical gap for event and command types
+themselves - `skilj-tui`'s Commands/Query Events tabs (and issue #8's
+schema-driven forms, once picked up) need a real type picker instead of
+a name typed by hand.
+
+Two new `db::` functions, `list_event_types_for_bounded_context`/
+`list_command_types_for_bounded_context` (`skilj-core/src/db/mod.rs`) -
+the same query `list_scheduled_event_types` already runs, minus its
+`WHERE system_triggered_allowed = true` filter. Two new `AdminAccess`-
+gated GraphQL fields on `Query`
+(`skilj-graphql/src/resolvers/type_registration.rs`'s
+`event_types_field`/`command_types_field`), copying
+`scheduled_event_types_field`'s own shape exactly. `specs/skilj.allium`'s
+`TypeRegistration` surface gained two new unfiltered `exposes:` loops
+(`for event_type in bounded_context.event_types`/`for command_type in
+bounded_context.command_types`) that deliberately stay separate from the
+existing `where system_triggered_allowed = true`-filtered `scheduled_type`
+loop rather than folding into it - the scheduled-only fields
+(`system_triggered_schedule`/`missed_occurrence_policy`/`last_fired_at`/
+`schedule_position`) would otherwise show as empty/null for every
+non-scheduled type, contradicting that loop's own existing "types never
+opted into scheduling are left out rather than listed with three empty
+values" design. `@guarantee GrantScopedToBoundedContext` got one more
+sentence confirming the same context-scoping already promised for
+projections/scheduled types applies here too.
+
+Verified end-to-end in `skilj/tests/graphql_type_registration.rs`
+(`event_types_and_command_types_list_every_registered_type`): registers
+one event type and one command type via the real mutations, queries both
+new fields, and asserts the full registered set comes back - plus the
+empty-bounded-context and unauthenticated-caller cases every other field
+on this surface already covers.
+
+## 14. `skilj-inspector` - a standalone read-only Postgres console (Codeberg issue #6, "5b")
+
+Even with §13's fix, everything about a running `skilj` deployment still
+requires `skilj-graphql` itself to be up - the exact moment an operator
+most wants to look (the app is down, Postgres isn't) has no tool at all.
+`skilj-inspector` is a second Ratatui console, built the opposite way
+from `skilj-tui` on purpose: where that crate is deliberately a pure
+GraphQL client with zero dependency on any other skilj crate (§11),
+`skilj-inspector` depends on `skilj-core` directly, since raw Postgres
+access *is* the whole point - there's no `Role`/`RoleAccessMapping`
+layer to authenticate against when nothing is serving GraphQL. One
+required arg, `--database-url`/`DATABASE_URL`, no IdP config, no token.
+
+**Read-only by construction, not just convention** - stated as an
+explicit doc comment on the crate root: every function in its `data`
+module calls only existing `skilj_core::db` read functions
+(`list_bounded_contexts`, the two new `list_*_types_for_bounded_context`
+from §13, `list_projections_for_bounded_context`,
+`list_recent_events_for_bounded_context`), reusing them rather than
+re-deriving SQL in a second place, and the crate never calls
+`db::migrate` or any write path. One real gap this surfaced:
+`list_recent_events_for_bounded_context` (like `list_events_for_bounded_context`)
+`.expect()`s the bounded context row already exists, assuming its caller
+already checked - true for every existing caller, but not for a tool
+whose whole premise is "look something up without already knowing it's
+there." `data::load_bounded_context_data` now checks
+`db::get_bounded_context` first and short-circuits to the same
+all-empty shape the other three list functions already give an
+unregistered context, rather than propagating that panic.
+
+**Sensitive fields render as ciphertext, always** - confirmed with the
+project owner as this crate's one real open design question before
+building it (raw Postgres access bypasses GraphQL's per-field
+entitlement check entirely, so *something* has to be decided here). The
+chosen answer needed zero special-case code to implement correctly:
+`encryption::encrypt_leaf` already substitutes ciphertext directly into
+the JSON payload leaf at write time, so the stored `payload` column
+already *is* ciphertext for every sensitive field before this crate's
+read path ever runs - rendering a row exactly as stored is already
+correct. This crate never accepts an `EncryptionMasterKey` and has no
+decryption code path at all, not even behind a flag; anyone needing
+plaintext goes through GraphQL, where the real entitlement check
+(`can_read_sensitive`/subject-match) lives and stays the only path to
+it.
+
+**UI shape** mirrors `skilj-tui`'s own `app.rs`/`ui.rs` split (a `Tab`
+enum, one `App` struct `handle_key` mutates, one `draw()` per tab) -
+five tabs (Bounded Contexts, then within a selected one: Event Types,
+Command Types, Projections, Events) rather than reinventing the
+pattern. Simpler than `skilj-tui`'s own loop in one respect: no live
+subscription means no background task or input channel is needed - a
+plain `crossterm::event::poll` loop is enough, since every read is
+already a key press away.
+
+Verified two ways: `skilj-inspector/tests/data.rs` against real
+(embedded) Postgres, seeding directly through `skilj_core` writes
+(including a real encrypted sensitive field via
+`db::create_and_insert_direct_event` - the same function the REST
+direct-creation endpoint itself calls) and asserting the read layer's
+output, especially that a sensitive field's plaintext never appears in
+what comes back; and a genuine interactive run in a real `tmux` pty
+(this sandboxed environment has no TTY, so a plain `cargo run` hangs on
+`enable_raw_mode`) against a freshly seeded database - drilled into a
+bounded context, cycled through all five tabs, confirmed the sensitive
+field rendered as ciphertext on screen (not just in the test assertion),
+and quit cleanly with `q`.

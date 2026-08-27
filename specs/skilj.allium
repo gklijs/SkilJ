@@ -4774,6 +4774,25 @@ surface TypeRegistration {
             scheduled_type.last_fired_at
             scheduled_type.schedule_position
 
+        for event_type in bounded_context.event_types:
+            event_type.name
+            event_type.schema
+            event_type.schema_version
+            event_type.tag_mappings
+            event_type.sensitive_fields
+            event_type.external_creation_allowed
+            event_type.direct_creation_allowed
+            event_type.system_triggered_allowed
+            event_type.event_read_allowed
+
+        for command_type in bounded_context.command_types:
+            command_type.name
+            command_type.schema
+            command_type.schema_version
+            command_type.tag_mappings
+            command_type.sensitive_fields
+            command_type.rest_trigger_allowed
+
     provides:
         RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
             sensitive_fields, external_creation_allowed, direct_creation_allowed,
@@ -4799,7 +4818,11 @@ surface TypeRegistration {
         -- the rebuilds visible here are those of its own context's
         -- projections, and a projection in any other context is not merely
         -- unrebuildable but invisible. The scheduled event types shown here
-        -- are scoped identically: its own context's, and no other's.
+        -- are scoped identically: its own context's, and no other's - and
+        -- so is the full event type and command type listing: an event
+        -- type or command type registered against any other bounded
+        -- context is not merely unlisted but invisible here, the same as
+        -- everything else this surface shows.
 
     @guarantee ScheduleStateIsShared
         -- What an admin reads about a scheduled event type here - its
