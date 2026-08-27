@@ -1,0 +1,21 @@
+[package]
+name = "{{project-name}}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Not on crates.io yet - see this project's own README.md and
+# docs/open-source-todo.md in the skilj repo for switching this to a
+# real version once it is.
+skilj = { git = "https://codeberg.org/gklijs/SklilJ" }
+skilj-core = { git = "https://codeberg.org/gklijs/SklilJ" }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "0.8", features = ["chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"

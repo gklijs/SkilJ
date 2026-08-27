@@ -1,0 +1,9 @@
+[template]
+cargo_generate_version = ">=0.20.0"
+
+[placeholders]
+# No custom placeholders - the example "wallet" bounded context is
+# deliberately concrete, not itself parameterized (see the template's
+# own README.md and docs/proposals/08-scaffolding-template.md for why).
+# Only cargo-generate's own built-in `project-name`/`crate_name` are
+# used, in Cargo.toml and src/bin/server.rs respectively.
