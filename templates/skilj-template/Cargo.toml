@@ -4,11 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Not on crates.io yet - see this project's own README.md and
-# docs/open-source-todo.md in the skilj repo for switching this to a
-# real version once it is.
-skilj = { git = "https://codeberg.org/gklijs/SklilJ" }
-skilj-core = { git = "https://codeberg.org/gklijs/SklilJ" }
+skilj = "0.0.1"
+skilj-core = "0.0.1"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }

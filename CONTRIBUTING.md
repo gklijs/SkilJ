@@ -21,9 +21,10 @@ known environment quirk on some Linux setups, not a code problem.
 ## Where things live
 
 - [`specs/skilj.allium`](specs/skilj.allium) is the behavioural
-  specification, written in the [Allium](https://codeberg.org/gklijs/SklilJ)
-  spec language. It describes *what* the system guarantees, independent
-  of the Rust implementation.
+  specification, written in Allium (a spec language/tooling used to
+  describe system behaviour independent of any implementation). It
+  describes *what* the system guarantees, independent of the Rust
+  implementation.
 - [`docs/architecture.md`](docs/architecture.md) explains *how* the
   spec is realised in Rust - crate boundaries, design decisions, and
   the reasoning behind them.
@@ -31,9 +32,8 @@ known environment quirk on some Linux setups, not a code problem.
 If your change affects observable system behaviour (a new rule, a
 changed guarantee, a new surface), please update `specs/skilj.allium`
 alongside the code, and run `allium check` against it if you have the
-[Allium CLI](https://codeberg.org/gklijs/SklilJ) installed. Changes
-that are pure implementation detail (refactors, performance work, doc
-fixes) don't need a spec change.
+Allium CLI installed. Changes that are pure implementation detail
+(refactors, performance work, doc fixes) don't need a spec change.
 
 ## Pull requests
 

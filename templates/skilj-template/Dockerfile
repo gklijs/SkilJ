@@ -10,16 +10,10 @@ FROM rust:1-alpine AS builder
 # `cargo build` - no cross-compiler needed, unlike cross-compiling the
 # musl target from a glibc-based image (which would need a separate
 # `x86_64-linux-musl-gcc`).
-RUN apk add --no-cache musl-dev openssh-client git ca-certificates \
-    && mkdir -p -m 0700 ~/.ssh && ssh-keyscan codeberg.org >> ~/.ssh/known_hosts
-# `skilj`/`skilj-core` aren't on crates.io yet (see this crate's own
-# Cargo.toml and README.md) - this build needs the host's ssh-agent
-# forwarded in (`docker build --ssh default ...`, not a key baked into a
-# layer) to fetch the private git dependency.
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN apk add --no-cache musl-dev ca-certificates
 WORKDIR /app
 COPY . .
-RUN --mount=type=ssh cargo build --release --target x86_64-unknown-linux-musl
+RUN cargo build --release --target x86_64-unknown-linux-musl
 
 # `x86_64-unknown-linux-musl` statically links by default (the target's
 # `crt-static` default) - that's the actual precondition for `scratch`

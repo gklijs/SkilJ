@@ -1,42 +1,123 @@
 # SklilJ
 
-`skilj` is a Rust library for building event-sourced, DDD-style applications backed by
-Postgres, using a Dynamic Consistency Boundary (DCB) instead of classic per-aggregate event
-sourcing - a command's consistency check spans exactly the tags it needs, not one fixed
-aggregate boundary. It exposes a GraphQL surface and a REST surface, and is built to guide an
-AI coding agent toward a correct, well-structured solution: the domain model is spec-first,
-data is encrypted/decrypted consistently, every surface is access-controlled, and adding a new
-event/command/projection follows one repeatable shape.
+`skilj` is a Rust library for building event-sourced applications backed by Postgres. You define
+your domain as **events** (facts that happened) and **commands** (requests to make something
+happen), and `skilj` handles storage, consistency checking, and exposing it all over GraphQL and
+REST — so you can focus on the domain logic itself.
 
-See [`specs/skilj.allium`](specs/skilj.allium) for the full behavioural specification, and
-[`docs/architecture.md`](docs/architecture.md) for how it's built in Rust.
+## Why not classic aggregates?
 
-## Crates
+Most event-sourced libraries make you pick one fixed "aggregate" boundary up front (an `Account`,
+an `Order`) and every command for that aggregate replays its entire history. `skilj` uses a
+**Dynamic Consistency Boundary (DCB)** instead: events and commands carry tags (e.g. `wallet:
+"w1"`), and a command's consistency check spans exactly the tagged events it needs — no more, no
+less. A command that touches two things at once (say, enrolling a student in a course) can check
+both their histories in one atomic decision, without either one having to "own" the other.
 
-| Crate | What it is |
-|---|---|
-| [`skilj`](skilj) | The main facade - a thin wrapper over `skilj-core`/`skilj-graphql`/`skilj-rest`. Start here. |
-| [`skilj-core`](skilj-core) | The domain engine: entities, rules, the plugin API, and persistence. Zero web-framework dependency. |
-| [`skilj-graphql`](skilj-graphql) | The GraphQL surface - a runtime-rebuilt dynamic schema and resolvers, independently usable. |
-| [`skilj-rest`](skilj-rest) | The REST surface - narrowly-scoped, `AccessToken`-authenticated routes for agents and automated callers. |
-| [`skilj-macros`](skilj-macros) | Two narrowly-scoped proc-macros used internally (re-exported through `skilj-core`, not usually added directly). |
-| [`skilj-codegen`](skilj-codegen) | Optional `build.rs` codegen: turns a declarative `.skilj.toml` bounded-context file into real Rust `EventType`/`CommandType` impls. |
-| [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a Ratatui operator console, a pure GraphQL client for any `skilj` deployment. |
-| [`skilj-inspector`](skilj-inspector) | `cargo install skilj-inspector` - a read-only Ratatui console that talks directly to Postgres, for when `skilj-graphql` isn't running. |
+## A quick look
 
-`skilj-demo` (in this repo, not published) is a full worked example - two bounded contexts
-(banking, courses) showing what the DCB buys over classic per-aggregate event sourcing.
+This is trimmed from [`templates/skilj-template/src/wallet.rs`](templates/skilj-template/src/wallet.rs)
+— see that file for the complete, running version:
+
+```rust
+// An event: something that happened, tagged by which wallet it belongs to.
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct WithdrawnPayload { wallet_id: String, amount: i64 }
+
+struct Withdrawn;
+
+#[auto_register(BOUNDED_CONTEXT)]
+impl EventType for Withdrawn {
+    type Payload = WithdrawnPayload;
+    const NAME: &'static str = "Withdrawn";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![TagMapping { key: "wallet".into(), field: "wallet_id".into() }]
+    }
+}
+
+// A command: a request, decided against only the events sharing its tags -
+// here, every Deposited/Withdrawn event for this one wallet, nothing else.
+struct Withdraw;
+
+#[auto_register(BOUNDED_CONTEXT)]
+impl CommandType for Withdraw {
+    type Payload = WithdrawPayload;
+    type Event = WalletEvent;
+    const NAME: &'static str = "Withdraw";
+    fn tag_mappings() -> Vec<TagMapping> { /* same as above */ }
+
+    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
+        let balance = balance_of(matching_events);
+        if payload.amount > balance {
+            return CommandDecision::Rejected {
+                reason: format!("insufficient funds: balance is {balance}"),
+                kind: "insufficient_funds".into(),
+            };
+        }
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "Withdrawn".into(),
+                payload: serde_json::json!({ "wallet_id": payload.wallet_id, "amount": payload.amount }),
+            }],
+        }
+    }
+}
+```
+
+That's it — no separate storage layer to wire up, no aggregate repository to implement. Add a
+`Projection` (also shown in `wallet.rs`) when you need a read-optimised view instead of replaying
+events on every query.
 
 ## Getting started
+
+The fastest way to try it is to generate a small, working project:
+
+```sh
+cargo generate --git https://codeberg.org/gklijs/SklilJ.git templates/skilj-template
+```
+
+That gives you a runnable server with one bounded context (the wallet example above) already
+wired up — see its own README for how to run it against Postgres.
+
+To add `skilj` to an existing project instead:
 
 ```toml
 [dependencies]
 skilj = "0.0"
 ```
 
-See [`skilj-demo`](skilj-demo) for a complete, runnable example, and
-[`.claude/skills/skilj/`](.claude/skills/skilj) for a Claude Code skill that walks an AI agent
-through adding a new event/command/projection to an existing bounded context.
+[`skilj-demo`](skilj-demo) in this repository is a larger worked example (two bounded contexts:
+banking and courses) if you want to see more before committing.
+
+## Crates in this workspace
+
+| Crate | What it is |
+|---|---|
+| [`skilj`](skilj) | The main library - start here. A thin facade over `skilj-core`/`skilj-graphql`/`skilj-rest`. |
+| [`skilj-core`](skilj-core) | The domain engine: events, commands, projections, and persistence. No web framework dependency. |
+| [`skilj-graphql`](skilj-graphql) | The GraphQL surface - usable on its own if you don't need REST. |
+| [`skilj-rest`](skilj-rest) | The REST surface - authenticated routes for agents and automated callers. |
+| [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file instead of hand-writing it. |
+| [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a terminal console (GraphQL client) for browsing and operating a running deployment. |
+| [`skilj-inspector`](skilj-inspector) | `cargo install skilj-inspector` - a terminal console that reads straight from Postgres, for when the GraphQL server isn't running. |
+| [`skilj-macros`](skilj-macros) | Internal proc-macros, re-exported through `skilj-core` - you won't normally add this directly. |
+
+## Documentation
+
+- [`specs/skilj.allium`](specs/skilj.allium) - the behavioural specification: what the system
+  guarantees, independent of the Rust code.
+- [`docs/architecture.md`](docs/architecture.md) - how that's actually built in Rust, including
+  the reasoning behind each design decision. It's written as a running design log, so later
+  sections assume you've read the earlier ones.
+- [`docs/rest-event-reading.md`](docs/rest-event-reading.md) - the three ways to consume the REST
+  event stream and when to use each.
+
+## Contributing
+
+Bug reports and pull requests are welcome - see [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to
+build, test, and submit changes, and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for community
+expectations. Found a security issue? See [`SECURITY.md`](SECURITY.md) instead of opening a
+public issue.
 
 ## License
 
@@ -51,40 +132,3 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
 in this project, as defined in the Apache-2.0 license, shall be dual-licensed as above, without
 any additional terms or conditions.
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build, test, and submit changes,
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for community expectations,
-[`SECURITY.md`](SECURITY.md) for how to report a vulnerability, and
-[`CHANGELOG.md`](CHANGELOG.md) for release notes.
-
-## Reading events over REST
-
-If you're a machine caller holding an `EventReadToken` (an AI agent, a remote workflow, an
-adapter), there are three ways to read a token's event stream, each trading off differently. Pick
-based on how your own process fails, not just on which is "best":
-
-| | Who remembers where you are | If your process crashes mid-read | Best for |
-|---|---|---|---|
-| **Client-tracked** (`GET /v1/events?after=...`) | You do | You resume exactly where you left off — you control the position | You already persist a checkpoint somewhere (a database row, a file) and want full control |
-| **Server-tracked, auto-advance** (`GET /v1/events/consume?mode=auto`) | SkilJ does, per token | You lose whatever you were served but hadn't finished handling — SkilJ won't send it again | Quick integrations, stateless workers, scripts — no checkpoint to manage at all, occasional missed events on crash is fine |
-| **Server-tracked, manual-ack** (`GET /v1/events/consume?mode=manual` + `POST /v1/events/consume/ack`) | SkilJ does, per token, but only once you confirm | You get the same events again next time — nothing is lost | Processing that must never silently drop an event, as long as your handler is safe to run twice on the same event (idempotent) |
-
-A few things that trip people up:
-
-- **One token = one read position.** If you want two independent places in the stream (say, two
-  worker instances), mint two `EventReadToken`s rather than trying to share one — there's no
-  separate "consumer name" to pass.
-- **Auto-advance and manual-ack are a one-time choice per token.** Whichever mode a token's first
-  `consume` call uses is the mode it keeps for that token's lifetime. Want to switch? Use a new
-  token.
-- **Manual-ack can redeliver duplicates, on purpose.** If you fetch a batch and crash before
-  acknowledging it, the next fetch serves the same batch again. This library doesn't de-duplicate
-  for you — your handler needs to be safe to run twice on the same event (e.g. keyed by the
-  event's own `sequence`).
-- **Mixing modes on one token is allowed but not coordinated.** `GET /v1/events` (client-tracked)
-  never reads or moves a token's server-side cursor, so using both against the same token gives
-  you two positions that know nothing about each other.
-
-See §7 of [`docs/architecture.md`](docs/architecture.md) for the full wire contract (routes,
-request/response shapes, error codes), and `entity ReadCursor` in
-[`specs/skilj.allium`](specs/skilj.allium) for the underlying behavioural guarantee.
