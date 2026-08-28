@@ -772,7 +772,10 @@ fn same_instance_delivery_is_exactly_once_not_duplicated() {
         let delivered = ws_recv_json(&mut ws).await;
         assert_eq!(delivered["id"], "1");
         assert_eq!(delivered["type"], "next");
-        assert_eq!(delivered["payload"]["data"]["allEvents"]["sequence"], sequence);
+        assert_eq!(
+            delivered["payload"]["data"]["allEvents"]["sequence"],
+            sequence
+        );
 
         // The bug: this instance's own self-NOTIFY used to republish the
         // identical event into the identical broadcaster a second time.

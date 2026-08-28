@@ -58,7 +58,10 @@ fn respond_to(body: &Value) -> Value {
 
     if query.contains("... on banking_AccountBalance") {
         // Step 3: the real, selection-set-driven fetch.
-        assert!(query.contains("balance"), "selection set should include the scalar field: {query}");
+        assert!(
+            query.contains("balance"),
+            "selection set should include the scalar field: {query}"
+        );
         assert!(
             query.contains("owner { name }"),
             "selection set should recurse into the nested OBJECT field: {query}"
@@ -144,8 +147,12 @@ async fn wait_for_sequence_reaches_every_request_as_the_wait_variable() {
     // circuits after its own second (introspection) request - that
     // request is filtered out of `seen_wait_values` above, so it stays
     // one entry per `fetch` call below regardless.
-    fetch(&client, "banking", "AccountBalance", None, Some(42)).await.unwrap();
-    fetch(&client, "banking", "AccountBalance", None, None).await.unwrap();
+    fetch(&client, "banking", "AccountBalance", None, Some(42))
+        .await
+        .unwrap();
+    fetch(&client, "banking", "AccountBalance", None, None)
+        .await
+        .unwrap();
 
     let seen = seen_wait_values.lock().unwrap();
     assert_eq!(seen[0], json!(42));

@@ -41,10 +41,10 @@ members = [
 #                 build.rs, not linked into the running binary itself.
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
-license = "Apache-2.0"
-repository = "https://github.com/gklijs/skilj"
+license = "MIT OR Apache-2.0"
+repository = "https://codeberg.org/gklijs/SklilJ"
 
 # Shared dependency versions across the workspace, so crates that share a
 # dependency (e.g. skilj-core and skilj-graphql both need serde) can't drift
@@ -129,9 +129,9 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 opentelemetry-appender-tracing = "0.32"
 
 # Path dependencies between skilj's own crates
-skilj-core = { path = "skilj-core" }
-skilj-graphql = { path = "skilj-graphql" }
-skilj-macros = { path = "skilj-macros" }
-skilj-rest = { path = "skilj-rest" }
-skilj = { path = "skilj" }
-skilj-codegen = { path = "skilj-codegen" }
+skilj-core = { path = "skilj-core", version = "0.0.1" }
+skilj-graphql = { path = "skilj-graphql", version = "0.0.1" }
+skilj-macros = { path = "skilj-macros", version = "0.0.1" }
+skilj-rest = { path = "skilj-rest", version = "0.0.1" }
+skilj = { path = "skilj", version = "0.0.1" }
+skilj-codegen = { path = "skilj-codegen", version = "0.0.1" }

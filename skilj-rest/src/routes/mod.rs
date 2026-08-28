@@ -151,7 +151,10 @@ async fn trace_request(request: Request, next: Next) -> Response {
         // other `tracing` event already goes through).
         if status.is_server_error() {
             span.record("otel.status_description", status.to_string());
-            tracing::error!(status = status.as_u16(), "request failed with a server error");
+            tracing::error!(
+                status = status.as_u16(),
+                "request failed with a server error"
+            );
         }
         REQUEST_DURATION.record(
             start.elapsed().as_secs_f64(),
@@ -754,12 +757,10 @@ async fn post_commands_trigger(
         decision,
         state.encryption_master_key.as_ref(),
         Utc::now(),
-        snapshot_context
-            .as_ref()
-            .map(|ctx| db::SnapshotContext {
-                state_json: &ctx.state_json,
-                as_of_sequence: ctx.as_of_sequence,
-            }),
+        snapshot_context.as_ref().map(|ctx| db::SnapshotContext {
+            state_json: &ctx.state_json,
+            as_of_sequence: ctx.as_of_sequence,
+        }),
     )
     .await?;
 

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
 description = "SkilJ: a Rust library for building event-sourced, DDD-style applications backed by Postgres, exposing a GraphQL surface and a REST surface. A thin facade over skilj-core/skilj-graphql/skilj-rest - see docs/architecture.md §3.1."
 
 [dependencies]

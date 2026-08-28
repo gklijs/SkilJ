@@ -287,7 +287,9 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
         let bounded_contexts = data::load_bounded_contexts(&pool).await.unwrap();
         assert!(bounded_contexts.iter().any(|b| b.name == bc_name));
 
-        let loaded = data::load_bounded_context_data(&pool, &bc_name).await.unwrap();
+        let loaded = data::load_bounded_context_data(&pool, &bc_name)
+            .await
+            .unwrap();
 
         assert_eq!(loaded.event_types.len(), 1);
         assert_eq!(loaded.event_types[0].name, "AccountOpened");

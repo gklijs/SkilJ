@@ -13,7 +13,11 @@ use ratatui::Frame;
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
 
     draw_tabs(frame, app, chunks[0]);
@@ -39,13 +43,20 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
             app.bounded_context
         )))
         .select(selected)
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan));
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
+        );
     frame.render_widget(tabs, area);
 }
 
 fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     let text = app.status.as_deref().unwrap_or("");
-    frame.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Yellow)), area);
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Yellow)),
+        area,
+    );
 }
 
 /// Codeberg issue #7: `/` enters filter-compose mode (see
@@ -69,17 +80,29 @@ fn draw_live_events(frame: &mut Frame, app: &App, area: Rect) {
         "Filter - / to edit"
     };
     let filter_box = Paragraph::new(app.live_events_filter.value.as_str()).block(
-        Block::default().borders(Borders::ALL).border_style(filter_style).title(filter_title),
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(filter_style)
+            .title(filter_title),
     );
     frame.render_widget(filter_box, chunks[0]);
 
-    let connected = if app.live_connected { "connected" } else { "connecting..." };
+    let connected = if app.live_connected {
+        "connected"
+    } else {
+        "connecting..."
+    };
     let filter = app.live_events_filter.value.to_lowercase();
     let items: Vec<ListItem> = app
         .live_events
         .iter()
         .rev()
-        .filter(|event| filter.is_empty() || json_style::compact_plain(event).to_lowercase().contains(&filter))
+        .filter(|event| {
+            filter.is_empty()
+                || json_style::compact_plain(event)
+                    .to_lowercase()
+                    .contains(&filter)
+        })
         .map(|event| ListItem::new(json_style::compact(event)))
         .collect();
     let list = List::new(items).block(
@@ -113,7 +136,11 @@ fn draw_query_events(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let mark = if app.query_events.checked.contains(&i) { "[x]" } else { "[ ]" };
+            let mark = if app.query_events.checked.contains(&i) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
             ListItem::new(format!("{mark} {}", t.name))
         })
         .collect();
@@ -132,11 +159,17 @@ fn draw_query_events(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.query_events.query_loading {
         Paragraph::new("running...")
     } else {
-        let lines: Vec<Line> = app.query_events.results.iter().map(json_style::compact).collect();
+        let lines: Vec<Line> = app
+            .query_events
+            .results
+            .iter()
+            .map(json_style::compact)
+            .collect();
         Paragraph::new(lines)
     };
     frame.render_widget(
-        body.wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("Results")),
+        body.wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Results")),
         chunks[1],
     );
 }
@@ -147,11 +180,40 @@ fn draw_query_events(frame: &mut Frame, app: &App, area: Rect) {
 /// raw-JSON payload entry.
 fn draw_commands(frame: &mut Frame, app: &App, area: Rect) {
     match &app.commands.stage {
-        CommandsStage::Picking { types, list_selected, loading, error } => {
-            draw_commands_picking(frame, area, types, *list_selected, *loading, error.as_deref());
+        CommandsStage::Picking {
+            types,
+            list_selected,
+            loading,
+            error,
+        } => {
+            draw_commands_picking(
+                frame,
+                area,
+                types,
+                *list_selected,
+                *loading,
+                error.as_deref(),
+            );
         }
-        CommandsStage::Form { type_name, fields, focus, result, error, loading, .. } => {
-            draw_commands_form(frame, area, type_name, fields, *focus, result.as_ref(), error.as_deref(), *loading);
+        CommandsStage::Form {
+            type_name,
+            fields,
+            focus,
+            result,
+            error,
+            loading,
+            ..
+        } => {
+            draw_commands_form(
+                frame,
+                area,
+                type_name,
+                fields,
+                *focus,
+                result.as_ref(),
+                error.as_deref(),
+                *loading,
+            );
         }
     }
 }
@@ -171,7 +233,10 @@ fn draw_commands_picking(
     } else {
         "Command types - Enter to pick, r to refresh".to_string()
     };
-    let items: Vec<ListItem> = types.iter().map(|t| ListItem::new(t.name.clone())).collect();
+    let items: Vec<ListItem> = types
+        .iter()
+        .map(|t| ListItem::new(t.name.clone()))
+        .collect();
     let is_empty = items.is_empty();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -200,12 +265,18 @@ fn draw_commands_form(
     let field_rows = fields.len().max(1);
     let mut constraints: Vec<Constraint> = (0..field_rows).map(|_| Constraint::Length(3)).collect();
     constraints.push(Constraint::Min(0));
-    let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
 
     if fields.is_empty() {
-        let empty = Paragraph::new("(this type's schema declares no fields - Enter to submit {})").block(
-            Block::default().borders(Borders::ALL).title(format!("{type_name} - Esc to pick a different type")),
-        );
+        let empty = Paragraph::new("(this type's schema declares no fields - Enter to submit {})")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("{type_name} - Esc to pick a different type")),
+            );
         frame.render_widget(empty, chunks[0]);
     } else {
         for (i, field) in fields.iter().enumerate() {
@@ -217,12 +288,19 @@ fn draw_commands_form(
                 FormWidget::Bool(b) => (if *b { "[x]" } else { "[ ]" }, "boolean, Space to toggle"),
             };
             let title = if i == 0 {
-                format!("{type_name}.{} ({kind}) - Tab to switch field, Esc to pick a different type", field.name)
+                format!(
+                    "{type_name}.{} ({kind}) - Tab to switch field, Esc to pick a different type",
+                    field.name
+                )
             } else {
                 format!("{} ({kind})", field.name)
             };
-            let input = Paragraph::new(value)
-                .block(Block::default().borders(Borders::ALL).border_style(focus_style(focused)).title(title));
+            let input = Paragraph::new(value).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(focus_style(focused))
+                    .title(title),
+            );
             frame.render_widget(input, chunks[i]);
         }
     }
@@ -237,7 +315,8 @@ fn draw_commands_form(
         Paragraph::new("Enter to submit")
     };
     frame.render_widget(
-        body.wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("Result")),
+        body.wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Result")),
         chunks[field_rows],
     );
 }
@@ -293,7 +372,8 @@ fn draw_projections(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new("")
     };
     frame.render_widget(
-        body.wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("State")),
+        body.wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("State")),
         chunks[3],
     );
 }
@@ -305,4 +385,3 @@ fn focus_style(focused: bool) -> Style {
         Style::default()
     }
 }
-

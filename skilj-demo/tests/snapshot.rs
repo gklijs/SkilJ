@@ -43,7 +43,10 @@ fn withdraw_money_fast_is_correct_both_cold_and_after_a_real_catch_up_tick() {
             serde_json::json!({ "account_id": account, "amount": 100 }),
         )
         .await;
-        assert!(accepted(&response), "deposit should be accepted: {response:?}");
+        assert!(
+            accepted(&response),
+            "deposit should be accepted: {response:?}"
+        );
 
         // No snapshot row exists yet for this account - decide_from_snapshot's
         // own cold-start path (Snapshot::State::default() plus every real
@@ -80,20 +83,24 @@ fn withdraw_money_fast_is_correct_both_cold_and_after_a_real_catch_up_tick() {
         .await
         .unwrap();
 
-        let (version, as_of_sequence, state_json, _updated_at) = skilj_core::db::get_snapshot_state(
-            &pool,
-            BOUNDED_CONTEXT,
-            "AccountBalanceSnapshot",
-            "account",
-            &account,
-        )
-        .await
-        .unwrap()
-        .expect("a real row now exists after a real catch-up tick");
+        let (version, as_of_sequence, state_json, _updated_at) =
+            skilj_core::db::get_snapshot_state(
+                &pool,
+                BOUNDED_CONTEXT,
+                "AccountBalanceSnapshot",
+                "account",
+                &account,
+            )
+            .await
+            .unwrap()
+            .expect("a real row now exists after a real catch-up tick");
         assert_eq!(version, 1);
         assert!(as_of_sequence >= 0);
         let state: AccountBalanceSnapshotState = serde_json::from_str(&state_json).unwrap();
-        assert_eq!(state.balance, 60, "the real, folded balance after deposit(100) - withdraw(40)");
+        assert_eq!(
+            state.balance, 60,
+            "the real, folded balance after deposit(100) - withdraw(40)"
+        );
 
         // Same withdrawal as before, now served from the real stored
         // snapshot instead of a cold-start replay - still correct.
@@ -151,7 +158,10 @@ fn a_tampered_stored_snapshot_changes_the_decision_proving_it_is_actually_read()
             serde_json::json!({ "account_id": account, "amount": 500 }),
         )
         .await;
-        assert!(!accepted(&response), "500 must be rejected against the real balance of 100");
+        assert!(
+            !accepted(&response),
+            "500 must be rejected against the real balance of 100"
+        );
 
         // Tamper the stored row directly - leaving snapshot_version
         // untouched, so it's still trusted, not treated as a "model

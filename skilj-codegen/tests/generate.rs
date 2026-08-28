@@ -44,7 +44,10 @@ fn generates_the_payload_struct_with_fields_in_declared_order() {
     // not a map.
     let account_pos = output.find("pub account_id: String").unwrap();
     let amount_pos = output.find("pub amount: i64").unwrap();
-    assert!(account_pos < amount_pos, "fields should stay in .skilj.toml order");
+    assert!(
+        account_pos < amount_pos,
+        "fields should stay in .skilj.toml order"
+    );
 }
 
 #[test]

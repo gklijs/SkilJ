@@ -221,7 +221,10 @@ mod tests {
     #[test]
     fn pascal_to_snake_case_handles_a_multi_word_name() {
         assert_eq!(pascal_case_to_snake_case("DepositMoney"), "deposit_money");
-        assert_eq!(pascal_case_to_snake_case("MoneyDeposited"), "money_deposited");
+        assert_eq!(
+            pascal_case_to_snake_case("MoneyDeposited"),
+            "money_deposited"
+        );
     }
 
     #[test]

@@ -44,11 +44,21 @@ async fn slash_enters_filter_mode_and_digits_type_into_the_filter_not_switch_tab
     app.handle(key(KeyCode::Char('4')));
     app.handle(key(KeyCode::Char('2')));
     assert_eq!(app.live_events_filter.value, "42");
-    assert_eq!(app.tab, Tab::LiveEvents, "tab must not have switched while composing the filter");
+    assert_eq!(
+        app.tab,
+        Tab::LiveEvents,
+        "tab must not have switched while composing the filter"
+    );
 
     app.handle(key(KeyCode::Esc));
-    assert!(!app.live_events_filter_active, "Esc exits filter-compose mode");
-    assert!(!app.should_quit, "Esc inside the filter must not quit the app");
+    assert!(
+        !app.live_events_filter_active,
+        "Esc exits filter-compose mode"
+    );
+    assert!(
+        !app.should_quit,
+        "Esc inside the filter must not quit the app"
+    );
 
     // Filter-compose mode off again - digits behave normally once more.
     app.handle(key(KeyCode::Char('3')));
@@ -58,17 +68,31 @@ async fn slash_enters_filter_mode_and_digits_type_into_the_filter_not_switch_tab
 #[tokio::test]
 async fn the_filter_text_survives_after_leaving_compose_mode_and_keeps_filtering() {
     let mut app = new_app();
-    app.handle(AppEvent::LiveEvent(Ok(json!({"sequence": 1, "payload": "{\"amount\":42}"}))));
-    app.handle(AppEvent::LiveEvent(Ok(json!({"sequence": 2, "payload": "{\"amount\":7}"}))));
+    app.handle(AppEvent::LiveEvent(Ok(
+        json!({"sequence": 1, "payload": "{\"amount\":42}"}),
+    )));
+    app.handle(AppEvent::LiveEvent(Ok(
+        json!({"sequence": 2, "payload": "{\"amount\":7}"}),
+    )));
 
     app.handle(key(KeyCode::Char('/')));
     for c in "42".chars() {
         app.handle(key(KeyCode::Char(c)));
     }
     app.handle(key(KeyCode::Enter));
-    assert!(!app.live_events_filter_active, "Enter also exits filter-compose mode");
-    assert_eq!(app.live_events_filter.value, "42", "the typed filter text itself must survive");
-    assert_eq!(app.live_events.len(), 2, "filtering is a view concern (ui.rs) - App keeps every event");
+    assert!(
+        !app.live_events_filter_active,
+        "Enter also exits filter-compose mode"
+    );
+    assert_eq!(
+        app.live_events_filter.value, "42",
+        "the typed filter text itself must survive"
+    );
+    assert_eq!(
+        app.live_events.len(),
+        2,
+        "filtering is a view concern (ui.rs) - App keeps every event"
+    );
 }
 
 // --- Projections: waitForSequence field + the extended digit-switch fix ---
@@ -83,7 +107,11 @@ async fn tab_cycles_through_all_three_projection_fields() {
     app.handle(key(KeyCode::Tab));
     assert_eq!(app.projections.focus, ProjectionField::WaitForSequence);
     app.handle(key(KeyCode::Tab));
-    assert_eq!(app.projections.focus, ProjectionField::Name, "cycles back around");
+    assert_eq!(
+        app.projections.focus,
+        ProjectionField::Name,
+        "cycles back around"
+    );
 }
 
 #[tokio::test]
@@ -98,7 +126,11 @@ async fn digits_reach_the_focused_projection_field_instead_of_switching_tabs() {
         app.handle(key(KeyCode::Char(c)));
     }
     assert_eq!(app.projections.wait_for_sequence.value, "142");
-    assert_eq!(app.tab, Tab::Projections, "tab must not have switched while editing a projection field");
+    assert_eq!(
+        app.tab,
+        Tab::Projections,
+        "tab must not have switched while editing a projection field"
+    );
 }
 
 /// Every field on this tab is now free text that can legitimately
@@ -114,12 +146,19 @@ async fn esc_leaves_the_projections_tab_since_digits_never_can() {
     assert_eq!(app.tab, Tab::Projections);
 
     app.handle(key(KeyCode::Char('1')));
-    assert_eq!(app.tab, Tab::Projections, "digits type into the focused field, never switch away");
+    assert_eq!(
+        app.tab,
+        Tab::Projections,
+        "digits type into the focused field, never switch away"
+    );
     assert_eq!(app.projections.name.value, "1");
 
     app.handle(key(KeyCode::Esc));
     assert_eq!(app.tab, Tab::LiveEvents);
-    assert!(!app.should_quit, "Esc leaves the tab, it must not quit the app");
+    assert!(
+        !app.should_quit,
+        "Esc leaves the tab, it must not quit the app"
+    );
 }
 
 #[tokio::test]
@@ -136,6 +175,9 @@ async fn an_unparseable_wait_for_sequence_blocks_submission_with_an_inline_error
     }
 
     app.handle(key(KeyCode::Enter));
-    assert!(!app.projections.loading, "an invalid sequence must not submit");
+    assert!(
+        !app.projections.loading,
+        "an invalid sequence must not submit"
+    );
     assert!(app.projections.error.is_some());
 }

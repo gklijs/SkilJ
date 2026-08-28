@@ -33,7 +33,8 @@ struct FieldVisitor(SpanFields);
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &TracingField, value: &dyn std::fmt::Debug) {
-        self.0.push((field.name().to_string(), format!("{value:?}")));
+        self.0
+            .push((field.name().to_string(), format!("{value:?}")));
     }
 }
 
@@ -65,11 +66,10 @@ fn schema() -> Schema {
             })
         },
     ));
-    let query = Object::new("Query").field(Field::new(
-        "widget",
-        TypeRef::named_nn("Widget"),
-        |_ctx| FieldFuture::new(async move { Ok(Some(FieldValue::value("w1".to_string()))) }),
-    ));
+    let query =
+        Object::new("Query").field(Field::new("widget", TypeRef::named_nn("Widget"), |_ctx| {
+            FieldFuture::new(async move { Ok(Some(FieldValue::value("w1".to_string()))) })
+        }));
 
     Schema::build("Query", None, None)
         .register(query)

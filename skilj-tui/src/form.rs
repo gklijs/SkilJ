@@ -126,9 +126,9 @@ pub fn assemble_payload(fields: &[Field]) -> Result<Value, String> {
             }
             Widget::Number(value) => {
                 if !value.is_empty() {
-                    let number = value.parse::<serde_json::Number>().map_err(|_| {
-                        format!("{}: {value:?} is not a valid number", field.name)
-                    })?;
+                    let number = value
+                        .parse::<serde_json::Number>()
+                        .map_err(|_| format!("{}: {value:?} is not a valid number", field.name))?;
                     object.insert(field.name.clone(), Value::Number(number));
                 }
             }
@@ -137,9 +137,8 @@ pub fn assemble_payload(fields: &[Field]) -> Result<Value, String> {
             }
             Widget::RawJson(value) => {
                 if !value.is_empty() {
-                    let parsed = serde_json::from_str::<Value>(value).map_err(|e| {
-                        format!("{}: not valid JSON ({e})", field.name)
-                    })?;
+                    let parsed = serde_json::from_str::<Value>(value)
+                        .map_err(|e| format!("{}: not valid JSON ({e})", field.name))?;
                     object.insert(field.name.clone(), parsed);
                 }
             }
@@ -175,7 +174,10 @@ mod tests {
     }"##;
 
     fn field<'a>(fields: &'a [Field], name: &str) -> &'a Field {
-        fields.iter().find(|f| f.name == name).unwrap_or_else(|| panic!("no field named {name}"))
+        fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no field named {name}"))
     }
 
     #[test]
@@ -230,10 +232,22 @@ mod tests {
     #[test]
     fn assemble_payload_round_trips_every_filled_widget() {
         let fields = vec![
-            Field { name: "a".into(), widget: Widget::Text("hello".into()) },
-            Field { name: "c".into(), widget: Widget::Number("42".into()) },
-            Field { name: "e".into(), widget: Widget::Bool(true) },
-            Field { name: "g".into(), widget: Widget::RawJson(r#"{"x":1}"#.into()) },
+            Field {
+                name: "a".into(),
+                widget: Widget::Text("hello".into()),
+            },
+            Field {
+                name: "c".into(),
+                widget: Widget::Number("42".into()),
+            },
+            Field {
+                name: "e".into(),
+                widget: Widget::Bool(true),
+            },
+            Field {
+                name: "g".into(),
+                widget: Widget::RawJson(r#"{"x":1}"#.into()),
+            },
         ];
         let payload = assemble_payload(&fields).unwrap();
         assert_eq!(
@@ -245,9 +259,18 @@ mod tests {
     #[test]
     fn assemble_payload_omits_blank_text_and_raw_json_fields() {
         let fields = vec![
-            Field { name: "a".into(), widget: Widget::Text(String::new()) },
-            Field { name: "g".into(), widget: Widget::RawJson(String::new()) },
-            Field { name: "e".into(), widget: Widget::Bool(false) },
+            Field {
+                name: "a".into(),
+                widget: Widget::Text(String::new()),
+            },
+            Field {
+                name: "g".into(),
+                widget: Widget::RawJson(String::new()),
+            },
+            Field {
+                name: "e".into(),
+                widget: Widget::Bool(false),
+            },
         ];
         let payload = assemble_payload(&fields).unwrap();
         assert_eq!(payload, serde_json::json!({ "e": false }));
@@ -255,15 +278,27 @@ mod tests {
 
     #[test]
     fn assemble_payload_rejects_an_unparseable_number_by_name() {
-        let fields = vec![Field { name: "c".into(), widget: Widget::Number("not-a-number".into()) }];
+        let fields = vec![Field {
+            name: "c".into(),
+            widget: Widget::Number("not-a-number".into()),
+        }];
         let err = assemble_payload(&fields).unwrap_err();
-        assert!(err.contains('c'), "error should name the offending field: {err}");
+        assert!(
+            err.contains('c'),
+            "error should name the offending field: {err}"
+        );
     }
 
     #[test]
     fn assemble_payload_rejects_invalid_raw_json_by_name() {
-        let fields = vec![Field { name: "g".into(), widget: Widget::RawJson("{not json".into()) }];
+        let fields = vec![Field {
+            name: "g".into(),
+            widget: Widget::RawJson("{not json".into()),
+        }];
         let err = assemble_payload(&fields).unwrap_err();
-        assert!(err.contains('g'), "error should name the offending field: {err}");
+        assert!(
+            err.contains('g'),
+            "error should name the offending field: {err}"
+        );
     }
 }

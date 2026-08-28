@@ -52,7 +52,9 @@ async fn picking_a_command_type_generates_a_form_from_its_own_schema() {
     // synthetic) actually arrives.
     app.handle(key(KeyCode::Char('3')));
     match &app.commands.stage {
-        CommandsStage::Picking { loading, .. } => assert!(*loading, "entering the tab should start a fetch"),
+        CommandsStage::Picking { loading, .. } => {
+            assert!(*loading, "entering the tab should start a fetch")
+        }
         CommandsStage::Form { .. } => panic!("must start in Picking, not Form"),
     }
 
@@ -69,7 +71,13 @@ async fn picking_a_command_type_generates_a_form_from_its_own_schema() {
     }
 
     app.handle(key(KeyCode::Enter));
-    let CommandsStage::Form { type_name, fields, focus, .. } = &app.commands.stage else {
+    let CommandsStage::Form {
+        type_name,
+        fields,
+        focus,
+        ..
+    } = &app.commands.stage
+    else {
         panic!("Enter on a picked row must transition to Form");
     };
     assert_eq!(type_name, "DepositMoney");
@@ -91,12 +99,19 @@ async fn esc_returns_from_the_form_to_the_picker_without_a_refetch() {
     app.handle(key(KeyCode::Esc));
     match &app.commands.stage {
         CommandsStage::Picking { types, loading, .. } => {
-            assert_eq!(types.len(), 1, "the previously fetched list survives Esc, no refetch");
+            assert_eq!(
+                types.len(),
+                1,
+                "the previously fetched list survives Esc, no refetch"
+            );
             assert!(!*loading);
         }
         CommandsStage::Form { .. } => panic!("Esc must return to Picking"),
     }
-    assert!(!app.should_quit, "Esc inside the form must not quit the app");
+    assert!(
+        !app.should_quit,
+        "Esc inside the form must not quit the app"
+    );
 }
 
 #[tokio::test]
@@ -125,7 +140,10 @@ async fn typing_into_a_generated_field_and_submitting_assembles_the_right_payloa
         app.handle(key(KeyCode::Char(c)));
     }
 
-    let CommandsStage::Form { fields, loading, .. } = &app.commands.stage else {
+    let CommandsStage::Form {
+        fields, loading, ..
+    } = &app.commands.stage
+    else {
         panic!("still in Form");
     };
     let payload = skilj_tui::form::assemble_payload(fields).unwrap();
@@ -136,7 +154,10 @@ async fn typing_into_a_generated_field_and_submitting_assembles_the_right_payloa
     let CommandsStage::Form { loading, .. } = &app.commands.stage else {
         panic!("still in Form");
     };
-    assert!(*loading, "Enter must submit (spawns the real mutation task)");
+    assert!(
+        *loading,
+        "Enter must submit (spawns the real mutation task)"
+    );
 }
 
 #[tokio::test]
@@ -154,19 +175,32 @@ async fn a_boolean_field_toggles_on_space_instead_of_accepting_typed_text() {
     app.handle(key(KeyCode::Enter));
 
     app.handle(key(KeyCode::Char(' ')));
-    let CommandsStage::Form { fields, .. } = &app.commands.stage else { panic!("still in Form") };
-    assert!(matches!(fields[0].widget, skilj_tui::form::Widget::Bool(true)));
+    let CommandsStage::Form { fields, .. } = &app.commands.stage else {
+        panic!("still in Form")
+    };
+    assert!(matches!(
+        fields[0].widget,
+        skilj_tui::form::Widget::Bool(true)
+    ));
 
     app.handle(key(KeyCode::Char(' ')));
-    let CommandsStage::Form { fields, .. } = &app.commands.stage else { panic!("still in Form") };
-    assert!(matches!(fields[0].widget, skilj_tui::form::Widget::Bool(false)));
+    let CommandsStage::Form { fields, .. } = &app.commands.stage else {
+        panic!("still in Form")
+    };
+    assert!(matches!(
+        fields[0].widget,
+        skilj_tui::form::Widget::Bool(false)
+    ));
 }
 
 #[tokio::test]
 async fn query_events_checklist_toggles_and_runs_with_only_checked_types() {
     let mut app = new_app();
     app.handle(key(KeyCode::Char('2')));
-    assert!(app.query_events.types_loading, "entering the tab should start a fetch");
+    assert!(
+        app.query_events.types_loading,
+        "entering the tab should start a fetch"
+    );
 
     app.handle(AppEvent::QueryEventsTypesResult(Ok(json!({
         "eventTypes": [
@@ -175,7 +209,10 @@ async fn query_events_checklist_toggles_and_runs_with_only_checked_types() {
         ]
     }))));
     assert_eq!(app.query_events.types.len(), 2);
-    assert!(app.query_events.checked.is_empty(), "nothing checked until the operator toggles one");
+    assert!(
+        app.query_events.checked.is_empty(),
+        "nothing checked until the operator toggles one"
+    );
 
     // Nothing checked yet - Enter must not run, and must say why.
     app.handle(key(KeyCode::Enter));
@@ -189,6 +226,9 @@ async fn query_events_checklist_toggles_and_runs_with_only_checked_types() {
     assert!(app.query_events.checked.contains(&1));
 
     app.handle(key(KeyCode::Enter));
-    assert!(app.query_events.query_loading, "Enter with something checked must run the query");
+    assert!(
+        app.query_events.query_loading,
+        "Enter with something checked must run the query"
+    );
     assert!(app.query_events.query_error.is_none());
 }

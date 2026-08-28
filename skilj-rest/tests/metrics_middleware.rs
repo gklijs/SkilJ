@@ -30,10 +30,18 @@ impl CommandDispatcher for NoopCommandDispatcher {
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         None
     }
-    fn required_role(&self, _bounded_context: &str, _command_type: &str) -> Option<Option<&'static str>> {
+    fn required_role(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+    ) -> Option<Option<&'static str>> {
         None
     }
-    fn snapshot_name(&self, _bounded_context: &str, _command_type: &str) -> Option<Option<&'static str>> {
+    fn snapshot_name(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+    ) -> Option<Option<&'static str>> {
         None
     }
     fn dispatch_from_snapshot(
@@ -50,7 +58,12 @@ impl CommandDispatcher for NoopCommandDispatcher {
 
 struct NoopProjectionDispatcher;
 impl ProjectionDispatcher for NoopProjectionDispatcher {
-    fn keys(&self, _bounded_context: &str, _projection_name: &str, _event: &Event) -> Option<Vec<String>> {
+    fn keys(
+        &self,
+        _bounded_context: &str,
+        _projection_name: &str,
+        _event: &Event,
+    ) -> Option<Vec<String>> {
         None
     }
     fn project(
@@ -146,10 +159,12 @@ async fn a_request_records_the_http_server_request_duration_histogram() {
             histogram.data_points().any(|dp| {
                 dp.count() >= 1
                     && dp.attributes().any(|kv| {
-                        kv.key.as_str() == "http.request.method" && kv.value.as_str().as_ref() == "GET"
+                        kv.key.as_str() == "http.request.method"
+                            && kv.value.as_str().as_ref() == "GET"
                     })
                     && dp.attributes().any(|kv| {
-                        kv.key.as_str() == "http.route" && kv.value.as_str().as_ref() == "/v1/events"
+                        kv.key.as_str() == "http.route"
+                            && kv.value.as_str().as_ref() == "/v1/events"
                     })
             })
         });

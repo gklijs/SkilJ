@@ -59,7 +59,7 @@
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header};
 use serde_json::json;
-use skilj::{IdpConfig, Skilj, SigningAlgorithm};
+use skilj::{IdpConfig, SigningAlgorithm, Skilj};
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db;
@@ -167,7 +167,10 @@ const COMMAND_TYPES: &[(&str, &str)] = &[
     (skilj_demo::banking::BOUNDED_CONTEXT, "DepositMoney"),
     (skilj_demo::banking::BOUNDED_CONTEXT, "WithdrawMoney"),
     (skilj_demo::courses::BOUNDED_CONTEXT, "OpenCourse"),
-    (skilj_demo::courses::BOUNDED_CONTEXT, "EnrollStudentInCourse"),
+    (
+        skilj_demo::courses::BOUNDED_CONTEXT,
+        "EnrollStudentInCourse",
+    ),
     (skilj_demo::courses::BOUNDED_CONTEXT, "DropCourse"),
 ];
 
@@ -303,8 +306,10 @@ fn init_telemetry() -> Option<TelemetryProviders> {
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .build()
-        .expect("OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP span exporter \
-                 shouldn't fail this early (no network call happens yet)");
+        .expect(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP span exporter \
+                 shouldn't fail this early (no network call happens yet)",
+        );
     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(span_exporter)
         .with_resource(resource.clone())
@@ -321,8 +326,10 @@ fn init_telemetry() -> Option<TelemetryProviders> {
     let log_exporter = opentelemetry_otlp::LogExporter::builder()
         .with_http()
         .build()
-        .expect("OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP log exporter \
-                 shouldn't fail this early (no network call happens yet)");
+        .expect(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP log exporter \
+                 shouldn't fail this early (no network call happens yet)",
+        );
     let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
         .with_batch_exporter(log_exporter)
         .with_resource(resource.clone())
@@ -340,9 +347,12 @@ fn init_telemetry() -> Option<TelemetryProviders> {
     let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
         .build()
-        .expect("OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP metric exporter \
-                 shouldn't fail this early (no network call happens yet)");
-    let metric_reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+        .expect(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is set - building the OTLP/HTTP metric exporter \
+                 shouldn't fail this early (no network call happens yet)",
+        );
+    let metric_reader =
+        opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
     let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_reader(metric_reader)
         .with_resource(resource)
@@ -360,9 +370,8 @@ fn init_telemetry() -> Option<TelemetryProviders> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let telemetry = init_telemetry();
 
-    let database_url = std::env::var("DATABASE_URL").expect(
-        "DATABASE_URL must be set, e.g. postgres://user:pass@localhost:5432/skilj_demo",
-    );
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set, e.g. postgres://user:pass@localhost:5432/skilj_demo");
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -421,7 +430,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (skilj, report) = skilj_demo::register(Skilj::builder(database_url))
         .reconciliation_role(external_subject)
         .identity_provider(IdpConfig::new(
-            jwks_url.parse().expect("serve_local_jwks's own URL is always well-formed"),
+            jwks_url
+                .parse()
+                .expect("serve_local_jwks's own URL is always well-formed"),
             TEST_ISSUER,
             SigningAlgorithm::Rs256,
         ))
@@ -468,7 +479,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             command_type = %command_type_name,
             "minted command token"
         );
-        println!("  {bounded_context}/{command_type_name}: {}.{}", token.id, token.secret);
+        println!(
+            "  {bounded_context}/{command_type_name}: {}.{}",
+            token.id, token.secret
+        );
     }
 
     let rest = skilj.rest_router();

@@ -727,7 +727,10 @@ fn event_types_and_command_types_list_every_registered_type() {
             json!({ "bc": bc_name }),
         )
         .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
         assert_eq!(response["data"]["eventTypes"], json!([]));
 
         // Gating: no caller at all is rejected before anything runs, same
@@ -739,7 +742,10 @@ fn event_types_and_command_types_list_every_registered_type() {
             json!({ "bc": bc_name }),
         )
         .await;
-        assert_eq!(response["errors"][0]["extensions"]["code"], "unauthenticated");
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "unauthenticated"
+        );
 
         graphql_request(
             &router,
@@ -770,7 +776,10 @@ fn event_types_and_command_types_list_every_registered_type() {
             json!({ "bc": bc_name }),
         )
         .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
         let event_types = response["data"]["eventTypes"].as_array().unwrap();
         assert_eq!(event_types.len(), 1);
         assert_eq!(event_types[0]["name"], "MoneyDeposited");
@@ -786,7 +795,10 @@ fn event_types_and_command_types_list_every_registered_type() {
             json!({ "bc": bc_name }),
         )
         .await;
-        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
         let command_types = response["data"]["commandTypes"].as_array().unwrap();
         assert_eq!(command_types.len(), 1);
         assert_eq!(command_types[0]["name"], "WithdrawMoney");

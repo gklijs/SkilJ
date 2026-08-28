@@ -12,7 +12,9 @@ use chrono::{SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
-use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType};
+use skilj_core::event_store::{
+    BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType,
+};
 use skilj_core::plugin::SnapshotDispatcher;
 use skilj_core::shared::{generate_token_id, Metadata, Tag, TagMapping};
 
@@ -57,7 +59,12 @@ impl SnapshotDispatcher for TestSnapshotDispatcher {
         }
         let mut state: BalanceState = match serde_json::from_str(state_json) {
             Ok(s) => s,
-            Err(e) => return Some(Err(skilj_core::event_store::Error::PayloadDecodeFailed(e.to_string()).into())),
+            Err(e) => {
+                return Some(Err(skilj_core::event_store::Error::PayloadDecodeFailed(
+                    e.to_string(),
+                )
+                .into()))
+            }
         };
         let amount: i64 = serde_json::from_str::<serde_json::Value>(&event.payload)
             .ok()
@@ -72,7 +79,8 @@ impl SnapshotDispatcher for TestSnapshotDispatcher {
     }
 
     fn default_state(&self, _bounded_context: &str, snapshot_name: &str) -> Option<String> {
-        (snapshot_name == "Balance").then(|| serde_json::to_string(&BalanceState::default()).unwrap())
+        (snapshot_name == "Balance")
+            .then(|| serde_json::to_string(&BalanceState::default()).unwrap())
     }
 }
 
@@ -389,7 +397,10 @@ fn a_stored_row_at_an_old_version_is_treated_as_absent() {
         .await
         .unwrap()
         .unwrap();
-        assert!(resolved_v1.as_of_sequence >= 0, "must be a real, non-cold row");
+        assert!(
+            resolved_v1.as_of_sequence >= 0,
+            "must be a real, non-cold row"
+        );
         let state_v1: BalanceState = serde_json::from_str(&resolved_v1.state_json).unwrap();
         assert_eq!(state_v1.balance, 100);
 
@@ -411,7 +422,10 @@ fn a_stored_row_at_an_old_version_is_treated_as_absent() {
         .unwrap()
         .expect("a registered, tag-matching snapshot always resolves to Some");
 
-        assert_eq!(resolved_v2.as_of_sequence, -1, "must be treated as cold, not the real stored 100");
+        assert_eq!(
+            resolved_v2.as_of_sequence, -1,
+            "must be treated as cold, not the real stored 100"
+        );
         let state_v2: BalanceState = serde_json::from_str(&resolved_v2.state_json).unwrap();
         assert_eq!(state_v2.balance, 0);
     });

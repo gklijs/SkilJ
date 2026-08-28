@@ -60,7 +60,10 @@ fn balance_of(matching_events: &[BankingEvent]) -> i64 {
     matching_events.iter().fold(0i64, apply_money_event)
 }
 
-fn decide_deposit_money(payload: &DepositMoneyPayload, _matching_events: &[BankingEvent]) -> CommandDecision {
+fn decide_deposit_money(
+    payload: &DepositMoneyPayload,
+    _matching_events: &[BankingEvent],
+) -> CommandDecision {
     if payload.amount <= 0 {
         return CommandDecision::Rejected {
             reason: "deposit amount must be positive".into(),
@@ -82,7 +85,10 @@ fn decide_deposit_money(payload: &DepositMoneyPayload, _matching_events: &[Banki
 /// this account has ever had, and nothing from any other account - the
 /// whole point of tagging both the command and the events on
 /// `account_id` alone.
-fn decide_withdraw_money(payload: &WithdrawMoneyPayload, matching_events: &[BankingEvent]) -> CommandDecision {
+fn decide_withdraw_money(
+    payload: &WithdrawMoneyPayload,
+    matching_events: &[BankingEvent],
+) -> CommandDecision {
     if payload.amount <= 0 {
         return CommandDecision::Rejected {
             reason: "withdrawal amount must be positive".into(),

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
 description = "SkilJ's REST surface: narrowly-scoped AccessToken-authenticated routes for agents and automated callers. See docs/architecture.md §7."
 
 [dependencies]

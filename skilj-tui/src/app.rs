@@ -22,7 +22,12 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::LiveEvents, Tab::QueryEvents, Tab::Commands, Tab::Projections];
+    pub const ALL: [Tab; 4] = [
+        Tab::LiveEvents,
+        Tab::QueryEvents,
+        Tab::Commands,
+        Tab::Projections,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -88,7 +93,11 @@ fn parse_type_options(data: &Value, field: &str) -> Vec<TypeOption> {
                 .iter()
                 .filter_map(|t| {
                     let name = t.get("name")?.as_str()?.to_string();
-                    let schema = t.get("schema").and_then(Value::as_str).unwrap_or("").to_string();
+                    let schema = t
+                        .get("schema")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     Some(TypeOption { name, schema })
                 })
                 .collect()
@@ -186,7 +195,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(client: Arc<Client>, bounded_context: String, events_tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        bounded_context: String,
+        events_tx: mpsc::UnboundedSender<AppEvent>,
+    ) -> Self {
         Self {
             should_quit: false,
             tab: Tab::LiveEvents,
@@ -272,7 +285,13 @@ impl App {
                 }
             }
             AppEvent::CommandResult(result) => {
-                if let CommandsStage::Form { loading, error, result: slot, .. } = &mut self.commands.stage {
+                if let CommandsStage::Form {
+                    loading,
+                    error,
+                    result: slot,
+                    ..
+                } = &mut self.commands.stage
+                {
                     *loading = false;
                     match result {
                         Ok(data) => {
@@ -284,7 +303,13 @@ impl App {
                 }
             }
             AppEvent::CommandTypesResult(result) => {
-                if let CommandsStage::Picking { types, list_selected, loading, error } = &mut self.commands.stage {
+                if let CommandsStage::Picking {
+                    types,
+                    list_selected,
+                    loading,
+                    error,
+                } = &mut self.commands.stage
+                {
                     *loading = false;
                     match result {
                         Ok(data) => {
@@ -478,7 +503,8 @@ impl App {
             .map(|t| Value::String(t.name.clone()))
             .collect();
         if event_types.is_empty() {
-            self.query_events.query_error = Some("select at least one event type (Space to toggle)".into());
+            self.query_events.query_error =
+                Some("select at least one event type (Space to toggle)".into());
             return;
         }
         self.query_events.query_loading = true;
@@ -510,7 +536,12 @@ impl App {
     }
 
     fn handle_commands_picking_key(&mut self, key: KeyEvent) {
-        let CommandsStage::Picking { types, list_selected, .. } = &mut self.commands.stage else {
+        let CommandsStage::Picking {
+            types,
+            list_selected,
+            ..
+        } = &mut self.commands.stage
+        else {
             return;
         };
         match key.code {
@@ -551,7 +582,12 @@ impl App {
     /// `list_selected` into `Form` too, so `commands_form_back_to_picking`
     /// can restore the picker without a refetch.
     fn pick_command_type(&mut self) {
-        let CommandsStage::Picking { types, list_selected, .. } = &self.commands.stage else {
+        let CommandsStage::Picking {
+            types,
+            list_selected,
+            ..
+        } = &self.commands.stage
+        else {
             return;
         };
         let Some(picked) = types.get(*list_selected) else {
@@ -574,7 +610,12 @@ impl App {
     }
 
     fn commands_form_back_to_picking(&mut self) {
-        let CommandsStage::Form { types, list_selected, .. } = &self.commands.stage else {
+        let CommandsStage::Form {
+            types,
+            list_selected,
+            ..
+        } = &self.commands.stage
+        else {
             return;
         };
         self.commands.stage = CommandsStage::Picking {
@@ -599,7 +640,9 @@ impl App {
             KeyCode::Backspace => {
                 if let Some(field) = fields.get_mut(*focus) {
                     match &mut field.widget {
-                        form::Widget::Text(s) | form::Widget::Number(s) | form::Widget::RawJson(s) => {
+                        form::Widget::Text(s)
+                        | form::Widget::Number(s)
+                        | form::Widget::RawJson(s) => {
                             s.pop();
                         }
                         form::Widget::Bool(_) => {}
@@ -613,7 +656,9 @@ impl App {
                 if let Some(field) = fields.get_mut(*focus) {
                     match &mut field.widget {
                         form::Widget::Bool(b) => *b = !*b,
-                        form::Widget::Text(s) | form::Widget::Number(s) | form::Widget::RawJson(s) => {
+                        form::Widget::Text(s)
+                        | form::Widget::Number(s)
+                        | form::Widget::RawJson(s) => {
                             s.push(' ');
                         }
                     }
@@ -621,8 +666,9 @@ impl App {
             }
             KeyCode::Char(c) => {
                 if let Some(field) = fields.get_mut(*focus) {
-                    if let form::Widget::Text(s) | form::Widget::Number(s) | form::Widget::RawJson(s) =
-                        &mut field.widget
+                    if let form::Widget::Text(s)
+                    | form::Widget::Number(s)
+                    | form::Widget::RawJson(s) = &mut field.widget
                     {
                         s.push(c);
                     }
@@ -633,7 +679,14 @@ impl App {
     }
 
     fn submit_command(&mut self) {
-        let CommandsStage::Form { type_name, fields, loading, error, .. } = &mut self.commands.stage else {
+        let CommandsStage::Form {
+            type_name,
+            fields,
+            loading,
+            error,
+            ..
+        } = &mut self.commands.stage
+        else {
             return;
         };
         let payload = match form::assemble_payload(fields) {
@@ -704,8 +757,9 @@ impl App {
             match wait_for_sequence_str.parse::<i64>() {
                 Ok(seq) => Some(seq),
                 Err(_) => {
-                    self.projections.error =
-                        Some(format!("{wait_for_sequence_str:?} is not a valid sequence number"));
+                    self.projections.error = Some(format!(
+                        "{wait_for_sequence_str:?} is not a valid sequence number"
+                    ));
                     return;
                 }
             }
@@ -716,7 +770,11 @@ impl App {
         let tx = self.events_tx.clone();
         let bounded_context = self.bounded_context.clone();
         tokio::spawn(async move {
-            let key = if key.is_empty() { None } else { Some(key.as_str()) };
+            let key = if key.is_empty() {
+                None
+            } else {
+                Some(key.as_str())
+            };
             let result = crate::projection_query::fetch(
                 &client,
                 &bounded_context,

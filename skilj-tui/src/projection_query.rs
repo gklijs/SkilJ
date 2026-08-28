@@ -52,7 +52,9 @@ pub async fn fetch(
     key: Option<&str>,
     wait_for_sequence: Option<i64>,
 ) -> Result<Value, ClientError> {
-    let key_value = key.map(|k| Value::String(k.to_string())).unwrap_or(Value::Null);
+    let key_value = key
+        .map(|k| Value::String(k.to_string()))
+        .unwrap_or(Value::Null);
     let wait_value = wait_for_sequence.map(Value::from).unwrap_or(Value::Null);
     let variables =
         json!({ "bc": bounded_context, "name": name, "key": key_value, "wait": wait_value });
@@ -70,7 +72,9 @@ pub async fn fetch(
     let type_name = typename_response
         .pointer("/projection/__typename")
         .and_then(Value::as_str)
-        .ok_or_else(|| ClientError::MalformedResponse("projection result had no __typename".into()))?
+        .ok_or_else(|| {
+            ClientError::MalformedResponse("projection result had no __typename".into())
+        })?
         .to_string();
 
     let selection = build_selection(client, &type_name, 0).await?;
@@ -141,12 +145,20 @@ fn build_selection<'a>(
 fn unwrap_type(type_value: &Value) -> (String, String) {
     let mut current = type_value;
     loop {
-        let kind = current.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+        let kind = current
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if kind == "NON_NULL" || kind == "LIST" {
             current = current.get("ofType").unwrap_or(&Value::Null);
             continue;
         }
-        let name = current.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let name = current
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         return (kind, name);
     }
 }

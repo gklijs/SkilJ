@@ -1,9 +1,61 @@
 # SklilJ
 
-Rust project to guide AI to good solution, making sure the data is stored in a proper way, authenticated, and it's easy to add new features.
+`skilj` is a Rust library for building event-sourced, DDD-style applications backed by
+Postgres, using a Dynamic Consistency Boundary (DCB) instead of classic per-aggregate event
+sourcing - a command's consistency check spans exactly the tags it needs, not one fixed
+aggregate boundary. It exposes a GraphQL surface and a REST surface, and is built to guide an
+AI coding agent toward a correct, well-structured solution: the domain model is spec-first,
+data is encrypted/decrypted consistently, every surface is access-controlled, and adding a new
+event/command/projection follows one repeatable shape.
 
 See [`specs/skilj.allium`](specs/skilj.allium) for the full behavioural specification, and
 [`docs/architecture.md`](docs/architecture.md) for how it's built in Rust.
+
+## Crates
+
+| Crate | What it is |
+|---|---|
+| [`skilj`](skilj) | The main facade - a thin wrapper over `skilj-core`/`skilj-graphql`/`skilj-rest`. Start here. |
+| [`skilj-core`](skilj-core) | The domain engine: entities, rules, the plugin API, and persistence. Zero web-framework dependency. |
+| [`skilj-graphql`](skilj-graphql) | The GraphQL surface - a runtime-rebuilt dynamic schema and resolvers, independently usable. |
+| [`skilj-rest`](skilj-rest) | The REST surface - narrowly-scoped, `AccessToken`-authenticated routes for agents and automated callers. |
+| [`skilj-macros`](skilj-macros) | Two narrowly-scoped proc-macros used internally (re-exported through `skilj-core`, not usually added directly). |
+| [`skilj-codegen`](skilj-codegen) | Optional `build.rs` codegen: turns a declarative `.skilj.toml` bounded-context file into real Rust `EventType`/`CommandType` impls. |
+| [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a Ratatui operator console, a pure GraphQL client for any `skilj` deployment. |
+| [`skilj-inspector`](skilj-inspector) | `cargo install skilj-inspector` - a read-only Ratatui console that talks directly to Postgres, for when `skilj-graphql` isn't running. |
+
+`skilj-demo` (in this repo, not published) is a full worked example - two bounded contexts
+(banking, courses) showing what the DCB buys over classic per-aggregate event sourcing.
+
+## Getting started
+
+```toml
+[dependencies]
+skilj = "0.0"
+```
+
+See [`skilj-demo`](skilj-demo) for a complete, runnable example, and
+[`.claude/skills/skilj/`](.claude/skills/skilj) for a Claude Code skill that walks an AI agent
+through adding a new event/command/projection to an existing bounded context.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in this project, as defined in the Apache-2.0 license, shall be dual-licensed as above, without
+any additional terms or conditions.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build, test, and submit changes,
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for community expectations,
+[`SECURITY.md`](SECURITY.md) for how to report a vulnerability, and
+[`CHANGELOG.md`](CHANGELOG.md) for release notes.
 
 ## Reading events over REST
 

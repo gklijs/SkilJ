@@ -205,7 +205,11 @@ impl CommandDispatcher for Dispatcher {
         Some(registered.required_role)
     }
 
-    fn snapshot_name(&self, bounded_context: &str, command_type: &str) -> Option<Option<&'static str>> {
+    fn snapshot_name(
+        &self,
+        bounded_context: &str,
+        command_type: &str,
+    ) -> Option<Option<&'static str>> {
         let registered = self
             .command_types
             .get(&(bounded_context.to_string(), command_type.to_string()))?;
@@ -574,9 +578,8 @@ type DeciderFn =
 /// snapshot_state_json, events_since_snapshot)` - the same shape
 /// `decide_from_snapshot` itself has, just with `payload`/`events_since_snapshot`
 /// still type-erased, exactly like `DeciderFn` above.
-type DecideFromSnapshotFn = Box<
-    dyn Fn(&str, &str, &[Event]) -> skilj_core::error::Result<CommandDecision> + Send + Sync,
->;
+type DecideFromSnapshotFn =
+    Box<dyn Fn(&str, &str, &[Event]) -> skilj_core::error::Result<CommandDecision> + Send + Sync>;
 
 struct RegisteredCommandType {
     schema: String,
@@ -644,7 +647,11 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
                     );
                 }
             }
-            Ok(T::decide_from_snapshot(&payload, snapshot_state_json, &matching))
+            Ok(T::decide_from_snapshot(
+                &payload,
+                snapshot_state_json,
+                &matching,
+            ))
         }),
     }
 }
@@ -763,8 +770,7 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
 /// `TAG_KEY` - a `BoundedContextEvent::try_from_event` failure here is a
 /// real, surfaced `Err`, not a silent no-op (see
 /// `SnapshotDispatcher::fold`'s own doc comment).
-type SnapshotFoldFn =
-    Box<dyn Fn(&str, &Event) -> skilj_core::error::Result<String> + Send + Sync>;
+type SnapshotFoldFn = Box<dyn Fn(&str, &Event) -> skilj_core::error::Result<String> + Send + Sync>;
 
 /// See `RegisteredProjection` above - same shape and reasoning, for
 /// `Snapshot`. `name` (`T::NAME`) is carried as its own field, unlike

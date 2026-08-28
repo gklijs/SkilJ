@@ -39,10 +39,18 @@ impl CommandDispatcher for NoopCommandDispatcher {
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         None
     }
-    fn required_role(&self, _bounded_context: &str, _command_type: &str) -> Option<Option<&'static str>> {
+    fn required_role(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+    ) -> Option<Option<&'static str>> {
         None
     }
-    fn snapshot_name(&self, _bounded_context: &str, _command_type: &str) -> Option<Option<&'static str>> {
+    fn snapshot_name(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+    ) -> Option<Option<&'static str>> {
         None
     }
     fn dispatch_from_snapshot(
@@ -59,7 +67,12 @@ impl CommandDispatcher for NoopCommandDispatcher {
 
 struct NoopProjectionDispatcher;
 impl ProjectionDispatcher for NoopProjectionDispatcher {
-    fn keys(&self, _bounded_context: &str, _projection_name: &str, _event: &Event) -> Option<Vec<String>> {
+    fn keys(
+        &self,
+        _bounded_context: &str,
+        _projection_name: &str,
+        _event: &Event,
+    ) -> Option<Vec<String>> {
         None
     }
     fn project(

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
 description = "SkilJ's domain engine: entities, rules, the plugin API, and persistence. Zero web-framework dependency - see docs/architecture.md §3."
 
 [dependencies]

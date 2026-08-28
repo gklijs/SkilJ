@@ -116,13 +116,14 @@ impl Client {
 fn extract_data(response: Value) -> Result<Value, ClientError> {
     if let Some(errors) = response.get("errors").and_then(Value::as_array) {
         if !errors.is_empty() {
-            return Err(ClientError::Graphql(errors.iter().map(parse_error).collect()));
+            return Err(ClientError::Graphql(
+                errors.iter().map(parse_error).collect(),
+            ));
         }
     }
-    response
-        .get("data")
-        .cloned()
-        .ok_or_else(|| ClientError::MalformedResponse("response had neither data nor errors".into()))
+    response.get("data").cloned().ok_or_else(|| {
+        ClientError::MalformedResponse("response had neither data nor errors".into())
+    })
 }
 
 fn parse_error(value: &Value) -> GraphQlError {
@@ -153,7 +154,8 @@ pub fn to_websocket_url(endpoint: &reqwest::Url) -> reqwest::Url {
         "https" => "wss",
         _ => "ws",
     };
-    ws.set_scheme(scheme).expect("http(s)/ws(s) are both non-special-cased schemes to swap");
+    ws.set_scheme(scheme)
+        .expect("http(s)/ws(s) are both non-special-cased schemes to swap");
     ws
 }
 
@@ -231,10 +233,11 @@ async fn run_subscription(
         let message = recv_json(&mut ws).await?;
         match message.get("type").and_then(Value::as_str) {
             Some("next") => {
-                let data = message
-                    .pointer("/payload/data")
-                    .cloned()
-                    .ok_or_else(|| ClientError::MalformedResponse(format!("next with no payload.data: {message:?}")))?;
+                let data = message.pointer("/payload/data").cloned().ok_or_else(|| {
+                    ClientError::MalformedResponse(format!(
+                        "next with no payload.data: {message:?}"
+                    ))
+                })?;
                 if tx.send(Ok(data)).is_err() {
                     return Ok(()); // the receiving end (the app) hung up - nothing left to do
                 }
@@ -260,9 +263,8 @@ async fn run_subscription(
     }
 }
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn send_json(ws: &mut WsStream, value: Value) -> Result<(), ClientError> {
     ws.send(Message::text(value.to_string()))

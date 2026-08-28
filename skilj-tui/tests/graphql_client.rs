@@ -48,9 +48,16 @@ async fn sends_the_bearer_token_and_the_query_variables_shape() {
         .expect("a well-formed data response should parse as Ok");
 
     assert_eq!(data, json!({ "ok": true }));
-    let captured = captured.lock().unwrap().clone().expect("the server should have captured one request");
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the server should have captured one request");
     assert_eq!(captured["authorization"], "Bearer test-jwt");
-    assert_eq!(captured["body"]["query"], "query($x: Int!) { thing(x: $x) }");
+    assert_eq!(
+        captured["body"]["query"],
+        "query($x: Int!) { thing(x: $x) }"
+    );
     assert_eq!(captured["body"]["variables"], json!({ "x": 1 }));
 }
 
@@ -94,5 +101,8 @@ async fn a_response_with_neither_data_nor_errors_is_a_malformed_response_error()
         .await
         .expect_err("a response with neither data nor errors should be Err");
 
-    assert!(matches!(error, ClientError::MalformedResponse(_)), "got {error:?}");
+    assert!(
+        matches!(error, ClientError::MalformedResponse(_)),
+        "got {error:?}"
+    );
 }

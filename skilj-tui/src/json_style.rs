@@ -65,9 +65,16 @@ pub fn pretty(value: &Value) -> Vec<Line<'static>> {
     lines
 }
 
-fn write_pretty(value: &Value, depth: usize, lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>) {
+fn write_pretty(
+    value: &Value,
+    depth: usize,
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+) {
     match value {
-        Value::Object(map) if map.is_empty() => current.push(Span::styled("{}", punctuation_style())),
+        Value::Object(map) if map.is_empty() => {
+            current.push(Span::styled("{}", punctuation_style()))
+        }
         Value::Object(map) => {
             current.push(Span::styled("{", punctuation_style()));
             lines.push(Line::from(std::mem::take(current)));
@@ -93,7 +100,9 @@ fn write_pretty(value: &Value, depth: usize, lines: &mut Vec<Line<'static>>, cur
             current.push(Span::raw(INDENT.repeat(depth)));
             current.push(Span::styled("}", punctuation_style()));
         }
-        Value::Array(items) if items.is_empty() => current.push(Span::styled("[]", punctuation_style())),
+        Value::Array(items) if items.is_empty() => {
+            current.push(Span::styled("[]", punctuation_style()))
+        }
         Value::Array(items) => {
             current.push(Span::styled("[", punctuation_style()));
             lines.push(Line::from(std::mem::take(current)));
@@ -199,7 +208,11 @@ mod tests {
         assert_eq!(plain_text(&lines[0]), "{");
         assert_eq!(plain_text(&lines[1]), "  \"a\": 1");
         assert_eq!(plain_text(&lines[2]), "}");
-        let key_span = lines[1].spans.iter().find(|s| s.content.as_ref() == "\"a\"").unwrap();
+        let key_span = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "\"a\"")
+            .unwrap();
         assert_eq!(key_span.style, key_style());
     }
 
@@ -213,8 +226,14 @@ mod tests {
     fn nested_objects_indent_one_level_deeper() {
         let lines = pretty(&json!({"a": {"b": 1}}));
         // {, "a": {, "b": 1 (indented two levels), }, }
-        let inner = lines.iter().find(|l| plain_text(l).contains("\"b\"")).unwrap();
-        assert!(plain_text(inner).starts_with("    "), "nested field should be double-indented");
+        let inner = lines
+            .iter()
+            .find(|l| plain_text(l).contains("\"b\""))
+            .unwrap();
+        assert!(
+            plain_text(inner).starts_with("    "),
+            "nested field should be double-indented"
+        );
     }
 
     #[test]

@@ -36,7 +36,8 @@ static TEST_DB: tokio::sync::OnceCell<Option<TestDb>> = tokio::sync::OnceCell::c
 pub fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
-        tokio::runtime::Runtime::new().expect("failed to build a tokio runtime for skilj-demo tests")
+        tokio::runtime::Runtime::new()
+            .expect("failed to build a tokio runtime for skilj-demo tests")
     })
 }
 
@@ -183,7 +184,9 @@ pub async fn seed_admin(pool: &Pool) -> Vec<RoleAccessMapping> {
             created_at: test_now(),
             revoked_at: None,
         };
-        db::insert_role_access_mapping(pool, &mapping).await.unwrap();
+        db::insert_role_access_mapping(pool, &mapping)
+            .await
+            .unwrap();
         mappings.push(mapping);
     }
     mappings
@@ -210,7 +213,10 @@ pub async fn setup() -> (Skilj, Pool, Vec<RoleAccessMapping>) {
     (skilj, pool, mappings)
 }
 
-pub fn mapping_for<'a>(mappings: &'a [RoleAccessMapping], bounded_context: &str) -> &'a RoleAccessMapping {
+pub fn mapping_for<'a>(
+    mappings: &'a [RoleAccessMapping],
+    bounded_context: &str,
+) -> &'a RoleAccessMapping {
     mappings
         .iter()
         .find(|m| m.bounded_context.name == bounded_context)

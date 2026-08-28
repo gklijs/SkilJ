@@ -38,7 +38,11 @@ impl Visit for NoopVisitor {
 impl<S: tracing::Subscriber> Layer<S> for CapturingLayer {
     fn on_new_span(&self, attrs: &Attributes<'_>, _id: &tracing::span::Id, _ctx: Context<'_, S>) {
         attrs.record(&mut NoopVisitor);
-        self.0 .0.lock().unwrap().push(attrs.metadata().name().to_string());
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(attrs.metadata().name().to_string());
     }
 }
 

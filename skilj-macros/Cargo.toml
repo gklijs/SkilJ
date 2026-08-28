@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
 description = "Two narrowly-scoped proc-macros (docs/architecture.md §1.3.1/§1.3.2): #[requires_role(...)] on a CommandType impl, and gql_object! for skilj-graphql's own wire-type builders. Neither reopens skilj-core's plugin API to macros generally."
 
 [lib]

@@ -224,7 +224,11 @@ pub fn submit_command_field() -> Field {
                     // decision or a DCB-conflict retry inside
                     // submit_command, a rejection renders identically
                     // either way.
-                    skilj_core::db::SubmitCommandOutcome::Rejected { reason, kind, matching_events } => {
+                    skilj_core::db::SubmitCommandOutcome::Rejected {
+                        reason,
+                        kind,
+                        matching_events,
+                    } => {
                         SubmitCommandResult {
                             accepted: false,
                             triggered_event_sequences: None,

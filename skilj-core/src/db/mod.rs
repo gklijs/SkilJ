@@ -2035,7 +2035,7 @@ pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::e
     .execute(&mut *tx)
     .await?;
     replace_consumed_event_types(
-        &mut *tx,
+        &mut tx,
         &projection.bounded_context.name,
         "projection_consumed_event_types",
         &projection.name,

@@ -114,8 +114,8 @@ impl App {
 
     fn switch_to(&mut self, tab: Tab) {
         if self.selected_bc.is_none() {
-            self.status = "select a bounded context first (Enter on the Bounded Contexts tab)"
-                .to_string();
+            self.status =
+                "select a bounded context first (Enter on the Bounded Contexts tab)".to_string();
             return;
         }
         self.tab = tab;

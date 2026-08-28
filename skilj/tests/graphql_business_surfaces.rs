@@ -221,11 +221,9 @@ impl CommandType for DoThingFast {
         Some("ThingTotalSnapshot")
     }
     fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
-        let total = matching_events
-            .iter()
-            .fold(0i64, |t, e| match e {
-                ThingEvent::ThingHappened(p) => t + p.amount,
-            });
+        let total = matching_events.iter().fold(0i64, |t, e| match e {
+            ThingEvent::ThingHappened(p) => t + p.amount,
+        });
         do_thing_decision(payload, total)
     }
     fn decide_from_snapshot(
@@ -233,7 +231,8 @@ impl CommandType for DoThingFast {
         snapshot_state_json: &str,
         events_since_snapshot: &[Self::Event],
     ) -> CommandDecision {
-        let snapshot: ThingTotalState = serde_json::from_str(snapshot_state_json).unwrap_or_default();
+        let snapshot: ThingTotalState =
+            serde_json::from_str(snapshot_state_json).unwrap_or_default();
         let total = events_since_snapshot
             .iter()
             .fold(snapshot.total, |t, e| match e {

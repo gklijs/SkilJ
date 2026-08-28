@@ -18,7 +18,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use jsonwebtoken::{EncodingKey, Header};
 use serde_json::json;
-use skilj::{IdpConfig, Skilj, SigningAlgorithm};
+use skilj::{IdpConfig, SigningAlgorithm, Skilj};
 use support::{runtime, test_db};
 use tower::ServiceExt;
 

@@ -14,7 +14,11 @@ use ratatui::Frame;
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
 
     draw_tabs(frame, app, chunks[0]);
@@ -42,7 +46,11 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title(title))
         .select(selected)
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan));
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
+        );
     frame.render_widget(tabs, area);
 }
 
@@ -53,10 +61,18 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn selectable_list<'a>(items: Vec<ListItem<'a>>, title: &str, selected: usize) -> (List<'a>, ListState) {
+fn selectable_list<'a>(
+    items: Vec<ListItem<'a>>,
+    title: &str,
+    selected: usize,
+) -> (List<'a>, ListState) {
     let is_empty = items.is_empty();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title.to_string()))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title.to_string()),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     if !is_empty {
@@ -162,7 +178,10 @@ fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_default();
     let (list, mut state) = selectable_list(
         items,
-        &format!("Events (newest first, most recent {})", crate::data::RECENT_EVENTS_LIMIT),
+        &format!(
+            "Events (newest first, most recent {})",
+            crate::data::RECENT_EVENTS_LIMIT
+        ),
         app.list_selected,
     );
     frame.render_stateful_widget(list, area, &mut state);

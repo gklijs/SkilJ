@@ -23,12 +23,22 @@ fn enrolling_past_a_courses_capacity_is_rejected() {
         let mapping = mapping_for(&mappings, BOUNDED_CONTEXT);
         let router = skilj.rest_router();
         let course = unique_name("course");
-        let (s1, s2, s3) = (unique_name("student"), unique_name("student"), unique_name("student"));
+        let (s1, s2, s3) = (
+            unique_name("student"),
+            unique_name("student"),
+            unique_name("student"),
+        );
 
         let open = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "OpenCourse").await;
-        let enroll = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
+        let enroll =
+            mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
 
-        let response = trigger(&router, &open, serde_json::json!({ "course_id": course, "capacity": 2 })).await;
+        let response = trigger(
+            &router,
+            &open,
+            serde_json::json!({ "course_id": course, "capacity": 2 }),
+        )
+        .await;
         assert!(accepted(&response));
 
         for student in [&s1, &s2] {
@@ -38,7 +48,10 @@ fn enrolling_past_a_courses_capacity_is_rejected() {
                 serde_json::json!({ "student_id": student, "course_id": course }),
             )
             .await;
-            assert!(accepted(&response), "{student} should get one of the 2 seats: {response:?}");
+            assert!(
+                accepted(&response),
+                "{student} should get one of the 2 seats: {response:?}"
+            );
         }
 
         let response = trigger(
@@ -70,7 +83,8 @@ fn enrolling_in_an_unopened_course_is_rejected() {
         let course = unique_name("course");
         let student = unique_name("student");
 
-        let enroll = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
+        let enroll =
+            mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
         let response = trigger(
             &router,
             &enroll,
@@ -95,9 +109,15 @@ fn enrolling_the_same_student_twice_in_one_course_is_rejected() {
         let student = unique_name("student");
 
         let open = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "OpenCourse").await;
-        let enroll = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
+        let enroll =
+            mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
 
-        trigger(&router, &open, serde_json::json!({ "course_id": course, "capacity": 5 })).await;
+        trigger(
+            &router,
+            &open,
+            serde_json::json!({ "course_id": course, "capacity": 5 }),
+        )
+        .await;
         let first = trigger(
             &router,
             &enroll,
@@ -133,7 +153,8 @@ fn a_student_cannot_exceed_their_own_active_course_limit() {
         let student = unique_name("student");
 
         let open = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "OpenCourse").await;
-        let enroll = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
+        let enroll =
+            mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
 
         let limit = skilj_demo::courses::MAX_ACTIVE_COURSES_PER_STUDENT;
         let courses: Vec<String> = (0..=limit).map(|_| unique_name("course")).collect();
@@ -154,7 +175,10 @@ fn a_student_cannot_exceed_their_own_active_course_limit() {
                 serde_json::json!({ "student_id": student, "course_id": course }),
             )
             .await;
-            assert!(accepted(&response), "enrollment {course} within the limit should succeed: {response:?}");
+            assert!(
+                accepted(&response),
+                "enrollment {course} within the limit should succeed: {response:?}"
+            );
         }
 
         let one_too_many = &courses[limit];
@@ -186,10 +210,16 @@ fn dropping_a_course_frees_both_the_seat_and_the_students_own_slot() {
         let (s1, s2) = (unique_name("student"), unique_name("student"));
 
         let open = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "OpenCourse").await;
-        let enroll = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
+        let enroll =
+            mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
         let drop = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "DropCourse").await;
 
-        trigger(&router, &open, serde_json::json!({ "course_id": course, "capacity": 1 })).await;
+        trigger(
+            &router,
+            &open,
+            serde_json::json!({ "course_id": course, "capacity": 1 }),
+        )
+        .await;
         let response = trigger(
             &router,
             &enroll,
@@ -222,7 +252,10 @@ fn dropping_a_course_frees_both_the_seat_and_the_students_own_slot() {
             serde_json::json!({ "student_id": s2, "course_id": course }),
         )
         .await;
-        assert!(accepted(&response), "the freed seat should now be available: {response:?}");
+        assert!(
+            accepted(&response),
+            "the freed seat should now be available: {response:?}"
+        );
 
         let roster: CourseRosterState =
             projection_state(&pool, BOUNDED_CONTEXT, "CourseRoster", &course).await;
@@ -252,9 +285,15 @@ fn concurrent_enrollments_for_the_last_seat_are_serialized_correctly() {
         let (student_a, student_b) = (unique_name("student"), unique_name("student"));
 
         let open = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "OpenCourse").await;
-        let enroll = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
+        let enroll =
+            mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
 
-        let response = trigger(&router, &open, serde_json::json!({ "course_id": course, "capacity": 1 })).await;
+        let response = trigger(
+            &router,
+            &open,
+            serde_json::json!({ "course_id": course, "capacity": 1 }),
+        )
+        .await;
         assert!(accepted(&response));
 
         let task_a = {
@@ -263,7 +302,12 @@ fn concurrent_enrollments_for_the_last_seat_are_serialized_correctly() {
             let course = course.clone();
             let student = student_a.clone();
             tokio::spawn(async move {
-                trigger(&router, &enroll, serde_json::json!({ "student_id": student, "course_id": course })).await
+                trigger(
+                    &router,
+                    &enroll,
+                    serde_json::json!({ "student_id": student, "course_id": course }),
+                )
+                .await
             })
         };
         let task_b = {
@@ -272,7 +316,12 @@ fn concurrent_enrollments_for_the_last_seat_are_serialized_correctly() {
             let course = course.clone();
             let student = student_b.clone();
             tokio::spawn(async move {
-                trigger(&router, &enroll, serde_json::json!({ "student_id": student, "course_id": course })).await
+                trigger(
+                    &router,
+                    &enroll,
+                    serde_json::json!({ "student_id": student, "course_id": course }),
+                )
+                .await
             })
         };
 
@@ -289,7 +338,11 @@ fn concurrent_enrollments_for_the_last_seat_are_serialized_correctly() {
             "exactly one of the two racing enrollments should win the last seat: \
              a={response_a:?} b={response_b:?}"
         );
-        let loser = if accepted(&response_a) { &response_b } else { &response_a };
+        let loser = if accepted(&response_a) {
+            &response_b
+        } else {
+            &response_a
+        };
         assert_eq!(rejection_kind(loser), "course_full");
 
         let roster: CourseRosterState =

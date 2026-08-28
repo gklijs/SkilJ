@@ -5,7 +5,10 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "skilj-tui", about = "A Ratatui operator console for a skilj deployment")]
+#[command(
+    name = "skilj-tui",
+    about = "A Ratatui operator console for a skilj deployment"
+)]
 pub struct Args {
     /// The skilj-graphql endpoint, e.g. http://localhost:8080/graphql.
     #[arg(long, env = "SKILJ_GRAPHQL_URL")]

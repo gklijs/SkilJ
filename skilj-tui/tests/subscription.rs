@@ -22,7 +22,8 @@ async fn serve_mock_subscription_server() -> reqwest::Url {
 }
 
 async fn handle_upgrade(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.protocols(["graphql-transport-ws"]).on_upgrade(run_mock_protocol)
+    ws.protocols(["graphql-transport-ws"])
+        .on_upgrade(run_mock_protocol)
 }
 
 /// Plays the server's own half of the handshake by hand - not
@@ -40,7 +41,9 @@ async fn run_mock_protocol(mut socket: WebSocket) {
     assert_eq!(init["payload"]["Authorization"], "Bearer test-jwt");
 
     socket
-        .send(Message::text(json!({ "type": "connection_ack" }).to_string()))
+        .send(Message::text(
+            json!({ "type": "connection_ack" }).to_string(),
+        ))
         .await
         .unwrap();
 
@@ -64,7 +67,9 @@ async fn run_mock_protocol(mut socket: WebSocket) {
         .unwrap();
 
     socket
-        .send(Message::text(json!({ "id": "1", "type": "complete" }).to_string()))
+        .send(Message::text(
+            json!({ "id": "1", "type": "complete" }).to_string(),
+        ))
         .await
         .unwrap();
 }
@@ -93,5 +98,8 @@ async fn drives_the_handshake_and_delivers_one_next_payload() {
     let after = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
         .await
         .expect("timed out waiting for the channel to close");
-    assert!(after.is_none(), "expected the channel to close after \"complete\", got {after:?}");
+    assert!(
+        after.is_none(),
+        "expected the channel to close after \"complete\", got {after:?}"
+    );
 }

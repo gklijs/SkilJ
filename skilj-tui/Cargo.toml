@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
 description = "A Ratatui operator console for any skilj deployment - a GraphQL client, independent of every other skilj crate. See docs/architecture.md §11."
 
 [dependencies]

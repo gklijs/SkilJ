@@ -90,9 +90,9 @@ async fn each_background_loop_records_the_tick_duration_histogram() {
                 };
                 histogram.data_points().any(|dp| {
                     dp.count() >= 1
-                        && dp
-                            .attributes()
-                            .any(|kv| kv.key.as_str() == "task" && kv.value.as_str().as_ref() == task)
+                        && dp.attributes().any(|kv| {
+                            kv.key.as_str() == "task" && kv.value.as_str().as_ref() == task
+                        })
                 })
             })
     };

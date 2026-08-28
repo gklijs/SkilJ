@@ -149,9 +149,10 @@ pub fn auto_register(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut item_impl = parse_macro_input!(item as ItemImpl);
 
     if let Some(expr) = bounded_context_expr {
-        let already_overridden = item_impl.items.iter().any(|item| {
-            matches!(item, syn::ImplItem::Const(c) if c.ident == "BOUNDED_CONTEXT")
-        });
+        let already_overridden = item_impl
+            .items
+            .iter()
+            .any(|item| matches!(item, syn::ImplItem::Const(c) if c.ident == "BOUNDED_CONTEXT"));
         if already_overridden {
             return syn::Error::new_spanned(
                 &item_impl,

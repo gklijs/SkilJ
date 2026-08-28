@@ -33,7 +33,10 @@ fn deposit_then_withdraw_within_balance_succeeds() {
             serde_json::json!({ "account_id": account, "amount": 100 }),
         )
         .await;
-        assert!(accepted(&response), "deposit should be accepted: {response:?}");
+        assert!(
+            accepted(&response),
+            "deposit should be accepted: {response:?}"
+        );
 
         let response = trigger(
             &router,
@@ -41,7 +44,10 @@ fn deposit_then_withdraw_within_balance_succeeds() {
             serde_json::json!({ "account_id": account, "amount": 40 }),
         )
         .await;
-        assert!(accepted(&response), "withdrawal within balance should be accepted: {response:?}");
+        assert!(
+            accepted(&response),
+            "withdrawal within balance should be accepted: {response:?}"
+        );
 
         let state: AccountBalanceState =
             projection_state(&pool, BOUNDED_CONTEXT, "AccountBalance", &account).await;
@@ -63,7 +69,12 @@ fn withdrawing_more_than_the_balance_is_rejected_and_persists_nothing() {
         let deposit = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "DepositMoney").await;
         let withdraw = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "WithdrawMoney").await;
 
-        trigger(&router, &deposit, serde_json::json!({ "account_id": account, "amount": 50 })).await;
+        trigger(
+            &router,
+            &deposit,
+            serde_json::json!({ "account_id": account, "amount": 50 }),
+        )
+        .await;
 
         let response = trigger(
             &router,
@@ -71,12 +82,18 @@ fn withdrawing_more_than_the_balance_is_rejected_and_persists_nothing() {
             serde_json::json!({ "account_id": account, "amount": 51 }),
         )
         .await;
-        assert!(!accepted(&response), "overdrawing should be rejected: {response:?}");
+        assert!(
+            !accepted(&response),
+            "overdrawing should be rejected: {response:?}"
+        );
         assert_eq!(rejection_kind(&response), "insufficient_funds");
 
         let state: AccountBalanceState =
             projection_state(&pool, BOUNDED_CONTEXT, "AccountBalance", &account).await;
-        assert_eq!(state.balance, 50, "the rejected withdrawal must not have moved the balance");
+        assert_eq!(
+            state.balance, 50,
+            "the rejected withdrawal must not have moved the balance"
+        );
     });
 }
 
