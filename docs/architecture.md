@@ -3005,3 +3005,149 @@ triggered and its real matching event shown, the Live Events filter
 shown hiding/showing events live, `waitForSequence: 0` shown returning
 current state rather than hanging, and real ANSI colour codes confirmed
 in the captured pane output (not just present in the test suite).
+
+## 16. Declarative bounded-context format + codegen: a prototype, not a build (Codeberg issue #5)
+
+Issue #5 proposes a small YAML/TOML format describing an event/command/
+projection's *shape* (fields, DCB tags, sensitive fields), plus a
+codegen step turning it into the Rust structs/trait impls/`#[auto_register]`
+wiring - leaving only `decide()`/`project()` bodies hand-written. The
+issue names itself "the biggest, riskiest proposal here" and explicitly
+asks for prototyping against `skilj-demo`'s own two bounded contexts
+before committing, rather than building the real thing on spec. This
+section is that prototype's findings, not the feature - **no codegen
+tool, no new crate, no `build.rs` integration exists after this pass**.
+The translation from real Rust to the draft format happened entirely by
+hand, so what follows is what that translation actually revealed, not
+what a generator was assumed capable of.
+
+**Two facts settled before prototyping, neither in the issue's own
+text.** First: the issue asks readers to weigh this against its own
+cheaper sibling proposal, a `cargo generate`-once scaffolding template -
+that already shipped, as `templates/skilj-template/` (Codeberg issue
+#10, closed before this pass). The issue's own "which one first"
+question already has its first half answered; what was actually open
+was just "is the expensive, continuously-regenerating option still
+wanted." Second: this session's own #3 (`skilj` skill)/#4
+(`skilj-event-modeling` skill) already lower the same friction this
+issue targets, from cheaper angles (how to write it correctly, what
+shape it should be) that don't add a second format to maintain forever.
+
+### Method
+
+Hand-translated `skilj-demo/src/banking.rs` and `skilj-demo/src/courses.rs`
+into a draft YAML shape - the full translated files live in this
+session's own scratchpad, not committed (throwaway working material, the
+same treatment this session's other prototyping scaffolding got). One
+event type, to show the shape:
+
+```yaml
+event_types:
+  - name: MoneyDeposited
+    fields:
+      account_id: string
+      amount: i64
+    tags:
+      account: account_id
+```
+
+For each file, every construct was classified as **eliminable** (the
+generator could produce it entirely from the declarative shape) or
+**stays** (real `decide()`/`project()` logic, or a domain constant/helper
+function nothing about the format could express), counted from the real
+file's own line ranges - blank lines and section comments are
+apportioned by judgement, not mechanical counting, so treat the
+percentages below as good approximations, not exact.
+
+### Finding 1: the event enum + `BoundedContextEvent` impl is 100% mechanical
+
+`BankingEvent`/`CoursesEvent` and their `try_from_event` match arms
+(`courses.rs:119-142`, 24 lines including its own doc comment) are
+entirely derivable from the event
+type list alone - one variant, one match arm, per registered
+`EventType`, with zero hand-judgement involved. This is real,
+uncontested boilerplate, and it scales linearly with event-type count -
+the strongest, least ambiguous case *for* codegen found in this pass.
+
+### Finding 2: the more valuable the bounded context, the less codegen buys you
+
+|  | Total lines | Eliminable (shape) | Stays (real logic/consts/docs) | Structural (blank/comments) |
+|--|--|--|--|--|
+| `banking.rs` | 228 | ~115 (~50%) | ~80 (~35%) | ~33 (~15%) |
+| `courses.rs` | 437 | ~177 (~40%) | ~205 (~47%) | ~55 (~13%) |
+
+`banking.rs` is close to half boilerplate. `courses.rs` - the bounded
+context whose own module doc comment calls its two-invariant,
+dual-tagged `EnrollStudentInCourse::decide()` (52 lines on its own,
+`courses.rs:266-317`) "the whole point of this demo" - eliminates a
+similar *absolute* line count (wrapper/struct/enum scaffolding scales
+with type count regardless of complexity) but a smaller *proportion*,
+because the interesting part of that file is exactly the part no format
+could ever generate. The more a bounded context is worth building in
+the first place, the less this feature helps with it, proportionally -
+worth weighing against the issue's own implicit framing ("every event
+type... is pure boilerplate").
+
+### Finding 3: `Projection::keys()` needs a real escape hatch, not just a field name
+
+`CourseRoster` keys all three of its consumed event types by `course_id`
+uniformly - a bare `keyed_by: course_id` covers it. `StudentSchedule`'s
+own `keys()` (`courses.rs:423-429`) does not: it keys `StudentEnrolled`/
+`StudentUnenrolled` by `student_id` but must map `CourseOpened` (an
+event type it's still required to list in `consumed_event_types`, for
+`caught_up_to` accounting) to `vec![]` - that event type never carries a
+student at all. A workable format needs `keyed_by` to accept either a
+bare field name (the common case) or a per-event-type map (the
+`StudentSchedule` case) - solvable, but real design work, and once
+written out, the map form isn't meaningfully shorter than the 8-line
+Rust `match` it replaces. This is the one place this pass recommends
+deferring rather than solving now (see Recommendation).
+
+### Finding 4: a real correctness win, not just less typing
+
+Not anticipated going in. Today, `tag_mappings()`/`sensitive_fields()`
+name a payload field as a **plain string** (`field: "account_id".into()`)
+- nothing checks it against the actual struct's real field names at
+compile time. A typo (`"acount_id"`) compiles cleanly and is only caught
+at registration time, against a live database
+(`InvalidTagMapping`/`InvalidSensitiveField` - see the `skilj` skill's
+own `references/common-mistakes.md`). A generator deriving both the
+payload struct *and* the tag reference from the same declarative source
+can guarantee the field exists, and (since it already knows every
+field's declared type from the same YAML) can check the "must resolve to
+a scalar leaf" rule too - at generation/build time, not just at
+registration time against a database. This is a genuine improvement
+over what hand-written code has today, not merely a convenience.
+
+### What this prototype didn't exercise
+
+Neither `banking.rs` nor `courses.rs` uses `sensitive_fields`,
+scheduling (`system_triggered_allowed`/`schedule`/`missed_occurrence_policy`),
+or `#[requires_role]` - so this pass's own translation never stress-tested
+those parts of the format the issue's scope still calls for. A real
+build would need to design and prototype those separately, not assume
+the pattern found here extends cleanly.
+
+### Recommendation
+
+Not a flat yes/no - the evidence supports a narrower first cut than the
+issue's own full proposal, not the full bet. **Event/command type
+generation** (structs, trait-impl wrapper methods, the event enum +
+`BoundedContextEvent` impl) is the unambiguous, 100%-mechanical win
+(Findings 1 and 4) and worth building for real. **Projection generation**
+should wait - `keyed_by`'s real design complexity (Finding 3) isn't
+resolved, and projections are a smaller share of most bounded contexts
+than event/command types are, so the win-to-design-cost ratio is worse
+there. Either way, this is a real new maintenance surface - a format
+whose own compatibility story needs the same rigor
+`SchemaEvolutionStaysCompatible` already gives hand-written schemas
+(the issue's own explicit worry), and a codegen tool that has to track
+`skilj-core`'s plugin API's own evolution in lockstep (this project's
+own `#[auto_register]`/`auto_register` shorthand passes, 2026-08-25,
+are real, recent examples of that API moving) - not a cost to wave away
+against a boilerplate reduction that, per Finding 2, is smaller than
+the issue's own framing suggests for exactly the bounded contexts most
+worth building. The final call - build the narrower first cut, or close
+#5 as adequately superseded by #10 (already shipped) plus #3/#4
+(shipped this session) - is the project owner's, informed by these
+numbers rather than the issue's own upfront guess.
