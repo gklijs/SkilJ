@@ -1177,21 +1177,33 @@ impl SkiljBuilder {
                     skilj_core::cross_instance::Message::EventAppended {
                         bounded_context,
                         sequence,
+                        origin_instance_id,
                     } => {
+                        // Self-NOTIFY dedup (Codeberg ultra-review
+                        // bug_001): Postgres delivers a NOTIFY to every
+                        // listening backend, including ones opened by the
+                        // same process that sent it, so this instance's
+                        // own writes echo back here too. The write path
+                        // already called `cross_instance_event_broadcaster
+                        // .publish(&event)` directly at commit time
+                        // (`db::submit_command` and friends) - refetching
+                        // and republishing that identical event into that
+                        // identical broadcaster again would deliver it
+                        // twice to every local `EventSubscription`
+                        // subscriber. See `EventBroadcaster::instance_id`'s
+                        // own doc comment for the full explanation.
+                        if origin_instance_id == cross_instance_event_broadcaster.instance_id() {
+                            continue;
+                        }
                         // The plain, uncached read - deliberately, not
-                        // `get_event_by_sequence_cached`. This refetch
-                        // races with the original write path's own
-                        // `event_cache.append(&event)` (this instance's
-                        // own self-`NOTIFY` can be received before that
-                        // `.await` continuation resumes), and
-                        // `EventCache::try_event_by_sequence`'s own
-                        // `freshen()` backfill has no dedup against a
-                        // concurrent direct `append()` for the identical
-                        // event - going through the cache here could
-                        // double-append it. A one-shot read triggered by
-                        // a notification has no repeated-read benefit to
-                        // gain from the cache anyway, so there's nothing
-                        // this trades away.
+                        // `get_event_by_sequence_cached`. A one-shot read
+                        // triggered by a notification has no repeated-read
+                        // benefit to gain from the cache, so there's
+                        // nothing this trades away; going through the
+                        // cache here would also risk double-appending an
+                        // event `EventCache::try_event_by_sequence`'s own
+                        // `freshen()` backfill already has no dedup
+                        // against.
                         match skilj_core::db::get_event_by_sequence(
                             &cross_instance_pool,
                             &bounded_context,
@@ -1213,8 +1225,19 @@ impl SkiljBuilder {
                             ),
                         }
                     }
-                    skilj_core::cross_instance::Message::Revoked(revoked) => {
-                        cross_instance_revocation_broadcaster.publish(revoked);
+                    skilj_core::cross_instance::Message::Revoked {
+                        revoked,
+                        origin_instance_id,
+                    } => {
+                        // Same self-NOTIFY dedup as EventAppended above,
+                        // against RevocationBroadcaster::instance_id
+                        // instead - the write path already published
+                        // this revocation into
+                        // cross_instance_revocation_broadcaster directly.
+                        if origin_instance_id != cross_instance_revocation_broadcaster.instance_id()
+                        {
+                            cross_instance_revocation_broadcaster.publish(revoked);
+                        }
                     }
                     skilj_core::cross_instance::Message::RegistrationChanged => {
                         if let Err(err) = cross_instance_schema_registry

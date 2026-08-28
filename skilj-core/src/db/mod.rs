@@ -104,19 +104,27 @@ fn record_event_appended(event: &Event) {
 
 /// `crate::cross_instance`'s sending half for the `skilj_events` channel -
 /// called alongside `record_event_appended`, at the same five call sites,
-/// for the identical "only after the commit" reason. Every listening
-/// instance (including this one) fetches the real event and republishes
-/// it into its own local `EventBroadcaster` - see `crate::cross_instance`'s
-/// own module doc comment for the full design. A `NOTIFY` failure is
-/// logged and swallowed, never propagated: the event it accompanies
-/// already committed, and this channel is a pure liveliness signal - a
-/// missed notification self-heals via the same DB-backed catch-up path a
-/// same-process lagged subscriber already takes, per `@guarantee
-/// DeliverySpansInstances` in specs/skilj.allium.
-async fn notify_event_appended(pool: &Pool, event: &Event) {
+/// for the identical "only after the commit" reason. Every *other*
+/// listening instance fetches the real event and republishes it into its
+/// own local `EventBroadcaster` - see `crate::cross_instance`'s own
+/// module doc comment for the full design. `origin_instance_id` is
+/// `EventBroadcaster::instance_id`'s own value at this call site (the
+/// broadcaster `publish` was already just called on, immediately above
+/// every one of these five call sites) - carried in the payload purely
+/// so this same instance's own `NOTIFY` echoing back to itself can be
+/// recognised and skipped rather than republished into that identical
+/// broadcaster a second time (see `EventBroadcaster::instance_id`'s own
+/// doc comment for why that duplication would otherwise happen). A
+/// `NOTIFY` failure is logged and swallowed, never propagated: the event
+/// it accompanies already committed, and this channel is a pure
+/// liveliness signal - a missed notification self-heals via the same
+/// DB-backed catch-up path a same-process lagged subscriber already
+/// takes, per `@guarantee DeliverySpansInstances` in specs/skilj.allium.
+async fn notify_event_appended(pool: &Pool, event: &Event, origin_instance_id: &str) {
     let payload = serde_json::json!({
         "bounded_context": event.bounded_context.name,
         "sequence": event.sequence,
+        "origin_instance_id": origin_instance_id,
     })
     .to_string();
     if let Err(err) = sqlx::query("SELECT pg_notify('skilj_events', $1)")
@@ -160,11 +168,19 @@ async fn notify_registration_changed(pool: &Pool) {
 /// hence `pub`: this is the one `notify_*` helper reached from outside
 /// this module, since revocation, unlike event/registration writes, is
 /// driven entirely from the GraphQL layer with no `db::` choke point of
-/// its own to hook. Same "log and swallow" treatment as its siblings.
-pub async fn notify_revocation(pool: &Pool, mapping: &crate::access_control::RevokedMapping) {
+/// its own to hook. `origin_instance_id` gets the identical
+/// self-NOTIFY-dedup treatment `notify_event_appended`'s own doc comment
+/// describes, here against `RevocationBroadcaster::instance_id`. Same
+/// "log and swallow" treatment as its siblings.
+pub async fn notify_revocation(
+    pool: &Pool,
+    mapping: &crate::access_control::RevokedMapping,
+    origin_instance_id: &str,
+) {
     let payload = serde_json::json!({
         "role_id": mapping.role_id,
         "bounded_context": mapping.bounded_context,
+        "origin_instance_id": origin_instance_id,
     })
     .to_string();
     if let Err(err) = sqlx::query("SELECT pg_notify('skilj_revocations', $1)")
@@ -1190,7 +1206,7 @@ pub async fn fire_system_event(
     tx.commit().await?;
     broadcaster.publish(&event);
     record_event_appended(&event);
-    notify_event_appended(pool, &event).await;
+    notify_event_appended(pool, &event, broadcaster.instance_id()).await;
     event_cache.append(&event).await;
 
     Ok(Some(event))
@@ -3355,7 +3371,7 @@ pub async fn insert_event_and_update_sync_projections(
     // shares).
     broadcaster.publish(event);
     record_event_appended(event);
-    notify_event_appended(pool, event).await;
+    notify_event_appended(pool, event, broadcaster.instance_id()).await;
     event_cache.append(event).await;
 
     Ok(())
@@ -3563,7 +3579,7 @@ pub async fn create_and_insert_external_event(
     tx.commit().await?;
     broadcaster.publish(&event);
     record_event_appended(&event);
-    notify_event_appended(pool, &event).await;
+    notify_event_appended(pool, &event, broadcaster.instance_id()).await;
     event_cache.append(&event).await;
 
     Ok(event)
@@ -3627,7 +3643,7 @@ pub async fn create_and_insert_direct_event(
     tx.commit().await?;
     broadcaster.publish(&event);
     record_event_appended(&event);
-    notify_event_appended(pool, &event).await;
+    notify_event_appended(pool, &event, broadcaster.instance_id()).await;
     event_cache.append(&event).await;
 
     Ok(event)
@@ -3922,7 +3938,7 @@ pub async fn submit_command(
     for event in &result.events {
         broadcaster.publish(event);
         record_event_appended(event);
-        notify_event_appended(pool, event).await;
+        notify_event_appended(pool, event, broadcaster.instance_id()).await;
         event_cache.append(event).await;
     }
 

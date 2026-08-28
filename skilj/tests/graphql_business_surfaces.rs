@@ -549,3 +549,97 @@ fn full_business_surfaces_lifecycle_end_to_end() {
         assert_eq!(response["errors"][0]["extensions"]["code"], "unauthenticated");
     });
 }
+
+/// A rejection's `matchingEvents` (Codeberg issue #7's DCB conflict
+/// visualizer) is full raw event content - the same visibility
+/// `queryEvents`/`countEvents`/`inspectEvent` require `Admin` level for.
+/// `CommandSubmission` itself faces `WriteAccess` (any write-level grant
+/// can submit), but a Write-level caller must not use a deliberately
+/// forced rejection as a read side channel into event history they have
+/// no query access to - `MatchingEventsRequiresAdminLevel` in
+/// `specs/skilj.allium`.
+#[test]
+fn matching_events_is_only_returned_to_an_admin_level_caller() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, admin_jwt, _admin_role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        const SUBMIT_COMMAND_WITH_MATCHING_EVENTS: &str = "\
+            mutation($bc: String!, $name: String!, $payload: String!) { \
+                submitCommand(boundedContext: $bc, commandTypeName: $name, payload: $payload) { \
+                    accepted rejectionKind \
+                    matchingEvents { sequence eventTypeName payload } \
+                } \
+            }";
+
+        // Admin-level caller: a rejection returns matchingEvents - Some
+        // even though this file's own WithdrawMoney fixture declares no
+        // tags (so the set is empty), matching submit_command's own
+        // "Some even when empty" contract (see command_submission.rs's
+        // doc comment) - the point under test is presence vs absence of
+        // the field by access level, not its contents.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            SUBMIT_COMMAND_WITH_MATCHING_EVENTS,
+            json!({ "bc": bc_name, "name": "WithdrawMoney", "payload": r#"{"amount":5000}"# }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["submitCommand"]["accepted"], false);
+        assert_eq!(response["data"]["submitCommand"]["rejectionKind"], "insufficient_funds");
+        assert!(
+            response["data"]["submitCommand"]["matchingEvents"].is_array(),
+            "an Admin-level caller's rejection must carry matchingEvents (even if empty): {response:?}"
+        );
+
+        // Write-level caller, same bounded context: submission itself
+        // still succeeds (this surface faces WriteAccess), but the
+        // identical rejection's matchingEvents is withheld.
+        let write_subject = unique_name("write-only");
+        let write_role = Role {
+            id: generate_token_id(),
+            external_subject: write_subject.clone(),
+            name: "WriteOnly".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &write_role).await.unwrap();
+        let write_mapping = RoleAccessMapping {
+            role: write_role,
+            bounded_context: skilj_core::db::get_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .unwrap(),
+            level: AccessLevel::Write,
+            can_read_sensitive: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &write_mapping)
+            .await
+            .unwrap();
+        let write_jwt = sign_jwt(&write_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&write_jwt),
+            SUBMIT_COMMAND_WITH_MATCHING_EVENTS,
+            json!({ "bc": bc_name, "name": "WithdrawMoney", "payload": r#"{"amount":5000}"# }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["submitCommand"]["accepted"], false);
+        assert_eq!(response["data"]["submitCommand"]["rejectionKind"], "insufficient_funds");
+        assert!(
+            response["data"]["submitCommand"]["matchingEvents"].is_null(),
+            "a Write-level caller must not receive matchingEvents: {response:?}"
+        );
+    });
+}

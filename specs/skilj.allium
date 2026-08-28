@@ -4667,6 +4667,18 @@ surface CommandSubmission {
         -- A write-level grant only authorises submitting commands for
         -- CommandTypes belonging to its own bounded context.
 
+    @guarantee MatchingEventsRequiresAdminLevel
+        -- The matching_events set surfaced on a rejection (see the
+        -- guidance below) is returned only when access_mapping.level =
+        -- admin - not for any write-level grant this surface otherwise
+        -- accepts for submission itself. matching_events is full event
+        -- content, the same visibility EventQuery's own AdminAccess
+        -- requires (see its SensitiveFieldsStayProtected), so a
+        -- write-level grant able to submit commands is not thereby able
+        -- to browse the event history submission reads from. A
+        -- write-level caller's rejection still carries rejection_reason
+        -- and rejection_kind as usual, with matching_events withheld.
+
     @guidance
         -- GraphQL only: a mutation, qualified by bounded context per the
         -- unified-graph naming scheme, authenticated as a Role and gated
@@ -4684,7 +4696,8 @@ surface CommandSubmission {
         -- acceptance already tells them what happened. CommandTrigger's
         -- own REST response does not carry this: that surface stays
         -- narrowly scoped to an automated caller acting on an outcome,
-        -- not debugging one.
+        -- not debugging one. See MatchingEventsRequiresAdminLevel above
+        -- for the access-level restriction on top of that scoping.
 }
 
 surface CommandTrigger {

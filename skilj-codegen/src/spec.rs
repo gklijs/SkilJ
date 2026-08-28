@@ -7,7 +7,11 @@
 //! all real, legitimate parts of the plugin API this format doesn't
 //! cover yet - named here as deliberately deferred, not silently
 //! missing, matching this project's own "don't build ahead of what's
-//! wired" convention.
+//! wired" convention. Every struct below carries `#[serde(deny_unknown_fields)]`
+//! so that promise holds on the input side too: a `.skilj.toml` naming
+//! one of those deferred fields (or a typo of a covered one, e.g.
+//! `taggs`) is a real `toml::de::Error` at `generate()` time, not a
+//! silently-ignored key.
 //!
 //! `fields` is an array of `{name, type}` tables, not a TOML map -
 //! deliberately, so field order in the generated struct matches the
@@ -19,6 +23,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoundedContextSpec {
     pub bounded_context: String,
     /// `Vec` field name stays plural (idiomatic Rust); the TOML key is
@@ -32,6 +37,7 @@ pub struct BoundedContextSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventTypeSpec {
     pub name: String,
     #[serde(default)]
@@ -47,6 +53,7 @@ pub struct EventTypeSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandTypeSpec {
     pub name: String,
     #[serde(default)]
@@ -58,6 +65,7 @@ pub struct CommandTypeSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldSpec {
     pub name: String,
     #[serde(rename = "type")]

@@ -672,18 +672,32 @@ pub struct RevokedMapping {
 /// receiver is already an exceptional case, handled defensively (a direct
 /// database re-check, not assumed-still-active) rather than tuned around.
 #[derive(Clone)]
-pub struct RevocationBroadcaster(tokio::sync::broadcast::Sender<RevokedMapping>);
+pub struct RevocationBroadcaster {
+    sender: tokio::sync::broadcast::Sender<RevokedMapping>,
+    instance_id: String,
+}
 
 impl RevocationBroadcaster {
     pub fn new() -> Self {
         let (sender, _receiver) = tokio::sync::broadcast::channel(256);
-        Self(sender)
+        Self {
+            sender,
+            instance_id: crate::shared::generate_token_id(),
+        }
+    }
+
+    /// See `EventBroadcaster::instance_id`'s own doc comment - identical
+    /// role, for `db::notify_revocation`/this instance's cross-instance
+    /// dispatch loop instead of `db::notify_event_appended`/the
+    /// `EventBroadcaster` one.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// A fresh, independent receiver - one call per live GraphQL
     /// subscription, the same as `EventBroadcaster::subscribe`.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RevokedMapping> {
-        self.0.subscribe()
+        self.sender.subscribe()
     }
 
     /// Called once per revoked `RoleAccessMapping`, right after that
@@ -692,7 +706,7 @@ impl RevocationBroadcaster {
     /// currently subscribed) is the expected steady state, not a
     /// failure - identical reasoning to `EventBroadcaster::publish`.
     pub fn publish(&self, revoked: RevokedMapping) {
-        let _ = self.0.send(revoked);
+        let _ = self.sender.send(revoked);
     }
 }
 

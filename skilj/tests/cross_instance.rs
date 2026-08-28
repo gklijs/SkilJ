@@ -651,3 +651,140 @@ fn cross_instance_push_reaches_a_second_instance_sharing_one_database() {
         );
     });
 }
+
+/// Codeberg ultra-review bug_001: Postgres delivers a `NOTIFY` to every
+/// listening backend, including ones opened by the same process that
+/// sent it, so the write path's own direct `EventBroadcaster::publish`
+/// and this instance's own cross-instance listener republishing its own
+/// self-`NOTIFY` used to both feed the identical local broadcaster,
+/// delivering every locally-committed event twice to a same-instance
+/// subscriber. Single-instance here, deliberately, unlike every other
+/// test in this file (see its own module doc comment for why those
+/// stay two-instance) - this is specifically about a submitter and
+/// subscriber sharing one instance, the case a two-instance harness
+/// can't observe.
+#[test]
+fn same_instance_delivery_is_exactly_once_not_duplicated() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: admin_role.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<DepositMoney>()
+            .reconciliation_role(admin_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let admin_jwt = sign_jwt(&admin_role.external_subject);
+        let (router, ws_url) = serve(&skilj).await;
+
+        let mut ws = ws_connect(&ws_url).await;
+        ws_send_json(
+            &mut ws,
+            json!({
+                "type": "connection_init",
+                "payload": { "Authorization": format!("Bearer {admin_jwt}") },
+            }),
+        )
+        .await;
+        assert_eq!(ws_recv_json(&mut ws).await["type"], "connection_ack");
+        ws_send_json(
+            &mut ws,
+            json!({
+                "id": "1",
+                "type": "subscribe",
+                "payload": {
+                    "query": "subscription($bc: String!) { \
+                        allEvents(boundedContext: $bc) { sequence payload } \
+                    }",
+                    "variables": { "bc": bc_name },
+                },
+            }),
+        )
+        .await;
+
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            DEPOSIT_MONEY_MUTATION,
+            json!({ "bc": bc_name, "payload": r#"{"amount":20}"# }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        let sequence = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+
+        let delivered = ws_recv_json(&mut ws).await;
+        assert_eq!(delivered["id"], "1");
+        assert_eq!(delivered["type"], "next");
+        assert_eq!(delivered["payload"]["data"]["allEvents"]["sequence"], sequence);
+
+        // The bug: this instance's own self-NOTIFY used to republish the
+        // identical event into the identical broadcaster a second time.
+        // A generous window - the self-NOTIFY round trip through this
+        // instance's own PgListener is normally sub-millisecond over a
+        // local connection, so if a duplicate is coming, it's here well
+        // before this timeout elapses.
+        let second = ws_try_recv_json(&mut ws, Duration::from_millis(500)).await;
+        assert!(
+            second.is_none(),
+            "a locally-committed event must reach a same-instance subscriber exactly once, \
+             not twice: got a second message {second:?}"
+        );
+    });
+}

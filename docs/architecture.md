@@ -3273,3 +3273,81 @@ flight work and is untouched by this one). `$OUT_DIR/banking_generated.rs`
 was manually inspected after a real build and reads as genuinely clean,
 idiomatic Rust - a maintainer debugging generated code would not be lost
 in it.
+
+## 18. Ultra-review fixes: an access-control leak, a duplicate-delivery bug, and two nits
+
+A `/code-review ultra` cloud review of this session's own recent work
+(`1bcfc70`..`HEAD` - roughly everything from `skilj-tui` through §17's
+`skilj-codegen`, chosen to fit the tool's diff-size cap) surfaced four
+findings, all fixed the same pass. Two were real, not nits.
+
+**`matchingEvents` leaked event payloads past `Admin` gating.**
+`CommandSubmission` (§7's DCB conflict visualizer) faces `WriteAccess`
+for submission itself, but a rejection's `matchingEvents` is full raw
+event content - the same visibility `EventQuery`'s `queryEvents`/
+`countEvents`/`inspectEvent` require `Admin` for. The resolver populated
+it for any Write-level caller's rejection, meaning a Write-only caller
+could construct a command whose derived tags scope any account/entity
+of interest, force a rejection on purpose, and read that entity's whole
+matching-event history back through this field - a read side channel
+around the Admin-only query surfaces. Fixed in
+`skilj-graphql/src/resolvers/command_submission.rs`: `matching_events`
+is now `Some(...)` only when `access_mapping.level == Admin`, `None`
+otherwise (a Write-level rejection still carries `rejection_reason`/
+`rejection_kind` as before). `specs/skilj.allium`'s `CommandSubmission`
+surface gained `@guarantee MatchingEventsRequiresAdminLevel` recording
+this (via `allium:tend`, `allium check` clean). A new test,
+`matching_events_is_only_returned_to_an_admin_level_caller` in
+`skilj/tests/graphql_business_surfaces.rs`, submits the identical
+rejecting command as both an Admin- and a Write-level caller against
+real Postgres and asserts the field is present only for the former.
+
+**Cross-instance `NOTIFY` double-delivered every locally-committed
+event.** §12's write path both calls `EventBroadcaster::publish`/
+`RevocationBroadcaster::publish` directly *and* `NOTIFY`s Postgres. But
+Postgres delivers a `NOTIFY` to every listening backend, including ones
+opened by the same process that sent it - so an instance's own
+`cross_instance::Listener` received its own self-`NOTIFY`, refetched
+the event, and republished it into the *same* local broadcaster the
+direct `publish` call had already fed. Every `allEvents`/`eventsByType`
+subscriber on the submitting instance saw every event twice; a
+revocation double-fired the same way. Fixed with a per-broadcaster
+random `instance_id` (`EventBroadcaster`/`RevocationBroadcaster` in
+`skilj-core/src/event_store/mod.rs`/`access_control/mod.rs`, generated
+once at construction via `shared::generate_token_id()`, exposed via
+`instance_id()`): `db::notify_event_appended`/`db::notify_revocation`
+now stamp their `NOTIFY` payload with the publishing broadcaster's own
+id, `cross_instance::Message::EventAppended`/`Message::Revoked` carry it
+as `origin_instance_id` (`#[serde(default)]` so an older instance's
+payload during a rolling deploy still parses rather than being dropped
+as malformed), and `skilj`'s dispatch loop skips republishing when
+`origin_instance_id` matches its own broadcaster's `instance_id()` -
+this instance's own write already delivered locally, once.
+`Message::RegistrationChanged` deliberately gets no such treatment: it's
+the *only* path that ever rebuilds the GraphQL schema, including for a
+locally-originated registration change, so a same-instance echo of it
+must always be acted on. Proven with a new single-instance test,
+`same_instance_delivery_is_exactly_once_not_duplicated` in
+`skilj/tests/cross_instance.rs` (every other test in that file is
+deliberately two-instance - see its own module doc comment) - verified
+to actually fail without the fix by temporarily short-circuiting the
+dedup check and re-running it, then restoring the fix and confirming
+green again.
+
+**Two nits, `skilj-codegen`-scoped**: none of its spec structs carried
+`#[serde(deny_unknown_fields)]`, so a deferred field name (`sensitive_fields`,
+say) or a typo (`taggs`) in a `.skilj.toml` was silently ignored rather
+than a build error - contradicting the crate's own "deliberately
+deferred, not silently missing" doc comment on the input side. Fixed
+with `#[serde(deny_unknown_fields)]` on all four spec structs in
+`skilj-codegen/src/spec.rs`, plus two new regression tests in
+`skilj-codegen/tests/generate.rs`. And `skilj-demo/src/banking.rs` still
+declared a hand-written `BOUNDED_CONTEXT_NAME` const left over from
+before §17's codegen refactor - dead, unreferenced anywhere, sitting two
+lines above the real generated `BOUNDED_CONTEXT` every caller actually
+uses. Deleted.
+
+Verification for all four: `cargo build/clippy/test --workspace` clean
+(the one pre-existing `skilj-core` `explicit_auto_deref` warning noted
+in §17 is unrelated and untouched), `allium check` clean on the spec
+change.

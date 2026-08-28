@@ -176,8 +176,21 @@ pub fn submit_command_field() -> Field {
                             // decider didn't reject *because* of a
                             // conflict still had a real, if empty, set to
                             // decide from) - None is reserved for
-                            // "accepted, not applicable" below.
-                            matching_events: Some(matching_events),
+                            // "accepted, not applicable" below. Gated on
+                            // Admin: this WriteAccess-gated resolver lets
+                            // any Write-level caller submit commands, but
+                            // matching_events is full raw event content -
+                            // the same thing queryEvents/countEvents/
+                            // inspectEvent require Admin for. Without this
+                            // gate a Write-only caller could construct a
+                            // command whose tags scope any account they
+                            // like, force a rejection, and read that
+                            // account's whole matching-event history back
+                            // through this field - a read side channel
+                            // around the Admin-only query surface.
+                            matching_events: (access_mapping.level
+                                == skilj_core::access_control::AccessLevel::Admin)
+                                .then_some(matching_events),
                         }
                     }
                     skilj_core::db::SubmitCommandOutcome::Accepted { events, .. } => {

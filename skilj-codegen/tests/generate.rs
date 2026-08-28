@@ -103,3 +103,33 @@ fn a_malformed_toml_file_is_a_real_error_not_a_panic() {
     let result = skilj_codegen::generate("this is not valid toml {{{");
     assert!(matches!(result, Err(skilj_codegen::Error::Toml(_))));
 }
+
+/// A deferred field (`sensitive_fields`, not yet covered by this format -
+/// see `spec.rs`'s own doc comment) or a typo of a covered one must be a
+/// real build-time error, not a silently-ignored key that leaves a
+/// user believing something was configured that never took effect.
+#[test]
+fn an_unknown_field_on_an_event_type_is_a_real_error_not_silently_dropped() {
+    let toml = r#"
+        bounded_context = "banking"
+        [[event_type]]
+        name = "SomethingHappened"
+        fields = [ { name = "note", type = "string" } ]
+        sensitive_fields = [ { field = "note", subject_key = "user", subject_field = "note" } ]
+    "#;
+    let result = skilj_codegen::generate(toml);
+    assert!(matches!(result, Err(skilj_codegen::Error::Toml(_))));
+}
+
+#[test]
+fn a_typo_d_field_name_is_a_real_error_not_silently_dropped() {
+    let toml = r#"
+        bounded_context = "banking"
+        [[event_type]]
+        name = "SomethingHappened"
+        fields = [ { name = "note", type = "string" } ]
+        taggs = { account = "note" }
+    "#;
+    let result = skilj_codegen::generate(toml);
+    assert!(matches!(result, Err(skilj_codegen::Error::Toml(_))));
+}

@@ -53,6 +53,23 @@ pub const REGISTRATION_CHANGED_CHANNEL: &str = "skilj_registration_changed";
 /// `Event`/`RevokedMapping` themselves reused verbatim as the payload
 /// shape: `EventAppended` is a pointer (see its own doc comment for
 /// why), and `RegistrationChanged` carries nothing at all.
+///
+/// `EventAppended` and `Revoked` both carry `origin_instance_id` - the
+/// sending instance's own `EventBroadcaster::instance_id`/
+/// `RevocationBroadcaster::instance_id` at the moment it published
+/// locally and NOTIFYed, alongside each other, from the same choke
+/// point. This module stays a decode-only layer (see its own doc
+/// comment - it "has no reason to know skilj-graphql's SchemaRegistry
+/// exists"), so it makes no decision based on this field itself; it's
+/// the caller's own local broadcasters this needs comparing against, and
+/// `skilj::SkiljBuilder::build`'s own dispatch loop is where that
+/// comparison happens - see its own doc comment for why a match there
+/// means "skip, this is my own write echoing back" rather than
+/// "republish." `RegistrationChanged` carries no such field: unlike the
+/// other two channels, nothing publishes a schema rebuild directly on
+/// the write path - this NOTIFY is the *only* way any instance, including
+/// the one that made the change, ever rebuilds its schema, so a
+/// same-instance echo of it must always be acted on, never skipped.
 #[derive(Debug, Clone)]
 pub enum Message {
     /// `skilj_events` - a pointer, not the full event (Postgres's own
@@ -62,13 +79,18 @@ pub enum Message {
     /// (via the plain, uncached `db::get_event_by_sequence` -
     /// `skilj::SkiljBuilder::build`'s own dispatch loop explains why not
     /// the cached variant) and republishes it into its own local
-    /// `EventBroadcaster`.
+    /// `EventBroadcaster` - unless `origin_instance_id` names this exact
+    /// instance, see this enum's own doc comment.
     EventAppended {
         bounded_context: String,
         sequence: i64,
+        origin_instance_id: String,
     },
     /// `skilj_revocations` - small enough to carry in full.
-    Revoked(RevokedMapping),
+    Revoked {
+        revoked: RevokedMapping,
+        origin_instance_id: String,
+    },
     /// `skilj_registration_changed` - a bare signal, no payload: which
     /// exact type or bounded context changed doesn't matter, every
     /// listener reacts identically (rebuild the whole schema).
@@ -79,12 +101,26 @@ pub enum Message {
 struct EventAppendedPayload {
     bounded_context: String,
     sequence: i64,
+    /// `#[serde(default)]` so an older instance's payload (predating
+    /// this field) still parses instead of being dropped as malformed -
+    /// this module's own established "a gap self-heals, isn't fatal"
+    /// principle. Defaulting to `""` (never a real
+    /// `EventBroadcaster::instance_id`, always a fresh random id) means
+    /// such a message is simply never mistaken for a self-echo, which
+    /// only briefly reintroduces the pre-fix double-delivery this field
+    /// exists to prevent, self-healing away as soon as every instance in
+    /// a rolling deploy is running code that sends it.
+    #[serde(default)]
+    origin_instance_id: String,
 }
 
 #[derive(serde::Deserialize)]
 struct RevokedPayload {
     role_id: String,
     bounded_context: String,
+    /// See `EventAppendedPayload::origin_instance_id`'s own doc comment.
+    #[serde(default)]
+    origin_instance_id: String,
 }
 
 /// Thin wrapper around `sqlx::postgres::PgListener`, subscribed to all
@@ -129,6 +165,7 @@ impl Listener {
                             return Ok(Message::EventAppended {
                                 bounded_context: p.bounded_context,
                                 sequence: p.sequence,
+                                origin_instance_id: p.origin_instance_id,
                             })
                         }
                         Err(err) => tracing::warn!(
@@ -140,10 +177,13 @@ impl Listener {
                 REVOCATIONS_CHANNEL => {
                     match serde_json::from_str::<RevokedPayload>(notification.payload()) {
                         Ok(p) => {
-                            return Ok(Message::Revoked(RevokedMapping {
-                                role_id: p.role_id,
-                                bounded_context: p.bounded_context,
-                            }))
+                            return Ok(Message::Revoked {
+                                revoked: RevokedMapping {
+                                    role_id: p.role_id,
+                                    bounded_context: p.bounded_context,
+                                },
+                                origin_instance_id: p.origin_instance_id,
+                            })
                         }
                         Err(err) => tracing::warn!(
                             error = %err,

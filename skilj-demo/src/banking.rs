@@ -31,8 +31,6 @@
 use serde::{Deserialize, Serialize};
 use skilj_core::shared::{CommandDecision, EventSpec};
 
-pub const BOUNDED_CONTEXT_NAME: &str = "banking";
-
 include!(concat!(env!("OUT_DIR"), "/banking_generated.rs"));
 
 fn balance_of(matching_events: &[BankingEvent]) -> i64 {

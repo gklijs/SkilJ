@@ -96,7 +96,12 @@ pub fn revoke_role_field() -> Field {
                     bounded_context: mapping.bounded_context.name.clone(),
                 };
                 state.revocation_broadcaster.publish(revoked.clone());
-                skilj_core::db::notify_revocation(&state.pool, &revoked).await;
+                skilj_core::db::notify_revocation(
+                    &state.pool,
+                    &revoked,
+                    state.revocation_broadcaster.instance_id(),
+                )
+                .await;
             }
 
             Ok(Some(FieldValue::owned_any(revoked_role)))
@@ -225,7 +230,12 @@ pub fn revoke_role_access_mapping_field() -> Field {
                 state
                     .revocation_broadcaster
                     .publish(revoked_mapping.clone());
-                skilj_core::db::notify_revocation(&state.pool, &revoked_mapping).await;
+                skilj_core::db::notify_revocation(
+                    &state.pool,
+                    &revoked_mapping,
+                    state.revocation_broadcaster.instance_id(),
+                )
+                .await;
 
                 Ok(Some(FieldValue::owned_any(revoked)))
             })

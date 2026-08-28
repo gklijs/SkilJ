@@ -1996,20 +1996,29 @@ pub fn deliver_to_subscriptions(
 }
 
 /// The real-time delivery mechanism `DeliverToSubscriptions`/
-/// `EventSubscription` need, deliberately as small as possible - see
-/// `docs/architecture.md`'s own write-up of this pass for why this is a
-/// single-process, in-memory broadcast rather than anything
-/// Postgres-`LISTEN`/`NOTIFY`- or broker-backed: "Multi-instance /
-/// distributed deployment" is explicitly out of this spec's scope
-/// (§Excludes), so there is exactly one process any event this engine
-/// produces could ever need to reach a live subscriber from.
+/// `EventSubscription` need, deliberately as small as possible - a
+/// single-process, in-memory broadcast rather than anything itself
+/// Postgres-`LISTEN`/`NOTIFY`- or broker-backed, since every local
+/// `EventSubscription` subscriber already lives in this one process and
+/// needs nothing more elaborate to be reached. Multi-instance delivery
+/// (Codeberg issue #2; `crate::cross_instance`) builds on top of this
+/// rather than replacing it: another instance's committed event still
+/// arrives here, republished by this instance's own cross-instance
+/// listener - see `instance_id`'s own doc comment for how a duplicate
+/// republish of *this* instance's own writes is avoided.
 ///
 /// `Clone`-cheap - `tokio::sync::broadcast::Sender` is already an `Arc`
 /// around its own internal state, so every clone shares the same
 /// channel, the same "hand out cheap clones from one shared thing"
-/// treatment `db::Pool`/the two dispatchers already get.
+/// treatment `db::Pool`/the two dispatchers already get. `instance_id` is
+/// a plain `String`, but `Clone` still stays effectively free for what
+/// this type is used for - it's cloned to hand out shared handles, not
+/// in any per-event hot path.
 #[derive(Clone)]
-pub struct EventBroadcaster(tokio::sync::broadcast::Sender<Event>);
+pub struct EventBroadcaster {
+    sender: tokio::sync::broadcast::Sender<Event>,
+    instance_id: String,
+}
 
 impl EventBroadcaster {
     /// `capacity` is how many not-yet-delivered events a single slow
@@ -2018,7 +2027,28 @@ impl EventBroadcaster {
     /// `SkiljBuilder::event_broadcast_capacity`'s own doc comment.
     pub fn new(capacity: usize) -> Self {
         let (sender, _receiver) = tokio::sync::broadcast::channel(capacity);
-        Self(sender)
+        Self {
+            sender,
+            instance_id: crate::shared::generate_token_id(),
+        }
+    }
+
+    /// A random id generated once per broadcaster - in practice once per
+    /// running `Skilj` instance, since `SkiljBuilder::build` is this
+    /// type's only real construction site. `db::notify_event_appended`
+    /// stamps every `NOTIFY` this instance sends with it; `skilj`'s own
+    /// cross-instance dispatch loop compares an incoming notification's
+    /// `origin_instance_id` against this to recognise "this is my own
+    /// write echoing back" and skip it, rather than calling `publish`
+    /// here a second time for an event this exact broadcaster already
+    /// delivered once directly. Without that check, every locally
+    /// submitted event reached every local subscriber twice - Postgres
+    /// `NOTIFY` is delivered to every listening backend including ones
+    /// opened by the same process that sent it, and this broadcaster is
+    /// the identical shared destination both the direct `publish` call
+    /// and the cross-instance republish write into.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// A fresh, independent receiver - `resolvers::event_subscription`'s
@@ -2027,7 +2057,7 @@ impl EventBroadcaster {
     /// with no coordination needed between them - `broadcast`'s own
     /// native fan-out, not something this type manages by hand.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
-        self.0.subscribe()
+        self.sender.subscribe()
     }
 
     /// `db::insert_event_and_update_sync_projections`'s own post-commit
@@ -2039,7 +2069,7 @@ impl EventBroadcaster {
     /// "nobody's listening right now" non-error `tokio::sync::broadcast`
     /// itself already models this way.
     pub fn publish(&self, event: &Event) {
-        let _ = self.0.send(event.clone());
+        let _ = self.sender.send(event.clone());
     }
 }
 
