@@ -573,6 +573,21 @@ async fn provision_bounded_context_schema(
     ))
     .execute(&mut **tx)
     .await?;
+    // docs/architecture.md §19's "Problem 1" fix -
+    // `list_events_for_bounded_context_matching_tags`' own GIN index.
+    // `tags` is already `JSONB`, so this needs no column-type change:
+    // GIN indexes each array element's key/value pairs, which is what
+    // makes a `tags @> '[{"key":"...","value":"..."}]'::jsonb`
+    // containment query fast rather than a sequential scan. Only
+    // bounded contexts provisioned after this change get it - a
+    // pre-existing one would need `CREATE INDEX ... USING GIN (tags)`
+    // run by hand, see that function's own doc comment for why no
+    // backfill migration exists for this yet.
+    sqlx::query(&format!(
+        "CREATE INDEX events_by_tags ON {schema}.events USING GIN (tags)"
+    ))
+    .execute(&mut **tx)
+    .await?;
     // See `command_encryption_keys` above - the identical join-table
     // treatment, keyed by `sequence` instead of a synthetic id since
     // `events.sequence` is already `Event`'s own natural primary key.
@@ -2965,9 +2980,8 @@ pub async fn list_events_for_bounded_context(
 /// Every `Event` committed after `after_sequence`, ordered by `sequence`.
 /// `catch_up_bounded_context`'s own bounded load, unlike
 /// `list_events_for_bounded_context` above's "always reload everything"
-/// shape (still used as-is by `process_command`'s consistency-boundary
-/// resolution - unrelated, unchanged). Same per-row resolution as that
-/// function, just with a `WHERE` clause and a starting point.
+/// shape. Same per-row resolution as that function, just with a `WHERE`
+/// clause and a starting point.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_for_bounded_context_from(
     pool: &Pool,
@@ -2988,6 +3002,115 @@ pub async fn list_events_for_bounded_context_from(
     .bind(after_sequence)
     .fetch_all(pool)
     .await?;
+
+    let mut event_types: std::collections::HashMap<String, EventType> =
+        std::collections::HashMap::new();
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !event_types.contains_key(&row.event_type_name) {
+            let et = get_event_type(pool, bounded_context, &row.event_type_name)
+                .await?
+                .expect("events row references an event_types row that no longer exists");
+            event_types.insert(row.event_type_name.clone(), et);
+        }
+        let origin = event_origin_from_row(
+            pool,
+            bounded_context,
+            &row.origin_kind,
+            row.origin_source_content,
+            row.origin_source_context,
+            row.origin_command_id,
+        )
+        .await?;
+        events.push(Event {
+            bounded_context: bc.clone(),
+            event_type: event_types[&row.event_type_name].clone(),
+            payload: row.payload,
+            metadata: Metadata {
+                r#type: row.metadata_type,
+                version: row.metadata_version,
+                client_id: row.metadata_client_id,
+                created_at: row.metadata_created_at,
+            },
+            sequence: row.sequence,
+            tags: row.tags.0,
+            encryption_keys: Vec::new(),
+            origin,
+        });
+    }
+    Ok(events)
+}
+
+/// Tag-indexed sibling of `list_events_for_bounded_context`/`_from` -
+/// docs/architecture.md §19's "Problem 1" fix. Those two always fetch
+/// the *whole* bounded context and leave tag-matching to the caller's
+/// own in-memory filter (`consistency_boundary_and_matching_events`'s
+/// own union semantics) - fine while a bounded context is small, but a
+/// full unfiltered scan on every command submission once it isn't. This
+/// pushes the same union-of-tags matching down into the query itself,
+/// via `events_by_tags` (a GIN index on the already-`JSONB` `tags`
+/// column, added in `provision_bounded_context_schema`) - one `tags @>
+/// $N::jsonb` containment clause per wanted tag, `OR`'d together,
+/// optionally further bounded by `sequence > after_sequence` (folds in
+/// both `queryEvents`' own pagination and `submit_command`'s
+/// DCB-conflict redispatch check, which needs the identical "tag-scoped
+/// and newer than X" shape - see that function's own call site).
+///
+/// An empty `tags` slice returns `Ok(vec![])` without ever touching
+/// Postgres - mirrors `consistency_boundary_and_matching_events`'s own
+/// "no `tag_mappings` declared" case exactly, so a `CommandType`/
+/// `EventType` with no tags sees no behavioural change at all.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_events_for_bounded_context_matching_tags(
+    pool: &Pool,
+    bounded_context: &str,
+    tags: &[Tag],
+    after_sequence: Option<i64>,
+) -> crate::error::Result<Vec<Event>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let bc = get_bounded_context(pool, bounded_context).await?.expect(
+        "list_events_for_bounded_context_matching_tags: bounded_context row must exist for any event referencing it",
+    );
+
+    let schema = schema_ident(bounded_context);
+    // One `[Tag]`-shaped single-element JSONB array literal per wanted
+    // tag - containment (`@>`) needs the right-hand side to be an array
+    // too, since `tags` itself is stored as an array of tag objects, not
+    // one bare object.
+    let tag_literals: Vec<String> = tags
+        .iter()
+        .map(|t| {
+            serde_json::to_string(std::slice::from_ref(t))
+                .expect("Tag serialisation is infallible")
+        })
+        .collect();
+    let tag_clause = (1..=tag_literals.len())
+        .map(|i| format!("tags @> ${i}::jsonb"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sequence_param = tag_literals.len() + 1;
+    let where_clause = match after_sequence {
+        Some(_) => format!("({tag_clause}) AND sequence > ${sequence_param}"),
+        None => tag_clause,
+    };
+
+    let sql = format!(
+        "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
+         metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
+         origin_source_context, origin_command_id FROM {schema}.events \
+         WHERE {where_clause} ORDER BY sequence"
+    );
+    let mut query = sqlx::query_as::<_, EventRowAnyType>(&sql);
+    for literal in tag_literals {
+        query = query.bind(literal);
+    }
+    if let Some(after_sequence) = after_sequence {
+        query = query.bind(after_sequence);
+    }
+    let rows: Vec<EventRowAnyType> = query.fetch_all(pool).await?;
 
     let mut event_types: std::collections::HashMap<String, EventType> =
         std::collections::HashMap::new();
@@ -3212,13 +3335,17 @@ pub async fn list_events_cached(
     }
 }
 
-/// `ProcessCommand`'s own DCB pre-check and `QueryEvents`/`CountEvents`'s
-/// own real read path - see `crate::event_cache`'s own module doc
-/// comment for the full design. `after_sequence: -1` asks for full
-/// history (`ProcessCommand`'s pre-check and `CountEvents`, neither of
-/// which has an `after_sequence` of their own); `list_events_for_bounded_context`/
-/// `list_events_for_bounded_context_from` (both already existed, reused
-/// unchanged) are the fallback for either case respectively.
+/// `QueryEvents`/`CountEvents`'s own real read path when no `tags`
+/// filter is given - see `crate::event_cache`'s own module doc comment
+/// for the full design. `after_sequence: -1` asks for full history
+/// (`CountEvents`, which has no `after_sequence` of its own);
+/// `list_events_for_bounded_context`/`list_events_for_bounded_context_from`
+/// (both already existed, reused unchanged) are the fallback for either
+/// case respectively. `ProcessCommand`'s own DCB pre-check, and
+/// `QueryEvents`/`CountEvents` when a `tags` filter *is* given, use
+/// `list_events_for_bounded_context_matching_tags_cached` below instead -
+/// docs/architecture.md §19's "Problem 1" fix, avoiding exactly the
+/// full-bounded-context fetch this function's own fallback still does.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_for_bounded_context_cached(
     pool: &Pool,
@@ -3233,6 +3360,33 @@ pub async fn list_events_for_bounded_context_cached(
         Some(events) => Ok(events),
         None if after_sequence < 0 => list_events_for_bounded_context(pool, bounded_context).await,
         None => list_events_for_bounded_context_from(pool, bounded_context, after_sequence).await,
+    }
+}
+
+/// `ProcessCommand`'s own DCB pre-check, and `QueryEvents`/`CountEvents`
+/// when a `tags` filter is supplied - the cached counterpart to
+/// `list_events_for_bounded_context_matching_tags` above, same
+/// cache-first/Postgres-fallback shape `list_events_for_bounded_context_cached`
+/// already has, via `EventCache::try_events_matching_tags` instead of
+/// `try_events_after`. Already tag-scoped either way - see that
+/// function's own doc comment.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_events_for_bounded_context_matching_tags_cached(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    tags: &[Tag],
+    after_sequence: Option<i64>,
+) -> crate::error::Result<Vec<Event>> {
+    match cache
+        .try_events_matching_tags(pool, bounded_context, tags)
+        .await?
+    {
+        Some(events) => Ok(events
+            .into_iter()
+            .filter(|e| e.sequence > after_sequence.unwrap_or(-1))
+            .collect()),
+        None => list_events_for_bounded_context_matching_tags(pool, bounded_context, tags, after_sequence).await,
     }
 }
 
@@ -3697,9 +3851,11 @@ pub enum SubmitCommandOutcome {
 /// many sequence numbers this submission ends up needing isn't known
 /// until the decision that finally governs it is. If that peek shows
 /// more has been committed than `bounded_context_events` (the caller's
-/// own optimistic read) already reflected, and at least one of those new
-/// arrivals matches `consistency_tags`, that is the DCB conflict this
-/// lock exists to catch (see `DynamicConsistencyBoundaryHonoured`):
+/// own optimistic read - already tag-scoped to `consistency_tags` by
+/// every real call site, docs/architecture.md §19's "Problem 1" fix)
+/// already reflected, and at least one of those new arrivals matches
+/// `consistency_tags`, that is the DCB conflict this lock exists to
+/// catch (see `DynamicConsistencyBoundaryHonoured`):
 /// `dispatch` is called again, now with a `matching_events` set that
 /// includes the new arrival, and the fresh decision it returns supersedes
 /// `initial_decision`. At most one such retry is ever needed - once the
@@ -3773,14 +3929,28 @@ pub async fn submit_command(
         // and this lock - but only a match on our own consistency_tags
         // is an actual DCB conflict; an unrelated event elsewhere in the
         // same bounded context changes nothing dispatch() would see, so
-        // redispatching over it would be pure waste.
-        let delta =
-            list_events_for_bounded_context_from(pool, &bounded_context_name, original_highest)
-                .await?;
-        let conflict = delta
-            .iter()
-            .any(|e| consistency_tags.iter().any(|t| e.tags.contains(t)));
-        if conflict {
+        // redispatching over it would be pure waste. docs/architecture.md
+        // §19's "Problem 1" fix: `original_highest` is now the highest
+        // sequence among `bounded_context_events` itself (already
+        // tag-scoped by every caller of this function - see their own
+        // comments), so it's exactly the DCB boundary for these tags,
+        // and this delta fetch can go straight to the tag-indexed query
+        // instead of an unfiltered range scan followed by an in-memory
+        // tag check. This branch now runs more often than it used to in
+        // a busy, multi-entity bounded context - `locked_highest`
+        // reflects the whole bounded context's own latest sequence,
+        // while a tag-scoped `original_highest` moves more slowly for a
+        // quiet entity, so the two diverge on every commit elsewhere -
+        // but each run is a small indexed query rather than a full scan,
+        // so this is still a net win.
+        let delta = list_events_for_bounded_context_matching_tags(
+            pool,
+            &bounded_context_name,
+            consistency_tags,
+            Some(original_highest),
+        )
+        .await?;
+        if !delta.is_empty() {
             final_bounded_context_events.extend(delta);
             final_bounded_context_events.sort_by_key(|e| e.sequence);
             let (_boundary, redispatch_matching_events) =

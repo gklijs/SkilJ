@@ -104,19 +104,26 @@ pub fn submit_command_field() -> Field {
                     Some(_) => {}
                 }
 
-                let bounded_context_events =
-                    skilj_core::db::list_events_for_bounded_context_cached(
-                        &state.pool,
-                        &state.event_cache,
-                        &bounded_context_name,
-                        -1,
-                    )
-                    .await
-                    .map_err(to_graphql_error)?;
+                // docs/architecture.md §19's "Problem 1" fix: derive_tags
+                // runs first so the fetch below can go straight to the
+                // tag-indexed query instead of pulling the whole bounded
+                // context and filtering in memory - `bounded_context_events`
+                // is already tag-scoped from here on, not literally every
+                // event in the bounded context.
                 let consistency_tags = skilj_core::event_store::derive_tags(
                     &authorised.command_type.tag_mappings,
                     &authorised.payload,
                 );
+                let bounded_context_events =
+                    skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
+                        &state.pool,
+                        &state.event_cache,
+                        &bounded_context_name,
+                        &consistency_tags,
+                        None,
+                    )
+                    .await
+                    .map_err(to_graphql_error)?;
                 let (_boundary, matching_events) =
                     skilj_core::event_store::consistency_boundary_and_matching_events(
                         &bounded_context_events,

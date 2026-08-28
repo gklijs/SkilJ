@@ -61,6 +61,7 @@
 
 use crate::db::Pool;
 use crate::event_store::Event;
+use crate::shared::Tag;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -219,6 +220,37 @@ impl EventCache {
             )),
             Some(_) => Ok(None), // after_sequence reaches further back than this window can prove
         }
+    }
+
+    /// docs/architecture.md §19's "Problem 1" fix -
+    /// `db::list_events_for_bounded_context_matching_tags_cached`'s own
+    /// cache-first half. Delegates the actual coverage check to
+    /// `try_events_after(pool, bounded_context, -1)` rather than
+    /// duplicating it - the "does this window cover from the very
+    /// beginning" question is identical either way, only what's done
+    /// with a hit differs: here, filtered by `tags` (the same union
+    /// semantics `consistency_boundary_and_matching_events` already
+    /// uses) before returning, so a caller gets the same already-
+    /// tag-scoped shape whether this was served from cache or fell
+    /// through to the tag-indexed Postgres query. `Ok(None)` is a
+    /// coverage miss, identical convention to every other method here -
+    /// the caller falls back to
+    /// `db::list_events_for_bounded_context_matching_tags`.
+    pub async fn try_events_matching_tags(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        tags: &[Tag],
+    ) -> crate::error::Result<Option<Vec<Event>>> {
+        let Some(events) = self.try_events_after(pool, bounded_context, -1).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            events
+                .into_iter()
+                .filter(|e| tags.iter().any(|t| e.tags.contains(t)))
+                .collect(),
+        ))
     }
 
     /// `InspectEvent`'s own single-row lookup. `Ok(None)` is a cache

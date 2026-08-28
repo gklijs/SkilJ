@@ -61,15 +61,37 @@ pub fn query_events_field() -> Field {
                     .map(|v| v.i64())
                     .transpose()?;
 
-                let bounded_context_events =
-                    skilj_core::db::list_events_for_bounded_context_cached(
+                // docs/architecture.md §19's "Problem 1" fix: a non-empty
+                // `tags` filter can go straight to the tag-indexed query
+                // instead of pulling the whole bounded context and
+                // filtering in memory - `query_events`'s own
+                // `event_types`/`tags` filters below still run
+                // unchanged, just over an already-narrowed candidate set
+                // rather than everything. No `tags` filter (the common
+                // "browse everything" case, or an `event_types`-only
+                // filter) keeps the existing full fetch - narrowing that
+                // case is a separate, unaddressed optimisation.
+                let bounded_context_events = match tags.as_deref() {
+                    Some(wanted) if !wanted.is_empty() => {
+                        skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
+                            &state.pool,
+                            &state.event_cache,
+                            &bounded_context_name,
+                            wanted,
+                            after_sequence,
+                        )
+                        .await
+                        .map_err(to_graphql_error)?
+                    }
+                    _ => skilj_core::db::list_events_for_bounded_context_cached(
                         &state.pool,
                         &state.event_cache,
                         &bounded_context_name,
                         after_sequence.unwrap_or(-1),
                     )
                     .await
-                    .map_err(to_graphql_error)?;
+                    .map_err(to_graphql_error)?,
+                };
 
                 // Decrypt-on-read's own pre-resolution step - scoped to
                 // events matching the caller's own `eventTypes` argument
@@ -146,14 +168,29 @@ pub fn count_events_field() -> Field {
             }
             let tags = parse_tags(ctx.args.get("tags"))?;
 
-            let bounded_context_events = skilj_core::db::list_events_for_bounded_context_cached(
-                &state.pool,
-                &state.event_cache,
-                &bounded_context_name,
-                -1,
-            )
-            .await
-            .map_err(to_graphql_error)?;
+            // See `query_events_field`'s own identical comment - same
+            // §19 "Problem 1" fix, same tags-supplied-or-not branch.
+            let bounded_context_events = match tags.as_deref() {
+                Some(wanted) if !wanted.is_empty() => {
+                    skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
+                        &state.pool,
+                        &state.event_cache,
+                        &bounded_context_name,
+                        wanted,
+                        None,
+                    )
+                    .await
+                    .map_err(to_graphql_error)?
+                }
+                _ => skilj_core::db::list_events_for_bounded_context_cached(
+                    &state.pool,
+                    &state.event_cache,
+                    &bounded_context_name,
+                    -1,
+                )
+                .await
+                .map_err(to_graphql_error)?,
+            };
 
             let count = skilj_core::event_store::count_events(
                 &access_mapping,

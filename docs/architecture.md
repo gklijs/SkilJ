@@ -3351,3 +3351,291 @@ Verification for all four: `cargo build/clippy/test --workspace` clean
 (the one pre-existing `skilj-core` `explicit_auto_deref` warning noted
 in §17 is unrelated and untouched), `allium check` clean on the spec
 change.
+
+## 19. Optional snapshotting for `matching_events`: a discussion, not a build
+
+User-initiated investigation, not tied to a Codeberg issue: for a
+bounded context with a lot of history, a command's `matching_events`
+(the tag-scoped union of prior events `decide()` folds) can be large and
+slow to assemble, especially past what `EventCache` can serve. This
+section records the investigation's findings and the design it
+converged on. **No code changes accompany this section** - it's a
+decision record, the same treatment §16 gave issue #5's prototype phase
+before a build was chosen.
+
+### What actually happens today (the real bottleneck)
+
+`matching_events` for *every* command submission is assembled by
+`list_events_for_bounded_context_cached(pool, cache, bc, -1)` →
+`consistency_boundary_and_matching_events()`, which:
+
+1. Fetches every event ever recorded for the *whole bounded context* -
+   `SELECT * FROM {schema}.events ORDER BY sequence`, no `WHERE` clause
+   at all (`db::list_events_for_bounded_context`).
+2. Filters that entire set *in Rust, in memory* for tag matches
+   (`consistency_boundary_and_matching_events`, `event_store/mod.rs`).
+
+`EventCache` (default capacity 1000, per §8's own drift-audit-closure
+history) is a single bounded-context-wide recent-events window, not
+scoped per tag/entity. Its `try_events_after(..., -1)` ("give me all
+history", exactly what the read above asks for) can only be served from
+cache if the window still covers back to the bounded context's very
+first event - i.e. only until total events exceed `capacity`. Past that
+point, *every* command submission, forever, is a guaranteed cache miss
+that triggers the full unfiltered table scan, regardless of how
+selective the command's own tags are. This is a harder wall than "some
+old events aren't cached" - once a bounded context outgrows `capacity`,
+nothing about `matching_events` is ever served from cache again.
+
+Two distinct performance problems fall out of this, calling for
+different fixes:
+
+- **Problem 1**: fetching-and-filtering *the whole bounded context* to
+  answer a *tag-scoped* question. Fixable without touching `decide()`
+  at all.
+- **Problem 2**: even correctly tag-scoped, *one entity's own* history
+  can genuinely be large (an account with tens of thousands of
+  transactions). This is what snapshotting targets, and no amount of
+  indexing fixes it.
+
+### Fix for Problem 1: a DB-side tag-scoped fetch (agreed, independent of snapshotting)
+
+`events.tags` is already `JSONB`. A GIN index plus containment queries
+(`tags @> '[{"key":"account","value":"x"}]'`, OR'd across a command's
+derived tags) fixes Problem 1 for the common case with no `CommandType`
+API change, no new storage, no new endpoint, and none of snapshotting's
+correctness surface. Lower-risk than snapshotting and worth doing
+regardless of whether snapshotting is ever built - snapshotting without
+it would still pay an unnecessarily expensive "events since the
+snapshot" fetch on every read.
+
+### Why `Projection` reuse was considered and rejected
+
+The initial design explored reusing `Projection` as the snapshot
+mechanism - the shapes rhyme closely (`project(state, event, key)` vs. a
+fold; `keys()` vs. tag-value scoping; `caught_up_to` vs. an as-of
+marker; `ProjectionRebuild`'s restage vs. "the model changed, get all
+the events again"). Rejected: `Projection`s are read-model
+infrastructure - eventually-consistent by default, rebuildable and
+restageable via `ProjectionRebuild`, exposed to Admin-level GraphQL
+callers - and nothing in that trait's contract carries any obligation
+about the timing or provable-correctness bar a DCB consistency check
+needs. Letting `decide()`'s own inputs depend on that would mean an
+operator rebuilding or restaging a projection for ordinary read-model
+reasons could silently corrupt what `decide()` sees - a correctness
+regression with no compiler or test surface to catch it. Snapshotting
+needs its own, separate concept, even though the shape looks similar.
+
+### The design: `Snapshot` as its own first-class concept
+
+A new trait, not `Projection`:
+
+```rust
+trait Snapshot {
+    type State: Serialize + DeserializeOwned + JsonSchema + Default;
+    type Event: BoundedContextEvent;
+    const NAME: &'static str;
+    const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT;
+    /// Single tag key only, deliberately - see "multi-tag commands" below.
+    const TAG_KEY: &'static str;
+    /// Bumped by hand whenever fold()'s logic or State's shape changes -
+    /// see "model changed" below. Not inferred: Rust can't detect a
+    /// fold's own semantic change, only a decider declaring one can.
+    const VERSION: u32;
+    fn fold(state: &mut Self::State, event: &Self::Event);
+}
+```
+
+A `CommandType` opts in via something like `fn snapshot() -> Option<&'static str>`
+naming the `Snapshot::NAME` to consult. **Scoped per `(tag_key)`, not
+per `CommandType`**: in `banking.rs`, both `DepositMoney` and
+`WithdrawMoney` tag on `account` and both need `balance_of()` - scoping
+per-`CommandType` would give them two independently-computed snapshot
+streams for the same entity, free to drift apart. One snapshot
+definition per tag key, shared by every command that tags on it.
+
+**The `decide()` signature question, stated plainly**: an I/O-only
+optimization (fetch a cached `Vec<Event>` faster) still makes `decide()`
+walk every old event's business logic on every call - it doesn't save
+the compute Problem 2 is actually about. Getting that saving requires
+`decide()` itself to take the folded state instead of replaying through
+it, which is a real, explicit, opt-in extension to `CommandType`, not
+something hidden under the existing signature:
+
+```rust
+fn decide_from_snapshot(
+    payload: &Self::Payload,
+    snapshot: &SnapshotState,      // Default::default() if none exists yet
+    events_since_snapshot: &[Self::Event],
+) -> CommandDecision
+```
+
+The framework only calls this for a `CommandType` that opts in; every
+other `CommandType` keeps working exactly as today, unchanged - the
+"optional" the original ask was for.
+
+**Storage** - its own table, not `projections`:
+
+```sql
+CREATE TABLE {schema}.snapshots (
+    snapshot_name TEXT NOT NULL,
+    snapshot_version BIGINT NOT NULL,
+    tag_key TEXT NOT NULL,
+    tag_value TEXT NOT NULL,
+    as_of_sequence BIGINT NOT NULL,
+    state JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (snapshot_name, tag_key, tag_value)
+);
+```
+
+**"Model changed"** - no shared `ProjectionRebuild` machinery; its own,
+simpler rule instead: a stored row whose `snapshot_version` doesn't
+match the currently-registered `Snapshot::VERSION` is treated as if it
+doesn't exist - fall back to a full (or tag-indexed) replay for that one
+tag value. The same "coverage miss, not a wrong answer" philosophy
+`EventCache`'s own module doc comment already states, applied to a
+different subsystem rather than shared with it. Self-healing: the next
+write past that point can lay down a fresh row at the new version.
+
+**Write cadence** - a `SNAPSHOT_EVERY: u32` cadence (store a state after
+every N events, not every one), written by its own small background
+task that polls each stale snapshot row and folds forward - deliberately
+not the `Projection` dispatcher's task, even though the shape rhymes,
+for the separation reason above. Async, never in the hot commit path:
+correctness only needs "never trust a snapshot ahead of what's
+committed," and events after `as_of_sequence` are always still fetched
+fresh, under `next_sequence`'s lock, exactly as `matching_events` already
+is today regardless of snapshot freshness.
+
+**Multi-tag commands** (`courses.rs`'s `EnrollStudentInCourse`, which
+unions one student's *and* one course's history in a single `decide()`
+call - the DCB case this project's own courses example exists to prove
+out): out of scope for a first cut, deliberately. `TAG_KEY` is singular
+by design, so a command unioning two tags gets no snapshot benefit until
+a later pass composes multiple single-tag snapshots (feasible in
+principle - dedup the union by `sequence` - but real, unbuilt design
+work). Matches this project's own repeated "narrower cut" discipline
+(§16/§17's own precedent).
+
+**Inspection endpoint** - new and separate, Admin-gated the same way
+`EventQuery` is (a snapshot's `state` is derived business data, the same
+sensitivity class as raw event content), not folded into
+`ProjectionQuery`. A real new GraphQL/REST surface, a new spec entity,
+plausibly a `skilj-inspector` read-only addition too, per that crate's
+own "second console for when the wire protocol isn't the point" niche.
+
+### Verified non-issues (so they aren't re-litigated later)
+
+- **Encryption/subject-erasure**: `decide()` already only ever sees
+  whatever is in the `payload` column as stored, and sensitive-field
+  encryption happens *after* `decide()` returns
+  (`submit_command`'s `resolve_encryption_keys` step runs post-decision).
+  `decide()` - and so any fold derived from the identical data - is
+  already ciphertext-blind for sensitive fields. A snapshot built this
+  way can't newly leak plaintext or newly evade crypto-shredding; it's
+  no more exposed than the `events` table already is.
+- **DCB freshness under the lock**: correctness only requires that
+  events *after* a snapshot's `as_of_sequence` are always fetched fresh,
+  under `next_sequence`'s lock, exactly as `matching_events` already is
+  today. The snapshot only ever replaces the prefix, never the
+  freshness-critical tail.
+
+### Upsides
+
+- Removes the Problem 1 wall for high-volume bounded contexts (though
+  the tag-indexed fetch alone already covers this for single-tag
+  commands - see above).
+- Addresses genuinely large per-entity histories (Problem 2) that no
+  amount of indexing fixes.
+- Kept structurally separate from `Projection`, per the correction
+  above - no shared code path a read-model change could accidentally
+  destabilise.
+- Genuinely optional per `CommandType` - a decider that never opts in is
+  completely unaffected.
+
+### Downsides / risks
+
+- **Multi-tag commands benefit least** - exactly the DCB cases that
+  differentiate this project from classic event sourcing get partial
+  coverage at best, full-fetch fallback for any un-snapshotted tag,
+  until a later composition pass.
+- **New correctness-critical surface**: a decider's `fold()` must be
+  provably equivalent to replaying the real events for its tag scope. A
+  bug here is silent logic corruption in `decide()` - wrong business
+  decisions - not a rejected write. This needs the same rigor the
+  crypto/erasure work already got, not a convenience-feature bar.
+- **Write amplification**: a snapshot write on some cadence, per hot tag
+  value - a new background task, new failure modes to reason about
+  (falling behind, a version bump landing mid-catch-up), not a detail.
+- **Multi-instance consistency**: unlike `EventCache` (in-memory,
+  self-healing via `freshen()`), a snapshot is Postgres-backed and every
+  instance must agree on "the latest trustworthy snapshot" - the same
+  bar cross-instance push (§12) and the scheduler's own
+  `ScheduleStateIsShared` already had to clear.
+- **Real, non-optional cost even for non-adopters**: a schema migration,
+  a new registration surface, a new endpoint, and spec work land on the
+  whole project regardless of adoption.
+- **Anticipatory, not yet observed**: neither `banking` nor `courses`
+  currently has volume proving either fix is needed today - this is
+  designed ahead of demonstrated pain, a deliberate exception to this
+  project's usual "don't build ahead of what's wired" convention,
+  justified only because the user's own production experience is what's
+  motivating it, not speculation from inside this codebase.
+
+### Where this stands
+
+**Problem 1 (the tag-indexed fetch) is built, for real.** `Snapshot`
+(Problem 2) is not - still a design record, not a build, exactly as it
+was when this section was first written.
+
+`db::list_events_for_bounded_context_matching_tags` (`skilj-core/src/db/mod.rs`)
+does exactly what's designed above - a `tags @> $N::jsonb` containment
+clause per wanted tag, `OR`'d, optionally `AND sequence > $N` - backed
+by a new `events_by_tags` GIN index added to `provision_bounded_context_schema`
+(applies to every bounded context created from here on; an already-
+provisioned one needs the index backfilled by hand, exactly the caveat
+this section originally called out). `EventCache::try_events_matching_tags`
+and the cached wrapper `list_events_for_bounded_context_matching_tags_cached`
+give it the same cache-first/Postgres-fallback shape every other cached
+read here already has.
+
+Four real call sites were switched over: `submitCommand` (GraphQL),
+`post_commands_trigger` (REST) - both now fetch tag-scoped
+`matching_events` directly instead of the whole bounded context - and
+`queryEvents`/`countEvents`, when a caller supplies a `tags` filter
+(user confirmed this scope explicitly, not just the originally-
+motivating DCB path). A gap found only during implementation planning,
+not in the original write-up: `db::submit_command`'s own DCB-conflict
+redispatch check was *still* doing an unfiltered range scan
+(`list_events_for_bounded_context_from`) to decide whether a concurrent
+write actually conflicted - left alone, that would have just moved
+Problem 1's cost from the common path into the conflict-recheck path
+instead of removing it. Fixed the same way, internal to that function,
+no signature change: the redispatch delta is now fetched via the same
+tag-indexed query, `AND`-bounded by `original_highest` (itself now the
+tag-scoped high-water mark, not the whole bounded context's). One
+accepted behavioural side effect worth recording: `submit_command`'s own
+`locked_highest > original_highest` branch now runs more often in a
+busy, multi-entity bounded context - the tag-scoped high-water mark
+moves more slowly than the bounded context's own overall sequence
+counter - but each run is a small indexed query instead of a full scan,
+so this is still a net win, not a regression.
+
+Verified: a new `skilj-core/tests/tag_indexed_events.rs` (6 tests)
+proves the query directly - correct tag matching, real union-not-
+intersection semantics (mirroring `courses.rs`'s own dual-tag
+`EnrollStudentInCourse`), an event matching two wanted tags returned
+exactly once, `after_sequence` bounding, `sequence` ordering, and the
+empty-`tags` short-circuit never touching Postgres at all. The GIN
+index's actual use was confirmed by hand, not assumed: `EXPLAIN` against
+8,000 rows still chose a sequential scan (correct, expected Postgres
+behaviour for a table that small - not a bug), so the check was
+re-run against 100,000 rows, which produced a real `Bitmap Index Scan
+on events_by_tags` - proof the index does what it's for, not just that
+it exists. Every existing real-Postgres test across `skilj-core`/
+`skilj`/`skilj-demo`/`skilj-rest`/`skilj-inspector` passed unchanged,
+`courses.rs`'s dual-tag tests included - the real regression proof, per
+this session's own established discipline. `cargo build/clippy/test
+--workspace` clean throughout (the one pre-existing, unrelated
+`skilj-core` `explicit_auto_deref` warning noted in §17/§18 untouched).
