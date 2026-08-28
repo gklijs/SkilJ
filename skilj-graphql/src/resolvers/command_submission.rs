@@ -114,13 +114,46 @@ pub fn submit_command_field() -> Field {
                     &authorised.command_type.tag_mappings,
                     &authorised.payload,
                 );
+
+                // docs/architecture.md §19's "Problem 2" - resolved
+                // once, shared with skilj-rest's own identical branch
+                // via skilj_core::db::resolve_snapshot_context. `None`
+                // either when this command type doesn't opt into
+                // snapshotting at all, or opts in but its own derived
+                // tags don't match the snapshot's single tag key
+                // exactly (a silent fallback to the ordinary path, not
+                // an error - see CommandType::snapshot()'s own doc
+                // comment).
+                let snapshot_context = match state
+                    .dispatcher
+                    .snapshot_name(&bounded_context_name, &authorised.command_type.name)
+                {
+                    Some(Some(snapshot_name)) => skilj_core::db::resolve_snapshot_context(
+                        &state.pool,
+                        &bounded_context_name,
+                        state.snapshot_dispatcher.as_ref(),
+                        snapshot_name,
+                        &consistency_tags,
+                    )
+                    .await
+                    .map_err(to_graphql_error)?,
+                    _ => None,
+                };
+
+                // The tag-indexed fetch (§19's "Problem 1") already
+                // supports an `after_sequence` bound for exactly this
+                // reason - `events_since_snapshot` when a snapshot
+                // context resolved, the full tag-scoped set otherwise.
+                // `matching_events` names it either way, since it's the
+                // one thing both `dispatch`/`dispatch_from_snapshot`
+                // below are fed.
                 let bounded_context_events =
                     skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
                         &state.pool,
                         &state.event_cache,
                         &bounded_context_name,
                         &consistency_tags,
-                        None,
+                        snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
                     )
                     .await
                     .map_err(to_graphql_error)?;
@@ -130,15 +163,28 @@ pub fn submit_command_field() -> Field {
                         &consistency_tags,
                     );
 
-                let decision = match state.dispatcher.dispatch(
-                    &bounded_context_name,
-                    &authorised.command_type.name,
-                    &authorised.payload,
-                    &matching_events,
-                ) {
-                    None => return Err(no_decider_registered_error()),
-                    Some(Err(e)) => return Err(to_graphql_error(e)),
-                    Some(Ok(decision)) => decision,
+                let decision = match &snapshot_context {
+                    Some(ctx) => match state.dispatcher.dispatch_from_snapshot(
+                        &bounded_context_name,
+                        &authorised.command_type.name,
+                        &authorised.payload,
+                        &ctx.state_json,
+                        &matching_events,
+                    ) {
+                        None => return Err(no_decider_registered_error()),
+                        Some(Err(e)) => return Err(to_graphql_error(e)),
+                        Some(Ok(decision)) => decision,
+                    },
+                    None => match state.dispatcher.dispatch(
+                        &bounded_context_name,
+                        &authorised.command_type.name,
+                        &authorised.payload,
+                        &matching_events,
+                    ) {
+                        None => return Err(no_decider_registered_error()),
+                        Some(Err(e)) => return Err(to_graphql_error(e)),
+                        Some(Ok(decision)) => decision,
+                    },
                 };
 
                 // The optimistic, unlocked half ends here - `decision`
@@ -162,6 +208,12 @@ pub fn submit_command_field() -> Field {
                     decision,
                     state.encryption_master_key.as_ref(),
                     Utc::now(),
+                    snapshot_context
+                        .as_ref()
+                        .map(|ctx| skilj_core::db::SnapshotContext {
+                            state_json: &ctx.state_json,
+                            as_of_sequence: ctx.as_of_sequence,
+                        }),
                 )
                 .await
                 .map_err(to_graphql_error)?;

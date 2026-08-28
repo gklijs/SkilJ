@@ -3585,9 +3585,10 @@ own "second console for when the wire protocol isn't the point" niche.
 
 ### Where this stands
 
-**Problem 1 (the tag-indexed fetch) is built, for real.** `Snapshot`
-(Problem 2) is not - still a design record, not a build, exactly as it
-was when this section was first written.
+**Both are built, for real.** Problem 1 (the tag-indexed fetch) first;
+`Snapshot` (Problem 2) afterward, once the user asked for "a solution
+for when there are a lot of events needed to determine the
+consistency" - see "Snapshot, built for real" below for that pass.
 
 `db::list_events_for_bounded_context_matching_tags` (`skilj-core/src/db/mod.rs`)
 does exactly what's designed above - a `tags @> $N::jsonb` containment
@@ -3639,3 +3640,145 @@ it exists. Every existing real-Postgres test across `skilj-core`/
 this session's own established discipline. `cargo build/clippy/test
 --workspace` clean throughout (the one pre-existing, unrelated
 `skilj-core` `explicit_auto_deref` warning noted in §17/§18 untouched).
+
+### `Snapshot`, built for real
+
+`Snapshot`'s own design (above) held up against real implementation,
+with the refinements already recorded at the top of this pass's own
+plan and carried through faithfully: raw-JSON `decide_from_snapshot`
+(not a typed state - Rust has no stable defaulted associated types),
+no `Snapshot::keys()` (tag-value extraction is generic off `event.tags`),
+no `SNAPSHOT_EVERY` cadence knob (folds every relevant event per catch-up
+tick instead, mirroring `catch_up_bounded_context`'s own proven shape),
+a new `snapshot_progress` table (one row per `(bounded_context,
+snapshot_name)`, since `MAX(as_of_sequence)` over `snapshots` rows can't
+safely stand in for how far the walk has progressed), and no GraphQL
+registration mutation (confirmed by tracing the real registration
+pipeline: `RegisterCommandType`/etc. are *already* a fully separate,
+optional layer from the in-process Rust dispatcher - a Snapshot stays
+compile-time-Rust-only, `#[auto_register]`/`SkiljBuilder::snapshot::<T>()`).
+
+**The trait** (`skilj-core/src/plugin/mod.rs`): `Snapshot { type State,
+type Event, NAME, BOUNDED_CONTEXT, TAG_KEY, VERSION, fn fold }` -
+structurally parallel to `Projection` but a genuinely separate trait,
+per the rejection already recorded above. `CommandType` gained two
+defaulted methods, fully backward-compatible: `snapshot() -> Option<&'static str>`
+(`None` by default) and `decide_from_snapshot(payload, snapshot_state_json:
+&str, events_since_snapshot)` (a safe, non-panicking `Rejected` by
+default, reachable only if a `CommandType` overrides `snapshot()`
+without also overriding this).
+
+**Wiring** mirrors `EventType`/`CommandType`/`Projection` exactly, one
+new parallel track through the whole pipeline: `#[auto_register]` gained
+a `"Snapshot"` arm (`skilj-macros`); `SkiljBuilder` gained `.snapshot::<T>()`,
+a `SnapshotRegistrar`, and a `snapshots: HashMap<(String, String),
+RegisteredSnapshot>` registry; a new `SnapshotDispatcher` trait
+(`tag_key`/`version`/`fold`/`default_state`, plus `snapshot_names` - the
+one method with no sibling on the other three dispatchers, needed
+because there's deliberately no metadata table to enumerate instead);
+`CommandDispatcher` gained `snapshot_name`/`dispatch_from_snapshot`,
+the same outer/inner `Option` convention `required_role` already uses.
+
+**Storage**: `{schema}.snapshots` (one row per `(snapshot_name, tag_key,
+tag_value)`, `snapshot_version`/`as_of_sequence`/`state`/`updated_at`)
+and `{schema}.snapshot_progress`, both added to
+`provision_bounded_context_schema`. `db::get_snapshot_state`/
+`resolve_snapshot_context` (the shared "does this command take the
+snapshot path, and if so what does it read" logic, used by both
+`skilj-graphql`'s `submitCommand` resolver and `skilj-rest`'s
+`post_commands_trigger` route, so it lives once) and
+`db::catch_up_snapshots` (the background task's own per-tick function,
+mirroring `catch_up_bounded_context`'s shape closely but deliberately
+not sharing code with it). A real bug caught by the test suite, not
+inspection: the first version of both the insert/update and the read
+queries didn't cast between the `String` sqlx binds/decodes and the
+`JSONB` column (`state = $N` needs `$N::jsonb`; reading it back needs
+`state::text`) - Postgres/sqlx don't do this coercion automatically
+outside a `VALUES (...)` list. Two real failing tests caught this
+immediately; fixed with explicit casts on both sides.
+
+**`submit_command`'s own integration**: a new `SnapshotContext { state_json,
+as_of_sequence }` parameter (`Option`, `None` for every existing
+non-snapshot caller). The redispatch branch (a DCB conflict landed
+between the optimistic read and the lock) now calls
+`dispatch_from_snapshot` again, with the same `state_json`, when the
+initial decision was snapshot-accelerated - calling the ordinary
+`dispatch` there instead would silently drop everything the snapshot
+had already folded, since the redispatch delta alone doesn't carry it.
+One documented, narrow, audit-only limitation: `Command.consistency_boundary`
+can under-report as `None` for a snapshot-accelerated command whose own
+`events_since_snapshot` is empty, since that field's own computation has
+no way to know about a snapshot's `as_of_sequence` - never affects the
+decision itself, only that one audit field; left as a known gap rather
+than widening `process_command`'s own signature too.
+
+**The background task** (`skilj/src/lib.rs`): a new shared task, same
+shape as the async-projection catch-up loop (`snapshot_poll_interval`,
+default 500ms; `BACKGROUND_TASK_TICK_DURATION`/`BACKGROUND_TASK_ERRORS`
+tagged `"snapshot"`; a trace root span per tick).
+
+**The inspection endpoint**: `inspectSnapshot(boundedContext, snapshotName,
+tagValue): InspectedSnapshot` (nullable - cold is a real, valid `null`,
+not an error), Admin-gated via the same `require_admin_mapping` helper
+`inspectEvent` uses, not folded into the `ReadAccess`-gated
+`ProjectionQuery`. Deliberately shows the *raw stored row*, including a
+`snapshot_version` that no longer matches the currently-registered one
+- unlike `decide_from_snapshot`'s own path, which treats that as absent;
+an operator inspecting a snapshot wants to see what's really there, only
+the decision path needs to distrust it. An unrecognised `snapshotName`
+is a real `not_found` error, distinguishable from a real, cold one.
+
+**The real adopter**, `skilj-demo/src/banking.rs`: `AccountBalanceSnapshot`
+(`TAG_KEY = "account"`) and `WithdrawMoneyFast`, both hand-written -
+deliberately *not* part of `banking.skilj.toml`'s codegen'd shape, since
+extending `skilj-codegen` itself for `snapshot()`/`decide_from_snapshot`
+was out of scope for this pass. Shares `apply_money_event` (the same
+per-event step `balance_of` already used) with the codegen'd `WithdrawMoney`'s
+own `decide_withdraw_money`, so the two can never silently drift apart.
+
+**Verification, in order of how convincing it is**:
+- `skilj-core/tests/snapshot_context.rs` (5 tests): `resolve_snapshot_context`'s
+  fallback rules (tag mismatch, multi-tag), cold-start default, a real
+  `catch_up_snapshots` fold read back correctly, and the version-mismatch
+  "treated as absent" rule, proven by constructing two dispatcher
+  instances at different versions over the same stored row.
+- `skilj-demo/tests/snapshot.rs` (2 tests): real HTTP through
+  `WithdrawMoneyFast`, cold and after a real, forced `catch_up_snapshots`
+  tick - and the decisive one: directly UPDATE-ing the stored row's own
+  `state` to a deliberately wrong balance (leaving `snapshot_version`
+  untouched, so it's still trusted) and showing the next withdrawal's
+  own accept/reject decision changes to match the *tampered* number.
+  This is what actually distinguishes "`decide_from_snapshot` genuinely
+  reads the stored row" from "a full-replay fallback happens to reach
+  the same correct answer" - a plain positive-path test can't tell the
+  two apart, since both would reach the identical correct decision
+  against real, untampered data.
+- `skilj/tests/graphql_business_surfaces.rs`: a new, separate,
+  minimal fixture (`ThingHappened`/`ThingTotalSnapshot`/`DoThingFast` -
+  not `WithdrawMoney`, which this file's own fixture never tags at all)
+  proving `inspectSnapshot` itself: cold is `null`, a real row after a
+  real catch-up tick reads back correctly, an unregistered name is a
+  real error, and a Write-level caller is rejected before ever reaching
+  the snapshot table.
+- Full existing regression suite (every crate) passes unchanged.
+  `cargo build/clippy/test --workspace` clean (the one pre-existing,
+  unrelated `skilj-core` warning noted throughout this file untouched).
+  `allium check`/`allium analyse` clean on the spec change - no new
+  findings, `SnapshotInspection` correctly recognised among the other
+  surfaces.
+
+**Spec** (`specs/skilj.allium`, via `allium:tend`): no new `entity` -
+a `Snapshot`'s own definition is never created by any rule in this
+system (no registration surface, deliberately), so there is nothing for
+a `context` clause to range over the way `Event`/`Projection` are
+ranged over elsewhere. Instead: a prose note alongside `rule ProcessCommand`'s
+own `decide()` black box, describing the optional accelerated
+computation as strictly behaviour-preserving (`decide()` always
+observes the identical `matching_events` either way - this is a cost
+optimisation, not a new observable branch), plus a new surface,
+`SnapshotInspection` (`AdminAccess`-faced, no context clause -
+`access_mapping.bounded_context` alone scopes every answer, the same
+way `QueryEvents`/`CountEvents` already scope without one), with
+`GrantScopedToBoundedContext`/`UnknownNameIsAnError`/`SensitiveFieldsStayProtected`
+guarantees and a guidance note tying it back to the `ProcessCommand`
+note and explaining the deliberate `Projection` separation.

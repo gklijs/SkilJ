@@ -111,6 +111,28 @@ impl CommandDispatcher for TestCommandDispatcher {
     ) -> Option<Option<&'static str>> {
         Some(None)
     }
+
+    // None of this file's fixtures opt into snapshotting - both new
+    // methods just report "registered, no snapshot" the same way
+    // `required_role` reports "registered, no extra gate" above.
+    fn snapshot_name(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+    ) -> Option<Option<&'static str>> {
+        Some(None)
+    }
+
+    fn dispatch_from_snapshot(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+        _payload: &str,
+        _snapshot_state_json: &str,
+        _events_since_snapshot: &[Event],
+    ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        unreachable!("no fixture in this file opts into snapshot()")
+    }
 }
 
 /// Registered as `sync = true`, consuming both `OrderShipped` and
@@ -401,6 +423,7 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
             initial_decision,
             None,
             test_now(),
+            None,
         )
         .await
         .unwrap();
@@ -410,7 +433,11 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
         // produce; the stale first Accepted decision never governs.
         assert_eq!(dispatcher.call_count(), 2);
         match outcome {
-            SubmitCommandOutcome::Rejected { kind, matching_events, .. } => {
+            SubmitCommandOutcome::Rejected {
+                kind,
+                matching_events,
+                ..
+            } => {
                 assert_eq!(kind, "already_shipped");
                 // Codeberg issue #7: the *final*, post-redispatch matching
                 // set - the concurrent writer's own event - not the
@@ -476,6 +503,7 @@ fn submit_command_does_not_redispatch_for_an_unrelated_concurrent_event() {
             initial_decision,
             None,
             test_now(),
+            None,
         )
         .await
         .unwrap();
@@ -537,6 +565,7 @@ fn submit_command_persists_a_real_command_id_that_round_trips() {
             initial_decision,
             None,
             test_now(),
+            None,
         )
         .await
         .unwrap();
@@ -604,6 +633,7 @@ fn submit_command_leaves_no_sequence_gap_when_process_command_fails() {
             initial_decision,
             None,
             test_now(),
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -662,6 +692,7 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
             initial_decision,
             None,
             test_now(),
+            None,
         )
         .await;
         assert!(

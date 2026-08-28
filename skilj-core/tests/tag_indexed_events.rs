@@ -11,7 +11,9 @@
 use chrono::{SubsecRound, Utc};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
-use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType};
+use skilj_core::event_store::{
+    BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType,
+};
 use skilj_core::shared::{generate_token_id, Metadata, Tag, TagMapping};
 
 struct TestDb {
@@ -148,7 +150,12 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
 /// Inserted directly (bypassing `submit_command`), tagged with whichever
 /// `tags` the caller supplies - lets each test build exactly the tag
 /// combination it needs without a payload/tag_mappings round trip.
-async fn insert_tagged_event(pool: &Pool, bc: &BoundedContext, et: &EventType, tags: Vec<Tag>) -> i64 {
+async fn insert_tagged_event(
+    pool: &Pool,
+    bc: &BoundedContext,
+    et: &EventType,
+    tags: Vec<Tag>,
+) -> i64 {
     let seq = db::next_sequence(pool, &bc.name).await.unwrap();
     let e = Event {
         bounded_context: bc.clone(),

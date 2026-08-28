@@ -65,6 +65,7 @@ pub mod event_query;
 pub mod event_subscription;
 pub mod event_type_admin_operations;
 pub mod projection_query;
+pub mod snapshot_query;
 pub mod subject_erasure;
 pub mod superadmin_bootstrap;
 pub mod token_revocation;

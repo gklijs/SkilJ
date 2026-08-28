@@ -14,13 +14,13 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{requires_role, CommandType, EventType, IdpConfig, SigningAlgorithm, Skilj};
+use skilj::{requires_role, CommandType, EventType, IdpConfig, SigningAlgorithm, Skilj, Snapshot};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::Pool;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
 use skilj_core::plugin::BoundedContextEvent;
-use skilj_core::shared::{generate_token_id, CommandDecision, EventSpec};
+use skilj_core::shared::{generate_token_id, CommandDecision, EventSpec, TagMapping};
 use tower::ServiceExt;
 
 const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
@@ -131,6 +131,124 @@ impl CommandType for CloseAccount {
     const NAME: &'static str = "CloseAccount";
     fn decide(_payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
         CommandDecision::Accepted { events: vec![] }
+    }
+}
+
+// --- a small, separate fixture for inspectSnapshot (docs/architecture.md
+// §19) - not `BankingEvent`/`WithdrawMoney` above, deliberately: those
+// carry no tags at all, and `Snapshot` needs a real one to scope
+// against. `skilj-demo/tests/snapshot.rs` already proves `decide_from_snapshot`
+// itself end to end (including a tampered-row proof); this fixture's
+// whole job is exercising `inspectSnapshot` - Admin-gated, `null` when
+// cold, a real error for an unregistered name.
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct ThingHappenedPayload {
+    thing_id: String,
+    amount: i64,
+}
+
+struct ThingHappened;
+
+impl EventType for ThingHappened {
+    type Payload = ThingHappenedPayload;
+    const NAME: &'static str = "ThingHappened";
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![TagMapping {
+            key: "thing".to_string(),
+            field: "thing_id".to_string(),
+        }]
+    }
+}
+
+enum ThingEvent {
+    ThingHappened(ThingHappenedPayload),
+}
+
+impl BoundedContextEvent for ThingEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "ThingHappened" => {
+                Some(serde_json::from_str(&event.payload).map(ThingEvent::ThingHappened))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct ThingTotalState {
+    total: i64,
+}
+
+struct ThingTotalSnapshot;
+
+impl Snapshot for ThingTotalSnapshot {
+    type State = ThingTotalState;
+    type Event = ThingEvent;
+    const NAME: &'static str = "ThingTotalSnapshot";
+    const TAG_KEY: &'static str = "thing";
+    const VERSION: u64 = 1;
+    fn fold(state: &mut Self::State, event: &Self::Event) {
+        match event {
+            ThingEvent::ThingHappened(p) => state.total += p.amount,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct DoThingFastPayload {
+    thing_id: String,
+    amount: i64,
+}
+
+struct DoThingFast;
+
+impl CommandType for DoThingFast {
+    type Payload = DoThingFastPayload;
+    type Event = ThingEvent;
+    const NAME: &'static str = "DoThingFast";
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![TagMapping {
+            key: "thing".to_string(),
+            field: "thing_id".to_string(),
+        }]
+    }
+    fn snapshot() -> Option<&'static str> {
+        Some("ThingTotalSnapshot")
+    }
+    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
+        let total = matching_events
+            .iter()
+            .fold(0i64, |t, e| match e {
+                ThingEvent::ThingHappened(p) => t + p.amount,
+            });
+        do_thing_decision(payload, total)
+    }
+    fn decide_from_snapshot(
+        payload: &Self::Payload,
+        snapshot_state_json: &str,
+        events_since_snapshot: &[Self::Event],
+    ) -> CommandDecision {
+        let snapshot: ThingTotalState = serde_json::from_str(snapshot_state_json).unwrap_or_default();
+        let total = events_since_snapshot
+            .iter()
+            .fold(snapshot.total, |t, e| match e {
+                ThingEvent::ThingHappened(p) => t + p.amount,
+            });
+        do_thing_decision(payload, total)
+    }
+}
+
+fn do_thing_decision(payload: &DoThingFastPayload, _total: i64) -> CommandDecision {
+    CommandDecision::Accepted {
+        events: vec![EventSpec {
+            event_type: "ThingHappened".to_string(),
+            payload: serde_json::json!({ "thing_id": payload.thing_id, "amount": payload.amount }),
+        }],
     }
 }
 
@@ -326,6 +444,9 @@ async fn setup() -> (Skilj, Pool, String, String, Role) {
         .event_type::<MoneyDeposited>()
         .command_type::<WithdrawMoney>()
         .command_type::<CloseAccount>()
+        .event_type::<ThingHappened>()
+        .snapshot::<ThingTotalSnapshot>()
+        .command_type::<DoThingFast>()
         .reconciliation_role(admin_subject)
         .build()
         .await
@@ -641,5 +762,133 @@ fn matching_events_is_only_returned_to_an_admin_level_caller() {
             response["data"]["submitCommand"]["matchingEvents"].is_null(),
             "a Write-level caller must not receive matchingEvents: {response:?}"
         );
+    });
+}
+
+/// `inspectSnapshot` (docs/architecture.md §19) - Admin-gated, `null`
+/// for a real, registered snapshot that's simply never had a row
+/// written yet (cold, not an error), and a real error for a
+/// `snapshotName` that isn't registered at all.
+/// `skilj-demo/tests/snapshot.rs` already proves `decide_from_snapshot`
+/// itself end to end against real, tampered data - this test's own job
+/// is the inspection endpoint alone.
+#[test]
+fn inspect_snapshot_is_admin_gated_null_when_cold_and_a_real_error_when_unregistered() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt, _admin_role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        const INSPECT_SNAPSHOT: &str = "\
+            query($bc: String!, $name: String!, $tagValue: String!) { \
+                inspectSnapshot(boundedContext: $bc, snapshotName: $name, tagValue: $tagValue) { \
+                    tagKey tagValue version asOfSequence state \
+                } \
+            }";
+
+        let thing_id = unique_name("thing");
+
+        // Cold: a real, registered snapshot, but nothing has ever been
+        // written for this tag value.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            INSPECT_SNAPSHOT,
+            json!({ "bc": bc_name, "name": "ThingTotalSnapshot", "tagValue": thing_id }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert!(
+            response["data"]["inspectSnapshot"].is_null(),
+            "a real snapshot with nothing written yet must be null, not an error: {response:?}"
+        );
+
+        // Trigger a real DoThingFast, then force the background catch-up
+        // tick a real deployment's own poll interval would eventually
+        // run, so a real row exists to inspect.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "name": "DoThingFast", "payload": format!(r#"{{"thing_id":"{thing_id}","amount":7}}"#) }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true);
+
+        skilj_core::db::catch_up_snapshots(&_pool, &bc_name, skilj.snapshot_dispatcher().as_ref())
+            .await
+            .unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            INSPECT_SNAPSHOT,
+            json!({ "bc": bc_name, "name": "ThingTotalSnapshot", "tagValue": thing_id }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["inspectSnapshot"]["tagKey"], "thing");
+        assert_eq!(response["data"]["inspectSnapshot"]["tagValue"], thing_id);
+        assert_eq!(response["data"]["inspectSnapshot"]["version"], 1);
+        assert!(response["data"]["inspectSnapshot"]["asOfSequence"].as_i64().unwrap() >= 0);
+        let state: serde_json::Value =
+            serde_json::from_str(response["data"]["inspectSnapshot"]["state"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(state["total"], 7);
+
+        // An unregistered snapshot name is a real error, not null - the
+        // caller named something that doesn't exist, distinguishable
+        // from a real one that's simply cold.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            INSPECT_SNAPSHOT,
+            json!({ "bc": bc_name, "name": "NoSuchSnapshot", "tagValue": thing_id }),
+        )
+        .await;
+        assert_eq!(response["errors"][0]["extensions"]["code"], "Snapshot_not_found");
+
+        // Admin-gated: a Write-level caller (mirroring the officer
+        // fixture pattern already used above in this file) is rejected
+        // before ever reaching the snapshot table.
+        let write_subject = unique_name("write-only");
+        let write_role = Role {
+            id: generate_token_id(),
+            external_subject: write_subject.clone(),
+            name: "WriteOnly".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&_pool, &write_role).await.unwrap();
+        let write_mapping = RoleAccessMapping {
+            role: write_role,
+            bounded_context: skilj_core::db::get_bounded_context(&_pool, &bc_name)
+                .await
+                .unwrap()
+                .unwrap(),
+            level: AccessLevel::Write,
+            can_read_sensitive: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&_pool, &write_mapping)
+            .await
+            .unwrap();
+        let write_jwt = sign_jwt(&write_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&write_jwt),
+            INSPECT_SNAPSHOT,
+            json!({ "bc": bc_name, "name": "ThingTotalSnapshot", "tagValue": thing_id }),
+        )
+        .await;
+        assert_eq!(response["errors"][0]["extensions"]["code"], "grant_not_active");
     });
 }

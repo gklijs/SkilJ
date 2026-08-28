@@ -20,7 +20,7 @@ use skilj_core::db::Pool;
 use skilj_core::encryption::EncryptionMasterKey;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::EventBroadcaster;
-use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
+use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher, SnapshotDispatcher};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -59,6 +59,12 @@ pub struct GraphqlState {
     /// `Skilj::rest_router()` hands its own event-creation routes, reused
     /// here for the same reason `dispatcher` above is.
     pub projection_dispatcher: Arc<dyn ProjectionDispatcher>,
+    /// `inspectSnapshot`'s own bridge into `Snapshot::fold`'s registered
+    /// `tag_key`/`version`/`default_state` (docs/architecture.md §19) -
+    /// the identical `Arc<dyn SnapshotDispatcher>` `Skilj`'s own
+    /// background snapshot catch-up task holds, reused here for the same
+    /// reason `dispatcher`/`projection_dispatcher` above are.
+    pub snapshot_dispatcher: Arc<dyn SnapshotDispatcher>,
     /// `ProjectionQuery`'s own `wait_for_sequence` timeout - "a process-
     /// start configuration knob, not a per-query argument or a fixed
     /// value" (the spec's own guidance above `rule QueryProjection`), the

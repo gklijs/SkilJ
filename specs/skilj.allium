@@ -2318,6 +2318,24 @@ rule ProcessCommand {
     -- valid_tag_mappings, valid_sensitive_fields, valid_payload, next_sequence,
     -- scheduled_payload, next_occurrence_after, generate_token_secret) is
     -- documented exactly this way; decide() is not special enough to earn a different treatment.
+    --
+    -- decide() always observes matching_events exactly as computed above -
+    -- complete, fresh, unabridged - and every guarantee here holds
+    -- regardless of how that computation happens to be carried out
+    -- underneath. For an entity with a long history, computing it from
+    -- scratch on every command is one legitimate way; another, behaviourally
+    -- identical, way is to combine a periodically-updated, versioned
+    -- summary of everything up to some earlier point with only the events
+    -- committed since - the same final matching_events either way, just
+    -- cheaper once that summary covers a long prefix. This summary, when
+    -- one exists, is scoped to a single one of consistency_tags' own keys
+    -- (never their union - a command deriving more than one tag simply has
+    -- no such summary to draw on, and computes matching_events the first
+    -- way instead) and is versioned: a summary computed under a
+    -- superseded definition is never trusted as current, treated instead
+    -- as if none exists yet. See surface SnapshotInspection for the one
+    -- place this summary is itself observable - nowhere else does its
+    -- existence, absence or content change what a caller can see.
     let decision = decide(command_type, payload, matching_events)
     requires: decision.accepted = true
 
@@ -4653,6 +4671,67 @@ surface EventQuery {
         -- still deferred with the rest of that contract, exactly as they
         -- are for EventFetch, ProjectionQuery and CommandQuery (see the
         -- scope header's exclusions).
+}
+
+surface SnapshotInspection {
+    facing access_mapping: AdminAccess
+
+    provides:
+        InspectSnapshot(access_mapping, snapshot_name, tag_value)
+
+    @guarantee GrantScopedToBoundedContext
+        -- A grant only authorises inspecting summaries belonging to its
+        -- own bounded context - the same scoping EventQuery/ProjectionQuery
+        -- already give their own context, established here through
+        -- access_mapping.bounded_context directly rather than a separate
+        -- context clause (see the guidance below for why this surface
+        -- has none).
+
+    @guarantee UnknownNameIsAnError
+        -- snapshot_name naming something that was never defined for this
+        -- bounded context at all is a real, reported error - distinct
+        -- from a real, defined one that simply has nothing recorded yet
+        -- for tag_value, which answers with nothing rather than an error
+        -- (the same "cold instance, not a failure" treatment
+        -- QueryProjection already gives an untouched projection key).
+
+    @guarantee SensitiveFieldsStayProtected
+        -- Whatever this surface answers with is full derived content, the
+        -- same sensitivity class EventQuery's own raw event content
+        -- already is - which is why this faces AdminAccess rather than
+        -- ReadAccess the way ProjectionQuery does, even though the shape
+        -- otherwise rhymes with a projection lookup.
+
+    @guidance
+        -- GraphQL only, admin-facing, read-only - the one place the
+        -- optional summary named in the guidance above ProcessCommand's
+        -- own decide() call is itself observable. No context clause:
+        -- unlike Event or Projection, a summary is never created by any
+        -- rule in this specification - it exists only as compiled,
+        -- deployed configuration, the same register CommandType.tag_mappings
+        -- itself is drawn from, with no registration surface of its own
+        -- and so nothing here for a context clause to range over.
+        -- access_mapping alone is enough to scope every answer to one
+        -- bounded context, the same way QueryEvents/CountEvents scope
+        -- through it without a context clause either.
+        --
+        -- Deliberately not folded into ProjectionQuery, and not
+        -- expressed as a kind of Projection: a Projection is
+        -- eventually-consistent, admin-rebuildable read-model
+        -- infrastructure with no obligation to the freshness a live
+        -- decision needs - see the guidance above ProcessCommand's own
+        -- decide() call for the full reasoning. Keeping this surface
+        -- separate, rather than a QueryProjection variant, is what keeps
+        -- an ordinary projection rebuild from ever being able to affect
+        -- what a live command decision sees.
+        --
+        -- Deliberately coarse on the wire contract otherwise, the same
+        -- register as EventQuery/ProjectionQuery: this establishes the
+        -- capability and its scoping, not the exact result shape (which
+        -- fields answer for tag_key, the recorded version, how far
+        -- events have been folded in, and the summary's own content) -
+        -- deferred with the rest of that contract (see the scope
+        -- header's exclusions).
 }
 
 surface CommandSubmission {

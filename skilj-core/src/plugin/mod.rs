@@ -129,6 +129,64 @@ pub trait CommandType {
     }
 
     fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision;
+
+    /// Opt-in accelerator for `decide()` against a large tag-scoped
+    /// history (docs/architecture.md §19's "Problem 2") - names the
+    /// `Snapshot::NAME` this command type's own decide() can fold
+    /// forward from instead of replaying every matching event. `None`
+    /// (the default) means no snapshot; every existing `CommandType`
+    /// impl is completely unaffected.
+    ///
+    /// Only actually used when this command type derives exactly the
+    /// one tag the named `Snapshot::TAG_KEY` is - a multi-tag command
+    /// that names a snapshot anyway is a harmless misconfiguration,
+    /// silently ignored (falls back to the ordinary `decide()` path),
+    /// not a hard error - see `decide_from_snapshot`'s own doc comment
+    /// for the *reachable* misconfiguration this trait can't catch for
+    /// you.
+    fn snapshot() -> Option<&'static str> {
+        None
+    }
+
+    /// Called instead of `decide()` when `snapshot()` names a real,
+    /// tag-matching `Snapshot` (see that method's own doc comment).
+    /// `snapshot_state_json` is `Snapshot::State::default()`,
+    /// JSON-encoded, when no snapshot has been written yet for this tag
+    /// value, or when a stored one's own `snapshot_version` no longer
+    /// matches `Snapshot::VERSION` - the model changed, so it's treated
+    /// as absent rather than trusted; `events_since_snapshot` is then
+    /// simply everything for this tag, the same set `decide()` would
+    /// have seen. Correctness obligation: this must reach the identical
+    /// `CommandDecision` `decide()` would over the *full* matching_events
+    /// for the same payload - `snapshot_state_json` plus
+    /// `events_since_snapshot` is meant to be exactly equivalent
+    /// information, not an approximation.
+    ///
+    /// `snapshot_state_json` deliberately isn't a typed `Snapshot::State`,
+    /// since linking `CommandType` to one specific `Snapshot` impl at
+    /// the type level needs either a new required associated type
+    /// (breaking every existing `CommandType` impl) or a *defaulted*
+    /// one (`associated_type_defaults`, nightly-only). Deserialise it
+    /// yourself, the same way `tag_mappings()`'s own `field` is already
+    /// just a string, unchecked against `Payload` at compile time.
+    ///
+    /// The default implementation is a safe, non-panicking rejection -
+    /// only ever reached if a `CommandType` overrides `snapshot()`
+    /// without also overriding this: a real misconfiguration (unlike
+    /// the multi-tag case above), but one this trait can still fail
+    /// safely on rather than silently producing a wrong decision.
+    fn decide_from_snapshot(
+        _payload: &Self::Payload,
+        _snapshot_state_json: &str,
+        _events_since_snapshot: &[Self::Event],
+    ) -> CommandDecision {
+        CommandDecision::Rejected {
+            reason: "this CommandType declares snapshot() but never overrides \
+                     decide_from_snapshot()"
+                .to_string(),
+            kind: "snapshot_misconfigured".to_string(),
+        }
+    }
 }
 
 /// One event type a bounded context registers. Unlike `CommandType`/
@@ -293,6 +351,74 @@ pub trait Projection {
     fn project(state: &mut Self::State, event: &Self::Event, key: &str);
 }
 
+/// A folded, tag-scoped accelerator for `CommandType::decide()` against
+/// a large `matching_events` history (docs/architecture.md §19's
+/// "Problem 2") - `CommandType::snapshot()`'s own doc comment is where a
+/// command type opts in.
+///
+/// Deliberately **not** `Projection`, even though the shape rhymes
+/// (`fold` vs. `project`, `TAG_KEY` vs. `keys()`, `VERSION` vs. a
+/// restage): `Projection`s are eventually-consistent, rebuildable/
+/// restageable, Admin-exposed read-model infrastructure with no
+/// obligation to the timing/correctness bar a DCB consistency check
+/// needs - letting `decide()`'s own inputs depend on `Projection`
+/// machinery would mean an operator rebuilding a projection for
+/// ordinary read-model reasons could silently corrupt what `decide()`
+/// sees. `Snapshot` is its own trait, own storage
+/// (`{schema}.snapshots`/`{schema}.snapshot_progress`), own background
+/// catch-up task, own inspection endpoint - no shared code path a
+/// read-model change could destabilise.
+///
+/// Scoped to exactly one tag key, deliberately: `matching_events` is a
+/// *union* across a command's own derived tags (`courses.rs`'s real
+/// `EnrollStudentInCourse` unions `student` and `course` in one
+/// `decide()` call), and only a single tag key has a stable, reusable
+/// identity to snapshot against - a multi-tag command gets no benefit
+/// here, out of scope for now (composing several single-tag snapshots
+/// is feasible in principle, real unbuilt design work).
+///
+/// One `Snapshot` definition is shared by every `CommandType` that tags
+/// on its `TAG_KEY` and opts in - `banking.rs`'s `DepositMoney`/
+/// `WithdrawMoney` both tag on `account` and both want the same running
+/// balance, so they share one `AccountBalanceSnapshot` rather than each
+/// computing their own, free to drift apart.
+pub trait Snapshot {
+    type State: Serialize + DeserializeOwned + JsonSchema + Default;
+
+    /// Same generated per-bounded-context event enum `CommandType::Event`/
+    /// `Projection::Event` use - a snapshot folds any event type
+    /// carrying its `TAG_KEY`, not just one.
+    type Event: BoundedContextEvent;
+
+    const NAME: &'static str;
+
+    /// See `CommandType::BOUNDED_CONTEXT`'s own doc comment - identical
+    /// role and default here, for `skilj::SkiljBuilder::auto_register()`'s
+    /// `Snapshot` side.
+    const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT;
+
+    /// The single tag key this snapshot is scoped to - see this trait's
+    /// own doc comment for why only one. The background catch-up task
+    /// derives which tag *value* an event belongs to generically, from
+    /// `event.tags`, so there's no `keys()`-equivalent method to
+    /// implement here the way `Projection` needs one.
+    const TAG_KEY: &'static str;
+
+    /// Bumped by hand whenever `fold()`'s own logic or `State`'s shape
+    /// changes - a stored row at an older version is treated as if it
+    /// doesn't exist (see `CommandType::decide_from_snapshot`'s own doc
+    /// comment), never trusted. Not inferred: Rust has no way to detect
+    /// a fold's own semantic change, only a decider declaring one can.
+    const VERSION: u64;
+
+    /// Folds one event into `state`, in place - the identical shape
+    /// `Projection::project` already has, minus the `key` parameter
+    /// (`Snapshot` only ever folds one entity's own events into its own
+    /// state, never several at once the way a multi-instance projection
+    /// can).
+    fn fold(state: &mut Self::State, event: &Self::Event);
+}
+
 /// Type-erased dispatch to a bounded context's own typed `decide()` -
 /// what `CommandTrigger`'s REST handler and GraphQL's `CommandSubmission`
 /// resolver both call through to actually process a command. Lives here,
@@ -334,6 +460,32 @@ pub trait CommandDispatcher: Send + Sync {
         bounded_context: &str,
         command_type: &str,
     ) -> Option<Option<&'static str>>;
+
+    /// The registered command type's own `CommandType::snapshot()` -
+    /// same outer/inner `Option` convention as `required_role`. Meant to
+    /// be checked before `dispatch`, the same way `required_role` is:
+    /// if this is `Some(Some(name))` and the command's own derived tags
+    /// match `SnapshotDispatcher::tag_key(bc, name)` exactly, the caller
+    /// should read that snapshot and call `dispatch_from_snapshot`
+    /// instead of `dispatch` - see docs/architecture.md §19.
+    fn snapshot_name(
+        &self,
+        bounded_context: &str,
+        command_type: &str,
+    ) -> Option<Option<&'static str>>;
+
+    /// `CommandType::decide_from_snapshot`'s own type-erased entry
+    /// point - `dispatch`'s counterpart for the snapshot-accelerated
+    /// path. `None` for the identical "pair isn't registered at all"
+    /// case `dispatch` already has.
+    fn dispatch_from_snapshot(
+        &self,
+        bounded_context: &str,
+        command_type: &str,
+        payload: &str,
+        snapshot_state_json: &str,
+        events_since_snapshot: &[Event],
+    ) -> Option<crate::error::Result<CommandDecision>>;
 }
 
 /// Type-erased dispatch to a bounded context's own typed `project()` -
@@ -396,4 +548,49 @@ pub trait ProjectionDispatcher: Send + Sync {
     /// dispatcher, not whichever caller triggered the reset, knows the
     /// *current* correct starting point.
     fn default_state(&self, bounded_context: &str, projection_name: &str) -> Option<String>;
+}
+
+/// Type-erased dispatch to a bounded context's own typed `Snapshot::fold` -
+/// `CommandDispatcher`'s `dispatch_from_snapshot`/`snapshot_name`'s own
+/// counterpart for the other half of the type-erasure boundary, and what
+/// `db::catch_up_snapshots` (the background catch-up task -
+/// docs/architecture.md §19) calls through to actually fold an event
+/// into a stored snapshot row. Same "outer `None` = not registered"
+/// convention every other dispatcher trait in this module already uses.
+pub trait SnapshotDispatcher: Send + Sync {
+    /// Every `Snapshot::NAME` registered for `bounded_context` in this
+    /// process - `db::catch_up_snapshots`' own discovery mechanism,
+    /// since (deliberately - see `Snapshot`'s own doc comment) there is
+    /// no `snapshots` metadata table to enumerate the way
+    /// `list_projections_for_bounded_context` does for `Projection`.
+    fn snapshot_names(&self, bounded_context: &str) -> Vec<&'static str>;
+
+    /// The registered snapshot's own `Snapshot::TAG_KEY`.
+    fn tag_key(&self, bounded_context: &str, snapshot_name: &str) -> Option<&'static str>;
+
+    /// The registered snapshot's own `Snapshot::VERSION` - compared
+    /// against a stored row's `snapshot_version` to decide whether it's
+    /// still trustworthy (see `CommandType::decide_from_snapshot`'s own
+    /// doc comment).
+    fn version(&self, bounded_context: &str, snapshot_name: &str) -> Option<u64>;
+
+    /// `Some(Ok(new_state))` is `state_json` with `event` folded into it
+    /// via `Snapshot::fold` - `None` for the identical "pair isn't
+    /// registered at all" case every dispatcher here already has.
+    /// `event`'s own `BoundedContextEvent::try_from_event` failing is a
+    /// real `Err`, not a silent skip - a stored event this snapshot's
+    /// own `TAG_KEY` names should always convert cleanly.
+    fn fold(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+        state_json: &str,
+        event: &Event,
+    ) -> Option<crate::error::Result<String>>;
+
+    /// `T::State::default()`, JSON-serialised - the starting point for a
+    /// tag value with no stored snapshot yet, or one whose stored
+    /// `snapshot_version` no longer matches. `None` for the identical
+    /// "pair isn't registered at all" case.
+    fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String>;
 }

@@ -24,7 +24,7 @@ use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{
-    BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType, EventBroadcaster,
+    BoundedContext, BoundedContextStatus, Event, EventBroadcaster, EventOrigin, EventType,
 };
 use skilj_core::plugin::ProjectionDispatcher;
 use skilj_core::shared::Metadata;
@@ -37,7 +37,14 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     fn keys(&self, _: &str, _: &str, _: &Event) -> Option<Vec<String>> {
         None
     }
-    fn project(&self, _: &str, _: &str, _: &str, _: &Event, _: &str) -> Option<skilj_core::error::Result<String>> {
+    fn project(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &Event,
+        _: &str,
+    ) -> Option<skilj_core::error::Result<String>> {
         None
     }
     fn default_state(&self, _: &str, _: &str) -> Option<String> {
@@ -166,7 +173,8 @@ async fn appending_an_event_records_the_events_appended_counter() {
                             && kv.value.as_str().as_ref() == bounded_context_name.as_str()
                     })
                     && dp.attributes().any(|kv| {
-                        kv.key.as_str() == "event_type" && kv.value.as_str().as_ref() == "SomethingHappened"
+                        kv.key.as_str() == "event_type"
+                            && kv.value.as_str().as_ref() == "SomethingHappened"
                     })
             })
         });

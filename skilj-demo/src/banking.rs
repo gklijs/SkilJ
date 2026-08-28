@@ -21,25 +21,43 @@
 //! real logic: `decide_deposit_money`/`decide_withdraw_money` (the
 //! generated `CommandType::decide()` methods each delegate to one of
 //! these by name - see `skilj-codegen`'s own doc comment for the naming
-//! convention), the shared `balance_of` helper, and the `AccountBalance`
-//! projection in full (`Projection` generation is out of scope for this
-//! pass - see §17 and §16's own Finding 3 for why). `courses.rs` has no
-//! `.skilj.toml` counterpart and stays fully hand-written - its own
-//! point is real, non-generatable `decide()` logic, so converting it
-//! would prove nothing this file doesn't already prove.
+//! convention), the shared `apply_money_event`/`balance_of` helpers, and
+//! the `AccountBalance` projection in full (`Projection` generation is
+//! out of scope for this pass - see §17 and §16's own Finding 3 for
+//! why). `courses.rs` has no `.skilj.toml` counterpart and stays fully
+//! hand-written - its own point is real, non-generatable `decide()`
+//! logic, so converting it would prove nothing this file doesn't
+//! already prove.
+//!
+//! **§19's own real adopter**: `AccountBalanceSnapshot`/`WithdrawMoneyFast`
+//! near the bottom of this file are deliberately *not* part of the
+//! codegen'd shape above - `skilj-codegen` doesn't generate `snapshot()`/
+//! `decide_from_snapshot()` (out of scope for this pass, see
+//! docs/architecture.md §19's own "Files to touch"), so proving
+//! snapshotting end-to-end needed one small, genuinely hand-written
+//! `CommandType` instead of retrofitting the generated `WithdrawMoney`.
+//! Same real business logic as `decide_withdraw_money` above, on
+//! purpose - see that pair's own doc comment for why sharing
+//! `apply_money_event` keeps them from drifting apart.
 
 use serde::{Deserialize, Serialize};
 use skilj_core::shared::{CommandDecision, EventSpec};
 
 include!(concat!(env!("OUT_DIR"), "/banking_generated.rs"));
 
+/// One event's own effect on a running balance - `balance_of`'s per-step
+/// fold, and `AccountBalanceSnapshot::fold`'s identical one below (§19),
+/// factored out so the two can never drift apart the way two
+/// independently hand-maintained copies of the same match could.
+fn apply_money_event(balance: i64, event: &BankingEvent) -> i64 {
+    match event {
+        BankingEvent::MoneyDeposited(p) => balance + p.amount,
+        BankingEvent::MoneyWithdrawn(p) => balance - p.amount,
+    }
+}
+
 fn balance_of(matching_events: &[BankingEvent]) -> i64 {
-    matching_events
-        .iter()
-        .fold(0i64, |balance, event| match event {
-            BankingEvent::MoneyDeposited(p) => balance + p.amount,
-            BankingEvent::MoneyWithdrawn(p) => balance - p.amount,
-        })
+    matching_events.iter().fold(0i64, apply_money_event)
 }
 
 fn decide_deposit_money(payload: &DepositMoneyPayload, _matching_events: &[BankingEvent]) -> CommandDecision {
@@ -129,5 +147,124 @@ impl skilj::Projection for AccountBalance {
             BankingEvent::MoneyDeposited(p) => state.balance += p.amount,
             BankingEvent::MoneyWithdrawn(p) => state.balance -= p.amount,
         }
+    }
+}
+
+// --- snapshot (docs/architecture.md §19) --- see this file's own doc
+// comment for why this pair is hand-written rather than codegen'd.
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AccountBalanceSnapshotState {
+    pub balance: i64,
+}
+
+/// Scoped to `account` alone - `WithdrawMoney`/`DepositMoney`'s own
+/// single tag, the exact shape `Snapshot` requires (`crate::plugin::Snapshot`'s
+/// own doc comment). `fold` is `apply_money_event`, the identical
+/// per-event step `balance_of` already uses above.
+pub struct AccountBalanceSnapshot;
+
+#[skilj::auto_register(BOUNDED_CONTEXT)]
+impl skilj::Snapshot for AccountBalanceSnapshot {
+    type State = AccountBalanceSnapshotState;
+    type Event = BankingEvent;
+    const NAME: &'static str = "AccountBalanceSnapshot";
+    const TAG_KEY: &'static str = "account";
+    const VERSION: u64 = 1;
+    fn fold(state: &mut Self::State, event: &Self::Event) {
+        state.balance = apply_money_event(state.balance, event);
+    }
+}
+
+/// `WithdrawMoney`'s own real behaviour (see `decide_withdraw_money`
+/// above), reachable through the snapshot-accelerated path instead -
+/// two separate `CommandType`s, not the same one wearing two hats,
+/// since `snapshot()`/`decide_from_snapshot()` aren't part of
+/// `banking.skilj.toml`'s own generated shape (this file's own module
+/// doc comment). A real consuming app with a genuinely large per-account
+/// history would give its *actual* `WithdrawMoney` this treatment
+/// directly; this demo keeps both side by side so the ordinary path
+/// (`WithdrawMoney`) and the snapshot-accelerated one
+/// (`WithdrawMoneyFast`) are each independently provable against the
+/// identical real events.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WithdrawMoneyFastPayload {
+    pub account_id: String,
+    pub amount: i64,
+}
+
+pub struct WithdrawMoneyFast;
+
+#[skilj::auto_register(BOUNDED_CONTEXT)]
+impl skilj::CommandType for WithdrawMoneyFast {
+    type Payload = WithdrawMoneyFastPayload;
+    type Event = BankingEvent;
+    const NAME: &'static str = "WithdrawMoneyFast";
+    fn tag_mappings() -> Vec<skilj_core::shared::TagMapping> {
+        vec![skilj_core::shared::TagMapping {
+            key: "account".to_string(),
+            field: "account_id".to_string(),
+        }]
+    }
+    fn rest_trigger_allowed() -> bool {
+        true
+    }
+    fn snapshot() -> Option<&'static str> {
+        Some("AccountBalanceSnapshot")
+    }
+
+    /// Never actually reached once `snapshot()` is `Some` - the
+    /// framework always prefers `decide_from_snapshot` for an opted-in
+    /// command type (`CommandType::snapshot()`'s own doc comment) - but
+    /// still required, since `decide()` has no default. Delegates to
+    /// the identical `withdraw_decision` both paths share, so they can
+    /// never disagree.
+    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
+        withdraw_decision(payload, balance_of(matching_events))
+    }
+
+    fn decide_from_snapshot(
+        payload: &Self::Payload,
+        snapshot_state_json: &str,
+        events_since_snapshot: &[Self::Event],
+    ) -> CommandDecision {
+        let snapshot: AccountBalanceSnapshotState =
+            serde_json::from_str(snapshot_state_json).unwrap_or_default();
+        let balance = events_since_snapshot
+            .iter()
+            .fold(snapshot.balance, apply_money_event);
+        withdraw_decision(payload, balance)
+    }
+}
+
+/// The one real rule both `WithdrawMoneyFast::decide`/`decide_from_snapshot`
+/// share - identical to `decide_withdraw_money`'s own body above, just
+/// taking an already-computed `balance` instead of `matching_events`
+/// directly, since the two callers arrive at that balance two different
+/// ways (a full replay vs. a folded snapshot plus a short tail).
+fn withdraw_decision(payload: &WithdrawMoneyFastPayload, balance: i64) -> CommandDecision {
+    if payload.amount <= 0 {
+        return CommandDecision::Rejected {
+            reason: "withdrawal amount must be positive".into(),
+            kind: "invalid_amount".into(),
+        };
+    }
+    if payload.amount > balance {
+        return CommandDecision::Rejected {
+            reason: format!(
+                "account {} has balance {balance}, cannot withdraw {}",
+                payload.account_id, payload.amount
+            ),
+            kind: "insufficient_funds".into(),
+        };
+    }
+    CommandDecision::Accepted {
+        events: vec![EventSpec {
+            event_type: "MoneyWithdrawn".into(),
+            payload: serde_json::json!({
+                "account_id": payload.account_id,
+                "amount": payload.amount,
+            }),
+        }],
     }
 }

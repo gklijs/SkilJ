@@ -111,32 +111,34 @@ pub fn requires_role(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Expands to the impl block plus the optional injected const (if any),
 /// followed by one `inventory::submit!` registering a small
 /// `fn(SkiljBuilder) -> SkiljBuilder` closure - `X::BOUNDED_CONTEXT` (see
-/// that const's own doc comment on `EventType`/`CommandType`/`Projection`,
-/// `skilj-core`) scopes the registration, so a type never overriding it
-/// lands under `plugin::DEFAULT_BOUNDED_CONTEXT` ("default") with zero
-/// other configuration anywhere. `SkiljBuilder::auto_register()` folds
-/// every submitted closure across the whole linked binary, in whatever
-/// order `inventory` iterates them in - order never matters, since each
-/// closure only ever inserts its own `(bounded_context, NAME)` entry.
+/// that const's own doc comment on `EventType`/`CommandType`/`Projection`/
+/// `Snapshot`, `skilj-core`) scopes the registration, so a type never
+/// overriding it lands under `plugin::DEFAULT_BOUNDED_CONTEXT` ("default")
+/// with zero other configuration anywhere. `SkiljBuilder::auto_register()`
+/// folds every submitted closure across the whole linked binary, in
+/// whatever order `inventory` iterates them in - order never matters,
+/// since each closure only ever inserts its own `(bounded_context, NAME)`
+/// entry.
 ///
 /// **Facade-only, unlike `requires_role`.** `requires_role` expands to a
 /// trait-method override alone, so it works against `skilj-core`'s plugin
 /// API directly, no `skilj` dependency needed. This macro's whole point is
 /// registering onto `skilj::SkiljBuilder` - the emitted `inventory::submit!`
 /// necessarily names `skilj`'s own `EventTypeRegistrar`/`CommandTypeRegistrar`/
-/// `ProjectionRegistrar` types (via `::skilj::...` absolute paths, so a
-/// consuming crate needs only its existing `skilj` dependency, not a
-/// direct one on `inventory` too - `skilj` re-exports the crate for
-/// exactly this). A consumer using `skilj-core` directly, without the
-/// `skilj` facade, can't use this attribute - the same boundary that
-/// consumer already accepts by hand-rolling its own `CommandDispatcher`/
-/// `ProjectionDispatcher`/`EventDispatcher` (see those traits' own doc
-/// comments in `skilj-core::plugin`).
+/// `ProjectionRegistrar`/`SnapshotRegistrar` types (via `::skilj::...`
+/// absolute paths, so a consuming crate needs only its existing `skilj`
+/// dependency, not a direct one on `inventory` too - `skilj` re-exports
+/// the crate for exactly this). A consumer using `skilj-core` directly,
+/// without the `skilj` facade, can't use this attribute - the same
+/// boundary that consumer already accepts by hand-rolling its own
+/// `CommandDispatcher`/`ProjectionDispatcher`/`EventDispatcher`/
+/// `SnapshotDispatcher` (see those traits' own doc comments in
+/// `skilj-core::plugin`).
 ///
 /// Only sanity-checked to be sitting on an `impl ... for ...` block whose
 /// trait path's last segment is literally `EventType`/`CommandType`/
-/// `Projection` - the same best-effort diagnostic `requires_role` makes
-/// for `CommandType`, not a real type check.
+/// `Projection`/`Snapshot` - the same best-effort diagnostic
+/// `requires_role` makes for `CommandType`, not a real type check.
 #[proc_macro_attribute]
 pub fn auto_register(attr: TokenStream, item: TokenStream) -> TokenStream {
     let bounded_context_expr = if attr.is_empty() {
@@ -197,11 +199,20 @@ pub fn auto_register(attr: TokenStream, item: TokenStream) -> TokenStream {
                 })
             }
         },
+        Some("Snapshot") => quote! {
+            ::skilj::inventory::submit! {
+                ::skilj::SnapshotRegistrar(|b| {
+                    b.bounded_context(<#self_ty as ::skilj_core::plugin::Snapshot>::BOUNDED_CONTEXT)
+                        .snapshot::<#self_ty>()
+                })
+            }
+        },
         _ => {
             return syn::Error::new_spanned(
                 &item_impl,
                 "#[auto_register] only belongs on an `impl EventType for ...` / `impl \
-                 CommandType for ...` / `impl Projection for ...` block",
+                 CommandType for ...` / `impl Projection for ...` / `impl Snapshot for ...` \
+                 block",
             )
             .to_compile_error()
             .into();

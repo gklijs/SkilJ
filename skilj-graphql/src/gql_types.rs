@@ -645,6 +645,33 @@ pub fn inspected_event_object() -> Object {
     })
 }
 
+/// `inspectSnapshot`'s own response shape (docs/architecture.md §19) -
+/// a real, stored `{schema}.snapshots` row, resolved by
+/// `resolvers::snapshot_query`. `state` is the raw JSON a `Snapshot`
+/// impl's own `fold()` produced, not decoded any further here - this
+/// endpoint has no compiled `Snapshot::State` type to decode it into,
+/// only the in-process `SnapshotDispatcher` registry's own `tag_key`/
+/// `version` (see that resolver's own doc comment).
+pub struct InspectedSnapshotData {
+    pub tag_key: String,
+    pub tag_value: String,
+    pub version: i64,
+    pub as_of_sequence: i64,
+    pub state: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub fn inspected_snapshot_object() -> Object {
+    gql_object!(InspectedSnapshotData => "InspectedSnapshot" {
+        scalar "tagKey": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.tag_key.clone()),
+        scalar "tagValue": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.tag_value.clone()),
+        scalar "version": TypeRef::named_nn(TypeRef::INT) => |i| Value::from(i.version),
+        scalar "asOfSequence": TypeRef::named_nn(TypeRef::INT) => |i| Value::from(i.as_of_sequence),
+        scalar "state": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.state.clone()),
+        scalar "updatedAt": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.updated_at.to_rfc3339()),
+    })
+}
+
 /// `SubmitCommand`'s own response shape - docs/architecture.md §5.4's
 /// already-committed `SubmitCommandPayload`: business rejections surface
 /// as ordinary typed data here, never through GraphQL's real `errors`

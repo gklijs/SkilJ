@@ -588,6 +588,46 @@ async fn provision_bounded_context_schema(
     ))
     .execute(&mut **tx)
     .await?;
+    // docs/architecture.md §19's "Problem 2" fix - `Snapshot`'s own
+    // storage, deliberately not shared with `projection_state` above
+    // (see `crate::plugin::Snapshot`'s own doc comment for why). One
+    // row per `(snapshot_name, tag_key, tag_value)` - `tag_value` alone
+    // isn't unique across different snapshot definitions that happen to
+    // share a `tag_key`, hence the three-column key rather than two.
+    // `snapshot_version` is checked against `Snapshot::VERSION` before a
+    // row is ever trusted - a mismatch is treated as if the row doesn't
+    // exist, never read, so there's no `CHECK`/foreign key tying it to
+    // anything: an old-version row is inert data until the next catch-up
+    // tick overwrites it.
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.snapshots (
+            snapshot_name TEXT NOT NULL,
+            tag_key TEXT NOT NULL,
+            tag_value TEXT NOT NULL,
+            snapshot_version BIGINT NOT NULL,
+            as_of_sequence BIGINT NOT NULL,
+            state JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (snapshot_name, tag_key, tag_value)
+        )"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    // The background catch-up task's own position, one row per
+    // `snapshot_name` - `Projection`'s `caught_up_to` column plays the
+    // identical role, but isn't reused here (see `crate::plugin::Snapshot`'s
+    // own doc comment): `MAX(as_of_sequence)` across `snapshots` rows
+    // above can't stand in for this, since a rarely-touched tag value's
+    // own row can be correctly stale (nothing has happened for it)
+    // without the walk itself being behind.
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.snapshot_progress (
+            snapshot_name TEXT PRIMARY KEY,
+            caught_up_to BIGINT NOT NULL
+        )"
+    ))
+    .execute(&mut **tx)
+    .await?;
     // See `command_encryption_keys` above - the identical join-table
     // treatment, keyed by `sequence` instead of a synthetic id since
     // `events.sequence` is already `Event`'s own natural primary key.
@@ -2071,6 +2111,203 @@ async fn get_or_create_projection_rebuild_state_for_update(
     Ok(state)
 }
 
+/// docs/architecture.md §19's "Problem 2" - get-or-create-with-lock for
+/// one snapshot's own `(snapshot_name, tag_key, tag_value)` row, the
+/// `Snapshot` counterpart to `get_or_create_projection_state_for_update`
+/// above. `version` is the currently-registered `Snapshot::VERSION` -
+/// on a fresh row, seeds it at `-1`/`default_state_json`; on an existing
+/// row whose own stored `snapshot_version` still matches, this is a
+/// no-op write purely to acquire the lock (identical reasoning to the
+/// `Projection` twin); on an existing row at an *older* version, resets
+/// it to `-1`/`default_state_json` at the new version, atomically as
+/// part of acquiring the lock - the "model changed" case
+/// `CommandType::decide_from_snapshot`'s own doc comment describes,
+/// done here rather than as a separate read-then-write (which could
+/// race two concurrent catch-up ticks against the same row).
+async fn get_or_create_snapshot_state_for_update(
+    executor: impl sqlx::PgExecutor<'_>,
+    schema: &str,
+    snapshot_name: &str,
+    tag_key: &str,
+    tag_value: &str,
+    version: u64,
+    default_state_json: &str,
+) -> crate::error::Result<(i64, String)> {
+    let (as_of_sequence, state): (i64, String) = sqlx::query_as(&format!(
+        "INSERT INTO {schema}.snapshots \
+            (snapshot_name, tag_key, tag_value, snapshot_version, as_of_sequence, state, updated_at) \
+         VALUES ($1, $2, $3, $4, -1, $5::jsonb, now()) \
+         ON CONFLICT (snapshot_name, tag_key, tag_value) DO UPDATE SET \
+            snapshot_version = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
+                THEN {schema}.snapshots.snapshot_version ELSE $4 END, \
+            as_of_sequence = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
+                THEN {schema}.snapshots.as_of_sequence ELSE -1 END, \
+            state = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
+                THEN {schema}.snapshots.state ELSE $5::jsonb END \
+         RETURNING as_of_sequence, state::text"
+    ))
+    .bind(snapshot_name)
+    .bind(tag_key)
+    .bind(tag_value)
+    .bind(version as i64)
+    .bind(default_state_json)
+    .fetch_one(executor)
+    .await?;
+    Ok((as_of_sequence, state))
+}
+
+/// `(snapshot_version, as_of_sequence, state, updated_at)` -
+/// `get_snapshot_state`'s own return shape, named to satisfy
+/// `clippy::type_complexity` rather than because anything else reuses
+/// it.
+type SnapshotStateRow = (u64, i64, String, DateTime<Utc>);
+
+/// One snapshot's own materialised state, JSON-encoded, alongside the
+/// `snapshot_version` it was written at, the `sequence` it's folded up
+/// to, and when that last happened - `None` when nothing has ever been
+/// written for this `(snapshot_name, tag_key, tag_value)` triple. Every
+/// caller (the GraphQL inspection endpoint, and `submit_command`'s own
+/// snapshot-accelerated `decide_from_snapshot` path) treats both
+/// "nothing yet" and "a stored `snapshot_version` that no longer
+/// matches the currently-registered `Snapshot::VERSION`" identically -
+/// a cold start, not an error - see `CommandType::decide_from_snapshot`'s
+/// own doc comment.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn get_snapshot_state(
+    pool: &Pool,
+    bounded_context: &str,
+    snapshot_name: &str,
+    tag_key: &str,
+    tag_value: &str,
+) -> crate::error::Result<Option<SnapshotStateRow>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(i64, i64, String, DateTime<Utc>)> = sqlx::query_as(&format!(
+        "SELECT snapshot_version, as_of_sequence, state::text, updated_at FROM {schema}.snapshots \
+         WHERE snapshot_name = $1 AND tag_key = $2 AND tag_value = $3"
+    ))
+    .bind(snapshot_name)
+    .bind(tag_key)
+    .bind(tag_value)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(version, as_of_sequence, state, updated_at)| {
+        (version as u64, as_of_sequence, state, updated_at)
+    }))
+}
+
+/// What `submit_command`'s own snapshot-accelerated `decide_from_snapshot`
+/// call needs, resolved from a stored `snapshots` row (or a cold start).
+pub struct ResolvedSnapshot {
+    pub state_json: String,
+    pub as_of_sequence: i64,
+}
+
+/// Shared by `skilj-graphql`'s `submitCommand` resolver and `skilj-rest`'s
+/// `post_commands_trigger` route (docs/architecture.md §19), so the "does
+/// this command take the snapshot-accelerated path" decision lives once,
+/// not duplicated per surface the way plenty of resolver-local logic
+/// legitimately is elsewhere - this one has real, non-trivial rules
+/// worth keeping in exactly one place.
+///
+/// `None` when `snapshot_name` isn't actually registered
+/// (`SnapshotDispatcher::tag_key` returning `None`), or when
+/// `consistency_tags` isn't *exactly* the snapshot's own single
+/// `TAG_KEY` - `CommandType::snapshot()`'s own doc comment on why a
+/// multi-tag command opting in is a silent fallback, not an error.
+/// `Some` otherwise: a fresh/cold snapshot (nothing stored yet, or a
+/// stored `snapshot_version` that no longer matches the currently-
+/// registered one - "model changed", `CommandType::decide_from_snapshot`'s
+/// own doc comment) resolves to `Snapshot::State::default()`,
+/// JSON-encoded, at `as_of_sequence: -1` - the same cold-start shape
+/// `get_or_create_snapshot_state_for_update` gives the background
+/// catch-up task.
+pub async fn resolve_snapshot_context(
+    pool: &Pool,
+    bounded_context: &str,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    snapshot_name: &str,
+    consistency_tags: &[Tag],
+) -> crate::error::Result<Option<ResolvedSnapshot>> {
+    let Some(tag_key) = snapshot_dispatcher.tag_key(bounded_context, snapshot_name) else {
+        return Ok(None);
+    };
+    let [only_tag] = consistency_tags else {
+        return Ok(None);
+    };
+    if only_tag.key != tag_key {
+        return Ok(None);
+    }
+    let Some(tag_value) = &only_tag.value else {
+        return Ok(None);
+    };
+
+    let version = snapshot_dispatcher
+        .version(bounded_context, snapshot_name)
+        .unwrap_or(0);
+    let stored =
+        get_snapshot_state(pool, bounded_context, snapshot_name, tag_key, tag_value).await?;
+    let (as_of_sequence, state_json) = match stored {
+        Some((stored_version, as_of_sequence, state_json, _updated_at))
+            if stored_version == version =>
+        {
+            (as_of_sequence, state_json)
+        }
+        _ => (
+            -1,
+            snapshot_dispatcher
+                .default_state(bounded_context, snapshot_name)
+                .unwrap_or_default(),
+        ),
+    };
+    Ok(Some(ResolvedSnapshot {
+        state_json,
+        as_of_sequence,
+    }))
+}
+
+/// The background catch-up task's own progress marker for one snapshot -
+/// `None` before its first ever catch-up tick. Plain read, no lock:
+/// only used to compute `catch_up_snapshots`' own starting point for
+/// the *next* tick, never to decide whether a specific write is safe -
+/// that's `get_or_create_snapshot_state_for_update`'s own job, per row.
+async fn get_snapshot_progress(
+    pool: &Pool,
+    bounded_context: &str,
+    snapshot_name: &str,
+) -> crate::error::Result<Option<i64>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(i64,)> = sqlx::query_as(&format!(
+        "SELECT caught_up_to FROM {schema}.snapshot_progress WHERE snapshot_name = $1"
+    ))
+    .bind(snapshot_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(v,)| v))
+}
+
+/// Advances (or seeds) one snapshot's own progress marker - called once
+/// per event `catch_up_snapshots` processes, for every registered
+/// snapshot, regardless of whether that particular event actually
+/// touched any of its rows - the identical "position always advances,
+/// state only changes when consumed" treatment `Projection`'s own
+/// `caught_up_to` already gets.
+async fn upsert_snapshot_progress(
+    executor: impl sqlx::PgExecutor<'_>,
+    schema: &str,
+    snapshot_name: &str,
+    caught_up_to: i64,
+) -> crate::error::Result<()> {
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.snapshot_progress (snapshot_name, caught_up_to) VALUES ($1, $2) \
+         ON CONFLICT (snapshot_name) DO UPDATE SET caught_up_to = $2"
+    ))
+    .bind(snapshot_name)
+    .bind(caught_up_to)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// One projection instance's own materialised state, JSON-encoded -
 /// `None` when nothing has touched this `(projection_name, key)` pair
 /// yet (a legitimate, common state now that instances are created
@@ -3083,8 +3320,7 @@ pub async fn list_events_for_bounded_context_matching_tags(
     let tag_literals: Vec<String> = tags
         .iter()
         .map(|t| {
-            serde_json::to_string(std::slice::from_ref(t))
-                .expect("Tag serialisation is infallible")
+            serde_json::to_string(std::slice::from_ref(t)).expect("Tag serialisation is infallible")
         })
         .collect();
     let tag_clause = (1..=tag_literals.len())
@@ -3386,7 +3622,15 @@ pub async fn list_events_for_bounded_context_matching_tags_cached(
             .into_iter()
             .filter(|e| e.sequence > after_sequence.unwrap_or(-1))
             .collect()),
-        None => list_events_for_bounded_context_matching_tags(pool, bounded_context, tags, after_sequence).await,
+        None => {
+            list_events_for_bounded_context_matching_tags(
+                pool,
+                bounded_context,
+                tags,
+                after_sequence,
+            )
+            .await
+        }
     }
 }
 
@@ -3835,6 +4079,33 @@ pub enum SubmitCommandOutcome {
     },
 }
 
+/// A `submit_command` call's own snapshot-acceleration context
+/// (docs/architecture.md §19) - `Some` when the caller took the
+/// snapshot-accelerated path (`CommandDispatcher::dispatch_from_snapshot`)
+/// instead of the ordinary one (`dispatch`) for its own `initial_decision`.
+/// `state_json` is handed to `dispatch_from_snapshot` again on a
+/// DCB-conflict redispatch (made fresh, here, exactly like the ordinary
+/// path's own `dispatch` re-call); `as_of_sequence` is the snapshot's
+/// own high-water mark - the floor `original_highest` needs when
+/// `bounded_context_events` (the caller's own `events_since_snapshot`)
+/// is empty, since a plain `.unwrap_or(-1)` there would wrongly treat
+/// "nothing changed since the snapshot" as "nothing has ever happened".
+///
+/// **Known limitation, narrow and audit-only**: `Command.consistency_boundary`
+/// can under-report as `None` for a snapshot-accelerated command whose
+/// own `events_since_snapshot` is empty, even though the snapshot's own
+/// folded prefix represents real prior history -
+/// `consistency_boundary_and_matching_events` has no way to know about
+/// `as_of_sequence`, only about `bounded_context_events`. This never
+/// affects `decide_from_snapshot`'s own inputs or the decision it
+/// produces - only that one audit field - so it's left as a documented
+/// gap for this pass rather than widening `process_command`'s own
+/// signature too.
+pub struct SnapshotContext<'a> {
+    pub state_json: &'a str,
+    pub as_of_sequence: i64,
+}
+
 /// The shared "locked half" of `ProcessCommand` - `skilj-rest`'s
 /// `post_commands_trigger` and `skilj-graphql`'s `submitCommand` both
 /// delegate to this once authorisation is done and `initial_decision` -
@@ -3899,6 +4170,7 @@ pub async fn submit_command(
     initial_decision: crate::shared::CommandDecision,
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
+    snapshot: Option<SnapshotContext<'_>>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
@@ -3906,7 +4178,7 @@ pub async fn submit_command(
         .iter()
         .map(|e| e.sequence)
         .max()
-        .unwrap_or(-1);
+        .unwrap_or_else(|| snapshot.as_ref().map(|s| s.as_of_sequence).unwrap_or(-1));
 
     let mut tx = pool.begin().await?;
     let (locked_highest,): (i64,) = sqlx::query_as(&format!(
@@ -3958,15 +4230,37 @@ pub async fn submit_command(
                     &final_bounded_context_events,
                     consistency_tags,
                 );
-            final_decision = match dispatcher.dispatch(
-                &bounded_context_name,
-                &command_type.name,
-                payload,
-                &redispatch_matching_events,
-            ) {
-                None => return Err(crate::error::Error::NoDeciderRegistered),
-                Some(Err(e)) => return Err(e),
-                Some(Ok(d)) => d,
+            // docs/architecture.md §19: a snapshot-accelerated initial
+            // decision redispatches through `dispatch_from_snapshot`
+            // again too, not the ordinary `dispatch` - the snapshot's
+            // own folded prefix (`snapshot.state_json`) still represents
+            // real history `redispatch_matching_events` alone doesn't
+            // (it's the tag-indexed delta since the snapshot, same as
+            // `bounded_context_events` already was); calling the
+            // ordinary path here would silently drop everything the
+            // snapshot had already folded.
+            final_decision = match &snapshot {
+                Some(ctx) => match dispatcher.dispatch_from_snapshot(
+                    &bounded_context_name,
+                    &command_type.name,
+                    payload,
+                    ctx.state_json,
+                    &redispatch_matching_events,
+                ) {
+                    None => return Err(crate::error::Error::NoDeciderRegistered),
+                    Some(Err(e)) => return Err(e),
+                    Some(Ok(d)) => d,
+                },
+                None => match dispatcher.dispatch(
+                    &bounded_context_name,
+                    &command_type.name,
+                    payload,
+                    &redispatch_matching_events,
+                ) {
+                    None => return Err(crate::error::Error::NoDeciderRegistered),
+                    Some(Err(e)) => return Err(e),
+                    Some(Ok(d)) => d,
+                },
             };
             final_matching_events = redispatch_matching_events;
         }
@@ -4360,6 +4654,131 @@ pub async fn catch_up_bounded_context(
             let _ =
                 promote_projection_rebuild(pool, bounded_context, &rebuild.projection.name).await?;
         }
+    }
+
+    Ok(())
+}
+
+/// docs/architecture.md §19's "Problem 2" - the background half of
+/// `Snapshot`: one poll tick, for one bounded context, folding every
+/// committed event not yet reflected in any registered snapshot.
+/// Deliberately its own function, not folded into `catch_up_bounded_context`
+/// above even though the shape closely mirrors it - see `Snapshot`'s own
+/// doc comment for why the two stay structurally separate. Called in a
+/// loop, on a timer, by its own shared background task
+/// `SkiljBuilder::build()` spawns.
+///
+/// Unlike `Projection` (discovered via the `projections` metadata
+/// table), which snapshots exist is asked of `dispatcher` directly -
+/// `SnapshotDispatcher::snapshot_names` - since there is deliberately no
+/// metadata table for `Snapshot` (see that trait's own doc comment).
+/// Progress is tracked per `snapshot_name` in `snapshot_progress`
+/// (`Projection`'s own `caught_up_to` column isn't reused, for the same
+/// separation reason), and, per event, at most one tag *value*'s own row
+/// is touched - `Snapshot::TAG_KEY` names a single tag key, so `event.tags`
+/// either does or doesn't carry it, no `keys()`-equivalent fan-out the
+/// way a multi-instance `Projection` needs.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn catch_up_snapshots(
+    pool: &Pool,
+    bounded_context: &str,
+    dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let latest = latest_sequence(pool, bounded_context).await?.unwrap_or(-1);
+
+    let snapshot_names = dispatcher.snapshot_names(bounded_context);
+    if snapshot_names.is_empty() {
+        return Ok(());
+    }
+
+    let mut progress = std::collections::HashMap::new();
+    for name in &snapshot_names {
+        let caught_up_to = get_snapshot_progress(pool, bounded_context, name)
+            .await?
+            .unwrap_or(-1);
+        progress.insert(*name, caught_up_to);
+    }
+
+    let min_caught_up = progress.values().copied().min().unwrap_or(latest);
+    let events = if min_caught_up >= latest {
+        Vec::new()
+    } else {
+        list_events_for_bounded_context_from(pool, bounded_context, min_caught_up).await?
+    };
+
+    for event in &events {
+        let mut tx = pool.begin().await?;
+
+        for name in &snapshot_names {
+            if progress[name] >= event.sequence {
+                continue;
+            }
+
+            // `None` (not registered) can't actually happen here -
+            // `name` came from this exact dispatcher's own
+            // `snapshot_names` a moment ago - but treated as "nothing to
+            // do" rather than unwrapped, the same defensive posture
+            // `catch_up_bounded_context` already takes for its own
+            // dispatcher lookups.
+            let Some(tag_key) = dispatcher.tag_key(bounded_context, name) else {
+                continue;
+            };
+            let Some(tag) = event.tags.iter().find(|t| t.key == tag_key) else {
+                continue;
+            };
+            let Some(tag_value) = &tag.value else {
+                continue;
+            };
+            let version = dispatcher.version(bounded_context, name).unwrap_or(0);
+            let default_state_json = dispatcher
+                .default_state(bounded_context, name)
+                .unwrap_or_default();
+
+            let (as_of_sequence, current_state) = get_or_create_snapshot_state_for_update(
+                &mut *tx,
+                &schema,
+                name,
+                tag_key,
+                tag_value,
+                version,
+                &default_state_json,
+            )
+            .await?;
+
+            if as_of_sequence >= event.sequence {
+                continue;
+            }
+
+            let new_state = match dispatcher.fold(bounded_context, name, &current_state, event) {
+                Some(result) => result?,
+                None => current_state,
+            };
+
+            sqlx::query(&format!(
+                "UPDATE {schema}.snapshots SET snapshot_version = $1, as_of_sequence = $2, \
+                 state = $3::jsonb, updated_at = now() \
+                 WHERE snapshot_name = $4 AND tag_key = $5 AND tag_value = $6"
+            ))
+            .bind(version as i64)
+            .bind(event.sequence)
+            .bind(&new_state)
+            .bind(name)
+            .bind(tag_key)
+            .bind(tag_value.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for name in &snapshot_names {
+            if progress[name] >= event.sequence {
+                continue;
+            }
+            upsert_snapshot_progress(&mut *tx, &schema, name, event.sequence).await?;
+            progress.insert(*name, event.sequence);
+        }
+
+        tx.commit().await?;
     }
 
     Ok(())

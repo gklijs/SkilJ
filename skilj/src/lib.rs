@@ -61,7 +61,7 @@ pub use inventory;
 pub use skilj_core::access_control::{IdpConfig, SigningAlgorithm};
 pub use skilj_core::encryption::EncryptionMasterKey;
 pub use skilj_core::plugin::{
-    requires_role, CommandType, EventType, Projection, DEFAULT_BOUNDED_CONTEXT,
+    requires_role, CommandType, EventType, Projection, Snapshot, DEFAULT_BOUNDED_CONTEXT,
 };
 /// See `skilj_macros::auto_register`'s own doc comment - unlike
 /// `requires_role` above, this one is facade-specific (its expansion
@@ -102,6 +102,12 @@ pub struct Skilj {
     /// EventDispatcher>`, and the background scheduler task spawned in
     /// `.build()` holds its own clone for the process's lifetime.
     event_types: Arc<HashMap<(String, String), RegisteredEventType>>,
+    /// `Arc`-wrapped for the identical reason `command_types`/
+    /// `projections`/`event_types` are - `snapshot_dispatcher()` hands
+    /// out a cheap `Arc<dyn SnapshotDispatcher>`, and the background
+    /// snapshot catch-up task spawned in `.build()` holds its own clone
+    /// for the process's lifetime (docs/architecture.md §19).
+    snapshots: Arc<HashMap<(String, String), RegisteredSnapshot>>,
     /// `bootstrap::generate_bootstrap_secret`'s output, computed once at
     /// `.build()` time and printed then too (see `SkiljBuilder::build`) -
     /// `None` once an active superadmin already exists
@@ -198,6 +204,31 @@ impl CommandDispatcher for Dispatcher {
             .get(&(bounded_context.to_string(), command_type.to_string()))?;
         Some(registered.required_role)
     }
+
+    fn snapshot_name(&self, bounded_context: &str, command_type: &str) -> Option<Option<&'static str>> {
+        let registered = self
+            .command_types
+            .get(&(bounded_context.to_string(), command_type.to_string()))?;
+        Some(registered.snapshot_name)
+    }
+
+    fn dispatch_from_snapshot(
+        &self,
+        bounded_context: &str,
+        command_type: &str,
+        payload: &str,
+        snapshot_state_json: &str,
+        events_since_snapshot: &[Event],
+    ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        let registered = self
+            .command_types
+            .get(&(bounded_context.to_string(), command_type.to_string()))?;
+        Some((registered.decide_from_snapshot)(
+            payload,
+            snapshot_state_json,
+            events_since_snapshot,
+        ))
+    }
 }
 
 /// `ProjectionDispatcher`'s own implementer - same shape and reasoning
@@ -258,6 +289,60 @@ impl skilj_core::plugin::EventDispatcher for EventDispatcherImpl {
     }
 }
 
+/// `SnapshotDispatcher`'s own implementer - same shape and reasoning as
+/// `Dispatcher`/`ProjectionDispatcherImpl`/`EventDispatcherImpl` above,
+/// over the `snapshots` registry instead. `snapshot_names` is the one
+/// method with no direct sibling on the other three dispatchers - see
+/// its own doc comment on the trait for why `Snapshot` needs an
+/// enumeration method at all.
+struct SnapshotDispatcherImpl {
+    snapshots: Arc<HashMap<(String, String), RegisteredSnapshot>>,
+}
+
+impl skilj_core::plugin::SnapshotDispatcher for SnapshotDispatcherImpl {
+    fn snapshot_names(&self, bounded_context: &str) -> Vec<&'static str> {
+        self.snapshots
+            .iter()
+            .filter(|((bc, _), _)| bc == bounded_context)
+            .map(|(_, registered)| registered.name)
+            .collect()
+    }
+
+    fn tag_key(&self, bounded_context: &str, snapshot_name: &str) -> Option<&'static str> {
+        let registered = self
+            .snapshots
+            .get(&(bounded_context.to_string(), snapshot_name.to_string()))?;
+        Some(registered.tag_key)
+    }
+
+    fn version(&self, bounded_context: &str, snapshot_name: &str) -> Option<u64> {
+        let registered = self
+            .snapshots
+            .get(&(bounded_context.to_string(), snapshot_name.to_string()))?;
+        Some(registered.version)
+    }
+
+    fn fold(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+        state_json: &str,
+        event: &Event,
+    ) -> Option<skilj_core::error::Result<String>> {
+        let registered = self
+            .snapshots
+            .get(&(bounded_context.to_string(), snapshot_name.to_string()))?;
+        Some((registered.fold)(state_json, event))
+    }
+
+    fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String> {
+        let registered = self
+            .snapshots
+            .get(&(bounded_context.to_string(), snapshot_name.to_string()))?;
+        Some(registered.default_state_json.clone())
+    }
+}
+
 impl Skilj {
     pub fn builder(database_url: impl Into<String>) -> SkiljBuilder {
         SkiljBuilder {
@@ -268,7 +353,9 @@ impl Skilj {
             event_types: HashMap::new(),
             command_types: HashMap::new(),
             projections: HashMap::new(),
+            snapshots: HashMap::new(),
             async_projection_poll_interval: std::time::Duration::from_millis(500),
+            snapshot_poll_interval: std::time::Duration::from_millis(500),
             scheduler_poll_interval: std::time::Duration::from_secs(1),
             projection_query_wait_timeout: std::time::Duration::from_secs(5),
             encryption_master_key: None,
@@ -314,6 +401,17 @@ impl Skilj {
         })
     }
 
+    /// The type-erased `SnapshotDispatcher` this `Skilj` hands
+    /// `graphql_router()`'s own snapshot-inspection resolver and the
+    /// background snapshot catch-up task `.build()` spawns
+    /// (docs/architecture.md §19). Same cheap-`Arc`-clone reasoning as
+    /// `command_dispatcher()`/`projection_dispatcher()`/`event_dispatcher()`.
+    pub fn snapshot_dispatcher(&self) -> Arc<dyn skilj_core::plugin::SnapshotDispatcher> {
+        Arc::new(SnapshotDispatcherImpl {
+            snapshots: self.snapshots.clone(),
+        })
+    }
+
     /// The freshly-generated `BootstrapSecret`, printed once to stderr at
     /// `.build()` time (see `SkiljBuilder::build`) and held here too -
     /// for a consuming application that wants it available in-process
@@ -334,6 +432,7 @@ impl Skilj {
             self.pool.clone(),
             self.command_dispatcher(),
             self.projection_dispatcher(),
+            self.snapshot_dispatcher(),
             self.encryption_master_key.clone(),
             self.event_broadcaster.clone(),
             self.event_cache.clone(),
@@ -384,6 +483,7 @@ impl Skilj {
                 }),
             dispatcher: self.command_dispatcher(),
             projection_dispatcher: self.projection_dispatcher(),
+            snapshot_dispatcher: self.snapshot_dispatcher(),
             projection_query_wait_timeout: self.projection_query_wait_timeout,
             encryption_master_key: self.encryption_master_key.clone(),
             event_broadcaster: self.event_broadcaster.clone(),
@@ -469,6 +569,15 @@ fn registered_event_type<T: EventType + 'static>() -> RegisteredEventType {
 type DeciderFn =
     Box<dyn Fn(&str, &[Event]) -> skilj_core::error::Result<CommandDecision> + Send + Sync>;
 
+/// `DeciderFn`'s own twin for `CommandType::decide_from_snapshot` -
+/// docs/architecture.md §19's "Problem 2". `(payload_json,
+/// snapshot_state_json, events_since_snapshot)` - the same shape
+/// `decide_from_snapshot` itself has, just with `payload`/`events_since_snapshot`
+/// still type-erased, exactly like `DeciderFn` above.
+type DecideFromSnapshotFn = Box<
+    dyn Fn(&str, &str, &[Event]) -> skilj_core::error::Result<CommandDecision> + Send + Sync,
+>;
+
 struct RegisteredCommandType {
     schema: String,
     tag_mappings: Vec<skilj_core::shared::TagMapping>,
@@ -480,11 +589,20 @@ struct RegisteredCommandType {
     /// `skilj-graphql`'s eventual mutation resolver to check (§1.3.1,
     /// §8 item 5).
     required_role: Option<&'static str>,
+    /// `CommandType::snapshot()`'s value, carried straight through
+    /// unchanged - read back by `Dispatcher::snapshot_name`, the same
+    /// "outer/inner `Option`" convention `required_role` already uses.
+    snapshot_name: Option<&'static str>,
     /// Called by `Dispatcher::dispatch` (this module's own
     /// `CommandDispatcher` implementer), reached from `skilj-rest`'s
     /// `CommandTrigger` route through the `Arc<dyn CommandDispatcher>`
     /// `rest_router()` hands it - docs/architecture.md §8 item 4.
     decide: DeciderFn,
+    /// `Dispatcher::dispatch_from_snapshot`'s own bridge into
+    /// `CommandType::decide_from_snapshot` - `decide`'s own twin, called
+    /// instead of it when `snapshot_name` is `Some` and the caller's own
+    /// derived tags matched.
+    decide_from_snapshot: DecideFromSnapshotFn,
 }
 
 /// `T: 'static` (beyond `CommandType` itself) is what lets the returned
@@ -499,6 +617,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
         sensitive_fields: T::sensitive_fields(),
         rest_trigger_allowed: T::rest_trigger_allowed(),
         required_role: T::required_role(),
+        snapshot_name: T::snapshot(),
         decide: Box::new(|payload_json, raw_events| {
             let payload: T::Payload = serde_json::from_str(payload_json)
                 .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
@@ -512,6 +631,20 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
                 }
             }
             Ok(T::decide(&payload, &matching))
+        }),
+        decide_from_snapshot: Box::new(|payload_json, snapshot_state_json, raw_events| {
+            let payload: T::Payload = serde_json::from_str(payload_json)
+                .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
+            let mut matching = Vec::with_capacity(raw_events.len());
+            for event in raw_events {
+                if let Some(converted) = T::Event::try_from_event(event) {
+                    matching.push(
+                        converted
+                            .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?,
+                    );
+                }
+            }
+            Ok(T::decide_from_snapshot(&payload, snapshot_state_json, &matching))
         }),
     }
 }
@@ -614,6 +747,67 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
     }
 }
 
+/// Folds one event into a snapshot's own state (as JSON) - `Snapshot::fold`'s
+/// own type-erased bridge, closing over a single `T: Snapshot` alone,
+/// the same shape `ProjectFn` above has for `Projection::project`. Built
+/// once, at `.snapshot::<T>()` call time (see `registered_snapshot`
+/// below), called by `db::catch_up_snapshots` (docs/architecture.md §19)
+/// through the `SnapshotDispatcher` bridge - `SnapshotDispatcherImpl`
+/// below, this module's own implementer.
+///
+/// Unlike `ProjectFn`, which silently passes `state_json` through
+/// unchanged for an event type a `Projection` doesn't consume (a
+/// `Projection` folds several event types, so that's an expected,
+/// common case), this is only ever called for an event
+/// `catch_up_snapshots` already confirmed carries this snapshot's own
+/// `TAG_KEY` - a `BoundedContextEvent::try_from_event` failure here is a
+/// real, surfaced `Err`, not a silent no-op (see
+/// `SnapshotDispatcher::fold`'s own doc comment).
+type SnapshotFoldFn =
+    Box<dyn Fn(&str, &Event) -> skilj_core::error::Result<String> + Send + Sync>;
+
+/// See `RegisteredProjection` above - same shape and reasoning, for
+/// `Snapshot`. `name` (`T::NAME`) is carried as its own field, unlike
+/// `RegisteredCommandType`/`RegisteredProjection` (whose own `NAME` is
+/// already the registry's own map key) - `SnapshotDispatcher::snapshot_names`
+/// needs to hand back `&'static str`s it doesn't otherwise have, since
+/// there is deliberately no metadata table to enumerate instead (see
+/// `skilj_core::plugin::Snapshot`'s own doc comment).
+struct RegisteredSnapshot {
+    name: &'static str,
+    tag_key: &'static str,
+    version: u64,
+    default_state_json: String,
+    fold: SnapshotFoldFn,
+}
+
+fn registered_snapshot<T: Snapshot + 'static>() -> RegisteredSnapshot {
+    let default_state_json = serde_json::to_string(&T::State::default())
+        .expect("JSON serialization of a Default::default() State is infallible");
+    RegisteredSnapshot {
+        name: T::NAME,
+        tag_key: T::TAG_KEY,
+        version: T::VERSION,
+        default_state_json,
+        fold: Box::new(|state_json, event| {
+            let mut state: T::State = serde_json::from_str(state_json)
+                .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
+            let converted = T::Event::try_from_event(event).ok_or_else(|| {
+                EventStoreError::PayloadDecodeFailed(format!(
+                    "event type {} does not convert via this bounded context's own \
+                     BoundedContextEvent - snapshot {} can't fold it",
+                    event.event_type.name,
+                    T::NAME
+                ))
+            })?;
+            let converted =
+                converted.map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
+            T::fold(&mut state, &converted);
+            Ok(serde_json::to_string(&state).expect("JSON serialization of State is infallible"))
+        }),
+    }
+}
+
 /// One `#[auto_register]`-tagged `EventType` impl's own contribution -
 /// the type-erased equivalent of one
 /// `.bounded_context(T::BOUNDED_CONTEXT).event_type::<T>()` call, as a
@@ -635,6 +829,11 @@ inventory::collect!(CommandTypeRegistrar);
 pub struct ProjectionRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
 inventory::collect!(ProjectionRegistrar);
 
+/// See `EventTypeRegistrar` above - same shape and reasoning, for
+/// `#[auto_register]` over a `Snapshot` impl (docs/architecture.md §19).
+pub struct SnapshotRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
+inventory::collect!(SnapshotRegistrar);
+
 pub struct SkiljBuilder {
     database_url: String,
     current_bounded_context: String,
@@ -643,7 +842,9 @@ pub struct SkiljBuilder {
     event_types: HashMap<(String, String), RegisteredEventType>,
     command_types: HashMap<(String, String), RegisteredCommandType>,
     projections: HashMap<(String, String), RegisteredProjection>,
+    snapshots: HashMap<(String, String), RegisteredSnapshot>,
     async_projection_poll_interval: std::time::Duration,
+    snapshot_poll_interval: std::time::Duration,
     scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
     encryption_master_key: Option<EncryptionMasterKey>,
@@ -686,6 +887,9 @@ impl SkiljBuilder {
         for registrar in inventory::iter::<ProjectionRegistrar> {
             self = (registrar.0)(self);
         }
+        for registrar in inventory::iter::<SnapshotRegistrar> {
+            self = (registrar.0)(self);
+        }
         self
     }
 
@@ -707,6 +911,16 @@ impl SkiljBuilder {
         let bc = self.current_bounded_context();
         self.projections
             .insert((bc, T::NAME.to_string()), registered_projection::<T>());
+        self
+    }
+
+    /// docs/architecture.md §19. Same shape as `.projection::<T>()`
+    /// above; unlike it, has no matching GraphQL registration mutation -
+    /// see `skilj_core::plugin::Snapshot`'s own doc comment for why.
+    pub fn snapshot<T: Snapshot + 'static>(mut self) -> Self {
+        let bc = self.current_bounded_context();
+        self.snapshots
+            .insert((bc, T::NAME.to_string()), registered_snapshot::<T>());
         self
     }
 
@@ -745,6 +959,17 @@ impl SkiljBuilder {
     /// `await_projection_caught_up`'s own wait bound already lives in.
     pub fn async_projection_poll_interval(mut self, interval: std::time::Duration) -> Self {
         self.async_projection_poll_interval = interval;
+        self
+    }
+
+    /// How often the single shared background task `.build()` spawns
+    /// polls for registered `Snapshot`s to catch up -
+    /// `db::catch_up_snapshots`' own wake mechanism (docs/architecture.md
+    /// §19), the `Snapshot` equivalent of `async_projection_poll_interval`
+    /// above. Defaults to 500ms, matching that default for the identical
+    /// reason.
+    pub fn snapshot_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.snapshot_poll_interval = interval;
         self
     }
 
@@ -890,6 +1115,7 @@ impl SkiljBuilder {
         // itself exists to hand out `command_dispatcher()`.
         let projections = Arc::new(self.projections);
         let command_types = Arc::new(self.command_types);
+        let snapshots = Arc::new(self.snapshots);
 
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
@@ -969,6 +1195,9 @@ impl SkiljBuilder {
                 projection_dispatcher: Arc::new(ProjectionDispatcherImpl {
                     projections: projections.clone(),
                 }),
+                snapshot_dispatcher: Arc::new(SnapshotDispatcherImpl {
+                    snapshots: snapshots.clone(),
+                }),
                 projection_query_wait_timeout,
                 encryption_master_key: encryption_master_key.clone(),
                 event_broadcaster: event_broadcaster.clone(),
@@ -982,6 +1211,7 @@ impl SkiljBuilder {
             pool,
             command_types,
             projections,
+            snapshots,
             event_types: Arc::new(self.event_types),
             bootstrap_secret,
             identity_provider,
@@ -1059,6 +1289,72 @@ impl SkiljBuilder {
                     &[KeyValue::new("task", "async_projection")],
                 );
                 tokio::time::sleep(poll_interval).await;
+            }
+        });
+
+        // docs/architecture.md §19's own background task - one shared
+        // task, not one per bounded context, for the identical reasons
+        // the async projection task above is. Detached, runs for the
+        // process's lifetime, same as every other background task here.
+        // Deliberately its own task, not folded into the async
+        // projection one above even though the shape rhymes closely -
+        // see `skilj_core::plugin::Snapshot`'s own doc comment for why
+        // `Snapshot` stays structurally separate from `Projection`
+        // throughout.
+        let snapshot_pool = skilj.pool.clone();
+        let snapshot_dispatcher = skilj.snapshot_dispatcher();
+        let snapshot_interval = self.snapshot_poll_interval;
+        tokio::spawn(async move {
+            loop {
+                let start = std::time::Instant::now();
+                async {
+                    match skilj_core::db::list_bounded_contexts(&snapshot_pool).await {
+                        Ok(bounded_contexts) => {
+                            for bc in bounded_contexts {
+                                if let Err(e) = skilj_core::db::catch_up_snapshots(
+                                    &snapshot_pool,
+                                    &bc.name,
+                                    snapshot_dispatcher.as_ref(),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        bounded_context = %bc.name,
+                                        error = %e,
+                                        "snapshot catch-up failed"
+                                    );
+                                    BACKGROUND_TASK_ERRORS.add(
+                                        1,
+                                        &[
+                                            KeyValue::new("task", "snapshot"),
+                                            KeyValue::new("reason", "catch_up_failed"),
+                                        ],
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "snapshot catch-up failed to list bounded contexts"
+                            );
+                            BACKGROUND_TASK_ERRORS.add(
+                                1,
+                                &[
+                                    KeyValue::new("task", "snapshot"),
+                                    KeyValue::new("reason", "list_bounded_contexts_failed"),
+                                ],
+                            );
+                        }
+                    }
+                }
+                .instrument(tracing::info_span!("snapshot_tick"))
+                .await;
+                BACKGROUND_TASK_TICK_DURATION.record(
+                    start.elapsed().as_secs_f64(),
+                    &[KeyValue::new("task", "snapshot")],
+                );
+                tokio::time::sleep(snapshot_interval).await;
             }
         });
 

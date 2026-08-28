@@ -15,7 +15,7 @@ use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{Event, EventBroadcaster};
-use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
+use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher, SnapshotDispatcher};
 use skilj_core::shared::CommandDecision;
 use tower::ServiceExt;
 
@@ -31,6 +31,19 @@ impl CommandDispatcher for NoopCommandDispatcher {
         None
     }
     fn required_role(&self, _bounded_context: &str, _command_type: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn snapshot_name(&self, _bounded_context: &str, _command_type: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn dispatch_from_snapshot(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+        _payload: &str,
+        _snapshot_state_json: &str,
+        _events_since_snapshot: &[Event],
+    ) -> Option<skilj_core::error::Result<CommandDecision>> {
         None
     }
 }
@@ -55,6 +68,31 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     }
 }
 
+struct NoopSnapshotDispatcher;
+impl SnapshotDispatcher for NoopSnapshotDispatcher {
+    fn snapshot_names(&self, _bounded_context: &str) -> Vec<&'static str> {
+        Vec::new()
+    }
+    fn tag_key(&self, _bounded_context: &str, _snapshot_name: &str) -> Option<&'static str> {
+        None
+    }
+    fn version(&self, _bounded_context: &str, _snapshot_name: &str) -> Option<u64> {
+        None
+    }
+    fn fold(
+        &self,
+        _bounded_context: &str,
+        _snapshot_name: &str,
+        _state_json: &str,
+        _event: &Event,
+    ) -> Option<skilj_core::error::Result<String>> {
+        None
+    }
+    fn default_state(&self, _bounded_context: &str, _snapshot_name: &str) -> Option<String> {
+        None
+    }
+}
+
 #[tokio::test]
 async fn a_request_records_the_http_server_request_duration_histogram() {
     let exporter = InMemoryMetricExporter::default();
@@ -74,6 +112,7 @@ async fn a_request_records_the_http_server_request_duration_histogram() {
         pool,
         std::sync::Arc::new(NoopCommandDispatcher),
         std::sync::Arc::new(NoopProjectionDispatcher),
+        std::sync::Arc::new(NoopSnapshotDispatcher),
         None,
         EventBroadcaster::new(4),
         EventCache::new(4),

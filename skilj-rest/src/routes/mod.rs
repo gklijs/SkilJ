@@ -58,7 +58,7 @@ use skilj_core::db::{self, AccessTokenKind, Pool};
 use skilj_core::encryption::EncryptionMasterKey;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{self, AckMode, Event, EventBroadcaster};
-use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher};
+use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher, SnapshotDispatcher};
 use skilj_core::shared::{hash_secret, secret_matches, Filter, FilterOperator};
 use std::sync::Arc;
 
@@ -79,6 +79,7 @@ struct AppState {
     pool: Pool,
     dispatcher: Arc<dyn CommandDispatcher>,
     projection_dispatcher: Arc<dyn ProjectionDispatcher>,
+    snapshot_dispatcher: Arc<dyn SnapshotDispatcher>,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
@@ -170,6 +171,7 @@ pub fn router(
     pool: Pool,
     dispatcher: Arc<dyn CommandDispatcher>,
     projection_dispatcher: Arc<dyn ProjectionDispatcher>,
+    snapshot_dispatcher: Arc<dyn SnapshotDispatcher>,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
@@ -186,6 +188,7 @@ pub fn router(
             pool,
             dispatcher,
             projection_dispatcher,
+            snapshot_dispatcher,
             encryption_master_key,
             event_broadcaster,
             event_cache,
@@ -677,12 +680,34 @@ async fn post_commands_trigger(
     // `skilj-graphql`'s `command_submission.rs` own identical change.
     let consistency_tags =
         event_store::derive_tags(&authorised.command_type.tag_mappings, &authorised.payload);
+
+    // docs/architecture.md §19's "Problem 2" - see skilj-graphql's own
+    // identical branch in command_submission.rs for the full reasoning;
+    // shared via skilj_core::db::resolve_snapshot_context so this logic
+    // lives once, not duplicated per surface.
+    let snapshot_context = match state
+        .dispatcher
+        .snapshot_name(&bounded_context_name, &authorised.command_type.name)
+    {
+        Some(Some(snapshot_name)) => {
+            db::resolve_snapshot_context(
+                &state.pool,
+                &bounded_context_name,
+                state.snapshot_dispatcher.as_ref(),
+                snapshot_name,
+                &consistency_tags,
+            )
+            .await?
+        }
+        _ => None,
+    };
+
     let bounded_context_events = db::list_events_for_bounded_context_matching_tags_cached(
         &state.pool,
         &state.event_cache,
         &bounded_context_name,
         &consistency_tags,
-        None,
+        snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
     )
     .await?;
     let (_boundary, matching_events) = event_store::consistency_boundary_and_matching_events(
@@ -690,15 +715,28 @@ async fn post_commands_trigger(
         &consistency_tags,
     );
 
-    let decision = match state.dispatcher.dispatch(
-        &bounded_context_name,
-        &authorised.command_type.name,
-        &authorised.payload,
-        &matching_events,
-    ) {
-        None => return Err(RestError::NoDeciderRegistered),
-        Some(Err(e)) => return Err(e.into()),
-        Some(Ok(decision)) => decision,
+    let decision = match &snapshot_context {
+        Some(ctx) => match state.dispatcher.dispatch_from_snapshot(
+            &bounded_context_name,
+            &authorised.command_type.name,
+            &authorised.payload,
+            &ctx.state_json,
+            &matching_events,
+        ) {
+            None => return Err(RestError::NoDeciderRegistered),
+            Some(Err(e)) => return Err(e.into()),
+            Some(Ok(decision)) => decision,
+        },
+        None => match state.dispatcher.dispatch(
+            &bounded_context_name,
+            &authorised.command_type.name,
+            &authorised.payload,
+            &matching_events,
+        ) {
+            None => return Err(RestError::NoDeciderRegistered),
+            Some(Err(e)) => return Err(e.into()),
+            Some(Ok(decision)) => decision,
+        },
     };
 
     let outcome = db::submit_command(
@@ -716,6 +754,12 @@ async fn post_commands_trigger(
         decision,
         state.encryption_master_key.as_ref(),
         Utc::now(),
+        snapshot_context
+            .as_ref()
+            .map(|ctx| db::SnapshotContext {
+                state_json: &ctx.state_json,
+                as_of_sequence: ctx.as_of_sequence,
+            }),
     )
     .await?;
 

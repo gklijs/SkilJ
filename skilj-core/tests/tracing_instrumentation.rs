@@ -50,7 +50,8 @@ struct FieldVisitor(SpanFields);
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0.push((field.name().to_string(), format!("{value:?}")));
+        self.0
+            .push((field.name().to_string(), format!("{value:?}")));
     }
 }
 
