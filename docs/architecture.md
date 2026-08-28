@@ -3151,3 +3151,125 @@ worth building. The final call - build the narrower first cut, or close
 #5 as adequately superseded by #10 (already shipped) plus #3/#4
 (shipped this session) - is the project owner's, informed by these
 numbers rather than the issue's own upfront guess.
+
+## 17. Event/command codegen, for real: the narrower cut (Codeberg issue #5)
+
+§16's recommendation was the narrower cut - event/command type
+generation only, `Projection` generation deferred (its Finding 3,
+`keyed_by`'s per-event-type map case, stays unresolved). The project
+owner chose it. This section documents the actual build, not another
+prototype: a real crate, wired into a real consumer, verified against
+the real Postgres-backed test suite `banking.rs` already had.
+
+**`skilj-codegen`** (new crate) is a plain library, not a proc-macro -
+it runs from a consumer's own `build.rs`, at `cargo build` time, not at
+`rustc`'s macro-expansion time, so generated code can never drift out of
+sync with the `.skilj.toml` it came from (the issue's own preferred
+default: no separate "did you remember to regenerate" step). Its entire
+public surface is one function:
+
+```rust
+pub fn generate(toml_source: &str) -> Result<String, Error>
+```
+
+It parses `toml_source` into a small internal spec
+(`BoundedContextSpec { bounded_context, event_types, command_types }`,
+each `EventTypeSpec`/`CommandTypeSpec` carrying `fields: Vec<FieldSpec>`
+- a `Vec`, not a map, specifically to preserve declared field order,
+which a TOML map alone doesn't guarantee - `tags: BTreeMap<String,
+String>`, and, for commands, `rest_trigger_allowed: bool`), builds a
+real `proc_macro2::TokenStream` with `quote!` (the same
+`syn`/`quote`/`proc-macro2` stack `skilj-macros` already proved out in
+this codebase, reused here for build-time codegen instead of compile-time
+macro expansion), and pretty-prints it with `prettyplease` (new
+dependency) so the generated file is genuinely readable, not a minified
+one-liner.
+
+**Scoped to exactly what a real conversion needs, nothing wider.**
+Matching this project's own repeated "don't build ahead of what's
+wired" discipline, the format covers `fields`, `tags`, and
+`rest_trigger_allowed` - not the plugin API's full trait surface.
+`sensitive_fields`, the creation-origin flags
+(`external_creation_allowed`/`direct_creation_allowed`/
+`event_read_allowed`), scheduling, and `#[requires_role]` are real,
+legitimate parts of that API but are **deliberately deferred**, named
+here rather than silently missing: `banking.rs` never exercised any of
+them (confirmed by direct reading during §16's own prototype pass), so
+building generator support for them now would be speculative,
+untested-by-anything-real surface area - the exact thing this project's
+own convention avoids. A `FieldType` closed enum
+(`string`/`i64`/`bool`) covers the scalar leaf shapes the plugin API's
+schema rules already require, not a general type system.
+
+**One deliberate deviation from §16's own draft format**: TOML, not
+YAML. `serde_yaml` - the natural choice for the prototype's own
+illustrative YAML sketch - was archived by its own maintainer in 2024,
+not a dependency to newly adopt for real, ongoing code. `toml` is
+actively maintained and expresses this exact shape (arrays of tables)
+just as cleanly.
+
+**What `generate()` emits**, per bounded context: `pub const
+BOUNDED_CONTEXT: &str = "...";` at the top (so nothing about wiring
+`#[auto_register(BOUNDED_CONTEXT)]` needs a separately hand-written
+const either); one `#[derive(Debug, Clone, Serialize, Deserialize,
+JsonSchema)] pub struct XPayload { ... }` per event/command type, fields
+in declared order; one unit struct + `#[auto_register(BOUNDED_CONTEXT)]
+impl EventType for X` per event type (`type Payload`, `const NAME`,
+`tag_mappings()` - omitted entirely when a type declares no tags, rather
+than emitted empty); one unit struct + `impl CommandType for X` per
+command type (`type Payload`, `type Event`, `const NAME`,
+`tag_mappings()`, `rest_trigger_allowed()` when set), with `decide()`
+generated as a one-line delegation to a hand-written free function the
+including module is expected to already provide - naming convention
+`decide_<snake_case(NAME)>`, e.g. `decide_deposit_money`. A missing one
+is a real, immediate compile error (an unresolved name) in the
+including crate, not a silent gap; and the shared per-bounded-context
+event enum (`BankingEvent`-shaped) plus its own `impl
+BoundedContextEvent for ... { fn try_from_event(...) }`, one
+variant/match-arm per event type - §16's own Finding 1, the cleanest,
+least-arguable win, and Finding 4's correctness win falls out of the
+same mechanism for free: the tag reference and the payload struct are
+now derived from the same declarative source, so a typo'd field name is
+a build-time error instead of a registration-time one against a live
+database.
+
+**Consumer wiring, proven against the real thing, not a synthetic
+fixture.** `skilj-demo/src/banking.skilj.toml` holds the declarative
+shape for `MoneyDeposited`/`MoneyWithdrawn`/`DepositMoney`/
+`WithdrawMoney`. `skilj-demo/build.rs` reads it, calls
+`skilj_codegen::generate`, and writes the result to
+`$OUT_DIR/banking_generated.rs`. `skilj-demo/src/banking.rs` itself now
+opens with `include!(concat!(env!("OUT_DIR"), "/banking_generated.rs"));`
+and keeps only what stays genuinely hand-written: `decide_deposit_money`/
+`decide_withdraw_money` (today's `decide()` bodies, lifted to free
+functions) and `balance_of()` (the shared helper). `AccountBalance` (the
+projection) and its own `keys()`/`project()` are untouched - projection
+generation is out of scope for this pass, not broken by it.
+
+`courses.rs` stays fully hand-written, deliberately, with no
+`.skilj.toml` counterpart. Its own point -
+`EnrollStudentInCourse`'s dual-invariant `decide()` - is real logic no
+declarative format generates, and its two projections
+(`CourseRoster`/`StudentSchedule`) are exactly the deferred
+`keyed_by`-map case from §16's Finding 3. Converting it would prove
+nothing this pass doesn't already prove via `banking.rs`.
+
+**Verification.** `skilj-codegen` has its own test suite: 2 unit tests
+for the PascalCase/snake_case helpers `decide_<name>` naming needs, and
+7 integration tests asserting the generated, `prettyplease`-formatted
+source contains the expected constructs (field order preserved, real
+`tag_mappings()` values, a type with no tags gets no `tag_mappings()`
+override at all, the event enum's own match arms, and a malformed TOML
+file is a real `Error`, not a panic). The real regression proof is that
+`skilj-demo`'s and `skilj`'s existing test suites - `banking.rs`'s own
+three tests plus every other real-Postgres integration test in both
+crates - were run completely **unchanged** against the newly-codegen'd
+`banking.rs`, and all passed: the generated code is behaviourally
+identical to the hand-written code it replaced, not merely
+"compiles." `cargo build/clippy/test --workspace` is clean (the one
+pre-existing `skilj-core` clippy warning at the time of this pass,
+`db/mod.rs`'s `explicit_auto_deref`, belongs to separate, already-in-
+flight work and is untouched by this one). `$OUT_DIR/banking_generated.rs`
+was manually inspected after a real build and reads as genuinely clean,
+idiomatic Rust - a maintainer debugging generated code would not be lost
+in it.

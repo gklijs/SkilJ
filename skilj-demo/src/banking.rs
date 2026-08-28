@@ -11,81 +11,29 @@
 //! a given `account_id` is what brings it into existence: `decide()`
 //! folds `matching_events` (empty, the first time) to find the current
 //! balance, so an unopened account reads as balance zero.
+//!
+//! **Codeberg issue #5's narrower cut (docs/architecture.md §17)**: the
+//! event/command *shape* half of this file - the payload structs, the
+//! `EventType`/`CommandType` impls' declarative fields, and the shared
+//! `BankingEvent` enum + its `BoundedContextEvent` impl - is generated
+//! at build time from `banking.skilj.toml` (`build.rs`), not
+//! hand-written here. What stays hand-written, below, is exactly the
+//! real logic: `decide_deposit_money`/`decide_withdraw_money` (the
+//! generated `CommandType::decide()` methods each delegate to one of
+//! these by name - see `skilj-codegen`'s own doc comment for the naming
+//! convention), the shared `balance_of` helper, and the `AccountBalance`
+//! projection in full (`Projection` generation is out of scope for this
+//! pass - see §17 and §16's own Finding 3 for why). `courses.rs` has no
+//! `.skilj.toml` counterpart and stays fully hand-written - its own
+//! point is real, non-generatable `decide()` logic, so converting it
+//! would prove nothing this file doesn't already prove.
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use skilj::{auto_register, CommandType, EventType, Projection};
-use skilj_core::event_store::Event;
-use skilj_core::plugin::BoundedContextEvent;
-use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
+use skilj_core::shared::{CommandDecision, EventSpec};
 
-pub const BOUNDED_CONTEXT: &str = "banking";
+pub const BOUNDED_CONTEXT_NAME: &str = "banking";
 
-fn account_tag() -> Vec<TagMapping> {
-    vec![TagMapping {
-        key: "account".into(),
-        field: "account_id".into(),
-    }]
-}
-
-// --- events ---
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MoneyDepositedPayload {
-    pub account_id: String,
-    pub amount: i64,
-}
-
-pub struct MoneyDeposited;
-
-#[auto_register(BOUNDED_CONTEXT)]
-impl EventType for MoneyDeposited {
-    type Payload = MoneyDepositedPayload;
-    const NAME: &'static str = "MoneyDeposited";
-    fn tag_mappings() -> Vec<TagMapping> {
-        account_tag()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MoneyWithdrawnPayload {
-    pub account_id: String,
-    pub amount: i64,
-}
-
-pub struct MoneyWithdrawn;
-
-#[auto_register(BOUNDED_CONTEXT)]
-impl EventType for MoneyWithdrawn {
-    type Payload = MoneyWithdrawnPayload;
-    const NAME: &'static str = "MoneyWithdrawn";
-    fn tag_mappings() -> Vec<TagMapping> {
-        account_tag()
-    }
-}
-
-/// This bounded context's own hand-written event enum - see
-/// docs/architecture.md §1.4/§1.6. `matching_events` handed to every
-/// `decide()` below is always scoped to one `account_id`'s own tag, so
-/// folding it never has to check which account an event belongs to.
-pub enum BankingEvent {
-    MoneyDeposited(MoneyDepositedPayload),
-    MoneyWithdrawn(MoneyWithdrawnPayload),
-}
-
-impl BoundedContextEvent for BankingEvent {
-    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
-        match event.event_type.name.as_str() {
-            "MoneyDeposited" => {
-                Some(serde_json::from_str(&event.payload).map(BankingEvent::MoneyDeposited))
-            }
-            "MoneyWithdrawn" => {
-                Some(serde_json::from_str(&event.payload).map(BankingEvent::MoneyWithdrawn))
-            }
-            _ => None,
-        }
-    }
-}
+include!(concat!(env!("OUT_DIR"), "/banking_generated.rs"));
 
 fn balance_of(matching_events: &[BankingEvent]) -> i64 {
     matching_events
@@ -96,101 +44,60 @@ fn balance_of(matching_events: &[BankingEvent]) -> i64 {
         })
 }
 
-// --- commands ---
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct DepositMoneyPayload {
-    pub account_id: String,
-    pub amount: i64,
-}
-
-pub struct DepositMoney;
-
-#[auto_register(BOUNDED_CONTEXT)]
-impl CommandType for DepositMoney {
-    type Payload = DepositMoneyPayload;
-    type Event = BankingEvent;
-    const NAME: &'static str = "DepositMoney";
-    fn tag_mappings() -> Vec<TagMapping> {
-        account_tag()
+fn decide_deposit_money(payload: &DepositMoneyPayload, _matching_events: &[BankingEvent]) -> CommandDecision {
+    if payload.amount <= 0 {
+        return CommandDecision::Rejected {
+            reason: "deposit amount must be positive".into(),
+            kind: "invalid_amount".into(),
+        };
     }
-    fn rest_trigger_allowed() -> bool {
-        true
-    }
-    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
-        if payload.amount <= 0 {
-            return CommandDecision::Rejected {
-                reason: "deposit amount must be positive".into(),
-                kind: "invalid_amount".into(),
-            };
-        }
-        CommandDecision::Accepted {
-            events: vec![EventSpec {
-                event_type: "MoneyDeposited".into(),
-                payload: serde_json::json!({
-                    "account_id": payload.account_id,
-                    "amount": payload.amount,
-                }),
-            }],
-        }
+    CommandDecision::Accepted {
+        events: vec![EventSpec {
+            event_type: "MoneyDeposited".into(),
+            payload: serde_json::json!({
+                "account_id": payload.account_id,
+                "amount": payload.amount,
+            }),
+        }],
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct WithdrawMoneyPayload {
-    pub account_id: String,
-    pub amount: i64,
-}
-
-pub struct WithdrawMoney;
-
-#[auto_register(BOUNDED_CONTEXT)]
-impl CommandType for WithdrawMoney {
-    type Payload = WithdrawMoneyPayload;
-    type Event = BankingEvent;
-    const NAME: &'static str = "WithdrawMoney";
-    fn tag_mappings() -> Vec<TagMapping> {
-        account_tag()
+/// `matching_events` is already every `MoneyDeposited`/`MoneyWithdrawn`
+/// this account has ever had, and nothing from any other account - the
+/// whole point of tagging both the command and the events on
+/// `account_id` alone.
+fn decide_withdraw_money(payload: &WithdrawMoneyPayload, matching_events: &[BankingEvent]) -> CommandDecision {
+    if payload.amount <= 0 {
+        return CommandDecision::Rejected {
+            reason: "withdrawal amount must be positive".into(),
+            kind: "invalid_amount".into(),
+        };
     }
-    fn rest_trigger_allowed() -> bool {
-        true
+    let balance = balance_of(matching_events);
+    if payload.amount > balance {
+        return CommandDecision::Rejected {
+            reason: format!(
+                "account {} has balance {balance}, cannot withdraw {}",
+                payload.account_id, payload.amount
+            ),
+            kind: "insufficient_funds".into(),
+        };
     }
-    /// `matching_events` is already every `MoneyDeposited`/`MoneyWithdrawn`
-    /// this account has ever had, and nothing from any other account -
-    /// the whole point of tagging both the command and the events on
-    /// `account_id` alone.
-    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
-        if payload.amount <= 0 {
-            return CommandDecision::Rejected {
-                reason: "withdrawal amount must be positive".into(),
-                kind: "invalid_amount".into(),
-            };
-        }
-        let balance = balance_of(matching_events);
-        if payload.amount > balance {
-            return CommandDecision::Rejected {
-                reason: format!(
-                    "account {} has balance {balance}, cannot withdraw {}",
-                    payload.account_id, payload.amount
-                ),
-                kind: "insufficient_funds".into(),
-            };
-        }
-        CommandDecision::Accepted {
-            events: vec![EventSpec {
-                event_type: "MoneyWithdrawn".into(),
-                payload: serde_json::json!({
-                    "account_id": payload.account_id,
-                    "amount": payload.amount,
-                }),
-            }],
-        }
+    CommandDecision::Accepted {
+        events: vec![EventSpec {
+            event_type: "MoneyWithdrawn".into(),
+            payload: serde_json::json!({
+                "account_id": payload.account_id,
+                "amount": payload.amount,
+            }),
+        }],
     }
 }
 
-// --- projection ---
+// --- projection --- (untouched - Projection generation is out of scope
+// for this pass, see this file's own doc comment)
 
-#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AccountBalanceState {
     pub balance: i64,
 }
@@ -202,8 +109,8 @@ pub struct AccountBalanceState {
 /// just triggered, no polling delay.
 pub struct AccountBalance;
 
-#[auto_register(BOUNDED_CONTEXT)]
-impl Projection for AccountBalance {
+#[skilj::auto_register(BOUNDED_CONTEXT)]
+impl skilj::Projection for AccountBalance {
     type State = AccountBalanceState;
     type Event = BankingEvent;
     const NAME: &'static str = "AccountBalance";

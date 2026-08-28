@@ -1,0 +1,43 @@
+# The declarative shape half of banking.rs (Codeberg issue #5's
+# narrower cut - docs/architecture.md §17) - build.rs turns this into
+# real Rust at $OUT_DIR/banking_generated.rs, included from banking.rs
+# itself. decide() bodies (decide_deposit_money/decide_withdraw_money)
+# stay hand-written in banking.rs, alongside its own balance_of() helper
+# and the untouched AccountBalance projection - see banking.rs's own
+# doc comment.
+
+bounded_context = "banking"
+
+[[event_type]]
+name = "MoneyDeposited"
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account = "account_id" }
+
+[[event_type]]
+name = "MoneyWithdrawn"
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account = "account_id" }
+
+[[command_type]]
+name = "DepositMoney"
+rest_trigger_allowed = true
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account = "account_id" }
+
+[[command_type]]
+name = "WithdrawMoney"
+rest_trigger_allowed = true
+fields = [
+    { name = "account_id", type = "string" },
+    { name = "amount", type = "i64" },
+]
+tags = { account = "account_id" }

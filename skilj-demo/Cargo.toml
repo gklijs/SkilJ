@@ -28,6 +28,13 @@ opentelemetry-appender-tracing.workspace = true
 # Role credential out of the box. See that file's own doc comment.
 jsonwebtoken.workspace = true
 
+[build-dependencies]
+# Codeberg issue #5's narrower cut (docs/architecture.md §17) -
+# banking.rs's own event/command shape is generated from
+# src/banking.skilj.toml at build time; see build.rs. A build-only
+# dependency, never linked into the running binary itself.
+skilj-codegen.workspace = true
+
 [dev-dependencies]
 postgresql_embedded = "0.21.0"
 tower = { version = "0.5", features = ["util"] }

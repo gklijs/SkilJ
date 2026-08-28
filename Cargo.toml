@@ -9,6 +9,7 @@ members = [
     "skilj-demo",
     "skilj-tui",
     "skilj-inspector",
+    "skilj-codegen",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -32,6 +33,12 @@ members = [
 #                 skilj-graphql itself isn't running, so it depends on
 #                 skilj-core directly rather than staying a wire client -
 #                 the opposite trade-off from skilj-tui, made on purpose.
+# skilj-codegen - build.rs codegen for skilj's own declarative
+#                 bounded-context format (§17, Codeberg issue #5's
+#                 narrower cut): a .skilj.toml's event/command shapes ->
+#                 real EventType/CommandType impls + the shared event
+#                 enum. Used as a build-dependency by a consumer's own
+#                 build.rs, not linked into the running binary itself.
 
 [workspace.package]
 version = "0.1.0"
@@ -66,6 +73,8 @@ asynk-strim = "0.1"
 syn = "2"
 quote = "1"
 proc-macro2 = "1"
+toml = "0.8"
+prettyplease = "0.2"
 # skilj-tui only
 ratatui = "0.30"
 crossterm = "0.29"
@@ -125,3 +134,4 @@ skilj-graphql = { path = "skilj-graphql" }
 skilj-macros = { path = "skilj-macros" }
 skilj-rest = { path = "skilj-rest" }
 skilj = { path = "skilj" }
+skilj-codegen = { path = "skilj-codegen" }
