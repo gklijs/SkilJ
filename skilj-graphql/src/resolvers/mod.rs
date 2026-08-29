@@ -283,3 +283,73 @@ pub fn not_found(entity: &str, key: &str) -> async_graphql::Error {
     async_graphql::Error::new(format!("no {entity} matches {key:?}"))
         .extend_with(|_, ext| ext.set("code", format!("{entity}_not_found")))
 }
+
+/// Shared by `event_type_admin_operations`/`command_type_admin_operations` -
+/// all four `create*Token` mutations (`createExternalEventToken`,
+/// `createDirectCreationToken`, `createEventReadToken`,
+/// `createCommandToken`) differ only in which type they resolve
+/// (`EventType`/`CommandType`, hence `$type_arg_name`/`$type_label`/
+/// `$get_type_fn`) and which `access_control::create_*_token`/
+/// `db::insert_*_token` pair they call. Originally two separate,
+/// near-identical macros/hand-written bodies (one file's own doc
+/// comment used to say so explicitly) - unified here since
+/// `command_type_admin_operations` only ever needed the identical
+/// shape with different type parameters, not a genuinely different one.
+macro_rules! create_type_token_field {
+    (
+        $field_name:literal,
+        $return_type:literal,
+        $type_arg_name:literal,
+        $type_label:literal,
+        $get_type_fn:path,
+        $create_fn:path,
+        $insert_fn:path
+    ) => {
+        ::async_graphql::dynamic::Field::new(
+            $field_name,
+            ::async_graphql::dynamic::TypeRef::named_nn($return_type),
+            |ctx| {
+                ::async_graphql::dynamic::FieldFuture::new(async move {
+                    let state = ctx.data::<$crate::GraphqlState>()?;
+                    let bounded_context_name =
+                        ctx.args.try_get("boundedContext")?.string()?.to_string();
+                    let access_mapping = $crate::resolvers::require_admin_mapping(
+                        &ctx,
+                        &state.pool,
+                        &bounded_context_name,
+                    )
+                    .await?;
+                    let type_name = ctx.args.try_get($type_arg_name)?.string()?.to_string();
+
+                    let target_type = $get_type_fn(&state.pool, &bounded_context_name, &type_name)
+                        .await
+                        .map_err($crate::error::to_graphql_error)?
+                        .ok_or_else(|| $crate::resolvers::not_found($type_label, &type_name))?;
+
+                    let token = $create_fn(
+                        &access_mapping,
+                        &target_type,
+                        ::skilj_core::shared::generate_token_id(),
+                        ::skilj_core::shared::generate_token_secret(),
+                        chrono::Utc::now(),
+                    )
+                    .map_err($crate::error::to_graphql_error)?;
+                    $insert_fn(&state.pool, &token)
+                        .await
+                        .map_err($crate::error::to_graphql_error)?;
+
+                    Ok(Some(::async_graphql::dynamic::FieldValue::owned_any(token)))
+                })
+            },
+        )
+        .argument(::async_graphql::dynamic::InputValue::new(
+            "boundedContext",
+            ::async_graphql::dynamic::TypeRef::named_nn(::async_graphql::dynamic::TypeRef::STRING),
+        ))
+        .argument(::async_graphql::dynamic::InputValue::new(
+            $type_arg_name,
+            ::async_graphql::dynamic::TypeRef::named_nn(::async_graphql::dynamic::TypeRef::STRING),
+        ))
+    };
+}
+pub(crate) use create_type_token_field;

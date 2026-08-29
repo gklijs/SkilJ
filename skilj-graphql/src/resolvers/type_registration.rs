@@ -519,6 +519,41 @@ pub fn projections_field() -> Field {
     ))
 }
 
+/// Shared by `scheduled_event_types_field`/`event_types_field`/
+/// `command_types_field` immediately below - all three resolve
+/// `boundedContext` → `require_admin_mapping` → call one `db::list_*`
+/// function → return the unwrapped list. `projections_field` above is a
+/// genuinely different shape (it layers a per-projection rebuild-status
+/// lookup on top) and is left as its own hand-written body.
+macro_rules! list_for_bounded_context_field {
+    ($field_name:literal, $return_type:literal, $list_fn:path) => {
+        Field::new(
+            $field_name,
+            TypeRef::named_nn_list_nn($return_type),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let state = ctx.data::<GraphqlState>()?;
+                    let bounded_context_name =
+                        ctx.args.try_get("boundedContext")?.string()?.to_string();
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+
+                    let items = $list_fn(&state.pool, &bounded_context_name)
+                        .await
+                        .map_err(to_graphql_error)?;
+
+                    Ok(Some(FieldValue::list(
+                        items.into_iter().map(FieldValue::owned_any),
+                    )))
+                })
+            },
+        )
+        .argument(InputValue::new(
+            "boundedContext",
+            TypeRef::named_nn(TypeRef::STRING),
+        ))
+    };
+}
+
 /// `scheduledEventTypes(boundedContext: String!): [EventType!]!` -
 /// satisfies `TypeRegistration`'s own `exposes: for scheduled_type in
 /// bounded_context.event_types where system_triggered_allowed = true`
@@ -527,31 +562,11 @@ pub fn projections_field() -> Field {
 /// see `gql_types::event_type_object` - so this is only ever the
 /// filtered listing, nothing new on the type).
 pub fn scheduled_event_types_field() -> Field {
-    Field::new(
+    list_for_bounded_context_field!(
         "scheduledEventTypes",
-        TypeRef::named_nn_list_nn("EventType"),
-        |ctx| {
-            FieldFuture::new(async move {
-                let state = ctx.data::<GraphqlState>()?;
-                let bounded_context_name =
-                    ctx.args.try_get("boundedContext")?.string()?.to_string();
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
-
-                let scheduled =
-                    skilj_core::db::list_scheduled_event_types(&state.pool, &bounded_context_name)
-                        .await
-                        .map_err(to_graphql_error)?;
-
-                Ok(Some(FieldValue::list(
-                    scheduled.into_iter().map(FieldValue::owned_any),
-                )))
-            })
-        },
+        "EventType",
+        skilj_core::db::list_scheduled_event_types
     )
-    .argument(InputValue::new(
-        "boundedContext",
-        TypeRef::named_nn(TypeRef::STRING),
-    ))
 }
 
 /// `eventTypes(boundedContext: String!): [EventType!]!` - satisfies
@@ -562,33 +577,11 @@ pub fn scheduled_event_types_field() -> Field {
 /// `db::list_event_types_for_bounded_context` is the identical query
 /// unfiltered - same `AdminAccess` gate, same shape.
 pub fn event_types_field() -> Field {
-    Field::new(
+    list_for_bounded_context_field!(
         "eventTypes",
-        TypeRef::named_nn_list_nn("EventType"),
-        |ctx| {
-            FieldFuture::new(async move {
-                let state = ctx.data::<GraphqlState>()?;
-                let bounded_context_name =
-                    ctx.args.try_get("boundedContext")?.string()?.to_string();
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
-
-                let event_types = skilj_core::db::list_event_types_for_bounded_context(
-                    &state.pool,
-                    &bounded_context_name,
-                )
-                .await
-                .map_err(to_graphql_error)?;
-
-                Ok(Some(FieldValue::list(
-                    event_types.into_iter().map(FieldValue::owned_any),
-                )))
-            })
-        },
+        "EventType",
+        skilj_core::db::list_event_types_for_bounded_context
     )
-    .argument(InputValue::new(
-        "boundedContext",
-        TypeRef::named_nn(TypeRef::STRING),
-    ))
 }
 
 /// `commandTypes(boundedContext: String!): [CommandType!]!` -
@@ -596,31 +589,9 @@ pub fn event_types_field() -> Field {
 /// above, satisfying `exposes: for command_type in
 /// bounded_context.command_types`.
 pub fn command_types_field() -> Field {
-    Field::new(
+    list_for_bounded_context_field!(
         "commandTypes",
-        TypeRef::named_nn_list_nn("CommandType"),
-        |ctx| {
-            FieldFuture::new(async move {
-                let state = ctx.data::<GraphqlState>()?;
-                let bounded_context_name =
-                    ctx.args.try_get("boundedContext")?.string()?.to_string();
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
-
-                let command_types = skilj_core::db::list_command_types_for_bounded_context(
-                    &state.pool,
-                    &bounded_context_name,
-                )
-                .await
-                .map_err(to_graphql_error)?;
-
-                Ok(Some(FieldValue::list(
-                    command_types.into_iter().map(FieldValue::owned_any),
-                )))
-            })
-        },
+        "CommandType",
+        skilj_core::db::list_command_types_for_bounded_context
     )
-    .argument(InputValue::new(
-        "boundedContext",
-        TypeRef::named_nn(TypeRef::STRING),
-    ))
 }

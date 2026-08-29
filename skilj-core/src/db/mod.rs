@@ -5556,96 +5556,54 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
 }
 
 /// `None` when either no token has this `id` at all, or one does but
-/// isn't kind `external_event` - callers that need to tell those two
-/// apart (for the 401-vs-403 split - see `AccessTokenKind`'s own doc
-/// comment) call `access_token_kind` first.
-#[tracing::instrument(skip_all)]
-pub async fn get_external_event_token(
-    pool: &Pool,
-    id: &str,
-) -> crate::error::Result<Option<ExternalEventToken>> {
-    let Some(row) = fetch_access_token_row(pool, id).await? else {
-        return Ok(None);
+/// isn't the expected kind - callers that need to tell those two apart
+/// (for the 401-vs-403 split - see `AccessTokenKind`'s own doc comment)
+/// call `access_token_kind` first. Covers `get_external_event_token`/
+/// `get_direct_creation_token`/`get_event_read_token`, identical apart
+/// from the `kind` string and return type - all three resolve
+/// `event_type_name` against `event_types` into an `event_type` field.
+/// `get_command_token` resolves `command_type_name` into a differently
+/// named field instead and is the only one of its kind, so it stays a
+/// hand-written function below rather than a fourth macro parameter.
+macro_rules! get_event_type_access_token {
+    ($fn_name:ident, $return_type:ident, $kind:literal) => {
+        #[tracing::instrument(skip_all)]
+        pub async fn $fn_name(pool: &Pool, id: &str) -> crate::error::Result<Option<$return_type>> {
+            let Some(row) = fetch_access_token_row(pool, id).await? else {
+                return Ok(None);
+            };
+            if row.columns.kind != $kind {
+                return Ok(None);
+            }
+            let event_type_name = row
+                .columns
+                .event_type_name
+                .expect(concat!($kind, " access_tokens row without event_type_name"));
+            let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
+                .await?
+                .expect("access_tokens row references an event_type that no longer exists");
+            Ok(Some($return_type {
+                id: row.columns.id,
+                secret: row.columns.secret,
+                status: token_status_from_str(&row.columns.status),
+                created_at: row.columns.created_at,
+                revoked_at: row.columns.revoked_at,
+                event_type,
+            }))
+        }
     };
-    if row.columns.kind != "external_event" {
-        return Ok(None);
-    }
-    let event_type_name = row
-        .columns
-        .event_type_name
-        .expect("external_event access_tokens row without event_type_name");
-    let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
-        .await?
-        .expect("access_tokens row references an event_type that no longer exists");
-    Ok(Some(ExternalEventToken {
-        id: row.columns.id,
-        secret: row.columns.secret,
-        status: token_status_from_str(&row.columns.status),
-        created_at: row.columns.created_at,
-        revoked_at: row.columns.revoked_at,
-        event_type,
-    }))
 }
-
-/// See `get_external_event_token`'s own doc comment - same shape and
-/// `None` reasoning.
-#[tracing::instrument(skip_all)]
-pub async fn get_direct_creation_token(
-    pool: &Pool,
-    id: &str,
-) -> crate::error::Result<Option<DirectCreationToken>> {
-    let Some(row) = fetch_access_token_row(pool, id).await? else {
-        return Ok(None);
-    };
-    if row.columns.kind != "direct_creation" {
-        return Ok(None);
-    }
-    let event_type_name = row
-        .columns
-        .event_type_name
-        .expect("direct_creation access_tokens row without event_type_name");
-    let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
-        .await?
-        .expect("access_tokens row references an event_type that no longer exists");
-    Ok(Some(DirectCreationToken {
-        id: row.columns.id,
-        secret: row.columns.secret,
-        status: token_status_from_str(&row.columns.status),
-        created_at: row.columns.created_at,
-        revoked_at: row.columns.revoked_at,
-        event_type,
-    }))
-}
-
-/// See `get_external_event_token`'s own doc comment - same shape and
-/// `None` reasoning.
-#[tracing::instrument(skip_all)]
-pub async fn get_event_read_token(
-    pool: &Pool,
-    id: &str,
-) -> crate::error::Result<Option<EventReadToken>> {
-    let Some(row) = fetch_access_token_row(pool, id).await? else {
-        return Ok(None);
-    };
-    if row.columns.kind != "event_read" {
-        return Ok(None);
-    }
-    let event_type_name = row
-        .columns
-        .event_type_name
-        .expect("event_read access_tokens row without event_type_name");
-    let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
-        .await?
-        .expect("access_tokens row references an event_type that no longer exists");
-    Ok(Some(EventReadToken {
-        id: row.columns.id,
-        secret: row.columns.secret,
-        status: token_status_from_str(&row.columns.status),
-        created_at: row.columns.created_at,
-        revoked_at: row.columns.revoked_at,
-        event_type,
-    }))
-}
+get_event_type_access_token!(
+    get_external_event_token,
+    ExternalEventToken,
+    "external_event"
+);
+get_event_type_access_token!(
+    get_direct_creation_token,
+    DirectCreationToken,
+    "direct_creation"
+);
+get_event_type_access_token!(get_event_read_token, EventReadToken, "event_read");
 
 /// See `get_external_event_token`'s own doc comment - same shape and
 /// `None` reasoning, resolving `command_type_name` against
