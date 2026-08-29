@@ -38,8 +38,14 @@ exists" requires.
 
 A command's own `decide()` never writes anything directly - it returns
 which events to append (or a rejection); skilj appends them, and any
-projection consuming that event type folds it in afterward. There is no
-fourth kind of type.
+projection consuming that event type folds it in afterward.
+
+There is a fourth plugin type, `Snapshot` - an optional accelerator for
+`decide()` against a large per-entity history, its own trait with its
+own registration and inspection endpoint - but it's a distinct,
+narrower concept, not part of this decision tree, and out of scope for
+this skill; see `docs/architecture.md`'s `Snapshot` section if that's
+what you're looking for.
 
 ## The three traits, at a glance
 

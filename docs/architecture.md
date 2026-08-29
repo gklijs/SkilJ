@@ -202,8 +202,8 @@ existing `SkiljBuilder` usage (`skilj-demo`'s own `banking`/`courses`
 modules included) changes unless a type opts in:
 
 **`BOUNDED_CONTEXT`, a new defaulted associated const** on `EventType`/
-`CommandType`/`Projection` (`skilj-core::plugin`), alongside the existing
-`NAME`:
+`CommandType`/`Projection`/`Snapshot` (`skilj-core::plugin`), alongside the
+existing `NAME`:
 
 ```rust
 const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT; // "default"
@@ -226,8 +226,9 @@ context app can now skip `.bounded_context(...)` entirely and every
 manually-chained registration lands under `"default"`.
 
 **`#[auto_register]`**, a third `skilj-macros` proc-macro, applied above
-an `impl EventType for X`/`impl CommandType for X`/`impl Projection for X`
-block:
+an `impl EventType for X`/`impl CommandType for X`/`impl Projection for X`/
+`impl Snapshot for X` block (the last added in the §19 pass that built
+`Snapshot` for real):
 
 ```rust
 #[auto_register]
@@ -292,9 +293,9 @@ trait-method override alone, so a `skilj-core`-only consumer (no `skilj`
 facade) can use it directly. `#[auto_register]`'s whole point is
 registering onto `skilj::SkiljBuilder`, so its expansion necessarily names
 `skilj`'s own `EventTypeRegistrar`/`CommandTypeRegistrar`/
-`ProjectionRegistrar` marker types — a `skilj-core`-only consumer can't use
-this attribute, the same boundary that consumer already accepts by
-hand-rolling its own `CommandDispatcher`/`ProjectionDispatcher`/
+`ProjectionRegistrar`/`SnapshotRegistrar` marker types — a `skilj-core`-only
+consumer can't use this attribute, the same boundary that consumer already
+accepts by hand-rolling its own `CommandDispatcher`/`ProjectionDispatcher`/
 `EventDispatcher` (§1.7's own note on this).
 
 Auto-registration and manual chaining are fully interoperable within one

@@ -4,7 +4,11 @@
 //! `EventType`/`CommandType`/`Projection` impl reaches the same
 //! `event_types`/`command_types`/`projections` tables an equivalent
 //! manual `.bounded_context(name).event_type::<T>()` chain would, with no
-//! explicit per-type call at all - and that the defaulted `SkiljBuilder`
+//! explicit per-type call at all - plus a fourth macro-tagged `Snapshot`
+//! fixture, proven a different way (`snapshot_dispatcher().snapshot_names(...)`,
+//! not the reconciliation report) since `Snapshot` has no metadata table/
+//! reconciliation surface of its own (see `Snapshot`'s own doc comment,
+//! `skilj-core::plugin`) - and that the defaulted `SkiljBuilder`
 //! (part 1 of the same pass) lands manual registration under
 //! `plugin::DEFAULT_BOUNDED_CONTEXT` too, when `.bounded_context(...)` is
 //! never called. Same `DATABASE_URL`-then-embedded-Postgres-then-skip
@@ -25,7 +29,7 @@
 use chrono::{SubsecRound, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use skilj::{auto_register, CommandType, EventType, Projection, Skilj};
+use skilj::{auto_register, CommandType, EventType, Projection, Skilj, Snapshot};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
@@ -113,6 +117,18 @@ impl Projection for DefaultScopedAutoProjection {
         vec!["AutoRegisterDefaultScopedEvent"]
     }
     fn project(_state: &mut Self::State, _event: &Self::Event, _key: &str) {}
+}
+
+struct DefaultScopedAutoSnapshot;
+
+#[auto_register]
+impl Snapshot for DefaultScopedAutoSnapshot {
+    type State = FixturePayload;
+    type Event = AutoRegisterEvent;
+    const NAME: &'static str = "AutoRegisterDefaultScopedSnapshot";
+    const TAG_KEY: &'static str = "fixture";
+    const VERSION: u64 = 1;
+    fn fold(_state: &mut Self::State, _event: &Self::Event) {}
 }
 
 /// A plain, un-tagged `EventType` - registered the ordinary manual way,
@@ -313,6 +329,18 @@ fn auto_register_registers_every_plugin_trait_under_its_own_bounded_context() {
         assert!(report.registered.contains(&format!(
             "{DEFAULT_BOUNDED_CONTEXT}/AutoRegisterDefaultScopedProjection"
         )));
+        // Snapshot has no metadata table/reconciliation surface of its own
+        // (see Snapshot's own doc comment) - so unlike the three above,
+        // there's no report.registered entry to check. What #[auto_register]
+        // reaching SkiljBuilder::snapshot::<T>() actually looks like is the
+        // in-process dispatcher now knowing about it.
+        assert!(
+            _skilj
+                .snapshot_dispatcher()
+                .snapshot_names(DEFAULT_BOUNDED_CONTEXT)
+                .contains(&"AutoRegisterDefaultScopedSnapshot"),
+            "the Snapshot arm of #[auto_register] did not reach SkiljBuilder"
+        );
         // The custom-scoped fixtures aren't skipped as "unregistered" -
         // they're skipped for lack of *this* role's access to
         // CUSTOM_BOUNDED_CONTEXT, the ordinary reconciliation outcome

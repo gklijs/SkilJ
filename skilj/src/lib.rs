@@ -65,8 +65,8 @@ pub use skilj_core::plugin::{
 };
 /// See `skilj_macros::auto_register`'s own doc comment - unlike
 /// `requires_role` above, this one is facade-specific (its expansion
-/// names `EventTypeRegistrar`/`CommandTypeRegistrar`/`ProjectionRegistrar`
-/// below), so it's re-exported here rather than through
+/// names `EventTypeRegistrar`/`CommandTypeRegistrar`/`ProjectionRegistrar`/
+/// `SnapshotRegistrar` below), so it's re-exported here rather than through
 /// `skilj_core::plugin`.
 pub use skilj_macros::auto_register;
 
