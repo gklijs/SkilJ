@@ -312,7 +312,7 @@ value EncryptedPayload {
 -- Enumerations
 ------------------------------------------------------------
 
-enum FilterOperator { equals | contains | is_like | greater_than | less_than }
+enum FilterOperator { equals | contains | is_like | greater_than | less_than | near | similar_color | in_subnet | in }
 
 enum AccessLevel { read | write | admin }
 
@@ -1853,6 +1853,35 @@ rule SkipMissedOccurrences {
 -- invalid filter is rejected outright rather than silently mismatched
 -- (stated above); which matrix valid_filters uses to decide "invalid" is
 -- the black box's job, not a gap in this one.
+--
+-- Four of the operators narrow more specifically than the general five,
+-- and are named here so that a reader meeting them in the enum is not
+-- left guessing what they are for. Which fields they fit stays inside
+-- the matrix above. near, similar_color and in_subnet each apply only
+-- to a field whose schema says what kind of value it carries - a
+-- geographic coordinate, a colour, an IP address respectively - and each
+-- narrows to events whose value sits within a caller-supplied bound of a
+-- caller-supplied reference: near to those within a distance of a point,
+-- similar_color to those within a similarity threshold of a target
+-- colour, in_subnet to those falling inside a network (CIDR) range.
+-- Gating on what a field's schema declares it to carry, rather than on
+-- its bare JSON type alone, is the same matrix doing the same job one
+-- notch more finely - not a second mechanism, and not a new kind of
+-- payload field either: each of the three still reads an ordinary scalar
+-- leaf, one whose schema happens to say what that scalar holds (see the
+-- payload schema shape note above entity CommandType). in is the
+-- exception among the four: it is tied to no particular kind of value
+-- and fits any plain scalar field, narrowing to events whose value
+-- equals any one of several caller-supplied candidates. How a caller
+-- expresses a reference, a bound or a candidate list - distance units,
+-- colour space, threshold encoding - belongs to the same query/filter
+-- wire contract that is still open (see the scope header's exclusions),
+-- not here.
+--
+-- All four are additive: equals, contains, is_like, greater_than and
+-- less_than are unchanged, and one of the four used against a field its
+-- schema does not fit is rejected by valid_filters exactly as any other
+-- ill-fitting operator is.
 --
 -- Unlike the write rules, this deliberately does not require the bounded
 -- context to be active: archiving stops new commands and events, but
@@ -4317,7 +4346,7 @@ surface EventFetch {
         -- Subscription/Filter model and EventSubscription's delivery and
         -- resume answer; only its wire contract is outstanding (see the
         -- scope header's exclusions). A filter whose operator doesn't fit
-        -- its field's declared type is rejected outright, not merely
+        -- the field it names is rejected outright, not merely
         -- unsatisfiable - see valid_filters in the note above rule
         -- FetchEvents.
         --

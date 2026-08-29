@@ -646,7 +646,12 @@ fn resolve_field_kind(
 /// own three renderings) additionally get ordering operators - see
 /// `matches_filters`' own `string_ordering` for why the comparison itself
 /// needs real parsing, not plain string `Ord`, despite the check here
-/// being schema-driven.
+/// being schema-driven. Three more `format` values gate their own single
+/// operator the same way: `"geo-point"` → `Near`, `"color"` →
+/// `SimilarColor`, `"ip"` → `InSubnet` - each format-gated pairing has
+/// its own real-parsing helper in `matches_one_filter` below, same
+/// reasoning as the date/time case. `In` needs no `format` at all - valid
+/// against any scalar leaf, same as `Equals`.
 fn filter_operator_is_valid(kind: &FieldKind, operator: FilterOperator) -> bool {
     match kind {
         FieldKind::Scalar {
@@ -655,26 +660,34 @@ fn filter_operator_is_valid(kind: &FieldKind, operator: FilterOperator) -> bool 
         } => {
             matches!(
                 operator,
-                FilterOperator::Equals | FilterOperator::Contains | FilterOperator::IsLike
+                FilterOperator::Equals
+                    | FilterOperator::Contains
+                    | FilterOperator::IsLike
+                    | FilterOperator::In
             ) || (matches!(
                 format.as_deref(),
                 Some("date-time" | "date" | "partial-date-time")
             ) && matches!(
                 operator,
                 FilterOperator::GreaterThan | FilterOperator::LessThan
-            ))
+            )) || (format.as_deref() == Some("geo-point") && operator == FilterOperator::Near)
+                || (format.as_deref() == Some("color") && operator == FilterOperator::SimilarColor)
+                || (format.as_deref() == Some("ip") && operator == FilterOperator::InSubnet)
         }
         FieldKind::Scalar {
             json_type: "integer" | "number",
             ..
         } => matches!(
             operator,
-            FilterOperator::Equals | FilterOperator::GreaterThan | FilterOperator::LessThan
+            FilterOperator::Equals
+                | FilterOperator::GreaterThan
+                | FilterOperator::LessThan
+                | FilterOperator::In
         ),
         FieldKind::Scalar {
             json_type: "boolean",
             ..
-        } => operator == FilterOperator::Equals,
+        } => matches!(operator, FilterOperator::Equals | FilterOperator::In),
         FieldKind::Scalar { .. } => false, // unreachable - classify only ever sets one of the four above
         FieldKind::ListOfScalar => operator == FilterOperator::Contains,
         FieldKind::Other => false,
@@ -1039,6 +1052,113 @@ fn string_ordering(payload: &str, filter_value: &str, operator: FilterOperator) 
     false
 }
 
+/// `FilterOperator::Near` - `payload` is a stored `"lat,lng"` string,
+/// `filter_value` is `"lat,lng,radius_meters"` (the query point plus how
+/// close counts as "near"). Haversine great-circle distance, `f64`
+/// throughout - plenty precise for anything this library's own filtering
+/// needs (not a geodesy library). Any parse failure on either side (not
+/// exactly two/three comma-separated numbers) just doesn't match, same
+/// "reject gracefully" register as `string_ordering`.
+fn geo_distance_within(payload: &str, filter_value: &str) -> bool {
+    fn parse_point(s: &str) -> Option<(f64, f64)> {
+        let mut parts = s.splitn(2, ',');
+        let lat = parts.next()?.trim().parse::<f64>().ok()?;
+        let lng = parts.next()?.trim().parse::<f64>().ok()?;
+        Some((lat, lng))
+    }
+    let Some((lat1, lng1)) = parse_point(payload) else {
+        return false;
+    };
+    let mut filter_parts = filter_value.splitn(3, ',');
+    let (Some(lat2_str), Some(lng2_str), Some(radius_str)) = (
+        filter_parts.next(),
+        filter_parts.next(),
+        filter_parts.next(),
+    ) else {
+        return false;
+    };
+    let (Ok(lat2), Ok(lng2), Ok(radius_meters)) = (
+        lat2_str.trim().parse::<f64>(),
+        lng2_str.trim().parse::<f64>(),
+        radius_str.trim().parse::<f64>(),
+    ) else {
+        return false;
+    };
+    const EARTH_RADIUS_METERS: f64 = 6_371_000.0;
+    let (phi1, phi2) = (lat1.to_radians(), lat2.to_radians());
+    let d_phi = (lat2 - lat1).to_radians();
+    let d_lambda = (lng2 - lng1).to_radians();
+    let a = (d_phi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (d_lambda / 2.0).sin().powi(2);
+    let distance_meters = EARTH_RADIUS_METERS * 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    distance_meters <= radius_meters
+}
+
+/// `FilterOperator::SimilarColor` - `payload` is a stored `"#RRGGBB"`
+/// string, `filter_value` is `"#RRGGBB,max_distance"`. Plain Euclidean
+/// distance over the three RGB channels (range `0.0..=441.67`, i.e.
+/// `sqrt(255^2 * 3)`) - deliberately not a perceptual metric (CIE ΔE
+/// would need a color-science dependency this doesn't warrant); the doc
+/// comment on `FilterOperator::SimilarColor` says so too, so a caller
+/// isn't misled about what "similar" means here.
+fn color_similarity_within(payload: &str, filter_value: &str) -> bool {
+    fn parse_hex(s: &str) -> Option<(f64, f64, f64)> {
+        let s = s.trim().strip_prefix('#')?;
+        if s.len() != 6 {
+            return None;
+        }
+        let r = u8::from_str_radix(&s[0..2], 16).ok()? as f64;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()? as f64;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()? as f64;
+        Some((r, g, b))
+    }
+    let Some((r1, g1, b1)) = parse_hex(payload) else {
+        return false;
+    };
+    let mut filter_parts = filter_value.splitn(2, ',');
+    let (Some(color_str), Some(max_distance_str)) = (filter_parts.next(), filter_parts.next())
+    else {
+        return false;
+    };
+    let Some((r2, g2, b2)) = parse_hex(color_str) else {
+        return false;
+    };
+    let Ok(max_distance) = max_distance_str.trim().parse::<f64>() else {
+        return false;
+    };
+    let distance = ((r1 - r2).powi(2) + (g1 - g2).powi(2) + (b1 - b2).powi(2)).sqrt();
+    distance <= max_distance
+}
+
+/// `FilterOperator::InSubnet` - `payload` is a stored IPv4/IPv6 address
+/// string, `filter_value` is a CIDR (e.g. `"192.168.1.0/24"`,
+/// `"2001:db8::/32"`). Delegates the actual containment check to
+/// `ipnet` rather than hand-rolled bitwise subnet math - IPv6 in
+/// particular is easy to get subtly wrong by hand.
+fn ip_in_subnet(payload: &str, filter_value: &str) -> bool {
+    let Ok(addr) = payload.trim().parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(subnet) = filter_value.trim().parse::<ipnet::IpNet>() else {
+        return false;
+    };
+    subnet.contains(&addr)
+}
+
+/// `FilterOperator::In` - `filter_value` is a comma-separated list of
+/// candidates, no escaping (same as `IsLike`'s `%`/`_` wildcards already
+/// being unescaped). Valid against any scalar leaf; reuses
+/// `json_scalar_to_string` (the same string representation the `Array`/
+/// `Contains` arm below already uses) so `In` is exactly "equals one of",
+/// not its own comparison logic.
+fn matches_any_of(value: &serde_json::Value, filter_value: &str) -> bool {
+    let Some(value_as_string) = json_scalar_to_string(value) else {
+        return false;
+    };
+    filter_value
+        .split(',')
+        .any(|candidate| candidate == value_as_string)
+}
+
 fn matches_one_filter(payload: &serde_json::Value, filter: &Filter) -> bool {
     // Absent field never matches a comparison filter - `valid_filters`
     // guarantees the field exists and is scalar/list-shaped in the
@@ -1061,8 +1181,15 @@ fn matches_one_filter(payload: &serde_json::Value, filter: &Filter) -> bool {
             FilterOperator::GreaterThan | FilterOperator::LessThan => {
                 string_ordering(s, &filter.value, filter.operator)
             }
+            FilterOperator::Near => geo_distance_within(s, &filter.value),
+            FilterOperator::SimilarColor => color_similarity_within(s, &filter.value),
+            FilterOperator::InSubnet => ip_in_subnet(s, &filter.value),
+            FilterOperator::In => matches_any_of(value, &filter.value),
         },
         serde_json::Value::Number(n) => {
+            if filter.operator == FilterOperator::In {
+                return matches_any_of(value, &filter.value);
+            }
             let (Some(a), Ok(b)) = (n.as_f64(), filter.value.parse::<f64>()) else {
                 return false;
             };
@@ -1070,12 +1197,19 @@ fn matches_one_filter(payload: &serde_json::Value, filter: &Filter) -> bool {
                 FilterOperator::Equals => a == b,
                 FilterOperator::GreaterThan => a > b,
                 FilterOperator::LessThan => a < b,
-                FilterOperator::Contains | FilterOperator::IsLike => false,
+                FilterOperator::Contains
+                | FilterOperator::IsLike
+                | FilterOperator::Near
+                | FilterOperator::SimilarColor
+                | FilterOperator::InSubnet
+                | FilterOperator::In => false,
             }
         }
-        serde_json::Value::Bool(b) => {
-            filter.operator == FilterOperator::Equals && b.to_string() == filter.value
-        }
+        serde_json::Value::Bool(b) => match filter.operator {
+            FilterOperator::Equals => b.to_string() == filter.value,
+            FilterOperator::In => matches_any_of(value, &filter.value),
+            _ => false,
+        },
         serde_json::Value::Null | serde_json::Value::Object(_) => false,
     }
 }

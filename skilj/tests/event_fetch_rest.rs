@@ -320,6 +320,56 @@ fn get_events_and_consume_expose_the_real_event_type_schema() {
     });
 }
 
+/// One of the new operators (docs/architecture.md's filterable-scalar-types
+/// pass) exercised through the real REST surface, not just the
+/// pure-function layer (`skilj-core/tests/event_filtering.rs` covers the
+/// full matrix, including the format-gated ones) - proves `In`'s wire
+/// parsing (`parse_filter_param`) actually reaches `valid_filters`/
+/// `matches_filters` end to end. `Near`/`SimilarColor`/`InSubnet` share
+/// the identical parsing plumbing (`parse_filter_param`'s own match), just
+/// gated to a different `format` - not re-proven per-operator here.
+#[test]
+fn get_events_filter_param_supports_the_in_operator_for_real_over_rest() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+
+        deposit(&router, &direct_credential, 5).await;
+        deposit(&router, &direct_credential, 20).await;
+        deposit(&router, &direct_credential, 99).await;
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events?filter=amount:in:5,20")
+            .header("authorization", format!("Bearer {read_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let events = json["events"].as_array().unwrap();
+        let amounts: Vec<i64> = events
+            .iter()
+            .map(|e| e["payload"]["amount"].as_i64().unwrap())
+            .collect();
+        assert_eq!(amounts.len(), 2, "amounts: {amounts:?}");
+        assert!(amounts.contains(&5));
+        assert!(amounts.contains(&20));
+        assert!(!amounts.contains(&99));
+    });
+}
+
 #[test]
 fn get_events_rejects_a_malformed_filter_param_with_400() {
     runtime().block_on(async {

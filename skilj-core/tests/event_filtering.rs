@@ -44,7 +44,10 @@ const SCHEMA: &str = r##"{
         "optional_name": {"type": ["string", "null"]},
         "optional_tags": {"type": ["array", "null"], "items": {"type": "string"}},
         "status": {"$ref": "#/definitions/Status"},
-        "address": {"$ref": "#/definitions/Address"}
+        "address": {"$ref": "#/definitions/Address"},
+        "geo": {"type": "string", "format": "geo-point"},
+        "color": {"type": "string", "format": "color"},
+        "ip": {"type": "string", "format": "ip"}
     },
     "definitions": {
         "Status": {"type": "string", "enum": ["Active", "Archived"]},
@@ -198,6 +201,76 @@ fn valid_filters_a_bare_unit_enum_field_is_accepted_as_a_plain_string() {
 }
 
 #[test]
+fn valid_filters_geo_point_format_additionally_accepts_near() {
+    let et = event_type();
+    assert!(event_store::valid_filters(
+        &et,
+        &[filter("geo", FilterOperator::Near, "52.37,4.90,5000")]
+    ));
+    assert!(event_store::valid_filters(
+        &et,
+        &[filter("geo", FilterOperator::Equals, "52.37,4.90")]
+    ));
+    // Near is format-gated - a plain string field with no geo-point
+    // format must not accept it.
+    assert!(!event_store::valid_filters(
+        &et,
+        &[filter("name", FilterOperator::Near, "52.37,4.90,5000")]
+    ));
+    assert!(!event_store::valid_filters(
+        &et,
+        &[filter("geo", FilterOperator::GreaterThan, "52.37,4.90")]
+    ));
+}
+
+#[test]
+fn valid_filters_color_format_additionally_accepts_similar_color() {
+    let et = event_type();
+    assert!(event_store::valid_filters(
+        &et,
+        &[filter("color", FilterOperator::SimilarColor, "#FF0000,30")]
+    ));
+    assert!(!event_store::valid_filters(
+        &et,
+        &[filter("name", FilterOperator::SimilarColor, "#FF0000,30")]
+    ));
+}
+
+#[test]
+fn valid_filters_ip_format_additionally_accepts_in_subnet() {
+    let et = event_type();
+    assert!(event_store::valid_filters(
+        &et,
+        &[filter("ip", FilterOperator::InSubnet, "192.168.1.0/24")]
+    ));
+    assert!(!event_store::valid_filters(
+        &et,
+        &[filter("name", FilterOperator::InSubnet, "192.168.1.0/24")]
+    ));
+}
+
+#[test]
+fn valid_filters_in_is_accepted_for_any_scalar_kind() {
+    let et = event_type();
+    for field in ["name", "amount", "price", "active", "status"] {
+        assert!(
+            event_store::valid_filters(&et, &[filter(field, FilterOperator::In, "a,b")]),
+            "{field} should accept In"
+        );
+    }
+    // Not for a list-of-scalar or nested-object leaf - same "only ever a
+    // scalar leaf" cap the rest of this matrix already enforces.
+    assert!(!event_store::valid_filters(
+        &et,
+        &[filter("tags", FilterOperator::In, "a,b")]
+    ));
+    assert!(!event_store::valid_filters(
+        &et,
+        &[filter("address", FilterOperator::In, "a,b")]
+    ));
+}
+
+#[test]
 fn valid_filters_rejects_a_bare_nested_object_field_directly() {
     let et = event_type();
     assert!(!event_store::valid_filters(
@@ -308,7 +381,7 @@ fn event(payload: &str) -> Event {
     }
 }
 
-const PAYLOAD: &str = r#"{
+const PAYLOAD: &str = r##"{
     "name": "Alice",
     "when": "2027-01-15T08:00:00Z",
     "day": "2027-01-15",
@@ -319,8 +392,11 @@ const PAYLOAD: &str = r#"{
     "active": true,
     "tags": ["a", "b"],
     "status": "Active",
-    "address": {"country": "NL"}
-}"#;
+    "address": {"country": "NL"},
+    "geo": "52.3676,4.9041",
+    "color": "#FF0000",
+    "ip": "192.168.1.42"
+}"##;
 
 #[test]
 fn matches_filters_is_true_for_an_empty_filter_list() {
@@ -413,6 +489,94 @@ fn matches_filters_dotted_path() {
     assert!(!event_store::matches_filters(
         &e,
         &[filter("address.country", FilterOperator::Equals, "BE")]
+    ));
+}
+
+#[test]
+fn matches_filters_near_geo_distance() {
+    let e = event(PAYLOAD);
+    // Same point as the payload's own "geo" (52.3676,4.9041) - distance
+    // 0, well within a 100m radius.
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter("geo", FilterOperator::Near, "52.3676,4.9041,100")]
+    ));
+    // New York - thousands of km away, well outside a 5km radius.
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("geo", FilterOperator::Near, "40.7128,-74.0060,5000")]
+    ));
+    // Malformed filter value never matches, doesn't panic.
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("geo", FilterOperator::Near, "not-a-point")]
+    ));
+}
+
+#[test]
+fn matches_filters_similar_color_distance() {
+    let e = event(PAYLOAD);
+    // Payload's own "color" is "#FF0000" (red) - identical color, distance 0.
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter("color", FilterOperator::SimilarColor, "#FF0000,10")]
+    ));
+    // Blue is maximally far from red on this metric - well outside a
+    // threshold of 10.
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("color", FilterOperator::SimilarColor, "#0000FF,10")]
+    ));
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("color", FilterOperator::SimilarColor, "not-a-color")]
+    ));
+}
+
+#[test]
+fn matches_filters_in_subnet() {
+    let e = event(PAYLOAD);
+    // Payload's own "ip" is "192.168.1.42".
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter("ip", FilterOperator::InSubnet, "192.168.1.0/24")]
+    ));
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("ip", FilterOperator::InSubnet, "10.0.0.0/8")]
+    ));
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("ip", FilterOperator::InSubnet, "not-a-cidr")]
+    ));
+}
+
+#[test]
+fn matches_filters_in_one_of_several_values() {
+    let e = event(PAYLOAD);
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter("name", FilterOperator::In, "Alice,Bob")]
+    ));
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("name", FilterOperator::In, "Bob,Carol")]
+    ));
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter("amount", FilterOperator::In, "42,43")]
+    ));
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("amount", FilterOperator::In, "1,2")]
+    ));
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter("active", FilterOperator::In, "true,maybe")]
+    ));
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("active", FilterOperator::In, "false")]
     ));
 }
 

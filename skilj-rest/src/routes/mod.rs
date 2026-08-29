@@ -441,10 +441,14 @@ fn parse_filter_param(raw: &str) -> Result<Filter, RestError> {
         "is_like" => FilterOperator::IsLike,
         "greater_than" => FilterOperator::GreaterThan,
         "less_than" => FilterOperator::LessThan,
+        "near" => FilterOperator::Near,
+        "similar_color" => FilterOperator::SimilarColor,
+        "in_subnet" => FilterOperator::InSubnet,
+        "in" => FilterOperator::In,
         other => {
             return Err(RestError::InvalidRequest(format!(
                 "unknown filter operator {other:?} - expected one of equals, contains, \
-                 is_like, greater_than, less_than"
+                 is_like, greater_than, less_than, near, similar_color, in_subnet, in"
             )))
         }
     };

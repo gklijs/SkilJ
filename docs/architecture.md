@@ -3782,3 +3782,128 @@ way `QueryEvents`/`CountEvents` already scope without one), with
 `GrantScopedToBoundedContext`/`UnknownNameIsAnError`/`SensitiveFieldsStayProtected`
 guarantees and a guidance note tying it back to the `ProcessCommand`
 note and explaining the deliberate `Projection` separation.
+
+## 20. Four new filter operators: geo, color, IP subnet, and generic `in`
+
+User-initiated: geo/color/IP-address filtering, brainstormed further
+into "should this be a general user-extensible type system instead?"
+Investigated first (2 Explore agents plus direct code verification):
+**no extensibility seam exists anywhere in the scalar/filter machinery**
+today - `classify`/`filter_operator_is_valid`/`matches_one_filter`
+(`event_store/mod.rs`), `scalar_kind_and_name`/`build_field`
+(`skilj-graphql::projection_types`), and `form.rs::classify`
+(`skilj-tui`) are three independent, un-shared closed `match` statements
+over JSON-Schema `"type"`/`"format"` strings. This exact territory ("real
+GraphQL scalar types") was already investigated and deliberately
+deferred in §8/§9 as "a genuinely separate, much larger change." Decided
+via `AskUserQuestion` (twice, as the scope grew): ship four concrete
+operators as contained additions to the existing `match` statements, no
+registry, `FilterOperator` stays a closed enum. The general
+user-extensible idea stays not built.
+
+### What was built
+
+| Type | JSON Schema shape | New `FilterOperator` | `Filter.value` encoding |
+|---|---|---|---|
+| Geo point | string, `format: "geo-point"` | `Near` | `"lat,lng,radius_meters"` |
+| Color | string, `format: "color"` | `SimilarColor` | `"#RRGGBB,max_distance"` |
+| IP address | string, `format: "ip"` (v4 or v6) | `InSubnet` | CIDR, e.g. `"192.168.1.0/24"` |
+| Any scalar | no new format | `In` | comma-separated candidates, e.g. `"a,b,c"` |
+
+All four follow the exact convention `date-time`/`date`/`partial-date-time`
+already established for `GreaterThan`/`LessThan`: a plain JSON-Schema
+string leaf with a `format` hint, schema-gated validity
+(`filter_operator_is_valid`) but format-blind runtime matching
+(`matches_one_filter` - the operator itself disambiguates what's being
+compared, same as `GreaterThan` already tries three date/time parsers
+without knowing which format the schema declared). No `Filter`/
+`FilterInput` wire-shape change - compound values (a geo radius, a color
+threshold) ride in the existing single `value: String`, exactly like a
+date-range comparison already does. `In`'s comma delimiter is unescaped,
+a known, accepted limitation matching `IsLike`'s `%`/`_` wildcards
+already being unescaped too.
+
+New helpers in `skilj-core::event_store` (each: parse both sides,
+`false` on any parse failure, never panic - same register as
+`string_ordering`): `geo_distance_within` (haversine, pure `f64`, no new
+dependency), `color_similarity_within` (Euclidean RGB distance,
+deliberately not a perceptual/CIE ΔE metric - the doc comment on
+`FilterOperator::SimilarColor` says so, to not overclaim), `ip_in_subnet`
+(delegates CIDR containment to the new `ipnet` crate rather than
+hand-rolled bitwise subnet math - IPv6 in particular is easy to get
+subtly wrong by hand), `matches_any_of` (reuses the existing
+`json_scalar_to_string` helper the `Array`/`Contains` arm already had,
+so `In` is exactly "equals one of").
+
+### A real gap fixed along the way, not just a nice-to-have
+
+Investigating `In`'s natural companion use case (filtering on an enum
+value) found that enum filtering already mostly works today - a
+`schemars`-derived unit enum already resolves to a filterable string
+scalar via `event_store::classify`'s bare-`$ref`-following. But
+`skilj-graphql::projection_types` (the one place payload-derived fields
+become typed GraphQL fields, for `ProjectionQuery`) had **no equivalent
+bare-`$ref`-to-scalar fallback** - `build_field`'s `depth == 0` branch
+only ever tried `object_from_schema_value` (needs `"properties"`, so it
+returns `None` for an enum definition) and then fell all the way through
+to the *opaque-JSON* fallback, which double-JSON-encodes a string value
+(`raw.to_string()` on a `Value::String` produces `"\"Shipped\""`, quotes
+included) - not the clean `ScalarKind::String` rendering a first read of
+the code might suggest. Fixed for real, not just documented as a gap: a
+new `enum_values_from_schema` check recognises a `{"type": "string",
+"enum": [...]}` definition and registers a real `async_graphql::dynamic::Enum`
+(namespaced `{parent_type_name}_{field_name}`, same collision-avoidance
+`nested_type_name` already uses for one-level nested objects) instead.
+Verified against `async-graphql`'s own vendored `dynamic::Enum` test
+(`src/dynamic/enum.rs`) that the correct runtime representation is
+`Value::from(Name::new(s))`, not a plain `String` `Value` - getting this
+wrong would have been a runtime schema-mismatch error, not a compile
+error. A stored value no longer among the enum's registered items (e.g.
+old data after a schema change removed a variant) now surfaces as a real
+GraphQL field-level error rather than either panicking or silently
+degrading - same "reject gracefully, not silently" register as the rest
+of this module, just realised as a typed error instead of an
+opaque-JSON fallback here.
+
+### Not touched, per the locked-in scope decision
+
+- No registry/trait - every change is a new arm in an already-duplicated
+  `match`, not a new mechanism.
+- `skilj-codegen`'s `FieldType` (`String`/`I64`/`Bool`) - unchanged, per
+  its own documented "not a general type system" stance; the four new
+  types are only usable via hand-written `#[derive(JsonSchema)]` structs,
+  same as `date-time` already is.
+- `skilj-tui::form.rs` - no change needed. All four types are
+  string-encoded, so they already get the existing `Text` widget by
+  default.
+- Structured "address" types, raised in the same brainstorm - out of
+  scope. A postal address is already filterable today as a one-level
+  nested object with per-field dotted-path filters (e.g.
+  `address.city`), no new code needed for that case; genuine geo-aware
+  "near this address" just means the payload also carries a `geo-point`
+  field and reuses `Near` directly.
+
+### Verified
+
+`skilj-core/tests/event_filtering.rs`: 12 new pure-function tests (no
+DB) - `valid_filters` gating for each new format (accepted only when
+gated, rejected on an ungated field or the wrong operator) and `In`
+across every scalar kind; `matches_filters` real match/no-match/malformed
+-input cases for all four operators, using genuinely far-apart
+points/colors/subnets so a broken distance/containment check would fail
+the test, not pass by coincidence. `skilj-graphql/src/projection_types.rs`:
+3 new tests using a real `schemars::schema_for!` capture (not
+hand-written, same discipline as this module's existing tests) - the
+enum renders as a real string through actual GraphQL execution, the
+schema really registers a distinct `Enum` type (not `String`/opaque
+JSON), and a stale stored value really does surface as a GraphQL error.
+`skilj/tests/event_fetch_rest.rs` and `skilj/tests/event_subscription.rs`:
+one real end-to-end test each (`In`, over REST and over a live GraphQL
+subscription respectively) proving the new wire-parsing arms
+(`parse_filter_param`, `gql_types::filter_operator_enum`/
+`resolvers::parse_filters`) actually reach `valid_filters`/
+`matches_filters` through the real HTTP/WebSocket stack - not repeated
+per-operator, since `Near`/`SimilarColor`/`InSubnet` share the identical
+parsing plumbing, just gated to a different `format`. Full existing
+regression suite passes unchanged; `cargo build/clippy/test --workspace`
+clean; `allium check` clean on the spec change.

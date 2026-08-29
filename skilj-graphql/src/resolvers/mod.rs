@@ -240,6 +240,10 @@ pub fn parse_filters(value: &ValueAccessor) -> async_graphql::Result<Vec<Filter>
             "CONTAINS" => FilterOperator::Contains,
             "IS_LIKE" => FilterOperator::IsLike,
             "GREATER_THAN" => FilterOperator::GreaterThan,
+            "NEAR" => FilterOperator::Near,
+            "SIMILAR_COLOR" => FilterOperator::SimilarColor,
+            "IN_SUBNET" => FilterOperator::InSubnet,
+            "IN" => FilterOperator::In,
             _ => FilterOperator::LessThan,
         };
         filters.push(Filter {

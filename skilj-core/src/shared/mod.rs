@@ -30,6 +30,26 @@ pub enum FilterOperator {
     IsLike,
     GreaterThan,
     LessThan,
+    /// Only valid against a string leaf with `format: "geo-point"`
+    /// (`"lat,lng"`). `Filter.value` is `"lat,lng,radius_meters"` - the
+    /// target point plus how close counts as "near". See
+    /// `event_store::geo_distance_within`.
+    Near,
+    /// Only valid against a string leaf with `format: "color"`
+    /// (`"#RRGGBB"`). `Filter.value` is `"#RRGGBB,max_distance"` - the
+    /// target color plus a similarity threshold (plain Euclidean RGB
+    /// distance, not a perceptual metric). See
+    /// `event_store::color_similarity_within`.
+    SimilarColor,
+    /// Only valid against a string leaf with `format: "ip"` (IPv4 or
+    /// IPv6, via `std::net::IpAddr`). `Filter.value` is a CIDR, e.g.
+    /// `"192.168.1.0/24"`. See `event_store::ip_in_subnet`.
+    InSubnet,
+    /// Valid against any scalar leaf (string/integer/number/boolean) -
+    /// not tied to any particular `format`. `Filter.value` is a
+    /// comma-separated list of candidates, e.g. `"a,b,c"` - no escaping,
+    /// same as `IsLike`'s `%`/`_` wildcards already being unescaped.
+    In,
 }
 
 /// See `value Metadata` in the spec. `version` and every other

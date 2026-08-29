@@ -768,6 +768,10 @@ pub fn filter_operator_enum() -> Enum {
         .item("IS_LIKE")
         .item("GREATER_THAN")
         .item("LESS_THAN")
+        .item("NEAR")
+        .item("SIMILAR_COLOR")
+        .item("IN_SUBNET")
+        .item("IN")
 }
 
 pub fn filter_input() -> InputObject {

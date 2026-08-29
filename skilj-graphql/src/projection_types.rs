@@ -47,8 +47,8 @@
 //! `plugin::ProjectionDispatcher::default_state`) - the schema string is
 //! all this module ever has.
 
-use async_graphql::dynamic::{Field, FieldFuture, FieldValue, Object, TypeRef, Union};
-use async_graphql::Value;
+use async_graphql::dynamic::{Enum, Field, FieldFuture, FieldValue, Object, TypeRef, Union};
+use async_graphql::{Name, Value};
 use serde_json::Map;
 use skilj_core::db::{self, Pool};
 
@@ -70,8 +70,11 @@ pub fn graphql_type_name(bounded_context: &str, projection_name: &str) -> String
 /// least one usable member. An empty union isn't valid to register, and
 /// "nothing to offer" is a legitimate startup state - a fresh app with
 /// no projections registered yet, not an error.
-pub async fn build(pool: &Pool) -> skilj_core::error::Result<Option<(Vec<Object>, Union)>> {
+pub async fn build(
+    pool: &Pool,
+) -> skilj_core::error::Result<Option<(Vec<Object>, Vec<Enum>, Union)>> {
     let mut objects = Vec::new();
+    let mut enums: Vec<Enum> = Vec::new();
     let mut union = Union::new("ProjectionResult");
     let mut any = false;
 
@@ -89,7 +92,8 @@ pub async fn build(pool: &Pool) -> skilj_core::error::Result<Option<(Vec<Object>
                 continue;
             };
             let mut extra = Vec::new();
-            let Some(object) = object_from_schema_value(&type_name, &root, &root, 0, &mut extra)
+            let Some(object) =
+                object_from_schema_value(&type_name, &root, &root, 0, &mut extra, &mut enums)
             else {
                 eprintln!(
                     "skilj: projection {:?}/{:?} has no usable top-level properties - excluded \
@@ -108,7 +112,7 @@ pub async fn build(pool: &Pool) -> skilj_core::error::Result<Option<(Vec<Object>
     if !any {
         return Ok(None);
     }
-    Ok(Some((objects, union)))
+    Ok(Some((objects, enums, union)))
 }
 
 /// `schema` describes the object being built right now (the whole
@@ -122,6 +126,7 @@ fn object_from_schema_value(
     root: &serde_json::Value,
     depth: u8,
     extra_objects: &mut Vec<Object>,
+    extra_enums: &mut Vec<Enum>,
 ) -> Option<Object> {
     let properties = schema.get("properties")?.as_object()?;
     if properties.is_empty() {
@@ -142,6 +147,7 @@ fn object_from_schema_value(
             definitions,
             depth,
             extra_objects,
+            extra_enums,
         );
         object = object.field(field);
     }
@@ -210,10 +216,48 @@ enum FieldKind {
     Scalar(ScalarKind),
     ScalarList(ScalarKind),
     NestedObject,
+    /// A `$ref` to a `{"type": "string", "enum": [...]}` definition - a
+    /// real GraphQL `Enum` type was registered for it (see `build_field`'s
+    /// `enum_values_from_schema` check), so the stored raw string needs
+    /// `Value::from(Name::new(s))`, not a plain `String` `Value` - an
+    /// async-graphql enum-typed field's resolved value is represented as
+    /// `Value::Enum`, confirmed against `async-graphql`'s own vendored
+    /// `dynamic::Enum` test (`enum_type`, `src/dynamic/enum.rs`). A stored
+    /// value that isn't one of the enum's registered items (e.g. old data
+    /// after a schema change removed a variant) surfaces as a real
+    /// GraphQL field-level error, not a panic or a silent fallback - same
+    /// "reject gracefully, not silently" register as the rest of this
+    /// module, just realised as a typed GraphQL error here instead of an
+    /// opaque-JSON degrade.
+    Enum,
     /// A field shape this module doesn't recognise - see the module doc
     /// comment. Rendered as compact JSON text rather than dropped, so a
     /// caller sees *something* rather than a silently missing field.
     OpaqueJson,
+}
+
+/// `def_schema` is a `{"type": "string", "enum": [...]}` shape - a
+/// `schemars`-rendered unit enum (`#[derive(JsonSchema)] enum Foo { A,
+/// B }`), the same shape `skilj-core::event_store::classify` already
+/// follows a bare `$ref` to treat as a plain string scalar leaf for
+/// filtering purposes. Requires every enum member to actually be a
+/// string (defensive - JSON Schema's own `"enum"` keyword technically
+/// allows mixed types, `schemars`' unit-enum output never does) and at
+/// least one member; anything else returns `None` so the caller falls
+/// through to the existing opaque-JSON fallback instead of registering a
+/// zero-member or non-string `Enum`, which wouldn't be valid GraphQL.
+fn enum_values_from_schema(def_schema: &serde_json::Value) -> Option<Vec<String>> {
+    if def_schema.get("type").and_then(json_type_str) != Some("string") {
+        return None;
+    }
+    let values = def_schema.get("enum")?.as_array()?;
+    if values.is_empty() {
+        return None;
+    }
+    values
+        .iter()
+        .map(|v| v.as_str().map(String::from))
+        .collect()
 }
 
 fn wrap(nullable: bool, name: String, list: bool) -> TypeRef {
@@ -254,14 +298,15 @@ fn build_field(
     definitions: Option<&Map<String, serde_json::Value>>,
     depth: u8,
     extra_objects: &mut Vec<Object>,
+    extra_enums: &mut Vec<Enum>,
 ) -> Field {
     let gql_name = snake_to_camel(field_name);
     let json_key = field_name.to_string();
 
-    // One level of a named nested shape - only ever resolved starting
-    // from the top level (depth == 0); see the module doc comment for
-    // why a second level falls through to the opaque fallback instead of
-    // recursing.
+    // One level of a named nested shape (object or enum) - only ever
+    // resolved starting from the top level (depth == 0); see the module
+    // doc comment for why a second level falls through to the opaque
+    // fallback instead of recursing.
     if depth == 0 {
         if let Some(def_name) = field_schema
             .get("$ref")
@@ -276,10 +321,28 @@ fn build_field(
                     root,
                     depth + 1,
                     extra_objects,
+                    extra_enums,
                 ) {
                     extra_objects.push(nested_object);
                     let ty = wrap(nullable, nested_type_name, false);
                     return dynamic_field(gql_name, ty, json_key, FieldKind::NestedObject);
+                }
+                if let Some(values) = enum_values_from_schema(def_schema) {
+                    // Namespaced by parent+field, same as `nested_type_name`
+                    // above - avoids two unrelated projections' own enums
+                    // (or two fields of the same projection referencing
+                    // different Rust enum types with the same name)
+                    // colliding on one shared GraphQL type name.
+                    let enum_type_name = nested_type_name;
+                    if !extra_enums.iter().any(|e| e.type_name() == enum_type_name) {
+                        let mut enum_type = Enum::new(enum_type_name.clone());
+                        for value in &values {
+                            enum_type = enum_type.item(value.clone());
+                        }
+                        extra_enums.push(enum_type);
+                    }
+                    let ty = wrap(nullable, enum_type_name, false);
+                    return dynamic_field(gql_name, ty, json_key, FieldKind::Enum);
                 }
             }
         }
@@ -341,6 +404,12 @@ fn render_field<'a>(raw: Option<&serde_json::Value>, kind: &FieldKind) -> Option
         // `build_field` generated for it - there's no polymorphic choice
         // left for a resolver to disambiguate at runtime.
         FieldKind::NestedObject => Some(FieldValue::owned_any(raw.clone())),
+        // `Value::from(Name::new(s))`, not `Value::from(s.to_string())` -
+        // see `FieldKind::Enum`'s own doc comment for why a plain String
+        // `Value` is the wrong representation for an enum-typed field.
+        FieldKind::Enum => raw
+            .as_str()
+            .map(|s| FieldValue::value(Value::from(Name::new(s)))),
         FieldKind::OpaqueJson => Some(FieldValue::value(Value::from(raw.to_string()))),
     }
 }
@@ -391,8 +460,10 @@ mod tests {
     ) -> async_graphql::Value {
         let root: serde_json::Value = serde_json::from_str(schema_json).unwrap();
         let mut extra = Vec::new();
-        let object = object_from_schema_value(type_name, &root, &root, 0, &mut extra)
-            .expect("test schema always has usable top-level properties");
+        let mut extra_enums = Vec::new();
+        let object =
+            object_from_schema_value(type_name, &root, &root, 0, &mut extra, &mut extra_enums)
+                .expect("test schema always has usable top-level properties");
 
         let state: serde_json::Value = serde_json::from_str(state_json).unwrap();
         // No `.with_type(...)` here, unlike the real resolver
@@ -414,6 +485,9 @@ mod tests {
             .register(object);
         for nested in extra {
             builder = builder.register(nested);
+        }
+        for enum_type in extra_enums {
+            builder = builder.register(enum_type);
         }
         let schema = builder.finish().expect("test schema is well-formed");
 
@@ -446,6 +520,103 @@ mod tests {
                         "address": { "country": "NL", "zip": null }
                     }
                 })
+            );
+        });
+    }
+
+    /// A real `schemars::schema_for!` output (0.8) for a struct with an
+    /// `i64` field and a unit-enum field - captured directly from running
+    /// `schemars::schema_for!` against
+    /// `enum OrderStatus { Pending, Shipped, Delivered }`, not
+    /// hand-written, same discipline as `ACCOUNT_BALANCE_SCHEMA` above.
+    const ORDER_STATE_SCHEMA: &str = r##"{
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "OrderState",
+        "type": "object",
+        "required": ["status", "total"],
+        "properties": {
+            "status": { "$ref": "#/definitions/OrderStatus" },
+            "total": { "type": "integer", "format": "int64" }
+        },
+        "definitions": {
+            "OrderStatus": {
+                "type": "string",
+                "enum": ["Pending", "Shipped", "Delivered"]
+            }
+        }
+    }"##;
+
+    #[test]
+    fn a_unit_enum_field_renders_as_a_real_graphql_enum_not_an_opaque_string() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let data = execute_against(
+                "Orders_OrderState",
+                ORDER_STATE_SCHEMA,
+                r#"{"total":3,"status":"Shipped"}"#,
+                "{ value { total status } }",
+            )
+            .await;
+            assert_eq!(
+                data,
+                async_graphql::value!({ "value": { "total": 3, "status": "Shipped" } })
+            );
+        });
+    }
+
+    #[test]
+    fn the_enum_field_is_a_real_enum_type_in_the_schema_not_a_string() {
+        let root: serde_json::Value = serde_json::from_str(ORDER_STATE_SCHEMA).unwrap();
+        let mut extra = Vec::new();
+        let mut extra_enums = Vec::new();
+        object_from_schema_value(
+            "Orders_OrderState",
+            &root,
+            &root,
+            0,
+            &mut extra,
+            &mut extra_enums,
+        )
+        .expect("test schema always has usable top-level properties");
+        assert_eq!(extra_enums.len(), 1, "exactly one Enum type registered");
+        assert_eq!(extra_enums[0].type_name(), "Orders_OrderState_status");
+    }
+
+    #[test]
+    fn a_stored_value_no_longer_in_the_enum_is_a_real_graphql_error_not_a_silent_fallback() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let root: serde_json::Value = serde_json::from_str(ORDER_STATE_SCHEMA).unwrap();
+            let mut extra = Vec::new();
+            let mut extra_enums = Vec::new();
+            let object = object_from_schema_value(
+                "Orders_OrderState",
+                &root,
+                &root,
+                0,
+                &mut extra,
+                &mut extra_enums,
+            )
+            .unwrap();
+            let state: serde_json::Value =
+                serde_json::from_str(r#"{"total":1,"status":"Cancelled"}"#).unwrap();
+            let query_object = Object::new("Query").field(Field::new(
+                "value",
+                TypeRef::named_nn("Orders_OrderState"),
+                move |_ctx| {
+                    let state = state.clone();
+                    FieldFuture::new(async move { Ok(Some(FieldValue::owned_any(state))) })
+                },
+            ));
+            let mut builder = Schema::build(query_object.type_name(), None, None)
+                .register(query_object)
+                .register(object);
+            for enum_type in extra_enums {
+                builder = builder.register(enum_type);
+            }
+            let schema = builder.finish().expect("test schema is well-formed");
+            let response = schema.execute("{ value { total status } }").await;
+            assert!(
+                !response.errors.is_empty(),
+                "a stale/unrecognised enum value must surface as a real GraphQL error"
             );
         });
     }
@@ -505,6 +676,7 @@ mod tests {
             &serde_json::json!({ "type": "object", "properties": {} }),
             &serde_json::json!({ "type": "object", "properties": {} }),
             0,
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .is_none());
