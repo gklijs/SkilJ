@@ -332,6 +332,7 @@ fn decrypt_on_read_end_to_end() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await
@@ -529,6 +530,7 @@ fn queries_succeed_with_no_master_key_configured_when_nothing_needs_decrypting()
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await

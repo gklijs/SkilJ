@@ -167,6 +167,7 @@ async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
         status: BoundedContextStatus::Active,
         created_at: test_now(),
         created_by: ContextCreator::SystemCreator,
+        template: None,
     };
     db::insert_bounded_context(pool, &bc).await.unwrap();
     bc
@@ -275,6 +276,7 @@ fn round_trips_a_superadmin_created_bounded_context() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SuperadminCreator { role: role.clone() },
+            template: None,
         };
         db::insert_role(&pool, &role).await.unwrap();
         db::insert_bounded_context(&pool, &bc).await.unwrap();
@@ -1603,6 +1605,7 @@ fn hard_delete_drops_the_schema_and_cascades_the_registry_row() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         db::insert_bounded_context(&pool, &reused).await.unwrap();
         assert_eq!(

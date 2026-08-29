@@ -138,6 +138,7 @@ async fn ensure_bounded_contexts(pool: &Pool) {
                             status: BoundedContextStatus::Active,
                             created_at: test_now(),
                             created_by: ContextCreator::SystemCreator,
+                            template: None,
                         },
                     )
                     .await

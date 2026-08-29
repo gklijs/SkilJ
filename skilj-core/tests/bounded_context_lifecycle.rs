@@ -71,6 +71,7 @@ fn bounded_context(name: &str, status: BoundedContextStatus) -> BoundedContext {
         created_by: ContextCreator::SuperadminCreator {
             role: superadmin(RoleStatus::Active),
         },
+        template: None,
     }
 }
 
@@ -236,7 +237,8 @@ fn add_bounded_context_rejects_a_non_superadmin_caller() {
     assert_eq!(err.code(), access_control::Error::NotSuperadmin.code());
 }
 
-/// rule-failure.AddBoundedContext.3 - `requires: not exists BoundedContext{name: name}`.
+/// rule-failure.AddBoundedContext.3 - `requires: not exists BoundedContext
+/// {name: name}`.
 #[test]
 fn add_bounded_context_rejects_a_name_already_taken() {
     let caller = superadmin(RoleStatus::Active);

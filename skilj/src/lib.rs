@@ -181,6 +181,59 @@ pub struct Skilj {
     /// another instance's. `Arc`-wrapped so both `graphql_router()` and
     /// that background task can hold a cheap clone.
     schema_registry: Arc<skilj_graphql::schema::SchemaRegistry>,
+    /// Codeberg issue #13 - see `TemplateCache`'s own doc comment.
+    /// `Arc`-wrapped for the identical reason `schema_registry` is: the
+    /// background cross-instance listener task holds its own clone and
+    /// refreshes it on every `RegistrationChanged` notification,
+    /// alongside `schema_registry.rebuild`.
+    template_cache: Arc<TemplateCache>,
+}
+
+/// Codeberg issue #13's own missing piece: every `Registered*` map below
+/// is keyed by whatever literal name `.bounded_context(name)`/
+/// `#[auto_register]`'s `T::BOUNDED_CONTEXT` declared at `.build()` time -
+/// for a templated tenant, that's always the *template*'s own name,
+/// never the tenant's (a tenant's name is chosen at runtime, long after
+/// `.build()` ran, so it can never be a map key). `TemplateCache` is the
+/// live, cross-instance-refreshed `bounded_context -> template` lookup
+/// every dispatcher below consults first: `effective_bounded_context`
+/// resolves a tenant's own name to its template's before the real
+/// `HashMap` lookup, so an already-compiled `decide()`/`project()`/etc.
+/// becomes reachable for every tenant cloned from that template with no
+/// redeploy. Refreshed the same way `skilj_graphql::schema::SchemaRegistry`
+/// already is: rebuilt from a fresh `list_bounded_contexts` read on every
+/// `RegistrationChanged` cross-instance notification (see `.build()`'s
+/// own cross-instance listener task) - `insert_bounded_context` already
+/// fires that notification on every new context, templated or not, so
+/// this reuses plumbing that already exists rather than adding a new
+/// channel.
+#[derive(Default)]
+struct TemplateCache(arc_swap::ArcSwap<HashMap<String, Option<String>>>);
+
+impl TemplateCache {
+    fn refresh(&self, contexts: &[skilj_core::event_store::BoundedContext]) {
+        let map = contexts
+            .iter()
+            .map(|bc| {
+                (
+                    bc.name.clone(),
+                    bc.template.as_ref().map(|t| t.name.clone()),
+                )
+            })
+            .collect();
+        self.0.store(Arc::new(map));
+    }
+
+    /// `bounded_context` itself when it has no template on record (the
+    /// ordinary case, and also the safe fallback for a context this
+    /// cache hasn't heard of yet - a lookup miss behaves exactly like an
+    /// untemplated context, never a dispatch failure of its own).
+    fn effective_bounded_context(&self, bounded_context: &str) -> String {
+        match self.0.load().get(bounded_context) {
+            Some(Some(template)) => template.clone(),
+            _ => bounded_context.to_string(),
+        }
+    }
 }
 
 /// `CommandDispatcher`'s own implementer - a thin wrapper around the
@@ -190,6 +243,7 @@ pub struct Skilj {
 /// alone) without requiring an `Arc<Skilj>`.
 struct Dispatcher {
     command_types: Arc<HashMap<(String, String), RegisteredCommandType>>,
+    template_cache: Arc<TemplateCache>,
 }
 
 impl CommandDispatcher for Dispatcher {
@@ -200,9 +254,12 @@ impl CommandDispatcher for Dispatcher {
         payload: &str,
         matching_events: &[Event],
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .command_types
-            .get(&(bounded_context.to_string(), command_type.to_string()))?;
+            .get(&(bounded_context, command_type.to_string()))?;
         Some((registered.decide)(payload, matching_events))
     }
 
@@ -211,9 +268,12 @@ impl CommandDispatcher for Dispatcher {
         bounded_context: &str,
         command_type: &str,
     ) -> Option<Option<&'static str>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .command_types
-            .get(&(bounded_context.to_string(), command_type.to_string()))?;
+            .get(&(bounded_context, command_type.to_string()))?;
         Some(registered.required_role)
     }
 
@@ -222,9 +282,12 @@ impl CommandDispatcher for Dispatcher {
         bounded_context: &str,
         command_type: &str,
     ) -> Option<Option<&'static str>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .command_types
-            .get(&(bounded_context.to_string(), command_type.to_string()))?;
+            .get(&(bounded_context, command_type.to_string()))?;
         Some(registered.snapshot_name)
     }
 
@@ -236,9 +299,12 @@ impl CommandDispatcher for Dispatcher {
         snapshot_state_json: &str,
         events_since_snapshot: &[Event],
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .command_types
-            .get(&(bounded_context.to_string(), command_type.to_string()))?;
+            .get(&(bounded_context, command_type.to_string()))?;
         Some((registered.decide_from_snapshot)(
             payload,
             snapshot_state_json,
@@ -252,6 +318,7 @@ impl CommandDispatcher for Dispatcher {
 /// `command_types`.
 struct ProjectionDispatcherImpl {
     projections: Arc<HashMap<(String, String), RegisteredProjection>>,
+    template_cache: Arc<TemplateCache>,
 }
 
 impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
@@ -261,9 +328,12 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
         projection_name: &str,
         event: &Event,
     ) -> Option<Vec<String>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .projections
-            .get(&(bounded_context.to_string(), projection_name.to_string()))?;
+            .get(&(bounded_context, projection_name.to_string()))?;
         Some((registered.keys)(event))
     }
 
@@ -275,16 +345,22 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
         event: &Event,
         key: &str,
     ) -> Option<skilj_core::error::Result<String>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .projections
-            .get(&(bounded_context.to_string(), projection_name.to_string()))?;
+            .get(&(bounded_context, projection_name.to_string()))?;
         Some((registered.project)(state_json, event, key))
     }
 
     fn default_state(&self, bounded_context: &str, projection_name: &str) -> Option<String> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .projections
-            .get(&(bounded_context.to_string(), projection_name.to_string()))?;
+            .get(&(bounded_context, projection_name.to_string()))?;
         Some(registered.default_state_json.clone())
     }
 }
@@ -294,13 +370,17 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
 /// registry instead.
 struct EventDispatcherImpl {
     event_types: Arc<HashMap<(String, String), RegisteredEventType>>,
+    template_cache: Arc<TemplateCache>,
 }
 
 impl skilj_core::plugin::EventDispatcher for EventDispatcherImpl {
     fn scheduled_payload(&self, bounded_context: &str, event_type: &str) -> Option<String> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .event_types
-            .get(&(bounded_context.to_string(), event_type.to_string()))?;
+            .get(&(bounded_context, event_type.to_string()))?;
         Some((registered.scheduled_payload)())
     }
 }
@@ -313,28 +393,38 @@ impl skilj_core::plugin::EventDispatcher for EventDispatcherImpl {
 /// enumeration method at all.
 struct SnapshotDispatcherImpl {
     snapshots: Arc<HashMap<(String, String), RegisteredSnapshot>>,
+    template_cache: Arc<TemplateCache>,
 }
 
 impl skilj_core::plugin::SnapshotDispatcher for SnapshotDispatcherImpl {
     fn snapshot_names(&self, bounded_context: &str) -> Vec<&'static str> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         self.snapshots
             .iter()
-            .filter(|((bc, _), _)| bc == bounded_context)
+            .filter(|((bc, _), _)| *bc == bounded_context)
             .map(|(_, registered)| registered.name)
             .collect()
     }
 
     fn tag_key(&self, bounded_context: &str, snapshot_name: &str) -> Option<&'static str> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .snapshots
-            .get(&(bounded_context.to_string(), snapshot_name.to_string()))?;
+            .get(&(bounded_context, snapshot_name.to_string()))?;
         Some(registered.tag_key)
     }
 
     fn version(&self, bounded_context: &str, snapshot_name: &str) -> Option<u64> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .snapshots
-            .get(&(bounded_context.to_string(), snapshot_name.to_string()))?;
+            .get(&(bounded_context, snapshot_name.to_string()))?;
         Some(registered.version)
     }
 
@@ -345,16 +435,22 @@ impl skilj_core::plugin::SnapshotDispatcher for SnapshotDispatcherImpl {
         state_json: &str,
         event: &Event,
     ) -> Option<skilj_core::error::Result<String>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .snapshots
-            .get(&(bounded_context.to_string(), snapshot_name.to_string()))?;
+            .get(&(bounded_context, snapshot_name.to_string()))?;
         Some((registered.fold)(state_json, event))
     }
 
     fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
         let registered = self
             .snapshots
-            .get(&(bounded_context.to_string(), snapshot_name.to_string()))?;
+            .get(&(bounded_context, snapshot_name.to_string()))?;
         Some(registered.default_state_json.clone())
     }
 }
@@ -392,6 +488,7 @@ impl Skilj {
     pub fn command_dispatcher(&self) -> Arc<dyn CommandDispatcher> {
         Arc::new(Dispatcher {
             command_types: self.command_types.clone(),
+            template_cache: self.template_cache.clone(),
         })
     }
 
@@ -403,6 +500,7 @@ impl Skilj {
     pub fn projection_dispatcher(&self) -> Arc<dyn skilj_core::plugin::ProjectionDispatcher> {
         Arc::new(ProjectionDispatcherImpl {
             projections: self.projections.clone(),
+            template_cache: self.template_cache.clone(),
         })
     }
 
@@ -414,6 +512,7 @@ impl Skilj {
     pub fn event_dispatcher(&self) -> Arc<dyn skilj_core::plugin::EventDispatcher> {
         Arc::new(EventDispatcherImpl {
             event_types: self.event_types.clone(),
+            template_cache: self.template_cache.clone(),
         })
     }
 
@@ -425,6 +524,7 @@ impl Skilj {
     pub fn snapshot_dispatcher(&self) -> Arc<dyn skilj_core::plugin::SnapshotDispatcher> {
         Arc::new(SnapshotDispatcherImpl {
             snapshots: self.snapshots.clone(),
+            template_cache: self.template_cache.clone(),
         })
     }
 
@@ -1135,6 +1235,21 @@ impl SkiljBuilder {
         let command_types = Arc::new(self.command_types);
         let snapshots = Arc::new(self.snapshots);
 
+        // Codeberg issue #13: built here, from the same full-snapshot
+        // `list_bounded_contexts` read the event-cache warm-up loop below
+        // already needs - one fetch serves both, rather than querying
+        // twice. Reconciliation immediately below never looks up a
+        // templated tenant's own name (it only ever loops over the
+        // literal keys this process's own `.bounded_context(name)`/
+        // `#[auto_register]` calls declared, always a template's name or
+        // an ordinary untemplated one - never a tenant's, chosen later at
+        // runtime), so `reconciliation_dispatcher` just below gets a real
+        // clone of this same cache for structural consistency, even
+        // though every lookup it makes resolves to itself.
+        let bounded_contexts_for_warm_up = skilj_core::db::list_bounded_contexts(&pool).await?;
+        let template_cache = Arc::new(TemplateCache::default());
+        template_cache.refresh(&bounded_contexts_for_warm_up);
+
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
             let role = skilj_core::access_control::resolve_role_by_external_subject(
@@ -1154,6 +1269,7 @@ impl SkiljBuilder {
             reconcile_command_types(&pool, &role, &command_types, &mut report).await?;
             let reconciliation_dispatcher = ProjectionDispatcherImpl {
                 projections: projections.clone(),
+                template_cache: template_cache.clone(),
             };
             reconcile_projections(
                 &pool,
@@ -1195,7 +1311,6 @@ impl SkiljBuilder {
         // schema, so nothing here is shared mutable state across
         // iterations - safe to run out of order.
         let event_cache = EventCache::new(self.event_cache_warm_up_count);
-        let bounded_contexts_for_warm_up = skilj_core::db::list_bounded_contexts(&pool).await?;
         stream::iter(bounded_contexts_for_warm_up)
             .map(|bc| {
                 let pool = &pool;
@@ -1237,12 +1352,15 @@ impl SkiljBuilder {
                     }),
                 dispatcher: Arc::new(Dispatcher {
                     command_types: command_types.clone(),
+                    template_cache: template_cache.clone(),
                 }),
                 projection_dispatcher: Arc::new(ProjectionDispatcherImpl {
                     projections: projections.clone(),
+                    template_cache: template_cache.clone(),
                 }),
                 snapshot_dispatcher: Arc::new(SnapshotDispatcherImpl {
                     snapshots: snapshots.clone(),
+                    template_cache: template_cache.clone(),
                 }),
                 projection_query_wait_timeout,
                 encryption_master_key: encryption_master_key.clone(),
@@ -1267,6 +1385,7 @@ impl SkiljBuilder {
             revocation_broadcaster,
             event_cache,
             schema_registry,
+            template_cache,
         };
 
         // The single shared background task backing §8 item 6's async
@@ -1482,7 +1601,12 @@ impl SkiljBuilder {
         // from one committed on another, they're already reading through
         // the same broadcaster either way. `Revoked` republishes into
         // `RevocationBroadcaster` the identical way. `RegistrationChanged`
-        // rebuilds and swaps `schema_registry`.
+        // rebuilds and swaps `schema_registry`, and (Codeberg issue #13)
+        // refreshes `template_cache` from the same fresh
+        // `list_bounded_contexts` read - `insert_bounded_context` already
+        // fires this exact notification for every new context, templated
+        // or not, so a new tenant's own dispatch resolution becomes live
+        // on every instance without any dedicated plumbing of its own.
         //
         // `Listener::connect` itself is retried in a loop (unlike
         // `recv()`, which `sqlx::postgres::PgListener` already retries
@@ -1494,6 +1618,7 @@ impl SkiljBuilder {
         let cross_instance_event_broadcaster = skilj.event_broadcaster.clone();
         let cross_instance_revocation_broadcaster = skilj.revocation_broadcaster.clone();
         let cross_instance_schema_registry = Arc::clone(&skilj.schema_registry);
+        let cross_instance_template_cache = Arc::clone(&skilj.template_cache);
         let cross_instance_state = skilj.graphql_state();
         tokio::spawn(async move {
             let mut listener = loop {
@@ -1607,6 +1732,16 @@ impl SkiljBuilder {
                             .await
                         {
                             tracing::warn!(error = %err, "cross-instance schema rebuild failed");
+                        }
+                        // Codeberg issue #13 - see the note above this
+                        // task's own spawn for why this shares the same
+                        // notification `schema_registry.rebuild` does.
+                        match skilj_core::db::list_bounded_contexts(&cross_instance_pool).await {
+                            Ok(contexts) => cross_instance_template_cache.refresh(&contexts),
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "cross-instance template cache refresh failed"
+                            ),
                         }
                     }
                 }

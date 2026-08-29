@@ -846,10 +846,15 @@ struct BoundedContextRow {
     created_at: DateTime<Utc>,
     created_by_kind: String,
     created_by_role_id: Option<String>,
+    /// Codeberg issue #13 - just the referenced row's own name; hydrated
+    /// into a full `BoundedContext` by `get_bounded_context`/
+    /// `list_bounded_contexts`, matching how `created_by_role_id` is
+    /// hydrated into a full `Role` below.
+    template: Option<String>,
 }
 
 const BOUNDED_CONTEXT_COLUMNS: &str =
-    "name, status, created_at, created_by_kind, created_by_role_id";
+    "name, status, created_at, created_by_kind, created_by_role_id, template";
 
 /// Provisions the new context's own `bc_<name>` schema (see
 /// `provision_bounded_context_schema`) and inserts its `bounded_contexts`
@@ -868,13 +873,14 @@ pub async fn insert_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate::
     let mut tx = pool.begin().await?;
     provision_bounded_context_schema(&mut tx, &bc.name).await?;
     sqlx::query(&format!(
-        "INSERT INTO bounded_contexts ({BOUNDED_CONTEXT_COLUMNS}) VALUES ($1,$2,$3,$4,$5)"
+        "INSERT INTO bounded_contexts ({BOUNDED_CONTEXT_COLUMNS}) VALUES ($1,$2,$3,$4,$5,$6)"
     ))
     .bind(&bc.name)
     .bind(bounded_context_status_to_str(bc.status))
     .bind(bc.created_at)
     .bind(kind)
     .bind(role_id)
+    .bind(bc.template.as_ref().map(|t| t.name.clone()))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -910,7 +916,11 @@ pub async fn update_bounded_context_status(
 /// `bounded_contexts` normalises onto `roles` rather than denormalising
 /// its fields directly), so this is a free function taking the row plus
 /// an already-resolved `Option<Role>`, not a method on the row type.
-fn bounded_context_from_row(row: BoundedContextRow, role: Option<Role>) -> BoundedContext {
+fn bounded_context_from_row(
+    row: BoundedContextRow,
+    role: Option<Role>,
+    template: Option<Box<BoundedContext>>,
+) -> BoundedContext {
     let created_by = match row.created_by_kind.as_str() {
         "system" => ContextCreator::SystemCreator,
         _ => ContextCreator::SuperadminCreator {
@@ -926,6 +936,7 @@ fn bounded_context_from_row(row: BoundedContextRow, role: Option<Role>) -> Bound
         status: bounded_context_status_from_str(&row.status),
         created_at: row.created_at,
         created_by,
+        template,
     }
 }
 
@@ -950,7 +961,21 @@ pub async fn get_bounded_context(
         )),
         None => None,
     };
-    Ok(Some(bounded_context_from_row(row, role)))
+    // Invariant TemplateIsNeverItselfTemplated: a template's own `template`
+    // is always `None`, so this recursion is at most one level deep - it
+    // can never loop.
+    let template = match &row.template {
+        Some(template_name) => Some(Box::new(
+            Box::pin(get_bounded_context(pool, template_name))
+                .await?
+                .expect(
+                    "bounded_contexts.template references a bounded_contexts row that no \
+                     longer exists",
+                ),
+        )),
+        None => None,
+    };
+    Ok(Some(bounded_context_from_row(row, role, template)))
 }
 
 /// Every `BoundedContext` this engine currently knows of - the
@@ -977,7 +1002,16 @@ pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<Boun
         .map(|role| (role.id.clone(), role))
         .collect();
 
-    let mut contexts = Vec::with_capacity(rows.len());
+    // Codeberg issue #13: a template is always some other row already in
+    // this same full-table fetch (invariant TemplateIsNeverItselfTemplated
+    // rules out a template needing a template of its own), so resolving
+    // `template` here is a map lookup, not an extra query per row - the
+    // same N+1 avoidance this function's own doc comment already commits
+    // to for `created_by_role_id`/`Role`. Build every context with
+    // `template: None` first, keyed by name, then fill in the box on a
+    // second pass.
+    let mut contexts_by_name = std::collections::HashMap::with_capacity(rows.len());
+    let mut template_names = Vec::with_capacity(rows.len());
     for row in rows {
         let role = row.created_by_role_id.as_ref().map(|role_id| {
             roles_by_id.get(role_id).cloned().expect(
@@ -985,9 +1019,26 @@ pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<Boun
                  exists",
             )
         });
-        contexts.push(bounded_context_from_row(row, role));
+        let name = row.name.clone();
+        let template_name = row.template.clone();
+        contexts_by_name.insert(name.clone(), bounded_context_from_row(row, role, None));
+        template_names.push((name, template_name));
     }
-    Ok(contexts)
+    for (name, template_name) in template_names {
+        let Some(template_name) = template_name else {
+            continue;
+        };
+        let template = contexts_by_name.get(&template_name).cloned().expect(
+            "bounded_contexts.template references a bounded_contexts row that no longer exists",
+        );
+        contexts_by_name.get_mut(&name).unwrap().template = Some(Box::new(template));
+    }
+
+    // Order isn't part of this function's contract (see callers - a
+    // `HashMap`-keyed round trip like this one loses whatever order the
+    // query returned), matching `list_roles`/`list_role_access_mappings`'s
+    // own unordered `Vec` return.
+    Ok(contexts_by_name.into_values().collect())
 }
 
 // --- EventType ---

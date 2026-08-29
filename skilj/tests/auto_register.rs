@@ -252,6 +252,7 @@ async fn ensure_bounded_context(pool: &Pool, name: &str) -> BoundedContext {
         status: BoundedContextStatus::Active,
         created_at: test_now(),
         created_by: ContextCreator::SystemCreator,
+        template: None,
     };
     if let Err(e) = db::insert_bounded_context(pool, &bc).await {
         return db::get_bounded_context(pool, name)

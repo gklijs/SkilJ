@@ -409,6 +409,7 @@ fn cross_instance_push_reaches_a_second_instance_sharing_one_database() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await
@@ -692,6 +693,7 @@ fn same_instance_delivery_is_exactly_once_not_duplicated() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await

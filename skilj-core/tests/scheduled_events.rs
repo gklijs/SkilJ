@@ -25,6 +25,7 @@ fn bounded_context(status: BoundedContextStatus) -> BoundedContext {
         status,
         created_at: timestamp(0),
         created_by: ContextCreator::SystemCreator,
+        template: None,
     }
 }
 

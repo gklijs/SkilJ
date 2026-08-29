@@ -43,6 +43,7 @@ pub fn stamp_admin_bounded_context(
         status: BoundedContextStatus::Active,
         created_at: now,
         created_by: ContextCreator::SystemCreator,
+        template: None,
     })
 }
 
@@ -97,6 +98,12 @@ pub enum Error {
 
     #[error("this external_subject is already bound to another active Role")]
     ExternalSubjectAlreadyClaimed,
+
+    #[error("a BoundedContext used as a template must have no template of its own")]
+    TemplateItselfTemplated,
+
+    #[error("this bounded context has no template to resync from")]
+    BoundedContextHasNoTemplate,
 }
 
 impl SkiljRejection for Error {
@@ -110,6 +117,8 @@ impl SkiljRejection for Error {
             Error::BoundedContextNotArchived => "bounded_context_not_archived",
             Error::CannotDeleteAdminContext => "cannot_delete_admin_context",
             Error::ExternalSubjectAlreadyClaimed => "external_subject_already_claimed",
+            Error::TemplateItselfTemplated => "template_itself_templated",
+            Error::BoundedContextHasNoTemplate => "bounded_context_has_no_template",
         }
     }
 
@@ -237,7 +246,88 @@ pub fn add_bounded_context(
         created_by: ContextCreator::SuperadminCreator {
             role: caller.clone(),
         },
+        template: None,
     })
+}
+
+/// See `rule CreateBoundedContextFromTemplate` (Codeberg issue #13).
+/// Same shape as `add_bounded_context` immediately above - identical
+/// name-uniqueness/validity checks, since this is the spec's own second
+/// and only other way a `BoundedContext` name is chosen - plus the two
+/// checks specific to templating: `template` must be `active` (an
+/// archived one's declared types are a frozen record, not a moving
+/// statement of what a tenant should have) and must itself have no
+/// `template` (invariant `TemplateIsNeverItselfTemplated` - one level
+/// only, enforced here as well as by the invariant since this is the
+/// only rule that ever sets the field).
+///
+/// Only decides the new `BoundedContext` itself. The caller (the
+/// `skilj-graphql` resolver) still has to separately call
+/// `access_control::grant_role_access_mapping` (the combined
+/// create-and-grant step this rule's own `@guarantee
+/// AccessGrantedWithCreation` describes) and then apply the template's
+/// current type registrations - see this module's own doc comment on
+/// why that fan-out isn't a single function here: three genuinely
+/// different `register_*` pure functions across three modules
+/// (`event_store`/`projections`) are involved, the same
+/// `RegisterEventType`/`RegisterCommandType`/`RegisterProjection` split
+/// `skilj/src/lib.rs`'s own `reconcile_*` functions already keep apart
+/// rather than collapsing into one generic.
+pub fn create_bounded_context_from_template(
+    caller: &Role,
+    template: &BoundedContext,
+    name: String,
+    existing_contexts: &[BoundedContext],
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::error::Result<BoundedContext> {
+    crate::access_control::require_active_superadmin(caller)?;
+    if existing_contexts.iter().any(|bc| bc.name == name) {
+        return Err(Error::BoundedContextNameTaken.into());
+    }
+    if !valid_bounded_context_name(&name) {
+        return Err(Error::InvalidBoundedContextName.into());
+    }
+    if template.status != BoundedContextStatus::Active {
+        return Err(crate::event_store::Error::BoundedContextArchived.into());
+    }
+    if template.template.is_some() {
+        return Err(Error::TemplateItselfTemplated.into());
+    }
+
+    Ok(BoundedContext {
+        name,
+        status: BoundedContextStatus::Active,
+        created_at: now,
+        created_by: ContextCreator::SuperadminCreator {
+            role: caller.clone(),
+        },
+        template: Some(Box::new(template.clone())),
+    })
+}
+
+/// See `rule ResyncBoundedContextFromTemplate` (Codeberg issue #13).
+/// Pure validation only, returning the template to resync *from* on
+/// success - applying its current registrations is the caller's own
+/// loop, the identical one `create_bounded_context_from_template`'s own
+/// doc comment describes. Safe to call as often as wanted: every
+/// registration the caller applies afterward is already the same
+/// upsert-shaped call a deploy-time reconciliation pass makes, so
+/// resyncing a tenant already in step changes nothing.
+pub fn resync_bounded_context_from_template<'a>(
+    caller: &Role,
+    bounded_context: &'a BoundedContext,
+) -> crate::error::Result<&'a BoundedContext> {
+    crate::access_control::require_active_superadmin(caller)?;
+    if bounded_context.status != BoundedContextStatus::Active {
+        return Err(crate::event_store::Error::BoundedContextArchived.into());
+    }
+    let Some(template) = bounded_context.template.as_deref() else {
+        return Err(Error::BoundedContextHasNoTemplate.into());
+    };
+    if template.status != BoundedContextStatus::Active {
+        return Err(crate::event_store::Error::BoundedContextArchived.into());
+    }
+    Ok(template)
 }
 
 /// See `rule ListBoundedContexts`. Unrestricted across contexts and

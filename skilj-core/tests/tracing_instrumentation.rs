@@ -78,6 +78,7 @@ fn bounded_context() -> BoundedContext {
         status: BoundedContextStatus::Active,
         created_at: Utc.timestamp_opt(0, 0).unwrap(),
         created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+        template: None,
     }
 }
 

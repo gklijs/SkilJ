@@ -36,6 +36,7 @@ fn bounded_context(status: BoundedContextStatus) -> BoundedContext {
         status,
         created_at: timestamp(0),
         created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+        template: None,
     }
 }
 
@@ -101,6 +102,7 @@ fn other_bounded_context_event_type() -> EventType {
             status: BoundedContextStatus::Active,
             created_at: timestamp(0),
             created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+            template: None,
         },
         ..event_type()
     }
@@ -113,6 +115,7 @@ fn other_bounded_context_command_type() -> CommandType {
             status: BoundedContextStatus::Active,
             created_at: timestamp(0),
             created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+            template: None,
         },
         ..command_type()
     }

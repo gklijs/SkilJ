@@ -122,6 +122,17 @@ pub struct BoundedContext {
     pub status: BoundedContextStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub created_by: crate::bootstrap::ContextCreator,
+    /// See `entity BoundedContext`'s own `template` field doc comment
+    /// (Codeberg issue #13). `None` for every context `AddBoundedContext`
+    /// makes and for the admin context - the ordinary case. Set once, at
+    /// creation, by `CreateBoundedContextFromTemplate`, and never
+    /// afterward - the one write it can still take is `DeleteBoundedContext`
+    /// clearing it to `None` when the referenced template is deleted (the
+    /// link ends with its target, it never moves to a different one).
+    /// Invariant `TemplateIsNeverItselfTemplated`: a `BoundedContext` used
+    /// as a template always has `template: None` itself, so this never
+    /// recurses past one level.
+    pub template: Option<Box<BoundedContext>>,
 }
 
 /// See `enum MissedOccurrencePolicy`. No `Default` impl, deliberately -

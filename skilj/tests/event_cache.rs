@@ -223,6 +223,7 @@ fn a_dcb_conflict_outside_the_cache_window_is_still_caught_via_the_postgres_fall
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         db::insert_bounded_context(&pool, &bc).await.unwrap();
 

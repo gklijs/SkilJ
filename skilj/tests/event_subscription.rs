@@ -379,6 +379,7 @@ fn event_subscription_end_to_end() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await
@@ -406,6 +407,7 @@ fn event_subscription_end_to_end() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &other_bc)
             .await
@@ -671,6 +673,7 @@ fn revoking_via_graphql_closes_a_quiet_subscription_without_waiting_for_an_event
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await
@@ -860,6 +863,7 @@ fn events_by_type_subscription_narrows_by_a_real_filter() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await
@@ -1051,6 +1055,7 @@ fn events_by_type_subscription_narrows_by_a_real_in_filter() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await

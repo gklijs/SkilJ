@@ -50,6 +50,7 @@ fn bounded_context(status: BoundedContextStatus) -> BoundedContext {
         status,
         created_at: timestamp(0),
         created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+        template: None,
     }
 }
 
@@ -338,6 +339,7 @@ fn authorise_command_submission_rejects_a_mapping_scoped_to_a_different_bounded_
         status: BoundedContextStatus::Active,
         created_at: timestamp(0),
         created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+        template: None,
     };
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write, other_context);
 

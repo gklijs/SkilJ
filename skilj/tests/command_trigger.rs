@@ -238,6 +238,7 @@ async fn setup() -> (Skilj, String, Pool, String) {
         status: BoundedContextStatus::Active,
         created_at: test_now(),
         created_by: ContextCreator::SystemCreator,
+        template: None,
     };
     db::insert_bounded_context(&pool, &bc).await.unwrap();
 

@@ -31,6 +31,12 @@ opentelemetry.workspace = true
 # (used in skilj/tests/ for WebSocket stream handling), promoted to a
 # real dependency now that src/lib.rs uses it too.
 futures-util.workspace = true
+# Codeberg issue #13: TemplateCache's own live, cross-instance-refreshed
+# `bounded_context -> template` lookup - same `ArcSwap`-behind-a-cheap-
+# `Arc` pattern `skilj_graphql::schema::SchemaRegistry` already uses for
+# an identical reason (a request in flight keeps reading a consistent
+# snapshot while a rebuild swaps in a new one, no lock held across it).
+arc-swap.workspace = true
 
 [dev-dependencies]
 postgresql_embedded = "0.21.0"

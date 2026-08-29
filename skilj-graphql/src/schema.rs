@@ -108,6 +108,8 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
         .field(resolvers::access_management::grant_role_access_mapping_field())
         .field(resolvers::access_management::revoke_role_access_mapping_field())
         .field(resolvers::bounded_context_creation::field())
+        .field(resolvers::bounded_context_templating::create_bounded_context_from_template_field())
+        .field(resolvers::bounded_context_templating::resync_bounded_context_from_template_field())
         .field(resolvers::bounded_context_archival::field())
         .field(resolvers::bounded_context_deletion::field())
         .field(resolvers::type_registration::register_event_type_field())

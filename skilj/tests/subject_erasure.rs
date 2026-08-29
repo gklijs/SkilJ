@@ -278,6 +278,7 @@ fn subject_erasure_end_to_end() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         skilj_core::db::insert_bounded_context(&pool, &bc)
             .await

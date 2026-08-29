@@ -26,6 +26,7 @@ fn bounded_context() -> BoundedContext {
         status: BoundedContextStatus::Active,
         created_at: Utc::now(),
         created_by: ContextCreator::SystemCreator,
+        template: None,
     }
 }
 

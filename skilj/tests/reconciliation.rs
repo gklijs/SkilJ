@@ -247,6 +247,7 @@ async fn seed_admin_context(pool: &Pool) -> (String, String) {
         status: BoundedContextStatus::Active,
         created_at: test_now(),
         created_by: ContextCreator::SystemCreator,
+        template: None,
     };
     db::insert_bounded_context(pool, &bc).await.unwrap();
 
@@ -349,6 +350,7 @@ fn reconciliation_skips_bounded_contexts_with_no_admin_access() {
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         db::insert_bounded_context(&pool, &bc).await.unwrap();
 
@@ -466,6 +468,7 @@ fn reconciliation_folds_pre_existing_history_into_a_first_time_sync_projection()
             status: BoundedContextStatus::Active,
             created_at: test_now(),
             created_by: ContextCreator::SystemCreator,
+            template: None,
         };
         db::insert_bounded_context(&pool, &bc).await.unwrap();
 

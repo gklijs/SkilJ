@@ -226,6 +226,7 @@ fn bounded_context() -> BoundedContext {
         status: BoundedContextStatus::Active,
         created_at: chrono::Utc::now(),
         created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+        template: None,
     }
 }
 

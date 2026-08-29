@@ -362,6 +362,40 @@ entity BoundedContext {
                                             -- Command or Event yet (see the note above the admin
                                             -- rules), so without these two fields nothing anywhere
                                             -- says when a context appeared or on whose authority
+    template: BoundedContext?              -- the context whose declared types this one was stamped
+                                            -- out from, set by rule
+                                            -- CreateBoundedContextFromTemplate and by nothing else.
+                                            -- Absent for every context AddBoundedContext makes and
+                                            -- for the admin context, which is the ordinary case.
+                                            --
+                                            -- Chosen once, exactly as name is, and for the same
+                                            -- reason: there is no retemplating any more than there
+                                            -- is a rename, so a context is a tenant of one template
+                                            -- or of none, decided at the moment it comes into being.
+                                            -- No rule points this field at a different context than
+                                            -- the one it was created with, which is what makes that
+                                            -- hold rather than a sentence asking for it.
+                                            --
+                                            -- The one write after creation clears it rather than
+                                            -- moves it: DeleteBoundedContext sets this to null on
+                                            -- every context templated from the one it deletes, so a
+                                            -- tenant whose template is gone becomes an ordinary
+                                            -- untemplated context rather than pointing at nothing
+                                            -- (see the note above that rule). The link ends with its
+                                            -- target; it never changes target.
+                                            --
+                                            -- Being a template is not a state a context enters:
+                                            -- nothing here marks a context as one, and a context is
+                                            -- a template only for as long as some other context's
+                                            -- field points at it. What is forbidden is the second
+                                            -- level - a context with a template of its own can never
+                                            -- be another's (see invariant
+                                            -- TemplateIsNeverItselfTemplated and the note above rule
+                                            -- CreateBoundedContextFromTemplate). In every other
+                                            -- respect a templated context is an ordinary bounded
+                                            -- context: it registers, evolves, archives and is
+                                            -- deleted exactly like any other, and what it inherited
+                                            -- becomes its own the instant it is registered
 
     event_types: EventType with bounded_context = this
     command_types: CommandType with bounded_context = this
@@ -2790,6 +2824,16 @@ rule InspectEvent {
 -- happen inside it - no type registered, no event, no command, no read -
 -- until a superadmin grants some Role access to it. Nothing expires,
 -- reminds or repairs it in the meantime.
+--
+-- Everything above describes this rule, and this rule is now one of two
+-- ways a bounded context comes into being. The other is
+-- CreateBoundedContextFromTemplate below, which does grant access in the
+-- same call - a stated exception, argued where it is made rather than
+-- here, and one that leaves this rule exactly as it was. The name checks
+-- are the part the two genuinely share: that rule applies the same
+-- uniqueness and validity guards to the name it is given, so "a name is
+-- chosen once and passes this check when it is" still holds of every
+-- bounded context, whichever of the two made it.
 
 rule AddBoundedContext {
     when: AddBoundedContext(caller, name)
@@ -2910,6 +2954,20 @@ rule ArchiveBoundedContext {
 -- observable end state: afterwards nothing anywhere answers a question
 -- about that context.
 --
+-- One effect does not fit that shape and so is stated outright below: a
+-- context deleted while other contexts were templated from it leaves
+-- those contexts standing. They are not scoped to it - each is a bounded
+-- context in its own right, with its own types, history and grants, all
+-- of which became its own at the moment they were registered (see the
+-- note above rule ApplyTemplateRegistrations) - so what the deletion
+-- takes from them is the link and nothing else. Each becomes an ordinary
+-- untemplated context: unchanged in what it holds and what it answers,
+-- and with nothing left to resync from. Being templated from is
+-- therefore not a claim on the template's continued existence, and no
+-- tenant makes its template undeletable. Deletion stays what it already
+-- was, an unconditional act depending on nothing outside the context
+-- being ended.
+--
 -- The name comes free again. AddBoundedContext's `not exists
 -- BoundedContext{name: name}` guard is true once more, so a later call
 -- may take the name back - and what it gets is a new bounded context with
@@ -2946,7 +3004,263 @@ rule DeleteBoundedContext {
     requires: bounded_context != admin
 
     ensures:
+        -- Any context templated from this one loses the link and nothing
+        -- else, becoming an ordinary untemplated bounded context. Stated
+        -- here rather than left to the cascade above because it is the one
+        -- effect that lands outside the deleted context: everything else
+        -- ceases to exist with it, while these contexts survive and are
+        -- merely amended. No new precondition comes with it - a tenant
+        -- does not make its template undeletable, and nothing is confirmed
+        -- or refused - since this is the data cleanup deletion implies, not
+        -- a decision of its own. See the note above.
+        for bc in BoundedContexts where template = bounded_context:
+            bc.template = null
         not exists bounded_context
+}
+
+-- The three rules below are one feature: a bounded context stamped out
+-- from another one's declared types, so that a deployment giving every
+-- tenant its own bounded context does not register the same
+-- EventTypes, CommandTypes and Projections by hand once per tenant. They
+-- belong to the same admin-operations group the note above
+-- AddBoundedContext describes, and carry the same eventual-dogfooding
+-- obligation as the rest of it.
+--
+-- The bar they are built to is an operational one: adding a tenant is an
+-- ops action, not a code change and not a redeploy. Everything a tenant
+-- context needs already exists as registered state on some other context,
+-- so what is missing is not a new kind of declaration but a way to say
+-- "that one, again, over here".
+--
+-- One level, deliberately. A context named as a template must have no
+-- template of its own (see invariant TemplateIsNeverItselfTemplated), so
+-- the picture is one edge deep: a template with tenants hanging off it,
+-- and nothing hanging off a tenant. What that buys is not tidiness but
+-- two questions never having to be answered.
+--
+-- The first is precedence. Registration rejects an incompatible schema
+-- outright rather than merging or preferring one (see
+-- schema_is_backwards_compatible in the note below), so a chain in which
+-- two levels both declare an event type of the same name under
+-- incompatible schemas has no resolution this file could state - the
+-- application would succeed or fail depending on which ancestor was
+-- walked first, which is not a contract. With one level there is exactly
+-- one source for any given name, and "what does this tenant get" is a
+-- lookup rather than a walk.
+--
+-- The second is cycles. Chained templates make A templating B templating
+-- A expressible, and ruling it out needs a transitive-closure check -
+-- something no invariant in this file can state, since an invariant reads
+-- current field values and navigates current relationships and nothing
+-- more. Capping the depth at one makes the cycle unconstructible instead
+-- of forbidden-and-hopefully-checked, which is the shape this file
+-- prefers wherever it can have it.
+--
+-- The cost is a deployment wanting a hierarchy of templates, which it
+-- does not get. That is accepted rather than overlooked: a second level
+-- can be added later without breaking anything written here, and nothing
+-- below assumes tenants are leaves other than the guard that makes them
+-- so.
+--
+-- Two departures from principles stated elsewhere in this file are
+-- deliberate, and both are stated rather than left to be noticed.
+--
+-- First, CreateBoundedContextFromTemplate creates a context and grants
+-- access into it in one call. The note above AddBoundedContext says
+-- plainly that those are two acts because they are two decisions, and
+-- that auto-granting on creation is the self-service path surface
+-- AccessManagement's SuperadminOnly guarantee rules out. That reasoning
+-- still holds for AddBoundedContext, which is untouched. It does not hold
+-- here, and the difference is which Role gets the grant: nothing is
+-- granted to the caller, so this is not a superadmin quietly acquiring
+-- access to what it just made. It is a superadmin naming, in one audited
+-- act, both the tenant context and the Role that operates it - which is a
+-- single decision, not two, and taking two calls to express it is the
+-- friction this whole feature exists to remove. The grant is still made
+-- on a Role's behalf by a superadmin, still explicitly, still at a level
+-- and sensitivity the superadmin chose; it is not made by, for, or as a
+-- convenience to whoever will use it.
+--
+-- Second, the type registrations these rules perform are not gated by an
+-- admin-level RoleAccessMapping the way RegisterEventType,
+-- RegisterCommandType and RegisterProjection are. They run on the
+-- superadmin's own authority, which is the authority that already creates
+-- and deletes bounded contexts outright. This is forced rather than
+-- chosen: the grant this rule makes is at whatever level the superadmin
+-- named, so it is not necessarily an admin one and cannot be what
+-- authorises anything; and ResyncBoundedContextFromTemplate names no
+-- mapping at all. A grant gate keeps a grant holder inside its own
+-- context, which is a bound a superadmin was never under.
+--
+-- What is not here is as decided as what is. Nothing propagates a
+-- template's later changes to its tenants on its own: a template that
+-- registers a new event type today reaches its tenants when, and only
+-- when, someone calls ResyncBoundedContextFromTemplate for each of them.
+-- Automatic propagation would make a deploy against one context an
+-- unbounded write across every other, which is exactly the kind of thing
+-- RegistrationNeverRebuilds exists to prevent. There is also no
+-- tenant-facing path: both rules face a superadmin, and a tenant cannot
+-- create itself, resync itself, or decline a resync.
+
+rule CreateBoundedContextFromTemplate {
+    when: CreateBoundedContextFromTemplate(caller, template, name, role, level,
+        can_read_sensitive)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+
+    -- The same two name guards AddBoundedContext applies, and the same
+    -- reasoning: this is the second and only other way a bounded context
+    -- name is chosen, so the gate that rule calls "the only gate a name
+    -- ever passes" has to be on both ways in or it is on neither.
+    requires: not exists BoundedContext{name: name}
+    requires: valid_bounded_context_name(name)
+
+    -- The context being stamped from has to exist and still be accepting
+    -- work. An archived one accepts no registration of its own, so its
+    -- declared types have stopped being a moving statement of what a
+    -- tenant should have and became a frozen record of what one once
+    -- did - and a tenant stamped out of it would be live from the moment
+    -- it was made, out of something that is not.
+    requires: template.status = active
+
+    -- One level. See the note above.
+    requires: template.template = null
+
+    -- Guards the grant below the same way GrantRoleAccessMapping does.
+    -- Its other guard - no active mapping for this pair already - is
+    -- vacuous here, since the context this grants on does not exist yet.
+    requires: role.status = active
+
+    ensures:
+        let creator = SuperadminCreator.created(role: caller)
+        let tenant = BoundedContext.created(
+            name: name,
+            status: active,
+            created_at: now,
+            created_by: creator,
+            template: template
+        )
+        RoleAccessMapping.created(
+            role: role,
+            bounded_context: tenant,
+            level: level,
+            can_read_sensitive: can_read_sensitive,
+            status: active,
+            created_at: now
+        )
+        TemplateApplicationDue(bounded_context: tenant, template: template)
+}
+
+-- How a template's later schema evolution reaches a tenant that already
+-- exists, and the only way it does. Safe to call as often as anyone
+-- likes: what it triggers is a resubmission of registrations, and a
+-- registration of an unchanged shape is already a no-op by construction
+-- (see the note below rule ApplyTemplateRegistrations and the
+-- reconciliation-loop note further down). Calling it on a tenant that is
+-- already in step therefore changes nothing at all.
+--
+-- The tenant has to be active, which the design of this rule inherits
+-- rather than invents: every registration it leads to requires an active
+-- bounded context, so a resync against an archived tenant would be a call
+-- that reports success and applies nothing. Refusing it outright is the
+-- same treatment RebuildProjection gives a projection with nothing
+-- staged.
+--
+-- The template has to be active too, for the reason
+-- CreateBoundedContextFromTemplate gives. A tenant whose template has
+-- been archived is not broken and is not degraded: it keeps serving
+-- everything it was already registered with, since what it inherited
+-- became its own at the moment it was registered. It simply has nothing
+-- new to be told, and says so rather than pretending to look.
+
+rule ResyncBoundedContextFromTemplate {
+    when: ResyncBoundedContextFromTemplate(caller, bounded_context)
+    requires: caller.status = active
+    requires: caller.superadmin = true
+    requires: bounded_context.status = active
+    requires: bounded_context.template != null
+    requires: bounded_context.template.status = active
+
+    ensures:
+        TemplateApplicationDue(
+            bounded_context: bounded_context,
+            template: bounded_context.template
+        )
+}
+
+-- What "applying a template" means, defined once and reached from both
+-- entry points above rather than written twice. Creation and resync
+-- differ in everything around this step - one makes a context and a
+-- grant, the other makes nothing - and in this step they are identical,
+-- which is the whole reason resync is safe to describe as "the same thing
+-- again".
+--
+-- Each of the three emissions below is a resubmission, not a copy. What
+-- it stands for is the template's current registration for that one type,
+-- submitted against bounded_context: the same schema, tag mappings,
+-- sensitive fields, permissions, consumed event types and sync flag the
+-- template declares at this moment, run through the same guards and the
+-- same outcomes RegisterEventType, RegisterCommandType and
+-- RegisterProjection apply to any other registration. That distinction is
+-- load-bearing in four places:
+--   - valid_schema, valid_tag_mappings, valid_sensitive_fields and the
+--     tag/sensitive-field overlap check are re-run against the tenant's
+--     own registration rather than assumed from the template's.
+--   - schema_version is the tenant's own. A first application registers
+--     at version 1 however far the template has evolved, and a later
+--     resync advances it only when the schema text actually changed for
+--     this tenant.
+--   - schema_is_backwards_compatible governs a resync exactly as it
+--     governs a deploy. A template whose schema evolved incompatibly
+--     cannot push that break into a tenant; the resubmission is rejected,
+--     and the tenant carries on with what it has.
+--   - a projection is staged, not rebuilt. A resync that changes a
+--     tenant's projection definition non-trivially leaves the live
+--     projection answering exactly what it answered before and waits for
+--     an explicit RebuildProjection, precisely as a deploy does (see
+--     RegisterProjection and TypeRegistration's RegistrationNeverRebuilds).
+--     A resync never replays a stream.
+-- Copying rows would have all four of those wrong, so the file says
+-- resubmission and means it. The mechanism by which the resubmission
+-- happens is left to the implementation, in the same register as
+-- DeleteBoundedContext's cascade: what is stated here is which
+-- registrations are owed and what each one is equivalent to.
+--
+-- Nothing is ever removed by this. A tenant that has an event type the
+-- template does not is left holding it: the template names what a tenant
+-- must have, never what it may not, and un-registering is not an
+-- operation this file has at all. A resync is additive in exactly the way
+-- every registration is.
+--
+-- The order of the three loops is the reconciliation loop's order, and
+-- for the reason stated there: event types before command types, so that
+-- a CommandType consistency-checking on a tag key becomes submittable
+-- only after the EventType declaring that key has landed
+-- (ConsistencyTagKeysAreDeclared), and projections last, which
+-- RegisterProjection's Set<EventType> argument already forces. An
+-- application is the same pass a deploy makes, so it is made in the same
+-- order.
+--
+-- The guards are the ones the entry points already checked, restated here
+-- because this rule is reached by a chained trigger and a guard that only
+-- exists at the emitting rule is a guard on one path rather than on the
+-- act. The template link in particular is checked from the tenant's own
+-- field, so no caller and no chain can apply an arbitrary context's
+-- registrations to a context that is not its tenant.
+
+rule ApplyTemplateRegistrations {
+    when: TemplateApplicationDue(bounded_context, template)
+    requires: bounded_context.template = template
+    requires: bounded_context.status = active
+    requires: template.status = active
+
+    ensures:
+        for source in template.event_types:
+            TemplateEventTypeApplied(bounded_context: bounded_context, source: source)
+        for source in template.command_types:
+            TemplateCommandTypeApplied(bounded_context: bounded_context, source: source)
+        for source in template.projections:
+            TemplateProjectionApplied(bounded_context: bounded_context, source: source)
 }
 
 -- RegisterEventType, RegisterCommandType and RegisterProjection below are
@@ -4200,6 +4514,22 @@ invariant AdminContextIsPermanent {
     admin.status = active
 }
 
+invariant TemplateIsNeverItselfTemplated {
+    -- One level, and this is what makes it one. A context named as some
+    -- other context's template has no template of its own, so a tenant is
+    -- never a template and the chain nobody wants to walk cannot be built
+    -- - see the note above rule CreateBoundedContextFromTemplate for why
+    -- precedence and cycles are the two questions this closes.
+    --
+    -- Stating it here rather than leaving it to
+    -- CreateBoundedContextFromTemplate's guard is the same move
+    -- AdminContextIsPermanent makes: the property is checkable in its own
+    -- right, so a later rule that also sets a template cannot quietly
+    -- reintroduce the second level.
+    for bc in BoundedContexts:
+        bc.template != null implies bc.template.template = null
+}
+
 invariant RevokedRoleImpliesMappingsRevoked {
     for r in Roles:
         r.status = revoked implies r.access_mappings.all(t => t.status = revoked)
@@ -5404,6 +5734,7 @@ surface BoundedContextDirectory {
             bounded_context.status
             bounded_context.created_at
             bounded_context.created_by
+            bounded_context.template
             for mapping in bounded_context.access_mappings:
                 mapping.role.name
                 mapping.role.id
@@ -5434,10 +5765,117 @@ surface BoundedContextDirectory {
         -- it only answers "who currently has what access to this bounded
         -- context" in one place, instead of a separate query per context.
         --
+        -- The template comes with it for a plainer reason: without it
+        -- nothing anywhere tells a superadmin which contexts are tenants,
+        -- of what, and which are templates - and
+        -- ResyncBoundedContextFromTemplate on surface
+        -- BoundedContextTemplating is an action nobody can aim without
+        -- knowing that. Absent for the ordinary case, which is most of
+        -- them.
+        --
         -- Wire contract deferred as everywhere else: result shape, paging
         -- and cursor encoding, and GraphQL type and argument naming stay
         -- with the rest of that contract (see the scope header's
         -- exclusions).
+}
+
+surface BoundedContextTemplating {
+    facing caller: Superadmin
+
+    provides:
+        CreateBoundedContextFromTemplate(caller, template, name, role, level,
+            can_read_sensitive)
+        ResyncBoundedContextFromTemplate(caller, bounded_context)
+
+    @guarantee SuperadminOnly
+        -- Both actions are operations on the set of contexts a deployment
+        -- has rather than operations within one, so both are gated by
+        -- Role.superadmin rather than by a per-context RoleAccessMapping -
+        -- the same bar BoundedContextCreation and BoundedContextDeletion
+        -- are at, for the same reason. That extends to the type
+        -- registrations an application performs: they run on the
+        -- superadmin's authority, not on the grant this surface makes and
+        -- not on any grant the tenant holds (see the note above rule
+        -- CreateBoundedContextFromTemplate).
+
+    @guarantee AccessGrantedWithCreation
+        -- Creating a templated context grants access into it in the same
+        -- call, and this is the one place in this spec where creation and
+        -- granting are a single act. It is a stated exception to the
+        -- principle the note above rule AddBoundedContext sets out - that
+        -- the two are separate because they are two decisions - not an
+        -- erosion of it: AddBoundedContext still grants nothing to
+        -- anybody, and nothing here grants anything to the caller. What
+        -- this action does is let a superadmin name the tenant context and
+        -- the Role that operates it in one audited decision, at a level
+        -- and sensitivity it chose explicitly. There is still no
+        -- self-service path and no grant that arrives as a by-product of
+        -- something else.
+
+    @guarantee TemplateIsNeverATenant
+        -- A context named as a template has no template of its own, so
+        -- templating is exactly one level deep and a tenant can never
+        -- become somebody else's template. Enforced as a guard and
+        -- restated as invariant TemplateIsNeverItselfTemplated; see the
+        -- note above rule CreateBoundedContextFromTemplate for why
+        -- precedence and cycles are the two things this closes.
+
+    @guarantee PropagationIsAlwaysAsked
+        -- A template's later changes never reach its tenants on their own.
+        -- Registering a new event type against a template writes nothing
+        -- to any tenant; a tenant changes only when someone calls
+        -- ResyncBoundedContextFromTemplate for that tenant. There is no
+        -- schedule, no cascade and no fan-out on deploy, and a deployment
+        -- with a thousand tenants makes a thousand explicit calls or none.
+
+    @guarantee ResyncIsRepeatableAndAdditive
+        -- Resyncing is safe to repeat: every registration it triggers is
+        -- the same idempotent upsert a deploy-time reconciliation loop
+        -- performs, so a tenant already in step is left exactly as it was.
+        -- It never removes anything either - a type a tenant has and the
+        -- template does not is untouched - and it never replays a stream:
+        -- a projection change that cannot honestly be applied in place is
+        -- staged and waits for an explicit RebuildProjection, exactly as
+        -- on TypeRegistration (see RegistrationNeverRebuilds).
+
+    @guidance
+        -- Exposed as GraphQL mutations, alongside the other
+        -- superadmin-facing bounded context operations. This is the
+        -- ops-facing answer to "one bounded context per tenant": adding a
+        -- tenant is one call by an operator, with no code change, no
+        -- redeploy and no per-tenant registration pass.
+        --
+        -- No context binding, for the same reason surface
+        -- AccessManagement has none: a superadmin already reaches every
+        -- bounded context, so the template and the tenant are named as
+        -- arguments rather than scoped by the surface. Which contexts are
+        -- templates and which are tenants is read from surface
+        -- BoundedContextDirectory, which shows each context's template.
+        --
+        -- The two actions are here together because they are one
+        -- lifecycle: creation stamps a tenant out of a template's current
+        -- registrations, and resync is the same stamping applied again
+        -- later. Everything about what "applying a template" means - and
+        -- in particular that it is a resubmission of registrations rather
+        -- than a copy of rows - is in the note above rule
+        -- ApplyTemplateRegistrations.
+        --
+        -- What a superadmin still has to do by hand is everything outside
+        -- the template's declared types: this creates no tokens, no
+        -- subscriptions and no further grants, and it does not archive or
+        -- delete anything. A templated context is archived and deleted
+        -- through BoundedContextArchival and BoundedContextDeletion like
+        -- any other, and so is a template: archiving one leaves its
+        -- tenants holding everything they have with nowhere new to resync
+        -- from, and deleting one leaves them holding it as ordinary
+        -- untemplated contexts, since DeleteBoundedContext clears the link
+        -- on each of them (see the note above that rule). Neither
+        -- operation is refused on account of a tenant, and neither takes
+        -- anything away from one.
+        --
+        -- Wire contract deferred as everywhere else: argument and result
+        -- shapes, and GraphQL type and mutation naming, stay with the rest
+        -- of that contract (see the scope header's exclusions).
 }
 
 surface SuperadminBootstrap {
@@ -5508,8 +5946,21 @@ surface AccessManagement {
 -- Open Questions
 ------------------------------------------------------------
 
--- None. What a scheduler owes for an occurrence it was not running for,
--- the last question standing here, is now answered - and answered by
+-- None. What a deleted template leaves behind, the question templated
+-- tenants arrived with, is answered where the deletion itself happens
+-- rather than here: DeleteBoundedContext clears the template link on
+-- every context templated from the one it ends, so each of them becomes
+-- an ordinary untemplated bounded context and carries on with everything
+-- it was registered with. Deletion stays unconditional, depending on
+-- nothing outside the context being deleted - which is exactly why the
+-- other candidate answer, refusing the deletion while any tenant still
+-- references the template, was not taken. Archival needs no answer of its
+-- own: a tenant whose template is archived keeps everything and merely
+-- has nowhere new to be resynced from (see the note above rule
+-- ResyncBoundedContextFromTemplate).
+--
+-- What a scheduler owes for an occurrence it was not running for,
+-- the question standing here before that one, is answered - and answered by
 -- refusing to answer it once for everybody. Both directions can lose or
 -- duplicate real work, so the choice is the bounded context author's:
 -- EventType.missed_occurrence_policy is stated per event type at

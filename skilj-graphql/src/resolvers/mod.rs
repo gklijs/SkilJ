@@ -58,6 +58,7 @@ pub mod bounded_context_archival;
 pub mod bounded_context_creation;
 pub mod bounded_context_deletion;
 pub mod bounded_context_directory;
+pub mod bounded_context_templating;
 pub mod command_query;
 pub mod command_submission;
 pub mod command_type_admin_operations;
