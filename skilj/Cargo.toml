@@ -25,6 +25,12 @@ serde_json.workspace = true
 inventory = "0.3"
 tracing.workspace = true
 opentelemetry.workspace = true
+# Codeberg issue #15: bounded concurrent fan-out over per-bounded-context
+# work in SkiljBuilder::build()'s startup warm-up and the background
+# pollers (buffer_unordered) - was previously only a dev-dependency
+# (used in skilj/tests/ for WebSocket stream handling), promoted to a
+# real dependency now that src/lib.rs uses it too.
+futures-util.workspace = true
 
 [dev-dependencies]
 postgresql_embedded = "0.21.0"
@@ -35,4 +41,3 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken.workspace = true
 tokio-tungstenite = "0.29"
-futures-util = "0.3"

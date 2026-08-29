@@ -35,10 +35,21 @@ impl ProjectionDispatcher for TestDispatcher {
         event: &Event,
     ) -> Option<Vec<String>> {
         match projection_name {
-            "AccountBalance" if event.event_type.name == "MoneyDeposited" => {
+            // Codeberg issue #15: "AccountBalanceCopy" is a second,
+            // identically-behaved registered name - existing only so
+            // `two_registered_projections_with_only_one_building_are_not_confused`
+            // below has two real projections to distinguish, proving the
+            // new batched `list_building_projection_rebuilds_for_bounded_context`
+            // attributes each `projection_rebuilds` row (and its own
+            // `consumed_event_types`) to the *correct* projection rather
+            // than mixing the two up - a risk one projection alone can't
+            // expose.
+            "AccountBalance" | "AccountBalanceCopy"
+                if event.event_type.name == "MoneyDeposited" =>
+            {
                 Some(vec![String::new()])
             }
-            "AccountBalance" => Some(Vec::new()),
+            "AccountBalance" | "AccountBalanceCopy" => Some(Vec::new()),
             _ => None,
         }
     }
@@ -52,7 +63,7 @@ impl ProjectionDispatcher for TestDispatcher {
         _key: &str,
     ) -> Option<skilj_core::error::Result<String>> {
         match projection_name {
-            "AccountBalance" => {
+            "AccountBalance" | "AccountBalanceCopy" => {
                 if event.event_type.name != "MoneyDeposited" {
                     return Some(Ok(state_json.to_string()));
                 }
@@ -70,7 +81,7 @@ impl ProjectionDispatcher for TestDispatcher {
 
     fn default_state(&self, _bounded_context: &str, projection_name: &str) -> Option<String> {
         match projection_name {
-            "AccountBalance" => Some("0".to_string()),
+            "AccountBalance" | "AccountBalanceCopy" => Some("0".to_string()),
             _ => None,
         }
     }
@@ -450,6 +461,115 @@ fn a_building_rebuild_replays_from_the_start_and_promotes_once_caught_up() {
         assert_eq!(promoted.schema_version, 2);
         assert_eq!(promoted.caught_up_to, Some(last_seq));
 
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                .await
+                .unwrap(),
+            Some("25".to_string())
+        );
+    });
+}
+
+/// Codeberg issue #15: `catch_up_bounded_context`'s rebuild-check now
+/// runs one batched query for every `building` rebuild in the bounded
+/// context, rather than one `get_projection_rebuild` call per registered
+/// projection - real risk that's new to that batching: incorrectly
+/// attributing a `projection_rebuilds` row (or its own
+/// `consumed_event_types`) to the wrong projection when more than one is
+/// registered. Two real, differently-scoped projections, only one of
+/// them building - the other must be completely untouched by the
+/// rebuild machinery (its own schema/schema_version stay exactly what
+/// they were, promoted via the ordinary fold path only), and the
+/// building one must promote with its *own* schema/schema_version/state,
+/// not the other's.
+#[test]
+fn two_registered_projections_with_only_one_building_are_not_confused() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+
+        let unchanged = seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        seed_async_projection(&pool, &bc, "AccountBalanceCopy", vec![et.clone()]).await;
+
+        insert_plain_event(&pool, &bc, &et, 20).await;
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        // Only "AccountBalanceCopy" gets a building rebuild - "AccountBalance"
+        // stays a plain, never-rebuilt projection throughout.
+        let rebuild = ProjectionRebuild {
+            projection: db::get_projection(&pool, &bc.name, "AccountBalanceCopy")
+                .await
+                .unwrap()
+                .unwrap(),
+            schema: r#"{"properties":{"total":{"type":"integer"}}}"#.to_string(),
+            schema_version: 2,
+            consumed_event_types: vec![et.clone()],
+            sync: false,
+            caught_up_to: None,
+            status: ProjectionRebuildStatus::Building,
+        };
+        db::upsert_projection_rebuild(&pool, &rebuild)
+            .await
+            .unwrap();
+
+        let last_seq = insert_plain_event(&pool, &bc, &et, 5).await;
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        // The building rebuild promoted for real, with its own schema -
+        // proves the batched fetch found it at all (not silently dropped).
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalanceCopy",
+            ProjectionRebuildStatus::Building
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let promoted_copy = db::get_projection(&pool, &bc.name, "AccountBalanceCopy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted_copy.schema, rebuild.schema);
+        assert_eq!(promoted_copy.schema_version, 2);
+        assert_eq!(promoted_copy.caught_up_to, Some(last_seq));
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalanceCopy", "")
+                .await
+                .unwrap(),
+            Some("25".to_string())
+        );
+
+        // The *other* projection was never touched by the rebuild
+        // machinery at all - its own schema/schema_version are exactly
+        // what they were seeded with, never "AccountBalanceCopy"'s.
+        // Proves the batched query didn't attribute the building row (or
+        // its consumed_event_types) to the wrong projection.
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Building
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let plain = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.schema, unchanged.schema);
+        assert_eq!(plain.schema_version, unchanged.schema_version);
+        // Caught up via the ordinary fold path, same as any registered
+        // async projection with no rebuild in flight.
+        assert_eq!(plain.caught_up_to, Some(last_seq));
         assert_eq!(
             db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
                 .await

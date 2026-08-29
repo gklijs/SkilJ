@@ -17,6 +17,7 @@
 //! and this bounded context's raw `Event`s into `T::decide()`. See
 //! `RegisteredCommandType`'s own doc comment for the closure itself.
 
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::KeyValue;
 use skilj_core::access_control::{AccessLevel, JwksCache, RevocationBroadcaster, Role};
@@ -51,6 +52,17 @@ static BACKGROUND_TASK_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("Errors encountered by a skilj background task.")
         .build()
 });
+
+/// Codeberg issue #15: how many bounded contexts `SkiljBuilder::build()`'s
+/// own startup warm-up loop and each background poller tick work on at
+/// once, rather than one at a time in a plain sequential `for` loop -
+/// each bounded context's own work is fully independent (its own
+/// Postgres schema, no shared mutable state with any other), so this is
+/// purely a throughput knob, not a correctness one. A fixed constant for
+/// now, not a `SkiljBuilder` tunable - the "lower-risk incremental fix"
+/// this issue's own open questions asked about; easy to expose as a
+/// builder option later if a real need for tuning it ever comes up.
+const BACKGROUND_TASK_CONCURRENCY: usize = 16;
 
 /// Re-exported so a crate using `#[auto_register]` (whose expansion emits
 /// `::skilj::inventory::submit! { ... }`) needs only its existing `skilj`
@@ -1174,20 +1186,38 @@ impl SkiljBuilder {
         // later starts its own window from empty on first touch -
         // `EventCache::append`/`try_events_after`'s own doc comments -
         // which is already correct, not a gap this loop needs to cover.
+        //
+        // Codeberg issue #15: run concurrently, `BACKGROUND_TASK_CONCURRENCY`
+        // at a time, rather than one bounded context at a time - this used
+        // to be a plain sequential `for` loop with `.await` inside, so
+        // startup latency scaled linearly with bounded-context count.
+        // Each iteration only ever touches its own bounded context's own
+        // schema, so nothing here is shared mutable state across
+        // iterations - safe to run out of order.
         let event_cache = EventCache::new(self.event_cache_warm_up_count);
-        for bc in skilj_core::db::list_bounded_contexts(&pool).await? {
-            event_cache.warm(&pool, &bc.name).await?;
-            // Codeberg issue #12: `idempotency_keys` patched into every
-            // bounded context, every startup - including ones
-            // provisioned before this feature existed, since
-            // `provision_bounded_context_schema` itself only ever runs
-            // once, at creation, and there's no general per-bounded-
-            // context migration mechanism in this codebase. `CREATE
-            // TABLE IF NOT EXISTS` makes this free once the table
-            // already exists - see `ensure_idempotency_keys_table`'s own
-            // doc comment.
-            skilj_core::db::ensure_idempotency_keys_table(&pool, &bc.name).await?;
-        }
+        let bounded_contexts_for_warm_up = skilj_core::db::list_bounded_contexts(&pool).await?;
+        stream::iter(bounded_contexts_for_warm_up)
+            .map(|bc| {
+                let pool = &pool;
+                let event_cache = &event_cache;
+                async move {
+                    event_cache.warm(pool, &bc.name).await?;
+                    // Codeberg issue #12: `idempotency_keys` patched into
+                    // every bounded context, every startup - including
+                    // ones provisioned before this feature existed, since
+                    // `provision_bounded_context_schema` itself only ever
+                    // runs once, at creation, and there's no general
+                    // per-bounded-context migration mechanism in this
+                    // codebase. `CREATE TABLE IF NOT EXISTS` makes this
+                    // free once the table already exists - see
+                    // `ensure_idempotency_keys_table`'s own doc comment.
+                    skilj_core::db::ensure_idempotency_keys_table(pool, &bc.name).await?;
+                    Ok::<(), skilj_core::Error>(())
+                }
+            })
+            .buffer_unordered(BACKGROUND_TASK_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await?;
 
         // The initial GraphQL schema (Codeberg issue #2; `@guarantee
         // RegistrationReachesEveryInstance`) - built here, ahead of
@@ -1260,28 +1290,39 @@ impl SkiljBuilder {
                 async {
                     match skilj_core::db::list_bounded_contexts(&poll_pool).await {
                         Ok(bounded_contexts) => {
-                            for bc in bounded_contexts {
-                                if let Err(e) = skilj_core::db::catch_up_bounded_context(
-                                    &poll_pool,
-                                    &bc.name,
-                                    poll_dispatcher.as_ref(),
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        bounded_context = %bc.name,
-                                        error = %e,
-                                        "async projection catch-up failed"
-                                    );
-                                    BACKGROUND_TASK_ERRORS.add(
-                                        1,
-                                        &[
-                                            KeyValue::new("task", "async_projection"),
-                                            KeyValue::new("reason", "catch_up_failed"),
-                                        ],
-                                    );
-                                }
-                            }
+                            // Codeberg issue #15: concurrent, not one bc
+                            // at a time - each bc's own catch-up only
+                            // ever touches its own schema, so nothing
+                            // here is shared mutable state across
+                            // iterations.
+                            stream::iter(bounded_contexts)
+                                .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
+                                    let poll_pool = poll_pool.clone();
+                                    let poll_dispatcher = poll_dispatcher.clone();
+                                    async move {
+                                        if let Err(e) = skilj_core::db::catch_up_bounded_context(
+                                            &poll_pool,
+                                            &bc.name,
+                                            poll_dispatcher.as_ref(),
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                bounded_context = %bc.name,
+                                                error = %e,
+                                                "async projection catch-up failed"
+                                            );
+                                            BACKGROUND_TASK_ERRORS.add(
+                                                1,
+                                                &[
+                                                    KeyValue::new("task", "async_projection"),
+                                                    KeyValue::new("reason", "catch_up_failed"),
+                                                ],
+                                            );
+                                        }
+                                    }
+                                })
+                                .await;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1326,28 +1367,37 @@ impl SkiljBuilder {
                 async {
                     match skilj_core::db::list_bounded_contexts(&snapshot_pool).await {
                         Ok(bounded_contexts) => {
-                            for bc in bounded_contexts {
-                                if let Err(e) = skilj_core::db::catch_up_snapshots(
-                                    &snapshot_pool,
-                                    &bc.name,
-                                    snapshot_dispatcher.as_ref(),
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        bounded_context = %bc.name,
-                                        error = %e,
-                                        "snapshot catch-up failed"
-                                    );
-                                    BACKGROUND_TASK_ERRORS.add(
-                                        1,
-                                        &[
-                                            KeyValue::new("task", "snapshot"),
-                                            KeyValue::new("reason", "catch_up_failed"),
-                                        ],
-                                    );
-                                }
-                            }
+                            // Codeberg issue #15: concurrent, same
+                            // reasoning as the async-projection task
+                            // above.
+                            stream::iter(bounded_contexts)
+                                .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
+                                    let snapshot_pool = snapshot_pool.clone();
+                                    let snapshot_dispatcher = snapshot_dispatcher.clone();
+                                    async move {
+                                        if let Err(e) = skilj_core::db::catch_up_snapshots(
+                                            &snapshot_pool,
+                                            &bc.name,
+                                            snapshot_dispatcher.as_ref(),
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                bounded_context = %bc.name,
+                                                error = %e,
+                                                "snapshot catch-up failed"
+                                            );
+                                            BACKGROUND_TASK_ERRORS.add(
+                                                1,
+                                                &[
+                                                    KeyValue::new("task", "snapshot"),
+                                                    KeyValue::new("reason", "catch_up_failed"),
+                                                ],
+                                            );
+                                        }
+                                    }
+                                })
+                                .await;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1655,88 +1705,94 @@ async fn scheduler_tick(
             return;
         }
     };
-    for bc in &bounded_contexts {
-        if bc.status != skilj_core::event_store::BoundedContextStatus::Active {
-            continue;
+    // Codeberg issue #15: concurrent, same reasoning as the async-
+    // projection/snapshot tasks - each bounded context's own schedule
+    // check only ever touches its own schema. The per-event-type/
+    // per-occurrence walk *within* one bounded context stays exactly as
+    // sequential as it already was (`scheduler_tick_for_bounded_context`
+    // below is an unmodified extraction of what this loop's body already
+    // did, not a behaviour change).
+    stream::iter(&bounded_contexts)
+        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
+            scheduler_tick_for_bounded_context(
+                pool,
+                projection_dispatcher,
+                event_dispatcher,
+                broadcaster,
+                event_cache,
+                encryption_master_key,
+                now,
+                bc,
+            )
+        })
+        .await;
+}
+
+/// One bounded context's own share of `scheduler_tick` - an unmodified
+/// extraction of what used to be that function's own loop body, so
+/// Codeberg issue #15's `for_each_concurrent` fan-out has something to
+/// call per bounded context.
+#[allow(clippy::too_many_arguments)]
+async fn scheduler_tick_for_bounded_context(
+    pool: &Pool,
+    projection_dispatcher: &dyn skilj_core::plugin::ProjectionDispatcher,
+    event_dispatcher: &dyn skilj_core::plugin::EventDispatcher,
+    broadcaster: &EventBroadcaster,
+    event_cache: &EventCache,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: chrono::DateTime<chrono::Utc>,
+    bc: &skilj_core::event_store::BoundedContext,
+) {
+    if bc.status != skilj_core::event_store::BoundedContextStatus::Active {
+        return;
+    }
+    let scheduled = match skilj_core::db::list_scheduled_event_types(pool, &bc.name).await {
+        Ok(scheduled) => scheduled,
+        Err(e) => {
+            tracing::warn!(
+                bounded_context = %bc.name,
+                error = %e,
+                "scheduler failed to list scheduled event types"
+            );
+            BACKGROUND_TASK_ERRORS.add(
+                1,
+                &[
+                    KeyValue::new("task", "scheduler"),
+                    KeyValue::new("reason", "list_scheduled_event_types_failed"),
+                ],
+            );
+            return;
         }
-        let scheduled = match skilj_core::db::list_scheduled_event_types(pool, &bc.name).await {
-            Ok(scheduled) => scheduled,
-            Err(e) => {
-                tracing::warn!(
-                    bounded_context = %bc.name,
-                    error = %e,
-                    "scheduler failed to list scheduled event types"
-                );
-                BACKGROUND_TASK_ERRORS.add(
-                    1,
-                    &[
-                        KeyValue::new("task", "scheduler"),
-                        KeyValue::new("reason", "list_scheduled_event_types_failed"),
-                    ],
-                );
-                continue;
-            }
+    };
+    for et in &scheduled {
+        let (Some(schedule), Some(policy), Some(initial_position)) = (
+            &et.system_triggered_schedule,
+            et.missed_occurrence_policy,
+            et.schedule_position,
+        ) else {
+            continue;
         };
-        for et in &scheduled {
-            let (Some(schedule), Some(policy), Some(initial_position)) = (
-                &et.system_triggered_schedule,
-                et.missed_occurrence_policy,
-                et.schedule_position,
-            ) else {
-                continue;
+
+        let mut cursor = initial_position;
+        for _ in 0..MAX_OCCURRENCES_PER_TICK {
+            let Some(occurrence_at) =
+                skilj_core::event_store::next_occurrence_after(schedule, cursor)
+            else {
+                break;
             };
+            if occurrence_at > now {
+                break;
+            }
 
-            let mut cursor = initial_position;
-            for _ in 0..MAX_OCCURRENCES_PER_TICK {
-                let Some(occurrence_at) =
-                    skilj_core::event_store::next_occurrence_after(schedule, cursor)
-                else {
-                    break;
-                };
-                if occurrence_at > now {
-                    break;
-                }
+            let nothing_later_is_due =
+                skilj_core::event_store::next_occurrence_after(schedule, occurrence_at)
+                    .is_none_or(|next| next > now);
 
-                let nothing_later_is_due =
-                    skilj_core::event_store::next_occurrence_after(schedule, occurrence_at)
-                        .is_none_or(|next| next > now);
-
-                if policy == skilj_core::event_store::MissedOccurrencePolicy::Skip
-                    && !nothing_later_is_due
-                {
-                    if let Err(e) = skilj_core::db::skip_missed_occurrences_for_event_type(
-                        pool, &bc.name, &et.name, now,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            bounded_context = %bc.name,
-                            event_type = %et.name,
-                            error = %e,
-                            "SkipMissedOccurrences failed"
-                        );
-                        BACKGROUND_TASK_ERRORS.add(
-                            1,
-                            &[
-                                KeyValue::new("task", "scheduler"),
-                                KeyValue::new("reason", "skip_missed_occurrences_failed"),
-                            ],
-                        );
-                    }
-                    break;
-                }
-
-                if let Err(e) = skilj_core::db::fire_system_event(
-                    pool,
-                    projection_dispatcher,
-                    event_dispatcher,
-                    broadcaster,
-                    event_cache,
-                    &bc.name,
-                    &et.name,
-                    occurrence_at,
-                    now,
-                    encryption_master_key,
+            if policy == skilj_core::event_store::MissedOccurrencePolicy::Skip
+                && !nothing_later_is_due
+            {
+                if let Err(e) = skilj_core::db::skip_missed_occurrences_for_event_type(
+                    pool, &bc.name, &et.name, now,
                 )
                 .await
                 {
@@ -1744,24 +1800,54 @@ async fn scheduler_tick(
                         bounded_context = %bc.name,
                         event_type = %et.name,
                         error = %e,
-                        "CreateSystemEvent failed"
+                        "SkipMissedOccurrences failed"
                     );
                     BACKGROUND_TASK_ERRORS.add(
                         1,
                         &[
                             KeyValue::new("task", "scheduler"),
-                            KeyValue::new("reason", "create_system_event_failed"),
+                            KeyValue::new("reason", "skip_missed_occurrences_failed"),
                         ],
                     );
-                    break;
                 }
-
-                // Whether this occurrence actually produced an event
-                // (`fire_once` rejects every one but a backlog's own
-                // last) or not, this tick's own search has to move past
-                // it - see this function's own doc comment for why.
-                cursor = occurrence_at;
+                break;
             }
+
+            if let Err(e) = skilj_core::db::fire_system_event(
+                pool,
+                projection_dispatcher,
+                event_dispatcher,
+                broadcaster,
+                event_cache,
+                &bc.name,
+                &et.name,
+                occurrence_at,
+                now,
+                encryption_master_key,
+            )
+            .await
+            {
+                tracing::warn!(
+                    bounded_context = %bc.name,
+                    event_type = %et.name,
+                    error = %e,
+                    "CreateSystemEvent failed"
+                );
+                BACKGROUND_TASK_ERRORS.add(
+                    1,
+                    &[
+                        KeyValue::new("task", "scheduler"),
+                        KeyValue::new("reason", "create_system_event_failed"),
+                    ],
+                );
+                break;
+            }
+
+            // Whether this occurrence actually produced an event
+            // (`fire_once` rejects every one but a backlog's own
+            // last) or not, this tick's own search has to move past
+            // it - see this function's own doc comment for why.
+            cursor = occurrence_at;
         }
     }
 }

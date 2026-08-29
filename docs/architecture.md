@@ -4059,3 +4059,130 @@ set of events actually exists. Full existing regression suite passes
 unchanged - proving the "no key ⇒ zero behaviour change" property for
 real. `cargo build/clippy/test --workspace` clean; `allium check` clean
 on the spec change.
+
+## 22. Background-polling and startup scaling (Codeberg issue #15)
+
+`SkiljBuilder::build()`'s startup warm-up loop and all three
+per-bounded-context background pollers (async-projection catch-up,
+snapshot catch-up, scheduler tick) redid real, uncached work for *every*
+bounded context on *every* tick, sequentially, with no early-exit before
+real cost was paid. Direct code reading (not just the investigation
+that raised this issue) found it went deeper than first estimated:
+`catch_up_bounded_context`'s per-projection rebuild check called
+`get_projection_rebuild`, which itself issued 3 queries per call
+(`get_projection`, the rebuild row, `rebuild_consumed_event_types`) -
+and `rebuild_consumed_event_types` had its **own** inner N+1
+(`get_event_type` per consumed event type name). A bounded context with
+`P` registered projections paid roughly `2P` queries every 500ms tick in
+the common "nothing building" case, not just `P`, before its own
+early-exit even fired.
+
+Raised while investigating a "route commands to specific instances"
+idea for multi-tenancy (Codeberg issue #13) - that idea was not
+adopted: every skilj instance is fully interchangeable for any bounded
+context today, a deliberate, twice-confirmed design decision (§12), and
+building instance routing would have reversed it for no correctness
+benefit. The real, underlying performance concern was legitimate, just
+aimed at the wrong fix - this section is that fix, entirely orthogonal
+to instance routing/affinity, which stays untouched.
+
+### Fix 1: `db::list_bounded_contexts`'s N+1
+
+Used to call `get_role` once per row with a `created_by_role_id`.
+`db::list_roles` already fetches every `Role` in one query - reused
+instead: one full-table fetch plus an in-memory `HashMap` lookup
+replaces what was one query per row.
+
+### Fix 2: `SkiljBuilder::build()`'s startup loop, and Fix 5: all three background pollers
+
+All four used to be a plain sequential `for bc in list_bounded_contexts(...)
+{ <per-bc work>.await }` - no concurrency, so cost scaled linearly with
+bounded-context count. Each bounded context's own work only ever
+touches its own Postgres schema, so nothing is shared mutable state
+across iterations - safe to run concurrently. Converted to
+`futures_util::stream::iter(...).buffer_unordered(BACKGROUND_TASK_CONCURRENCY)`
+(startup, needs real error propagation, `try_collect`) /
+`.for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, ...)` (the three
+pollers, which already handle their own per-bc errors inline - no
+propagation needed). `BACKGROUND_TASK_CONCURRENCY` is a fixed constant
+(16), not a new `SkiljBuilder` tunable - the lower-risk incremental fix
+the issue's own open questions asked about; easy to expose as a builder
+option later if a real need for tuning it ever comes up.
+`scheduler_tick`'s own per-bc body (real side-effecting logic - firing
+system events, tracking missed occurrences) was extracted verbatim into
+`scheduler_tick_for_bounded_context` first, a pure mechanical
+extraction with no logic change, so the concurrent fan-out had a
+function to call per bounded context without touching the delicate
+inner per-event-type/per-occurrence walk at all - that inner loop stays
+exactly as sequential as it always was within one bounded context's own
+turn.
+
+`futures-util` was already a workspace dependency but only a
+`skilj`-crate *dev*-dependency (used in its own tests for WebSocket
+handling) - promoted to a real dependency now that `src/lib.rs` uses it
+too.
+
+**Verified empirically, not just reasoned about from the code shape**:
+a new test times the identical warm-up work (`EventCache::warm` +
+`ensure_idempotency_keys_table`) both sequentially and concurrently
+against 40 real, seeded bounded contexts in the same test run - a real
+A/B comparison, not a before/after across separate commits. Measured
+result on a local, low-latency embedded Postgres: sequential 63.5ms,
+concurrent (×16) 28.7ms - roughly 2.2x, with the gap expected to be
+larger over a real network deployment where the per-round-trip latency
+this concurrency overlaps is higher.
+
+### Fix 3: `db::catch_up_bounded_context`'s rebuild-check loop
+
+Replaced the per-projection `get_projection_rebuild` loop with one new
+batched function, `list_building_projection_rebuilds_for_bounded_context`:
+one query for every `building` row in the bc's `projection_rebuilds`
+table, one for every row in `projection_rebuild_consumed_event_types`
+(grouped by `projection_name` in memory), one for every `EventType` in
+the bc (`list_event_types_for_bounded_context`, already a single
+query), and zero further queries for the live `Projection` each rebuild
+belongs to - `all_projections` is data `catch_up_bounded_context`
+already had in hand, handed in rather than re-fetched via `get_project`
+per row the way `get_projection_rebuild` does for its own single-row
+callers (`RebuildProjection`/`DiscardProjectionRebuild`'s resolvers -
+untouched, a single lookup is the right shape there). Net: the whole
+rebuild-check phase drops from up to `~2P` queries to a small constant
+number (3-4) regardless of `P` or how many rebuilds are in flight.
+
+**A real, targeted regression test, not just reliance on existing
+coverage**: two real, differently-named projections registered, only
+one with a building rebuild - proves the batched query correctly
+attributes each `projection_rebuilds` row (and its own
+`consumed_event_types`) to the *right* projection, not just that "some"
+rebuild gets found. A single-projection fixture (all the pre-existing
+tests) can't expose an identity mix-up between two rows the way this
+can - the other, non-building projection's schema/schema_version are
+asserted completely untouched.
+
+### Fix 4: `db::catch_up_snapshots`'s progress-check loop
+
+Same shape, smaller: the per-snapshot-name `get_snapshot_progress` loop
+replaced with one new `list_snapshot_progress_for_bounded_context(pool,
+bc) -> HashMap<String, i64>` - one query, no `WHERE`, looked up per
+registered snapshot name in memory afterward (defaulting to `-1` for a
+name with no row yet, matching the old per-call default exactly).
+`get_snapshot_progress` had no other call site, so it was replaced
+outright rather than kept alongside the new batched function.
+
+### Not in scope this pass (flagged, not forgotten)
+
+Pagination of `list_bounded_contexts` itself, or a UNION-style
+cross-schema query to replace the scheduler's own remaining O(N) (one
+query per active bc, no multiplier - already the least urgent of the
+four loops before this pass, still true after it). Real open questions
+from the issue itself; revisit only if these fixes aren't enough at the
+target scale. No general per-bounded-context migration/dirty-tracking
+framework was built - these are targeted query-shape fixes, not new
+infrastructure. Nothing about instance routing/affinity - confirmed out
+of scope by the investigation that raised this issue; untouched here.
+
+**Verified**: full existing regression suite (every crate) passes
+unchanged - including the real end-to-end async-projection/snapshot/
+scheduler tests, proving the batched queries and concurrent fan-out
+preserve behaviour exactly, not just "look right." `cargo
+build/clippy/test --workspace` clean.

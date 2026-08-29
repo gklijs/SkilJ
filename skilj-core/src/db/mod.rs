@@ -957,7 +957,12 @@ pub async fn get_bounded_context(
 /// `bounded_contexts` parameter `bootstrap::list_bounded_contexts`
 /// expects (see its own doc comment: unrestricted, same full-snapshot
 /// treatment `list_roles`/`list_role_access_mappings` get). Backs the
-/// `BoundedContextDirectory` surface's `boundedContexts` query.
+/// `BoundedContextDirectory` surface's `boundedContexts` query - and,
+/// Codeberg issue #15, `SkiljBuilder::build()`'s startup warm-up loop
+/// plus all three background pollers, which is why this used to be a
+/// real N+1 (one `get_role` query per row) worth fixing: `list_roles`
+/// already fetches every `Role` in one query, so one full-table fetch
+/// plus an in-memory lookup replaces what was one query per row.
 #[tracing::instrument(skip_all)]
 pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<BoundedContext>> {
     let rows: Vec<BoundedContextRow> = sqlx::query_as(&format!(
@@ -966,14 +971,20 @@ pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<Boun
     .fetch_all(pool)
     .await?;
 
+    let roles_by_id: std::collections::HashMap<String, Role> = list_roles(pool)
+        .await?
+        .into_iter()
+        .map(|role| (role.id.clone(), role))
+        .collect();
+
     let mut contexts = Vec::with_capacity(rows.len());
     for row in rows {
-        let role = match &row.created_by_role_id {
-            Some(role_id) => Some(get_role(pool, role_id).await?.expect(
-                "bounded_contexts.created_by_role_id references a roles row that no longer exists",
-            )),
-            None => None,
-        };
+        let role = row.created_by_role_id.as_ref().map(|role_id| {
+            roles_by_id.get(role_id).cloned().expect(
+                "bounded_contexts.created_by_role_id references a roles row that no longer \
+                 exists",
+            )
+        });
         contexts.push(bounded_context_from_row(row, role));
     }
     Ok(contexts)
@@ -2306,24 +2317,28 @@ pub async fn resolve_snapshot_context(
     }))
 }
 
-/// The background catch-up task's own progress marker for one snapshot -
-/// `None` before its first ever catch-up tick. Plain read, no lock:
-/// only used to compute `catch_up_snapshots`' own starting point for
-/// the *next* tick, never to decide whether a specific write is safe -
-/// that's `get_or_create_snapshot_state_for_update`'s own job, per row.
-async fn get_snapshot_progress(
+/// The background catch-up task's own progress marker for every
+/// registered snapshot in one bounded context, in one query - Codeberg
+/// issue #15's batched replacement for what used to be a `get_snapshot_progress`
+/// call per snapshot name (one query each). A name absent from the
+/// returned map has never had a catch-up tick yet - `catch_up_snapshots`
+/// treats that the same as this function's own predecessor did
+/// (`unwrap_or(-1)` at the call site), just without a per-name round
+/// trip to discover it. Plain read, no lock: only used to compute
+/// `catch_up_snapshots`' own starting point for the *next* tick, never
+/// to decide whether a specific write is safe - that's
+/// `get_or_create_snapshot_state_for_update`'s own job, per row.
+async fn list_snapshot_progress_for_bounded_context(
     pool: &Pool,
     bounded_context: &str,
-    snapshot_name: &str,
-) -> crate::error::Result<Option<i64>> {
+) -> crate::error::Result<std::collections::HashMap<String, i64>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<(i64,)> = sqlx::query_as(&format!(
-        "SELECT caught_up_to FROM {schema}.snapshot_progress WHERE snapshot_name = $1"
+    let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT snapshot_name, caught_up_to FROM {schema}.snapshot_progress"
     ))
-    .bind(snapshot_name)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(row.map(|(v,)| v))
+    Ok(rows.into_iter().collect())
 }
 
 /// Advances (or seeds) one snapshot's own progress marker - called once
@@ -4557,6 +4572,102 @@ async fn insert_idempotency_key<'e>(
     Ok(())
 }
 
+/// Codeberg issue #15: the batched replacement for looping every
+/// registered projection through `get_projection_rebuild` - that path
+/// cost up to `~2P` queries per tick for `P` projections even when
+/// nothing was building (`get_projection_rebuild` alone is 3 queries:
+/// `get_projection`, the rebuild row, `rebuild_consumed_event_types` -
+/// and that last one has its own inner N+1, one `get_event_type` call
+/// per consumed event type name). This does the same job in a small
+/// constant number of queries regardless of `P` or how many rebuilds
+/// are actually building: one query for every `building` row in the
+/// bc's `projection_rebuilds` table, one for every row in
+/// `projection_rebuild_consumed_event_types` (grouped by
+/// `projection_name` in memory), one for every `EventType` in the bc
+/// (`list_event_types_for_bounded_context`, already a single query),
+/// and zero further queries for the live `Projection` each rebuild
+/// belongs to - `all_projections` is data the caller
+/// (`catch_up_bounded_context`) already fetched, handed in here instead
+/// of re-fetched via `get_project` per row the way `get_projection_rebuild`
+/// does for its own single-row callers (`RebuildProjection`/
+/// `DiscardProjectionRebuild`'s resolvers - untouched, a single lookup
+/// is the right shape there).
+async fn list_building_projection_rebuilds_for_bounded_context(
+    pool: &Pool,
+    bounded_context: &str,
+    all_projections: &[Projection],
+) -> crate::error::Result<Vec<ProjectionRebuild>> {
+    let schema = schema_ident(bounded_context);
+
+    let rebuild_rows: Vec<ProjectionRebuildRow> = sqlx::query_as(&format!(
+        "SELECT {PROJECTION_REBUILD_COLUMNS} FROM {schema}.projection_rebuilds \
+         WHERE status = 'building'"
+    ))
+    .fetch_all(pool)
+    .await?;
+    if rebuild_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let consumed_rows: Vec<(String, String)> = sqlx::query_as(&format!(
+        "SELECT projection_name, event_type_name \
+         FROM {schema}.projection_rebuild_consumed_event_types WHERE status = 'building'"
+    ))
+    .fetch_all(pool)
+    .await?;
+    let mut consumed_by_projection: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (projection_name, event_type_name) in consumed_rows {
+        consumed_by_projection
+            .entry(projection_name)
+            .or_default()
+            .push(event_type_name);
+    }
+
+    let all_event_types = list_event_types_for_bounded_context(pool, bounded_context).await?;
+    let event_types_by_name: std::collections::HashMap<&str, &EventType> = all_event_types
+        .iter()
+        .map(|et| (et.name.as_str(), et))
+        .collect();
+
+    let projections_by_name: std::collections::HashMap<&str, &Projection> = all_projections
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+
+    let mut rebuilds = Vec::with_capacity(rebuild_rows.len());
+    for row in rebuild_rows {
+        let Some(projection) = projections_by_name.get(row.projection_name.as_str()) else {
+            continue;
+        };
+        let consumed_event_types = consumed_by_projection
+            .remove(&row.projection_name)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| {
+                event_types_by_name
+                    .get(name.as_str())
+                    .copied()
+                    .cloned()
+                    .expect(
+                        "projection_rebuild_consumed_event_types join row references an \
+                         event_types row that no longer exists",
+                    )
+            })
+            .collect();
+        rebuilds.push(ProjectionRebuild {
+            projection: (*projection).clone(),
+            schema: row.schema,
+            schema_version: row.schema_version,
+            consumed_event_types,
+            sync: row.sync,
+            caught_up_to: row.caught_up_to,
+            status: projection_rebuild_status_from_str(&row.status),
+        });
+    }
+    Ok(rebuilds)
+}
+
 /// The background half of §8 item 6: one poll tick, for one bounded
 /// context - folds every committed event not yet reflected in that
 /// context's `sync = false` `Projection`s, and separately walks any
@@ -4601,19 +4712,12 @@ pub async fn catch_up_bounded_context(
 
     let all_projections = list_projections_for_bounded_context(pool, bounded_context).await?;
     let async_projections: Vec<_> = all_projections.iter().filter(|p| !p.sync).collect();
-    let mut building_rebuilds = Vec::new();
-    for projection in &all_projections {
-        if let Some(rebuild) = get_projection_rebuild(
-            pool,
-            bounded_context,
-            &projection.name,
-            ProjectionRebuildStatus::Building,
-        )
-        .await?
-        {
-            building_rebuilds.push(rebuild);
-        }
-    }
+    let building_rebuilds = list_building_projection_rebuilds_for_bounded_context(
+        pool,
+        bounded_context,
+        &all_projections,
+    )
+    .await?;
 
     if async_projections.is_empty() && building_rebuilds.is_empty() {
         return Ok(());
@@ -4828,13 +4932,12 @@ pub async fn catch_up_snapshots(
         return Ok(());
     }
 
-    let mut progress = std::collections::HashMap::new();
-    for name in &snapshot_names {
-        let caught_up_to = get_snapshot_progress(pool, bounded_context, name)
-            .await?
-            .unwrap_or(-1);
-        progress.insert(*name, caught_up_to);
-    }
+    let progress_from_db =
+        list_snapshot_progress_for_bounded_context(pool, bounded_context).await?;
+    let mut progress: std::collections::HashMap<&str, i64> = snapshot_names
+        .iter()
+        .map(|name| (*name, progress_from_db.get(*name).copied().unwrap_or(-1)))
+        .collect();
 
     let min_caught_up = progress.values().copied().min().unwrap_or(latest);
     let events = if min_caught_up >= latest {

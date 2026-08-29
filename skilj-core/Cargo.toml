@@ -52,3 +52,8 @@ tracing-subscriber.workspace = true
 # (`opentelemetry_sdk::metrics::InMemoryMetricExporter`) the metrics
 # test uses instead of a real OTLP collector.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Codeberg issue #15: only for a real, timed A/B comparison of sequential
+# vs. `buffer_unordered` concurrent fan-out over per-bounded-context
+# warm-up work, proving the concurrency actually helps rather than
+# assuming it from the code shape alone.
+futures-util.workspace = true
