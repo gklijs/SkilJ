@@ -670,6 +670,81 @@ fn full_business_surfaces_lifecycle_end_to_end() {
     });
 }
 
+const SUBMIT_COMMAND_WITH_IDEMPOTENCY_KEY_MUTATION: &str = "\
+    mutation($bc: String!, $name: String!, $payload: String!, $key: String) { \
+        submitCommand(boundedContext: $bc, commandTypeName: $name, payload: $payload, \
+            idempotencyKey: $key) { \
+            accepted triggeredEventSequences deduplicated \
+        } \
+    }";
+
+/// Codeberg issue #12, real end-to-end over GraphQL: a genuine retry
+/// with the same `idempotencyKey` returns the identical
+/// `triggeredEventSequences` and `deduplicated: true` - and only one
+/// event actually exists, not just that the response looks right.
+#[test]
+fn submit_command_deduplicates_a_repeated_idempotency_key_over_graphql() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _admin_role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let variables = json!({
+            "bc": bc_name,
+            "name": "WithdrawMoney",
+            "payload": r#"{"amount":20}"#,
+            "key": "retry-1",
+        });
+
+        let first = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_WITH_IDEMPOTENCY_KEY_MUTATION,
+            variables.clone(),
+        )
+        .await;
+        assert!(
+            first.get("errors").is_none(),
+            "unexpected errors: {first:?}"
+        );
+        assert_eq!(first["data"]["submitCommand"]["accepted"], true);
+        assert_eq!(first["data"]["submitCommand"]["deduplicated"], false);
+        let first_sequences = first["data"]["submitCommand"]["triggeredEventSequences"].clone();
+
+        let second = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_WITH_IDEMPOTENCY_KEY_MUTATION,
+            variables,
+        )
+        .await;
+        assert!(
+            second.get("errors").is_none(),
+            "unexpected errors: {second:?}"
+        );
+        assert_eq!(second["data"]["submitCommand"]["accepted"], true);
+        assert_eq!(
+            second["data"]["submitCommand"]["deduplicated"], true,
+            "a repeated idempotencyKey must be reported as deduplicated"
+        );
+        assert_eq!(
+            second["data"]["submitCommand"]["triggeredEventSequences"], first_sequences,
+            "a dedup hit must return the *original* sequences, not a fresh decision"
+        );
+
+        let events = skilj_core::db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a deduplicated retry must not double-apply the command"
+        );
+    });
+}
+
 /// A rejection's `matchingEvents` (Codeberg issue #7's DCB conflict
 /// visualizer) is full raw event content - the same visibility
 /// `queryEvents`/`countEvents`/`inspectEvent` require `Admin` level for.

@@ -410,6 +410,7 @@ async fn provision_bounded_context_schema(
     ))
     .execute(&mut **tx)
     .await?;
+    ensure_idempotency_keys_table(&mut **tx, bounded_context).await?;
     // `EncryptionKey` is a real, independently-lived entity (its own
     // status/lifecycle - see `entity EncryptionKey`), so it's referenced
     // here, not JSONB-embedded like `tag_mappings`/`sensitive_fields` -
@@ -671,6 +672,46 @@ async fn provision_bounded_context_schema(
     .execute(&mut **tx)
     .await?;
 
+    Ok(())
+}
+
+/// `idempotency_keys` - a caller-supplied idempotency key on command
+/// submission (Codeberg issue #12), one row per `(command_type_name,
+/// idempotency_key)` that has ever produced a real `Accepted` outcome. A
+/// duplicate submission bearing the same key short-circuits to the
+/// stored `triggered_event_sequences` rather than being re-decided -
+/// see `submit_command`'s own doc comment for the full design.
+///
+/// `impl PgExecutor`, the same "works on `&Pool` autocommit or inside a
+/// caller's own open `Transaction`" treatment `update_role` already
+/// gets: `provision_bounded_context_schema` above needs the latter (one
+/// more table for a brand-new bounded context, inside its own
+/// provisioning transaction); the per-bounded-context startup loop in
+/// `skilj/src/lib.rs` needs the former, patching a bounded context
+/// provisioned *before* this feature existed. `CREATE TABLE IF NOT
+/// EXISTS`, called unconditionally on every `build()`, is the whole
+/// migration story here - there's no general per-bounded-context schema
+/// migration mechanism in this codebase (`provision_bounded_context_schema`
+/// itself only ever runs once, at creation), and this deliberately isn't
+/// one either, just a small, targeted, idempotent patch for this one
+/// table.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_idempotency_keys_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.idempotency_keys (
+            command_type_name TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            triggered_event_sequences BIGINT[] NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (command_type_name, idempotency_key)
+        )"
+    ))
+    .execute(executor)
+    .await?;
     Ok(())
 }
 
@@ -4077,6 +4118,14 @@ pub enum SubmitCommandOutcome {
         // comment.
         matching_events: Vec<Event>,
     },
+    /// A duplicate submission bearing an `idempotency_key` that already
+    /// produced a real `Accepted` outcome (Codeberg issue #12) - not a
+    /// new decision, the *original* one, verbatim. `decide()` never ran
+    /// again; no event was inserted again. Rejected outcomes are never
+    /// deduplicated - they have zero side effects, so a duplicate one is
+    /// simply re-decided fresh, correctly, every time (see
+    /// `submit_command`'s own doc comment for why).
+    Deduplicated { triggered_event_sequences: Vec<i64> },
 }
 
 /// A `submit_command` call's own snapshot-acceleration context
@@ -4171,6 +4220,7 @@ pub async fn submit_command(
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
     snapshot: Option<SnapshotContext<'_>>,
+    idempotency_key: Option<&str>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
@@ -4186,6 +4236,22 @@ pub async fn submit_command(
     ))
     .fetch_one(&mut *tx)
     .await?;
+
+    // Codeberg issue #12: a cached prior answer, not a new decision -
+    // checked as early as possible, right after the lock that makes this
+    // plain `SELECT` race-free (see `lookup_idempotency_key`'s own doc
+    // comment). `initial_decision`/the redispatch logic below never runs
+    // on a hit - `tx` is simply dropped (implicit rollback), the same as
+    // every other early return in this function; nothing was written.
+    if let Some(key) = idempotency_key {
+        if let Some(triggered_event_sequences) =
+            lookup_idempotency_key(&mut *tx, &schema, &command_type.name, key).await?
+        {
+            return Ok(SubmitCommandOutcome::Deduplicated {
+                triggered_event_sequences,
+            });
+        }
+    }
 
     let mut final_decision = initial_decision;
     let mut final_bounded_context_events = bounded_context_events.to_vec();
@@ -4394,6 +4460,20 @@ pub async fn submit_command(
         .await?;
     }
 
+    if let Some(key) = idempotency_key {
+        let triggered_event_sequences: Vec<i64> =
+            result.events.iter().map(|e| e.sequence).collect();
+        insert_idempotency_key(
+            &mut *tx,
+            &schema,
+            &command_type.name,
+            key,
+            &triggered_event_sequences,
+            now,
+        )
+        .await?;
+    }
+
     tx.commit().await?;
 
     // EventSubscription's own real-time delivery - after the commit, not
@@ -4419,6 +4499,62 @@ pub async fn submit_command(
         command: Box::new(result.command),
         events: result.events,
     })
+}
+
+/// A hit returns the stored `triggered_event_sequences` from a prior
+/// `Accepted` outcome for this exact `(command_type_name,
+/// idempotency_key)` pair - `submit_command`'s own short-circuit. Must
+/// only be called after the bounded context's own `sequence` row lock
+/// is already held (see `submit_command`'s own doc comment) - that lock
+/// is what makes this plain, unlocked `SELECT` race-free, the same way
+/// it already makes the DCB-conflict recheck a few lines below it
+/// race-free.
+async fn lookup_idempotency_key<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    schema: &str,
+    command_type_name: &str,
+    idempotency_key: &str,
+) -> crate::error::Result<Option<Vec<i64>>> {
+    let row: Option<(Vec<i64>,)> = sqlx::query_as(&format!(
+        "SELECT triggered_event_sequences FROM {schema}.idempotency_keys \
+         WHERE command_type_name = $1 AND idempotency_key = $2"
+    ))
+    .bind(command_type_name)
+    .bind(idempotency_key)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(|(sequences,)| sequences))
+}
+
+/// Records a real `Accepted` outcome against its idempotency key, inside
+/// the same transaction as the `Command`/`Event` rows it describes - a
+/// later duplicate submission bearing this key short-circuits to
+/// `triggered_event_sequences` via `lookup_idempotency_key` instead of
+/// being re-decided. No `ON CONFLICT` - the sequence row lock already
+/// rules out a concurrent duplicate reaching here (`lookup_idempotency_key`
+/// would already have caught it); a real conflict here would mean a bug
+/// in that check, worth surfacing as a hard error rather than silently
+/// swallowing.
+async fn insert_idempotency_key<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    schema: &str,
+    command_type_name: &str,
+    idempotency_key: &str,
+    triggered_event_sequences: &[i64],
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.idempotency_keys \
+         (command_type_name, idempotency_key, triggered_event_sequences, created_at) \
+         VALUES ($1, $2, $3, $4)"
+    ))
+    .bind(command_type_name)
+    .bind(idempotency_key)
+    .bind(triggered_event_sequences)
+    .bind(now)
+    .execute(executor)
+    .await?;
+    Ok(())
 }
 
 /// The background half of §8 item 6: one poll tick, for one bounded

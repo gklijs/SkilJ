@@ -29,7 +29,7 @@
 use crate::auth::BearerCredential;
 use crate::error::RestError;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -491,6 +491,12 @@ struct CommandTriggerResponse {
     rejection_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rejection_kind: Option<String>,
+    // Codeberg issue #12: `true` only when an `Idempotency-Key` header
+    // was given and it matched a prior `Accepted` outcome -
+    // `triggered_event_sequences` is that prior outcome's, not a fresh
+    // decision. Always `false` when no header was given, matching
+    // today's behaviour exactly.
+    deduplicated: bool,
 }
 
 // --- handlers ---
@@ -661,11 +667,21 @@ async fn post_events_consume_ack(
 async fn post_commands_trigger(
     State(state): State<AppState>,
     credential: BearerCredential,
+    headers: HeaderMap,
     Json(body): Json<CommandTriggerRequest>,
 ) -> Result<impl IntoResponse, RestError> {
     let token = resolve_token::<CommandToken>(&state, &credential).await?;
     let payload = serde_json::to_string(&body.payload)
         .expect("serde_json::Value serialization is infallible");
+    // Codeberg issue #12: optional, backward compatible - omitted (the
+    // existing default for every caller) means skip the idempotency
+    // mechanism entirely, not "generate a key anyway" - see
+    // skilj_core::db::submit_command's own doc comment for why that's
+    // the right realisation of "unchanged behaviour when absent". A
+    // present but non-UTF-8 header value is treated the same as absent
+    // rather than a hard error - this is a caller convenience, not a
+    // load-bearing part of the request.
+    let idempotency_key = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok());
 
     let authorised = event_store::authorise_command_trigger(&token, payload)?;
     let bounded_context_name = authorised.command_type.bounded_context.name.clone();
@@ -765,6 +781,7 @@ async fn post_commands_trigger(
             state_json: &ctx.state_json,
             as_of_sequence: ctx.as_of_sequence,
         }),
+        idempotency_key,
     )
     .await?;
 
@@ -782,12 +799,25 @@ async fn post_commands_trigger(
             triggered_event_sequences: None,
             rejection_reason: Some(reason),
             rejection_kind: Some(kind),
+            deduplicated: false,
         },
         db::SubmitCommandOutcome::Accepted { events, .. } => CommandTriggerResponse {
             accepted: true,
             triggered_event_sequences: Some(events.iter().map(|e| e.sequence).collect()),
             rejection_reason: None,
             rejection_kind: None,
+            deduplicated: false,
+        },
+        // Codeberg issue #12: a cached prior answer, not a fresh
+        // decision.
+        db::SubmitCommandOutcome::Deduplicated {
+            triggered_event_sequences,
+        } => CommandTriggerResponse {
+            accepted: true,
+            triggered_event_sequences: Some(triggered_event_sequences),
+            rejection_reason: None,
+            rejection_kind: None,
+            deduplicated: true,
         },
     }))
 }

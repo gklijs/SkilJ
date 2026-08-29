@@ -46,7 +46,7 @@ fn no_decider_registered_error() -> async_graphql::Error {
         .extend_with(|_, ext| ext.set("code", "no_decider_registered"))
 }
 
-/// `submitCommand(boundedContext: String!, commandTypeName: String!, payload: String!): SubmitCommandPayload!`
+/// `submitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String): SubmitCommandPayload!`
 pub fn submit_command_field() -> Field {
     Field::new(
         "submitCommand",
@@ -59,6 +59,18 @@ pub fn submit_command_field() -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 let command_type_name = ctx.args.try_get("commandTypeName")?.string()?.to_string();
                 let payload = ctx.args.try_get("payload")?.string()?.to_string();
+                // Codeberg issue #12: optional, backward compatible -
+                // omitted (the existing default for every caller) means
+                // skip the idempotency mechanism entirely, not "generate
+                // a key anyway" - see skilj_core::db::submit_command's
+                // own doc comment for why that's the right realisation
+                // of "unchanged behaviour when absent".
+                let idempotency_key = ctx
+                    .args
+                    .get("idempotencyKey")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| v.string().ok())
+                    .map(|s| s.to_string());
 
                 // WriteAccess: any active mapping, any level -
                 // authorise_command_submission itself enforces
@@ -214,6 +226,7 @@ pub fn submit_command_field() -> Field {
                             state_json: &ctx.state_json,
                             as_of_sequence: ctx.as_of_sequence,
                         }),
+                    idempotency_key.as_deref(),
                 )
                 .await
                 .map_err(to_graphql_error)?;
@@ -254,6 +267,7 @@ pub fn submit_command_field() -> Field {
                             matching_events: (access_mapping.level
                                 == skilj_core::access_control::AccessLevel::Admin)
                                 .then_some(matching_events),
+                            deduplicated: false,
                         }
                     }
                     skilj_core::db::SubmitCommandOutcome::Accepted { events, .. } => {
@@ -265,8 +279,23 @@ pub fn submit_command_field() -> Field {
                             rejection_reason: None,
                             rejection_kind: None,
                             matching_events: None,
+                            deduplicated: false,
                         }
                     }
+                    // Codeberg issue #12: a cached prior answer, not a
+                    // fresh decision - no live matchingEvents to show
+                    // (nothing was redispatched), same as a normal
+                    // Accepted response otherwise.
+                    skilj_core::db::SubmitCommandOutcome::Deduplicated {
+                        triggered_event_sequences,
+                    } => SubmitCommandResult {
+                        accepted: true,
+                        triggered_event_sequences: Some(triggered_event_sequences),
+                        rejection_reason: None,
+                        rejection_kind: None,
+                        matching_events: None,
+                        deduplicated: true,
+                    },
                 })))
             })
         },
@@ -282,5 +311,9 @@ pub fn submit_command_field() -> Field {
     .argument(InputValue::new(
         "payload",
         TypeRef::named_nn(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "idempotencyKey",
+        TypeRef::named(TypeRef::STRING),
     ))
 }

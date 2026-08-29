@@ -25,7 +25,11 @@
 --   erases both at once (SensitiveField, EncryptionKey,
 --   right-to-be-forgotten via ForgetSubject) - admin-facing retrieval of
 --   stored commands, by command type, by time window, or by the event a
---   command produced (CommandQuery), and two independent authentication
+--   command produced (CommandQuery), an optional caller-supplied
+--   idempotency key on command submission over either track, so a caller
+--   retrying a submission it never heard back from is answered with the
+--   original outcome rather than applying the command a second time
+--   (see rule ProcessCommand), and two independent authentication
 --   tracks:
 --   - GraphQL: identity is delegated to a trusted external identity
 --     provider. A caller presents a JWT the IdP issued; SkilJ verifies
@@ -865,6 +869,12 @@ entity Command {
                                             -- matching that against a candidate is an identity
                                             -- comparison, so two commands carrying identical payload,
                                             -- metadata, tags and boundary stay distinct.
+                                            --
+                                            -- An idempotency key does not change any of that. A key is
+                                            -- something the caller chooses and this library remembers an
+                                            -- outcome against; it is never this id, never derived into
+                                            -- it, and never a second way to name a stored Command - see
+                                            -- rule ProcessCommand.
     bounded_context: BoundedContext
     command_type: CommandType
     payload: String                        -- JSON-encoded command data, conforms to command_type.schema
@@ -2280,22 +2290,29 @@ rule DeliverToSubscriptions {
 -- decision to reject is still reported to the original caller.
 
 rule AuthoriseCommandSubmission {
-    when: SubmitCommand(access_mapping, command_type, payload)
+    when: SubmitCommand(access_mapping, command_type, payload, idempotency_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level in {write, admin}
     requires: access_mapping.bounded_context = command_type.bounded_context
     requires: command_type.bounded_context.status = active
     requires: valid_payload(command_type.schema, payload)
+
+    -- idempotency_key is carried through untouched and unvalidated: it is
+    -- the caller's own opaque value, not part of the command's payload and
+    -- so no business of valid_payload's, and null whenever the caller
+    -- supplied none. What it means is ProcessCommand's, since both tracks
+    -- mean the same thing by it.
     ensures:
         CommandAuthorised(
             command_type: command_type,
             payload: payload,
-            client_id: access_mapping.role.id
+            client_id: access_mapping.role.id,
+            idempotency_key: idempotency_key
         )
 }
 
 rule AuthoriseCommandTrigger {
-    when: TriggerCommand(token, command_type, payload)
+    when: TriggerCommand(token, command_type, payload, idempotency_key?)
     requires: token.status = active
     requires: token.command_type = command_type
     requires: command_type.rest_trigger_allowed = true
@@ -2305,12 +2322,87 @@ rule AuthoriseCommandTrigger {
         CommandAuthorised(
             command_type: command_type,
             payload: payload,
-            client_id: token.id
+            client_id: token.id,
+            idempotency_key: idempotency_key
         )
 }
 
 rule ProcessCommand {
-    when: CommandAuthorised(command_type, payload, client_id)
+    when: CommandAuthorised(command_type, payload, client_id, idempotency_key?)
+
+    -- Idempotency. idempotency_key is a value the caller chooses and
+    -- supplies itself, carried here untouched from whichever surface
+    -- authorised the command (CommandSubmission over GraphQL,
+    -- CommandTrigger over REST) and null whenever the caller supplied
+    -- none. It exists because a caller whose request times out cannot tell
+    -- whether the command landed, and resubmitting blind applies it twice -
+    -- two Commands, two sets of events - out of what the caller meant as
+    -- one action.
+    --
+    -- recorded_acceptance(command_type, idempotency_key) is the outcome
+    -- this library remembers against that key: the events an earlier
+    -- submission bearing it actually triggered, or null when the key is
+    -- null or when nothing has been recorded against it yet. It is a black
+    -- box in the same register as next_sequence - library-owned durable
+    -- state whose storage shape this spec does not reach into - rather
+    -- than a plugged-in decision like decide().
+    --
+    -- Three cases, and they are the whole of the behaviour:
+    --
+    --   Key absent. Nothing is looked up and nothing is recorded. The
+    --   submission is processed as new, exactly as every submission was
+    --   before keys existed at all. This is a guarantee rather than merely
+    --   the common case - see CommandSubmission's
+    --   OmittingTheKeyChangesNothing.
+    --
+    --   Key not seen before. Processed as new, and then, if and only if
+    --   the decision is an acceptance, its outcome is recorded against the
+    --   key as part of the same transaction the command and its events are
+    --   written in - so a key is remembered exactly when the events it
+    --   stands for are durable, never before and never without them.
+    --
+    --   Key already accepted. This rule does not fire: decide() is not
+    --   called again, no second Command is created and no second event is
+    --   appended. The caller is answered with the recorded outcome - the
+    --   very events the original submission triggered - and can tell that
+    --   answer apart from a fresh acceptance rather than being left to
+    --   guess. Deliberately the original answer rather than a fresh one
+    --   that would usually agree: events committed in between are exactly
+    --   what can make a fresh decide() decide differently, and a caller
+    --   retrying a request it never heard back from is asking what
+    --   happened, not asking again. This is where an idempotency key
+    --   genuinely changes what is observable, and it is the point of
+    --   having one.
+    --
+    -- Only acceptances are remembered. A rejection is decided fresh every
+    -- time, however often the same key arrives with it, and that is
+    -- deliberate rather than an omission: this rule does not fire on a
+    -- rejection at all (see the requires on decision.accepted below), so a
+    -- rejection appends no event, creates no Command and leaves nothing
+    -- durable behind. With no side effect to double-apply there is nothing
+    -- to protect, and re-deciding is both always safe and more truthful
+    -- than replaying a stale "no" at a caller whose command might now
+    -- succeed.
+    --
+    -- A key is scoped to one bounded context and one command type, and to
+    -- nothing else. It is not global, and deliberately not scoped to the
+    -- calling identity either: two callers presenting the same key for the
+    -- same command type are answered as one. Resolved that way for
+    -- simplicity - it also makes the two tracks share one record rather
+    -- than keep two, which they could not do anyway, since one
+    -- authenticates a Role and the other a CommandToken and they have no
+    -- identity in common to scope by (see the note above
+    -- AuthoriseCommandSubmission). The obligation this puts on a caller is
+    -- to choose keys that are unique to an attempt - a fresh UUID per
+    -- submission, not a name like "retry-1" another caller could pick too.
+    --
+    -- Nothing expires. Once recorded, a key's association with its outcome
+    -- is permanent, the same treatment every command and event here
+    -- already gets: nothing in this library is ever deleted except by
+    -- ForgetSubject, which shreds a subject's ciphertext without removing
+    -- anything, and by deleting the bounded context itself.
+    let prior_outcome = recorded_acceptance(command_type, idempotency_key)
+    requires: prior_outcome = null
 
     let consistency_tags = derive_tags(command_type, payload)
     let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
@@ -4769,11 +4861,38 @@ surface CommandSubmission {
         where bounded_context = access_mapping.bounded_context and bounded_context.status = active
 
     provides:
-        SubmitCommand(access_mapping, command_type, payload)
+        SubmitCommand(access_mapping, command_type, payload, idempotency_key?)
 
     @guarantee GrantScopedToBoundedContext
         -- A write-level grant only authorises submitting commands for
         -- CommandTypes belonging to its own bounded context.
+
+    @guarantee OmittingTheKeyChangesNothing
+        -- idempotency_key is optional, and omitting it is a supported,
+        -- permanent way to submit rather than a legacy shape: a submission
+        -- carrying no key has nothing looked up and nothing remembered
+        -- against it, and is processed as new every single time, exactly as
+        -- every submission behaved before keys existed. A caller that never
+        -- supplies one is never deduplicated, never answered with an
+        -- earlier submission's outcome, and never has to opt out of
+        -- anything to keep that.
+
+    @guarantee DuplicateAcceptanceReturnsTheOriginalOutcome
+        -- A submission whose idempotency_key already produced an accepted
+        -- outcome for this command type in this bounded context is answered
+        -- with that original outcome - the same triggered events - and
+        -- decide() is not called again, no second Command is created and no
+        -- second event is appended. It is the original answer even when
+        -- events committed since would make a fresh decision differ; that
+        -- is what the key is for, not an imprecision tolerated for
+        -- cheapness. A caller can tell such an answer apart from a fresh
+        -- acceptance rather than having to infer it.
+        --
+        -- Bounded to acceptances on purpose: a key that produced a
+        -- rejection has nothing remembered against it, and a resubmission
+        -- bearing it is decided fresh, every time (see rule
+        -- ProcessCommand). Scoped to the bounded context and command type
+        -- alone, and not to the submitting Role.
 
     @guarantee MatchingEventsRequiresAdminLevel
         -- The matching_events set surfaced on a rejection (see the
@@ -4814,12 +4933,34 @@ surface CommandTrigger {
         where this = token.command_type and rest_trigger_allowed = true and token.status = active
 
     provides:
-        TriggerCommand(token, command_type, payload)
+        TriggerCommand(token, command_type, payload, idempotency_key?)
 
     @guarantee TokenScopedToCommandType
         -- A token only authorises triggering the one CommandType it was
         -- issued for; it grants no other capability, and in particular no
         -- way to read anything back beyond the command's own outcome.
+
+    @guarantee OmittingTheKeyChangesNothing
+        -- idempotency_key is optional here too, with exactly the force it
+        -- has on CommandSubmission: a trigger carrying no key has nothing
+        -- looked up and nothing remembered against it, and is processed as
+        -- new every single time, exactly as every trigger behaved before
+        -- keys existed. An automated caller that never supplies one keeps
+        -- its existing behaviour unchanged and opts out of nothing.
+
+    @guarantee DuplicateAcceptanceReturnsTheOriginalOutcome
+        -- A trigger whose idempotency_key already produced an accepted
+        -- outcome for this command type in this bounded context is answered
+        -- with that original outcome, without decide() running again and
+        -- without a second Command or a second event - the same guarantee
+        -- CommandSubmission carries, backed by the same recorded outcome
+        -- (see rule ProcessCommand).
+        --
+        -- The same one, literally: a key is scoped to the bounded context
+        -- and command type and to nothing else, so a command triggered here
+        -- and one submitted over CommandSubmission under that same key for
+        -- that same command type are one key, not two. The two tracks share
+        -- the record exactly as they already share ProcessCommand.
 
     @guidance
         -- REST only, with the token presented as

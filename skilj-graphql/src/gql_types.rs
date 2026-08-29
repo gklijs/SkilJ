@@ -687,6 +687,11 @@ pub struct SubmitCommandResult {
     // why `Accepted` gets `None`), the tag-scoped set `decide()`
     // actually evaluated against for the rejection that governed.
     pub matching_events: Option<Vec<skilj_core::event_store::Event>>,
+    // Codeberg issue #12: `true` only when an `idempotencyKey` was given
+    // and it matched a prior `Accepted` outcome - `triggered_event_sequences`
+    // is that prior outcome's, not a fresh decision. Always `false` when
+    // no key was given, matching today's behaviour exactly.
+    pub deduplicated: bool,
 }
 
 pub fn submit_command_payload_object() -> Object {
@@ -701,6 +706,7 @@ pub fn submit_command_payload_object() -> Object {
         scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
         scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_reason.clone()),
         scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
+        scalar "deduplicated": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.deduplicated),
     })
     .field(Field::new(
         "triggeredEventSequences",

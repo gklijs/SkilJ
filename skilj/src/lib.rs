@@ -1177,6 +1177,16 @@ impl SkiljBuilder {
         let event_cache = EventCache::new(self.event_cache_warm_up_count);
         for bc in skilj_core::db::list_bounded_contexts(&pool).await? {
             event_cache.warm(&pool, &bc.name).await?;
+            // Codeberg issue #12: `idempotency_keys` patched into every
+            // bounded context, every startup - including ones
+            // provisioned before this feature existed, since
+            // `provision_bounded_context_schema` itself only ever runs
+            // once, at creation, and there's no general per-bounded-
+            // context migration mechanism in this codebase. `CREATE
+            // TABLE IF NOT EXISTS` makes this free once the table
+            // already exists - see `ensure_idempotency_keys_table`'s own
+            // doc comment.
+            skilj_core::db::ensure_idempotency_keys_table(&pool, &bc.name).await?;
         }
 
         // The initial GraphQL schema (Codeberg issue #2; `@guarantee

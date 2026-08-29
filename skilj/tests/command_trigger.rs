@@ -328,6 +328,76 @@ fn command_trigger_accepts_and_persists_triggered_events() {
     });
 }
 
+/// Codeberg issue #12, real end-to-end: a genuine retry with the same
+/// `Idempotency-Key` header returns the identical `triggeredEventSequences`
+/// and `deduplicated: true`, and only one set of events actually exists -
+/// not just that the response looks right, but that nothing was
+/// double-applied.
+#[test]
+fn command_trigger_deduplicates_a_repeated_idempotency_key() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name) = setup().await;
+        let router = skilj.rest_router();
+
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/commands/trigger")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "retry-1")
+                .body(Body::from(r#"{"payload":{"amount":20}}"#))
+                .unwrap()
+        };
+
+        let first_response = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = first_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["accepted"], true);
+        assert_eq!(first_json["deduplicated"], false);
+        let first_sequences = first_json["triggeredEventSequences"].clone();
+
+        let second_response = router.oneshot(request()).await.unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second_body = second_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_json["accepted"], true);
+        assert_eq!(
+            second_json["deduplicated"], true,
+            "a repeated Idempotency-Key must be reported as deduplicated"
+        );
+        assert_eq!(
+            second_json["triggeredEventSequences"], first_sequences,
+            "a dedup hit must return the *original* sequences, not a fresh decision"
+        );
+
+        // Only one event actually exists - the second request inserted
+        // nothing.
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a deduplicated retry must not double-apply the command"
+        );
+    });
+}
+
 /// Real end-to-end proof of the drift audit's #10 fix (`valid_payload` -
 /// see project memory `skilj-drift-audit-2026-08-18`): the request body
 /// is decoded as generic JSON at the wire layer (`CommandTriggerRequest.

@@ -424,6 +424,7 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
             None,
             test_now(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -447,6 +448,9 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
             }
             SubmitCommandOutcome::Accepted { .. } => {
                 panic!("a genuine DCB conflict was not caught - stale decision was used")
+            }
+            SubmitCommandOutcome::Deduplicated { .. } => {
+                panic!("no idempotency_key was given - Deduplicated must be unreachable")
             }
         }
 
@@ -503,6 +507,7 @@ fn submit_command_does_not_redispatch_for_an_unrelated_concurrent_event() {
             initial_decision,
             None,
             test_now(),
+            None,
             None,
         )
         .await
@@ -566,6 +571,7 @@ fn submit_command_persists_a_real_command_id_that_round_trips() {
             None,
             test_now(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -595,6 +601,257 @@ fn submit_command_persists_a_real_command_id_that_round_trips() {
             .unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].id, command.id);
+    });
+}
+
+/// Codeberg issue #12: the actual idempotency short-circuit. Mirrors a
+/// real retry - the caller re-runs its own optimistic `dispatch()` a
+/// second time too (as it genuinely would on a network-timeout retry),
+/// same `idempotency_key` both times. The second `submit_command` call
+/// must return the *first* call's own outcome verbatim, not a fresh
+/// decision, and must not insert a second `Command`/set of events.
+#[test]
+fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original_outcome() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+
+        let payload = r#"{"order_id":"A"}"#;
+        let key = "retry-key-1";
+
+        let first_decision = dispatcher.dispatch(&bc.name, &ct.name, payload, &[]).unwrap().unwrap();
+        let first_outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "client-1",
+            &[],
+            &[],
+            &[],
+            first_decision,
+            None,
+            test_now(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap();
+        let SubmitCommandOutcome::Accepted {
+            events: first_events,
+            ..
+        } = first_outcome
+        else {
+            panic!("this submission has no reason to be rejected");
+        };
+        let first_sequences: Vec<i64> = first_events.iter().map(|e| e.sequence).collect();
+
+        let second_decision = dispatcher.dispatch(&bc.name, &ct.name, payload, &[]).unwrap().unwrap();
+        let second_outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "client-1",
+            &[],
+            &[],
+            &[],
+            second_decision,
+            None,
+            test_now(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap();
+
+        let SubmitCommandOutcome::Deduplicated {
+            triggered_event_sequences,
+        } = second_outcome
+        else {
+            panic!("a repeated idempotency key must short-circuit to Deduplicated, got {second_outcome:?}");
+        };
+        assert_eq!(triggered_event_sequences, first_sequences);
+
+        // Only one Command actually exists - the second call inserted
+        // nothing, it just read the first call's own stored answer back.
+        let commands = db::list_commands_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.len(),
+            1,
+            "a dedup hit must not insert a second Command row"
+        );
+    });
+}
+
+/// The direct counterpart to the test above: no `idempotency_key` at all
+/// (the default for every existing caller) must show today's unchanged
+/// double-processing behaviour - two full `Accepted` outcomes, two real
+/// `Command` rows, two distinct sets of event sequences. Proves the
+/// "byte-identical when absent" claim for real, not by inspection.
+#[test]
+fn submit_command_without_an_idempotency_key_still_double_processes_a_repeated_submission() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+
+        let payload = r#"{"order_id":"A"}"#;
+
+        for _ in 0..2 {
+            let decision = dispatcher
+                .dispatch(&bc.name, &ct.name, payload, &[])
+                .unwrap()
+                .unwrap();
+            let outcome = db::submit_command(
+                &pool,
+                &dispatcher,
+                &TestProjectionDispatcher,
+                &broadcaster,
+                &event_cache,
+                &ct,
+                payload,
+                "client-1",
+                &[],
+                &[],
+                &[],
+                decision,
+                None,
+                test_now(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(outcome, SubmitCommandOutcome::Accepted { .. }),
+                "no key given - every submission is new, exactly as before this feature existed"
+            );
+        }
+
+        let commands = db::list_commands_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.len(),
+            2,
+            "two keyless submissions must both persist"
+        );
+    });
+}
+
+/// Codeberg issue #12's migration-gap fix: `ensure_idempotency_keys_table`
+/// is what `SkiljBuilder::build()`'s own per-bounded-context startup loop
+/// calls unconditionally, every startup, precisely because
+/// `provision_bounded_context_schema` only ever runs once, at creation -
+/// a bounded context created before this feature existed would otherwise
+/// never get the table. Simulates that exact "provisioned before this
+/// feature existed" state by dropping the table a normal `provision`
+/// already created, then proves the patch doesn't just recreate the
+/// table but that idempotency actually works normally afterward.
+#[test]
+fn ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_this_feature() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+
+        let schema = format!("\"bc_{}\"", bc.name);
+        sqlx::query(&format!("DROP TABLE {schema}.idempotency_keys"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // What SkiljBuilder::build()'s own startup loop does, per
+        // bounded context, every time.
+        db::ensure_idempotency_keys_table(&pool, &bc.name)
+            .await
+            .unwrap();
+
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+        let payload = r#"{"order_id":"A"}"#;
+        let key = "post-patch-retry";
+
+        let first_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+        db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "client-1",
+            &[],
+            &[],
+            &[],
+            first_decision,
+            None,
+            test_now(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap();
+
+        let second_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+        let second_outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "client-1",
+            &[],
+            &[],
+            &[],
+            second_decision,
+            None,
+            test_now(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(second_outcome, SubmitCommandOutcome::Deduplicated { .. }),
+            "idempotency must work normally after the patch, not just leave the table present"
+        );
     });
 }
 
@@ -633,6 +890,7 @@ fn submit_command_leaves_no_sequence_gap_when_process_command_fails() {
             initial_decision,
             None,
             test_now(),
+            None,
             None,
         )
         .await;
@@ -692,6 +950,7 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
             initial_decision,
             None,
             test_now(),
+            None,
             None,
         )
         .await;

@@ -3907,3 +3907,154 @@ per-operator, since `Near`/`SimilarColor`/`InSubnet` share the identical
 parsing plumbing, just gated to a different `format`. Full existing
 regression suite passes unchanged; `cargo build/clippy/test --workspace`
 clean; `allium check` clean on the spec change.
+
+## 21. Optional idempotency key for command submission (Codeberg issue #12)
+
+Command submission had no idempotency mechanism - `Command.id` is
+always server-generated (`generate_token_id()`), never derived from or
+checked against the caller's own request. A client retrying a command
+after a network timeout had no way to avoid double-applying it.
+
+Investigation (tracing the real `submit_command` pipeline) found two
+things that reshaped the naive version of this feature, both resolved
+with the user via `AskUserQuestion` before building:
+
+1. **Per-bounded-context schemas are provisioned once, never migrated.**
+   `provision_bounded_context_schema` runs exactly once, at
+   `BoundedContext` creation; there was no `ALTER TABLE` anywhere in
+   this codebase before this pass. A naive new column/table would only
+   have existed for bounded contexts created *after* this shipped -
+   every already-provisioned one (real, now that skilj is public)
+   wouldn't have gotten it. **Resolved**: a small, targeted, idempotent
+   schema-patch (`CREATE TABLE IF NOT EXISTS`), run against every
+   bounded context on every `build()`, piggybacking on the existing
+   unconditional per-bounded-context startup loop in
+   `SkiljBuilder::build()` (previously just warming `EventCache`) - not
+   a general migration framework, a deliberately narrower fix.
+2. **Rejected outcomes are never persisted at all** - `submit_command`
+   returns immediately on rejection, no `Command` row written. Since a
+   rejection has zero side effects, re-deciding a duplicate rejected
+   submission is harmless. **Resolved**: dedup applies to `Accepted`
+   outcomes only - the case with real side effects (events). A
+   duplicate that was rejected is simply recomputed fresh, correctly,
+   every time.
+
+Also resolved: REST wire shape is an `Idempotency-Key` header (the
+Stripe-style convention, keeps it out of the domain payload); scoping
+is `(bounded_context, command_type)` only, not also per-caller; no
+retention/TTL (matches this codebase's existing "nothing is ever
+deleted except via `ForgetSubject`/bounded-context deletion"
+precedent).
+
+**Realising "generate a random key when absent" as actually asked
+for**: rather than literally generating and storing a random key (and
+its insert) on every keyless submission - which would add a DB write
+to every single command submission for zero possible benefit, since a
+fresh random key can never collide with anything - a keyless
+submission simply skips the idempotency mechanism entirely: no lookup,
+no insert, zero overhead, byte-identical to the pre-existing
+behaviour. Observably equivalent to "always succeeds as new," which
+was the actual intent.
+
+### Storage - one new table, minimal by construction
+
+```sql
+CREATE TABLE IF NOT EXISTS {schema}.idempotency_keys (
+    command_type_name TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    triggered_event_sequences BIGINT[] NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (command_type_name, idempotency_key)
+)
+```
+
+Deliberately stores only `triggered_event_sequences` - neither
+response shape (`SubmitCommandResult`/`CommandTriggerResponse`) needs
+the full `Command`/`Event` objects back on a dedup hit, only the
+sequence numbers, so a hit needs no join back to `commands`/`events`
+at all. `db::ensure_idempotency_keys_table` (`impl PgExecutor`, the
+same "works on `&Pool` autocommit or inside a caller's own open
+`Transaction`" treatment `update_role`/`next_sequence` already have)
+owns this DDL, called from both `provision_bounded_context_schema`
+(brand-new bounded contexts) and `SkiljBuilder::build()`'s startup
+loop (patches every already-provisioned one, every startup, forever -
+`CREATE TABLE IF NOT EXISTS` makes repeated calls free).
+
+### `submit_command` integration
+
+New `idempotency_key: Option<&str>` parameter. The existing `SELECT
+next_value FROM {schema}.sequence FOR UPDATE` already serializes every
+submission to one bounded context across all instances (the
+codebase's own existing concurrency precedent - Postgres NOTIFY/LISTEN
+is at-most-once and not usable for correctness) - so the idempotency
+check needs no lock of its own, riding entirely on the lock already
+held:
+
+1. Right after the sequence lock is acquired: if `idempotency_key` is
+   `Some`, look it up in `idempotency_keys` (plain `SELECT`, inside the
+   same transaction, already race-free under the held lock). A hit
+   short-circuits immediately to a new `SubmitCommandOutcome::Deduplicated
+   { triggered_event_sequences }`, skipping DCB-conflict redispatch,
+   event insertion, and the `Command` row entirely - a cached prior
+   answer, not a new decision. `tx` is simply dropped (implicit
+   rollback) on a hit, the same as every other early return in this
+   function.
+2. A miss proceeds exactly as before. After computing a real `Accepted`
+   outcome and before `tx.commit()`: if `idempotency_key` was `Some`,
+   `INSERT INTO {schema}.idempotency_keys (...)` in the same
+   transaction - plain insert, no `ON CONFLICT`, since the lock already
+   ruled out a concurrent duplicate reaching here.
+
+No change to the optimistic pre-lock prelude in either surface - on a
+true retry, `decide()` runs once more, wastefully but harmlessly (pure
+function, no side effects), before the DB-level check prevents any
+actual persistence. Same accepted-optimism shape the existing
+DCB-conflict redispatch path already has.
+
+### Both surfaces
+
+`skilj-graphql`'s `submitCommand` gained an optional `idempotencyKey:
+String` argument; `skilj-rest`'s `POST /v1/commands/trigger` gained an
+optional `Idempotency-Key` header. Both map `Deduplicated` the same
+way as `Accepted` in their response (`accepted: true`,
+`triggeredEventSequences` from the stored value, no live
+`matchingEvents` - a dedup hit has nothing redispatched to show), plus
+a new `deduplicated: bool` field (default `false`, `true` only on a
+dedup hit) on both `SubmitCommandResult`/`CommandTriggerResponse` -
+cheap, real observability for a caller that wants to know whether its
+retry actually got deduped.
+
+### Spec
+
+`specs/skilj.allium`, via `allium:tend`: this is a genuine new
+observable guarantee, not a pure optimisation (unlike `Snapshot`'s
+"identical answer either way" framing) - a duplicate accepted
+submission returns the *original* decision, which can differ from what
+a fresh `decide()` would now produce if state changed in between.
+
+### Verified
+
+`skilj-core/tests/submit_command.rs`: a real short-circuit test
+(mirroring a genuine retry - the caller's own optimistic `dispatch()`
+runs a second time too, same key both times - the second
+`submit_command` call must return the *first* call's own outcome
+verbatim and insert nothing new), a companion regression test proving
+the no-key case still double-processes exactly as before this feature
+existed, and a migration-gap test that drops a freshly-provisioned
+bounded context's own `idempotency_keys` table (simulating "provisioned
+before this feature existed"), re-runs `ensure_idempotency_keys_table`,
+and proves idempotency actually works normally afterward, not just that
+the table exists again. The short-circuit test was verified decisive,
+not just passing by construction: temporarily disabling the insert side
+made it fail for real (`Accepted` instead of `Deduplicated` on the
+second call), then the fix was restored.
+
+`skilj/tests/command_trigger.rs` (REST) and
+`skilj/tests/graphql_business_surfaces.rs` (GraphQL): real end-to-end -
+submit twice with the same `Idempotency-Key`/`idempotencyKey`, assert
+identical `triggeredEventSequences` and `deduplicated: true` on the
+second response, and confirm via a follow-up event read that only one
+set of events actually exists. Full existing regression suite passes
+unchanged - proving the "no key ⇒ zero behaviour change" property for
+real. `cargo build/clippy/test --workspace` clean; `allium check` clean
+on the spec change.
