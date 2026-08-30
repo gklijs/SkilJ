@@ -98,6 +98,18 @@ pub struct GraphqlState {
     /// here for the same reason `event_broadcaster` above is: one
     /// shared, process-wide cache, not a second one.
     pub event_cache: EventCache,
+    /// `createBoundedContextFromTemplate`'s own synchronous refresh
+    /// target (ultra-review bug_001) - the identical `TemplateCache`
+    /// every dispatcher above already consults for template resolution,
+    /// reused here so the resolver can close the same-instance race a
+    /// refresh-only-via-cross-instance-NOTIFY design left open: calling
+    /// `.refresh(&state.pool)` right after committing a new tenant means
+    /// an immediate `submitCommand` on this same instance sees it, not
+    /// just other instances once their own listener task catches up.
+    /// See `skilj_core::template_cache`'s own doc comment for the full
+    /// design and why this lives in `skilj-core`, not here or in the
+    /// `skilj` facade crate that first held it.
+    pub template_cache: skilj_core::template_cache::TemplateCache,
 }
 
 /// Mounts a fresh `axum::Router` at `/graphql` against an already-built

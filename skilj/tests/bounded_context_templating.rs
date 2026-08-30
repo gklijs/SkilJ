@@ -299,6 +299,12 @@ const EVENT_TYPES_QUERY: &str = "\
 const COMMAND_TYPES_QUERY: &str = "\
     query($bc: String!) { commandTypes(boundedContext: $bc) { name } }";
 
+const ARCHIVE_MUTATION: &str = "\
+    mutation($name: String!) { archiveBoundedContext(name: $name) { name } }";
+
+const DELETE_MUTATION: &str = "\
+    mutation($name: String!) { deleteBoundedContext(name: $name) { name } }";
+
 // --- fixtures for the dispatch test - see this file's own doc comment
 // for why these need a compile-time-fixed BOUNDED_CONTEXT ---
 
@@ -341,6 +347,53 @@ impl CommandType for TemplateFixtureCommand {
     type Payload = FixturePayload;
     type Event = TemplateFixtureBoundedContextEvent;
     const NAME: &'static str = "TemplatingFixtureCommand";
+    fn decide(_payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted { events: vec![] }
+    }
+}
+
+// --- a second, independent fixture set for the template-deletion test
+// below - it archives and deletes its own template, so it needs a
+// compile-time-fixed name of its own, isolated from `TEMPLATE_BOUNDED_
+// CONTEXT` above (deleting that one would corrupt the dispatch test,
+// which runs concurrently in the same binary by default) ---
+
+const DELETION_TEMPLATE_BOUNDED_CONTEXT: &str = "skilj_templating_test_deltpl";
+
+struct DeletionTemplateFixtureEvent;
+
+#[auto_register(DELETION_TEMPLATE_BOUNDED_CONTEXT)]
+impl EventType for DeletionTemplateFixtureEvent {
+    type Payload = FixturePayload;
+    const NAME: &'static str = "DeletionTemplatingFixtureEvent";
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+}
+
+enum DeletionTemplateFixtureBoundedContextEvent {
+    Fixture(FixturePayload),
+}
+
+impl BoundedContextEvent for DeletionTemplateFixtureBoundedContextEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "DeletionTemplatingFixtureEvent" => Some(
+                serde_json::from_str(&event.payload)
+                    .map(DeletionTemplateFixtureBoundedContextEvent::Fixture),
+            ),
+            _ => None,
+        }
+    }
+}
+
+struct DeletionTemplateFixtureCommand;
+
+#[auto_register(DELETION_TEMPLATE_BOUNDED_CONTEXT)]
+impl CommandType for DeletionTemplateFixtureCommand {
+    type Payload = FixturePayload;
+    type Event = DeletionTemplateFixtureBoundedContextEvent;
+    const NAME: &'static str = "DeletionTemplatingFixtureCommand";
     fn decide(_payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
         CommandDecision::Accepted { events: vec![] }
     }
@@ -423,31 +476,22 @@ fn creating_a_tenant_from_a_template_lets_it_actually_process_commands() {
             tenant_name
         );
 
-        // The tenant's own schema now carries the template's type
-        // registrations - real rows, not just a live dispatch fallback.
-        // `commandTypes` is `AdminAccess`-gated, so this needs the
-        // tenant's own admin-level mapping just granted above, not the
-        // superadmin caller (a superadmin has no per-context mapping of
-        // its own on any ordinary bounded context).
-        let response = graphql_request(
-            &router,
-            &tenant_jwt,
-            COMMAND_TYPES_QUERY,
-            json!({ "bc": tenant_name }),
-        )
-        .await;
-        assert!(
-            response.get("errors").is_none(),
-            "unexpected errors: {response:?}"
-        );
-        assert_eq!(
-            response["data"]["commandTypes"][0]["name"],
-            "TemplatingFixtureCommand"
-        );
-
-        // The decisive assertion: a real command, submitted against the
-        // tenant's own runtime-chosen name, reaches the exact `decide()`
-        // compiled under the template's name.
+        // The decisive assertion: a real command, submitted immediately -
+        // zero intervening GraphQL round-trips - against the tenant's own
+        // runtime-chosen name, reaches the exact `decide()` compiled
+        // under the template's name.
+        //
+        // NOT a reliable regression test for ultra-review bug_001's own
+        // same-instance race specifically, despite the shape suggesting
+        // it should be: verified directly (temporarily removed the
+        // create resolver's synchronous `template_cache.refresh` call
+        // and reran) that this still passes without it, in this harness -
+        // one local Postgres, no real network hop, everything in one
+        // process, so the background cross-instance `PgListener` task
+        // wins that race too reliably to ever demonstrate the gap here.
+        // The synchronous refresh stays (it's still correct, and closes
+        // a real window once network latency between instances is
+        // real), but don't read a pass here as proof it's load-bearing.
         let response = graphql_request(
             &router,
             &tenant_jwt,
@@ -464,6 +508,29 @@ fn creating_a_tenant_from_a_template_lets_it_actually_process_commands() {
             "unexpected errors: {response:?}"
         );
         assert_eq!(response["data"]["submitCommand"]["accepted"], true);
+
+        // Structural check, now that the decisive assertion above is
+        // safely past: the tenant's own schema really does carry the
+        // template's type registrations as real rows, not just a live
+        // dispatch fallback. `commandTypes` is `AdminAccess`-gated, so
+        // this needs the tenant's own admin-level mapping granted above,
+        // not the superadmin caller (a superadmin has no per-context
+        // mapping of its own on any ordinary bounded context).
+        let response = graphql_request(
+            &router,
+            &tenant_jwt,
+            COMMAND_TYPES_QUERY,
+            json!({ "bc": tenant_name }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["commandTypes"][0]["name"],
+            "TemplatingFixtureCommand"
+        );
     });
 }
 
@@ -586,5 +653,216 @@ fn resync_bounded_context_from_template_pulls_in_a_later_schema_change() {
             .as_str()
             .unwrap()
             .contains("note"));
+    });
+}
+
+/// Ultra-review bug_002's own regression test: a `roleId` that doesn't
+/// resolve to any real `Role` must not leave an orphaned tenant behind.
+/// Without the fix, `insert_bounded_context` had already committed by
+/// the time the bad `roleId` was even looked up, so the name was
+/// permanently stuck (`BoundedContextNameTaken` on any retry, with no
+/// way to reach `deleteBoundedContext` either, since that itself
+/// requires archiving first). The decisive assertion is the *second*
+/// call: the exact same name, now with a real `roleId`, must succeed -
+/// which is only possible if the first call's failure left nothing
+/// behind to collide with.
+#[test]
+fn a_bad_role_id_leaves_no_orphaned_tenant_behind() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let jwks_url = serve_jwks().await;
+
+        let template_name = unique_name("atpl");
+        insert_bounded_context(&pool, &template_name).await;
+        let (_superadmin, superadmin_jwt) = insert_role(&pool, true, "Superadmin").await;
+        let (real_role, _) = insert_role(&pool, false, "Real Role").await;
+
+        let (skilj, _report) = Skilj::builder(database_url)
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+
+        let tenant_name = unique_name("orphan");
+        let bogus_role_id = generate_token_id();
+
+        let response = graphql_request(
+            &router,
+            &superadmin_jwt,
+            CREATE_FROM_TEMPLATE_MUTATION,
+            json!({
+                "template": template_name,
+                "name": tenant_name,
+                "roleId": bogus_role_id,
+                "level": "ADMIN",
+            }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_some(),
+            "expected a not_found error: {response:?}"
+        );
+
+        // The decisive check: retrying the identical name with a real
+        // role now succeeds - proving nothing from the failed call was
+        // left behind to collide with it.
+        let response = graphql_request(
+            &router,
+            &superadmin_jwt,
+            CREATE_FROM_TEMPLATE_MUTATION,
+            json!({
+                "template": template_name,
+                "name": tenant_name,
+                "roleId": real_role.id,
+                "level": "ADMIN",
+            }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["createBoundedContextFromTemplate"]["name"],
+            tenant_name
+        );
+    });
+}
+
+/// Ultra-review bug_005's own regression test: deleting a template must
+/// not silently stop its tenants from processing commands. Without the
+/// fix, `TemplateCache` read the same nullable `template` column
+/// `DeleteBoundedContext`'s `ON DELETE SET NULL` cascade clears, so
+/// dispatch resolution would fall back to the tenant's own name -  never
+/// a real dispatcher-map key - the moment the template's row was gone.
+#[test]
+fn deleting_a_template_does_not_break_its_tenants_own_dispatch() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let jwks_url = serve_jwks().await;
+
+        if skilj_core::db::get_bounded_context(&pool, DELETION_TEMPLATE_BOUNDED_CONTEXT)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            let _ = insert_bounded_context(&pool, DELETION_TEMPLATE_BOUNDED_CONTEXT).await;
+        }
+        let template_bc =
+            skilj_core::db::get_bounded_context(&pool, DELETION_TEMPLATE_BOUNDED_CONTEXT)
+                .await
+                .unwrap()
+                .unwrap();
+
+        let (reconciliation_role, _) = insert_role(&pool, false, "Reconciliation").await;
+        grant(
+            &pool,
+            &reconciliation_role,
+            &template_bc,
+            AccessLevel::Admin,
+        )
+        .await;
+        let (template_admin, template_admin_jwt) =
+            insert_role(&pool, false, "Template Admin").await;
+        grant(&pool, &template_admin, &template_bc, AccessLevel::Admin).await;
+        let (_superadmin, superadmin_jwt) = insert_role(&pool, true, "Superadmin").await;
+        let (tenant_role, tenant_jwt) = insert_role(&pool, false, "Tenant Operator").await;
+
+        let (skilj, _report) = Skilj::builder(database_url)
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .auto_register()
+            .reconciliation_role(reconciliation_role.external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+
+        let tenant_name = unique_name("dtnt");
+        let response = graphql_request(
+            &router,
+            &superadmin_jwt,
+            CREATE_FROM_TEMPLATE_MUTATION,
+            json!({
+                "template": DELETION_TEMPLATE_BOUNDED_CONTEXT,
+                "name": tenant_name,
+                "roleId": tenant_role.id,
+                "level": "ADMIN",
+            }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+
+        let submit = json!({
+            "bc": tenant_name,
+            "type": "DeletionTemplatingFixtureCommand",
+            "payload": "{}",
+        });
+
+        // Baseline: dispatch works while the template still exists.
+        let response = graphql_request(
+            &router,
+            &tenant_jwt,
+            SUBMIT_COMMAND_MUTATION,
+            submit.clone(),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true);
+
+        // Archive then delete the template - the tenant's own `template`
+        // column is cleared by the FK cascade at this point, but its
+        // `dispatch_template` is not.
+        let response = graphql_request(
+            &router,
+            &template_admin_jwt,
+            ARCHIVE_MUTATION,
+            json!({ "name": DELETION_TEMPLATE_BOUNDED_CONTEXT }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        let response = graphql_request(
+            &router,
+            &superadmin_jwt,
+            DELETE_MUTATION,
+            json!({ "name": DELETION_TEMPLATE_BOUNDED_CONTEXT }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+
+        // The decisive assertion: the tenant still answers exactly what
+        // it answered before its template was deleted.
+        let response = graphql_request(&router, &tenant_jwt, SUBMIT_COMMAND_MUTATION, submit).await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true);
     });
 }

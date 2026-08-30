@@ -964,15 +964,20 @@ pub async fn get_bounded_context(
     // Invariant TemplateIsNeverItselfTemplated: a template's own `template`
     // is always `None`, so this recursion is at most one level deep - it
     // can never loop.
+    //
+    // Ultra-review bug_006: this template row and the tenant row above
+    // are two separate `SELECT`s, no shared transaction - a real,
+    // legitimate race (the template gets deleted, and its own
+    // `ON DELETE SET NULL` cascade fires, between the two) means this
+    // recursive lookup can genuinely return `None` even though the
+    // outer row's own snapshot still said `Some(template_name)`. Treated
+    // as `None` here rather than an `.expect()` panic: that's exactly
+    // the state a fresh re-read of the same tenant would show anyway,
+    // once the delete has committed.
     let template = match &row.template {
-        Some(template_name) => Some(Box::new(
-            Box::pin(get_bounded_context(pool, template_name))
-                .await?
-                .expect(
-                    "bounded_contexts.template references a bounded_contexts row that no \
-                     longer exists",
-                ),
-        )),
+        Some(template_name) => Box::pin(get_bounded_context(pool, template_name))
+            .await?
+            .map(Box::new),
         None => None,
     };
     Ok(Some(bounded_context_from_row(row, role, template)))
@@ -1039,6 +1044,50 @@ pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<Boun
     // query returned), matching `list_roles`/`list_role_access_mappings`'s
     // own unordered `Vec` return.
     Ok(contexts_by_name.into_values().collect())
+}
+
+/// Ultra-review bug_005's own fix - see migration `0003_add_bounded_
+/// context_dispatch_template.sql`'s own doc comment for the full
+/// reasoning. `createBoundedContextFromTemplate` calls this once,
+/// immediately after `insert_bounded_context` succeeds, to set the
+/// permanent, never-cleared record `TemplateCache`'s dispatch resolution
+/// reads from (`list_dispatch_template_mappings` below) - deliberately
+/// not part of `insert_bounded_context`'s own signature, since every
+/// other caller of that function (bootstrap, ordinary `AddBoundedContext`,
+/// every test fixture) has no dispatch template to set and shouldn't
+/// need to pass one.
+#[tracing::instrument(skip_all, fields(name = %name))]
+pub async fn set_dispatch_template(
+    pool: &Pool,
+    name: &str,
+    dispatch_template: &str,
+) -> crate::error::Result<()> {
+    sqlx::query("UPDATE bounded_contexts SET dispatch_template = $1 WHERE name = $2")
+        .bind(dispatch_template)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `TemplateCache::refresh`'s own data source - every `BoundedContext`'s
+/// own `name` paired with its `dispatch_template` (`None` for the
+/// ordinary, untemplated case), read directly rather than through
+/// `list_bounded_contexts`'s full `BoundedContext` hydration: dispatch
+/// resolution needs nothing else about a context, and this stays a
+/// single flat query with no recursive template lookup, no `Role`
+/// join - a smaller, cheaper, single-purpose read for a call this
+/// crate's own cross-instance listener makes on every registration
+/// change.
+#[tracing::instrument(skip_all)]
+pub async fn list_dispatch_template_mappings(
+    pool: &Pool,
+) -> crate::error::Result<Vec<(String, Option<String>)>> {
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, dispatch_template FROM bounded_contexts")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
 }
 
 // --- EventType ---

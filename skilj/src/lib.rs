@@ -181,59 +181,16 @@ pub struct Skilj {
     /// another instance's. `Arc`-wrapped so both `graphql_router()` and
     /// that background task can hold a cheap clone.
     schema_registry: Arc<skilj_graphql::schema::SchemaRegistry>,
-    /// Codeberg issue #13 - see `TemplateCache`'s own doc comment.
-    /// `Arc`-wrapped for the identical reason `schema_registry` is: the
-    /// background cross-instance listener task holds its own clone and
-    /// refreshes it on every `RegistrationChanged` notification,
-    /// alongside `schema_registry.rebuild`.
-    template_cache: Arc<TemplateCache>,
-}
-
-/// Codeberg issue #13's own missing piece: every `Registered*` map below
-/// is keyed by whatever literal name `.bounded_context(name)`/
-/// `#[auto_register]`'s `T::BOUNDED_CONTEXT` declared at `.build()` time -
-/// for a templated tenant, that's always the *template*'s own name,
-/// never the tenant's (a tenant's name is chosen at runtime, long after
-/// `.build()` ran, so it can never be a map key). `TemplateCache` is the
-/// live, cross-instance-refreshed `bounded_context -> template` lookup
-/// every dispatcher below consults first: `effective_bounded_context`
-/// resolves a tenant's own name to its template's before the real
-/// `HashMap` lookup, so an already-compiled `decide()`/`project()`/etc.
-/// becomes reachable for every tenant cloned from that template with no
-/// redeploy. Refreshed the same way `skilj_graphql::schema::SchemaRegistry`
-/// already is: rebuilt from a fresh `list_bounded_contexts` read on every
-/// `RegistrationChanged` cross-instance notification (see `.build()`'s
-/// own cross-instance listener task) - `insert_bounded_context` already
-/// fires that notification on every new context, templated or not, so
-/// this reuses plumbing that already exists rather than adding a new
-/// channel.
-#[derive(Default)]
-struct TemplateCache(arc_swap::ArcSwap<HashMap<String, Option<String>>>);
-
-impl TemplateCache {
-    fn refresh(&self, contexts: &[skilj_core::event_store::BoundedContext]) {
-        let map = contexts
-            .iter()
-            .map(|bc| {
-                (
-                    bc.name.clone(),
-                    bc.template.as_ref().map(|t| t.name.clone()),
-                )
-            })
-            .collect();
-        self.0.store(Arc::new(map));
-    }
-
-    /// `bounded_context` itself when it has no template on record (the
-    /// ordinary case, and also the safe fallback for a context this
-    /// cache hasn't heard of yet - a lookup miss behaves exactly like an
-    /// untemplated context, never a dispatch failure of its own).
-    fn effective_bounded_context(&self, bounded_context: &str) -> String {
-        match self.0.load().get(bounded_context) {
-            Some(Some(template)) => template.clone(),
-            _ => bounded_context.to_string(),
-        }
-    }
+    /// Codeberg issue #13 - see `skilj_core::template_cache`'s own doc
+    /// comment. Already cheaply `Clone` (`Arc`-wrapped internals), so
+    /// unlike `schema_registry` this doesn't need an outer `Arc` of its
+    /// own - the background cross-instance listener task and
+    /// `graphql_state()` both just hold their own clone, refreshed on
+    /// every `RegistrationChanged` notification alongside
+    /// `schema_registry.rebuild`, and also refreshed synchronously by
+    /// `createBoundedContextFromTemplate`'s own resolver (ultra-review
+    /// bug_001).
+    template_cache: skilj_core::template_cache::TemplateCache,
 }
 
 /// `CommandDispatcher`'s own implementer - a thin wrapper around the
@@ -243,7 +200,7 @@ impl TemplateCache {
 /// alone) without requiring an `Arc<Skilj>`.
 struct Dispatcher {
     command_types: Arc<HashMap<(String, String), RegisteredCommandType>>,
-    template_cache: Arc<TemplateCache>,
+    template_cache: skilj_core::template_cache::TemplateCache,
 }
 
 impl CommandDispatcher for Dispatcher {
@@ -318,7 +275,7 @@ impl CommandDispatcher for Dispatcher {
 /// `command_types`.
 struct ProjectionDispatcherImpl {
     projections: Arc<HashMap<(String, String), RegisteredProjection>>,
-    template_cache: Arc<TemplateCache>,
+    template_cache: skilj_core::template_cache::TemplateCache,
 }
 
 impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
@@ -370,7 +327,7 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
 /// registry instead.
 struct EventDispatcherImpl {
     event_types: Arc<HashMap<(String, String), RegisteredEventType>>,
-    template_cache: Arc<TemplateCache>,
+    template_cache: skilj_core::template_cache::TemplateCache,
 }
 
 impl skilj_core::plugin::EventDispatcher for EventDispatcherImpl {
@@ -393,7 +350,7 @@ impl skilj_core::plugin::EventDispatcher for EventDispatcherImpl {
 /// enumeration method at all.
 struct SnapshotDispatcherImpl {
     snapshots: Arc<HashMap<(String, String), RegisteredSnapshot>>,
-    template_cache: Arc<TemplateCache>,
+    template_cache: skilj_core::template_cache::TemplateCache,
 }
 
 impl skilj_core::plugin::SnapshotDispatcher for SnapshotDispatcherImpl {
@@ -605,6 +562,7 @@ impl Skilj {
             event_broadcaster: self.event_broadcaster.clone(),
             revocation_broadcaster: self.revocation_broadcaster.clone(),
             event_cache: self.event_cache.clone(),
+            template_cache: self.template_cache.clone(),
         }
     }
 }
@@ -1235,20 +1193,18 @@ impl SkiljBuilder {
         let command_types = Arc::new(self.command_types);
         let snapshots = Arc::new(self.snapshots);
 
-        // Codeberg issue #13: built here, from the same full-snapshot
-        // `list_bounded_contexts` read the event-cache warm-up loop below
-        // already needs - one fetch serves both, rather than querying
-        // twice. Reconciliation immediately below never looks up a
-        // templated tenant's own name (it only ever loops over the
-        // literal keys this process's own `.bounded_context(name)`/
-        // `#[auto_register]` calls declared, always a template's name or
-        // an ordinary untemplated one - never a tenant's, chosen later at
-        // runtime), so `reconciliation_dispatcher` just below gets a real
-        // clone of this same cache for structural consistency, even
-        // though every lookup it makes resolves to itself.
+        // Codeberg issue #13: reconciliation immediately below never
+        // looks up a templated tenant's own name (it only ever loops
+        // over the literal keys this process's own `.bounded_context
+        // (name)`/`#[auto_register]` calls declared, always a template's
+        // name or an ordinary untemplated one - never a tenant's, chosen
+        // later at runtime), so `reconciliation_dispatcher` just below
+        // gets a real clone of this same cache for structural
+        // consistency, even though every lookup it makes resolves to
+        // itself.
         let bounded_contexts_for_warm_up = skilj_core::db::list_bounded_contexts(&pool).await?;
-        let template_cache = Arc::new(TemplateCache::default());
-        template_cache.refresh(&bounded_contexts_for_warm_up);
+        let template_cache = skilj_core::template_cache::TemplateCache::new();
+        template_cache.refresh(&pool).await?;
 
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
@@ -1367,6 +1323,7 @@ impl SkiljBuilder {
                 event_broadcaster: event_broadcaster.clone(),
                 revocation_broadcaster: revocation_broadcaster.clone(),
                 event_cache: event_cache.clone(),
+                template_cache: template_cache.clone(),
             })
             .await?,
         );
@@ -1618,7 +1575,7 @@ impl SkiljBuilder {
         let cross_instance_event_broadcaster = skilj.event_broadcaster.clone();
         let cross_instance_revocation_broadcaster = skilj.revocation_broadcaster.clone();
         let cross_instance_schema_registry = Arc::clone(&skilj.schema_registry);
-        let cross_instance_template_cache = Arc::clone(&skilj.template_cache);
+        let cross_instance_template_cache = skilj.template_cache.clone();
         let cross_instance_state = skilj.graphql_state();
         tokio::spawn(async move {
             let mut listener = loop {
@@ -1736,12 +1693,14 @@ impl SkiljBuilder {
                         // Codeberg issue #13 - see the note above this
                         // task's own spawn for why this shares the same
                         // notification `schema_registry.rebuild` does.
-                        match skilj_core::db::list_bounded_contexts(&cross_instance_pool).await {
-                            Ok(contexts) => cross_instance_template_cache.refresh(&contexts),
-                            Err(err) => tracing::warn!(
+                        if let Err(err) = cross_instance_template_cache
+                            .refresh(&cross_instance_pool)
+                            .await
+                        {
+                            tracing::warn!(
                                 error = %err,
                                 "cross-instance template cache refresh failed"
-                            ),
+                            );
                         }
                     }
                 }

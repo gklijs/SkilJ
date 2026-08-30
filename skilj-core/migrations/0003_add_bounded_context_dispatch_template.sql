@@ -1,0 +1,22 @@
+-- Ultra-review bug_005 (Codeberg issue #13's own follow-up): `template`
+-- (0002) is correctly cleared by `ON DELETE SET NULL` when the
+-- referenced template is deleted - that's the right behaviour for the
+-- display/resync-eligibility field ("was this tenant stamped from a
+-- template, and is there still one to resync from"). But dispatch
+-- resolution (`TemplateCache`, skilj-core::template_cache) was reading
+-- that same nullable column, so a deleted template silently broke
+-- command/event/projection dispatch for every one of its tenants -
+-- contradicting the spec's own guarantee that a tenant stays "unchanged
+-- in what it holds and what it answers" after its template is deleted.
+--
+-- `dispatch_template` is a second, permanent record of the same fact:
+-- set once, at tenant creation, by `createBoundedContextFromTemplate`
+-- alone, and never updated or cleared by anything afterward - in
+-- particular no FK/cascade here, deliberately, since the whole point is
+-- that it must survive the referenced template row's own deletion.
+-- Internal bookkeeping only: no spec field, no GraphQL exposure - it
+-- exists purely so `TemplateCache` can keep routing a tenant's dispatch
+-- to its own compiled `decide()`/`project()` after its template is gone,
+-- the same way `template` (0002) already lets it before that.
+ALTER TABLE bounded_contexts
+    ADD COLUMN dispatch_template TEXT;

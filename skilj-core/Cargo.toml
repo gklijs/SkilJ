@@ -35,6 +35,13 @@ opentelemetry.workspace = true
 # applies.
 jsonschema = { version = "0.49.9", default-features = false }
 ipnet.workspace = true
+# Ultra-review bug_001/bug_005's own fix: `TemplateCache`'s live,
+# cross-instance-refreshed `bounded_context -> dispatch_template` lookup
+# - the same `ArcSwap`-behind-a-cheap-`Arc` pattern
+# `skilj_graphql::schema::SchemaRegistry` already uses, moved here (from
+# the `skilj` facade crate, where it first lived) so both `skilj` and
+# `skilj-graphql` can share one instance through `GraphqlState`.
+arc-swap.workspace = true
 
 [dev-dependencies]
 postgresql_embedded = "0.21.0"

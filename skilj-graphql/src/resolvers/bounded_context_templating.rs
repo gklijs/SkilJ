@@ -204,6 +204,69 @@ async fn apply_template_registrations(
     Ok(())
 }
 
+/// Everything `createBoundedContextFromTemplate` still has to do once
+/// its tenant durably exists: mark the tenant's own permanent dispatch-
+/// routing name (ultra-review bug_005 - see `skilj_core::template_cache`'s
+/// own doc comment for why this is a second, never-cleared field rather
+/// than reusing `BoundedContext.template`), grant the given role access,
+/// apply the template's current registrations, and load the result back.
+/// Factored out so the caller can wrap it: any `Err` here means a
+/// compensating `hard_delete_bounded_context` runs before the error is
+/// propagated (ultra-review bug_002).
+#[allow(clippy::too_many_arguments)]
+async fn finish_creating_tenant(
+    state: &GraphqlState,
+    caller: &Role,
+    template: &BoundedContext,
+    template_name: &str,
+    tenant: &BoundedContext,
+    name: &str,
+    role: &Role,
+    level: AccessLevel,
+    can_read_sensitive: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> async_graphql::Result<crate::gql_types::BoundedContextWithMappings> {
+    skilj_core::db::set_dispatch_template(&state.pool, &tenant.name, template_name)
+        .await
+        .map_err(to_graphql_error)?;
+
+    let existing_mappings = skilj_core::db::list_role_access_mappings(&state.pool)
+        .await
+        .map_err(to_graphql_error)?;
+    let mapping = skilj_core::access_control::grant_role_access_mapping(
+        caller,
+        role,
+        tenant,
+        level,
+        can_read_sensitive,
+        &existing_mappings,
+        now,
+    )
+    .map_err(to_graphql_error)?;
+    skilj_core::db::insert_role_access_mapping(&state.pool, &mapping)
+        .await
+        .map_err(to_graphql_error)?;
+
+    apply_template_registrations(
+        &state.pool,
+        caller,
+        template,
+        tenant,
+        state.projection_dispatcher.as_ref(),
+        now,
+    )
+    .await?;
+
+    load_bounded_context_with_mappings(&state.pool, name)
+        .await
+        .map_err(to_graphql_error)?
+        .ok_or_else(|| {
+            async_graphql::Error::new(
+                "just inserted this bounded context - it must be readable back",
+            )
+        })
+}
+
 /// `createBoundedContextFromTemplate(template: String!, name: String!, roleId: ID!, level: AccessLevel!, canReadSensitive: Boolean!): BoundedContext!`
 pub fn create_bounded_context_from_template_field() -> Field {
     Field::new(
@@ -232,6 +295,16 @@ pub fn create_bounded_context_from_template_field() -> Field {
                     .await
                     .map_err(to_graphql_error)?;
 
+                // Ultra-review bug_002: `role` is looked up and validated
+                // *before* `insert_bounded_context` runs - a caller-typo'd
+                // `roleId` is by far the most reachable way this mutation
+                // can fail, and this is the one part of the flow a plain
+                // reordering (no transaction, no cleanup) fully closes.
+                let role = skilj_core::db::get_role(&state.pool, &role_id)
+                    .await
+                    .map_err(to_graphql_error)?
+                    .ok_or_else(|| not_found("Role", &role_id))?;
+
                 let tenant = skilj_core::bootstrap::create_bounded_context_from_template(
                     &caller,
                     &template,
@@ -244,41 +317,65 @@ pub fn create_bounded_context_from_template_field() -> Field {
                     .await
                     .map_err(to_graphql_error)?;
 
-                let role = skilj_core::db::get_role(&state.pool, &role_id)
-                    .await
-                    .map_err(to_graphql_error)?
-                    .ok_or_else(|| not_found("Role", &role_id))?;
-                let existing_mappings = skilj_core::db::list_role_access_mappings(&state.pool)
-                    .await
-                    .map_err(to_graphql_error)?;
-                let mapping = skilj_core::access_control::grant_role_access_mapping(
-                    &caller,
-                    &role,
-                    &tenant,
-                    level,
-                    can_read_sensitive,
-                    &existing_mappings,
-                    now,
-                )
-                .map_err(to_graphql_error)?;
-                skilj_core::db::insert_role_access_mapping(&state.pool, &mapping)
-                    .await
-                    .map_err(to_graphql_error)?;
-
-                apply_template_registrations(
-                    &state.pool,
+                // Everything from here on runs against a tenant that now
+                // durably exists. Ultra-review bug_002's remaining gap
+                // (a role revoked mid-flight, an existing-mapping
+                // conflict, or a template registration that fails to
+                // apply) is closed with a compensating delete rather than
+                // a shared transaction across `skilj-core::access_control`/
+                // `event_store`/`projections` - `db::hard_delete_bounded_
+                // context` needs no prior archival (that precondition
+                // lives in `bootstrap::delete_bounded_context`, the
+                // ordinary user-facing rule this bypasses on purpose:
+                // this is an internal rollback of a resource the *same*
+                // request just created, not a real deletion request).
+                let finish = finish_creating_tenant(
+                    state,
                     &caller,
                     &template,
+                    &template_name,
                     &tenant,
-                    state.projection_dispatcher.as_ref(),
+                    &name,
+                    &role,
+                    level,
+                    can_read_sensitive,
                     now,
                 )
-                .await?;
+                .await;
+                let with_mappings = match finish {
+                    Ok(with_mappings) => with_mappings,
+                    Err(err) => {
+                        if let Err(cleanup_err) =
+                            skilj_core::db::hard_delete_bounded_context(&state.pool, &tenant.name)
+                                .await
+                        {
+                            tracing::warn!(
+                                error = %cleanup_err,
+                                bounded_context = %tenant.name,
+                                "createBoundedContextFromTemplate: failed to clean up a \
+                                 partially-created tenant after a downstream error"
+                            );
+                        }
+                        return Err(err);
+                    }
+                };
 
-                let with_mappings = load_bounded_context_with_mappings(&state.pool, &name)
-                    .await
-                    .map_err(to_graphql_error)?
-                    .expect("just inserted this bounded context - it must be readable back");
+                // Ultra-review bug_001: refreshed synchronously, not left
+                // to the cross-instance `RegistrationChanged` listener
+                // alone - that refreshes every *other* instance, but this
+                // is the one that just created the tenant, and an
+                // immediate `submitCommand` right after this call returns
+                // needs to see it too.
+                if let Err(err) = state.template_cache.refresh(&state.pool).await {
+                    tracing::warn!(
+                        error = %err,
+                        bounded_context = %tenant.name,
+                        "createBoundedContextFromTemplate: synchronous template cache refresh \
+                         failed - dispatch for this tenant on this instance will only become \
+                         reachable once the cross-instance listener catches up"
+                    );
+                }
+
                 Ok(Some(FieldValue::owned_any(with_mappings)))
             })
         },
