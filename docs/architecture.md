@@ -4186,3 +4186,370 @@ unchanged - including the real end-to-end async-projection/snapshot/
 scheduler tests, proving the batched queries and concurrent fan-out
 preserve behaviour exactly, not just "look right." `cargo
 build/clippy/test --workspace` clean.
+
+## 23. Cross-tenant projection read fix: owner-tag scoping on `RoleAccessMapping`
+
+A security review found that `ProjectionQuery`'s only access check
+(`require_read_mapping`, `skilj-graphql/src/resolvers/mod.rs`) was "does
+the caller hold any active `RoleAccessMapping` on this bounded context" -
+never whether the specific instance queried belonged to that caller. In
+a bounded context shared by several tenants (skilj-helpdesk's own
+motivating case: every company's tickets live in one `helpdesk` bounded
+context, `company_id` a payload field rather than a tenancy boundary),
+any authenticated caller with read access could query any instance by
+key - `TicketSummary`/`CompanyTicketList` for a company they had nothing
+to do with, and equally a staff-only, non-sensitive projection like
+`TicketInternalNotes`. The existing per-field sensitive-data mechanism
+(`can_read_sensitive`/subject-match) didn't cover this: it's a
+field-level crypto-shredding gate, not an instance-level read ACL, and
+its self-match grant only fires when a projection's key *is* a person's
+own identity - never for a ticket-id-keyed projection, and it says
+nothing at all about a non-sensitive projection's own visibility.
+
+skilj's authorization model had exactly two scopes: bounded-context-level
+(`RoleAccessMapping`) and per-field-sensitive-value (`EncryptionKey`) -
+no primitive for "this Role may only see instances whose owner matches a
+value it's scoped to" within one shared bounded context. Three
+directions were on the table (a scoping value on `RoleAccessMapping`
+checked against a declared owner tag on the projection; a pluggable
+per-query authorization callback the embedding app registers; extending
+the subject/`EncryptionKey` mechanism to also gate plain visibility) -
+the first was chosen: it fits the existing DCB-tag-based design most
+closely, and doesn't conflate encryption with access control the way the
+third would.
+
+**Design**: two new pieces, deliberately asymmetric in how public they
+are.
+
+`Projection::OWNER_TAG_KEY: Option<&'static str>` (`skilj-core/src/plugin/mod.rs`,
+default `None`) names which tag key - one a consumed event type's own
+`tag_mappings` already produces - is this projection's "owner" dimension.
+Mirrors `Snapshot::TAG_KEY`'s own treatment exactly: a compile-time Rust
+constant resolved in-process via a new `ProjectionDispatcher::owner_tag_key`
+method (same `Option<Option<&'static str>>` shape
+`CommandDispatcher::snapshot_name` already has - outer `None` for "pair
+not registered"), with **no spec entity field and no registration
+surface** - implementation detail an admin has no need to see, not
+something `RegisterProjection` reconciles.
+
+`RoleAccessMapping.scope: Option<String>`, by contrast, **is** spec'd
+and DB-persisted (`role_access_mappings.scope`, migration
+`0004_add_role_access_mapping_scope.sql`), because `GrantRoleAccessMapping`
+is a real, GraphQL-exposed mutation an admin calls. `None` (every
+mapping's default, including every one granted before this column
+existed) means unrestricted within the bounded context - identical to
+this mapping's own behaviour before `scope` existed. `Some(v)` restricts
+the grant: for a projection that declares `OWNER_TAG_KEY`, it may only
+read instances whose own derived owner equals `v`. A projection that
+declares no owner dimension at all is unaffected by `scope` regardless
+of its value - `banking.rs`/`courses.rs` and every other existing
+projection needed zero changes.
+
+Each instance's own owner is derived automatically, not caller-supplied:
+when an event folds into a projection that declares `OWNER_TAG_KEY`, and
+that event's own `tags` carries a tag with that key and a non-null
+value, that value becomes (or refreshes) the instance's stored `owner`
+column (`projection_state.owner`/`projection_rebuild_state.owner`, both
+nullable). An event lacking the tag leaves an already-established owner
+untouched - one wrongly-modelled event in an instance's history can't
+erase existing scoping. `apply_projection_fold_update`
+(`skilj-core/src/db/mod.rs`) is the one place this is computed, shared by
+all four "fold one event, persist the new state" call sites
+(`insert_event_and_update_sync_projections_in_tx`, both of
+`catch_up_bounded_context`'s live and rebuild-building loops, and
+`fold_history_into_new_sync_projection`) that were near-identical copies
+of the same `UPDATE` before this pass - consolidated along the way, not
+left duplicated a fifth time. `promote_projection_rebuild`'s own
+`INSERT ... SELECT` from `projection_rebuild_state` into `projection_state`
+carries `owner` across too, so a promoted rebuild keeps whatever
+ownership it derived while building.
+
+Enforcement lives in `projections::query_projection`
+(`skilj-core/src/projections/mod.rs`), the spec's own `owner_scope_satisfied`
+black box: a new `Error::GrantScopeMismatch` rejection, fail-closed. When
+the projection declares an owner dimension and the grant's `scope` is
+`Some`, the query is rejected unless the instance's own derived owner is
+`Some` *and* equal to it - an instance whose ownership can't be
+affirmatively proven (including a key nothing has touched yet, which
+previously answered from `ProjectionDispatcher::default_state` with no
+further check) is treated the same as a proven mismatch, not as "no
+conflict." `skilj-graphql/src/resolvers/projection_query.rs`'s resolver
+wires it: a new `db::get_projection_state_and_owner` (kept separate from
+the existing `get_projection_state`, which has many callers - tests
+included - uninterested in `owner`) fetches the stored owner alongside
+state, `ProjectionDispatcher::owner_tag_key` says whether the projection
+declares a dimension at all, both feed into `query_projection`. The
+GraphQL-facing `grantRoleAccessMapping` mutation gained an optional
+`scope: String` argument (`access_management.rs`), and `RoleAccessMapping`'s
+own GraphQL type exposes it (`gql_types.rs`, reusing the existing
+`optional_string` helper).
+
+`specs/skilj.allium` changes (via `allium:tend`, `allium check` clean,
+`allium plan` moved 397 → 399 obligations with exactly the two expected
+additions - `entity-optional.RoleAccessMapping.scope`,
+`rule-failure.QueryProjection.4` - nothing else): `entity RoleAccessMapping`
+gained `scope: String?`; `rule GrantRoleAccessMapping` gained an optional
+`scope` parameter; `rule QueryProjection` gained
+`requires: owner_scope_satisfied(projection, instance_key, access_mapping)`,
+placed before the `wait_for_sequence` check (resolve the instance, check
+ownership, *then* block on catch-up - not the other way round); `surface
+ProjectionQuery` gained `@guarantee GrantScopedToOwnerWhenDeclared`
+alongside the existing `GrantScopedToBoundedContext`. One gap flagged by
+the spec pass, deliberately left alone: `rule CreateBoundedContextFromTemplate`
+is the *second* place a `RoleAccessMapping` comes into being and takes no
+`scope` argument, so a templated tenant's grant is always created
+unrestricted - and, since `UniqueActiveGrantPerRoleAndContext` forbids a
+second active grant for the same `(role, bounded_context)` pair with no
+amend-in-place rule, cannot be scoped for the life of that mapping short
+of revoking and re-granting it. Out of scope for this pass; revisit if
+owner-scoped templated tenants become a real need.
+
+**Explicitly out of scope, flagged for a follow-up**:
+`FetchEvents`/`QueryEvents`/`EventSubscription` read/deliver raw events
+by tag filter under the same "any active bounded-context mapping sees
+everything" gate, with no per-role tag scoping either - a same-shaped
+gap, but a separately-designed fix (a subscription can span several
+event types, each with its own independent `tag_mappings`, so there's no
+single natural "the owner tag" the way one `Projection` declares one).
+
+**Verified**: a new real-Postgres regression suite,
+`skilj-core/tests/projection_owner_scoping.rs` - a `TicketOpened` event
+type tagged `company`, feeding a `TicketSummary` projection that
+declares `OWNER_TAG_KEY = Some("company")`, exercised through the real
+fold path (not `apply_projection_fold_update` called directly): confirms
+two different companies' tickets get correctly distinct derived owners,
+an untagged follow-up event (`TicketCommented`) leaves an established
+owner untouched, and - the concrete vulnerability this pass closes - a
+`scope`-restricted grant can read its own company's ticket but is
+rejected reading the other company's, a never-touched key is rejected
+the same fail-closed way, and an unscoped (staff) grant remains
+unrestricted. `skilj-core/tests/projection_query.rs` gained six new pure
+unit tests covering `query_projection`'s new parameters directly (the
+new `rule-failure.QueryProjection.4` obligation, plus every accept path).
+Every one of the ~40 existing `RoleAccessMapping`/`grant_role_access_mapping`
+call sites across the workspace (test fixtures and the three real
+admin-bootstrap sites in `skilj-demo`/`templates/skilj-template`/
+`bounded_context_templating.rs`) updated to carry `scope: None` -
+`cargo build/clippy/test --workspace` and `cargo fmt --check` all clean,
+full existing suite green with no behavioural change to any
+already-unscoped mapping or projection.
+
+## 24. Cross-tenant read fix, part two: raw events (`FetchEvents`, `QueryEvents`/`CountEvents`/`InspectEvent`, `EventSubscription`)
+
+§23 closed the gap for `ProjectionQuery`; this pass closes the same gap
+for skilj's other read surfaces, all of which shared the identical
+shallow check (`require_read_mapping`/a bearer `EventReadToken`: "any
+active grant/token", never "does this specific *event* belong to the
+caller"). `EventSubscription` is `ReadAccess`-faced, exactly parallel to
+`ProjectionQuery`; `QueryEvents`/`CountEvents`/`InspectEvent` are
+`Admin`-faced but still leak across tenants sharing one bounded
+context - a company's own admin, scoped to their own company, could read
+every other company's raw events too; `FetchEvents`/`ConsumeEvents` are
+the REST track's own pull-based reads, authenticated by a bearer
+`EventReadToken` with no `Role` behind it at all.
+
+**Design**: the same `scope`-vs-derived-owner mechanism as §23, but
+reshaped around two differences from the projection case.
+
+First, raw events are already fully described by `EventType.tag_mappings`,
+a real, registered, spec'd field - unlike a `Projection`'s opaque
+instance state, there's no need for a parallel Rust-only declaration.
+`EventType.owner_tag_key: Option<String>` (`skilj-core/src/event_store/mod.rs`)
+names which of a type's own `tag_mappings` keys is its owner dimension,
+and **is** spec'd and registered (unlike `Projection::OWNER_TAG_KEY`,
+which deliberately mirrors `Snapshot::TAG_KEY`'s Rust-only treatment):
+`RegisterEventType` gained a `valid_owner_tag_key(tag_mappings,
+owner_tag_key)` requires clause, mirroring `valid_tag_mappings`'s own
+shape - null, or a key present in `tag_mappings`. Unlike `tag_mappings`
+itself, `owner_tag_key` is *not* additive-only on re-registration: it's
+a pointer into the mappings, re-validated fresh every time, free to
+change or clear. `plugin::EventType::owner_tag_key() -> Option<&'static str>`
+(default `None`) is the Rust-facing declaration; `RegisteredEventType`
+(`skilj/src/lib.rs`) and both reconciliation paths that call
+`register_event_type` (the `#[auto_register]` startup loop, and
+`bounded_context_templating.rs`'s template-application path) carry it
+through unchanged from the source type.
+
+Second, an instance's own owner is derived per-event, not per-instance:
+`event_store::event_owner_scope_satisfied(event: &Event, scope: Option<&str>) -> bool`
+holds when `scope` is `None`, the event's own type declares no
+`owner_tag_key`, or `event.tags` carries a tag with that key and a
+matching value - fails closed otherwise (no such tag, or a null-valued
+one, is treated as a proven mismatch, the identical stance
+`projections::query_projection`'s own `owner_scope_satisfied` takes).
+Deliberately takes a raw `scope: Option<&str>` rather than a whole
+`RoleAccessMapping`, so it serves both tracks identically: GraphQL
+callers pass `access_mapping.scope`, the REST track passes the new
+`EventReadToken.scope: Option<String>` (`skilj-core/src/access_control/mod.rs`,
+set at minting time by `create_event_read_token`'s new optional `scope`
+parameter - independent of the minting admin's own `access_mapping.scope`,
+so an unscoped staff admin can mint a company-scoped token for a
+company's own external integration).
+
+Multi-record surfaces filter rather than reject: `query_events`/
+`count_events`/`deliver_to_subscriptions`/`fetch_events`/`consume_events`
+(`skilj-core/src/event_store/mod.rs`) each gained one more `.filter()` in
+their existing chains - a non-owned event is silently excluded, the call
+still succeeds, the same "redact, don't reject the whole query" register
+sensitive-field decryption already uses. `inspect_event`, the one
+single-record surface here (mirrors `query_projection`'s own shape),
+rejects outright with the relocated `access_control::Error::GrantScopeMismatch` -
+moved up from `projections::Error` (where §23 first put it) to sit
+alongside `GrantBoundedContextMismatch`, since it's now shared by both
+`projections::query_projection` and every function in this pass, the
+same cross-cutting-error convention `GrantBoundedContextMismatch` itself
+already follows.
+
+No GraphQL/REST resolver wiring changed for `queryEvents`/`countEvents`/
+`inspectEvent`/`fetchEvents`/`consumeEvents`/event delivery - every call
+site already passed its whole `RoleAccessMapping`/`EventReadToken`/
+`Subscription` through unchanged, so `scope` rides along for free.
+`registerEventType`'s mutation gained an optional `ownerTagKey: String`
+argument (`type_registration.rs`, mirroring `grantRoleAccessMapping`'s
+own `scope` argument from §23) and `createEventReadToken`'s gained
+`scope: String` - pulled out of the shared `create_type_token_field!`
+macro into its own hand-written resolver, the same reason
+`db::get_event_type_access_token!` already has an identical exception
+for `get_event_read_token` (only `EventReadToken` carries the extra
+field; the macro's fixed shape has no way to vary it per invocation).
+
+**Deliberately not addressed this pass, flagged for a follow-up**:
+`CommandQuery`/`FetchCommands` have no owner scoping at all, and
+`CommandType` already carries `tag_mappings` the identical way
+`EventType` does - a scoped caller filtered out of an event by
+`QueryEvents` can currently still read the `Command` that produced it
+unfiltered, via `FetchCommands`. Also unexposed: `EventType.owner_tag_key`
+has no GraphQL read-back (`TypeRegistration`'s `exposes:` doesn't list
+it) and `EventReadToken.scope`/`RoleAccessMapping.scope` aren't the only
+place `token_object!`'s shared macro would need a similar per-variant
+exception to expose it on the wire. Neither is a security gap in what
+this pass covers - both are read-back/completeness gaps only.
+
+**Verified**: a new pure-function suite,
+`skilj-core/tests/event_owner_scoping.rs` (16 tests, no Postgres needed -
+every function this pass touches is already pure) - `event_owner_scope_satisfied`
+in isolation across every hold/fail-closed case, then `query_events`/
+`count_events` filtering, `inspect_event` rejecting, `fetch_events`/
+`consume_events` filtering by `token.scope`, and `deliver_to_subscriptions`
+skipping a scoped subscription for another company's event while
+delivering to an unscoped one regardless. Three new `type_registration.rs`
+tests cover `valid_owner_tag_key`'s reject/accept/re-registration-clears
+paths. `EventType.owner_tag_key`/`EventReadToken.scope`'s own DB
+round-trip is covered by `persistence.rs`'s existing whole-struct
+`assert_eq!` tests, which now include both fields by construction.
+`cargo build/clippy/test --workspace` and `cargo fmt --check` clean;
+`allium check`/`plan`/`analyse` independently re-run against the spec
+diff (not taken on the `allium:tend` report alone) - clean, 399 → 402
+obligations with exactly the three expected additions, the same 4
+pre-existing `analyse` findings unchanged.
+
+## 25. Cross-tenant read fix, part three: `CommandQuery`/`FetchCommands`
+
+The third and final pass. §23 covered `ProjectionQuery`, §24 covered raw
+events (`QueryEvents`/`CountEvents`/`InspectEvent`, `FetchEvents`/
+`ConsumeEvents`, `EventSubscription`); this one covers `CommandQuery` -
+`FetchCommands`, the only read surface for `Command`. Narrower than §24
+in one real way: the REST track's `CommandToken` only *triggers* one
+command type and reads nothing back (`surface CommandQuery`'s own
+guidance: "the REST track has no equivalent and is not meant to grow
+one"), so there is no token-scope side to build here - one entity field,
+one rule, one surface guarantee, done.
+
+**Design**: exactly §24's mechanism, adapted to `Command`/`CommandType`
+in place of `Event`/`EventType`. `CommandType.owner_tag_key: Option<String>`
+(`skilj-core/src/event_store/mod.rs`) - spec'd and registered exactly
+like `EventType.owner_tag_key`, validated by the *same*
+`valid_owner_tag_key(tag_mappings, owner_tag_key)` function reused
+unchanged (it only asks a question about a `Set<TagMapping>` and a
+string, generic over which entity the mappings came from - the same
+"takes an EventType and a CommandType interchangeably" register
+`derive_tags` already established). `command_owner_scope_satisfied(command: &Command, scope: Option<&str>) -> bool`
+is `event_owner_scope_satisfied`'s twin, reading `Command.consistency_tags`
+where that one reads `Event.tags`. `consistency_tags` is the right field
+precisely because it's `derive_tags(command_type, payload)`
+unconditionally on every stored command - a plain, never-null `Vec<Tag>` -
+regardless of whether that particular command actually used a
+consistency boundary; only `consistency_boundary: Option<i64>` goes
+missing for that case. `fetch_commands` gained one more `.filter()` in
+its existing chain, covering both the type/time-window narrowing and the
+`triggered_event` reverse lookup uniformly (naming an event whose
+command belongs to another owner yields nothing, not an error). No
+single-command reject case here, unlike `inspect_event` on the event
+side - `FetchCommands` is a browse over many, always a filter.
+
+`RegisterCommandType` gained the identical treatment `RegisterEventType`
+got: a new optional `owner_tag_key` parameter,
+`valid_owner_tag_key`-checked, *not* additive-only on re-registration
+(free to change or clear, unlike the `tag_mappings` keys it points into).
+`RegisteredCommandType` (`skilj/src/lib.rs`) and both reconciliation
+paths (`#[auto_register]`'s startup loop, and `bounded_context_templating.rs`'s
+template-application path) carry it through from `plugin::CommandType::owner_tag_key()`
+unchanged, mirroring the event-type wiring exactly.
+`registerCommandType`'s GraphQL mutation gained the matching optional
+`ownerTagKey: String` argument. No resolver wiring changed for
+`fetchCommands` itself - it already passed the whole `RoleAccessMapping`
+through.
+
+**Same read-back gap as §23/§24, spanning all three now**: neither
+`EventType.owner_tag_key` nor `CommandType.owner_tag_key` is exposed by
+`TypeRegistration`'s own query side - an admin can set or clear the
+declaration but can't read back which key is currently in force. Left
+alone again, consistently, rather than fixed on one side only; worth a
+follow-up if it becomes a real operational need.
+
+**Verified**: a new pure-function suite,
+`skilj-core/tests/command_owner_scoping.rs` (12 tests, no Postgres -
+`fetch_commands`/`command_owner_scope_satisfied` are pure like every
+function this pass touches) - the same isolation coverage
+`event_owner_scoping.rs` has for its own predicate, `fetch_commands`
+filtering by scope (including the concrete cross-tenant scenario: a
+company's own admin no longer sees another company's commands) and the
+`triggered_event` reverse lookup filtered the same way, plus three
+`RegisterCommandType` tests (`valid_owner_tag_key` reject/accept/
+re-registration-clears). `CommandType.owner_tag_key`'s own DB round-trip
+is covered by `persistence.rs`'s existing whole-struct `assert_eq!`
+tests. `cargo build/clippy/test --workspace` and `cargo fmt --check`
+clean; `allium check`/`plan`/`analyse` independently re-run - clean,
+402 → 404 obligations with exactly the two expected additions, the same
+4 pre-existing `analyse` findings unchanged.
+
+This closes the cross-tenant read gap across all three of skilj's read
+surfaces - projections, raw events, and commands - with one consistent
+mechanism (`scope` vs. a per-record derived owner, fail-closed on an
+unproven owner) applied three times, each adapted to what that surface's
+own record shape already provided rather than forcing a single
+implementation onto all three.
+
+## 26. Closing the admin read-back gap on `owner_tag_key`
+
+§24/§25 each flagged the same small completeness gap and left it alone:
+`surface TypeRegistration`'s own `exposes:` clause never listed
+`event_type.owner_tag_key`/`command_type.owner_tag_key` alongside the
+other registered fields it already exposes (`tagMappings`,
+`sensitiveFields`, etc.) - an admin could set or clear the declaration
+via `registerEventType`/`registerCommandType` but had no way to read
+back which key was currently in force. Closed now, on both sides at
+once (per §25's own note: fixing one side only would have been worse
+than neither).
+
+Purely additive, no new mechanism: `exposes:` gained
+`event_type.owner_tag_key`/`command_type.owner_tag_key`
+(specs/skilj.allium), and `gql_types.rs`'s `event_type_object()`/
+`command_type_object()` each gained an `ownerTagKey` scalar field,
+reusing the existing `optional_string` helper `RoleAccessMapping.scope`'s
+own field already established. No resolver/mutation changes needed - the
+value was already being set and stored by the three prior passes, this
+just makes it queryable. `allium plan`'s own obligation count is
+unchanged (404 → 404): an `exposes:` field addition extends an existing
+`surface-exposure` obligation's own scope rather than creating a new one.
+
+**Verified**: `skilj/tests/graphql_type_registration.rs`'s existing
+`full_type_registration_lifecycle_end_to_end` test extended - registers
+an `EventType` with `ownerTagKey: "account"`, asserts it on both the
+mutation's own response and a separate `eventTypes` query afterward (so
+the value is proven to round-trip through Postgres, not just echoed back
+by the resolver); `commandTypes` gained the same field asserted `null`
+for a type that never set one, covering the unset path. `cargo
+build/clippy/test --workspace` and `cargo fmt --check` clean; `allium
+check`/`plan`/`analyse` independently re-verified - clean, obligation
+count unchanged, same 4 pre-existing `analyse` findings.

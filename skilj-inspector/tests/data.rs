@@ -135,6 +135,14 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     fn default_state(&self, _bounded_context: &str, _projection_name: &str) -> Option<String> {
         None
     }
+
+    fn owner_tag_key(
+        &self,
+        _bounded_context: &str,
+        _projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        None
+    }
 }
 
 #[test]
@@ -172,6 +180,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             bounded_context: bc.clone(),
             level: AccessLevel::Admin,
             can_read_sensitive: false,
+            scope: None,
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,
@@ -194,6 +203,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             })
             .to_string(),
             vec![],
+            None,
             vec![SensitiveField {
                 field: "email".to_string(),
                 subject_key: "user".to_string(),
@@ -220,6 +230,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             "WithdrawMoney".to_string(),
             "{}".to_string(),
             vec![],
+            None,
             vec![],
             true,
             None,

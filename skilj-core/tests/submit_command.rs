@@ -181,6 +181,17 @@ impl ProjectionDispatcher for TestProjectionDispatcher {
             _ => None,
         }
     }
+
+    fn owner_tag_key(
+        &self,
+        _bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        match projection_name {
+            "Poisonable" => Some(None),
+            _ => None,
+        }
+    }
 }
 
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
@@ -292,6 +303,7 @@ async fn seed_order_shipped_event_type(pool: &Pool, bc: &BoundedContext) -> Even
             key: "order".to_string(),
             field: "order_id".to_string(),
         }],
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
@@ -313,6 +325,7 @@ async fn seed_poison_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
         schema: r#"{"properties":{}}"#.to_string(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
@@ -337,6 +350,7 @@ async fn seed_command_type(pool: &Pool, bc: &BoundedContext, name: &str) -> Comm
             key: "order".to_string(),
             field: "order_id".to_string(),
         }],
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         rest_trigger_allowed: true,
     };

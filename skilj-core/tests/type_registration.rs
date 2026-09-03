@@ -58,6 +58,7 @@ fn access_mapping(status: RoleStatus, level: AccessLevel) -> RoleAccessMapping {
         bounded_context: bounded_context(BoundedContextStatus::Active),
         level,
         can_read_sensitive: false,
+        scope: None,
         status,
         created_at: timestamp(0),
         revoked_at: None,
@@ -127,6 +128,7 @@ fn existing_event_type(schema: String, tag_mappings: Vec<TagMapping>) -> EventTy
         schema,
         schema_version: 1,
         tag_mappings,
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
@@ -146,6 +148,7 @@ fn existing_command_type(schema: String, tag_mappings: Vec<TagMapping>) -> Comma
         schema,
         schema_version: 1,
         tag_mappings,
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         rest_trigger_allowed: false,
     }
@@ -376,6 +379,7 @@ fn register_event_type_creates_a_new_type_when_none_exists() {
         "OrderPlaced".into(),
         schema_v1(),
         vec![tag_mapping("currency", "currency")],
+        None,
         Vec::new(),
         true,
         false,
@@ -411,6 +415,7 @@ fn register_event_type_rejects_a_revoked_mapping() {
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -438,6 +443,7 @@ fn register_event_type_rejects_a_write_level_mapping() {
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -471,6 +477,7 @@ fn register_event_type_rejects_a_bounded_context_the_mapping_is_not_scoped_to() 
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -504,6 +511,7 @@ fn register_event_type_rejects_an_archived_bounded_context() {
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -539,6 +547,7 @@ fn register_event_type_rejects_a_malformed_schema_even_with_no_tag_mappings_or_s
         "OrderPlaced".into(),
         "not json at all".into(),
         Vec::new(),
+        None,
         Vec::new(),
         true,
         false,
@@ -566,6 +575,7 @@ fn register_event_type_rejects_a_tag_mapping_naming_an_undeclared_field() {
         "OrderPlaced".into(),
         schema_v1(),
         vec![tag_mapping("bogus", "no_such_field")],
+        None,
         Vec::new(),
         false,
         false,
@@ -581,6 +591,103 @@ fn register_event_type_rejects_a_tag_mapping_naming_an_undeclared_field() {
     assert_eq!(err.code(), event_store::Error::InvalidTagMapping.code());
 }
 
+/// Cross-tenant read fix (docs/architecture.md's own write-up of these
+/// passes) - `valid_owner_tag_key`: `owner_tag_key` naming a key not
+/// present in `tag_mappings` is rejected, the same register as an
+/// undeclared tag mapping field just above.
+#[test]
+fn register_event_type_rejects_an_owner_tag_key_naming_an_undeclared_tag_mapping_key() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    let err = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "TicketOpened".into(),
+        schema_v1(),
+        vec![tag_mapping("currency", "currency")],
+        Some("company".into()), // never declared as a tag_mappings key
+        Vec::new(),
+        false,
+        false,
+        false,
+        None,
+        None,
+        false,
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), event_store::Error::InvalidOwnerTagKey.code());
+}
+
+/// `owner_tag_key` naming a real `tag_mappings` key succeeds and is
+/// carried onto the registered `EventType`.
+#[test]
+fn register_event_type_accepts_an_owner_tag_key_naming_a_real_tag_mapping_key() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    let result = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "TicketOpened".into(),
+        schema_v1(),
+        vec![tag_mapping("currency", "currency")],
+        Some("currency".into()),
+        Vec::new(),
+        false,
+        false,
+        false,
+        None,
+        None,
+        false,
+        None,
+        timestamp(0),
+    )
+    .unwrap();
+
+    assert_eq!(
+        result.event_type().owner_tag_key.as_deref(),
+        Some("currency")
+    );
+}
+
+/// `owner_tag_key` is re-validated fresh on every registration, not
+/// additive: a later registration is free to clear it even though
+/// `tag_mappings` keys themselves are additive-only.
+#[test]
+fn register_event_type_allows_clearing_a_previously_set_owner_tag_key() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let existing = EventType {
+        owner_tag_key: Some("currency".into()),
+        ..existing_event_type(schema_v1(), vec![tag_mapping("currency", "currency")])
+    };
+
+    let result = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "OrderPlaced".into(),
+        schema_v1(),
+        vec![tag_mapping("currency", "currency")],
+        None,
+        Vec::new(),
+        false,
+        false,
+        false,
+        None,
+        None,
+        false,
+        Some(&existing),
+        timestamp(0),
+    )
+    .unwrap();
+
+    assert_eq!(result.event_type().owner_tag_key, None);
+}
+
 /// rule-failure.RegisterEventType.7 - `requires: valid_sensitive_fields(schema, sensitive_fields)`.
 #[test]
 fn register_event_type_rejects_a_sensitive_field_naming_an_undeclared_field() {
@@ -593,6 +700,7 @@ fn register_event_type_rejects_a_sensitive_field_naming_an_undeclared_field() {
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(),
+        None,
         vec![sensitive_field("no_such_field", "amount")],
         false,
         false,
@@ -621,6 +729,7 @@ fn register_event_type_rejects_a_tag_mapping_and_sensitive_field_overlap() {
         "OrderPlaced".into(),
         schema_v1(),
         vec![tag_mapping("currency", "currency")],
+        None,
         vec![sensitive_field("currency", "amount")],
         false,
         false,
@@ -655,6 +764,7 @@ fn register_event_type_updates_in_place_and_bumps_schema_version_when_schema_cha
         "OrderPlaced".into(),
         schema_v2_added_optional_field(),
         vec![tag_mapping("amount", "amount")],
+        None,
         Vec::new(),
         true,
         false,
@@ -692,6 +802,7 @@ fn register_event_type_leaves_schema_version_unchanged_when_schema_is_identical(
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -721,6 +832,7 @@ fn register_event_type_rejects_an_incompatible_schema_change() {
         "OrderPlaced".into(),
         schema_v2_dropped_currency(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -750,6 +862,7 @@ fn register_event_type_rejects_dropping_an_existing_tag_mapping_key() {
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(), // dropped the "amount" key
+        None,
         Vec::new(),
         false,
         false,
@@ -779,6 +892,7 @@ fn register_event_type_allows_retargeting_a_tag_mapping_key_to_a_different_field
         "OrderPlaced".into(),
         schema_v1(),
         vec![tag_mapping("amount", "currency")], // same key, different field
+        None,
         Vec::new(),
         false,
         false,
@@ -818,6 +932,7 @@ fn register_event_type_rejects_system_triggered_allowed_with_no_schedule_or_poli
         "DailyDigest".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -841,6 +956,7 @@ fn register_event_type_rejects_system_triggered_allowed_with_no_schedule_or_poli
         "DailyDigest".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -864,6 +980,7 @@ fn register_event_type_rejects_system_triggered_allowed_with_no_schedule_or_poli
         "DailyDigest".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -892,6 +1009,7 @@ fn register_event_type_anchors_schedule_position_on_first_opt_in() {
         "DailyDigest".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -935,6 +1053,7 @@ fn register_event_type_leaves_schedule_position_untouched_on_re_registration() {
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -977,6 +1096,7 @@ fn register_event_type_re_anchors_schedule_position_when_switched_off_and_on_aga
         "OrderPlaced".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         false,
@@ -1014,6 +1134,7 @@ fn register_command_type_creates_a_new_type_when_none_exists() {
         "PlaceOrder".into(),
         schema_v1(),
         vec![tag_mapping("currency", "currency")],
+        None,
         Vec::new(),
         true,
         None,
@@ -1042,6 +1163,7 @@ fn register_command_type_rejects_a_revoked_mapping() {
         "PlaceOrder".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         None,
@@ -1063,6 +1185,7 @@ fn register_command_type_rejects_a_write_level_mapping() {
         "PlaceOrder".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         None,
@@ -1090,6 +1213,7 @@ fn register_command_type_rejects_a_bounded_context_the_mapping_is_not_scoped_to(
         "PlaceOrder".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         None,
@@ -1117,6 +1241,7 @@ fn register_command_type_rejects_an_archived_bounded_context() {
         "PlaceOrder".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         None,
@@ -1146,6 +1271,7 @@ fn register_command_type_rejects_a_malformed_schema_even_with_no_tag_mappings_or
         "PlaceOrder".into(),
         "not json at all".into(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         None,
@@ -1167,6 +1293,7 @@ fn register_command_type_rejects_a_tag_mapping_naming_an_undeclared_field() {
         "PlaceOrder".into(),
         schema_v1(),
         vec![tag_mapping("bogus", "no_such_field")],
+        None,
         Vec::new(),
         false,
         None,
@@ -1188,6 +1315,7 @@ fn register_command_type_rejects_a_sensitive_field_naming_an_undeclared_field() 
         "PlaceOrder".into(),
         schema_v1(),
         Vec::new(),
+        None,
         vec![sensitive_field("no_such_field", "amount")],
         false,
         None,
@@ -1209,6 +1337,7 @@ fn register_command_type_rejects_a_tag_mapping_and_sensitive_field_overlap() {
         "PlaceOrder".into(),
         schema_v1(),
         vec![tag_mapping("currency", "currency")],
+        None,
         vec![sensitive_field("currency", "amount")],
         false,
         None,
@@ -1233,6 +1362,7 @@ fn register_command_type_updates_in_place_and_bumps_schema_version_when_schema_c
         "PlaceOrder".into(),
         schema_v2_added_optional_field(),
         vec![tag_mapping("amount", "amount")],
+        None,
         Vec::new(),
         true,
         Some(&existing),
@@ -1261,6 +1391,7 @@ fn register_command_type_rejects_an_incompatible_schema_change() {
         "PlaceOrder".into(),
         schema_v2_dropped_currency(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         Some(&existing),
@@ -1283,6 +1414,7 @@ fn register_command_type_rejects_dropping_an_existing_tag_mapping_key() {
         "PlaceOrder".into(),
         schema_v1(),
         Vec::new(),
+        None,
         Vec::new(),
         false,
         Some(&existing),

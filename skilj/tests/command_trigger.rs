@@ -247,6 +247,7 @@ async fn setup() -> (Skilj, String, Pool, String) {
         bounded_context: bc.clone(),
         level: AccessLevel::Admin,
         can_read_sensitive: false,
+        scope: None,
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,

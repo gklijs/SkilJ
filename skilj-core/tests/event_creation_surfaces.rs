@@ -40,6 +40,7 @@ fn event_type(external_creation_allowed: bool, direct_creation_allowed: bool) ->
         schema: "{}".into(),
         schema_version: 3,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed,
         direct_creation_allowed,

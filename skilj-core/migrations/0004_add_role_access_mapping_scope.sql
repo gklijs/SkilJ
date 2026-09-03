@@ -1,0 +1,15 @@
+-- Cross-tenant projection read fix (docs/architecture.md's own write-up
+-- of this pass): `ProjectionQuery`'s access check only ever verified
+-- that the caller held *any* active `RoleAccessMapping` on a bounded
+-- context, never whether the specific projection instance queried
+-- actually belonged to that caller. `scope`, checked by
+-- `projections::query_projection` against a queried instance's own
+-- derived "owner" value (see `{schema}.projection_state.owner`,
+-- 0004_add_projection_state_owner.sql), is the fix: `RoleAccessMapping.scope`
+-- in specs/skilj.allium.
+--
+-- Nullable, and null is the default for every mapping granted before
+-- this column existed - `RoleAccessMapping.scope`'s own doc comment:
+-- null means unrestricted within the bounded context, identical to this
+-- table's own behaviour before this column existed.
+ALTER TABLE role_access_mappings ADD COLUMN scope TEXT;

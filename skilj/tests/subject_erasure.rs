@@ -289,6 +289,7 @@ fn subject_erasure_end_to_end() {
             bounded_context: bc.clone(),
             level: AccessLevel::Admin,
             can_read_sensitive: false,
+            scope: None,
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,

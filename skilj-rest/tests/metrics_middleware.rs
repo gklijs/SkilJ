@@ -79,6 +79,13 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     fn default_state(&self, _bounded_context: &str, _projection_name: &str) -> Option<String> {
         None
     }
+    fn owner_tag_key(
+        &self,
+        _bounded_context: &str,
+        _projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        None
+    }
 }
 
 struct NoopSnapshotDispatcher;

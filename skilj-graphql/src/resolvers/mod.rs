@@ -184,6 +184,16 @@ pub async fn require_admin_mapping(
 /// (`skilj-core::projections`) itself, which imposes none either. Same
 /// "no mapping at all collapses into the same rejection a revoked one
 /// gets" treatment as `require_admin_mapping`.
+///
+/// Deliberately bounded-context-level only, same as it always was: this
+/// resolves *whether the caller may query the bounded context at all*,
+/// not *which instances within it*. The finer-grained check -
+/// `RoleAccessMapping.scope` against a queried instance's own derived
+/// owner, for a projection that declares one - is `projections::
+/// query_projection`'s own job, applied per query in `projection_query`'s
+/// resolver (cross-tenant projection read fix, docs/architecture.md's
+/// own write-up of this pass). The mapping this function returns already
+/// carries `scope`; it is only enforced downstream.
 pub async fn require_read_mapping(
     ctx: &ResolverContext<'_>,
     pool: &Pool,
@@ -286,16 +296,23 @@ pub fn not_found(entity: &str, key: &str) -> async_graphql::Error {
 }
 
 /// Shared by `event_type_admin_operations`/`command_type_admin_operations` -
-/// all four `create*Token` mutations (`createExternalEventToken`,
-/// `createDirectCreationToken`, `createEventReadToken`,
-/// `createCommandToken`) differ only in which type they resolve
-/// (`EventType`/`CommandType`, hence `$type_arg_name`/`$type_label`/
-/// `$get_type_fn`) and which `access_control::create_*_token`/
-/// `db::insert_*_token` pair they call. Originally two separate,
-/// near-identical macros/hand-written bodies (one file's own doc
-/// comment used to say so explicitly) - unified here since
-/// `command_type_admin_operations` only ever needed the identical
+/// three of the four `create*Token` mutations (`createExternalEventToken`,
+/// `createDirectCreationToken`, `createCommandToken`) differ only in
+/// which type they resolve (`EventType`/`CommandType`, hence
+/// `$type_arg_name`/`$type_label`/`$get_type_fn`) and which
+/// `access_control::create_*_token`/`db::insert_*_token` pair they call.
+/// Originally two separate, near-identical macros/hand-written bodies
+/// (one file's own doc comment used to say so explicitly) - unified here
+/// since `command_type_admin_operations` only ever needed the identical
 /// shape with different type parameters, not a genuinely different one.
+///
+/// `createEventReadToken` is the fourth, hand-written below
+/// (`create_event_read_token_field`) rather than a macro invocation -
+/// `EventReadToken` alone carries `scope` (cross-tenant read fix,
+/// docs/architecture.md's own write-up of these passes), and this
+/// macro's fixed argument list has no way to vary that one field between
+/// invocations, the same reasoning `db::get_event_type_access_token!`
+/// already gives for its own identical exception.
 macro_rules! create_type_token_field {
     (
         $field_name:literal,

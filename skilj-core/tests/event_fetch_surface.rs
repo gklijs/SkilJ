@@ -49,6 +49,7 @@ fn event_type(event_read_allowed: bool) -> EventType {
         schema: "{}".into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
@@ -76,6 +77,7 @@ fn token(status: TokenStatus, event_type: EventType) -> EventReadToken {
         created_at: timestamp(0),
         revoked_at: None,
         event_type,
+        scope: None,
     }
 }
 

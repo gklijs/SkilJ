@@ -98,6 +98,19 @@ pub trait CommandType {
         Vec::new()
     }
 
+    /// See `plugin::EventType::owner_tag_key`'s own doc comment - identical
+    /// role here: which of `tag_mappings()`'s own keys names this command
+    /// type's "owner" dimension, `None` (the default) for one with no such
+    /// notion. Registered and validated exactly the same way
+    /// (`RegisterCommandType`'s own `valid_owner_tag_key`), and read by
+    /// `event_store::command_owner_scope_satisfied` - `Command.consistency_tags`'
+    /// own sibling check to `event_owner_scope_satisfied`'s `Event.tags`.
+    /// Cross-tenant read fix (docs/architecture.md's own write-up of these
+    /// passes).
+    fn owner_tag_key() -> Option<&'static str> {
+        None
+    }
+
     fn sensitive_fields() -> Vec<SensitiveField> {
         Vec::new()
     }
@@ -205,6 +218,21 @@ pub trait EventType {
 
     fn tag_mappings() -> Vec<TagMapping> {
         Vec::new()
+    }
+
+    /// Which of `tag_mappings()`'s own keys names this type's "owner"
+    /// dimension, if it has one - `Some("company")` for a type whose
+    /// events belong to different tenants sharing one bounded context,
+    /// `None` (the default) for a type with no such notion. Unlike
+    /// `plugin::Projection::OWNER_TAG_KEY` (deliberately Rust-only, no
+    /// spec field), this one is registered and validated:
+    /// `RegisterEventType`'s own `valid_owner_tag_key` requires it be
+    /// null or name a real `tag_mappings()` key, since `EventType.tag_mappings`
+    /// is already a real, spec'd, registered field this joins rather than
+    /// a fresh Rust-only concept. Cross-tenant read fix
+    /// (docs/architecture.md's own write-up of these passes).
+    fn owner_tag_key() -> Option<&'static str> {
+        None
     }
 
     fn sensitive_fields() -> Vec<SensitiveField> {
@@ -339,6 +367,29 @@ pub trait Projection {
     fn keys(_event: &Self::Event) -> Vec<String> {
         vec![String::new()]
     }
+
+    /// The tag key (one of some consumed event type's own `tag_mappings`
+    /// keys) that names this projection's "owner" dimension, if it has
+    /// one - `Some("company")` for a projection whose instances belong to
+    /// different tenants sharing one bounded context, `None` (the
+    /// default) for a projection with no such notion, e.g. `keys()`
+    /// already being a person's own id or the projection being unkeyed.
+    /// Deliberately a Rust-only implementation detail with no spec entity
+    /// field and no registration/admin-visible surface of its own - the
+    /// identical treatment `Snapshot::TAG_KEY` already gets, and for the
+    /// same reason: `RoleAccessMapping.scope` is what an admin actually
+    /// grants and sees, not this.
+    ///
+    /// When set, each instance's own "owner" value is derived
+    /// automatically at fold time from whichever event touched it: the
+    /// value of the tag on `event.tags` whose key matches this one, if
+    /// present. An event lacking that tag leaves an already-established
+    /// owner untouched rather than clearing it. `query_projection`
+    /// rejects a `scope`-restricted `RoleAccessMapping` whose `scope`
+    /// does not match an instance's own derived owner - see that
+    /// function's own doc comment and specs/skilj.allium's
+    /// `owner_scope_satisfied`.
+    const OWNER_TAG_KEY: Option<&'static str> = None;
 
     /// `key` is which instance is currently being folded - one of
     /// `Self::keys(event)`'s own return values, handed back so `project()`
@@ -548,6 +599,18 @@ pub trait ProjectionDispatcher: Send + Sync {
     /// dispatcher, not whichever caller triggered the reset, knows the
     /// *current* correct starting point.
     fn default_state(&self, bounded_context: &str, projection_name: &str) -> Option<String>;
+
+    /// The registered projection's own `Projection::OWNER_TAG_KEY` -
+    /// `CommandDispatcher::snapshot_name`'s identical `Option<Option<_>>`
+    /// shape: outer `None` for the same "pair isn't registered at all"
+    /// case every method here already has, inner `None` when the
+    /// projection is registered but declares no owner dimension (the
+    /// default, and every projection that predates this).
+    fn owner_tag_key(
+        &self,
+        bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<Option<&'static str>>;
 }
 
 /// Type-erased dispatch to a bounded context's own typed `Snapshot::fold` -

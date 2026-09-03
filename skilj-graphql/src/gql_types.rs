@@ -204,6 +204,7 @@ pub fn role_access_mapping_object() -> Object {
         object "role": TypeRef::named_nn("Role") => |m| Some(m.role.clone()),
         scalar "level": TypeRef::named_nn("AccessLevel") => |m| Value::from(access_level_name(m.level)),
         scalar "canReadSensitive": TypeRef::named_nn(TypeRef::BOOLEAN) => |m| Value::from(m.can_read_sensitive),
+        scalar "scope": TypeRef::named(TypeRef::STRING) => |m| optional_string(m.scope.clone()),
         scalar "status": TypeRef::named_nn("RoleStatus") => |m| Value::from(role_status_name(m.status)),
     })
 }
@@ -333,6 +334,7 @@ pub fn event_type_object() -> Object {
         scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |et| Value::from(et.schema.clone()),
         scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |et| Value::from(et.schema_version),
         list "tagMappings": TypeRef::named_nn_list_nn("TagMapping") => |et| et.tag_mappings.clone(),
+        scalar "ownerTagKey": TypeRef::named(TypeRef::STRING) => |et| optional_string(et.owner_tag_key.clone()),
         list "sensitiveFields": TypeRef::named_nn_list_nn("SensitiveField") => |et| et.sensitive_fields.clone(),
         scalar "externalCreationAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.external_creation_allowed),
         scalar "directCreationAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.direct_creation_allowed),
@@ -358,6 +360,7 @@ pub fn command_type_object() -> Object {
         scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |ct| Value::from(ct.schema.clone()),
         scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |ct| Value::from(ct.schema_version),
         list "tagMappings": TypeRef::named_nn_list_nn("TagMapping") => |ct| ct.tag_mappings.clone(),
+        scalar "ownerTagKey": TypeRef::named(TypeRef::STRING) => |ct| optional_string(ct.owner_tag_key.clone()),
         list "sensitiveFields": TypeRef::named_nn_list_nn("SensitiveField") => |ct| ct.sensitive_fields.clone(),
         scalar "restTriggerAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |ct| Value::from(ct.rest_trigger_allowed),
     })

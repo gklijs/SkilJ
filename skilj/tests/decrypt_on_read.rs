@@ -296,6 +296,7 @@ async fn grant_admin(
         bounded_context: bc.clone(),
         level: AccessLevel::Admin,
         can_read_sensitive,
+        scope: None,
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,

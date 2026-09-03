@@ -85,6 +85,17 @@ impl ProjectionDispatcher for TestDispatcher {
             _ => None,
         }
     }
+
+    fn owner_tag_key(
+        &self,
+        _bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        match projection_name {
+            "AccountBalance" | "AccountBalanceCopy" => Some(None),
+            _ => None,
+        }
+    }
 }
 
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
@@ -193,6 +204,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str) -> EventT
         schema: r#"{"properties":{"amount":{"type":"number"}}}"#.to_string(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,

@@ -564,6 +564,29 @@ entity CommandType {
     -- events are tagged with, so the two are directly comparable.
     tag_mappings: Set<TagMapping>
 
+    -- Names which of this type's own tag_mappings keys above is its
+    -- "owner" dimension, in the identical shape and with the identical
+    -- meaning EventType.owner_tag_key has: a pointer into tag_mappings
+    -- rather than a second declaration standing beside it, and the key
+    -- named here must be one those mappings actually produce, checked at
+    -- every registration by the very same valid_owner_tag_key (see rule
+    -- RegisterCommandType). Null - which is the default, what every
+    -- registration omitting it holds, and what every type registered
+    -- before this field existed holds - means the type has no owner
+    -- dimension at all: commands of this type are unrestricted by any
+    -- grant's scope, whatever that scope holds (see
+    -- RoleAccessMapping.scope). A command's owner value is derived from
+    -- its own payload exactly as every other tag is - it is the entry
+    -- under this key in Command.consistency_tags, never caller-supplied,
+    -- and never supplied by the caller reading it either (see the
+    -- derive_tags note above the rules, and rule FetchCommands' guidance
+    -- on command_owner_scope_satisfied for the read-time contract).
+    --
+    -- There is no token-side counterpart to RoleAccessMapping.scope here
+    -- the way EventReadToken.scope is one on the event side: the REST
+    -- track reads no commands back at all (see surface CommandQuery).
+    owner_tag_key: String?
+
     -- Opt-in, in the same shape as EventType.sensitive_fields and using
     -- the identical SensitiveField convention, so a subject named by a
     -- command resolves to the very same EncryptionKey an event naming it
@@ -603,6 +626,25 @@ entity EventType {
     -- field to an indexed, queryable tag. Only mapped fields are
     -- indexed - not every field - to keep the index footprint bounded.
     tag_mappings: Set<TagMapping>
+
+    -- Names which of this type's own tag_mappings keys above is its
+    -- "owner" dimension - "company", say, where every event of the type
+    -- carries the company it belongs to under that key. Null - which is
+    -- the default, what every registration omitting it holds, and what
+    -- every type registered before this field existed holds - means the
+    -- type has no owner dimension at all: events of this type are
+    -- unrestricted by any grant's or token's scope, whatever that scope
+    -- holds (see RoleAccessMapping.scope, EventReadToken.scope, and rule
+    -- QueryEvents' guidance on event_owner_scope_satisfied for the
+    -- read-time contract). A pointer into tag_mappings rather than a
+    -- second declaration standing beside it: the key named here must be
+    -- one those mappings actually produce, checked at every registration
+    -- by valid_owner_tag_key (see rule RegisterEventType). An event's
+    -- owner value is therefore derived from its own payload exactly as
+    -- every other tag is - never caller-supplied, and never supplied by
+    -- the caller reading it either (see the derive_tags note above the
+    -- rules).
+    owner_tag_key: String?
 
     -- Opt-in, mirrors tag_mappings in shape. Adding an entry here only
     -- affects events created from this point forward - it does not
@@ -723,6 +765,23 @@ variant EventReadToken : AccessToken {
     -- Held by a remote workflow that fetches events of one type to drive
     -- itself. Read-only: it authorises no writing of any kind.
     event_type: EventType
+
+    -- The REST track's counterpart to RoleAccessMapping.scope, in the
+    -- same register and with the same meaning: where event_type above
+    -- says which type this token may read, this one narrows which of that
+    -- type's events it may read. Null - which is what every token holds
+    -- unless the minting admin named a value (see rule
+    -- CreateEventReadToken) - means unrestricted within that type,
+    -- exactly as every token read before this field existed. A value
+    -- means this token may fetch only those events whose own derived
+    -- owner value equals it, and only for an event type that declares an
+    -- owner dimension at all; a type declaring none is unaffected by this
+    -- field whatever it holds (see EventType.owner_tag_key). The value
+    -- itself is an opaque caller-chosen string this library compares for
+    -- equality and never interprets, the same treatment
+    -- RoleAccessMapping.scope gets (see rule QueryEvents' guidance on
+    -- event_owner_scope_satisfied for the full contract).
+    scope: String?
 }
 
 -- The bootstrap secret: the only credential SkilJ ever generates for
@@ -847,6 +906,28 @@ entity RoleAccessMapping {
                                              -- bounded context. A write or admin grant
                                              -- does not see decrypted sensitive values
                                              -- unless this is also true.
+    scope: String?                          -- orthogonal to level too, and to
+                                             -- can_read_sensitive beside it: where those two
+                                             -- say what this grant may do within its bounded
+                                             -- context, this one narrows which projection
+                                             -- instances it may read there. Null - which is
+                                             -- what every grant holds unless a superadmin
+                                             -- named a value (see rule
+                                             -- GrantRoleAccessMapping) - means unrestricted
+                                             -- within the bounded context, exactly as every
+                                             -- grant read before this field existed. A value
+                                             -- means this grant may read only those
+                                             -- projection instances whose own derived owner
+                                             -- value equals it, and only for a projection
+                                             -- that declares an owner dimension at all; a
+                                             -- projection that declares none is unaffected
+                                             -- by this field whatever it holds. The value
+                                             -- itself is an opaque caller-chosen string this
+                                             -- library compares for equality and never
+                                             -- interprets, the same treatment
+                                             -- CommandDecision.rejection_kind gets (see rule
+                                             -- QueryProjection's guidance on
+                                             -- owner_scope_satisfied for the full contract).
     status: active | revoked
     created_at: Timestamp
     revoked_at: Timestamp? when status = revoked
@@ -929,8 +1010,16 @@ entity Command {
 
     -- Dynamic consistency boundary: the tags this command's decision was
     -- based on, and the highest Event.sequence observed among events
-    -- matching those tags at decision time. Null when the command does
-    -- not use a consistency boundary.
+    -- matching those tags at decision time. consistency_boundary is null
+    -- when the command does not use a consistency boundary;
+    -- consistency_tags is not, and never is. It is
+    -- derive_tags(command_type, payload) on every command this library
+    -- stores, whether a boundary was used or not (see rule
+    -- ProcessCommand), which is what makes it the exact command-side
+    -- counterpart to Event.tags rather than a by-product of using a
+    -- boundary - and therefore the field a command's owner value is read
+    -- from (see rule FetchCommands' guidance on
+    -- command_owner_scope_satisfied).
     consistency_tags: Set<Tag>
     consistency_boundary: Integer?
 
@@ -1951,11 +2040,22 @@ rule FetchEvents {
             and event_type = read_type
             and sequence > (after_sequence ?? -1)
 
+    -- The token's own ownership check, composed into the filter beside the
+    -- caller's rather than standing apart from it: an event this token is
+    -- not scoped to is simply not delivered, and the fetch itself still
+    -- succeeds. Checked against token.scope rather than any grant's - the
+    -- REST track has no Role behind it, so the token is the whole of the
+    -- permission model here (see EventFetch's TokenScopedToEventType).
+    -- Vacuously true for a token that names no scope, which is every token
+    -- unless the minting admin named one, and for an event type that
+    -- declares no owner dimension. See rule QueryEvents' guidance on
+    -- event_owner_scope_satisfied.
     ensures:
         EventsDelivered(
             token: token,
             event_type: read_type,
-            events: filter(candidates, e => matches_filters(e, filters))
+            events: filter(candidates, e =>
+                matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope))
         )
 }
 
@@ -2044,7 +2144,18 @@ rule ConsumeEvents {
             and event_type = token.event_type
             and sequence > position
 
-    let served = filter(candidates, e => matches_filters(e, filters))
+    -- The same two-part filter FetchEvents applies, on the same candidate
+    -- population under the same token, and deliberately identical: these
+    -- are two ways to read one stream under one permission model, so what
+    -- either serves is the same set (see the note above). An event this
+    -- token is not scoped to is not served here either - see rule
+    -- QueryEvents' guidance on event_owner_scope_satisfied. What that
+    -- composition does not change is the cursor: an event excluded because
+    -- of scope is treated exactly as one excluded by a filter already is,
+    -- passed over without being served and without moving the position
+    -- past it.
+    let served = filter(candidates, e =>
+        matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope))
 
     -- Unchanged when nothing matched, in either mode: an auto_advance
     -- cursor has nothing new to advance past, and a manual_ack one never
@@ -2118,6 +2229,14 @@ rule QueryProjection {
     -- (see the instance-data note on entity Projection).
     let instance_key = key ?? ""
 
+    -- The ownership check, decided against the one instance just named
+    -- rather than against the bounded context alone - see the
+    -- owner_scope_satisfied paragraphs in the guidance below.
+    -- Vacuously true for a grant that names no scope, which is every
+    -- grant unless a superadmin named one, and for any projection that
+    -- declares no owner dimension.
+    requires: owner_scope_satisfied(projection, instance_key, access_mapping)
+
     -- Blocks until the projection has caught up, and fails the query if
     -- it does not within the configured wait - see the
     -- await_projection_caught_up note above the rules. Vacuously true
@@ -2173,6 +2292,47 @@ rule QueryProjection {
         -- post-filtering the result is deliberate - a caller with
         -- neither grant is never handed a decrypted value to redact
         -- afterwards.
+        --
+        -- owner_scope_satisfied(projection, key, access_mapping) is a
+        -- black box in that same register, and is what gives
+        -- RoleAccessMapping.scope its meaning at read time. A projection
+        -- may optionally declare which tag key names its "owner"
+        -- dimension - "customer", say, or "tenant". That declaration is
+        -- deliberately not a field on entity Projection and has no
+        -- registration or admin-visible surface anywhere: it is compiled,
+        -- deployed configuration only, the same register the summary
+        -- behind surface SnapshotInspection is drawn from (see the
+        -- guidance above ProcessCommand's decide() call) and the same
+        -- register in which this spec never says what project() folds or
+        -- how a key is chosen. An instance's own owner value is derived,
+        -- not supplied: as events are folded into that instance, the tag
+        -- whose key matches the declared owner tag key carries the value,
+        -- read from the tags of whichever events touched it - derived
+        -- exactly as Event.tags is itself derived from tag_mappings and
+        -- never caller-supplied (see the derive_tags note above the
+        -- rules). Nothing a querying caller sends decides it.
+        --
+        -- The predicate holds, and the query proceeds, when any of three
+        -- things is true: access_mapping.scope is null, so the grant is
+        -- unrestricted within its bounded context and reads exactly as
+        -- every grant read before scope existed; or the projection
+        -- declares no owner tag key at all, so there is no owner
+        -- dimension for a scope to select within; or the queried
+        -- instance's own derived owner value equals access_mapping.scope.
+        -- It does not hold, and the query is rejected, when the grant
+        -- names a scope, the projection does declare an owner tag key,
+        -- and that instance's owner value is either a different value or
+        -- not yet established - an instance nothing has touched yet, a
+        -- key with no owner behind it, fails closed exactly as a
+        -- mismatched one does. Ownership must be affirmatively provable,
+        -- not merely un-contradicted, which is deliberately stricter than
+        -- the "cold instance, not a failure" treatment an untouched key
+        -- otherwise gets here (see SnapshotInspection's
+        -- UnknownNameIsAnError): an owner nothing has established is the
+        -- case an attacker reaches for. What a rejected query leaves the
+        -- caller with is the same framing another context's projections
+        -- already get - invisible, not merely unreadable - see
+        -- GrantScopedToOwnerWhenDeclared on surface ProjectionQuery.
 }
 
 -- CreateAllEventsSubscription and CreateEventTypeSubscription register a
@@ -2296,13 +2456,26 @@ rule DeliverToSubscriptions {
             where bounded_context = event.bounded_context
                 and from_sequence < event.sequence
                 and access_mapping.status = active:
-        let matches =
+        -- The ownership check is an additional condition on matches
+        -- itself rather than a branch of its own: whichever kind of
+        -- subscription this is, and whichever narrowing that kind already
+        -- applies, an event the receiving grant is not scoped to is not
+        -- delivered. Checked against the subscription's own grant, which
+        -- is re-read live on every delivery exactly as its status is (see
+        -- the note above). Vacuously true for a grant that names no scope
+        -- and for an event whose type declares no owner dimension. See
+        -- rule QueryEvents' guidance on event_owner_scope_satisfied.
+        let kind_matches =
             if subscription.kind = AllEventsSubscription:
                 subscription.event_types.count = 0
                     or event.event_type in subscription.event_types
             else:
                 subscription.event_type = event.event_type
                     and matches_filters(event, subscription.filters)
+
+        let matches =
+            kind_matches
+            and event_owner_scope_satisfied(event, subscription.access_mapping.scope)
         ensures:
             if matches:
                 EventDelivered(
@@ -2608,12 +2781,28 @@ rule FetchCommands {
         triggered_event = null
         or triggered_event?.bounded_context = access_mapping.bounded_context
 
-    let candidates =
+    let matched =
         Commands where bounded_context = access_mapping.bounded_context
             and (command_types.count = 0 or command_type in command_types)
             and (after = null or metadata.created_at >= after)
             and (before = null or metadata.created_at <= before)
             and (triggered_event = null or triggered_event in triggered_events)
+
+    -- The ownership check narrows what matched rather than standing beside
+    -- it as a requires, which is what makes it a filter - the same shape
+    -- QueryEvents uses and for the same reason: this ranges over many
+    -- commands, so one the grant does not own is simply not among them and
+    -- the fetch itself still succeeds. It is composed here rather than
+    -- folded into the narrowing above because the predicate needs the
+    -- command bound to ask anything of it, exactly as QueryEvents composes
+    -- its own. It is one more narrowing among the four, and overrides none
+    -- of them: the reverse lookup gets it too, so naming a triggered_event
+    -- whose command the grant does not own yields nothing rather than that
+    -- command anyway - the same uniform conjunction stated above. Vacuously
+    -- true for a grant that names no scope, which is every grant unless a
+    -- superadmin named one, and for any command whose type declares no
+    -- owner dimension.
+    let candidates = filter(matched, c => command_owner_scope_satisfied(c, access_mapping.scope))
 
     ensures:
         CommandsDelivered(
@@ -2640,6 +2829,34 @@ rule FetchCommands {
         -- as filter(candidates, ...) in FetchEvents: the library owns
         -- which commands are delivered and which of their fields arrive
         -- decrypted, not how a stored command is rendered onto the wire.
+        --
+        -- command_owner_scope_satisfied(command, scope) is a black box in
+        -- the same register as event_owner_scope_satisfied, and is that
+        -- predicate's command-side sibling: the identical contract - the
+        -- three ways it holds, and the fail-closed treatment of an owner
+        -- nothing established - stated once in full on rule QueryEvents'
+        -- guidance rather than a third time here. Only the two places it
+        -- reads differ. The owner dimension is CommandType.owner_tag_key
+        -- rather than EventType.owner_tag_key, validated at registration by
+        -- the very same valid_owner_tag_key (see rule RegisterCommandType).
+        -- And the owner value is read from Command.consistency_tags rather
+        -- than Event.tags.
+        --
+        -- consistency_tags is the right field to read precisely because it
+        -- is derive_tags(command_type, payload) unconditionally, on every
+        -- command this library stores (see rule ProcessCommand). It is not
+        -- a by-product of using a consistency boundary and does not go
+        -- missing when a command uses none - only consistency_boundary
+        -- itself is absent in that case. So a command's derived owner value
+        -- is exactly as reliably present as an event's, and comparable with
+        -- it for the reason every tag on either side is: one derive_tags
+        -- produces both (see the derive_tags note above the rules).
+        --
+        -- Whose scope is checked never varies here, unlike on the event
+        -- side where it is the grant's or the token's depending on the
+        -- track. It is always the grant's, RoleAccessMapping.scope: there
+        -- is no command-read token to be the other half, and none is
+        -- intended (see surface CommandQuery's guidance).
 }
 
 -- The event-side counterpart to FetchCommands, and the gap it closes is a
@@ -2696,11 +2913,23 @@ rule QueryEvents {
     -- nameable inside it, where tags is each event's own field.
     let wanted_tags = tags
 
-    let candidates =
+    let matched =
         Events where bounded_context = access_mapping.bounded_context
             and (event_types.count = 0 or event_type in event_types)
             and (wanted_tags = null or wanted_tags.any(t => t in tags))
             and sequence > (after_sequence ?? -1)
+
+    -- The ownership check narrows what matched rather than standing beside
+    -- it as a requires, which is what makes it a filter: this is a browse
+    -- over many events, so an event the grant does not own is simply not
+    -- among them and the query itself still succeeds. Composed the same
+    -- way FetchEvents composes matches_filters, and for the same reason -
+    -- the predicate needs the event bound to ask anything of it. Vacuously
+    -- true for a grant that names no scope, which is every grant unless a
+    -- superadmin named one, and for any event whose type declares no owner
+    -- dimension - see the event_owner_scope_satisfied paragraphs in the
+    -- guidance below.
+    let candidates = filter(matched, e => event_owner_scope_satisfied(e, access_mapping.scope))
 
     ensures:
         EventsQueried(
@@ -2724,6 +2953,68 @@ rule QueryEvents {
         -- because it carries a different thing: a grant and events drawn
         -- from a whole bounded context, rather than a token and events of
         -- the one type it was issued for.
+        --
+        -- event_owner_scope_satisfied(event, scope) is a black box in the
+        -- same register as owner_scope_satisfied (see rule
+        -- QueryProjection's guidance), and is the sibling mechanism to it:
+        -- the same idea applied per raw event instead of per projection
+        -- instance. It is documented here once, because this is the first
+        -- rule that reaches for it; QueryProjection's own is the
+        -- projection-side half, and neither restates the other. Everywhere
+        -- else it appears - CountEvents, InspectEvent, FetchEvents,
+        -- ConsumeEvents, DeliverToSubscriptions, and the surface
+        -- guarantees over those - refers back to this paragraph rather
+        -- than repeating it.
+        --
+        -- What differs from the projection half is where the owner
+        -- dimension is declared and where the owner value is read. A
+        -- projection's owner tag key is compiled, deployed configuration
+        -- with no registration surface at all; an event type's is
+        -- registered state an admin submits and this library validates -
+        -- EventType.owner_tag_key, checked against the type's own
+        -- tag_mappings at registration (see rule RegisterEventType). And a
+        -- projection instance's owner value is folded up over the events
+        -- that built it, whereas an event's is simply on the event: it is
+        -- one of its own derived Tags, derived from its payload by
+        -- derive_tags exactly as every other tag is and never supplied by
+        -- the caller reading it (see the derive_tags note above the
+        -- rules).
+        --
+        -- The predicate holds, and the event is in scope, when any of
+        -- three things is true: scope is null, so the caller is
+        -- unrestricted within whatever it may already read and reads
+        -- exactly as it did before scope existed; or
+        -- event.event_type.owner_tag_key is null, so the type declares no
+        -- owner dimension for a scope to select within; or the event
+        -- carries a tag whose key equals event.event_type.owner_tag_key
+        -- and whose value equals scope. It does not hold - and the event
+        -- is excluded, or the read of it rejected, depending on which
+        -- caller asked - when scope is non-null, the type does declare an
+        -- owner tag key, and no tag on the event carries that key with a
+        -- matching value. That covers three cases and treats them alike: a
+        -- tag under that key holding a different value, a tag under that
+        -- key holding null (the never-set state a Tag can legitimately be
+        -- in - see value Tag), and no tag under that key at all, which is
+        -- what an event written before the key was declared holds.
+        -- Ownership must be affirmatively provable, not merely
+        -- un-contradicted, the same framing owner_scope_satisfied already
+        -- uses and for the same reason: an owner nothing established is
+        -- the case an attacker reaches for, so it fails closed.
+        --
+        -- Which caller's scope is checked depends on the track, and the
+        -- predicate itself neither knows nor cares. On the GraphQL track
+        -- it is the grant's - RoleAccessMapping.scope, here and in
+        -- CountEvents, InspectEvent and DeliverToSubscriptions. On the
+        -- REST track it is the token's - EventReadToken.scope, in
+        -- FetchEvents and ConsumeEvents. Both are opaque caller-chosen
+        -- strings compared for equality and never interpreted.
+        --
+        -- Decided live against the event type's current declaration, never
+        -- snapshotted onto an event when it was written: changing or
+        -- clearing owner_tag_key at a later registration therefore changes
+        -- who may read the type's whole history from that point on, not
+        -- merely what is written next (see RegisterEventType's note on why
+        -- additive-only does not extend to this field).
 }
 
 rule CountEvents {
@@ -2739,10 +3030,19 @@ rule CountEvents {
     -- sequence window would only describe how far a caller happened to
     -- have read. It answers the same question the browse answers, which
     -- is why it takes the same filters rather than an unfiltered total.
-    let candidates =
+    let matched =
         Events where bounded_context = access_mapping.bounded_context
             and (event_types.count = 0 or event_type in event_types)
             and (wanted_tags = null or wanted_tags.any(t => t in tags))
+
+    -- And the same ownership filter, composed the same way, for the same
+    -- reason it is a filter there: an event the grant does not own is not
+    -- counted, rather than the count being refused. A count is the browse's
+    -- own aggregate, so counting what the browse would not show would be
+    -- the one place a scoped caller could still infer another owner's
+    -- volume. See rule QueryEvents' guidance on
+    -- event_owner_scope_satisfied.
+    let candidates = filter(matched, e => event_owner_scope_satisfied(e, access_mapping.scope))
 
     ensures:
         EventsCounted(
@@ -2756,6 +3056,18 @@ rule InspectEvent {
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = event.bounded_context
+
+    -- The ownership check, and the one place on this surface it rejects
+    -- rather than filters. QueryEvents and CountEvents range over many
+    -- events, so an event the grant does not own drops out of a result;
+    -- this names exactly one, so there is nothing to drop it out of and
+    -- the read of it is refused outright - the same shape
+    -- QueryProjection's own owner_scope_satisfied requires clause has, for
+    -- the same reason. Vacuously true for a grant that names no scope and
+    -- for an event whose type declares no owner dimension. See rule
+    -- QueryEvents' guidance on event_owner_scope_satisfied, and rule
+    -- QueryProjection's on the projection-side sibling.
+    requires: event_owner_scope_satisfied(event, access_mapping.scope)
 
     ensures:
         EventInspected(
@@ -3203,9 +3515,10 @@ rule ResyncBoundedContextFromTemplate {
 -- same outcomes RegisterEventType, RegisterCommandType and
 -- RegisterProjection apply to any other registration. That distinction is
 -- load-bearing in four places:
---   - valid_schema, valid_tag_mappings, valid_sensitive_fields and the
---     tag/sensitive-field overlap check are re-run against the tenant's
---     own registration rather than assumed from the template's.
+--   - valid_schema, valid_tag_mappings, valid_sensitive_fields,
+--     valid_owner_tag_key and the tag/sensitive-field overlap check are
+--     re-run against the tenant's own registration rather than assumed
+--     from the template's.
 --   - schema_version is the tenant's own. A first application registers
 --     at version 1 however far the template has evolved, and a later
 --     resync advances it only when the schema text actually changed for
@@ -3573,7 +3886,7 @@ rule RegisterEventType {
     when: RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
         sensitive_fields, external_creation_allowed, direct_creation_allowed,
         system_triggered_allowed, event_read_allowed, system_triggered_schedule?,
-        missed_occurrence_policy?)
+        missed_occurrence_policy?, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
@@ -3581,6 +3894,21 @@ rule RegisterEventType {
     requires: valid_schema(schema)
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
+
+    -- valid_owner_tag_key(tag_mappings, owner_tag_key) holds when
+    -- owner_tag_key is null - the type declares no owner dimension, which
+    -- is every registration that omits it - or when it names a key one of
+    -- the tag_mappings submitted in this same call actually produces. A
+    -- registration naming a key nothing derives is rejected outright,
+    -- exactly as an invalid tag mapping is, rather than registering an
+    -- owner dimension no event can ever satisfy: an owner that cannot be
+    -- established is one no scoped caller can ever read past (see rule
+    -- QueryEvents' guidance on event_owner_scope_satisfied), so the
+    -- mistake is caught at the registration its author can still see. It
+    -- is checked against the mappings in this call rather than the
+    -- registered type's current ones, the same way valid_tag_mappings and
+    -- valid_sensitive_fields are checked against the schema in this call.
+    requires: valid_owner_tag_key(tag_mappings, owner_tag_key)
 
     -- No TagMapping may read a field sensitive_fields encrypts: the tag
     -- copy is plaintext and would outlive crypto-shredding. Only
@@ -3617,6 +3945,21 @@ rule RegisterEventType {
     -- EventType's current mappings. Dropping a key would strand that
     -- history, so registration is rejected outright rather than silently
     -- losing it. The field a key reads from may change freely.
+    --
+    -- Additive-only deliberately does not extend to owner_tag_key. It is
+    -- a pointer into tag_mappings rather than a member of it, re-validated
+    -- fresh on every registration by valid_owner_tag_key above rather than
+    -- accumulated across them, so a later registration may freely change
+    -- which key it names or clear it back to null - as long as whatever it
+    -- names is still a key those mappings produce. Nothing is stranded by
+    -- that: the tags themselves are what history carries, and the keys
+    -- carrying them stay additive-only regardless of which one is
+    -- currently pointed at as the owner. What changing it does change is
+    -- who may read the type's events from that point on, immediately and
+    -- for its whole history alike, since ownership is decided live at read
+    -- time against the type's current declaration and never snapshotted
+    -- onto an event (see rule QueryEvents' guidance on
+    -- event_owner_scope_satisfied).
     requires:
         not exists existing
         or existing.tag_mappings.all(m => tag_mappings.any(n => n.key = m.key))
@@ -3630,6 +3973,7 @@ rule RegisterEventType {
             existing.schema_version =
                 if schema_changed: existing.schema_version + 1 else: existing.schema_version
             existing.tag_mappings = tag_mappings
+            existing.owner_tag_key = owner_tag_key
             existing.sensitive_fields = sensitive_fields
             existing.external_creation_allowed = external_creation_allowed
             existing.direct_creation_allowed = direct_creation_allowed
@@ -3646,6 +3990,7 @@ rule RegisterEventType {
                 schema: schema,
                 schema_version: 1,
                 tag_mappings: tag_mappings,
+                owner_tag_key: owner_tag_key,
                 sensitive_fields: sensitive_fields,
                 external_creation_allowed: external_creation_allowed,
                 direct_creation_allowed: direct_creation_allowed,
@@ -3660,7 +4005,7 @@ rule RegisterEventType {
 
 rule RegisterCommandType {
     when: RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
-        sensitive_fields, rest_trigger_allowed)
+        sensitive_fields, rest_trigger_allowed, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
@@ -3668,6 +4013,19 @@ rule RegisterCommandType {
     requires: valid_schema(schema)
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
+
+    -- The very same valid_owner_tag_key RegisterEventType applies, reused
+    -- unchanged rather than mirrored: it asks a question about a
+    -- Set<TagMapping> and a key, and a CommandType's mappings are the
+    -- identical shape an EventType's are - the same reason derive_tags
+    -- takes both types interchangeably. So the contract is the one stated
+    -- above rule RegisterEventType, and it is not restated here. What it
+    -- rejects is a registration naming a key nothing in this same call
+    -- derives, rather than registering an owner dimension no command can
+    -- ever satisfy: an owner that cannot be established is one no scoped
+    -- caller can ever read past (see rule FetchCommands' guidance on
+    -- command_owner_scope_satisfied).
+    requires: valid_owner_tag_key(tag_mappings, owner_tag_key)
 
     -- Same overlap constraint as RegisterEventType, for the same reason: a
     -- command's consistency_tags are derived from its plaintext payload
@@ -3685,6 +4043,21 @@ rule RegisterCommandType {
     -- Additive-only for the same reason as RegisterEventType, protecting
     -- CommandConsistencyTagsMatchDeclaredMappings: commands already
     -- recorded a consistency_tags set drawn from the keys declared so far.
+    --
+    -- And, exactly as there, additive-only deliberately does not extend to
+    -- owner_tag_key. It is a pointer into tag_mappings rather than a
+    -- member of it, re-validated fresh on every registration by
+    -- valid_owner_tag_key above rather than accumulated across them, so a
+    -- later registration may freely change which key it names or clear it
+    -- back to null - as long as whatever it names is still a key those
+    -- mappings produce. Nothing is stranded by that: the consistency_tags
+    -- themselves are what history carries, and the keys carrying them stay
+    -- additive-only regardless of which one is currently pointed at as the
+    -- owner. What changing it does change is who may read the type's
+    -- commands from that point on, immediately and for its whole history
+    -- alike, since ownership is decided live at read time against the
+    -- type's current declaration and never snapshotted onto a command (see
+    -- rule FetchCommands' guidance on command_owner_scope_satisfied).
     requires:
         not exists existing
         or existing.tag_mappings.all(m => tag_mappings.any(n => n.key = m.key))
@@ -3697,6 +4070,7 @@ rule RegisterCommandType {
             existing.schema_version =
                 if schema_changed: existing.schema_version + 1 else: existing.schema_version
             existing.tag_mappings = tag_mappings
+            existing.owner_tag_key = owner_tag_key
             existing.sensitive_fields = sensitive_fields
             existing.rest_trigger_allowed = rest_trigger_allowed
         else:
@@ -3706,6 +4080,7 @@ rule RegisterCommandType {
                 schema: schema,
                 schema_version: 1,
                 tag_mappings: tag_mappings,
+                owner_tag_key: owner_tag_key,
                 sensitive_fields: sensitive_fields,
                 rest_trigger_allowed: rest_trigger_allowed
             )
@@ -4089,15 +4464,33 @@ rule CreateCommandToken {
 }
 
 rule CreateEventReadToken {
-    when: CreateEventReadToken(access_mapping, event_type)
+    when: CreateEventReadToken(access_mapping, event_type, scope?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = event_type.bounded_context
+
+    -- scope is carried through unvalidated, the same treatment
+    -- GrantRoleAccessMapping gives the scope it records: an opaque
+    -- caller-chosen string compared for equality at read time and never
+    -- interpreted here (see variant EventReadToken, and rule QueryEvents'
+    -- guidance on event_owner_scope_satisfied). Omitted, the token is
+    -- minted unrestricted within its event type - which is what every
+    -- token minted before this argument existed is.
+    --
+    -- It is the minted token's own scope, and independent of the minting
+    -- admin's: the grant authorising this call is checked for level and
+    -- bounded context alone, exactly as the three token-minting rules
+    -- above are, and access_mapping.scope has no bearing on what may be
+    -- named here. An admin holding an unscoped staff grant may mint a
+    -- company-scoped token, and that is the ordinary case rather than an
+    -- oversight - narrowing a REST reader is an act of issuing a
+    -- credential, not an act of delegating the issuer's own reach.
     ensures:
         EventReadToken.created(
             id: generate_token_id(),
             event_type: event_type,
             secret: generate_token_secret(),
+            scope: scope,
             status: active,
             created_at: now
         )
@@ -4285,18 +4678,27 @@ rule RevokeRole {
 }
 
 rule GrantRoleAccessMapping {
-    when: GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive)
+    when: GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive, scope?)
     requires: caller.status = active
     requires: caller.superadmin = true
     requires: role.status = active
     requires: bounded_context.status = active
     requires: not exists RoleAccessMapping{role: role, bounded_context: bounded_context, status: active}
+
+    -- scope is carried through unvalidated, the same treatment
+    -- can_read_sensitive's boolean already gets: it is an opaque
+    -- caller-chosen string compared for equality at read time and never
+    -- interpreted here (see entity RoleAccessMapping, and rule
+    -- QueryProjection's guidance on owner_scope_satisfied). Omitted, the
+    -- mapping is created unrestricted within its bounded context - which
+    -- is what every grant made before this argument existed is.
     ensures:
         RoleAccessMapping.created(
             role: role,
             bounded_context: bounded_context,
             level: level,
             can_read_sensitive: can_read_sensitive,
+            scope: scope,
             status: active,
             created_at: now
         )
@@ -4712,6 +5114,35 @@ surface EventFetch {
         -- and a server-side cursor adds reach into nothing it did not
         -- already reach.
 
+    @guarantee EventsScopedToOwnerWhenDeclared
+        -- Within the one type it was issued for, a token that names a
+        -- scope (see EventReadToken.scope) only reaches events that belong
+        -- to it. This is the REST track's half of the same mechanism
+        -- EventQuery's guarantee of this name describes on the GraphQL
+        -- track, differing only in whose scope is checked: there it is the
+        -- grant's, here it is the token's own, since a bearer credential
+        -- carries no RoleAccessMapping and the minting admin's own scope
+        -- has no bearing on what the token it issued may read (see rule
+        -- CreateEventReadToken). A token naming no scope, which is every
+        -- token unless the minting admin named one, reaches everything of
+        -- its type exactly as it always has; so does any token whose event
+        -- type declares no owner dimension, whatever the token's scope
+        -- holds.
+        --
+        -- All three reads filter, none rejects, because all three range
+        -- over many events: an event owned by someone else, or one whose
+        -- owner is not established at all - no tag under the declared key,
+        -- or one holding null - is silently excluded from what fetching
+        -- and consuming serve, and the call itself still succeeds.
+        -- Ownership has to be provable, not merely unrefuted. A
+        -- server-side cursor adds no reach past this either, exactly as it
+        -- adds none past TokenScopedToEventType above: an event excluded
+        -- for scope is passed over without being served and without the
+        -- cursor moving past it, the same treatment a filtered-out event
+        -- already gets. AcknowledgeEvents is untouched by any of this - it
+        -- serves nothing, only moving a position the caller supplies (see
+        -- rule QueryEvents' guidance on event_owner_scope_satisfied).
+
     @guarantee SensitiveFieldsStayEncrypted
         -- Sensitive fields are delivered as stored, which is to say as
         -- ciphertext. Both paths to decryption belong to the GraphQL
@@ -4816,6 +5247,29 @@ surface ProjectionQuery {
         -- more - which is why this faces ReadAccess rather than a level of
         -- its own.
 
+    @guarantee GrantScopedToOwnerWhenDeclared
+        -- Within its own bounded context, a grant that names a scope (see
+        -- RoleAccessMapping.scope) only authorises querying projection
+        -- instances that belong to it. A projection may declare which tag
+        -- key names its "owner" dimension - in deployed configuration
+        -- only, with no registration surface and nothing an admin can
+        -- read it back from - and each instance's own owner value is
+        -- derived from the tags of the events that built it, never
+        -- supplied by the caller querying it. An instance owned by
+        -- someone else, or one whose owner is not established at all -
+        -- including a key nothing has touched yet - is not merely
+        -- unreadable but invisible, exactly as a projection in another
+        -- bounded context is above: ownership has to be provable here,
+        -- not merely unrefuted. A grant naming no scope, which is every
+        -- grant unless a superadmin named one, is unrestricted within its
+        -- context and queries exactly as it always has; so is any query
+        -- against a projection that declares no owner dimension,
+        -- whatever the grant's scope holds. This is authorisation, not
+        -- decryption: it decides which instances answer at all, before
+        -- SensitiveFieldsStayProtected below decides what an answering
+        -- instance may show (see rule QueryProjection's guidance on
+        -- owner_scope_satisfied).
+
     @guarantee SensitiveFieldsStayProtected
         -- A projection built from a field its source EventType marked
         -- sensitive stays protected exactly as the source event is:
@@ -4910,6 +5364,34 @@ surface EventSubscription {
         -- context - either kind - and only ever delivers events from
         -- that context. Read level is enough; write and admin grants
         -- include it, the same reasoning as ProjectionQuery.
+
+    @guarantee EventsScopedToOwnerWhenDeclared
+        -- And within that context, a subscription never receives an event
+        -- it isn't scoped to. A grant that names a scope (see
+        -- RoleAccessMapping.scope) is delivered only those events whose
+        -- own derived owner value equals it, and only where the event's
+        -- type declares an owner dimension at all - the same mechanism
+        -- EventQuery's guarantee of this name describes for the pull side,
+        -- against the same grant, applied here per pushed event. This
+        -- narrows delivery on top of whatever the subscription already
+        -- narrows by: it applies to both kinds alike, whether the
+        -- subscription names event types or names one type and filters
+        -- within it. A grant naming no scope, which is every grant unless a
+        -- superadmin named one, is delivered exactly what it always was; so
+        -- is any event whose type declares no owner dimension.
+        --
+        -- Not delivering is the whole of what happens: an event another
+        -- owner holds is silently not pushed, never pushed and then
+        -- withheld, and its absence is not a gap this caller could notice
+        -- or should treat as one - DeliveryIsAtMostOnce's "no gaps" is a
+        -- promise about what this subscription is entitled to, and an
+        -- event it is not entitled to was never part of that. Ownership
+        -- has to be provable, not merely unrefuted: an event whose owner
+        -- is not established at all - no tag under the declared key, or
+        -- one holding null - is not delivered either. Decided live on
+        -- every delivery against the grant's current scope, exactly as the
+        -- grant's status is (see rule QueryEvents' guidance on
+        -- event_owner_scope_satisfied).
 
     @guarantee FreshEventsOnly
         -- A subscription never replays history: delivery starts strictly
@@ -5068,6 +5550,40 @@ surface EventQuery {
         -- around that either: this surface exists only for events of the
         -- grant's own context, so another context's event is not something
         -- InspectEvent can be pointed at.
+
+    @guarantee EventsScopedToOwnerWhenDeclared
+        -- Within its own bounded context, a grant that names a scope (see
+        -- RoleAccessMapping.scope) only reaches events that belong to it.
+        -- An event type may declare which of its own tag keys names its
+        -- owner dimension - registered, and validated against that type's
+        -- tag mappings, unlike the projection-side declaration
+        -- ProjectionQuery's GrantScopedToOwnerWhenDeclared describes - and
+        -- each event's own owner value is derived from its payload the way
+        -- every tag is, never supplied by the caller reading it. A grant
+        -- naming no scope, which is every grant unless a superadmin named
+        -- one, reaches everything in its context exactly as it always has;
+        -- so does any read of an event whose type declares no owner
+        -- dimension, whatever the grant's scope holds.
+        --
+        -- Browsing and counting filter. An event owned by someone else, or
+        -- one whose owner is not established at all - no tag under the
+        -- declared key, or one holding null - is silently excluded from
+        -- queryEvents' results and from countEvents' count alike, and the
+        -- query itself still succeeds. The count is over exactly the
+        -- population the browse would show, so a scoped caller cannot
+        -- learn another owner's volume from an aggregate it cannot see the
+        -- members of.
+        --
+        -- inspectEvent is the exception, because it names one event rather
+        -- than ranging over many: there the same unmet ownership rejects
+        -- the read outright, and what the caller is left with is the
+        -- framing another bounded context's events already get above -
+        -- invisible, not merely unreadable. Ownership has to be provable
+        -- here, not merely unrefuted. This is authorisation, not
+        -- decryption: it decides which events answer at all, before
+        -- SensitiveFieldsStayProtected below decides what an answering
+        -- event may show (see rule QueryEvents' guidance on
+        -- event_owner_scope_satisfied).
 
     @guarantee SensitiveFieldsStayProtected
         -- A field its EventType marked sensitive is stored as ciphertext
@@ -5315,6 +5831,33 @@ surface CommandQuery {
         -- reverse lookup too: naming an event from another bounded context
         -- is not a way into that context's commands.
 
+    @guarantee CommandsScopedToOwnerWhenDeclared
+        -- Within its own bounded context, a grant that names a scope (see
+        -- RoleAccessMapping.scope) only reaches commands that belong to it.
+        -- A command type may declare which of its own tag keys names its
+        -- owner dimension, registered and validated against that type's own
+        -- tag mappings exactly as an event type's is, and each command's
+        -- own owner value is derived from its payload the way every tag is,
+        -- never supplied by the caller reading it. This is the command-side
+        -- half of the guarantee EventQuery's
+        -- EventsScopedToOwnerWhenDeclared states in full, and does not
+        -- restate it: a grant naming no scope reaches everything in its
+        -- context exactly as it always has, and so does any read of a
+        -- command whose type declares no owner dimension.
+        --
+        -- It filters, and only filters. There is no single-command read
+        -- here for inspectEvent's rejecting form to have a counterpart in -
+        -- fetchCommands ranges over many commands, so one owned by someone
+        -- else, or one whose owner is not established at all, is silently
+        -- excluded from its result and the fetch itself still succeeds.
+        -- That covers the reverse lookup as much as the type and time
+        -- filters: naming an event whose command the grant does not own
+        -- yields nothing, rather than that command anyway. This is
+        -- authorisation, not decryption: it decides which commands answer
+        -- at all, before SensitiveFieldsStayProtected below decides what an
+        -- answering command may show (see rule FetchCommands' guidance on
+        -- command_owner_scope_satisfied).
+
     @guarantee SensitiveFieldsStayProtected
         -- A field its CommandType marked sensitive is stored as
         -- ciphertext and read back that way unless the caller is entitled
@@ -5383,6 +5926,7 @@ surface TypeRegistration {
             event_type.schema
             event_type.schema_version
             event_type.tag_mappings
+            event_type.owner_tag_key
             event_type.sensitive_fields
             event_type.external_creation_allowed
             event_type.direct_creation_allowed
@@ -5394,6 +5938,7 @@ surface TypeRegistration {
             command_type.schema
             command_type.schema_version
             command_type.tag_mappings
+            command_type.owner_tag_key
             command_type.sensitive_fields
             command_type.rest_trigger_allowed
 
@@ -5401,10 +5946,10 @@ surface TypeRegistration {
         RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
             sensitive_fields, external_creation_allowed, direct_creation_allowed,
             system_triggered_allowed, event_read_allowed, system_triggered_schedule?,
-            missed_occurrence_policy?)
+            missed_occurrence_policy?, owner_tag_key?)
             when bounded_context.status = active
         RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
-            sensitive_fields, rest_trigger_allowed)
+            sensitive_fields, rest_trigger_allowed, owner_tag_key?)
             when bounded_context.status = active
         RegisterProjection(access_mapping, bounded_context, name, schema,
             consumed_event_types, sync)
@@ -5596,7 +6141,7 @@ surface EventTypeAdminOperations {
     provides:
         CreateExternalEventToken(access_mapping, event_type)
         CreateDirectCreationToken(access_mapping, event_type)
-        CreateEventReadToken(access_mapping, event_type)
+        CreateEventReadToken(access_mapping, event_type, scope?)
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises minting tokens for
@@ -5918,7 +6463,7 @@ surface AccessManagement {
     provides:
         CreateRole(caller, name, superadmin, external_subject)
         RevokeRole(caller, role)
-        GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive)
+        GrantRoleAccessMapping(caller, role, bounded_context, level, can_read_sensitive, scope?)
         RevokeRoleAccessMapping(caller, access_mapping)
 
     @guarantee SuperadminOnly

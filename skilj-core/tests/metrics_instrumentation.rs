@@ -50,6 +50,9 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     fn default_state(&self, _: &str, _: &str) -> Option<String> {
         None
     }
+    fn owner_tag_key(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
 }
 
 async fn provisioned_pool() -> Option<(db::Pool, Option<postgresql_embedded::PostgreSQL>)> {
@@ -106,6 +109,7 @@ async fn appending_an_event_records_the_events_appended_counter() {
         schema: "{}".into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,

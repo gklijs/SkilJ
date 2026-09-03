@@ -110,7 +110,18 @@ pub fn revoke_role_field() -> Field {
     .argument(InputValue::new("roleId", TypeRef::named_nn(TypeRef::ID)))
 }
 
-/// `grantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: AccessLevel!, canReadSensitive: Boolean!): RoleAccessMapping!`
+/// `grantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: AccessLevel!, canReadSensitive: Boolean!, scope: String): RoleAccessMapping!`
+///
+/// `scope` (Codeberg cross-tenant projection read fix,
+/// docs/architecture.md's own write-up of this pass): omitted or
+/// explicitly `null` grants unrestricted read within `boundedContext`,
+/// identical to this mutation's own behaviour before this argument
+/// existed. A non-null value restricts the granted mapping to projection
+/// instances whose own derived owner matches it, for a projection that
+/// declares an owner-tag dimension - see
+/// `skilj_core::access_control::RoleAccessMapping::scope`'s own doc
+/// comment and `skilj_core::projections::query_projection`'s
+/// enforcement.
 pub fn grant_role_access_mapping_field() -> Field {
     Field::new(
         "grantRoleAccessMapping",
@@ -128,6 +139,12 @@ pub fn grant_role_access_mapping_field() -> Field {
                     _ => AccessLevel::Admin,
                 };
                 let can_read_sensitive = ctx.args.try_get("canReadSensitive")?.boolean()?;
+                let scope = ctx
+                    .args
+                    .get("scope")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
 
                 let role = skilj_core::db::get_role(&state.pool, &role_id)
                     .await
@@ -148,6 +165,7 @@ pub fn grant_role_access_mapping_field() -> Field {
                     &bounded_context,
                     level,
                     can_read_sensitive,
+                    scope,
                     &existing_mappings,
                     chrono::Utc::now(),
                 )
@@ -170,6 +188,7 @@ pub fn grant_role_access_mapping_field() -> Field {
         "canReadSensitive",
         TypeRef::named_nn(TypeRef::BOOLEAN),
     ))
+    .argument(InputValue::new("scope", TypeRef::named(TypeRef::STRING)))
 }
 
 /// `revokeRoleAccessMapping(roleId: ID!, boundedContext: String!): RoleAccessMapping!`,

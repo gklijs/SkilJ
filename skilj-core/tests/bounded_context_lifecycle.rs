@@ -92,6 +92,7 @@ fn access_mapping(
         bounded_context,
         level,
         can_read_sensitive: false,
+        scope: None,
         status,
         created_at: timestamp(0),
         revoked_at: None,

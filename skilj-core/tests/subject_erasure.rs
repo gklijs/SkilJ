@@ -51,6 +51,7 @@ fn access_mapping(status: RoleStatus, level: AccessLevel) -> RoleAccessMapping {
         bounded_context: bounded_context(BoundedContextStatus::Active),
         level,
         can_read_sensitive: false,
+        scope: None,
         status,
         created_at: timestamp(0),
         revoked_at: None,

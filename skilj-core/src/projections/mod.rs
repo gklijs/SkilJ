@@ -399,12 +399,31 @@ pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey
 /// the time it's handed in), but `ProjectionDelivered`'s own `ensures`
 /// carries it alongside `result`, so the caller echoes it back in its own
 /// response shape.
+///
+/// `owner_scope_satisfied(projection, key, access_mapping)` (cross-tenant
+/// projection read fix, docs/architecture.md's own write-up of this
+/// pass): `projection_declares_owner` is whether this projection
+/// registered an `OWNER_TAG_KEY` at all (from `ProjectionDispatcher::
+/// owner_tag_key`, the caller's own already-resolved lookup); `instance_owner`
+/// is the queried instance's own stored `owner` column, or `None` for a
+/// row that doesn't exist yet or has never had one derived. When the
+/// projection declares no owner dimension, `access_mapping.scope` is
+/// irrelevant here regardless of its own value - it only ever restricts
+/// an owner-declaring projection. When it does, and `access_mapping.scope`
+/// is `Some`, the query is rejected unless `instance_owner` is `Some` and
+/// equal to it - fail-closed: an instance whose ownership can't be
+/// affirmatively proven (including one nothing has touched yet) is
+/// treated the same as a proven mismatch, not the same as a proven
+/// match.
+#[allow(clippy::too_many_arguments)]
 pub fn query_projection(
     access_mapping: &RoleAccessMapping,
     projection: &Projection,
     _key: &str,
     wait_for_sequence: Option<i64>,
     caught_up: bool,
+    projection_declares_owner: bool,
+    instance_owner: Option<&str>,
     read_projection_result: String,
 ) -> crate::error::Result<String> {
     if access_mapping.status != RoleStatus::Active {
@@ -412,6 +431,13 @@ pub fn query_projection(
     }
     if access_mapping.bounded_context != projection.bounded_context {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
+    }
+    if projection_declares_owner {
+        if let Some(scope) = &access_mapping.scope {
+            if instance_owner != Some(scope.as_str()) {
+                return Err(crate::access_control::Error::GrantScopeMismatch.into());
+            }
+        }
     }
     if wait_for_sequence.is_some() && !caught_up {
         return Err(Error::ProjectionCaughtUpTimedOut.into());

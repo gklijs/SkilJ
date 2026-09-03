@@ -326,6 +326,7 @@ async fn provision_bounded_context_schema(
             schema TEXT NOT NULL,
             schema_version BIGINT NOT NULL,
             tag_mappings JSONB NOT NULL DEFAULT '[]',
+            owner_tag_key TEXT,
             sensitive_fields JSONB NOT NULL DEFAULT '[]',
             external_creation_allowed BOOLEAN NOT NULL,
             direct_creation_allowed BOOLEAN NOT NULL,
@@ -347,6 +348,7 @@ async fn provision_bounded_context_schema(
             schema TEXT NOT NULL,
             schema_version BIGINT NOT NULL,
             tag_mappings JSONB NOT NULL DEFAULT '[]',
+            owner_tag_key TEXT,
             sensitive_fields JSONB NOT NULL DEFAULT '[]',
             rest_trigger_allowed BOOLEAN NOT NULL
         )"
@@ -499,12 +501,17 @@ async fn provision_bounded_context_schema(
     // `catch_up_bounded_context` reaches this key first - there is no
     // single call site that knows every instance a projection will ever
     // have ahead of time.
+    // `owner`, like `projection_state.owner` below, is the derived
+    // owner-tag value this instance's own folded events carry - see
+    // `plugin::Projection::OWNER_TAG_KEY`'s own doc comment. Nullable:
+    // most projections declare no owner dimension at all.
     sqlx::query(&format!(
         "CREATE TABLE {schema}.projection_rebuild_state (
             projection_name TEXT NOT NULL,
             status TEXT NOT NULL,
             key TEXT NOT NULL,
             state TEXT NOT NULL,
+            owner TEXT,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (projection_name, status, key),
             FOREIGN KEY (projection_name, status)
@@ -521,11 +528,23 @@ async fn provision_bounded_context_schema(
     // multi-row Projections" pass. Created lazily, on first touch, not
     // seeded at registration time - a projection's own instances aren't
     // known until events actually name them.
+    //
+    // `owner` (cross-tenant projection read fix, docs/architecture.md's
+    // own write-up of this pass): this instance's own derived owner-tag
+    // value, or null when the projection declares no
+    // `Projection::OWNER_TAG_KEY` or no consuming event has supplied one
+    // yet. Set/refreshed by whichever fold call site (`insert_event_and_
+    // update_sync_projections_in_tx`/`catch_up_bounded_context`/
+    // `fold_history_into_new_sync_projection`) touches this row -
+    // `apply_projection_fold_update`'s own doc comment. Read by
+    // `get_projection_state`/`projections::query_projection`'s own
+    // enforcement.
     sqlx::query(&format!(
         "CREATE TABLE {schema}.projection_state (
             projection_name TEXT NOT NULL REFERENCES {schema}.projections (name),
             key TEXT NOT NULL,
             state TEXT NOT NULL,
+            owner TEXT,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (projection_name, key)
         )"
@@ -652,6 +671,11 @@ async fn provision_bounded_context_schema(
             revoked_at TIMESTAMPTZ,
             event_type_name TEXT REFERENCES {schema}.event_types (name),
             command_type_name TEXT REFERENCES {schema}.command_types (name),
+            -- Only ever set (and only ever read) for kind = 'event_read' -
+            -- EventReadToken.scope, cross-tenant read fix
+            -- (docs/architecture.md's own write-up of these passes).
+            -- Every other kind leaves this null, unread.
+            scope TEXT,
             CHECK (
                 (kind = 'command' AND command_type_name IS NOT NULL AND event_type_name IS NULL)
                 OR (kind != 'command' AND event_type_name IS NOT NULL AND command_type_name IS NULL)
@@ -711,6 +735,70 @@ pub async fn ensure_idempotency_keys_table<'e>(
         )"
     ))
     .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `projection_state.owner`/`projection_rebuild_state.owner` (cross-tenant
+/// projection read fix, docs/architecture.md's own write-up of this
+/// pass) - `ensure_idempotency_keys_table`'s own doc comment's "no
+/// general per-bounded-context schema migration mechanism" applies
+/// identically here, just for an added column rather than an added
+/// table: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, called
+/// unconditionally on every `build()`, is the whole migration story.
+/// Unlike `ensure_idempotency_keys_table`, `provision_bounded_context_schema`
+/// itself never needs this - a brand-new context's `CREATE TABLE`
+/// already declares `owner` from the start - so this only ever runs
+/// against an already-open `pool`, never inside that function's own
+/// provisioning transaction, and takes `&Pool` directly rather than a
+/// generic executor.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_projection_state_owner_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.projection_state ADD COLUMN IF NOT EXISTS owner TEXT"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.projection_rebuild_state ADD COLUMN IF NOT EXISTS owner TEXT"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `event_types.owner_tag_key`/`access_tokens.scope`/`command_types.owner_tag_key` -
+/// the raw-event and command halves of the cross-tenant read fix
+/// (docs/architecture.md's own write-up of these passes), following
+/// `ensure_projection_state_owner_columns`'s own pattern and reasoning
+/// exactly (see its own doc comment): a targeted, idempotent `ALTER
+/// TABLE ... ADD COLUMN IF NOT EXISTS` patch, called unconditionally on
+/// every `build()`, for a bounded context provisioned before these
+/// fields existed.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_event_scoping_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS scope TEXT"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"
+    ))
+    .execute(pool)
     .await?;
     Ok(())
 }
@@ -1114,6 +1202,7 @@ struct EventTypeRow {
     schema: String,
     schema_version: i64,
     tag_mappings: Json<Vec<TagMapping>>,
+    owner_tag_key: Option<String>,
     sensitive_fields: Json<Vec<SensitiveField>>,
     external_creation_allowed: bool,
     direct_creation_allowed: bool,
@@ -1133,6 +1222,7 @@ impl EventTypeRow {
             schema: self.schema,
             schema_version: self.schema_version,
             tag_mappings: self.tag_mappings.0,
+            owner_tag_key: self.owner_tag_key,
             sensitive_fields: self.sensitive_fields.0,
             external_creation_allowed: self.external_creation_allowed,
             direct_creation_allowed: self.direct_creation_allowed,
@@ -1149,7 +1239,8 @@ impl EventTypeRow {
     }
 }
 
-const EVENT_TYPE_COLUMNS: &str = "name, schema, schema_version, tag_mappings, sensitive_fields, \
+const EVENT_TYPE_COLUMNS: &str =
+    "name, schema, schema_version, tag_mappings, owner_tag_key, sensitive_fields, \
     external_creation_allowed, direct_creation_allowed, system_triggered_allowed, \
     system_triggered_schedule, missed_occurrence_policy, schedule_position, last_fired_at, \
     event_read_allowed";
@@ -1163,10 +1254,11 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     let schema = schema_ident(&et.bounded_context.name);
     sqlx::query(&format!(
         "INSERT INTO {schema}.event_types ({EVENT_TYPE_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
-            tag_mappings = EXCLUDED.tag_mappings, sensitive_fields = EXCLUDED.sensitive_fields, \
+            tag_mappings = EXCLUDED.tag_mappings, owner_tag_key = EXCLUDED.owner_tag_key, \
+            sensitive_fields = EXCLUDED.sensitive_fields, \
             external_creation_allowed = EXCLUDED.external_creation_allowed, \
             direct_creation_allowed = EXCLUDED.direct_creation_allowed, \
             system_triggered_allowed = EXCLUDED.system_triggered_allowed, \
@@ -1180,6 +1272,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     .bind(&et.schema)
     .bind(et.schema_version)
     .bind(Json(&et.tag_mappings))
+    .bind(&et.owner_tag_key)
     .bind(Json(&et.sensitive_fields))
     .bind(et.external_creation_allowed)
     .bind(et.direct_creation_allowed)
@@ -1476,6 +1569,7 @@ struct CommandTypeRow {
     schema: String,
     schema_version: i64,
     tag_mappings: Json<Vec<TagMapping>>,
+    owner_tag_key: Option<String>,
     sensitive_fields: Json<Vec<SensitiveField>>,
     rest_trigger_allowed: bool,
 }
@@ -1488,14 +1582,15 @@ impl CommandTypeRow {
             schema: self.schema,
             schema_version: self.schema_version,
             tag_mappings: self.tag_mappings.0,
+            owner_tag_key: self.owner_tag_key,
             sensitive_fields: self.sensitive_fields.0,
             rest_trigger_allowed: self.rest_trigger_allowed,
         }
     }
 }
 
-const COMMAND_TYPE_COLUMNS: &str =
-    "name, schema, schema_version, tag_mappings, sensitive_fields, rest_trigger_allowed";
+const COMMAND_TYPE_COLUMNS: &str = "name, schema, schema_version, tag_mappings, owner_tag_key, \
+    sensitive_fields, rest_trigger_allowed";
 
 /// See `upsert_event_type` above - same shape and reasoning.
 #[tracing::instrument(skip_all)]
@@ -1503,16 +1598,18 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     let schema = schema_ident(&ct.bounded_context.name);
     sqlx::query(&format!(
         "INSERT INTO {schema}.command_types ({COMMAND_TYPE_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
-            tag_mappings = EXCLUDED.tag_mappings, sensitive_fields = EXCLUDED.sensitive_fields, \
+            tag_mappings = EXCLUDED.tag_mappings, owner_tag_key = EXCLUDED.owner_tag_key, \
+            sensitive_fields = EXCLUDED.sensitive_fields, \
             rest_trigger_allowed = EXCLUDED.rest_trigger_allowed"
     ))
     .bind(&ct.name)
     .bind(&ct.schema)
     .bind(ct.schema_version)
     .bind(Json(&ct.tag_mappings))
+    .bind(&ct.owner_tag_key)
     .bind(Json(&ct.sensitive_fields))
     .bind(ct.rest_trigger_allowed)
     .execute(pool)
@@ -2263,6 +2360,75 @@ async fn get_or_create_projection_rebuild_state_for_update(
     Ok(state)
 }
 
+/// Applies one projection fold's `UPDATE ... SET state = ...` - shared by
+/// every "fold one event, persist the new state" call site
+/// (`insert_event_and_update_sync_projections_in_tx`, both of
+/// `catch_up_bounded_context`'s live and rebuild-building loops, and
+/// `fold_history_into_new_sync_projection`), which were four near-identical
+/// copies of the same statement before this pass. `table` is
+/// `"projection_state"` or `"projection_rebuild_state"`; `extra_where` is
+/// appended to the `WHERE` clause verbatim - `""` for the live table,
+/// `" AND status = 'building'"` for the rebuild one, the same
+/// distinction `get_or_create_projection_rebuild_state_for_update`'s own
+/// hard-coded `'building'` already draws.
+///
+/// Also derives and persists this instance's own `owner` column
+/// alongside `state` - cross-tenant projection read fix
+/// (docs/architecture.md's own write-up of this pass). When
+/// `owner_tag_key` is `Some` and `event.tags` carries a tag with that
+/// key *and* a non-null value, that value becomes this row's own
+/// `owner`; otherwise `owner` is left exactly as already stored - an
+/// event lacking the tag (or carrying it with a null value, the "mapped
+/// field was absent" case - see `Tag.value` in the spec) never clears an
+/// already-established owner. See `plugin::Projection::OWNER_TAG_KEY`'s
+/// own doc comment for the full contract.
+#[allow(clippy::too_many_arguments)]
+async fn apply_projection_fold_update(
+    executor: impl sqlx::PgExecutor<'_>,
+    schema: &str,
+    table: &str,
+    extra_where: &str,
+    projection_name: &str,
+    key: &str,
+    new_state: &str,
+    owner_tag_key: Option<&str>,
+    event: &Event,
+) -> crate::error::Result<()> {
+    let owner = owner_tag_key.and_then(|owner_tag_key| {
+        event
+            .tags
+            .iter()
+            .find(|tag| tag.key == owner_tag_key)
+            .and_then(|tag| tag.value.clone())
+    });
+    match owner {
+        Some(owner) => {
+            sqlx::query(&format!(
+                "UPDATE {schema}.{table} SET state = $1, owner = $2, updated_at = now() \
+                 WHERE projection_name = $3 AND key = $4{extra_where}"
+            ))
+            .bind(new_state)
+            .bind(owner)
+            .bind(projection_name)
+            .bind(key)
+            .execute(executor)
+            .await?;
+        }
+        None => {
+            sqlx::query(&format!(
+                "UPDATE {schema}.{table} SET state = $1, updated_at = now() \
+                 WHERE projection_name = $2 AND key = $3{extra_where}"
+            ))
+            .bind(new_state)
+            .bind(projection_name)
+            .bind(key)
+            .execute(executor)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// docs/architecture.md §19's "Problem 2" - get-or-create-with-lock for
 /// one snapshot's own `(snapshot_name, tag_key, tag_value)` row, the
 /// `Snapshot` counterpart to `get_or_create_projection_state_for_update`
@@ -2487,6 +2653,35 @@ pub async fn get_projection_state(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(state,)| state))
+}
+
+/// `get_projection_state`'s own twin, also returning the row's `owner`
+/// column - cross-tenant projection read fix (docs/architecture.md's own
+/// write-up of this pass). A separate function rather than changing
+/// `get_projection_state`'s own return shape: that function has many
+/// existing callers (tests included) uninterested in `owner` at all: only
+/// `projection_query`'s resolver, which needs `owner` to enforce
+/// `RoleAccessMapping.scope` (see `projections::query_projection`), calls
+/// this one instead. `None` for "no row at all" (an untouched key) is not
+/// distinguished from `Some((state, None))` at the SQL level by this
+/// function - only the caller decides what "no proven owner" versus "no
+/// row yet" means for its own enforcement.
+pub async fn get_projection_state_and_owner(
+    pool: &Pool,
+    bounded_context: &str,
+    projection_name: &str,
+    key: &str,
+) -> crate::error::Result<Option<(String, Option<String>)>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(String, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT state, owner FROM {schema}.projection_state \
+         WHERE projection_name = $1 AND key = $2"
+    ))
+    .bind(projection_name)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 /// A building `ProjectionRebuild`'s own materialised state, JSON-encoded,
@@ -2921,6 +3116,7 @@ struct RoleAccessMappingRow {
     bounded_context: String,
     level: String,
     can_read_sensitive: bool,
+    scope: Option<String>,
     status: String,
     created_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
@@ -2948,6 +3144,7 @@ impl RoleAccessMappingRow {
             bounded_context,
             level: access_level_from_str(&self.level),
             can_read_sensitive: self.can_read_sensitive,
+            scope: self.scope,
             status: role_status_from_str(&self.status),
             created_at: self.created_at,
             revoked_at: self.revoked_at,
@@ -2956,7 +3153,7 @@ impl RoleAccessMappingRow {
 }
 
 const ROLE_ACCESS_MAPPING_COLUMNS: &str =
-    "role_id, bounded_context, level, can_read_sensitive, status, created_at, revoked_at";
+    "role_id, bounded_context, level, can_read_sensitive, scope, status, created_at, revoked_at";
 
 #[tracing::instrument(skip_all)]
 pub async fn insert_role_access_mapping(
@@ -2965,12 +3162,13 @@ pub async fn insert_role_access_mapping(
 ) -> crate::error::Result<()> {
     sqlx::query(&format!(
         "INSERT INTO role_access_mappings ({ROLE_ACCESS_MAPPING_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7)"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
     ))
     .bind(&mapping.role.id)
     .bind(&mapping.bounded_context.name)
     .bind(access_level_to_str(mapping.level))
     .bind(mapping.can_read_sensitive)
+    .bind(&mapping.scope)
     .bind(role_status_to_str(mapping.status))
     .bind(mapping.created_at)
     .bind(mapping.revoked_at)
@@ -4006,6 +4204,9 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
         let default_state_json = dispatcher
             .default_state(bounded_context, &projection.name)
             .unwrap_or_default();
+        let owner_tag_key = dispatcher
+            .owner_tag_key(bounded_context, &projection.name)
+            .flatten();
 
         for key in &keys {
             let current_state = get_or_create_projection_state_for_update(
@@ -4028,14 +4229,17 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
                 None => current_state,
             };
 
-            sqlx::query(&format!(
-                "UPDATE {schema}.projection_state SET state = $1, updated_at = now() \
-                 WHERE projection_name = $2 AND key = $3"
-            ))
-            .bind(&new_state)
-            .bind(&projection.name)
-            .bind(key)
-            .execute(&mut **tx)
+            apply_projection_fold_update(
+                &mut **tx,
+                &schema,
+                "projection_state",
+                "",
+                &projection.name,
+                key,
+                &new_state,
+                owner_tag_key,
+                event,
+            )
             .await?;
         }
 
@@ -4869,6 +5073,9 @@ pub async fn catch_up_bounded_context(
             let default_state_json = dispatcher
                 .default_state(bounded_context, &projection.name)
                 .unwrap_or_default();
+            let owner_tag_key = dispatcher
+                .owner_tag_key(bounded_context, &projection.name)
+                .flatten();
 
             for key in &keys {
                 let current_state = get_or_create_projection_state_for_update(
@@ -4891,14 +5098,17 @@ pub async fn catch_up_bounded_context(
                     None => current_state,
                 };
 
-                sqlx::query(&format!(
-                    "UPDATE {schema}.projection_state SET state = $1, updated_at = now() \
-                     WHERE projection_name = $2 AND key = $3"
-                ))
-                .bind(&new_state)
-                .bind(&projection.name)
-                .bind(key)
-                .execute(&mut *tx)
+                apply_projection_fold_update(
+                    &mut *tx,
+                    &schema,
+                    "projection_state",
+                    "",
+                    &projection.name,
+                    key,
+                    &new_state,
+                    owner_tag_key,
+                    event,
+                )
                 .await?;
             }
 
@@ -4922,6 +5132,9 @@ pub async fn catch_up_bounded_context(
             let default_state_json = dispatcher
                 .default_state(bounded_context, &rebuild.projection.name)
                 .unwrap_or_default();
+            let owner_tag_key = dispatcher
+                .owner_tag_key(bounded_context, &rebuild.projection.name)
+                .flatten();
 
             for key in &keys {
                 let current_state = get_or_create_projection_rebuild_state_for_update(
@@ -4944,14 +5157,17 @@ pub async fn catch_up_bounded_context(
                     None => current_state,
                 };
 
-                sqlx::query(&format!(
-                    "UPDATE {schema}.projection_rebuild_state SET state = $1, updated_at = now() \
-                     WHERE projection_name = $2 AND status = 'building' AND key = $3"
-                ))
-                .bind(&new_state)
-                .bind(&rebuild.projection.name)
-                .bind(key)
-                .execute(&mut *tx)
+                apply_projection_fold_update(
+                    &mut *tx,
+                    &schema,
+                    "projection_rebuild_state",
+                    " AND status = 'building'",
+                    &rebuild.projection.name,
+                    key,
+                    &new_state,
+                    owner_tag_key,
+                    event,
+                )
                 .await?;
             }
 
@@ -5160,6 +5376,9 @@ pub async fn fold_history_into_new_sync_projection(
     let default_state_json = dispatcher
         .default_state(bounded_context, &projection.name)
         .unwrap_or_default();
+    let owner_tag_key = dispatcher
+        .owner_tag_key(bounded_context, &projection.name)
+        .flatten();
 
     let mut caught_up_to = None;
     for event in &events {
@@ -5189,14 +5408,17 @@ pub async fn fold_history_into_new_sync_projection(
                 None => current_state,
             };
 
-            sqlx::query(&format!(
-                "UPDATE {schema}.projection_state SET state = $1, updated_at = now() \
-                 WHERE projection_name = $2 AND key = $3"
-            ))
-            .bind(&new_state)
-            .bind(&projection.name)
-            .bind(key)
-            .execute(&mut *tx)
+            apply_projection_fold_update(
+                &mut *tx,
+                &schema,
+                "projection_state",
+                "",
+                &projection.name,
+                key,
+                &new_state,
+                owner_tag_key,
+                event,
+            )
             .await?;
         }
 
@@ -5342,9 +5564,13 @@ pub async fn promote_projection_rebuild(
     .bind(projection_name)
     .execute(&mut *tx)
     .await?;
+    // `owner` carried across too - a promoted rebuild keeps whatever
+    // ownership it derived while building, exactly as `state` does
+    // (cross-tenant projection read fix, docs/architecture.md's own
+    // write-up of this pass).
     sqlx::query(&format!(
-        "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
-         SELECT projection_name, key, state, updated_at \
+        "INSERT INTO {schema}.projection_state (projection_name, key, state, owner, updated_at) \
+         SELECT projection_name, key, state, owner, updated_at \
          FROM {schema}.projection_rebuild_state WHERE projection_name = $1 AND status = $2"
     ))
     .bind(projection_name)
@@ -5456,6 +5682,9 @@ struct AccessTokenColumns {
     revoked_at: Option<DateTime<Utc>>,
     event_type_name: Option<String>,
     command_type_name: Option<String>,
+    /// Only meaningful for `kind = "event_read"` - see `EventReadToken.scope`'s
+    /// own doc comment. Every other kind carries `None` here, unread.
+    scope: Option<String>,
 }
 
 struct AccessTokenRow {
@@ -5478,7 +5707,7 @@ async fn fetch_access_token_row(
     let schema = schema_ident(&bounded_context);
     let columns: Option<AccessTokenColumns> = sqlx::query_as(&format!(
         "SELECT id, kind, secret, status, created_at, revoked_at, event_type_name, \
-         command_type_name FROM {schema}.access_tokens WHERE id = $1"
+         command_type_name, scope FROM {schema}.access_tokens WHERE id = $1"
     ))
     .bind(id)
     .fetch_optional(pool)
@@ -5555,11 +5784,12 @@ async fn insert_access_token_row(
     revoked_at: Option<DateTime<Utc>>,
     bounded_context: &str,
     event_type_name: &str,
+    scope: Option<&str>,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     sqlx::query(&format!(
         "INSERT INTO {schema}.access_tokens (id, kind, secret, status, created_at, revoked_at, \
-         event_type_name) VALUES ($1,$2,$3,$4,$5,$6,$7)"
+         event_type_name, scope) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
     ))
     .bind(id)
     .bind(kind.as_str())
@@ -5568,6 +5798,7 @@ async fn insert_access_token_row(
     .bind(created_at)
     .bind(revoked_at)
     .bind(event_type_name)
+    .bind(scope)
     .execute(pool)
     .await?;
     insert_token_index(pool, id, bounded_context).await
@@ -5588,6 +5819,7 @@ pub async fn insert_external_event_token(
         token.revoked_at,
         &token.event_type.bounded_context.name,
         &token.event_type.name,
+        None,
     )
     .await
 }
@@ -5607,6 +5839,7 @@ pub async fn insert_direct_creation_token(
         token.revoked_at,
         &token.event_type.bounded_context.name,
         &token.event_type.name,
+        None,
     )
     .await
 }
@@ -5626,6 +5859,7 @@ pub async fn insert_event_read_token(
         token.revoked_at,
         &token.event_type.bounded_context.name,
         &token.event_type.name,
+        token.scope.as_deref(),
     )
     .await
 }
@@ -5659,12 +5893,16 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
 /// isn't the expected kind - callers that need to tell those two apart
 /// (for the 401-vs-403 split - see `AccessTokenKind`'s own doc comment)
 /// call `access_token_kind` first. Covers `get_external_event_token`/
-/// `get_direct_creation_token`/`get_event_read_token`, identical apart
-/// from the `kind` string and return type - all three resolve
-/// `event_type_name` against `event_types` into an `event_type` field.
-/// `get_command_token` resolves `command_type_name` into a differently
-/// named field instead and is the only one of its kind, so it stays a
-/// hand-written function below rather than a fourth macro parameter.
+/// `get_direct_creation_token`, identical apart from the `kind` string
+/// and return type - both resolve `event_type_name` against
+/// `event_types` into an `event_type` field. `get_event_read_token`
+/// below is a near-identical hand-written twin, not a third macro
+/// invocation - `EventReadToken` alone carries `scope` (cross-tenant read
+/// fix, docs/architecture.md's own write-up of these passes), and this
+/// macro's fixed field list has no way to vary that one field between
+/// invocations. `get_command_token` resolves `command_type_name` into a
+/// differently named field instead and is the only one of its own kind,
+/// so it too stays hand-written below.
 macro_rules! get_event_type_access_token {
     ($fn_name:ident, $return_type:ident, $kind:literal) => {
         #[tracing::instrument(skip_all)]
@@ -5703,7 +5941,36 @@ get_event_type_access_token!(
     DirectCreationToken,
     "direct_creation"
 );
-get_event_type_access_token!(get_event_read_token, EventReadToken, "event_read");
+/// See `get_event_type_access_token!`'s own doc comment for why this one
+/// isn't a third macro invocation.
+#[tracing::instrument(skip_all)]
+pub async fn get_event_read_token(
+    pool: &Pool,
+    id: &str,
+) -> crate::error::Result<Option<EventReadToken>> {
+    let Some(row) = fetch_access_token_row(pool, id).await? else {
+        return Ok(None);
+    };
+    if row.columns.kind != "event_read" {
+        return Ok(None);
+    }
+    let event_type_name = row
+        .columns
+        .event_type_name
+        .expect("event_read access_tokens row without event_type_name");
+    let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
+        .await?
+        .expect("access_tokens row references an event_type that no longer exists");
+    Ok(Some(EventReadToken {
+        id: row.columns.id,
+        secret: row.columns.secret,
+        status: token_status_from_str(&row.columns.status),
+        created_at: row.columns.created_at,
+        revoked_at: row.columns.revoked_at,
+        event_type,
+        scope: row.columns.scope,
+    }))
+}
 
 /// See `get_external_event_token`'s own doc comment - same shape and
 /// `None` reasoning, resolving `command_type_name` against

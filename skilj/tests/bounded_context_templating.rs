@@ -264,6 +264,7 @@ async fn grant(pool: &Pool, role: &Role, bc: &BoundedContext, level: AccessLevel
         bounded_context: bc.clone(),
         level,
         can_read_sensitive: false,
+        scope: None,
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,

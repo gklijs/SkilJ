@@ -182,6 +182,7 @@ fn event_type_with_sensitive_field() -> EventType {
         schema: r#"{"properties":{"email":{"type":"string"},"user_id":{"type":"string"}}}"#.into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: vec![SensitiveField {
             field: "email".into(),
             subject_key: "user".into(),
@@ -216,6 +217,7 @@ fn access_mapping(can_read_sensitive: bool, external_subject: &str) -> RoleAcces
         bounded_context: bounded_context(),
         level: AccessLevel::Read,
         can_read_sensitive,
+        scope: None,
         status: RoleStatus::Active,
         created_at: Utc::now(),
         revoked_at: None,
@@ -257,6 +259,7 @@ fn command_type_with_sensitive_field() -> CommandType {
         schema: r#"{"properties":{"email":{"type":"string"},"user_id":{"type":"string"}}}"#.into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: vec![SensitiveField {
             field: "email".into(),
             subject_key: "user".into(),

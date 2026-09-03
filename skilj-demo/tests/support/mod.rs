@@ -181,6 +181,7 @@ pub async fn seed_admin(pool: &Pool) -> Vec<RoleAccessMapping> {
             bounded_context,
             level: AccessLevel::Admin,
             can_read_sensitive: false,
+            scope: None,
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,

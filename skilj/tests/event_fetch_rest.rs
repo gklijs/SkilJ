@@ -161,6 +161,7 @@ async fn setup() -> (Skilj, String, String) {
         bounded_context: bc.clone(),
         level: AccessLevel::Admin,
         can_read_sensitive: false,
+        scope: None,
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,
@@ -201,6 +202,7 @@ async fn setup() -> (Skilj, String, String) {
         &event_type,
         generate_token_id(),
         generate_token_secret(),
+        None,
         test_now(),
     )
     .unwrap();

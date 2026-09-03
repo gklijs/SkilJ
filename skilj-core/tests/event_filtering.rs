@@ -66,6 +66,7 @@ fn event_type() -> EventType {
         schema: SCHEMA.into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,

@@ -81,6 +81,19 @@ pub struct RoleAccessMapping {
     pub bounded_context: BoundedContext,
     pub level: AccessLevel,
     pub can_read_sensitive: bool,
+    /// Orthogonal to `level`, exactly as `can_read_sensitive` is: `None`
+    /// (the default for every mapping today) means unrestricted within
+    /// `bounded_context`, identical to this grant's own behaviour before
+    /// this field existed. `Some(v)` restricts this grant to projection
+    /// instances whose own derived "owner" value equals `v`, for a
+    /// projection that declares an owner-tag dimension (see
+    /// `plugin::Projection::OWNER_TAG_KEY`) - a projection with no such
+    /// declaration is unaffected by this field regardless of its value.
+    /// No validation on the value itself, the same unchecked
+    /// pass-through `can_read_sensitive`'s boolean already gets. See
+    /// `projections::query_projection`'s own enforcement and
+    /// specs/skilj.allium's `owner_scope_satisfied`.
+    pub scope: Option<String>,
     pub status: RoleStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -106,6 +119,16 @@ pub struct EventReadToken {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub event_type: crate::event_store::EventType,
+    /// Cross-tenant read fix (docs/architecture.md's own write-up of
+    /// these passes) - the REST track's own counterpart to
+    /// `RoleAccessMapping.scope`, set at minting time
+    /// (`create_event_read_token`) by whichever admin issues this token,
+    /// independent of that admin's own `access_mapping.scope`: an
+    /// unscoped staff admin can mint a company-scoped token. Same
+    /// null-is-unrestricted semantics, checked by
+    /// `event_store::event_owner_scope_satisfied` in
+    /// `fetch_events`/`consume_events`.
+    pub scope: Option<String>,
 }
 
 /// See `variant ExternalEventToken`.
@@ -201,6 +224,21 @@ pub enum Error {
     #[error("this RoleAccessMapping is scoped to a different bounded context")]
     GrantBoundedContextMismatch,
 
+    /// Cross-tenant read fix (docs/architecture.md's own write-up of
+    /// these passes): a grant/token names a `scope`, the record's own
+    /// type declares an owner dimension, and the record's own derived
+    /// owner either differs from `scope` or is not yet established -
+    /// fail-closed, the same "affirmatively provable, not merely
+    /// un-contradicted" framing every caller of this variant shares. A
+    /// single-record surface (`projections::query_projection`,
+    /// `event_store::inspect_event`) rejects outright with this;
+    /// multi-record ones (`event_store::query_events`/`count_events`/
+    /// `deliver_to_subscriptions`/`fetch_events`/`consume_events`) never
+    /// construct it at all - a record that fails this check is filtered
+    /// out of the result, not a reason to fail the whole call.
+    #[error("this grant is scoped to a value that does not match this record's own owner")]
+    GrantScopeMismatch,
+
     #[error("this AccessToken is not active")]
     TokenNotActive,
 
@@ -245,6 +283,7 @@ impl SkiljRejection for Error {
             Error::GrantNotActive => "grant_not_active",
             Error::InsufficientAccessLevel => "insufficient_access_level",
             Error::GrantBoundedContextMismatch => "grant_bounded_context_mismatch",
+            Error::GrantScopeMismatch => "grant_scope_mismatch",
             Error::TokenNotActive => "token_not_active",
             Error::NotSuperadmin => "not_superadmin",
             Error::UnrecognisedSubject => "unrecognised_subject",
@@ -462,6 +501,19 @@ pub async fn verify_and_extract_subject(
 
     let mut validation = jsonwebtoken::Validation::new(config.signing_algorithm.to_jsonwebtoken());
     validation.set_issuer(&[&config.issuer]);
+    // `IdpConfig` has no audience field at all - deliberately, per this
+    // function's own doc comment above ("nothing else from it" but the
+    // subject claim). `jsonwebtoken::Validation::new`'s own default is
+    // `validate_aud: true` with no configured value, which rejects any
+    // token carrying an `aud` claim outright rather than skipping the
+    // check - and every spec-compliant OIDC ID token carries one. Found
+    // against a real external IdP (self-hosted Dex, skilj-helpdesk):
+    // signature and issuer verified correctly, then every real token
+    // rejected with InvalidAudience regardless of its actual audience
+    // value. The local JWKS/JWT test fixtures elsewhere in this
+    // workspace never carry an `aud` claim, so they never exercised
+    // this path.
+    validation.validate_aud = false;
 
     let token_data = jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
         jwt,
@@ -583,12 +635,14 @@ pub fn revoke_role(
 /// exists RoleAccessMapping{role, bounded_context, status: active}`
 /// check - same full-snapshot treatment as `create_role`'s
 /// `existing_roles`.
+#[allow(clippy::too_many_arguments)]
 pub fn grant_role_access_mapping(
     caller: &Role,
     role: &Role,
     bounded_context: &BoundedContext,
     level: AccessLevel,
     can_read_sensitive: bool,
+    scope: Option<String>,
     existing_mappings: &[RoleAccessMapping],
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<RoleAccessMapping> {
@@ -610,6 +664,7 @@ pub fn grant_role_access_mapping(
         bounded_context: bounded_context.clone(),
         level,
         can_read_sensitive,
+        scope,
         status: RoleStatus::Active,
         created_at: now,
         revoked_at: None,
@@ -782,12 +837,16 @@ pub fn create_direct_creation_token(
 }
 
 /// See `rule CreateEventReadToken`. Same shape and reasoning as
-/// `create_external_event_token` above.
+/// `create_external_event_token` above, plus `scope` -
+/// `EventReadToken.scope`'s own doc comment - carried through
+/// unvalidated, the same "no validation on this value" treatment
+/// `RoleAccessMapping.scope` already gets from `grant_role_access_mapping`.
 pub fn create_event_read_token(
     access_mapping: &RoleAccessMapping,
     event_type: &crate::event_store::EventType,
     id: String,
     secret: String,
+    scope: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<EventReadToken> {
     require_active_admin(access_mapping)?;
@@ -802,6 +861,7 @@ pub fn create_event_read_token(
         created_at: now,
         revoked_at: None,
         event_type: event_type.clone(),
+        scope,
     })
 }
 

@@ -8,10 +8,13 @@
 //! (see `query_projection`'s own doc comment for why).
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
-//! filtered to this pass's source constructs): 4 of 7 total.
-//! Uncovered, with reason - see the doc comment at the bottom of this
-//! file: `surface-actor`/`surface-exposure`/`surface-provides.ProjectionQuery`
-//! (3) - the usual GraphQL-scaffolding gap.
+//! filtered to this pass's source constructs): 5 of 8 total -
+//! `rule-failure.QueryProjection.4` (cross-tenant projection read fix,
+//! docs/architecture.md's own write-up of this pass) added alongside the
+//! original 4. Uncovered, with reason - see the doc comment at the
+//! bottom of this file: `surface-actor`/`surface-exposure`/
+//! `surface-provides.ProjectionQuery` (3) - the usual GraphQL-scaffolding
+//! gap.
 
 use chrono::{TimeZone, Utc};
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
@@ -51,6 +54,7 @@ fn access_mapping(status: RoleStatus, level: AccessLevel) -> RoleAccessMapping {
         bounded_context: bounded_context(BoundedContextStatus::Active),
         level,
         can_read_sensitive: false,
+        scope: None,
         status,
         created_at: timestamp(0),
         revoked_at: None,
@@ -84,6 +88,8 @@ fn query_projection_succeeds_and_returns_the_supplied_result_when_no_sequence_is
         "",
         None,  // no wait_for_sequence
         false, // caught_up is irrelevant when nothing was requested
+        false, // this projection declares no owner dimension
+        None,
         r#"{"total":42}"#.into(),
     )
     .unwrap();
@@ -104,6 +110,8 @@ fn query_projection_succeeds_when_caught_up_to_the_requested_sequence() {
         "",
         Some(10),
         true, // await_projection_caught_up already resolved true
+        false,
+        None,
         r#"{"total":99}"#.into(),
     )
     .unwrap();
@@ -120,7 +128,8 @@ fn query_projection_succeeds_for_every_access_level() {
         let p = projection();
 
         let result =
-            projections::query_projection(&mapping, &p, "", None, false, "ok".into()).unwrap();
+            projections::query_projection(&mapping, &p, "", None, false, false, None, "ok".into())
+                .unwrap();
 
         assert_eq!(result, "ok");
     }
@@ -132,7 +141,8 @@ fn query_projection_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Read);
     let p = projection();
 
-    let err = projections::query_projection(&mapping, &p, "", None, false, "x".into()).unwrap_err();
+    let err = projections::query_projection(&mapping, &p, "", None, false, false, None, "x".into())
+        .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -149,7 +159,8 @@ fn query_projection_rejects_a_mapping_scoped_to_a_different_bounded_context() {
     };
     let p = projection();
 
-    let err = projections::query_projection(&mapping, &p, "", None, false, "x".into()).unwrap_err();
+    let err = projections::query_projection(&mapping, &p, "", None, false, false, None, "x".into())
+        .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -172,6 +183,8 @@ fn query_projection_rejects_with_a_distinguishable_timeout_when_not_caught_up_in
         "",
         Some(10),
         false, // await_projection_caught_up resolved false (timed out)
+        false,
+        None,
         "x".into(),
     )
     .unwrap_err();
@@ -190,10 +203,155 @@ fn query_projection_never_times_out_when_no_sequence_was_requested() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Read);
     let p = projection();
 
-    let result =
-        projections::query_projection(&mapping, &p, "", None, false, "whatever".into()).unwrap();
+    let result = projections::query_projection(
+        &mapping,
+        &p,
+        "",
+        None,
+        false,
+        false,
+        None,
+        "whatever".into(),
+    )
+    .unwrap();
 
     assert_eq!(result, "whatever");
+}
+
+// ---------------------------------------------------------------------
+// rule-success.QueryProjection / rule-failure.QueryProjection.4 -
+// `requires: owner_scope_satisfied(projection, instance_key, access_mapping)`
+// (cross-tenant projection read fix, docs/architecture.md's own write-up
+// of this pass)
+// ---------------------------------------------------------------------
+
+/// A grant with no `scope` is unrestricted, exactly as before this check
+/// existed - regardless of whether the projection declares an owner
+/// dimension or what the instance's own owner is.
+#[test]
+fn query_projection_succeeds_when_the_grant_has_no_scope() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Read);
+    let p = projection();
+
+    let result = projections::query_projection(
+        &mapping,
+        &p,
+        "company-a",
+        None,
+        false,
+        true, // projection declares an owner dimension
+        Some("company-b"),
+        "x".into(),
+    )
+    .unwrap();
+
+    assert_eq!(result, "x");
+}
+
+/// A scoped grant querying a projection that declares no owner dimension
+/// at all is unaffected by `scope` regardless of its value.
+#[test]
+fn query_projection_succeeds_when_the_projection_declares_no_owner_dimension() {
+    let mapping = RoleAccessMapping {
+        scope: Some("company-a".into()),
+        ..access_mapping(RoleStatus::Active, AccessLevel::Read)
+    };
+    let p = projection();
+
+    let result = projections::query_projection(
+        &mapping,
+        &p,
+        "",
+        None,
+        false,
+        false, // no owner dimension declared
+        None,
+        "x".into(),
+    )
+    .unwrap();
+
+    assert_eq!(result, "x");
+}
+
+/// A scoped grant querying an owner-declaring projection succeeds when
+/// the instance's own derived owner matches.
+#[test]
+fn query_projection_succeeds_when_the_instance_owner_matches_the_grants_scope() {
+    let mapping = RoleAccessMapping {
+        scope: Some("company-a".into()),
+        ..access_mapping(RoleStatus::Active, AccessLevel::Read)
+    };
+    let p = projection();
+
+    let result = projections::query_projection(
+        &mapping,
+        &p,
+        "ticket-1",
+        None,
+        false,
+        true,
+        Some("company-a"),
+        "x".into(),
+    )
+    .unwrap();
+
+    assert_eq!(result, "x");
+}
+
+/// rule-failure.QueryProjection.4 - a scoped grant querying an
+/// owner-declaring projection is rejected when the instance's own
+/// derived owner belongs to someone else. The concrete cross-tenant leak
+/// this whole pass fixes: before it, `require_read_mapping`'s
+/// any-active-mapping check was the only thing gating this query.
+#[test]
+fn query_projection_rejects_an_instance_owned_by_a_different_scope() {
+    let mapping = RoleAccessMapping {
+        scope: Some("company-a".into()),
+        ..access_mapping(RoleStatus::Active, AccessLevel::Read)
+    };
+    let p = projection();
+
+    let err = projections::query_projection(
+        &mapping,
+        &p,
+        "ticket-1",
+        None,
+        false,
+        true,
+        Some("company-b"),
+        "x".into(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
+}
+
+/// rule-failure.QueryProjection.4, the fail-closed half: an instance
+/// nothing has established an owner for yet (a never-touched key, or a
+/// row that predates the projection declaring an owner dimension) is
+/// treated as unproven, not as "no conflict" - a scoped grant is
+/// rejected exactly as it would be for a proven mismatch.
+#[test]
+fn query_projection_rejects_an_unestablished_owner_for_a_scoped_grant() {
+    let mapping = RoleAccessMapping {
+        scope: Some("company-a".into()),
+        ..access_mapping(RoleStatus::Active, AccessLevel::Read)
+    };
+    let p = projection();
+
+    let err = projections::query_projection(
+        &mapping,
+        &p,
+        "ticket-1",
+        None,
+        false,
+        true,
+        None, // no owner established yet
+        "x".into(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
 }
 
 // ---------------------------------------------------------------------

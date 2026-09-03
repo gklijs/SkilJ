@@ -180,6 +180,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
         schema: r#"{"properties":{"amount":{"type":"number"}}}"#.to_string(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
@@ -201,6 +202,7 @@ async fn seed_command_type(pool: &Pool, bc: &BoundedContext) -> CommandType {
         schema: r#"{"properties":{"amount":{"type":"number"}}}"#.to_string(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         rest_trigger_allowed: true,
     };
@@ -233,6 +235,7 @@ async fn seed_active_role_access_mapping(
         bounded_context: bc.clone(),
         level,
         can_read_sensitive: false,
+        scope: None,
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,
@@ -571,6 +574,7 @@ fn round_trips_a_revoked_event_read_token() {
             created_at: now,
             revoked_at: Some(now),
             event_type: et,
+            scope: None,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -666,6 +670,7 @@ fn read_cursor_is_none_before_the_first_consume() {
             created_at: test_now(),
             revoked_at: None,
             event_type: et,
+            scope: None,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -688,6 +693,7 @@ fn apply_cursor_update_created_then_advanced_round_trips() {
             created_at: test_now(),
             revoked_at: None,
             event_type: et,
+            scope: None,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -736,6 +742,7 @@ fn record_acknowledgement_moves_the_cursor() {
             created_at: test_now(),
             revoked_at: None,
             event_type: et,
+            scope: None,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
         db::apply_cursor_update(

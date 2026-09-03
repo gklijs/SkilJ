@@ -242,6 +242,7 @@ async fn setup() -> (Skilj, Pool, String, String) {
         bounded_context: bc.clone(),
         level: AccessLevel::Admin,
         can_read_sensitive: false,
+        scope: None,
         status: RoleStatus::Active,
         created_at: test_now(),
         revoked_at: None,
@@ -280,10 +281,10 @@ async fn graphql_request(
 const REGISTER_EVENT_TYPE_MUTATION: &str = "\
     mutation($bc: String!, $name: String!) { \
         registerEventType(boundedContext: $bc, name: $name, schema: \"{\\\"properties\\\":{\\\"amount\\\":{\\\"type\\\":\\\"number\\\"},\\\"account_id\\\":{\\\"type\\\":\\\"string\\\"}}}\", \
-            tagMappings: [{key: \"account\", field: \"account_id\"}], sensitiveFields: [], \
+            tagMappings: [{key: \"account\", field: \"account_id\"}], ownerTagKey: \"account\", sensitiveFields: [], \
             externalCreationAllowed: true, directCreationAllowed: true, systemTriggeredAllowed: false, \
             eventReadAllowed: true) { \
-            name schemaVersion tagMappings { key field } externalCreationAllowed \
+            name schemaVersion tagMappings { key field } ownerTagKey externalCreationAllowed \
         } \
     }";
 
@@ -321,6 +322,7 @@ fn full_type_registration_lifecycle_end_to_end() {
             response["data"]["registerEventType"]["tagMappings"][0]["key"],
             "account"
         );
+        assert_eq!(response["data"]["registerEventType"]["ownerTagKey"], "account");
         assert_eq!(
             response["data"]["registerEventType"]["externalCreationAllowed"],
             true
@@ -771,7 +773,7 @@ fn event_types_and_command_types_list_every_registered_type() {
             Some(&jwt),
             "query($bc: String!) { \
                 eventTypes(boundedContext: $bc) { \
-                    name schemaVersion tagMappings { key field } externalCreationAllowed \
+                    name schemaVersion tagMappings { key field } ownerTagKey externalCreationAllowed \
                 } \
             }",
             json!({ "bc": bc_name }),
@@ -785,13 +787,17 @@ fn event_types_and_command_types_list_every_registered_type() {
         assert_eq!(event_types.len(), 1);
         assert_eq!(event_types[0]["name"], "MoneyDeposited");
         assert_eq!(event_types[0]["tagMappings"][0]["key"], "account");
+        // Read back through the query side too, not just the mutation's own
+        // response - proves the registered value round-trips through
+        // Postgres, not just through the resolver's own echo.
+        assert_eq!(event_types[0]["ownerTagKey"], "account");
         assert_eq!(event_types[0]["externalCreationAllowed"], true);
 
         let response = graphql_request(
             &router,
             Some(&jwt),
             "query($bc: String!) { \
-                commandTypes(boundedContext: $bc) { name schemaVersion restTriggerAllowed } \
+                commandTypes(boundedContext: $bc) { name schemaVersion ownerTagKey restTriggerAllowed } \
             }",
             json!({ "bc": bc_name }),
         )
@@ -803,6 +809,9 @@ fn event_types_and_command_types_list_every_registered_type() {
         let command_types = response["data"]["commandTypes"].as_array().unwrap();
         assert_eq!(command_types.len(), 1);
         assert_eq!(command_types[0]["name"], "WithdrawMoney");
+        // Never set for this type - proves the null/unset path reads back
+        // as null, not just the set one eventTypes just covered above.
+        assert!(command_types[0]["ownerTagKey"].is_null());
         assert_eq!(command_types[0]["restTriggerAllowed"], true);
     });
 }

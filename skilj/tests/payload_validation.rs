@@ -167,6 +167,7 @@ fn direct_event_creation_rejects_a_payload_that_does_not_match_the_schema_with_4
             bounded_context: bc.clone(),
             level: AccessLevel::Admin,
             can_read_sensitive: false,
+            scope: None,
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,

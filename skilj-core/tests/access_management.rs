@@ -84,6 +84,7 @@ fn mapping(role: Role, status: RoleStatus) -> RoleAccessMapping {
         bounded_context: bounded_context(BoundedContextStatus::Active),
         level: AccessLevel::Write,
         can_read_sensitive: false,
+        scope: None,
         status,
         created_at: timestamp(0),
         revoked_at: None,
@@ -375,6 +376,7 @@ fn grant_role_access_mapping_succeeds_with_the_given_fields() {
         &bc,
         AccessLevel::Admin,
         true,
+        None,
         &[],
         timestamp(30),
     )
@@ -400,6 +402,7 @@ fn grant_role_access_mapping_rejects_an_inactive_caller() {
         &bc,
         AccessLevel::Read,
         false,
+        None,
         &[],
         timestamp(0),
     )
@@ -417,6 +420,7 @@ fn grant_role_access_mapping_rejects_a_non_superadmin_caller() {
         &bc,
         AccessLevel::Read,
         false,
+        None,
         &[],
         timestamp(0),
     )
@@ -434,6 +438,7 @@ fn grant_role_access_mapping_rejects_an_inactive_target_role() {
         &bc,
         AccessLevel::Read,
         false,
+        None,
         &[],
         timestamp(0),
     )
@@ -451,6 +456,7 @@ fn grant_role_access_mapping_rejects_an_archived_bounded_context() {
         &bc,
         AccessLevel::Read,
         false,
+        None,
         &[],
         timestamp(0),
     )
@@ -475,6 +481,7 @@ fn grant_role_access_mapping_rejects_a_duplicate_active_mapping() {
         &bc,
         AccessLevel::Write,
         false,
+        None,
         std::slice::from_ref(&existing),
         timestamp(0),
     )
@@ -501,6 +508,7 @@ fn grant_role_access_mapping_allows_regranting_after_a_revocation() {
         &bc,
         AccessLevel::Write,
         false,
+        None,
         std::slice::from_ref(&existing),
         timestamp(0),
     )
@@ -614,6 +622,7 @@ fn unique_active_access_per_role_and_context_is_enforced_by_grant_role_access_ma
         &bc,
         AccessLevel::Read,
         false,
+        None,
         std::slice::from_ref(&existing),
         timestamp(0),
     )

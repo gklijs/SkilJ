@@ -73,7 +73,11 @@ async fn wait_until_caught_up(
 /// `ProjectionDispatcher::default_state` (the same value a fresh instance
 /// lazily starts from) rather than a "not found" error - a customer with
 /// no purchase history yet is a legitimate, common case (§9's "keyed /
-/// multi-row Projections" pass).
+/// multi-row Projections" pass) - unless `query_projection` below
+/// rejects it first: for an owner-declaring projection, an untouched key
+/// is exactly the "unestablished owner" case a `scope`-restricted grant
+/// fails closed on (cross-tenant projection read fix,
+/// docs/architecture.md's own write-up of this pass).
 pub fn field() -> Field {
     Field::new("projection", TypeRef::named_nn("ProjectionResult"), |ctx| {
         FieldFuture::new(async move {
@@ -115,20 +119,32 @@ pub fn field() -> Field {
                 .map_err(to_graphql_error)?,
             };
 
-            let state_json = skilj_core::db::get_projection_state(
+            let stored = skilj_core::db::get_projection_state_and_owner(
                 &state.pool,
                 &bounded_context_name,
                 &name,
                 &key,
             )
             .await
-            .map_err(to_graphql_error)?
-            .or_else(|| {
-                state
-                    .projection_dispatcher
-                    .default_state(&bounded_context_name, &name)
-            })
-            .unwrap_or_else(|| "{}".to_string());
+            .map_err(to_graphql_error)?;
+            // Cross-tenant projection read fix (docs/architecture.md's
+            // own write-up of this pass): `instance_owner` is this row's
+            // own `owner` column, `None` for a row that doesn't exist yet
+            // - the same "no proven owner" treatment either way, decided
+            // by `query_projection` below, not here.
+            let instance_owner = stored.as_ref().and_then(|(_, owner)| owner.clone());
+            let state_json = stored
+                .map(|(state_json, _)| state_json)
+                .or_else(|| {
+                    state
+                        .projection_dispatcher
+                        .default_state(&bounded_context_name, &name)
+                })
+                .unwrap_or_else(|| "{}".to_string());
+            let owner_tag_key = state
+                .projection_dispatcher
+                .owner_tag_key(&bounded_context_name, &name)
+                .flatten();
 
             // Real decrypt-on-read - automatic, no `Projection.sensitive_fields`
             // declaration anywhere (see this field's own doc comment).
@@ -156,6 +172,8 @@ pub fn field() -> Field {
                 &key,
                 wait_for_sequence,
                 caught_up,
+                owner_tag_key.is_some(),
+                instance_owner.as_deref(),
                 state_json,
             )
             .map_err(to_graphql_error)?;

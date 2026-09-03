@@ -232,6 +232,7 @@ fn a_dcb_conflict_outside_the_cache_window_is_still_caught_via_the_postgres_fall
             bounded_context: bc.clone(),
             level: AccessLevel::Admin,
             can_read_sensitive: false,
+            scope: None,
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,

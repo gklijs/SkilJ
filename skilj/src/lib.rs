@@ -320,6 +320,20 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
             .get(&(bounded_context, projection_name.to_string()))?;
         Some(registered.default_state_json.clone())
     }
+
+    fn owner_tag_key(
+        &self,
+        bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        let registered = self
+            .projections
+            .get(&(bounded_context, projection_name.to_string()))?;
+        Some(registered.owner_tag_key)
+    }
 }
 
 /// `EventDispatcher`'s own implementer - same shape and reasoning as
@@ -594,6 +608,7 @@ type ScheduledPayloadFn = Box<dyn Fn() -> String + Send + Sync>;
 struct RegisteredEventType {
     schema: String,
     tag_mappings: Vec<skilj_core::shared::TagMapping>,
+    owner_tag_key: Option<String>,
     sensitive_fields: Vec<skilj_core::shared::SensitiveField>,
     external_creation_allowed: bool,
     direct_creation_allowed: bool,
@@ -615,6 +630,7 @@ fn registered_event_type<T: EventType + 'static>() -> RegisteredEventType {
     RegisteredEventType {
         schema: serde_json::to_string(&schema).expect("JSON Schema serialization is infallible"),
         tag_mappings: T::tag_mappings(),
+        owner_tag_key: T::owner_tag_key().map(str::to_string),
         sensitive_fields: T::sensitive_fields(),
         external_creation_allowed: T::external_creation_allowed(),
         direct_creation_allowed: T::direct_creation_allowed(),
@@ -654,6 +670,7 @@ type DecideFromSnapshotFn =
 struct RegisteredCommandType {
     schema: String,
     tag_mappings: Vec<skilj_core::shared::TagMapping>,
+    owner_tag_key: Option<String>,
     sensitive_fields: Vec<skilj_core::shared::SensitiveField>,
     rest_trigger_allowed: bool,
     /// `CommandType::required_role()`'s value, carried straight through
@@ -687,6 +704,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
     RegisteredCommandType {
         schema: serde_json::to_string(&schema).expect("JSON Schema serialization is infallible"),
         tag_mappings: T::tag_mappings(),
+        owner_tag_key: T::owner_tag_key().map(str::to_string),
         sensitive_fields: T::sensitive_fields(),
         rest_trigger_allowed: T::rest_trigger_allowed(),
         required_role: T::required_role(),
@@ -766,6 +784,7 @@ struct RegisteredProjection {
     consumed_event_types: Vec<&'static str>,
     sync: bool,
     default_state_json: String,
+    owner_tag_key: Option<&'static str>,
     keys: KeysFn,
     project: ProjectFn,
 }
@@ -782,6 +801,7 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
         consumed_event_types,
         sync: T::sync(),
         default_state_json,
+        owner_tag_key: T::OWNER_TAG_KEY,
         keys: Box::new(move |event| {
             if !consumed_for_keys
                 .iter()
@@ -1283,6 +1303,18 @@ impl SkiljBuilder {
                     // free once the table already exists - see
                     // `ensure_idempotency_keys_table`'s own doc comment.
                     skilj_core::db::ensure_idempotency_keys_table(pool, &bc.name).await?;
+                    // Cross-tenant projection read fix
+                    // (docs/architecture.md's own write-up of this pass):
+                    // same "patched into every bounded context, every
+                    // startup" treatment, for `projection_state.owner`/
+                    // `projection_rebuild_state.owner` instead - see
+                    // `ensure_projection_state_owner_columns`'s own doc
+                    // comment.
+                    skilj_core::db::ensure_projection_state_owner_columns(pool, &bc.name).await?;
+                    // Same pass's own raw-event half - `event_types.owner_tag_key`/
+                    // `access_tokens.scope` - see
+                    // `ensure_event_scoping_columns`'s own doc comment.
+                    skilj_core::db::ensure_event_scoping_columns(pool, &bc.name).await?;
                     Ok::<(), skilj_core::Error>(())
                 }
             })
@@ -2015,6 +2047,7 @@ async fn reconcile_event_types(
             name.clone(),
             registered.schema.clone(),
             registered.tag_mappings.clone(),
+            registered.owner_tag_key.clone(),
             registered.sensitive_fields.clone(),
             registered.external_creation_allowed,
             registered.direct_creation_allowed,
@@ -2053,6 +2086,7 @@ async fn reconcile_command_types(
             name.clone(),
             registered.schema.clone(),
             registered.tag_mappings.clone(),
+            registered.owner_tag_key.clone(),
             registered.sensitive_fields.clone(),
             registered.rest_trigger_allowed,
             existing.as_ref(),

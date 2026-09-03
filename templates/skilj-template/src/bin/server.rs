@@ -78,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bounded_context: bc,
         level: AccessLevel::Admin,
         can_read_sensitive: false,
+        scope: None,
         status: RoleStatus::Active,
         created_at: Utc::now(),
         revoked_at: None,

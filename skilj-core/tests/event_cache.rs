@@ -125,6 +125,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
         schema: r#"{"properties":{}}"#.to_string(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,

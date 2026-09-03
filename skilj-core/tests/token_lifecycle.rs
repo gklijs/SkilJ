@@ -58,6 +58,7 @@ fn access_mapping(status: RoleStatus, level: AccessLevel) -> RoleAccessMapping {
         bounded_context: bounded_context(BoundedContextStatus::Active),
         level,
         can_read_sensitive: false,
+        scope: None,
         status,
         created_at: timestamp(0),
         revoked_at: None,
@@ -71,6 +72,7 @@ fn event_type() -> EventType {
         schema: "{}".into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
@@ -90,6 +92,7 @@ fn command_type() -> CommandType {
         schema: "{}".into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         rest_trigger_allowed: false,
     }
@@ -307,6 +310,7 @@ fn create_event_read_token_succeeds_and_stamps_the_full_entity_shape() {
         &et,
         "token-3".into(),
         "s3cr3t".into(),
+        None,
         timestamp(1000),
     )
     .unwrap();
@@ -328,6 +332,7 @@ fn create_event_read_token_rejects_a_revoked_mapping() {
         &event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -344,6 +349,7 @@ fn create_event_read_token_rejects_a_write_level_mapping() {
         &event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -363,6 +369,7 @@ fn create_event_read_token_rejects_an_event_type_from_another_bounded_context() 
         &other_bounded_context_event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -387,6 +394,7 @@ fn event_read_token_carries_its_variant_specific_field_through_the_access_token_
         created_at: timestamp(0),
         revoked_at: None,
         event_type: et.clone(),
+        scope: None,
     };
 
     match AccessToken::EventReadToken(token) {
@@ -518,6 +526,7 @@ fn revoke_token_succeeds_for_every_variant_and_stamps_revoked_at() {
             created_at: timestamp(0),
             revoked_at: None,
             event_type: event_type(),
+            scope: None,
         }),
     ];
 
@@ -566,6 +575,7 @@ fn revoke_token_rejects_a_revoked_mapping() {
         created_at: timestamp(0),
         revoked_at: None,
         event_type: event_type(),
+        scope: None,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -584,6 +594,7 @@ fn revoke_token_rejects_a_write_level_mapping() {
         created_at: timestamp(0),
         revoked_at: None,
         event_type: event_type(),
+        scope: None,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -605,6 +616,7 @@ fn revoke_token_rejects_a_token_scoped_to_another_bounded_context() {
         created_at: timestamp(0),
         revoked_at: None,
         event_type: other_bounded_context_event_type(),
+        scope: None,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -628,6 +640,7 @@ fn revoke_token_rejects_an_already_revoked_token() {
         created_at: timestamp(0),
         revoked_at: Some(timestamp(0)),
         event_type: event_type(),
+        scope: None,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -652,6 +665,7 @@ fn revoke_token_only_ever_produces_the_revoked_status() {
         created_at: timestamp(0),
         revoked_at: None,
         event_type: event_type(),
+        scope: None,
     });
 
     let revoked = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap();

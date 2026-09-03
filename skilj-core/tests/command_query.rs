@@ -49,6 +49,7 @@ fn access_mapping(status: RoleStatus, level: AccessLevel) -> RoleAccessMapping {
         bounded_context: bounded_context(BoundedContextStatus::Active),
         level,
         can_read_sensitive: false,
+        scope: None,
         status,
         created_at: timestamp(0),
         revoked_at: None,
@@ -62,6 +63,7 @@ fn command_type(name: &str) -> CommandType {
         schema: "{}".into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         rest_trigger_allowed: false,
     }
@@ -74,6 +76,7 @@ fn event_type(name: &str) -> EventType {
         schema: "{}".into(),
         schema_version: 1,
         tag_mappings: Vec::new(),
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,

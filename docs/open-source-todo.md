@@ -20,7 +20,7 @@ deleting it - keeps a record of what this list already caught.
   opened [dcb-events/dcb-events.github.io#81](https://github.com/dcb-events/dcb-events.github.io/pull/81),
   adding `skilj` to the Rust section of `docs/resources/libraries.md`
   alongside Disintegrate, linking the Codeberg repo and the crates.io
-  page. Not yet merged by the DCB community maintainers as of writing.
+  page. Merged by the DCB community maintainers as of 2026-08-30.
 
 - **Publish `skilj`/`skilj-core` (and the rest of the workspace) to
   crates.io, and switch `templates/skilj-template/Cargo.toml` off its

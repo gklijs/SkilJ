@@ -194,6 +194,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str, tag_key: 
             key: tag_key.to_string(),
             field: "account_id".to_string(),
         }],
+        owner_tag_key: None,
         sensitive_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,

@@ -223,6 +223,7 @@ fn triggering_a_command_updates_a_real_sync_projection_through_rest() {
             bounded_context: bc.clone(),
             level: AccessLevel::Admin,
             can_read_sensitive: false,
+            scope: None,
             status: RoleStatus::Active,
             created_at: test_now(),
             revoked_at: None,

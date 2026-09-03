@@ -46,6 +46,7 @@ fn synthetic_admin_mapping(
         bounded_context: bounded_context.clone(),
         level: AccessLevel::Admin,
         can_read_sensitive: true,
+        scope: None,
         status: RoleStatus::Active,
         created_at: now,
         revoked_at: None,
@@ -85,6 +86,7 @@ async fn apply_template_registrations(
             source.name.clone(),
             source.schema.clone(),
             source.tag_mappings.clone(),
+            source.owner_tag_key.clone(),
             source.sensitive_fields.clone(),
             source.external_creation_allowed,
             source.direct_creation_allowed,
@@ -119,6 +121,7 @@ async fn apply_template_registrations(
             source.name.clone(),
             source.schema.clone(),
             source.tag_mappings.clone(),
+            source.owner_tag_key.clone(),
             source.sensitive_fields.clone(),
             source.rest_trigger_allowed,
             existing.as_ref(),
@@ -233,12 +236,18 @@ async fn finish_creating_tenant(
     let existing_mappings = skilj_core::db::list_role_access_mappings(&state.pool)
         .await
         .map_err(to_graphql_error)?;
+    // `CreateBoundedContextFromTemplate` (specs/skilj.allium) takes no
+    // `scope` argument of its own - a templated tenant's grant is always
+    // created unrestricted, matching this call's own behaviour before
+    // `scope` existed. See `RoleAccessMapping.scope`'s own doc comment
+    // for what a non-null value would mean.
     let mapping = skilj_core::access_control::grant_role_access_mapping(
         caller,
         role,
         tenant,
         level,
         can_read_sensitive,
+        None,
         &existing_mappings,
         now,
     )

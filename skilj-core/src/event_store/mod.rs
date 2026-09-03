@@ -153,6 +153,16 @@ pub struct EventType {
     pub schema: String,
     pub schema_version: i64,
     pub tag_mappings: Vec<TagMapping>,
+    /// See `plugin::EventType::owner_tag_key`'s own doc comment - names
+    /// which of `tag_mappings`' own keys is this type's "owner"
+    /// dimension, or `None` for a type with no such notion (every type
+    /// registered before this field existed). Validated at registration
+    /// time by `valid_owner_tag_key` - `null`, or a key present in
+    /// `tag_mappings` - never re-validated here. Read by
+    /// `event_owner_scope_satisfied`, the cross-tenant read fix's own
+    /// per-event predicate (docs/architecture.md's own write-up of these
+    /// passes).
+    pub owner_tag_key: Option<String>,
     pub sensitive_fields: Vec<SensitiveField>,
     pub external_creation_allowed: bool,
     pub direct_creation_allowed: bool,
@@ -197,6 +207,10 @@ pub struct CommandType {
     pub schema: String,
     pub schema_version: i64,
     pub tag_mappings: Vec<TagMapping>,
+    /// See `EventType.owner_tag_key`'s own doc comment - identical role,
+    /// for `Command.consistency_tags` instead of `Event.tags`. Cross-tenant
+    /// read fix (docs/architecture.md's own write-up of these passes).
+    pub owner_tag_key: Option<String>,
     pub sensitive_fields: Vec<SensitiveField>,
     pub rest_trigger_allowed: bool,
 }
@@ -431,6 +445,13 @@ pub enum Error {
     #[error("this tag mapping names a field the schema doesn't declare")]
     InvalidTagMapping,
 
+    /// Cross-tenant read fix (docs/architecture.md's own write-up of
+    /// these passes): `owner_tag_key` names something other than an
+    /// existing `tag_mappings` key - see `valid_owner_tag_key`'s own doc
+    /// comment.
+    #[error("this owner_tag_key does not name a key present in tag_mappings")]
+    InvalidOwnerTagKey,
+
     #[error("a TagMapping and a SensitiveField may not name the same field")]
     SensitiveFieldTagOverlap,
 
@@ -525,6 +546,7 @@ impl SkiljRejection for Error {
             Error::InvalidFilter => "invalid_filter",
             Error::InvalidSchema => "invalid_schema",
             Error::InvalidTagMapping => "invalid_tag_mapping",
+            Error::InvalidOwnerTagKey => "invalid_owner_tag_key",
             Error::SensitiveFieldTagOverlap => "sensitive_field_tag_overlap",
             Error::InvalidSensitiveField => "invalid_sensitive_field",
             Error::TagMappingKeyDropped => "tag_mapping_key_dropped",
@@ -880,6 +902,24 @@ pub fn valid_tag_mappings(schema: &str, tag_mappings: &[TagMapping]) -> bool {
     tag_mappings
         .iter()
         .all(|m| resolve_field_kind(&properties, definitions.as_ref(), &m.field).is_some())
+}
+
+/// Black box (see the note above rule `RegisterEventType`) - cross-tenant
+/// read fix (docs/architecture.md's own write-up of these passes):
+/// `owner_tag_key` is `null` (no owner dimension declared - every type
+/// registered before this field existed), or names a key present in
+/// `tag_mappings`. Unlike `valid_tag_mappings`'/`valid_sensitive_fields`'
+/// additive-only re-registration treatment (`RegisterEventType`'s own
+/// `existing.tag_mappings.all(...)` check), `owner_tag_key` is re-validated
+/// fresh on every registration rather than accumulated: it is a pointer
+/// *into* `tag_mappings`, not itself additive state, so a later
+/// registration is free to change or clear it as long as it still points
+/// at a real key (or is null).
+pub fn valid_owner_tag_key(tag_mappings: &[TagMapping], owner_tag_key: Option<&str>) -> bool {
+    match owner_tag_key {
+        None => true,
+        Some(key) => tag_mappings.iter().any(|m| m.key == key),
+    }
 }
 
 /// Black box (see the note above rule `RegisterEventType`): the same
@@ -1244,6 +1284,73 @@ pub fn matches_filters(event: &Event, filters: &[Filter]) -> bool {
     filters.iter().all(|f| matches_one_filter(&payload, f))
 }
 
+/// Cross-tenant read fix (docs/architecture.md's own write-up of these
+/// passes) - the per-event sibling of `projections::query_projection`'s
+/// own `owner_scope_satisfied`, same idea applied to a raw `Event`
+/// instead of a projection instance. Takes a raw `scope: Option<&str>`
+/// rather than a whole `RoleAccessMapping`, so both the GraphQL track
+/// (`RoleAccessMapping.scope`) and the REST track (`EventReadToken.scope`)
+/// feed it identically - `query_events`/`count_events`/
+/// `deliver_to_subscriptions`/`inspect_event` call it with the former,
+/// `fetch_events`/`consume_events` with the latter.
+///
+/// Holds - the event is visible/included - when `scope` is `None`
+/// (unrestricted, every caller's behaviour before `scope` existed), or
+/// `event.event_type.owner_tag_key` is `None` (this type declares no
+/// owner dimension, so no `scope` value ever restricts it), or
+/// `event.tags` carries a tag whose key equals `owner_tag_key` and whose
+/// value equals `scope`. Does not hold - fails closed, the identical
+/// "affirmatively provable, not merely un-contradicted" stance
+/// `owner_scope_satisfied` already takes - when `scope` is `Some`, the
+/// type does declare `owner_tag_key`, and no tag on the event carries
+/// that key with a matching value (including no such tag at all, or one
+/// with a null value - the "mapped field was absent" case, see `Tag.value`
+/// in the spec).
+///
+/// A multi-record surface (`query_events`/`count_events`/
+/// `deliver_to_subscriptions`/`fetch_events`/`consume_events`) uses this
+/// as a `.filter()`: a non-owned event is silently excluded, the call
+/// still succeeds. A single-record surface (`inspect_event`) rejects
+/// outright when it returns `false`, the same shape
+/// `query_projection`'s own check has.
+pub fn event_owner_scope_satisfied(event: &Event, scope: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let Some(owner_tag_key) = event.event_type.owner_tag_key.as_deref() else {
+        return true;
+    };
+    event
+        .tags
+        .iter()
+        .any(|tag| tag.key == owner_tag_key && tag.value.as_deref() == Some(scope))
+}
+
+/// `event_owner_scope_satisfied`'s own sibling for `Command`, read by
+/// `fetch_commands` (`FetchCommands`' `command_owner_scope_satisfied`).
+/// Identical contract - see that function's own doc comment for the full
+/// three-holds/fails-closed reasoning, not restated here - reading
+/// `Command.consistency_tags`/`CommandType.owner_tag_key` where the event
+/// version reads `Event.tags`/`EventType.owner_tag_key`.
+/// `consistency_tags` is the right field for this: it is always
+/// `derive_tags(command_type, payload)`, unconditionally - a plain
+/// `Vec<Tag>`, never absent - regardless of whether this particular
+/// command actually used a consistency boundary; only `consistency_boundary`
+/// itself goes missing for that case (see `Command.consistency_boundary`'s
+/// own doc comment).
+pub fn command_owner_scope_satisfied(command: &Command, scope: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let Some(owner_tag_key) = command.command_type.owner_tag_key.as_deref() else {
+        return true;
+    };
+    command
+        .consistency_tags
+        .iter()
+        .any(|tag| tag.key == owner_tag_key && tag.value.as_deref() == Some(scope))
+}
+
 /// The greatest `Event.sequence` among a set of events, or `None` when
 /// empty - see the note above rule `ConsumeEvents`.
 fn highest_sequence(events: &[Event]) -> Option<i64> {
@@ -1563,6 +1670,7 @@ pub fn register_event_type(
     name: String,
     schema: String,
     tag_mappings: Vec<TagMapping>,
+    owner_tag_key: Option<String>,
     sensitive_fields: Vec<SensitiveField>,
     external_creation_allowed: bool,
     direct_creation_allowed: bool,
@@ -1590,6 +1698,9 @@ pub fn register_event_type(
     }
     if !valid_tag_mappings(&schema, &tag_mappings) {
         return Err(Error::InvalidTagMapping.into());
+    }
+    if !valid_owner_tag_key(&tag_mappings, owner_tag_key.as_deref()) {
+        return Err(Error::InvalidOwnerTagKey.into());
     }
     if !valid_sensitive_fields(&schema, &sensitive_fields) {
         return Err(Error::InvalidSensitiveField.into());
@@ -1625,6 +1736,7 @@ pub fn register_event_type(
             schema,
             schema_version: 1,
             tag_mappings,
+            owner_tag_key,
             sensitive_fields,
             external_creation_allowed,
             direct_creation_allowed,
@@ -1659,6 +1771,7 @@ pub fn register_event_type(
             existing.schema_version
         },
         tag_mappings,
+        owner_tag_key,
         sensitive_fields,
         external_creation_allowed,
         direct_creation_allowed,
@@ -1707,6 +1820,7 @@ pub fn register_command_type(
     name: String,
     schema: String,
     tag_mappings: Vec<TagMapping>,
+    owner_tag_key: Option<String>,
     sensitive_fields: Vec<SensitiveField>,
     rest_trigger_allowed: bool,
     existing: Option<&CommandType>,
@@ -1729,6 +1843,9 @@ pub fn register_command_type(
     if !valid_tag_mappings(&schema, &tag_mappings) {
         return Err(Error::InvalidTagMapping.into());
     }
+    if !valid_owner_tag_key(&tag_mappings, owner_tag_key.as_deref()) {
+        return Err(Error::InvalidOwnerTagKey.into());
+    }
     if !valid_sensitive_fields(&schema, &sensitive_fields) {
         return Err(Error::InvalidSensitiveField.into());
     }
@@ -1746,6 +1863,7 @@ pub fn register_command_type(
             schema,
             schema_version: 1,
             tag_mappings,
+            owner_tag_key,
             sensitive_fields,
             rest_trigger_allowed,
         }));
@@ -1773,6 +1891,7 @@ pub fn register_command_type(
             existing.schema_version
         },
         tag_mappings,
+        owner_tag_key,
         sensitive_fields,
         rest_trigger_allowed,
     }))
@@ -1862,6 +1981,7 @@ pub fn query_events(
         .filter(|e| event_types.is_empty() || event_types.contains(&e.event_type))
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
         .filter(|e| e.sequence > after)
+        .filter(|e| event_owner_scope_satisfied(e, access_mapping.scope.as_deref()))
         .map(|e| {
             (
                 e.sequence,
@@ -1899,6 +2019,7 @@ pub fn count_events(
         .filter(|e| e.bounded_context == access_mapping.bounded_context)
         .filter(|e| event_types.is_empty() || event_types.contains(&e.event_type))
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
+        .filter(|e| event_owner_scope_satisfied(e, access_mapping.scope.as_deref()))
         .count() as i64)
 }
 
@@ -1932,6 +2053,9 @@ pub fn inspect_event(
     }
     if access_mapping.bounded_context != event.bounded_context {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
+    }
+    if !event_owner_scope_satisfied(event, access_mapping.scope.as_deref()) {
+        return Err(crate::access_control::Error::GrantScopeMismatch.into());
     }
 
     Ok(EventInspected {
@@ -1995,6 +2119,7 @@ pub fn fetch_commands(
                 _ => false,
             })
         })
+        .filter(|c| command_owner_scope_satisfied(c, access_mapping.scope.as_deref()))
         .map(|c| render_command(c, access_mapping, &resolve_data_key))
         .collect())
 }
@@ -2132,6 +2257,7 @@ pub fn deliver_to_subscriptions(
                 e.event_type == event.event_type && matches_filters(event, &e.filters)
             }
         })
+        .filter(|s| event_owner_scope_satisfied(event, s.access_mapping().scope.as_deref()))
         .map(|s| EventDelivered {
             subscription: s.clone(),
             event: event.clone(),
@@ -2247,6 +2373,7 @@ pub fn fetch_events(
         .filter(|e| &e.event_type == read_type)
         .filter(|e| e.sequence > after)
         .filter(|e| matches_filters(e, filters))
+        .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
         .cloned()
         .collect())
 }
@@ -2331,6 +2458,7 @@ pub fn consume_events(
         .filter(|e| &e.event_type == read_type)
         .filter(|e| e.sequence > position)
         .filter(|e| matches_filters(e, filters))
+        .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
         .cloned()
         .collect();
 

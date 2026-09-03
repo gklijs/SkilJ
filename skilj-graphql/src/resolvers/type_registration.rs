@@ -28,7 +28,14 @@ use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use skilj_core::projections::{ProjectionRebuildStatus, ProjectionRegistration};
 
-/// `registerEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [TagMappingInput!]!, sensitiveFields: [SensitiveFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: MissedOccurrencePolicy): EventType!`
+/// `registerEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [TagMappingInput!]!, ownerTagKey: String, sensitiveFields: [SensitiveFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: MissedOccurrencePolicy): EventType!`
+///
+/// `ownerTagKey` (cross-tenant read fix, docs/architecture.md's own
+/// write-up of these passes): names which of `tagMappings`' own keys is
+/// this type's owner dimension - `null`/omitted (every type registered
+/// before this argument existed) means no owner dimension, unaffected by
+/// any grant's `scope` regardless of its value. Validated by
+/// `valid_owner_tag_key` - see `RegisterEventType` in specs/skilj.allium.
 pub fn register_event_type_field() -> Field {
     Field::new("registerEventType", TypeRef::named_nn("EventType"), |ctx| {
         FieldFuture::new(async move {
@@ -39,6 +46,12 @@ pub fn register_event_type_field() -> Field {
             let name = ctx.args.try_get("name")?.string()?.to_string();
             let schema = ctx.args.try_get("schema")?.string()?.to_string();
             let tag_mappings = parse_tag_mappings(&ctx.args.try_get("tagMappings")?)?;
+            let owner_tag_key = ctx
+                .args
+                .get("ownerTagKey")
+                .filter(|v| !v.is_null())
+                .map(|v| v.string().map(str::to_string))
+                .transpose()?;
             let sensitive_fields = parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
             let external_creation_allowed =
                 ctx.args.try_get("externalCreationAllowed")?.boolean()?;
@@ -76,6 +89,7 @@ pub fn register_event_type_field() -> Field {
                 name,
                 schema,
                 tag_mappings,
+                owner_tag_key,
                 sensitive_fields,
                 external_creation_allowed,
                 direct_creation_allowed,
@@ -110,6 +124,10 @@ pub fn register_event_type_field() -> Field {
         TypeRef::named_nn_list_nn("TagMappingInput"),
     ))
     .argument(InputValue::new(
+        "ownerTagKey",
+        TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
         "sensitiveFields",
         TypeRef::named_nn_list_nn("SensitiveFieldInput"),
     ))
@@ -139,7 +157,12 @@ pub fn register_event_type_field() -> Field {
     ))
 }
 
-/// `registerCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [TagMappingInput!]!, sensitiveFields: [SensitiveFieldInput!]!, restTriggerAllowed: Boolean!): CommandType!`
+/// `registerCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [TagMappingInput!]!, ownerTagKey: String, sensitiveFields: [SensitiveFieldInput!]!, restTriggerAllowed: Boolean!): CommandType!`
+///
+/// `ownerTagKey` - see `registerEventType`'s own doc comment on
+/// `ownerTagKey`, identical role for `CommandType`/`FetchCommands`
+/// (cross-tenant read fix, docs/architecture.md's own write-up of these
+/// passes).
 pub fn register_command_type_field() -> Field {
     Field::new(
         "registerCommandType",
@@ -154,6 +177,12 @@ pub fn register_command_type_field() -> Field {
                 let name = ctx.args.try_get("name")?.string()?.to_string();
                 let schema = ctx.args.try_get("schema")?.string()?.to_string();
                 let tag_mappings = parse_tag_mappings(&ctx.args.try_get("tagMappings")?)?;
+                let owner_tag_key = ctx
+                    .args
+                    .get("ownerTagKey")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
                 let sensitive_fields =
                     parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
                 let rest_trigger_allowed = ctx.args.try_get("restTriggerAllowed")?.boolean()?;
@@ -174,6 +203,7 @@ pub fn register_command_type_field() -> Field {
                     name,
                     schema,
                     tag_mappings,
+                    owner_tag_key,
                     sensitive_fields,
                     rest_trigger_allowed,
                     existing.as_ref(),
@@ -201,6 +231,10 @@ pub fn register_command_type_field() -> Field {
     .argument(InputValue::new(
         "tagMappings",
         TypeRef::named_nn_list_nn("TagMappingInput"),
+    ))
+    .argument(InputValue::new(
+        "ownerTagKey",
+        TypeRef::named(TypeRef::STRING),
     ))
     .argument(InputValue::new(
         "sensitiveFields",
