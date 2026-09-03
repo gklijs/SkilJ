@@ -51,7 +51,7 @@ pub fn requires_role(attr: TokenStream, item: TokenStream) -> TokenStream {
     let implements_command_type = item_impl
         .trait_
         .as_ref()
-        .and_then(|(_, path, _)| path.segments.last())
+        .and_then(|(path, _)| path.segments.last())
         .is_some_and(|segment| segment.ident == "CommandType");
     if !implements_command_type {
         return syn::Error::new_spanned(
@@ -171,7 +171,7 @@ pub fn auto_register(attr: TokenStream, item: TokenStream) -> TokenStream {
     let trait_name = item_impl
         .trait_
         .as_ref()
-        .and_then(|(_, path, _)| path.segments.last())
+        .and_then(|(path, _)| path.segments.last())
         .map(|segment| segment.ident.to_string());
 
     let self_ty = &item_impl.self_ty;

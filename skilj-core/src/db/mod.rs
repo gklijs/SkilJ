@@ -316,11 +316,11 @@ async fn provision_bounded_context_schema(
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
 
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&mut **tx)
         .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.event_types (
             name TEXT PRIMARY KEY,
             schema TEXT NOT NULL,
@@ -339,11 +339,11 @@ async fn provision_bounded_context_schema(
             last_fired_at TIMESTAMPTZ,
             event_read_allowed BOOLEAN NOT NULL
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.command_types (
             name TEXT PRIMARY KEY,
             schema TEXT NOT NULL,
@@ -354,7 +354,7 @@ async fn provision_bounded_context_schema(
             private_fields JSONB NOT NULL DEFAULT '[]',
             rest_trigger_allowed BOOLEAN NOT NULL
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
@@ -372,7 +372,7 @@ async fn provision_bounded_context_schema(
     // around permanently (append-only, like everything else here) so a
     // later event for the same subject provisions a genuinely new key
     // rather than colliding with the old row.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.encryption_keys (
             id BIGSERIAL PRIMARY KEY,
             subject_key TEXT NOT NULL,
@@ -383,17 +383,17 @@ async fn provision_bounded_context_schema(
             wrapped_key BYTEA,
             wrap_nonce BYTEA
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE UNIQUE INDEX encryption_keys_unique_active ON {schema}.encryption_keys \
          (subject_key, subject_value) WHERE status = 'active'"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.commands (
             id BIGSERIAL PRIMARY KEY,
             external_id TEXT NOT NULL UNIQUE,
@@ -406,12 +406,12 @@ async fn provision_bounded_context_schema(
             consistency_tags JSONB NOT NULL DEFAULT '[]',
             consistency_boundary BIGINT
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX commands_by_created_at ON {schema}.commands (metadata_created_at)"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     ensure_idempotency_keys_table(&mut **tx, bounded_context).await?;
@@ -420,17 +420,17 @@ async fn provision_bounded_context_schema(
     // here, not JSONB-embedded like `tag_mappings`/`sensitive_fields` -
     // the same distinction `projection_rebuilds`/`consumed_event_types`
     // already draw for the identical reason.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.command_encryption_keys (
             command_id BIGINT NOT NULL REFERENCES {schema}.commands (id),
             encryption_key_id BIGINT NOT NULL REFERENCES {schema}.encryption_keys (id),
             PRIMARY KEY (command_id, encryption_key_id)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.projections (
             name TEXT PRIMARY KEY,
             schema TEXT NOT NULL,
@@ -438,17 +438,17 @@ async fn provision_bounded_context_schema(
             sync BOOLEAN NOT NULL,
             caught_up_to BIGINT
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.projection_consumed_event_types (
             projection_name TEXT NOT NULL REFERENCES {schema}.projections (name),
             event_type_name TEXT NOT NULL REFERENCES {schema}.event_types (name),
             PRIMARY KEY (projection_name, event_type_name)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
@@ -463,7 +463,7 @@ async fn provision_bounded_context_schema(
     // own `status` column and FK-ing against the composite key, so a
     // pending row's own consumed-types set and a building row's own
     // fold-in-progress state never get mixed up when both exist at once.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.projection_rebuilds (
             projection_name TEXT NOT NULL REFERENCES {schema}.projections (name),
             schema TEXT NOT NULL,
@@ -473,11 +473,11 @@ async fn provision_bounded_context_schema(
             status TEXT NOT NULL CHECK (status IN ('pending', 'building')),
             PRIMARY KEY (projection_name, status)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.projection_rebuild_consumed_event_types (
             projection_name TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -486,7 +486,7 @@ async fn provision_bounded_context_schema(
             FOREIGN KEY (projection_name, status)
                 REFERENCES {schema}.projection_rebuilds (projection_name, status)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
@@ -507,7 +507,7 @@ async fn provision_bounded_context_schema(
     // owner-tag value this instance's own folded events carry - see
     // `plugin::Projection::OWNER_TAG_KEY`'s own doc comment. Nullable:
     // most projections declare no owner dimension at all.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.projection_rebuild_state (
             projection_name TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -519,7 +519,7 @@ async fn provision_bounded_context_schema(
             FOREIGN KEY (projection_name, status)
                 REFERENCES {schema}.projection_rebuilds (projection_name, status)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
@@ -541,7 +541,7 @@ async fn provision_bounded_context_schema(
     // `apply_projection_fold_update`'s own doc comment. Read by
     // `get_projection_state`/`projections::query_projection`'s own
     // enforcement.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.projection_state (
             projection_name TEXT NOT NULL REFERENCES {schema}.projections (name),
             key TEXT NOT NULL,
@@ -550,7 +550,7 @@ async fn provision_bounded_context_schema(
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (projection_name, key)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
@@ -559,18 +559,18 @@ async fn provision_bounded_context_schema(
     // "nothing allocated yet", so the first call returns `0` - the same
     // convention `after_sequence.unwrap_or(-1)`/`highest_sequence`'s
     // `None` case use throughout skilj-core.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.sequence (next_value BIGINT NOT NULL)"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.sequence (next_value) VALUES (-1)"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.events (
             sequence BIGINT PRIMARY KEY,
             event_type_name TEXT NOT NULL REFERENCES {schema}.event_types (name),
@@ -587,12 +587,12 @@ async fn provision_bounded_context_schema(
             origin_source_context TEXT,
             origin_command_id BIGINT REFERENCES {schema}.commands (id)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX events_by_type ON {schema}.events (event_type_name, sequence)"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     // docs/architecture.md §19's "Problem 1" fix -
@@ -605,9 +605,9 @@ async fn provision_bounded_context_schema(
     // pre-existing one would need `CREATE INDEX ... USING GIN (tags)`
     // run by hand, see that function's own doc comment for why no
     // backfill migration exists for this yet.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX events_by_tags ON {schema}.events USING GIN (tags)"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     // docs/architecture.md §19's "Problem 2" fix - `Snapshot`'s own
@@ -627,7 +627,7 @@ async fn provision_bounded_context_schema(
     // no folded event has supplied one yet - `catch_up_snapshots`' own
     // fold loop sets/refreshes it. Read by `get_snapshot_state_and_owner`/
     // `snapshot_query::inspect_snapshot_field`'s own enforcement.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.snapshots (
             snapshot_name TEXT NOT NULL,
             tag_key TEXT NOT NULL,
@@ -639,7 +639,7 @@ async fn provision_bounded_context_schema(
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (snapshot_name, tag_key, tag_value)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     // The background catch-up task's own position, one row per
@@ -649,28 +649,28 @@ async fn provision_bounded_context_schema(
     // above can't stand in for this, since a rarely-touched tag value's
     // own row can be correctly stale (nothing has happened for it)
     // without the walk itself being behind.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.snapshot_progress (
             snapshot_name TEXT PRIMARY KEY,
             caught_up_to BIGINT NOT NULL
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
     // See `command_encryption_keys` above - the identical join-table
     // treatment, keyed by `sequence` instead of a synthetic id since
     // `events.sequence` is already `Event`'s own natural primary key.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.event_encryption_keys (
             event_sequence BIGINT NOT NULL REFERENCES {schema}.events (sequence),
             encryption_key_id BIGINT NOT NULL REFERENCES {schema}.encryption_keys (id),
             PRIMARY KEY (event_sequence, encryption_key_id)
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.access_tokens (
             id TEXT PRIMARY KEY,
             kind TEXT NOT NULL CHECK (kind IN ('external_event', 'direct_creation', 'event_read', 'command')),
@@ -693,27 +693,27 @@ async fn provision_bounded_context_schema(
                 OR (kind != 'command' AND event_type_name IS NOT NULL AND command_type_name IS NULL)
             )
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {schema}.read_cursors (
             token_id TEXT PRIMARY KEY REFERENCES {schema}.access_tokens (id),
             ack_mode TEXT NOT NULL CHECK (ack_mode IN ('auto_advance', 'manual_ack')),
             sequence BIGINT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL
         )"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(&private_field_grants_table_ddl(&schema))
+    sqlx::query(sqlx::AssertSqlSafe(private_field_grants_table_ddl(&schema)))
         .execute(&mut **tx)
         .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX private_field_grants_by_grantee ON {schema}.private_field_grants (grantee_role_id, status)"
-    ))
+    )))
     .execute(&mut **tx)
     .await?;
 
@@ -765,12 +765,12 @@ pub async fn ensure_private_field_grants_table(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(&private_field_grants_table_ddl(&schema))
+    sqlx::query(sqlx::AssertSqlSafe(private_field_grants_table_ddl(&schema)))
         .execute(pool)
         .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX IF NOT EXISTS private_field_grants_by_grantee ON {schema}.private_field_grants (grantee_role_id, status)"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -790,9 +790,9 @@ async fn command_internal_id(
     external_id: &str,
 ) -> crate::error::Result<Option<i64>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<(i64,)> = sqlx::query_as(&format!(
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id FROM {schema}.commands WHERE external_id = $1"
-    ))
+    )))
     .bind(external_id)
     .fetch_optional(pool)
     .await?;
@@ -873,10 +873,10 @@ pub async fn insert_private_field_grant(
         ),
         None => None,
     };
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
-    ))
+    )))
     .bind(&grant.id)
     .bind(&grant.grantor.id)
     .bind(&grant.grantee.id)
@@ -906,9 +906,9 @@ pub async fn list_private_field_grants_for_context(
         return Ok(Vec::new());
     };
     let schema = schema_ident(bounded_context);
-    let rows: Vec<PrivateFieldGrantRow> = sqlx::query_as(&format!(
+    let rows: Vec<PrivateFieldGrantRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PRIVATE_FIELD_GRANT_COLUMNS} FROM {schema}.private_field_grants"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     let mut grants = Vec::with_capacity(rows.len());
@@ -930,9 +930,9 @@ pub async fn get_private_field_grant(
         return Ok(None);
     };
     let schema = schema_ident(bounded_context);
-    let row: Option<PrivateFieldGrantRow> = sqlx::query_as(&format!(
+    let row: Option<PrivateFieldGrantRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PRIVATE_FIELD_GRANT_COLUMNS} FROM {schema}.private_field_grants WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -953,9 +953,9 @@ pub async fn update_private_field_grant(
     grant: &PrivateFieldGrant,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(&grant.bounded_context.name);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.private_field_grants SET status = $1, revoked_at = $2 WHERE id = $3"
-    ))
+    )))
     .bind(token_status_to_str(grant.status))
     .bind(grant.revoked_at)
     .bind(&grant.id)
@@ -990,7 +990,7 @@ pub async fn ensure_idempotency_keys_table<'e>(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS {schema}.idempotency_keys (
             command_type_name TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
@@ -998,7 +998,7 @@ pub async fn ensure_idempotency_keys_table<'e>(
             created_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (command_type_name, idempotency_key)
         )"
-    ))
+    )))
     .execute(executor)
     .await?;
     Ok(())
@@ -1023,14 +1023,14 @@ pub async fn ensure_projection_state_owner_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.projection_state ADD COLUMN IF NOT EXISTS owner TEXT"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.projection_rebuild_state ADD COLUMN IF NOT EXISTS owner TEXT"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -1051,24 +1051,24 @@ pub async fn ensure_event_scoping_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS scope TEXT"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.snapshots ADD COLUMN IF NOT EXISTS owner TEXT"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -1084,14 +1084,14 @@ pub async fn ensure_private_field_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())
@@ -1110,7 +1110,7 @@ pub async fn ensure_private_field_columns(
 pub async fn hard_delete_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<()> {
     let schema = schema_ident(name);
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM bounded_contexts WHERE name = $1")
@@ -1153,9 +1153,9 @@ const ROLE_COLUMNS: &str = "id, external_subject, name, superadmin, status, crea
 
 #[tracing::instrument(skip_all)]
 pub async fn insert_role(pool: &Pool, role: &Role) -> crate::error::Result<()> {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO roles ({ROLE_COLUMNS}) VALUES ($1,$2,$3,$4,$5,$6,$7)"
-    ))
+    )))
     .bind(&role.id)
     .bind(&role.external_subject)
     .bind(&role.name)
@@ -1170,11 +1170,12 @@ pub async fn insert_role(pool: &Pool, role: &Role) -> crate::error::Result<()> {
 
 #[tracing::instrument(skip_all)]
 pub async fn get_role(pool: &Pool, id: &str) -> crate::error::Result<Option<Role>> {
-    let row: Option<RoleRow> =
-        sqlx::query_as(&format!("SELECT {ROLE_COLUMNS} FROM roles WHERE id = $1"))
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<RoleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {ROLE_COLUMNS} FROM roles WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(RoleRow::into_domain))
 }
 
@@ -1186,9 +1187,11 @@ pub async fn get_role(pool: &Pool, id: &str) -> crate::error::Result<Option<Role
 /// a `Role` isn't scoped to one.
 #[tracing::instrument(skip_all)]
 pub async fn list_roles(pool: &Pool) -> crate::error::Result<Vec<Role>> {
-    let rows: Vec<RoleRow> = sqlx::query_as(&format!("SELECT {ROLE_COLUMNS} FROM roles"))
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<RoleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {ROLE_COLUMNS} FROM roles"
+    )))
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(RoleRow::into_domain).collect())
 }
 
@@ -1254,9 +1257,9 @@ pub async fn insert_bounded_context(pool: &Pool, bc: &BoundedContext) -> crate::
 
     let mut tx = pool.begin().await?;
     provision_bounded_context_schema(&mut tx, &bc.name).await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO bounded_contexts ({BOUNDED_CONTEXT_COLUMNS}) VALUES ($1,$2,$3,$4,$5,$6)"
-    ))
+    )))
     .bind(&bc.name)
     .bind(bounded_context_status_to_str(bc.status))
     .bind(bc.created_at)
@@ -1327,9 +1330,9 @@ pub async fn get_bounded_context(
     pool: &Pool,
     name: &str,
 ) -> crate::error::Result<Option<BoundedContext>> {
-    let Some(row): Option<BoundedContextRow> = sqlx::query_as(&format!(
+    let Some(row): Option<BoundedContextRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {BOUNDED_CONTEXT_COLUMNS} FROM bounded_contexts WHERE name = $1"
-    ))
+    )))
     .bind(name)
     .fetch_optional(pool)
     .await?
@@ -1377,9 +1380,9 @@ pub async fn get_bounded_context(
 /// plus an in-memory lookup replaces what was one query per row.
 #[tracing::instrument(skip_all)]
 pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<BoundedContext>> {
-    let rows: Vec<BoundedContextRow> = sqlx::query_as(&format!(
+    let rows: Vec<BoundedContextRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {BOUNDED_CONTEXT_COLUMNS} FROM bounded_contexts"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
 
@@ -1548,7 +1551,7 @@ const EVENT_TYPE_COLUMNS: &str =
 #[tracing::instrument(skip_all)]
 pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Result<()> {
     let schema = schema_ident(&et.bounded_context.name);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.event_types ({EVENT_TYPE_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
          ON CONFLICT (name) DO UPDATE SET \
@@ -1564,7 +1567,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
             last_fired_at = EXCLUDED.last_fired_at, \
             event_read_allowed = EXCLUDED.event_read_allowed, \
             private_fields = EXCLUDED.private_fields"
-    ))
+    )))
     .bind(&et.name)
     .bind(&et.schema)
     .bind(et.schema_version)
@@ -1599,9 +1602,9 @@ pub async fn get_event_type(
         return Ok(None);
     };
     let schema = schema_ident(bounded_context);
-    let row: Option<EventTypeRow> = sqlx::query_as(&format!(
+    let row: Option<EventTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = $1"
-    ))
+    )))
     .bind(name)
     .fetch_optional(pool)
     .await?;
@@ -1625,10 +1628,10 @@ pub async fn list_scheduled_event_types(
         return Ok(Vec::new());
     };
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventTypeRow> = sqlx::query_as(&format!(
+    let rows: Vec<EventTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types \
          WHERE system_triggered_allowed = true ORDER BY name"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -1654,9 +1657,9 @@ pub async fn list_event_types_for_bounded_context(
         return Ok(Vec::new());
     };
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventTypeRow> = sqlx::query_as(&format!(
+    let rows: Vec<EventTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types ORDER BY name"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -1677,9 +1680,9 @@ pub async fn list_command_types_for_bounded_context(
         return Ok(Vec::new());
     };
     let schema = schema_ident(bounded_context);
-    let rows: Vec<CommandTypeRow> = sqlx::query_as(&format!(
+    let rows: Vec<CommandTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COMMAND_TYPE_COLUMNS} FROM {schema}.command_types ORDER BY name"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -1745,9 +1748,9 @@ pub async fn fire_system_event(
 
     let schema = schema_ident(bounded_context);
     let mut tx = pool.begin().await?;
-    let row: Option<EventTypeRow> = sqlx::query_as(&format!(
+    let row: Option<EventTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = $1 FOR UPDATE"
-    ))
+    )))
     .bind(event_type_name)
     .fetch_optional(&mut *tx)
     .await?;
@@ -1792,9 +1795,9 @@ pub async fn fire_system_event(
     )
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.event_types SET schedule_position = $1, last_fired_at = $2 WHERE name = $3"
-    ))
+    )))
     .bind(new_position)
     .bind(new_position)
     .bind(event_type_name)
@@ -1832,9 +1835,9 @@ pub async fn skip_missed_occurrences_for_event_type(
     };
     let schema = schema_ident(bounded_context);
     let mut tx = pool.begin().await?;
-    let row: Option<EventTypeRow> = sqlx::query_as(&format!(
+    let row: Option<EventTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = $1 FOR UPDATE"
-    ))
+    )))
     .bind(event_type_name)
     .fetch_optional(&mut *tx)
     .await?;
@@ -1847,9 +1850,9 @@ pub async fn skip_missed_occurrences_for_event_type(
         return Ok(None);
     };
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.event_types SET schedule_position = $1 WHERE name = $2"
-    ))
+    )))
     .bind(new_position)
     .bind(event_type_name)
     .execute(&mut *tx)
@@ -1896,7 +1899,7 @@ const COMMAND_TYPE_COLUMNS: &str = "name, schema, schema_version, tag_mappings, 
 #[tracing::instrument(skip_all)]
 pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error::Result<()> {
     let schema = schema_ident(&ct.bounded_context.name);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.command_types ({COMMAND_TYPE_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
          ON CONFLICT (name) DO UPDATE SET \
@@ -1905,7 +1908,7 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
             sensitive_fields = EXCLUDED.sensitive_fields, \
             rest_trigger_allowed = EXCLUDED.rest_trigger_allowed, \
             private_fields = EXCLUDED.private_fields"
-    ))
+    )))
     .bind(&ct.name)
     .bind(&ct.schema)
     .bind(ct.schema_version)
@@ -1930,9 +1933,9 @@ pub async fn get_command_type(
         return Ok(None);
     };
     let schema = schema_ident(bounded_context);
-    let row: Option<CommandTypeRow> = sqlx::query_as(&format!(
+    let row: Option<CommandTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COMMAND_TYPE_COLUMNS} FROM {schema}.command_types WHERE name = $1"
-    ))
+    )))
     .bind(name)
     .fetch_optional(pool)
     .await?;
@@ -2017,13 +2020,13 @@ pub async fn get_or_create_encryption_key(
 
     let (data_key, wrapped, nonce) = encryption::generate_and_wrap_data_key(master_key);
     let now = Utc::now();
-    let inserted: Option<EncryptionKeyRow> = sqlx::query_as(&format!(
+    let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.encryption_keys \
          (subject_key, subject_value, status, created_at, wrapped_key, wrap_nonce) \
          VALUES ($1, $2, 'active', $3, $4, $5) \
          ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
          RETURNING {ENCRYPTION_KEY_COLUMNS}"
-    ))
+    )))
     .bind(subject_key)
     .bind(subject_value)
     .bind(now)
@@ -2204,10 +2207,10 @@ async fn get_active_encryption_key_row(
     subject_value: &str,
 ) -> crate::error::Result<Option<EncryptionKeyRow>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<EncryptionKeyRow> = sqlx::query_as(&format!(
+    let row: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ENCRYPTION_KEY_COLUMNS} FROM {schema}.encryption_keys \
          WHERE subject_key = $1 AND subject_value = $2 AND status = 'active'"
-    ))
+    )))
     .bind(subject_key)
     .bind(subject_value)
     .fetch_optional(pool)
@@ -2283,10 +2286,10 @@ pub async fn list_active_data_keys_for_subject_value(
     master_key: Option<&EncryptionMasterKey>,
 ) -> crate::error::Result<Vec<DataKey>> {
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EncryptionKeyRow> = sqlx::query_as(&format!(
+    let rows: Vec<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ENCRYPTION_KEY_COLUMNS} FROM {schema}.encryption_keys \
          WHERE subject_value = $1 AND status = 'active'"
-    ))
+    )))
     .bind(subject_value)
     .fetch_all(pool)
     .await?;
@@ -2314,11 +2317,11 @@ pub async fn destroy_encryption_key(
     destroyed_at: DateTime<Utc>,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.encryption_keys SET status = 'destroyed', destroyed_at = $1, \
          wrapped_key = NULL, wrap_nonce = NULL \
          WHERE subject_key = $2 AND subject_value = $3 AND status = 'active'"
-    ))
+    )))
     .bind(destroyed_at)
     .bind(subject_key)
     .bind(subject_value)
@@ -2406,10 +2409,10 @@ pub async fn insert_command(
     encryption_key_ids: &[i64],
 ) -> crate::error::Result<i64> {
     let schema = schema_ident(&command.bounded_context.name);
-    let (id,): (i64,) = sqlx::query_as(&format!(
+    let (id,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id"
-    ))
+    )))
     .bind(&command.id)
     .bind(&command.command_type.name)
     .bind(&command.payload)
@@ -2423,10 +2426,10 @@ pub async fn insert_command(
     .await?;
 
     for encryption_key_id in encryption_key_ids {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.command_encryption_keys (command_id, encryption_key_id) \
              VALUES ($1, $2)"
-        ))
+        )))
         .bind(id)
         .bind(encryption_key_id)
         .execute(&mut **tx)
@@ -2443,9 +2446,9 @@ pub async fn get_command_by_id(
     id: i64,
 ) -> crate::error::Result<Option<Command>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<CommandRow> = sqlx::query_as(&format!(
+    let row: Option<CommandRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COMMAND_COLUMNS} FROM {schema}.commands WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -2467,9 +2470,9 @@ pub async fn get_command_by_external_id(
     external_id: &str,
 ) -> crate::error::Result<Option<Command>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<CommandRow> = sqlx::query_as(&format!(
+    let row: Option<CommandRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COMMAND_COLUMNS} FROM {schema}.commands WHERE external_id = $1"
-    ))
+    )))
     .bind(external_id)
     .fetch_optional(pool)
     .await?;
@@ -2490,10 +2493,11 @@ pub async fn list_commands_for_bounded_context(
     bounded_context: &str,
 ) -> crate::error::Result<Vec<Command>> {
     let schema = schema_ident(bounded_context);
-    let rows: Vec<CommandRow> =
-        sqlx::query_as(&format!("SELECT {COMMAND_COLUMNS} FROM {schema}.commands"))
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<CommandRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {COMMAND_COLUMNS} FROM {schema}.commands"
+    )))
+    .fetch_all(pool)
+    .await?;
 
     let mut commands = Vec::with_capacity(rows.len());
     for row in rows {
@@ -2524,9 +2528,9 @@ async fn consumed_event_types(
     projection_name: &str,
 ) -> crate::error::Result<Vec<EventType>> {
     let schema = schema_ident(bounded_context);
-    let names: Vec<(String,)> = sqlx::query_as(&format!(
+    let names: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name FROM {schema}.{join_table} WHERE projection_name = $1"
-    ))
+    )))
     .bind(projection_name)
     .fetch_all(pool)
     .await?;
@@ -2551,16 +2555,16 @@ async fn replace_consumed_event_types(
     event_types: &[EventType],
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.{join_table} WHERE projection_name = $1"
-    ))
+    )))
     .bind(projection_name)
     .execute(&mut *executor)
     .await?;
     for et in event_types {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.{join_table} (projection_name, event_type_name) VALUES ($1,$2)"
-        ))
+        )))
         .bind(projection_name)
         .bind(&et.name)
         .execute(&mut *executor)
@@ -2595,13 +2599,13 @@ const PROJECTION_COLUMNS: &str = "name, schema, schema_version, sync, caught_up_
 pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::error::Result<()> {
     let schema = schema_ident(&projection.bounded_context.name);
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projections ({PROJECTION_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
             sync = EXCLUDED.sync, caught_up_to = EXCLUDED.caught_up_to"
-    ))
+    )))
     .bind(&projection.name)
     .bind(&projection.schema)
     .bind(projection.schema_version)
@@ -2643,12 +2647,12 @@ async fn get_or_create_projection_state_for_update(
     key: &str,
     default_state_json: &str,
 ) -> crate::error::Result<String> {
-    let (state,): (String,) = sqlx::query_as(&format!(
+    let (state,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
          VALUES ($1, $2, $3, now()) \
          ON CONFLICT (projection_name, key) DO UPDATE SET state = {schema}.projection_state.state \
          RETURNING state"
-    ))
+    )))
     .bind(projection_name)
     .bind(key)
     .bind(default_state_json)
@@ -2671,13 +2675,13 @@ async fn get_or_create_projection_rebuild_state_for_update(
     key: &str,
     default_state_json: &str,
 ) -> crate::error::Result<String> {
-    let (state,): (String,) = sqlx::query_as(&format!(
+    let (state,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projection_rebuild_state (projection_name, status, key, state, \
          updated_at) VALUES ($1, 'building', $2, $3, now()) \
          ON CONFLICT (projection_name, status, key) DO UPDATE SET \
          state = {schema}.projection_rebuild_state.state \
          RETURNING state"
-    ))
+    )))
     .bind(projection_name)
     .bind(key)
     .bind(default_state_json)
@@ -2729,10 +2733,10 @@ async fn apply_projection_fold_update(
     });
     match owner {
         Some(owner) => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.{table} SET state = $1, owner = $2, updated_at = now() \
                  WHERE projection_name = $3 AND key = $4{extra_where}"
-            ))
+            )))
             .bind(new_state)
             .bind(owner)
             .bind(projection_name)
@@ -2741,10 +2745,10 @@ async fn apply_projection_fold_update(
             .await?;
         }
         None => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.{table} SET state = $1, updated_at = now() \
                  WHERE projection_name = $2 AND key = $3{extra_where}"
-            ))
+            )))
             .bind(new_state)
             .bind(projection_name)
             .bind(key)
@@ -2777,7 +2781,7 @@ async fn get_or_create_snapshot_state_for_update(
     version: u64,
     default_state_json: &str,
 ) -> crate::error::Result<(i64, String)> {
-    let (as_of_sequence, state): (i64, String) = sqlx::query_as(&format!(
+    let (as_of_sequence, state): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.snapshots \
             (snapshot_name, tag_key, tag_value, snapshot_version, as_of_sequence, state, updated_at) \
          VALUES ($1, $2, $3, $4, -1, $5::jsonb, now()) \
@@ -2789,7 +2793,7 @@ async fn get_or_create_snapshot_state_for_update(
             state = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
                 THEN {schema}.snapshots.state ELSE $5::jsonb END \
          RETURNING as_of_sequence, state::text"
-    ))
+    )))
     .bind(snapshot_name)
     .bind(tag_key)
     .bind(tag_value)
@@ -2825,15 +2829,16 @@ pub async fn get_snapshot_state(
     tag_value: &str,
 ) -> crate::error::Result<Option<SnapshotStateRow>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<(i64, i64, String, DateTime<Utc>)> = sqlx::query_as(&format!(
+    let row: Option<(i64, i64, String, DateTime<Utc>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT snapshot_version, as_of_sequence, state::text, updated_at FROM {schema}.snapshots \
          WHERE snapshot_name = $1 AND tag_key = $2 AND tag_value = $3"
-    ))
-    .bind(snapshot_name)
-    .bind(tag_key)
-    .bind(tag_value)
-    .fetch_optional(pool)
-    .await?;
+    )))
+        .bind(snapshot_name)
+        .bind(tag_key)
+        .bind(tag_value)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|(version, as_of_sequence, state, updated_at)| {
         (version as u64, as_of_sequence, state, updated_at)
     }))
@@ -2859,10 +2864,10 @@ pub async fn get_snapshot_state_and_owner(
 ) -> crate::error::Result<Option<(SnapshotStateRow, Option<String>)>> {
     type RawSnapshotStateAndOwnerRow = (i64, i64, String, DateTime<Utc>, Option<String>);
     let schema = schema_ident(bounded_context);
-    let row: Option<RawSnapshotStateAndOwnerRow> = sqlx::query_as(&format!(
+    let row: Option<RawSnapshotStateAndOwnerRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT snapshot_version, as_of_sequence, state::text, updated_at, owner \
          FROM {schema}.snapshots WHERE snapshot_name = $1 AND tag_key = $2 AND tag_value = $3"
-    ))
+    )))
     .bind(snapshot_name)
     .bind(tag_key)
     .bind(tag_value)
@@ -2961,9 +2966,9 @@ async fn list_snapshot_progress_for_bounded_context(
     bounded_context: &str,
 ) -> crate::error::Result<std::collections::HashMap<String, i64>> {
     let schema = schema_ident(bounded_context);
-    let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT snapshot_name, caught_up_to FROM {schema}.snapshot_progress"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().collect())
@@ -2981,10 +2986,10 @@ async fn upsert_snapshot_progress(
     snapshot_name: &str,
     caught_up_to: i64,
 ) -> crate::error::Result<()> {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.snapshot_progress (snapshot_name, caught_up_to) VALUES ($1, $2) \
          ON CONFLICT (snapshot_name) DO UPDATE SET caught_up_to = $2"
-    ))
+    )))
     .bind(snapshot_name)
     .bind(caught_up_to)
     .execute(executor)
@@ -3007,9 +3012,9 @@ pub async fn get_projection_state(
     key: &str,
 ) -> crate::error::Result<Option<String>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<(String,)> = sqlx::query_as(&format!(
+    let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT state FROM {schema}.projection_state WHERE projection_name = $1 AND key = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(key)
     .fetch_optional(pool)
@@ -3035,10 +3040,10 @@ pub async fn get_projection_state_and_owner(
     key: &str,
 ) -> crate::error::Result<Option<(String, Option<String>)>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<(String, Option<String>)> = sqlx::query_as(&format!(
+    let row: Option<(String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT state, owner FROM {schema}.projection_state \
          WHERE projection_name = $1 AND key = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(key)
     .fetch_optional(pool)
@@ -3064,10 +3069,10 @@ pub async fn get_projection_rebuild_state(
     let schema = schema_ident(bounded_context);
     // Always the `'building'` row - see `get_or_create_projection_rebuild_state_for_update`'s
     // own doc comment for why no other status is meaningful here.
-    let row: Option<(String,)> = sqlx::query_as(&format!(
+    let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT state FROM {schema}.projection_rebuild_state \
          WHERE projection_name = $1 AND status = 'building' AND key = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(key)
     .fetch_optional(pool)
@@ -3085,9 +3090,9 @@ pub async fn get_projection(
         return Ok(None);
     };
     let schema = schema_ident(bounded_context);
-    let Some(row): Option<ProjectionRow> = sqlx::query_as(&format!(
+    let Some(row): Option<ProjectionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PROJECTION_COLUMNS} FROM {schema}.projections WHERE name = $1"
-    ))
+    )))
     .bind(name)
     .fetch_optional(pool)
     .await?
@@ -3126,9 +3131,9 @@ pub async fn list_projections_for_bounded_context(
         return Ok(Vec::new());
     };
     let schema = schema_ident(bounded_context);
-    let rows: Vec<ProjectionRow> = sqlx::query_as(&format!(
+    let rows: Vec<ProjectionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PROJECTION_COLUMNS} FROM {schema}.projections"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
 
@@ -3195,10 +3200,10 @@ async fn rebuild_consumed_event_types(
     status: ProjectionRebuildStatus,
 ) -> crate::error::Result<Vec<EventType>> {
     let schema = schema_ident(bounded_context);
-    let names: Vec<(String,)> = sqlx::query_as(&format!(
+    let names: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name FROM {schema}.projection_rebuild_consumed_event_types \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(projection_rebuild_status_to_str(status))
     .fetch_all(pool)
@@ -3226,19 +3231,19 @@ async fn replace_rebuild_consumed_event_types(
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     let status = projection_rebuild_status_to_str(status);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(status)
     .execute(pool)
     .await?;
     for et in event_types {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.projection_rebuild_consumed_event_types \
              (projection_name, status, event_type_name) VALUES ($1,$2,$3)"
-        ))
+        )))
         .bind(projection_name)
         .bind(status)
         .bind(&et.name)
@@ -3277,13 +3282,13 @@ pub async fn upsert_projection_rebuild(
     rebuild: &ProjectionRebuild,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(&rebuild.projection.bounded_context.name);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projection_rebuilds ({PROJECTION_REBUILD_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6) \
          ON CONFLICT (projection_name, status) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
             sync = EXCLUDED.sync, caught_up_to = EXCLUDED.caught_up_to"
-    ))
+    )))
     .bind(&rebuild.projection.name)
     .bind(&rebuild.schema)
     .bind(rebuild.schema_version)
@@ -3331,29 +3336,29 @@ pub async fn transition_projection_rebuild_to_building(
     let schema = schema_ident(&rebuild.projection.bounded_context.name);
     let pending = projection_rebuild_status_to_str(ProjectionRebuildStatus::Pending);
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(&rebuild.projection.name)
     .bind(pending)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuilds WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(&rebuild.projection.name)
     .bind(pending)
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projection_rebuilds ({PROJECTION_REBUILD_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6) \
          ON CONFLICT (projection_name, status) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
             sync = EXCLUDED.sync, caught_up_to = EXCLUDED.caught_up_to"
-    ))
+    )))
     .bind(&rebuild.projection.name)
     .bind(&rebuild.schema)
     .bind(rebuild.schema_version)
@@ -3363,19 +3368,19 @@ pub async fn transition_projection_rebuild_to_building(
     .execute(&mut *tx)
     .await?;
     let building = projection_rebuild_status_to_str(rebuild.status);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(&rebuild.projection.name)
     .bind(building)
     .execute(&mut *tx)
     .await?;
     for et in &rebuild.consumed_event_types {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.projection_rebuild_consumed_event_types \
              (projection_name, status, event_type_name) VALUES ($1,$2,$3)"
-        ))
+        )))
         .bind(&rebuild.projection.name)
         .bind(building)
         .bind(&et.name)
@@ -3406,10 +3411,10 @@ pub async fn get_projection_rebuild(
         return Ok(None);
     };
     let schema = schema_ident(bounded_context);
-    let Some(row): Option<ProjectionRebuildRow> = sqlx::query_as(&format!(
+    let Some(row): Option<ProjectionRebuildRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PROJECTION_REBUILD_COLUMNS} FROM {schema}.projection_rebuilds \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(projection_rebuild_status_to_str(status))
     .fetch_optional(pool)
@@ -3452,17 +3457,17 @@ pub async fn delete_projection_rebuild(
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     let status = projection_rebuild_status_to_str(status);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(status)
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuilds WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(status)
     .execute(pool)
@@ -3534,10 +3539,10 @@ pub async fn insert_role_access_mapping(
     pool: &Pool,
     mapping: &RoleAccessMapping,
 ) -> crate::error::Result<()> {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO role_access_mappings ({ROLE_ACCESS_MAPPING_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
-    ))
+    )))
     .bind(&mapping.role.id)
     .bind(&mapping.bounded_context.name)
     .bind(access_level_to_str(mapping.level))
@@ -3564,10 +3569,10 @@ pub async fn get_active_role_access_mapping(
     role_id: &str,
     bounded_context: &str,
 ) -> crate::error::Result<Option<RoleAccessMapping>> {
-    let row: Option<RoleAccessMappingRow> = sqlx::query_as(&format!(
+    let row: Option<RoleAccessMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ROLE_ACCESS_MAPPING_COLUMNS} FROM role_access_mappings \
          WHERE role_id = $1 AND bounded_context = $2 AND status = 'active'"
-    ))
+    )))
     .bind(role_id)
     .bind(bounded_context)
     .fetch_optional(pool)
@@ -3590,9 +3595,9 @@ pub async fn get_active_role_access_mapping(
 pub async fn list_role_access_mappings(
     pool: &Pool,
 ) -> crate::error::Result<Vec<RoleAccessMapping>> {
-    let rows: Vec<RoleAccessMappingRow> = sqlx::query_as(&format!(
+    let rows: Vec<RoleAccessMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ROLE_ACCESS_MAPPING_COLUMNS} FROM role_access_mappings"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     let mut mappings = Vec::with_capacity(rows.len());
@@ -3612,10 +3617,10 @@ pub async fn list_active_role_access_mappings_for_role(
     pool: &Pool,
     role_id: &str,
 ) -> crate::error::Result<Vec<RoleAccessMapping>> {
-    let rows: Vec<RoleAccessMappingRow> = sqlx::query_as(&format!(
+    let rows: Vec<RoleAccessMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ROLE_ACCESS_MAPPING_COLUMNS} FROM role_access_mappings \
          WHERE role_id = $1 AND status = 'active'"
-    ))
+    )))
     .bind(role_id)
     .fetch_all(pool)
     .await?;
@@ -3716,9 +3721,9 @@ pub async fn next_sequence<'e>(
     bounded_context: &str,
 ) -> crate::error::Result<i64> {
     let schema = schema_ident(bounded_context);
-    let (next,): (i64,) = sqlx::query_as(&format!(
+    let (next,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.sequence SET next_value = next_value + 1 RETURNING next_value"
-    ))
+    )))
     .fetch_one(executor)
     .await?;
     Ok(next)
@@ -3736,10 +3741,11 @@ pub async fn latest_sequence(
     bounded_context: &str,
 ) -> crate::error::Result<Option<i64>> {
     let schema = schema_ident(bounded_context);
-    let (max,): (Option<i64>,) =
-        sqlx::query_as(&format!("SELECT MAX(sequence) FROM {schema}.events"))
-            .fetch_one(pool)
-            .await?;
+    let (max,): (Option<i64>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT MAX(sequence) FROM {schema}.events"
+    )))
+    .fetch_one(pool)
+    .await?;
     Ok(max)
 }
 
@@ -3854,11 +3860,11 @@ pub async fn list_events(
         .expect("list_events: event_type row must exist for any event referencing it");
 
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventRow> = sqlx::query_as(&format!(
+    let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
          metadata_created_at, tags, origin_kind, origin_source_content, origin_source_context, \
          origin_command_id FROM {schema}.events WHERE event_type_name = $1 ORDER BY sequence"
-    ))
+    )))
     .bind(event_type_name)
     .fetch_all(pool)
     .await?;
@@ -3904,11 +3910,11 @@ pub async fn list_events_for_bounded_context(
     );
 
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventRowAnyType> = sqlx::query_as(&format!(
+    let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
          metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events ORDER BY sequence"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
 
@@ -3966,12 +3972,12 @@ pub async fn list_events_for_bounded_context_from(
     );
 
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventRowAnyType> = sqlx::query_as(&format!(
+    let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
          metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
          WHERE sequence > $1 ORDER BY sequence"
-    ))
+    )))
     .bind(after_sequence)
     .fetch_all(pool)
     .await?;
@@ -4075,7 +4081,7 @@ pub async fn list_events_for_bounded_context_matching_tags(
          origin_source_context, origin_command_id FROM {schema}.events \
          WHERE {where_clause} ORDER BY sequence"
     );
-    let mut query = sqlx::query_as::<_, EventRowAnyType>(&sql);
+    let mut query = sqlx::query_as::<_, EventRowAnyType>(sqlx::AssertSqlSafe(sql));
     for literal in tag_literals {
         query = query.bind(literal);
     }
@@ -4137,11 +4143,11 @@ pub async fn get_event_by_sequence(
     };
 
     let schema = schema_ident(bounded_context);
-    let Some(row): Option<EventRowAnyType> = sqlx::query_as(&format!(
+    let Some(row): Option<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
          metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events WHERE sequence = $1"
-    ))
+    )))
     .bind(sequence)
     .fetch_optional(pool)
     .await?
@@ -4194,12 +4200,12 @@ pub async fn list_recent_events_for_bounded_context(
     );
 
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventRowAnyType> = sqlx::query_as(&format!(
+    let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
          metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
          ORDER BY sequence DESC LIMIT $1"
-    ))
+    )))
     .bind(limit as i64)
     .fetch_all(pool)
     .await?;
@@ -4264,12 +4270,12 @@ pub async fn list_events_from(
         .expect("list_events_from: event_type row must exist for any event referencing it");
 
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventRow> = sqlx::query_as(&format!(
+    let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
          metadata_created_at, tags, origin_kind, origin_source_content, origin_source_context, \
          origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \
          ORDER BY sequence"
-    ))
+    )))
     .bind(event_type_name)
     .bind(after_sequence)
     .fetch_all(pool)
@@ -4430,12 +4436,12 @@ pub async fn insert_event<'e>(
     };
 
     let schema = schema_ident(&event.bounded_context.name);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.events (sequence, event_type_name, payload, metadata_type, \
          metadata_version, metadata_client_id, metadata_created_at, tags, \
          origin_kind, origin_source_content, origin_source_context, origin_command_id) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"
-    ))
+    )))
     .bind(event.sequence)
     .bind(&event.event_type.name)
     .bind(&event.payload)
@@ -4563,10 +4569,10 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
     // transaction can also link the join rows atomically with the event
     // insert they belong to.
     for encryption_key_id in encryption_key_ids {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.event_encryption_keys (event_sequence, encryption_key_id) \
              VALUES ($1, $2)"
-        ))
+        )))
         .bind(event.sequence)
         .bind(encryption_key_id)
         .execute(&mut **tx)
@@ -4625,9 +4631,9 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
             .await?;
         }
 
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
-        ))
+        )))
         .bind(event.sequence)
         .bind(&projection.name)
         .execute(&mut **tx)
@@ -4932,9 +4938,9 @@ pub async fn submit_command(
         .unwrap_or_else(|| snapshot.as_ref().map(|s| s.as_of_sequence).unwrap_or(-1));
 
     let mut tx = pool.begin().await?;
-    let (locked_highest,): (i64,) = sqlx::query_as(&format!(
+    let (locked_highest,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT next_value FROM {schema}.sequence FOR UPDATE"
-    ))
+    )))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -5216,10 +5222,10 @@ async fn lookup_idempotency_key<'e>(
     command_type_name: &str,
     idempotency_key: &str,
 ) -> crate::error::Result<Option<Vec<i64>>> {
-    let row: Option<(Vec<i64>,)> = sqlx::query_as(&format!(
+    let row: Option<(Vec<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT triggered_event_sequences FROM {schema}.idempotency_keys \
          WHERE command_type_name = $1 AND idempotency_key = $2"
-    ))
+    )))
     .bind(command_type_name)
     .bind(idempotency_key)
     .fetch_optional(executor)
@@ -5244,11 +5250,11 @@ async fn insert_idempotency_key<'e>(
     triggered_event_sequences: &[i64],
     now: DateTime<Utc>,
 ) -> crate::error::Result<()> {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.idempotency_keys \
          (command_type_name, idempotency_key, triggered_event_sequences, created_at) \
          VALUES ($1, $2, $3, $4)"
-    ))
+    )))
     .bind(command_type_name)
     .bind(idempotency_key)
     .bind(triggered_event_sequences)
@@ -5285,20 +5291,20 @@ async fn list_building_projection_rebuilds_for_bounded_context(
 ) -> crate::error::Result<Vec<ProjectionRebuild>> {
     let schema = schema_ident(bounded_context);
 
-    let rebuild_rows: Vec<ProjectionRebuildRow> = sqlx::query_as(&format!(
+    let rebuild_rows: Vec<ProjectionRebuildRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PROJECTION_REBUILD_COLUMNS} FROM {schema}.projection_rebuilds \
          WHERE status = 'building'"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     if rebuild_rows.is_empty() {
         return Ok(Vec::new());
     }
 
-    let consumed_rows: Vec<(String, String)> = sqlx::query_as(&format!(
+    let consumed_rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT projection_name, event_type_name \
          FROM {schema}.projection_rebuild_consumed_event_types WHERE status = 'building'"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     let mut consumed_by_projection: std::collections::HashMap<String, Vec<String>> =
@@ -5411,10 +5417,10 @@ pub async fn catch_up_bounded_context(
 
     for rebuild in &building_rebuilds {
         if rebuild.caught_up_to.is_none() {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {schema}.projection_rebuild_state \
                  WHERE projection_name = $1 AND status = 'building'"
-            ))
+            )))
             .bind(&rebuild.projection.name)
             .execute(pool)
             .await?;
@@ -5494,9 +5500,9 @@ pub async fn catch_up_bounded_context(
                 .await?;
             }
 
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
-            ))
+            )))
             .bind(event.sequence)
             .bind(&projection.name)
             .execute(&mut *tx)
@@ -5559,10 +5565,10 @@ pub async fn catch_up_bounded_context(
             // also stamp the pending row's own `caught_up_to`, which
             // means nothing for a row that is never folded and must stay
             // `None` until it is promoted or discarded.
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.projection_rebuilds SET caught_up_to = $1 \
                  WHERE projection_name = $2 AND status = 'building'"
-            ))
+            )))
             .bind(event.sequence)
             .bind(&rebuild.projection.name)
             .execute(&mut *tx)
@@ -5714,11 +5720,11 @@ pub async fn catch_up_snapshots(
 
             match owner {
                 Some(owner) => {
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE {schema}.snapshots SET snapshot_version = $1, as_of_sequence = $2, \
                          state = $3::jsonb, owner = $4, updated_at = now() \
                          WHERE snapshot_name = $5 AND tag_key = $6 AND tag_value = $7"
-                    ))
+                    )))
                     .bind(version as i64)
                     .bind(event.sequence)
                     .bind(&new_state)
@@ -5730,11 +5736,11 @@ pub async fn catch_up_snapshots(
                     .await?;
                 }
                 None => {
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE {schema}.snapshots SET snapshot_version = $1, as_of_sequence = $2, \
                          state = $3::jsonb, updated_at = now() \
                          WHERE snapshot_name = $4 AND tag_key = $5 AND tag_value = $6"
-                    ))
+                    )))
                     .bind(version as i64)
                     .bind(event.sequence)
                     .bind(&new_state)
@@ -5844,9 +5850,9 @@ pub async fn fold_history_into_new_sync_projection(
             .await?;
         }
 
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
-        ))
+        )))
         .bind(event.sequence)
         .bind(&projection.name)
         .execute(&mut *tx)
@@ -5907,9 +5913,9 @@ pub async fn promote_projection_rebuild(
     // The lock this whole fix hinges on - see this function's own doc
     // comment. A read-only peek, not `next_sequence`'s increment: this
     // never allocates a sequence number of its own.
-    let (locked_highest,): (i64,) = sqlx::query_as(&format!(
+    let (locked_highest,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT next_value FROM {schema}.sequence FOR UPDATE"
-    ))
+    )))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -5922,10 +5928,10 @@ pub async fn promote_projection_rebuild(
     // finished.
     let building = projection_rebuild_status_to_str(ProjectionRebuildStatus::Building);
 
-    let rebuild_row: ProjectionRebuildRow = sqlx::query_as(&format!(
+    let rebuild_row: ProjectionRebuildRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PROJECTION_REBUILD_COLUMNS} FROM {schema}.projection_rebuilds \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(building)
     .fetch_one(&mut *tx)
@@ -5941,10 +5947,10 @@ pub async fn promote_projection_rebuild(
         return Ok(false);
     }
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.projections SET schema = $1, schema_version = $2, sync = $3, \
          caught_up_to = $4 WHERE name = $5"
-    ))
+    )))
     .bind(&rebuild_row.schema)
     .bind(rebuild_row.schema_version)
     .bind(rebuild_row.sync)
@@ -5953,18 +5959,18 @@ pub async fn promote_projection_rebuild(
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_consumed_event_types WHERE projection_name = $1"
-    ))
+    )))
     .bind(projection_name)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projection_consumed_event_types (projection_name, event_type_name) \
          SELECT projection_name, event_type_name \
          FROM {schema}.projection_rebuild_consumed_event_types \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(building)
     .execute(&mut *tx)
@@ -5980,9 +5986,9 @@ pub async fn promote_projection_rebuild(
     // function's own doc comment) has no rebuild-side rows to copy at
     // all - the live set is simply left empty, not clobbered with
     // nothing pretending to be something.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_state WHERE projection_name = $1"
-    ))
+    )))
     .bind(projection_name)
     .execute(&mut *tx)
     .await?;
@@ -5990,34 +5996,34 @@ pub async fn promote_projection_rebuild(
     // ownership it derived while building, exactly as `state` does
     // (cross-tenant projection read fix, docs/architecture.md's own
     // write-up of this pass).
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projection_state (projection_name, key, state, owner, updated_at) \
          SELECT projection_name, key, state, owner, updated_at \
          FROM {schema}.projection_rebuild_state WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(building)
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuild_state WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(building)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuild_consumed_event_types \
          WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(building)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM {schema}.projection_rebuilds WHERE projection_name = $1 AND status = $2"
-    ))
+    )))
     .bind(projection_name)
     .bind(building)
     .execute(&mut *tx)
@@ -6128,10 +6134,10 @@ async fn fetch_access_token_row(
         return Ok(None);
     };
     let schema = schema_ident(&bounded_context);
-    let columns: Option<AccessTokenColumns> = sqlx::query_as(&format!(
+    let columns: Option<AccessTokenColumns> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, kind, secret, status, created_at, revoked_at, event_type_name, \
          command_type_name, scope FROM {schema}.access_tokens WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -6174,9 +6180,9 @@ pub async fn revoke_access_token(
         return Ok(());
     };
     let schema = schema_ident(&bounded_context);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.access_tokens SET status = 'revoked', revoked_at = $1 WHERE id = $2"
-    ))
+    )))
     .bind(revoked_at)
     .bind(id)
     .execute(pool)
@@ -6210,10 +6216,10 @@ async fn insert_access_token_row(
     scope: Option<&str>,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.access_tokens (id, kind, secret, status, created_at, revoked_at, \
          event_type_name, scope) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
-    ))
+    )))
     .bind(id)
     .bind(kind.as_str())
     .bind(crate::shared::hash_secret(secret))
@@ -6296,10 +6302,10 @@ pub async fn insert_event_read_token(
 #[tracing::instrument(skip_all)]
 pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::error::Result<()> {
     let schema = schema_ident(&token.command_type.bounded_context.name);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.access_tokens (id, kind, secret, status, created_at, revoked_at, \
          command_type_name, scope) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
-    ))
+    )))
     .bind(&token.id)
     .bind(AccessTokenKind::Command.as_str())
     .bind(crate::shared::hash_secret(&token.secret))
@@ -6421,9 +6427,9 @@ pub async fn get_read_cursor(
     token: &EventReadToken,
 ) -> crate::error::Result<Option<ReadCursor>> {
     let schema = schema_ident(&token.event_type.bounded_context.name);
-    let row: Option<ReadCursorRow> = sqlx::query_as(&format!(
+    let row: Option<ReadCursorRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT ack_mode, sequence, updated_at FROM {schema}.read_cursors WHERE token_id = $1"
-    ))
+    )))
     .bind(&token.id)
     .fetch_optional(pool)
     .await?;
@@ -6437,13 +6443,13 @@ pub async fn get_read_cursor(
 
 async fn upsert_read_cursor(pool: &Pool, cursor: &ReadCursor) -> crate::error::Result<()> {
     let schema = schema_ident(&cursor.token.event_type.bounded_context.name);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.read_cursors (token_id, ack_mode, sequence, updated_at) \
          VALUES ($1,$2,$3,$4) \
          ON CONFLICT (token_id) DO UPDATE SET \
             ack_mode = EXCLUDED.ack_mode, sequence = EXCLUDED.sequence, \
             updated_at = EXCLUDED.updated_at"
-    ))
+    )))
     .bind(&cursor.token.id)
     .bind(ack_mode_to_str(cursor.ack_mode))
     .bind(cursor.sequence)
@@ -6470,9 +6476,9 @@ pub async fn apply_cursor_update(
             updated_at,
         } => {
             let schema = schema_ident(&token.event_type.bounded_context.name);
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.read_cursors SET sequence = $1, updated_at = $2 WHERE token_id = $3"
-            ))
+            )))
             .bind(sequence)
             .bind(updated_at)
             .bind(&token.id)
@@ -6496,9 +6502,9 @@ pub async fn record_acknowledgement(
     updated_at: DateTime<Utc>,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(&token.event_type.bounded_context.name);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.read_cursors SET sequence = $1, updated_at = $2 WHERE token_id = $3"
-    ))
+    )))
     .bind(sequence)
     .bind(updated_at)
     .bind(&token.id)

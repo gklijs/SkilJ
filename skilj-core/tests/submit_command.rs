@@ -799,10 +799,12 @@ fn ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_th
         let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
 
         let schema = format!("\"bc_{}\"", bc.name);
-        sqlx::query(&format!("DROP TABLE {schema}.idempotency_keys"))
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE {schema}.idempotency_keys"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
 
         // What SkiljBuilder::build()'s own startup loop does, per
         // bounded context, every time.

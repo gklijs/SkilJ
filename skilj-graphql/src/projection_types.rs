@@ -8,14 +8,25 @@
 //! pattern `resolvers::token_revocation`'s `AccessToken` union already
 //! uses.
 //!
-//! Verified against a real `schemars::schema_for!` output (0.8, this
-//! workspace's pinned version): a nested struct field is
-//! `{"$ref": "#/definitions/Name"}`, resolved against the schema's own
-//! *top-level* `"definitions"` map regardless of nesting depth (never a
-//! second, nested `definitions` map); an optional scalar's `type` may
-//! additionally appear as `["T","null"]`, but `required` array absence
-//! is the authoritative nullability signal this module actually uses -
-//! matching `skilj-core::event_store::schema_required`'s own convention,
+//! Verified against a real `schemars::schema_for!` output (1.x, this
+//! workspace's pinned version, JSON Schema 2020-12): a required nested
+//! struct field is `{"$ref": "#/$defs/Name"}`, resolved against the
+//! schema's own *top-level* `"$defs"` map regardless of nesting depth
+//! (never a second, nested `$defs` map); an *optional* `$ref`'d field
+//! (a nested object or enum) instead wraps it as
+//! `{"anyOf": [{"$ref": "#/$defs/Name"}, {"type": "null"}]}`, unwrapped
+//! to the non-null member before the `$ref` handling below ever sees it.
+//!
+//! `schemars` 0.8, this crate's previously pinned version, used
+//! `"#/definitions/Name"` and its top-level `"definitions"` map instead;
+//! both are still checked, since a schema stored under 0.8 stays exactly
+//! as it was written until its owning type is next re-registered.
+//!
+//! An optional *scalar*'s `type` may additionally appear as
+//! `["T","null"]` (unchanged across both `schemars` versions), but
+//! `required` array absence is the authoritative nullability signal this
+//! module actually uses - matching
+//! `skilj-core::event_store::schema_required`'s own convention,
 //! reimplemented here rather than exposed from that module (a `pub`
 //! widening purely to serve a type-generation concern `event_store`
 //! itself has nothing to do with); a list is
@@ -133,7 +144,15 @@ fn object_from_schema_value(
         return None;
     }
     let required = required_fields(schema);
-    let definitions = root.get("definitions").and_then(|v| v.as_object());
+    // `schemars` 1.x emits JSON Schema 2020-12, whose named-shapes map is
+    // `$defs` - `definitions` was the draft-07 (schemars 0.8) name for the
+    // same thing. Both are checked so a schema stored before a `schemars`
+    // upgrade (still shaped the old way in the database until its owning
+    // type is next re-registered) keeps resolving too.
+    let definitions = root
+        .get("$defs")
+        .or_else(|| root.get("definitions"))
+        .and_then(|v| v.as_object());
 
     let mut object = Object::new(type_name.to_string());
     for (field_name, field_schema) in properties {
@@ -302,6 +321,24 @@ fn build_field(
 ) -> Field {
     let gql_name = snake_to_camel(field_name);
     let json_key = field_name.to_string();
+
+    // `schemars` 1.x wraps an *optional* `$ref`'d shape (a nested object
+    // or enum, unlike a plain optional scalar - see the module doc
+    // comment) in `{"anyOf": [{"$ref": "..."}, {"type": "null"}]}` rather
+    // than embedding `$ref` directly the way a required one still does.
+    // Unwrap to the non-null member so the `$ref` handling right below
+    // never needs to know the difference - nullability itself is already
+    // established via the `nullable` parameter (the `required` array),
+    // never read back out of this shape.
+    let field_schema = field_schema
+        .get("anyOf")
+        .and_then(|v| v.as_array())
+        .and_then(|variants| {
+            variants
+                .iter()
+                .find(|v| v.get("type").and_then(|t| t.as_str()) != Some("null"))
+        })
+        .unwrap_or(field_schema);
 
     // One level of a named nested shape (object or enum) - only ever
     // resolved starting from the top level (depth == 0); see the module
@@ -518,6 +555,70 @@ mod tests {
                         "label": null,
                         "tags": ["a", "b"],
                         "address": { "country": "NL", "zip": null }
+                    }
+                })
+            );
+        });
+    }
+
+    /// A real `schemars::schema_for!` output (1.x, this crate's currently
+    /// pinned version, JSON Schema 2020-12) for the same shape
+    /// `ACCOUNT_BALANCE_SCHEMA` above captures under 0.8 - captured
+    /// directly from running `schemars::schema_for!`, not hand-written -
+    /// plus one *optional* nested struct field, to exercise the `anyOf`
+    /// wrapping 1.x uses for those (see this module's own doc comment):
+    /// `$defs` rather than `definitions`, and `address_or_none`'s
+    /// `{"anyOf": [{"$ref": ...}, {"type": "null"}]}` rather than a bare
+    /// `$ref`.
+    const ACCOUNT_BALANCE_SCHEMA_V1: &str = r##"{
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "AccountBalanceState",
+        "type": "object",
+        "required": ["address", "tags", "total"],
+        "properties": {
+            "address": { "$ref": "#/$defs/Address" },
+            "address_or_none": {
+                "anyOf": [{ "$ref": "#/$defs/Address" }, { "type": "null" }]
+            },
+            "label": { "type": ["string", "null"] },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "total": { "type": "integer", "format": "int64" }
+        },
+        "$defs": {
+            "Address": {
+                "type": "object",
+                "required": ["country"],
+                "properties": {
+                    "country": { "type": "string" },
+                    "zip": { "type": ["string", "null"] }
+                }
+            }
+        }
+    }"##;
+
+    #[test]
+    fn schemars_1x_defs_and_anyof_wrapped_optional_refs_both_resolve() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let data = execute_against(
+                "Banking_AccountBalance",
+                ACCOUNT_BALANCE_SCHEMA_V1,
+                r#"{"total":25,"label":null,"tags":["a","b"],
+                    "address":{"country":"NL","zip":null},
+                    "address_or_none":{"country":"BE","zip":"1000"}}"#,
+                "{ value { total label tags \
+                   address { country zip } \
+                   addressOrNone { country zip } } }",
+            )
+            .await;
+            assert_eq!(
+                data,
+                async_graphql::value!({
+                    "value": {
+                        "total": 25,
+                        "label": null,
+                        "tags": ["a", "b"],
+                        "address": { "country": "NL", "zip": null },
+                        "addressOrNone": { "country": "BE", "zip": "1000" }
                     }
                 })
             );

@@ -168,11 +168,11 @@ fn a_tampered_stored_snapshot_changes_the_decision_proving_it_is_actually_read()
         // changed" cold start. No committed event actually changed the
         // real balance; only the row's own claimed state did.
         let schema = format!("\"bc_{BOUNDED_CONTEXT}\"");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.snapshots SET state = $1::jsonb \
              WHERE snapshot_name = 'AccountBalanceSnapshot' AND tag_key = 'account' \
              AND tag_value = $2"
-        ))
+        )))
         .bind(serde_json::json!({ "balance": 1_000_000 }).to_string())
         .bind(&account)
         .execute(&pool)
