@@ -590,6 +590,16 @@ async fn get_events(
         .map(|e| e.sequence.to_string())
         .or_else(|| query.after.map(|a| a.to_string()));
 
+    // `redact_private_fields` - unconditional, no `Role`/`access_mapping`
+    // to condition it on (see that function's own doc comment, and
+    // `EventFetch`'s `PrivateFieldsStayRedacted` guarantee): a private
+    // field is stored in plaintext, so this REST track - which has no
+    // path to decrypt a *sensitive* field either - must actively redact
+    // one rather than rely on it already being ciphertext at rest.
+    let matched: Vec<_> = matched
+        .iter()
+        .map(event_store::redact_private_fields)
+        .collect();
     Ok(Json(EventsResponse {
         events: matched.iter().map(EventDto::from).collect(),
         next_cursor,
@@ -637,8 +647,14 @@ async fn get_events_consume(
     )?;
     db::apply_cursor_update(&state.pool, &token, &result.cursor_update).await?;
 
+    // See `get_events`' own identical comment above.
+    let served: Vec<_> = result
+        .served
+        .iter()
+        .map(event_store::redact_private_fields)
+        .collect();
     Ok(Json(ConsumeResponse {
-        events: result.served.iter().map(EventDto::from).collect(),
+        events: served.iter().map(EventDto::from).collect(),
         event_type_name: token.event_type.name.clone(),
         event_type_schema: token.event_type.schema.clone(),
         event_type_schema_version: token.event_type.schema_version,

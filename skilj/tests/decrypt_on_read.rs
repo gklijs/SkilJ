@@ -382,6 +382,7 @@ fn decrypt_on_read_end_to_end() {
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();
@@ -568,6 +569,7 @@ fn queries_succeed_with_no_master_key_configured_when_nothing_needs_decrypting()
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();

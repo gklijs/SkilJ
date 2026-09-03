@@ -105,6 +105,13 @@ impl SnapshotDispatcher for NoopSnapshotDispatcher {
     fn tag_key(&self, _bounded_context: &str, _snapshot_name: &str) -> Option<&'static str> {
         None
     }
+    fn owner_tag_key(
+        &self,
+        _bounded_context: &str,
+        _snapshot_name: &str,
+    ) -> Option<Option<&'static str>> {
+        None
+    }
     fn version(&self, _bounded_context: &str, _snapshot_name: &str) -> Option<u64> {
         None
     }

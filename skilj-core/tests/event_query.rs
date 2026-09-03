@@ -65,6 +65,7 @@ fn event_type(name: &str) -> EventType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,
@@ -111,7 +112,7 @@ fn render_event_passes_the_payload_through_unchanged_when_no_fields_are_sensitiv
     let e = event(event_type("OrderPlaced"), 0, r#"{"amount":10}"#, Vec::new());
 
     assert_eq!(
-        event_store::render_event(&e, &mapping, &|_, _| unreachable!()),
+        event_store::render_event(&e, &mapping, &|_, _| unreachable!(), &[]),
         r#"{"amount":10}"#
     );
 }
@@ -130,9 +131,16 @@ fn query_events_returns_only_matching_later_events_rendered() {
         event(et.clone(), 2, r#"{"amount":20}"#, Vec::new()),
     ];
 
-    let rendered =
-        event_store::query_events(&mapping, &[], None, Some(0), &events, |_, _| unreachable!())
-            .unwrap();
+    let rendered = event_store::query_events(
+        &mapping,
+        &[],
+        None,
+        Some(0),
+        &events,
+        |_, _| unreachable!(),
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(
         rendered,
@@ -149,9 +157,16 @@ fn query_events_with_no_after_sequence_starts_from_the_beginning() {
     let et = event_type("OrderPlaced");
     let events = vec![event(et, 0, "first", Vec::new())];
 
-    let rendered =
-        event_store::query_events(&mapping, &[], None, None, &events, |_, _| unreachable!())
-            .unwrap();
+    let rendered = event_store::query_events(
+        &mapping,
+        &[],
+        None,
+        None,
+        &events,
+        |_, _| unreachable!(),
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(rendered, vec![(0, "first".to_string())]);
 }
@@ -166,9 +181,16 @@ fn query_events_with_empty_event_types_matches_every_type() {
         event(event_type("OrderCancelled"), 1, "b", Vec::new()),
     ];
 
-    let rendered =
-        event_store::query_events(&mapping, &[], None, None, &events, |_, _| unreachable!())
-            .unwrap();
+    let rendered = event_store::query_events(
+        &mapping,
+        &[],
+        None,
+        None,
+        &events,
+        |_, _| unreachable!(),
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(rendered.len(), 2);
 }
@@ -190,6 +212,7 @@ fn query_events_filters_by_named_event_type() {
         None,
         &events,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -214,6 +237,7 @@ fn query_events_filters_by_any_matching_tag() {
         None,
         &events,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -241,6 +265,7 @@ fn query_events_never_returns_events_from_another_bounded_context() {
         None,
         &[foreign_event],
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -252,7 +277,7 @@ fn query_events_never_returns_events_from_another_bounded_context() {
 fn query_events_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Admin);
 
-    let err = event_store::query_events(&mapping, &[], None, None, &[], |_, _| unreachable!())
+    let err = event_store::query_events(&mapping, &[], None, None, &[], |_, _| unreachable!(), &[])
         .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
@@ -263,7 +288,7 @@ fn query_events_rejects_a_revoked_mapping() {
 fn query_events_rejects_a_write_level_mapping() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write);
 
-    let err = event_store::query_events(&mapping, &[], None, None, &[], |_, _| unreachable!())
+    let err = event_store::query_events(&mapping, &[], None, None, &[], |_, _| unreachable!(), &[])
         .unwrap_err();
 
     assert_eq!(
@@ -292,6 +317,7 @@ fn query_events_rejects_a_named_event_type_from_another_bounded_context() {
         None,
         &[],
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap_err();
 
@@ -405,7 +431,7 @@ fn inspect_event_succeeds_and_delivers_the_event_alongside_its_rendered_payload(
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
     let e = event(event_type("OrderPlaced"), 5, r#"{"amount":10}"#, Vec::new());
 
-    let inspected = event_store::inspect_event(&mapping, &e, |_, _| unreachable!()).unwrap();
+    let inspected = event_store::inspect_event(&mapping, &e, |_, _| unreachable!(), &[]).unwrap();
 
     assert_eq!(inspected.event, e);
     assert_eq!(inspected.rendered_payload, r#"{"amount":10}"#);
@@ -417,7 +443,7 @@ fn inspect_event_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Admin);
     let e = event(event_type("OrderPlaced"), 0, "{}", Vec::new());
 
-    let err = event_store::inspect_event(&mapping, &e, |_, _| unreachable!()).unwrap_err();
+    let err = event_store::inspect_event(&mapping, &e, |_, _| unreachable!(), &[]).unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -428,7 +454,7 @@ fn inspect_event_rejects_a_write_level_mapping() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write);
     let e = event(event_type("OrderPlaced"), 0, "{}", Vec::new());
 
-    let err = event_store::inspect_event(&mapping, &e, |_, _| unreachable!()).unwrap_err();
+    let err = event_store::inspect_event(&mapping, &e, |_, _| unreachable!(), &[]).unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -449,7 +475,7 @@ fn inspect_event_rejects_an_event_from_another_bounded_context() {
         ..event(event_type("InvoiceIssued"), 0, "{}", Vec::new())
     };
 
-    let err = event_store::inspect_event(&mapping, &e, |_, _| unreachable!()).unwrap_err();
+    let err = event_store::inspect_event(&mapping, &e, |_, _| unreachable!(), &[]).unwrap_err();
 
     assert_eq!(
         err.code(),

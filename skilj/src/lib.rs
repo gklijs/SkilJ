@@ -389,6 +389,20 @@ impl skilj_core::plugin::SnapshotDispatcher for SnapshotDispatcherImpl {
         Some(registered.tag_key)
     }
 
+    fn owner_tag_key(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+    ) -> Option<Option<&'static str>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        let registered = self
+            .snapshots
+            .get(&(bounded_context, snapshot_name.to_string()))?;
+        Some(registered.owner_tag_key)
+    }
+
     fn version(&self, bounded_context: &str, snapshot_name: &str) -> Option<u64> {
         let bounded_context = self
             .template_cache
@@ -610,6 +624,7 @@ struct RegisteredEventType {
     tag_mappings: Vec<skilj_core::shared::TagMapping>,
     owner_tag_key: Option<String>,
     sensitive_fields: Vec<skilj_core::shared::SensitiveField>,
+    private_fields: Vec<skilj_core::shared::PrivateField>,
     external_creation_allowed: bool,
     direct_creation_allowed: bool,
     event_read_allowed: bool,
@@ -632,6 +647,7 @@ fn registered_event_type<T: EventType + 'static>() -> RegisteredEventType {
         tag_mappings: T::tag_mappings(),
         owner_tag_key: T::owner_tag_key().map(str::to_string),
         sensitive_fields: T::sensitive_fields(),
+        private_fields: T::private_fields(),
         external_creation_allowed: T::external_creation_allowed(),
         direct_creation_allowed: T::direct_creation_allowed(),
         event_read_allowed: T::event_read_allowed(),
@@ -672,6 +688,7 @@ struct RegisteredCommandType {
     tag_mappings: Vec<skilj_core::shared::TagMapping>,
     owner_tag_key: Option<String>,
     sensitive_fields: Vec<skilj_core::shared::SensitiveField>,
+    private_fields: Vec<skilj_core::shared::PrivateField>,
     rest_trigger_allowed: bool,
     /// `CommandType::required_role()`'s value, carried straight through
     /// unchanged - not persisted anywhere (see that method's own doc
@@ -706,6 +723,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
         tag_mappings: T::tag_mappings(),
         owner_tag_key: T::owner_tag_key().map(str::to_string),
         sensitive_fields: T::sensitive_fields(),
+        private_fields: T::private_fields(),
         rest_trigger_allowed: T::rest_trigger_allowed(),
         required_role: T::required_role(),
         snapshot_name: T::snapshot(),
@@ -872,6 +890,7 @@ type SnapshotFoldFn = Box<dyn Fn(&str, &Event) -> skilj_core::error::Result<Stri
 struct RegisteredSnapshot {
     name: &'static str,
     tag_key: &'static str,
+    owner_tag_key: Option<&'static str>,
     version: u64,
     default_state_json: String,
     fold: SnapshotFoldFn,
@@ -883,6 +902,7 @@ fn registered_snapshot<T: Snapshot + 'static>() -> RegisteredSnapshot {
     RegisteredSnapshot {
         name: T::NAME,
         tag_key: T::TAG_KEY,
+        owner_tag_key: T::OWNER_TAG_KEY,
         version: T::VERSION,
         default_state_json,
         fold: Box::new(|state_json, event| {
@@ -1315,6 +1335,16 @@ impl SkiljBuilder {
                     // `access_tokens.scope` - see
                     // `ensure_event_scoping_columns`'s own doc comment.
                     skilj_core::db::ensure_event_scoping_columns(pool, &bc.name).await?;
+                    // Private-field mechanism (docs/architecture.md's own
+                    // write-up of this pass) - `event_types.private_fields`/
+                    // `command_types.private_fields` columns, and the new
+                    // `private_field_grants` table - same "patched into
+                    // every bounded context, every startup" treatment. See
+                    // `ensure_private_field_columns`/
+                    // `ensure_private_field_grants_table`'s own doc
+                    // comments.
+                    skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
+                    skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
                     Ok::<(), skilj_core::Error>(())
                 }
             })
@@ -2049,6 +2079,7 @@ async fn reconcile_event_types(
             registered.tag_mappings.clone(),
             registered.owner_tag_key.clone(),
             registered.sensitive_fields.clone(),
+            registered.private_fields.clone(),
             registered.external_creation_allowed,
             registered.direct_creation_allowed,
             registered.system_triggered_allowed,
@@ -2088,6 +2119,7 @@ async fn reconcile_command_types(
             registered.tag_mappings.clone(),
             registered.owner_tag_key.clone(),
             registered.sensitive_fields.clone(),
+            registered.private_fields.clone(),
             registered.rest_trigger_allowed,
             existing.as_ref(),
         )?;

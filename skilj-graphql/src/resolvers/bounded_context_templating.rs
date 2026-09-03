@@ -88,6 +88,7 @@ async fn apply_template_registrations(
             source.tag_mappings.clone(),
             source.owner_tag_key.clone(),
             source.sensitive_fields.clone(),
+            source.private_fields.clone(),
             source.external_creation_allowed,
             source.direct_creation_allowed,
             source.system_triggered_allowed,
@@ -123,6 +124,7 @@ async fn apply_template_registrations(
             source.tag_mappings.clone(),
             source.owner_tag_key.clone(),
             source.sensitive_fields.clone(),
+            source.private_fields.clone(),
             source.rest_trigger_allowed,
             existing.as_ref(),
         )
@@ -227,6 +229,7 @@ async fn finish_creating_tenant(
     role: &Role,
     level: AccessLevel,
     can_read_sensitive: bool,
+    scope: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> async_graphql::Result<crate::gql_types::BoundedContextWithMappings> {
     skilj_core::db::set_dispatch_template(&state.pool, &tenant.name, template_name)
@@ -236,18 +239,21 @@ async fn finish_creating_tenant(
     let existing_mappings = skilj_core::db::list_role_access_mappings(&state.pool)
         .await
         .map_err(to_graphql_error)?;
-    // `CreateBoundedContextFromTemplate` (specs/skilj.allium) takes no
-    // `scope` argument of its own - a templated tenant's grant is always
-    // created unrestricted, matching this call's own behaviour before
-    // `scope` existed. See `RoleAccessMapping.scope`'s own doc comment
-    // for what a non-null value would mean.
+    // `CreateBoundedContextFromTemplate` (specs/skilj.allium) carries its
+    // own optional `scope` through unvalidated, the same treatment
+    // `GrantRoleAccessMapping`'s does - lets a templated tenant's own
+    // initial grant be created already-scoped, in this one call, rather
+    // than needing a revoke-then-re-grant follow-up (`UniqueActiveGrantPerRoleAndContext`
+    // blocks a second active grant for the same pair, so a plain
+    // `GrantRoleAccessMapping` call afterward couldn't rescope this same
+    // grant anyway). See `RoleAccessMapping.scope`'s own doc comment.
     let mapping = skilj_core::access_control::grant_role_access_mapping(
         caller,
         role,
         tenant,
         level,
         can_read_sensitive,
-        None,
+        scope,
         &existing_mappings,
         now,
     )
@@ -276,7 +282,14 @@ async fn finish_creating_tenant(
         })
 }
 
-/// `createBoundedContextFromTemplate(template: String!, name: String!, roleId: ID!, level: AccessLevel!, canReadSensitive: Boolean!): BoundedContext!`
+/// `createBoundedContextFromTemplate(template: String!, name: String!, roleId: ID!, level: AccessLevel!, canReadSensitive: Boolean!, scope: String): BoundedContext!`
+///
+/// `scope` (cross-tenant read fix, docs/architecture.md's own write-up
+/// of these passes): lets the tenant's own initial grant be created
+/// already-scoped, in this one call - see `finish_creating_tenant`'s own
+/// doc comment for why that matters (`UniqueActiveGrantPerRoleAndContext`
+/// means a follow-up `grantRoleAccessMapping` couldn't rescope this same
+/// grant afterward).
 pub fn create_bounded_context_from_template_field() -> Field {
     Field::new(
         "createBoundedContextFromTemplate",
@@ -294,6 +307,12 @@ pub fn create_bounded_context_from_template_field() -> Field {
                     _ => AccessLevel::Admin,
                 };
                 let can_read_sensitive = ctx.args.try_get("canReadSensitive")?.boolean()?;
+                let scope = ctx
+                    .args
+                    .get("scope")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
                 let now = chrono::Utc::now();
 
                 let template = skilj_core::db::get_bounded_context(&state.pool, &template_name)
@@ -348,6 +367,7 @@ pub fn create_bounded_context_from_template_field() -> Field {
                     &role,
                     level,
                     can_read_sensitive,
+                    scope,
                     now,
                 )
                 .await;
@@ -400,6 +420,7 @@ pub fn create_bounded_context_from_template_field() -> Field {
         "canReadSensitive",
         TypeRef::named_nn(TypeRef::BOOLEAN),
     ))
+    .argument(InputValue::new("scope", TypeRef::named(TypeRef::STRING)))
 }
 
 /// `resyncBoundedContextFromTemplate(boundedContext: String!): BoundedContext!`

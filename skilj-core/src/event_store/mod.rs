@@ -15,12 +15,13 @@
 
 use crate::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
-    RoleAccessMapping, RoleStatus, TokenStatus,
+    PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use crate::encryption::DataKey;
 use crate::error::SkiljRejection;
 use crate::shared::{
-    CommandDecision, Filter, FilterOperator, Metadata, SensitiveField, Tag, TagMapping,
+    CommandDecision, Filter, FilterOperator, Metadata, PrivateField, PrivateFieldKind,
+    SensitiveField, Tag, TagMapping,
 };
 
 // The in-memory per-bounded-context event cache the spec describes
@@ -164,6 +165,16 @@ pub struct EventType {
     /// passes).
     pub owner_tag_key: Option<String>,
     pub sensitive_fields: Vec<SensitiveField>,
+    /// See `value PrivateField`'s own doc comment - a plain read-time
+    /// redaction rule standing beside `sensitive_fields`, not inside it.
+    /// Unlike `sensitive_fields`, this is not a fact about how an event
+    /// was stored (a private field is always stored in plaintext), so
+    /// changing this declaration changes what every reader sees of this
+    /// type's whole history immediately, not merely of events created
+    /// next - the same live-declaration treatment `owner_tag_key` already
+    /// gets, and for the same reason. Validated at registration by
+    /// `valid_private_fields`.
+    pub private_fields: Vec<PrivateField>,
     pub external_creation_allowed: bool,
     pub direct_creation_allowed: bool,
     /// See `EventOrigin::SystemTriggered`'s registration opt-in, and
@@ -212,6 +223,9 @@ pub struct CommandType {
     /// read fix (docs/architecture.md's own write-up of these passes).
     pub owner_tag_key: Option<String>,
     pub sensitive_fields: Vec<SensitiveField>,
+    /// See `EventType.private_fields`'s own doc comment - identical role,
+    /// for `Command.payload` instead of `Event.payload`.
+    pub private_fields: Vec<PrivateField>,
     pub rest_trigger_allowed: bool,
 }
 
@@ -458,6 +472,26 @@ pub enum Error {
     #[error("this sensitive field names a field the schema doesn't declare")]
     InvalidSensitiveField,
 
+    /// `valid_private_fields`'s own rejection - either `field`/
+    /// `addressee_field` names something the schema doesn't declare, or
+    /// the `team`/`addressee_field` presence doesn't match `kind` (see
+    /// that function's own doc comment for the full contract).
+    #[error(
+        "this private field names a field the schema doesn't declare, or its team/addressee_field \
+         presence doesn't match its kind"
+    )]
+    InvalidPrivateField,
+
+    /// The identical leak this variant's `tag_mappings` sibling
+    /// (`SensitiveFieldTagOverlap`) already guards against, one register
+    /// over: a tag is visible to every reader with no per-field
+    /// redaction at all, so a field that is also `tag_mappings`-derived
+    /// or `sensitive_fields`-encrypted cannot also be `private_fields` -
+    /// its plaintext value would leak through the tag/ciphertext
+    /// unredacted regardless of what `private_fields` says.
+    #[error("a private field may not also be a tag mapping or a sensitive field")]
+    PrivateFieldOverlap,
+
     #[error("a re-registration may not drop a tag mapping key already in use")]
     TagMappingKeyDropped,
 
@@ -549,6 +583,8 @@ impl SkiljRejection for Error {
             Error::InvalidOwnerTagKey => "invalid_owner_tag_key",
             Error::SensitiveFieldTagOverlap => "sensitive_field_tag_overlap",
             Error::InvalidSensitiveField => "invalid_sensitive_field",
+            Error::InvalidPrivateField => "invalid_private_field",
+            Error::PrivateFieldOverlap => "private_field_overlap",
             Error::TagMappingKeyDropped => "tag_mapping_key_dropped",
             Error::EventTypeNotInBoundedContext => "event_type_not_in_bounded_context",
             Error::CommandTypeNotInBoundedContext => "command_type_not_in_bounded_context",
@@ -958,6 +994,43 @@ pub fn valid_sensitive_fields(schema: &str, sensitive_fields: &[SensitiveField])
     })
 }
 
+/// Black box (see the note above rule `RegisterEventType`) - the
+/// private-field mechanism's own registration-time check, in the same
+/// register as `valid_tag_mappings`/`valid_sensitive_fields`: `field` (and,
+/// for an `addressed`-kind entry, `addressee_field`) must be a real schema
+/// leaf. Unlike `valid_sensitive_fields`, no `json_type: "string"`
+/// restriction on `field` itself - a private field is redacted to `null`
+/// at read time, not encrypted, so any scalar leaf works. The
+/// kind-specific presence rule is `value PrivateField`'s own contract,
+/// checked here rather than by the type system alone: `team` set and
+/// `addressee_field` absent iff `kind = Team`; `addressee_field` set (and
+/// itself a real schema leaf) and `team` absent iff `kind = Addressed`;
+/// both absent iff `kind = Own`.
+pub fn valid_private_fields(schema: &str, private_fields: &[PrivateField]) -> bool {
+    if private_fields.is_empty() {
+        return true;
+    }
+    let Some(properties) = schema_properties(schema) else {
+        return false;
+    };
+    let definitions = schema_definitions(schema);
+    private_fields.iter().all(|p| {
+        if resolve_field_kind(&properties, definitions.as_ref(), &p.field).is_none() {
+            return false;
+        }
+        match p.kind {
+            PrivateFieldKind::Own => p.team.is_none() && p.addressee_field.is_none(),
+            PrivateFieldKind::Team => p.team.is_some() && p.addressee_field.is_none(),
+            PrivateFieldKind::Addressed => {
+                p.team.is_none()
+                    && p.addressee_field.as_deref().is_some_and(|af| {
+                        resolve_field_kind(&properties, definitions.as_ref(), af).is_some()
+                    })
+            }
+        }
+    })
+}
+
 /// Black box (see the note above `entity CommandType`'s "Payload schema
 /// shape"): does `payload`, read as JSON, validate against the JSON
 /// Schema string `schema`. Checked wherever a caller-supplied payload
@@ -1284,28 +1357,55 @@ pub fn matches_filters(event: &Event, filters: &[Filter]) -> bool {
     filters.iter().all(|f| matches_one_filter(&payload, f))
 }
 
+/// Cross-tenant read/write fix (docs/architecture.md's own write-up of
+/// these passes) - the shared core `event_owner_scope_satisfied`/
+/// `command_owner_scope_satisfied` below each delegate to, and the one
+/// the write-side `authorise_command_submission`/`authorise_command_trigger`/
+/// `create_external_event`/`create_direct_event` call directly, since
+/// none of those have an `Event`/`Command` yet to read `.tags`/
+/// `.event_type.owner_tag_key` off of at the point they need this check -
+/// the record does not exist until after it passes. Takes the derived
+/// `tags` and the type's own `owner_tag_key` as plain values instead, so
+/// every caller - already-materialized or not-yet-created alike - feeds
+/// it identically.
+///
+/// Holds - the record is visible/included, or in the write-side case,
+/// permitted to be created - when `scope` is `None` (unrestricted, every
+/// caller's behaviour before `scope` existed), or `owner_tag_key` is
+/// `None` (this type declares no owner dimension, so no `scope` value
+/// ever restricts it), or `tags` carries a tag whose key equals
+/// `owner_tag_key` and whose value equals `scope`. Does not hold - fails
+/// closed, the "affirmatively provable, not merely un-contradicted"
+/// stance every caller of this shares - when `scope` is `Some`, the type
+/// does declare `owner_tag_key`, and no tag carries that key with a
+/// matching value (including no such tag at all, or one with a null
+/// value - the "mapped field was absent" case, see `Tag.value` in the
+/// spec).
+pub fn tag_owner_scope_satisfied(
+    tags: &[Tag],
+    owner_tag_key: Option<&str>,
+    scope: Option<&str>,
+) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let Some(owner_tag_key) = owner_tag_key else {
+        return true;
+    };
+    tags.iter()
+        .any(|tag| tag.key == owner_tag_key && tag.value.as_deref() == Some(scope))
+}
+
 /// Cross-tenant read fix (docs/architecture.md's own write-up of these
 /// passes) - the per-event sibling of `projections::query_projection`'s
-/// own `owner_scope_satisfied`, same idea applied to a raw `Event`
-/// instead of a projection instance. Takes a raw `scope: Option<&str>`
-/// rather than a whole `RoleAccessMapping`, so both the GraphQL track
-/// (`RoleAccessMapping.scope`) and the REST track (`EventReadToken.scope`)
-/// feed it identically - `query_events`/`count_events`/
-/// `deliver_to_subscriptions`/`inspect_event` call it with the former,
-/// `fetch_events`/`consume_events` with the latter.
-///
-/// Holds - the event is visible/included - when `scope` is `None`
-/// (unrestricted, every caller's behaviour before `scope` existed), or
-/// `event.event_type.owner_tag_key` is `None` (this type declares no
-/// owner dimension, so no `scope` value ever restricts it), or
-/// `event.tags` carries a tag whose key equals `owner_tag_key` and whose
-/// value equals `scope`. Does not hold - fails closed, the identical
-/// "affirmatively provable, not merely un-contradicted" stance
-/// `owner_scope_satisfied` already takes - when `scope` is `Some`, the
-/// type does declare `owner_tag_key`, and no tag on the event carries
-/// that key with a matching value (including no such tag at all, or one
-/// with a null value - the "mapped field was absent" case, see `Tag.value`
-/// in the spec).
+/// own `tag_owner_scope_satisfied`, same idea applied to a raw `Event`
+/// instead of a projection instance; delegates to `tag_owner_scope_satisfied`
+/// above with `event.tags`/`event.event_type.owner_tag_key`. Takes a raw
+/// `scope: Option<&str>` rather than a whole `RoleAccessMapping`, so both
+/// the GraphQL track (`RoleAccessMapping.scope`) and the REST track
+/// (`EventReadToken.scope`) feed it identically - `query_events`/
+/// `count_events`/`deliver_to_subscriptions`/`inspect_event` call it with
+/// the former, `fetch_events`/`consume_events` with the latter.
 ///
 /// A multi-record surface (`query_events`/`count_events`/
 /// `deliver_to_subscriptions`/`fetch_events`/`consume_events`) uses this
@@ -1314,24 +1414,20 @@ pub fn matches_filters(event: &Event, filters: &[Filter]) -> bool {
 /// outright when it returns `false`, the same shape
 /// `query_projection`'s own check has.
 pub fn event_owner_scope_satisfied(event: &Event, scope: Option<&str>) -> bool {
-    let Some(scope) = scope else {
-        return true;
-    };
-    let Some(owner_tag_key) = event.event_type.owner_tag_key.as_deref() else {
-        return true;
-    };
-    event
-        .tags
-        .iter()
-        .any(|tag| tag.key == owner_tag_key && tag.value.as_deref() == Some(scope))
+    tag_owner_scope_satisfied(
+        &event.tags,
+        event.event_type.owner_tag_key.as_deref(),
+        scope,
+    )
 }
 
 /// `event_owner_scope_satisfied`'s own sibling for `Command`, read by
 /// `fetch_commands` (`FetchCommands`' `command_owner_scope_satisfied`).
 /// Identical contract - see that function's own doc comment for the full
-/// three-holds/fails-closed reasoning, not restated here - reading
-/// `Command.consistency_tags`/`CommandType.owner_tag_key` where the event
-/// version reads `Event.tags`/`EventType.owner_tag_key`.
+/// three-holds/fails-closed reasoning, not restated here - delegating to
+/// `tag_owner_scope_satisfied` above with
+/// `command.consistency_tags`/`command.command_type.owner_tag_key` where
+/// the event version delegates with `Event.tags`/`EventType.owner_tag_key`.
 /// `consistency_tags` is the right field for this: it is always
 /// `derive_tags(command_type, payload)`, unconditionally - a plain
 /// `Vec<Tag>`, never absent - regardless of whether this particular
@@ -1339,16 +1435,11 @@ pub fn event_owner_scope_satisfied(event: &Event, scope: Option<&str>) -> bool {
 /// itself goes missing for that case (see `Command.consistency_boundary`'s
 /// own doc comment).
 pub fn command_owner_scope_satisfied(command: &Command, scope: Option<&str>) -> bool {
-    let Some(scope) = scope else {
-        return true;
-    };
-    let Some(owner_tag_key) = command.command_type.owner_tag_key.as_deref() else {
-        return true;
-    };
-    command
-        .consistency_tags
-        .iter()
-        .any(|tag| tag.key == owner_tag_key && tag.value.as_deref() == Some(scope))
+    tag_owner_scope_satisfied(
+        &command.consistency_tags,
+        command.command_type.owner_tag_key.as_deref(),
+        scope,
+    )
 }
 
 /// The greatest `Event.sequence` among a set of events, or `None` when
@@ -1527,6 +1618,133 @@ pub fn sensitive_field_is_granted(access_mapping: &RoleAccessMapping, subject_va
     access_mapping.can_read_sensitive || access_mapping.role.external_subject == subject_value
 }
 
+/// The private-field mechanism's own accessor trait: `is_default_private_reader`
+/// and the render-time redaction pass below read the same three things
+/// off an `Event` or a `Command` alike rather than being duplicated per
+/// type - the identical role `protect_sensitive_fields`'s own shared walk
+/// already plays for `sensitive_fields`, just needing one more field read
+/// (`private_fields`) than that walk does.
+pub trait PrivateFieldRecord {
+    fn private_fields(&self) -> &[PrivateField];
+    fn client_id(&self) -> &str;
+    fn payload(&self) -> &str;
+}
+
+impl PrivateFieldRecord for Event {
+    fn private_fields(&self) -> &[PrivateField] {
+        &self.event_type.private_fields
+    }
+    fn client_id(&self) -> &str {
+        &self.metadata.client_id
+    }
+    fn payload(&self) -> &str {
+        &self.payload
+    }
+}
+
+impl PrivateFieldRecord for Command {
+    fn private_fields(&self) -> &[PrivateField] {
+        &self.command_type.private_fields
+    }
+    fn client_id(&self) -> &str {
+        &self.metadata.client_id
+    }
+    fn payload(&self) -> &str {
+        &self.payload
+    }
+}
+
+/// `is_default_private_reader(record, access_mapping)` in the spec -
+/// takes `role: &Role` rather than a whole `&RoleAccessMapping` here,
+/// since nothing else off it is ever read: `RoleAccessMapping.status`/
+/// `.level`/`.bounded_context` play no part in this specific question,
+/// only `.role.id`/`.role.external_subject` do. That narrower signature
+/// is what lets `PrivateFieldGrant.grantor` - a bare `Role`, no
+/// `RoleAccessMapping` alongside it - be re-checked here directly at
+/// render time (see the redaction pass below) without fabricating one.
+///
+/// Holds when either of two things is true, read off `record`'s own
+/// type's `private_fields`:
+///   - some `Own`-kind field is declared and `record`'s own `client_id`
+///     equals `role.id` - the caller is the record's creator (`client_id`
+///     is the Role's internal id for anything a GraphQL caller produced -
+///     see `authorise_command_submission`), or
+///   - some `Addressed`-kind field is declared and `role.external_subject`
+///     equals the value that field's own `addressee_field` names in
+///     `record`'s payload - the caller is the party the record itself
+///     addressed, the identical match a sensitive field's subject already
+///     gets in `render_event`/`render_command`, resolved against a
+///     payload field rather than an `EncryptionKey`'s subject value.
+///
+/// Does not hold for a record whose type declares only `Team`-kind
+/// private fields, or none at all - there is no default reader to be.
+/// Generic over `Event`/`Command` alike via `PrivateFieldRecord` above -
+/// used both here and at grant time (`grant_private_field_access_for_event`/
+/// `grant_private_field_access_for_command`), one predicate, several call
+/// sites, never two implementations of the same question.
+pub fn is_default_private_reader<R: PrivateFieldRecord>(record: &R, role: &Role) -> bool {
+    let private_fields = record.private_fields();
+    if private_fields
+        .iter()
+        .any(|p| p.kind == PrivateFieldKind::Own)
+        && record.client_id() == role.id
+    {
+        return true;
+    }
+    if !private_fields
+        .iter()
+        .any(|p| p.kind == PrivateFieldKind::Addressed)
+    {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(record.payload()) else {
+        return false;
+    };
+    private_fields.iter().any(|p| {
+        p.kind == PrivateFieldKind::Addressed
+            && p.addressee_field
+                .as_deref()
+                .and_then(|af| payload_field_value(&parsed, af))
+                .and_then(json_scalar_to_string)
+                .is_some_and(|addressee| addressee == role.external_subject)
+    })
+}
+
+/// Whether `access_mapping.role` may read one `PrivateField` entry on
+/// `record` - the one decision the redaction pass below makes per field.
+/// `Team`-kind needs no `record`/grant lookup at all: membership is the
+/// grant. `Own`/`Addressed` hold when `is_default_private_reader` holds
+/// directly, or an active `PrivateFieldGrant` reaches this caller -
+/// either a per-record one `matches_this_record` identifies, or a
+/// blanket one (naming neither an event nor a command) whose own
+/// `grantor` independently satisfies `is_default_private_reader` for
+/// `record` - re-derived here, against the record actually being read,
+/// which is what keeps a blanket grant a convenience rather than a wider
+/// trust boundary (see `entity PrivateFieldGrant`'s own doc comment).
+fn entitled_to_read_private_field<R: PrivateFieldRecord>(
+    record: &R,
+    kind: PrivateFieldKind,
+    team: Option<&str>,
+    access_mapping: &RoleAccessMapping,
+    grants: &[PrivateFieldGrant],
+    matches_this_record: impl Fn(&PrivateFieldGrant) -> bool,
+) -> bool {
+    match kind {
+        PrivateFieldKind::Team => Some(access_mapping.role.name.as_str()) == team,
+        PrivateFieldKind::Own | PrivateFieldKind::Addressed => {
+            is_default_private_reader(record, &access_mapping.role)
+                || grants.iter().any(|g| {
+                    g.status == TokenStatus::Active
+                        && g.grantee == access_mapping.role
+                        && (matches_this_record(g)
+                            || (g.event_sequence.is_none()
+                                && g.command_id.is_none()
+                                && is_default_private_reader(record, &g.grantor)))
+                })
+        }
+    }
+}
+
 /// Black box (see the note above rule `DeliverToSubscriptions`, reused by
 /// `QueryEvents`/`CountEvents`/`InspectEvent` and by `crate::projections::
 /// read_projection` too - see its own doc comment for its real, since
@@ -1553,36 +1771,133 @@ pub fn sensitive_field_is_granted(access_mapping: &RoleAccessMapping, subject_va
 /// always storing ciphertext as a string leaf, discarding the original
 /// type at encrypt time; restoring it would need schema-aware re-parsing,
 /// a separate, out-of-scope piece of work.
+/// `grants` is the caller's own already-loaded snapshot of active
+/// `PrivateFieldGrant`s naming `access_mapping.role` as grantee, within
+/// this bounded context - the identical "pure function, I/O resolved
+/// before the call" split every other rule in this module already
+/// follows for `resolve_data_key`. Empty for a caller with no such
+/// grants, which is every caller before this mechanism existed - the
+/// third pass below is then just `is_default_private_reader`/`Team`
+/// membership, unchanged from a `private_fields`-free type's own
+/// behaviour.
 pub fn render_event(
     event: &Event,
     access_mapping: &RoleAccessMapping,
     resolve_data_key: &impl Fn(&str, &str) -> Option<DataKey>,
+    grants: &[PrivateFieldGrant],
 ) -> String {
-    decrypt_sensitive_fields(
+    let decrypted = decrypt_sensitive_fields(
         &event.event_type.sensitive_fields,
         &event.payload,
         access_mapping,
         resolve_data_key,
-    )
+    );
+    redact_unentitled_private_fields(event, &decrypted, access_mapping, grants, |g| {
+        g.bounded_context == event.bounded_context && g.event_sequence == Some(event.sequence)
+    })
 }
 
-/// See `render_event` above - same black box, same real decrypt logic,
-/// applied to `Command.payload`/`CommandType.sensitive_fields` instead.
-/// See `rule FetchCommands`' own `@guidance` for why this is a distinct
-/// function rather than `render_event` reused: the two-grant test is
-/// identical, but the value being rendered is a `Command`, not an
-/// `Event`.
+/// See `render_event` above - same black box, same real decrypt/redact
+/// logic, applied to `Command.payload`/`CommandType.sensitive_fields`/
+/// `CommandType.private_fields` instead. See `rule FetchCommands`' own
+/// `@guidance` for why this is a distinct function rather than
+/// `render_event` reused: the tests are identical, but the value being
+/// rendered is a `Command`, not an `Event`.
 pub fn render_command(
     command: &Command,
     access_mapping: &RoleAccessMapping,
     resolve_data_key: &impl Fn(&str, &str) -> Option<DataKey>,
+    grants: &[PrivateFieldGrant],
 ) -> String {
-    decrypt_sensitive_fields(
+    let decrypted = decrypt_sensitive_fields(
         &command.command_type.sensitive_fields,
         &command.payload,
         access_mapping,
         resolve_data_key,
-    )
+    );
+    redact_unentitled_private_fields(command, &decrypted, access_mapping, grants, |g| {
+        g.bounded_context == command.bounded_context
+            && g.command_id.as_deref() == Some(command.id.as_str())
+    })
+}
+
+/// The redaction pass `render_event`/`render_command` both run after
+/// decrypting sensitive fields - a plain visibility rule, not a
+/// cryptographic one, with no `EncryptionKey`/`resolve_data_key`/
+/// `ForgetSubject` involvement anywhere: a private field is stored in
+/// plaintext exactly as written, and that absence is the whole point of
+/// the mechanism (see `value PrivateField`). Per `PrivateField` entry,
+/// `entitled_to_read_private_field` decides whether this caller may see
+/// the leaf; a caller who isn't gets it set to `null` - not the enclosing
+/// object, not the whole record withheld, and not ciphertext either,
+/// since none was ever produced, exactly the shape and exactly the place
+/// an unentitled caller already finds a sensitive field's leaf left as
+/// stored ciphertext, one pass up.
+fn redact_unentitled_private_fields<R: PrivateFieldRecord>(
+    record: &R,
+    payload: &str,
+    access_mapping: &RoleAccessMapping,
+    grants: &[PrivateFieldGrant],
+    matches_this_record: impl Fn(&PrivateFieldGrant) -> bool,
+) -> String {
+    let private_fields = record.private_fields();
+    if private_fields.is_empty() {
+        return payload.to_string();
+    }
+
+    let mut parsed: serde_json::Value = serde_json::from_str(payload).expect(
+        "redact_unentitled_private_fields: payload is always valid JSON by the time this is called",
+    );
+    for p in private_fields {
+        if entitled_to_read_private_field(
+            record,
+            p.kind,
+            p.team.as_deref(),
+            access_mapping,
+            grants,
+            &matches_this_record,
+        ) {
+            continue;
+        }
+        if let Some(slot) = payload_field_value_mut(&mut parsed, &p.field) {
+            *slot = serde_json::Value::Null;
+        }
+    }
+    serde_json::to_string(&parsed).expect("re-serialising a parsed JSON Value is infallible")
+}
+
+/// `redact_private_fields(record)` in the spec - the REST track's
+/// unconditional counterpart to the render-time pass above. No
+/// `access_mapping`/`Role` argument at all, deliberately: an
+/// `EventReadToken` is tied to no `Role`, so every `private_fields` leaf
+/// is nulled for every caller alike, the same fail-closed-by-construction
+/// shape `EventFetch`'s own `PrivateFieldsStayRedacted` guarantee states.
+/// All three kinds fail closed structurally here, not by omission - a
+/// token is nobody's `client_id`, carries no `Role.name`, carries no
+/// `external_subject`, and no `PrivateFieldGrant` can name it as a
+/// grantee (a grant's grantee is always a `Role`) - so no amount of
+/// sharing on the GraphQL side ever opens a private field on this one.
+/// Called by `fetch_events`/`consume_events` alone: `CommandQuery` is
+/// GraphQL/`AdminAccess`-only and already routes through `render_command`,
+/// and `CommandTrigger` reads nothing back, so there is no command-side
+/// counterpart to this function.
+pub fn redact_private_fields(event: &Event) -> Event {
+    let private_fields = &event.event_type.private_fields;
+    if private_fields.is_empty() {
+        return event.clone();
+    }
+    let mut parsed: serde_json::Value = serde_json::from_str(&event.payload)
+        .expect("redact_private_fields: payload is always valid JSON by the time this is called");
+    for p in private_fields {
+        if let Some(slot) = payload_field_value_mut(&mut parsed, &p.field) {
+            *slot = serde_json::Value::Null;
+        }
+    }
+    Event {
+        payload: serde_json::to_string(&parsed)
+            .expect("re-serialising a parsed JSON Value is infallible"),
+        ..event.clone()
+    }
 }
 
 /// The shared walk `render_event`/`render_command` both need - same
@@ -1672,6 +1987,7 @@ pub fn register_event_type(
     tag_mappings: Vec<TagMapping>,
     owner_tag_key: Option<String>,
     sensitive_fields: Vec<SensitiveField>,
+    private_fields: Vec<PrivateField>,
     external_creation_allowed: bool,
     direct_creation_allowed: bool,
     system_triggered_allowed: bool,
@@ -1705,11 +2021,27 @@ pub fn register_event_type(
     if !valid_sensitive_fields(&schema, &sensitive_fields) {
         return Err(Error::InvalidSensitiveField.into());
     }
+    if !valid_private_fields(&schema, &private_fields) {
+        return Err(Error::InvalidPrivateField.into());
+    }
     if tag_mappings
         .iter()
         .any(|m| sensitive_fields.iter().any(|s| s.field == m.field))
     {
         return Err(Error::SensitiveFieldTagOverlap.into());
+    }
+    // A private field may not also be a tag mapping or a sensitive
+    // field - the identical leak `SensitiveFieldTagOverlap` above already
+    // guards against, one register over (see `Error::PrivateFieldOverlap`'s
+    // own doc comment).
+    if tag_mappings
+        .iter()
+        .any(|m| private_fields.iter().any(|p| p.field == m.field))
+        || sensitive_fields
+            .iter()
+            .any(|s| private_fields.iter().any(|p| p.field == s.field))
+    {
+        return Err(Error::PrivateFieldOverlap.into());
     }
     // Scheduling is opted into whole - a type saying it fires on a
     // schedule has to say when *and* what a missed occurrence means, no
@@ -1738,6 +2070,7 @@ pub fn register_event_type(
             tag_mappings,
             owner_tag_key,
             sensitive_fields,
+            private_fields,
             external_creation_allowed,
             direct_creation_allowed,
             system_triggered_allowed,
@@ -1773,6 +2106,7 @@ pub fn register_event_type(
         tag_mappings,
         owner_tag_key,
         sensitive_fields,
+        private_fields,
         external_creation_allowed,
         direct_creation_allowed,
         system_triggered_allowed,
@@ -1822,6 +2156,7 @@ pub fn register_command_type(
     tag_mappings: Vec<TagMapping>,
     owner_tag_key: Option<String>,
     sensitive_fields: Vec<SensitiveField>,
+    private_fields: Vec<PrivateField>,
     rest_trigger_allowed: bool,
     existing: Option<&CommandType>,
 ) -> crate::error::Result<CommandTypeRegistration> {
@@ -1849,11 +2184,24 @@ pub fn register_command_type(
     if !valid_sensitive_fields(&schema, &sensitive_fields) {
         return Err(Error::InvalidSensitiveField.into());
     }
+    if !valid_private_fields(&schema, &private_fields) {
+        return Err(Error::InvalidPrivateField.into());
+    }
     if tag_mappings
         .iter()
         .any(|m| sensitive_fields.iter().any(|s| s.field == m.field))
     {
         return Err(Error::SensitiveFieldTagOverlap.into());
+    }
+    // See the identical check in `register_event_type` - same reasoning.
+    if tag_mappings
+        .iter()
+        .any(|m| private_fields.iter().any(|p| p.field == m.field))
+        || sensitive_fields
+            .iter()
+            .any(|s| private_fields.iter().any(|p| p.field == s.field))
+    {
+        return Err(Error::PrivateFieldOverlap.into());
     }
 
     let Some(existing) = existing else {
@@ -1865,6 +2213,7 @@ pub fn register_command_type(
             tag_mappings,
             owner_tag_key,
             sensitive_fields,
+            private_fields,
             rest_trigger_allowed,
         }));
     };
@@ -1893,6 +2242,7 @@ pub fn register_command_type(
         tag_mappings,
         owner_tag_key,
         sensitive_fields,
+        private_fields,
         rest_trigger_allowed,
     }))
 }
@@ -1953,6 +2303,7 @@ pub fn forget_subject(
 /// `skilj-graphql`'s `EventQuery` resolver (§8 item 5, Phase 3) - a
 /// caller with only the rendered strings back could never page past the
 /// first call.
+#[allow(clippy::too_many_arguments)]
 pub fn query_events(
     access_mapping: &RoleAccessMapping,
     event_types: &[EventType],
@@ -1960,6 +2311,7 @@ pub fn query_events(
     after_sequence: Option<i64>,
     bounded_context_events: &[Event],
     resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
+    private_field_grants: &[PrivateFieldGrant],
 ) -> crate::error::Result<Vec<(i64, String)>> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -1985,7 +2337,7 @@ pub fn query_events(
         .map(|e| {
             (
                 e.sequence,
-                render_event(e, access_mapping, &resolve_data_key),
+                render_event(e, access_mapping, &resolve_data_key, private_field_grants),
             )
         })
         .collect())
@@ -2044,6 +2396,7 @@ pub fn inspect_event(
     access_mapping: &RoleAccessMapping,
     event: &Event,
     resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
+    private_field_grants: &[PrivateFieldGrant],
 ) -> crate::error::Result<EventInspected> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -2060,7 +2413,12 @@ pub fn inspect_event(
 
     Ok(EventInspected {
         event: event.clone(),
-        rendered_payload: render_event(event, access_mapping, &resolve_data_key),
+        rendered_payload: render_event(
+            event,
+            access_mapping,
+            &resolve_data_key,
+            private_field_grants,
+        ),
     })
 }
 
@@ -2082,6 +2440,7 @@ pub fn inspect_event(
 /// Returns rendered payloads only, the same "deliberately coarse on the
 /// wire contract" choice `query_events` makes for `EventsQueried.events`
 /// - see its own doc comment.
+#[allow(clippy::too_many_arguments)]
 pub fn fetch_commands(
     access_mapping: &RoleAccessMapping,
     command_types: &[CommandType],
@@ -2090,6 +2449,7 @@ pub fn fetch_commands(
     triggered_event: Option<&Event>,
     bounded_context_commands: &[Command],
     resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
+    private_field_grants: &[PrivateFieldGrant],
 ) -> crate::error::Result<Vec<String>> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -2120,7 +2480,7 @@ pub fn fetch_commands(
             })
         })
         .filter(|c| command_owner_scope_satisfied(c, access_mapping.scope.as_deref()))
-        .map(|c| render_command(c, access_mapping, &resolve_data_key))
+        .map(|c| render_command(c, access_mapping, &resolve_data_key, private_field_grants))
         .collect())
 }
 
@@ -2237,10 +2597,19 @@ pub struct EventDelivered {
 /// function is the pure "who matches and what do they get" computation
 /// underneath that, the same split `project()`'s own async/sync halves
 /// have.
+/// `private_field_grants` is every active `PrivateFieldGrant` in
+/// `event.bounded_context`, regardless of grantee - a single shared
+/// snapshot passed to every subscriber's own `render_event` call below
+/// rather than looked up per subscriber, since `render_event` already
+/// filters a grant list down to `g.grantee == access_mapping.role`
+/// internally. Different subscribers see different rendered payloads
+/// from the identical input for exactly that reason: each is only ever
+/// entitled by its own grants.
 pub fn deliver_to_subscriptions(
     event: &Event,
     subscriptions: &[Subscription],
     resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
+    private_field_grants: &[PrivateFieldGrant],
 ) -> Vec<EventDelivered> {
     subscriptions
         .iter()
@@ -2261,7 +2630,12 @@ pub fn deliver_to_subscriptions(
         .map(|s| EventDelivered {
             subscription: s.clone(),
             event: event.clone(),
-            rendered_payload: render_event(event, s.access_mapping(), &resolve_data_key),
+            rendered_payload: render_event(
+                event,
+                s.access_mapping(),
+                &resolve_data_key,
+                private_field_grants,
+            ),
         })
         .collect()
 }
@@ -2542,6 +2916,22 @@ pub fn create_external_event(
     if !valid_payload(&event_type.schema, &payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
     }
+    // Cross-tenant write fix (docs/architecture.md's own write-up of
+    // these passes) - the write-side counterpart to EventFetch's own
+    // EventsScopedToOwnerWhenDeclared read guarantee: a token that names
+    // a scope may create events only for the owner it names. Single-
+    // record, so this rejects outright rather than filtering, the same
+    // reasoning authorise_command_submission's own note gives. Vacuously
+    // true for a token naming no scope or an event type declaring no
+    // owner dimension.
+    let tags = derive_tags(&event_type.tag_mappings, &payload);
+    if !tag_owner_scope_satisfied(
+        &tags,
+        event_type.owner_tag_key.as_deref(),
+        adapter.scope.as_deref(),
+    ) {
+        return Err(crate::access_control::Error::GrantScopeMismatch.into());
+    }
 
     let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
     Ok(Event {
@@ -2555,7 +2945,7 @@ pub fn create_external_event(
             created_at: now,
         },
         sequence: next_sequence,
-        tags: derive_tags(&event_type.tag_mappings, &payload),
+        tags,
         encryption_keys: protected.encryption_keys,
         origin: EventOrigin::ExternalTriggered {
             source_content,
@@ -2589,6 +2979,15 @@ pub fn create_direct_event(
     if !valid_payload(&event_type.schema, &payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
     }
+    // See create_external_event's own identical note above.
+    let tags = derive_tags(&event_type.tag_mappings, &payload);
+    if !tag_owner_scope_satisfied(
+        &tags,
+        event_type.owner_tag_key.as_deref(),
+        adapter.scope.as_deref(),
+    ) {
+        return Err(crate::access_control::Error::GrantScopeMismatch.into());
+    }
 
     let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
     Ok(Event {
@@ -2602,7 +3001,7 @@ pub fn create_direct_event(
             created_at: now,
         },
         sequence: next_sequence,
-        tags: derive_tags(&event_type.tag_mappings, &payload),
+        tags,
         encryption_keys: protected.encryption_keys,
         origin: EventOrigin::DirectlyCreated,
     })
@@ -2764,12 +3163,20 @@ pub fn skip_missed_occurrences(
 /// The `CommandAuthorised` fact `AuthoriseCommandSubmission`/
 /// `AuthoriseCommandTrigger` each produce, and `process_command` below
 /// consumes - the join point between REST/GraphQL authorisation and the
-/// one command-processing pipeline both funnel into.
+/// one command-processing pipeline both funnel into. `consistency_tags`
+/// is a Rust-only addition beyond the spec's own `CommandAuthorised`
+/// fact: both authorising functions already have to compute
+/// `derive_tags(command_type, payload)` themselves to check
+/// `tag_owner_scope_satisfied` before returning, and every caller needs the
+/// identical value again immediately afterward (to fetch
+/// `matching_events`) - carrying it here is one computation instead of
+/// two, not a behaviour change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandAuthorised {
     pub command_type: CommandType,
     pub payload: String,
     pub client_id: String,
+    pub consistency_tags: Vec<Tag>,
 }
 
 /// See `rule AuthoriseCommandTrigger`. Same "derived, not a separate
@@ -2794,11 +3201,28 @@ pub fn authorise_command_trigger(
     if !valid_payload(&command_type.schema, &payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
     }
+    // Cross-tenant write fix (docs/architecture.md's own write-up of
+    // these passes) - the write-side counterpart to CommandQuery's own
+    // command_owner_scope_satisfied read check: a token that names a
+    // scope may trigger commands only for the owner it names, checked
+    // against its own scope rather than any minting admin's, exactly as
+    // EventFetch's tokens are (see create_event_read_token's own doc
+    // comment). Single-record, so this rejects outright rather than
+    // filtering - there is exactly one command being authorised here.
+    let consistency_tags = derive_tags(&command_type.tag_mappings, &payload);
+    if !tag_owner_scope_satisfied(
+        &consistency_tags,
+        command_type.owner_tag_key.as_deref(),
+        token.scope.as_deref(),
+    ) {
+        return Err(crate::access_control::Error::GrantScopeMismatch.into());
+    }
 
     Ok(CommandAuthorised {
         command_type: command_type.clone(),
         payload,
         client_id: token.id.clone(),
+        consistency_tags,
     })
 }
 
@@ -2836,11 +3260,32 @@ pub fn authorise_command_submission(
     if !valid_payload(&command_type.schema, &payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
     }
+    // Cross-tenant write fix (docs/architecture.md's own write-up of
+    // these passes) - the write-side counterpart to CommandQuery's own
+    // CommandsScopedToOwnerWhenDeclared read guarantee: a grant that
+    // names a scope may submit commands only for the owner it names,
+    // checked against the same command_type.owner_tag_key/derived tags
+    // the read side already reads back with command_owner_scope_satisfied,
+    // just before the record exists rather than after. Single-record, so
+    // this rejects outright rather than filtering, the same shape
+    // InspectEvent/InspectSnapshot already have - there is exactly one
+    // command being authorised here, so there is nothing to filter, only
+    // one thing to refuse. Vacuously true, same as always, for a grant
+    // naming no scope or a command type declaring no owner dimension.
+    let consistency_tags = derive_tags(&command_type.tag_mappings, &payload);
+    if !tag_owner_scope_satisfied(
+        &consistency_tags,
+        command_type.owner_tag_key.as_deref(),
+        access_mapping.scope.as_deref(),
+    ) {
+        return Err(crate::access_control::Error::GrantScopeMismatch.into());
+    }
 
     Ok(CommandAuthorised {
         command_type: command_type.clone(),
         payload,
         client_id: access_mapping.role.id.clone(),
+        consistency_tags,
     })
 }
 

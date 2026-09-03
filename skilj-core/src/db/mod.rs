@@ -32,8 +32,8 @@
 //! what's deliberately not here yet (`EncryptionKey`).
 
 use crate::access_control::{
-    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken, Role,
-    RoleAccessMapping, RoleStatus, TokenStatus,
+    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
+    PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use crate::bootstrap::ContextCreator;
 use crate::encryption::{self, DataKey, EncryptionMasterKey};
@@ -43,7 +43,7 @@ use crate::event_store::{
     ReadCursor,
 };
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
-use crate::shared::{Metadata, SensitiveField, Tag, TagMapping};
+use crate::shared::{Metadata, PrivateField, SensitiveField, Tag, TagMapping};
 use chrono::{DateTime, Utc};
 use opentelemetry::metrics::{Counter, Meter};
 use opentelemetry::KeyValue;
@@ -328,6 +328,7 @@ async fn provision_bounded_context_schema(
             tag_mappings JSONB NOT NULL DEFAULT '[]',
             owner_tag_key TEXT,
             sensitive_fields JSONB NOT NULL DEFAULT '[]',
+            private_fields JSONB NOT NULL DEFAULT '[]',
             external_creation_allowed BOOLEAN NOT NULL,
             direct_creation_allowed BOOLEAN NOT NULL,
             system_triggered_allowed BOOLEAN NOT NULL,
@@ -350,6 +351,7 @@ async fn provision_bounded_context_schema(
             tag_mappings JSONB NOT NULL DEFAULT '[]',
             owner_tag_key TEXT,
             sensitive_fields JSONB NOT NULL DEFAULT '[]',
+            private_fields JSONB NOT NULL DEFAULT '[]',
             rest_trigger_allowed BOOLEAN NOT NULL
         )"
     ))
@@ -619,6 +621,12 @@ async fn provision_bounded_context_schema(
     // exist, never read, so there's no `CHECK`/foreign key tying it to
     // anything: an old-version row is inert data until the next catch-up
     // tick overwrites it.
+    // `owner` (cross-tenant read fix, docs/architecture.md's own
+    // write-up of these passes): this row's own derived owner-tag value,
+    // or null when the snapshot declares no `Snapshot::OWNER_TAG_KEY` or
+    // no folded event has supplied one yet - `catch_up_snapshots`' own
+    // fold loop sets/refreshes it. Read by `get_snapshot_state_and_owner`/
+    // `snapshot_query::inspect_snapshot_field`'s own enforcement.
     sqlx::query(&format!(
         "CREATE TABLE {schema}.snapshots (
             snapshot_name TEXT NOT NULL,
@@ -627,6 +635,7 @@ async fn provision_bounded_context_schema(
             snapshot_version BIGINT NOT NULL,
             as_of_sequence BIGINT NOT NULL,
             state JSONB NOT NULL,
+            owner TEXT,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (snapshot_name, tag_key, tag_value)
         )"
@@ -671,10 +680,13 @@ async fn provision_bounded_context_schema(
             revoked_at TIMESTAMPTZ,
             event_type_name TEXT REFERENCES {schema}.event_types (name),
             command_type_name TEXT REFERENCES {schema}.command_types (name),
-            -- Only ever set (and only ever read) for kind = 'event_read' -
-            -- EventReadToken.scope, cross-tenant read fix
+            -- EventReadToken.scope/ExternalEventToken.scope/
+            -- DirectCreationToken.scope/CommandToken.scope - one column
+            -- for all four kinds, the cross-tenant read/write fix
             -- (docs/architecture.md's own write-up of these passes).
-            -- Every other kind leaves this null, unread.
+            -- Null (the default before these fixes existed, and still
+            -- the default for a token minted with none) means
+            -- unrestricted, for every kind alike.
             scope TEXT,
             CHECK (
                 (kind = 'command' AND command_type_name IS NOT NULL AND event_type_name IS NULL)
@@ -696,6 +708,259 @@ async fn provision_bounded_context_schema(
     .execute(&mut **tx)
     .await?;
 
+    sqlx::query(&private_field_grants_table_ddl(&schema))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(&format!(
+        "CREATE INDEX private_field_grants_by_grantee ON {schema}.private_field_grants (grantee_role_id, status)"
+    ))
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+/// `entity PrivateFieldGrant` - `event_sequence`/`command_id` are this
+/// table's own foreign keys into `events`/`commands`, one column each
+/// rather than the `AccessToken`-style single discriminated pair, since
+/// both may be null at once (a blanket grant) but never both non-null -
+/// enforced here, not just by `access_control::grant_private_field_access_for_event`/
+/// `_for_command` alone, the same "the invariant is a real constraint,
+/// not merely an implication of how callers happen to behave" stance
+/// `access_tokens`' own `kind`-vs-`event_type_name`/`command_type_name`
+/// CHECK already takes. `command_id` references `commands.id` (the
+/// internal `BIGSERIAL`, not `Command.id`/`commands.external_id`) -
+/// `origin_command_id` on `events` already sets this precedent.
+/// `grantor_role_id`/`grantee_role_id` reference `public.roles (id)`
+/// across schemas - Postgres allows this freely, and `roles` is
+/// guaranteed to exist by the time any bounded context is provisioned
+/// (the global migration set runs first, at `db::migrate()`). Shared
+/// between `provision_bounded_context_schema` (a brand-new context) and
+/// `ensure_private_field_grants_table` below (an existing one, added
+/// after this table existed) - one DDL string, not two copies to keep in
+/// sync.
+fn private_field_grants_table_ddl(schema: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.private_field_grants (
+            id TEXT PRIMARY KEY,
+            grantor_role_id TEXT NOT NULL REFERENCES public.roles (id),
+            grantee_role_id TEXT NOT NULL REFERENCES public.roles (id),
+            event_sequence BIGINT REFERENCES {schema}.events (sequence),
+            command_id BIGINT REFERENCES {schema}.commands (id),
+            status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+            created_at TIMESTAMPTZ NOT NULL,
+            revoked_at TIMESTAMPTZ,
+            CHECK (event_sequence IS NULL OR command_id IS NULL)
+        )"
+    )
+}
+
+/// `ensure_idempotency_keys_table`'s own doc comment's "no general
+/// per-bounded-context schema migration mechanism" applies identically
+/// here, just for `private_field_grants` instead of `idempotency_keys` -
+/// called unconditionally on every `build()`, for a bounded context
+/// provisioned before this table existed.
+pub async fn ensure_private_field_grants_table(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(&private_field_grants_table_ddl(&schema))
+        .execute(pool)
+        .await?;
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS private_field_grants_by_grantee ON {schema}.private_field_grants (grantee_role_id, status)"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// --- PrivateFieldGrant ---
+
+/// `commands.id` (the internal `BIGSERIAL`) for a given `Command.id`
+/// (`commands.external_id`) - the forward half of the translation
+/// `insert_private_field_grant` needs; `get_command_by_id` already is the
+/// reverse (see its own doc comment, and the note on `PrivateFieldGrant.
+/// command_id` in `access_control` for why a grant stores the internal
+/// id rather than the external one).
+async fn command_internal_id(
+    pool: &Pool,
+    bounded_context: &str,
+    external_id: &str,
+) -> crate::error::Result<Option<i64>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(i64,)> = sqlx::query_as(&format!(
+        "SELECT id FROM {schema}.commands WHERE external_id = $1"
+    ))
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id,)| id))
+}
+
+#[derive(sqlx::FromRow)]
+struct PrivateFieldGrantRow {
+    id: String,
+    grantor_role_id: String,
+    grantee_role_id: String,
+    event_sequence: Option<i64>,
+    command_id: Option<i64>,
+    status: String,
+    created_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+impl PrivateFieldGrantRow {
+    /// `Ok(None)` - not a panic - when `grantor_role_id`/`grantee_role_id`
+    /// names a `Role` that's gone by the time this looks it up, the same
+    /// "gone by the time you look" treatment `RoleAccessMappingRow::
+    /// into_domain` already gives an analogous race (see that method's
+    /// own doc comment, docs/architecture.md's own write-up of that
+    /// hardening pass) - `Role` rows are never hard-deleted in this
+    /// codebase, so this is a defensive match for a race that shouldn't
+    /// occur in practice, not one known to.
+    async fn into_domain(
+        self,
+        pool: &Pool,
+        bounded_context: &BoundedContext,
+    ) -> crate::error::Result<Option<PrivateFieldGrant>> {
+        let Some(grantor) = get_role(pool, &self.grantor_role_id).await? else {
+            return Ok(None);
+        };
+        let Some(grantee) = get_role(pool, &self.grantee_role_id).await? else {
+            return Ok(None);
+        };
+        let command_id = match self.command_id {
+            Some(internal_id) => {
+                match get_command_by_id(pool, &bounded_context.name, internal_id).await? {
+                    Some(command) => Some(command.id),
+                    None => return Ok(None),
+                }
+            }
+            None => None,
+        };
+        Ok(Some(PrivateFieldGrant {
+            id: self.id,
+            bounded_context: bounded_context.clone(),
+            grantor,
+            grantee,
+            event_sequence: self.event_sequence,
+            command_id,
+            status: token_status_from_str(&self.status),
+            created_at: self.created_at,
+            revoked_at: self.revoked_at,
+        }))
+    }
+}
+
+const PRIVATE_FIELD_GRANT_COLUMNS: &str =
+    "id, grantor_role_id, grantee_role_id, event_sequence, command_id, status, created_at, revoked_at";
+
+#[tracing::instrument(skip_all)]
+pub async fn insert_private_field_grant(
+    pool: &Pool,
+    grant: &PrivateFieldGrant,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(&grant.bounded_context.name);
+    let command_id = match grant.command_id.as_deref() {
+        Some(external_id) => Some(
+            command_internal_id(pool, &grant.bounded_context.name, external_id)
+                .await?
+                .expect(
+                    "insert_private_field_grant: command_id names a command that doesn't exist",
+                ),
+        ),
+        None => None,
+    };
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.private_field_grants ({PRIVATE_FIELD_GRANT_COLUMNS}) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
+    ))
+    .bind(&grant.id)
+    .bind(&grant.grantor.id)
+    .bind(&grant.grantee.id)
+    .bind(grant.event_sequence)
+    .bind(command_id)
+    .bind(token_status_to_str(grant.status))
+    .bind(grant.created_at)
+    .bind(grant.revoked_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every `PrivateFieldGrant` in one bounded context, active or revoked
+/// alike - `ListPrivateFieldGrants` itself reads both back (see its own
+/// `@guidance`: "what have I shared, and what have I stopped sharing").
+/// Also what `render_event`/`render_command`'s own callers pre-load and
+/// pass through as `grants` - one shared snapshot, filtered internally
+/// by `grantee` (see those functions' own doc comments for why that's
+/// enough for every caller in one request, subscribers included).
+#[tracing::instrument(skip_all)]
+pub async fn list_private_field_grants_for_context(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<PrivateFieldGrant>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(Vec::new());
+    };
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<PrivateFieldGrantRow> = sqlx::query_as(&format!(
+        "SELECT {PRIVATE_FIELD_GRANT_COLUMNS} FROM {schema}.private_field_grants"
+    ))
+    .fetch_all(pool)
+    .await?;
+    let mut grants = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(grant) = row.into_domain(pool, &bc).await? {
+            grants.push(grant);
+        }
+    }
+    Ok(grants)
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn get_private_field_grant(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+) -> crate::error::Result<Option<PrivateFieldGrant>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(None);
+    };
+    let schema = schema_ident(bounded_context);
+    let row: Option<PrivateFieldGrantRow> = sqlx::query_as(&format!(
+        "SELECT {PRIVATE_FIELD_GRANT_COLUMNS} FROM {schema}.private_field_grants WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(row) => row.into_domain(pool, &bc).await,
+        None => Ok(None),
+    }
+}
+
+/// Persists a `revoke_private_field_access` outcome - a status-only
+/// update, the same shape `revoke_active_role_access_mapping` already
+/// has, addressed by `id` rather than a composite key since a grant's
+/// own `id` is already unambiguous (see `PrivateFieldGrant.id`'s own doc
+/// comment).
+#[tracing::instrument(skip_all)]
+pub async fn update_private_field_grant(
+    pool: &Pool,
+    grant: &PrivateFieldGrant,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(&grant.bounded_context.name);
+    sqlx::query(&format!(
+        "UPDATE {schema}.private_field_grants SET status = $1, revoked_at = $2 WHERE id = $3"
+    ))
+    .bind(token_status_to_str(grant.status))
+    .bind(grant.revoked_at)
+    .bind(&grant.id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -771,8 +1036,9 @@ pub async fn ensure_projection_state_owner_columns(
     Ok(())
 }
 
-/// `event_types.owner_tag_key`/`access_tokens.scope`/`command_types.owner_tag_key` -
-/// the raw-event and command halves of the cross-tenant read fix
+/// `event_types.owner_tag_key`/`access_tokens.scope`/
+/// `command_types.owner_tag_key`/`snapshots.owner` - the raw-event,
+/// command and snapshot halves of the cross-tenant read fix
 /// (docs/architecture.md's own write-up of these passes), following
 /// `ensure_projection_state_owner_columns`'s own pattern and reasoning
 /// exactly (see its own doc comment): a targeted, idempotent `ALTER
@@ -797,6 +1063,34 @@ pub async fn ensure_event_scoping_columns(
     .await?;
     sqlx::query(&format!(
         "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.snapshots ADD COLUMN IF NOT EXISTS owner TEXT"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `event_types.private_fields`/`command_types.private_fields` - the
+/// private-field mechanism (docs/architecture.md's own write-up of this
+/// pass), following `ensure_event_scoping_columns`'s own pattern and
+/// reasoning exactly for a bounded context provisioned before these
+/// columns existed.
+pub async fn ensure_private_field_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"
     ))
     .execute(pool)
     .await?;
@@ -1212,6 +1506,7 @@ struct EventTypeRow {
     schedule_position: Option<DateTime<Utc>>,
     last_fired_at: Option<DateTime<Utc>>,
     event_read_allowed: bool,
+    private_fields: Json<Vec<PrivateField>>,
 }
 
 impl EventTypeRow {
@@ -1224,6 +1519,7 @@ impl EventTypeRow {
             tag_mappings: self.tag_mappings.0,
             owner_tag_key: self.owner_tag_key,
             sensitive_fields: self.sensitive_fields.0,
+            private_fields: self.private_fields.0,
             external_creation_allowed: self.external_creation_allowed,
             direct_creation_allowed: self.direct_creation_allowed,
             system_triggered_allowed: self.system_triggered_allowed,
@@ -1243,7 +1539,7 @@ const EVENT_TYPE_COLUMNS: &str =
     "name, schema, schema_version, tag_mappings, owner_tag_key, sensitive_fields, \
     external_creation_allowed, direct_creation_allowed, system_triggered_allowed, \
     system_triggered_schedule, missed_occurrence_policy, schedule_position, last_fired_at, \
-    event_read_allowed";
+    event_read_allowed, private_fields";
 
 /// Upsert, not insert-only - `RegisterEventType`'s own create-or-update
 /// shape (see `event_store::register_event_type`), though no surface
@@ -1254,7 +1550,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     let schema = schema_ident(&et.bounded_context.name);
     sqlx::query(&format!(
         "INSERT INTO {schema}.event_types ({EVENT_TYPE_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
             tag_mappings = EXCLUDED.tag_mappings, owner_tag_key = EXCLUDED.owner_tag_key, \
@@ -1266,7 +1562,8 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
             missed_occurrence_policy = EXCLUDED.missed_occurrence_policy, \
             schedule_position = EXCLUDED.schedule_position, \
             last_fired_at = EXCLUDED.last_fired_at, \
-            event_read_allowed = EXCLUDED.event_read_allowed"
+            event_read_allowed = EXCLUDED.event_read_allowed, \
+            private_fields = EXCLUDED.private_fields"
     ))
     .bind(&et.name)
     .bind(&et.schema)
@@ -1285,6 +1582,7 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
     .bind(et.schedule_position)
     .bind(et.last_fired_at)
     .bind(et.event_read_allowed)
+    .bind(Json(&et.private_fields))
     .execute(pool)
     .await?;
     notify_registration_changed(pool).await;
@@ -1572,6 +1870,7 @@ struct CommandTypeRow {
     owner_tag_key: Option<String>,
     sensitive_fields: Json<Vec<SensitiveField>>,
     rest_trigger_allowed: bool,
+    private_fields: Json<Vec<PrivateField>>,
 }
 
 impl CommandTypeRow {
@@ -1584,13 +1883,14 @@ impl CommandTypeRow {
             tag_mappings: self.tag_mappings.0,
             owner_tag_key: self.owner_tag_key,
             sensitive_fields: self.sensitive_fields.0,
+            private_fields: self.private_fields.0,
             rest_trigger_allowed: self.rest_trigger_allowed,
         }
     }
 }
 
 const COMMAND_TYPE_COLUMNS: &str = "name, schema, schema_version, tag_mappings, owner_tag_key, \
-    sensitive_fields, rest_trigger_allowed";
+    sensitive_fields, rest_trigger_allowed, private_fields";
 
 /// See `upsert_event_type` above - same shape and reasoning.
 #[tracing::instrument(skip_all)]
@@ -1598,12 +1898,13 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     let schema = schema_ident(&ct.bounded_context.name);
     sqlx::query(&format!(
         "INSERT INTO {schema}.command_types ({COMMAND_TYPE_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
          ON CONFLICT (name) DO UPDATE SET \
             schema = EXCLUDED.schema, schema_version = EXCLUDED.schema_version, \
             tag_mappings = EXCLUDED.tag_mappings, owner_tag_key = EXCLUDED.owner_tag_key, \
             sensitive_fields = EXCLUDED.sensitive_fields, \
-            rest_trigger_allowed = EXCLUDED.rest_trigger_allowed"
+            rest_trigger_allowed = EXCLUDED.rest_trigger_allowed, \
+            private_fields = EXCLUDED.private_fields"
     ))
     .bind(&ct.name)
     .bind(&ct.schema)
@@ -1612,6 +1913,7 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     .bind(&ct.owner_tag_key)
     .bind(Json(&ct.sensitive_fields))
     .bind(ct.rest_trigger_allowed)
+    .bind(Json(&ct.private_fields))
     .execute(pool)
     .await?;
     notify_registration_changed(pool).await;
@@ -2153,6 +2455,30 @@ pub async fn get_command_by_id(
     }
 }
 
+/// `get_command_by_id`'s own sibling, addressed by `Command.id`
+/// (`commands.external_id`) instead of the internal `BIGSERIAL` - what a
+/// caller holding a domain `Command.id` (the private-field mechanism's
+/// own `grantPrivateFieldAccessForCommand` mutation, naming the command
+/// being shared by its own wire id) needs, without knowing the internal
+/// one at all.
+pub async fn get_command_by_external_id(
+    pool: &Pool,
+    bounded_context: &str,
+    external_id: &str,
+) -> crate::error::Result<Option<Command>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<CommandRow> = sqlx::query_as(&format!(
+        "SELECT {COMMAND_COLUMNS} FROM {schema}.commands WHERE external_id = $1"
+    ))
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(row) => Ok(Some(row.into_domain(pool, bounded_context).await?)),
+        None => Ok(None),
+    }
+}
+
 /// Every `Command` currently stored for a whole bounded context - the
 /// full-snapshot parameter `fetch_commands`' own `bounded_context_commands`
 /// expects (same treatment `list_events_for_bounded_context` gets for
@@ -2511,6 +2837,42 @@ pub async fn get_snapshot_state(
     Ok(row.map(|(version, as_of_sequence, state, updated_at)| {
         (version as u64, as_of_sequence, state, updated_at)
     }))
+}
+
+/// `get_snapshot_state`'s own sibling, also returning the row's `owner`
+/// column - cross-tenant read fix (docs/architecture.md's own write-up
+/// of these passes). A separate function rather than changing
+/// `get_snapshot_state`'s own return shape: that function's other
+/// caller, `submit_command`'s snapshot-accelerated `decide_from_snapshot`
+/// path, is a write-path internal accelerator, not a caller read -
+/// deliberately untouched here, the same "`ProcessCommand`'s
+/// `matching_events` is deliberately untouched" principle the raw-event
+/// pass already stated. Only `snapshot_query::inspect_snapshot_field`,
+/// which needs `owner` to enforce `RoleAccessMapping.scope`, calls this
+/// one instead.
+pub async fn get_snapshot_state_and_owner(
+    pool: &Pool,
+    bounded_context: &str,
+    snapshot_name: &str,
+    tag_key: &str,
+    tag_value: &str,
+) -> crate::error::Result<Option<(SnapshotStateRow, Option<String>)>> {
+    type RawSnapshotStateAndOwnerRow = (i64, i64, String, DateTime<Utc>, Option<String>);
+    let schema = schema_ident(bounded_context);
+    let row: Option<RawSnapshotStateAndOwnerRow> = sqlx::query_as(&format!(
+        "SELECT snapshot_version, as_of_sequence, state::text, updated_at, owner \
+         FROM {schema}.snapshots WHERE snapshot_name = $1 AND tag_key = $2 AND tag_value = $3"
+    ))
+    .bind(snapshot_name)
+    .bind(tag_key)
+    .bind(tag_value)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(version, as_of_sequence, state, updated_at, owner)| {
+            ((version as u64, as_of_sequence, state, updated_at), owner)
+        }),
+    )
 }
 
 /// What `submit_command`'s own snapshot-accelerated `decide_from_snapshot`
@@ -3130,16 +3492,28 @@ impl RoleAccessMappingRow {
     /// lookup already makes for a simpler implementation over a joined
     /// query. Worth revisiting if this ever shows up in a profile; a
     /// small admin-managed table is an unlikely place for that to matter.
-    async fn into_domain(self, pool: &Pool) -> crate::error::Result<RoleAccessMapping> {
-        let role = get_role(pool, &self.role_id)
-            .await?
-            .expect("role_access_mappings row references a roles row that no longer exists");
-        let bounded_context = get_bounded_context(pool, &self.bounded_context)
-            .await?
-            .expect(
-                "role_access_mappings row references a bounded_contexts row that no longer exists",
-            );
-        Ok(RoleAccessMapping {
+    ///
+    /// `Ok(None)`, not a panic, when the role or bounded context this
+    /// row points to is gone by the time the follow-up query runs:
+    /// `hard_delete_bounded_context`'s `DROP SCHEMA`+`DELETE` and its
+    /// `ON DELETE CASCADE` onto this very table mean no *committed*
+    /// state ever has a `role_access_mappings` row outliving its
+    /// `bounded_contexts` row - but this method's own initial `SELECT`
+    /// and this follow-up lookup are two separate, unsynchronized
+    /// queries, not one snapshot, so a concurrent hard delete landing
+    /// in that gap is exactly this: a row this method legitimately read
+    /// a moment ago, now legitimately gone. Treating that as "wasn't in
+    /// the snapshot after all" rather than panicking is the same call
+    /// `list_role_access_mappings`'s "gone by the time you look" case
+    /// deserves anywhere it's read without a shared transaction.
+    async fn into_domain(self, pool: &Pool) -> crate::error::Result<Option<RoleAccessMapping>> {
+        let Some(role) = get_role(pool, &self.role_id).await? else {
+            return Ok(None);
+        };
+        let Some(bounded_context) = get_bounded_context(pool, &self.bounded_context).await? else {
+            return Ok(None);
+        };
+        Ok(Some(RoleAccessMapping {
             role,
             bounded_context,
             level: access_level_from_str(&self.level),
@@ -3148,7 +3522,7 @@ impl RoleAccessMappingRow {
             status: role_status_from_str(&self.status),
             created_at: self.created_at,
             revoked_at: self.revoked_at,
-        })
+        }))
     }
 }
 
@@ -3199,7 +3573,7 @@ pub async fn get_active_role_access_mapping(
     .fetch_optional(pool)
     .await?;
     match row {
-        Some(row) => Ok(Some(row.into_domain(pool).await?)),
+        Some(row) => row.into_domain(pool).await,
         None => Ok(None),
     }
 }
@@ -3207,7 +3581,11 @@ pub async fn get_active_role_access_mapping(
 /// Every `RoleAccessMapping` this engine currently knows of, active or
 /// not - the full-snapshot parameter `grant_role_access_mapping`'s own
 /// `existing_mappings` expects (see its doc comment). Same "small,
-/// admin-managed, unscoped is fine" reasoning as `list_roles`.
+/// admin-managed, unscoped is fine" reasoning as `list_roles`. A row
+/// whose role or bounded context was concurrently hard-deleted between
+/// this method's own `SELECT` and `RoleAccessMappingRow::into_domain`'s
+/// follow-up lookups is silently dropped, not an error - see that
+/// method's own doc comment.
 #[tracing::instrument(skip_all)]
 pub async fn list_role_access_mappings(
     pool: &Pool,
@@ -3219,7 +3597,9 @@ pub async fn list_role_access_mappings(
     .await?;
     let mut mappings = Vec::with_capacity(rows.len());
     for row in rows {
-        mappings.push(row.into_domain(pool).await?);
+        if let Some(mapping) = row.into_domain(pool).await? {
+            mappings.push(mapping);
+        }
     }
     Ok(mappings)
 }
@@ -3241,7 +3621,9 @@ pub async fn list_active_role_access_mappings_for_role(
     .await?;
     let mut mappings = Vec::with_capacity(rows.len());
     for row in rows {
-        mappings.push(row.into_domain(pool).await?);
+        if let Some(mapping) = row.into_domain(pool).await? {
+            mappings.push(mapping);
+        }
     }
     Ok(mappings)
 }
@@ -5310,19 +5692,59 @@ pub async fn catch_up_snapshots(
                 None => current_state,
             };
 
-            sqlx::query(&format!(
-                "UPDATE {schema}.snapshots SET snapshot_version = $1, as_of_sequence = $2, \
-                 state = $3::jsonb, updated_at = now() \
-                 WHERE snapshot_name = $4 AND tag_key = $5 AND tag_value = $6"
-            ))
-            .bind(version as i64)
-            .bind(event.sequence)
-            .bind(&new_state)
-            .bind(name)
-            .bind(tag_key)
-            .bind(tag_value.as_str())
-            .execute(&mut *tx)
-            .await?;
+            // Cross-tenant read fix (docs/architecture.md's own
+            // write-up of these passes) - `apply_projection_fold_update`'s
+            // own identical reasoning, for `Snapshot::OWNER_TAG_KEY`
+            // instead of `Projection::OWNER_TAG_KEY`: this event's own
+            // tag under that key (not necessarily `tag_key` itself)
+            // becomes this row's own derived `owner`, when present. An
+            // event lacking it leaves an already-established owner
+            // untouched, so `owner` is only ever included in the SET
+            // list when this event actually supplies one.
+            let owner = dispatcher
+                .owner_tag_key(bounded_context, name)
+                .flatten()
+                .and_then(|owner_tag_key| {
+                    event
+                        .tags
+                        .iter()
+                        .find(|t| t.key == owner_tag_key)
+                        .and_then(|t| t.value.clone())
+                });
+
+            match owner {
+                Some(owner) => {
+                    sqlx::query(&format!(
+                        "UPDATE {schema}.snapshots SET snapshot_version = $1, as_of_sequence = $2, \
+                         state = $3::jsonb, owner = $4, updated_at = now() \
+                         WHERE snapshot_name = $5 AND tag_key = $6 AND tag_value = $7"
+                    ))
+                    .bind(version as i64)
+                    .bind(event.sequence)
+                    .bind(&new_state)
+                    .bind(owner)
+                    .bind(name)
+                    .bind(tag_key)
+                    .bind(tag_value.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                None => {
+                    sqlx::query(&format!(
+                        "UPDATE {schema}.snapshots SET snapshot_version = $1, as_of_sequence = $2, \
+                         state = $3::jsonb, updated_at = now() \
+                         WHERE snapshot_name = $4 AND tag_key = $5 AND tag_value = $6"
+                    ))
+                    .bind(version as i64)
+                    .bind(event.sequence)
+                    .bind(&new_state)
+                    .bind(name)
+                    .bind(tag_key)
+                    .bind(tag_value.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
         }
 
         for name in &snapshot_names {
@@ -5682,8 +6104,9 @@ struct AccessTokenColumns {
     revoked_at: Option<DateTime<Utc>>,
     event_type_name: Option<String>,
     command_type_name: Option<String>,
-    /// Only meaningful for `kind = "event_read"` - see `EventReadToken.scope`'s
-    /// own doc comment. Every other kind carries `None` here, unread.
+    /// One column, all four kinds - see `EventReadToken.scope`'s own doc
+    /// comment for the read-side reasoning and
+    /// `ExternalEventToken.scope`'s for the write-side one.
     scope: Option<String>,
 }
 
@@ -5819,7 +6242,7 @@ pub async fn insert_external_event_token(
         token.revoked_at,
         &token.event_type.bounded_context.name,
         &token.event_type.name,
-        None,
+        token.scope.as_deref(),
     )
     .await
 }
@@ -5839,7 +6262,7 @@ pub async fn insert_direct_creation_token(
         token.revoked_at,
         &token.event_type.bounded_context.name,
         &token.event_type.name,
-        None,
+        token.scope.as_deref(),
     )
     .await
 }
@@ -5875,7 +6298,7 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
     let schema = schema_ident(&token.command_type.bounded_context.name);
     sqlx::query(&format!(
         "INSERT INTO {schema}.access_tokens (id, kind, secret, status, created_at, revoked_at, \
-         command_type_name) VALUES ($1,$2,$3,$4,$5,$6,$7)"
+         command_type_name, scope) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
     ))
     .bind(&token.id)
     .bind(AccessTokenKind::Command.as_str())
@@ -5884,6 +6307,7 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
     .bind(token.created_at)
     .bind(token.revoked_at)
     .bind(&token.command_type.name)
+    .bind(token.scope.as_deref())
     .execute(pool)
     .await?;
     insert_token_index(pool, &token.id, &token.command_type.bounded_context.name).await
@@ -5893,16 +6317,17 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
 /// isn't the expected kind - callers that need to tell those two apart
 /// (for the 401-vs-403 split - see `AccessTokenKind`'s own doc comment)
 /// call `access_token_kind` first. Covers `get_external_event_token`/
-/// `get_direct_creation_token`, identical apart from the `kind` string
-/// and return type - both resolve `event_type_name` against
-/// `event_types` into an `event_type` field. `get_event_read_token`
-/// below is a near-identical hand-written twin, not a third macro
-/// invocation - `EventReadToken` alone carries `scope` (cross-tenant read
-/// fix, docs/architecture.md's own write-up of these passes), and this
-/// macro's fixed field list has no way to vary that one field between
-/// invocations. `get_command_token` resolves `command_type_name` into a
-/// differently named field instead and is the only one of its own kind,
-/// so it too stays hand-written below.
+/// `get_direct_creation_token`/`get_event_read_token`, identical apart
+/// from the `kind` string and return type - all three resolve
+/// `event_type_name` against `event_types` into an `event_type` field
+/// and now carry `scope` alike (cross-tenant read/write fix,
+/// docs/architecture.md's own write-up of these passes - `EventReadToken`
+/// was the only one of the four token kinds this was true for before
+/// that fix's write-side half, which is why this used to be two macro
+/// invocations plus a near-identical hand-written twin; now all three
+/// genuinely share one shape). `get_command_token` resolves
+/// `command_type_name` into a differently named field instead and is the
+/// only one of its own kind, so it stays hand-written below.
 macro_rules! get_event_type_access_token {
     ($fn_name:ident, $return_type:ident, $kind:literal) => {
         #[tracing::instrument(skip_all)]
@@ -5927,6 +6352,7 @@ macro_rules! get_event_type_access_token {
                 created_at: row.columns.created_at,
                 revoked_at: row.columns.revoked_at,
                 event_type,
+                scope: row.columns.scope,
             }))
         }
     };
@@ -5941,36 +6367,7 @@ get_event_type_access_token!(
     DirectCreationToken,
     "direct_creation"
 );
-/// See `get_event_type_access_token!`'s own doc comment for why this one
-/// isn't a third macro invocation.
-#[tracing::instrument(skip_all)]
-pub async fn get_event_read_token(
-    pool: &Pool,
-    id: &str,
-) -> crate::error::Result<Option<EventReadToken>> {
-    let Some(row) = fetch_access_token_row(pool, id).await? else {
-        return Ok(None);
-    };
-    if row.columns.kind != "event_read" {
-        return Ok(None);
-    }
-    let event_type_name = row
-        .columns
-        .event_type_name
-        .expect("event_read access_tokens row without event_type_name");
-    let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
-        .await?
-        .expect("access_tokens row references an event_type that no longer exists");
-    Ok(Some(EventReadToken {
-        id: row.columns.id,
-        secret: row.columns.secret,
-        status: token_status_from_str(&row.columns.status),
-        created_at: row.columns.created_at,
-        revoked_at: row.columns.revoked_at,
-        event_type,
-        scope: row.columns.scope,
-    }))
-}
+get_event_type_access_token!(get_event_read_token, EventReadToken, "event_read");
 
 /// See `get_external_event_token`'s own doc comment - same shape and
 /// `None` reasoning, resolving `command_type_name` against
@@ -6000,6 +6397,7 @@ pub async fn get_command_token(
         created_at: row.columns.created_at,
         revoked_at: row.columns.revoked_at,
         command_type,
+        scope: row.columns.scope,
     }))
 }
 

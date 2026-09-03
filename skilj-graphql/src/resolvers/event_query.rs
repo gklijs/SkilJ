@@ -117,6 +117,8 @@ pub fn query_events_field() -> Field {
                     .await?;
                 }
 
+                let private_field_grants =
+                    super::load_private_field_grants(&state.pool, &bounded_context_name).await?;
                 let results = skilj_core::event_store::query_events(
                     &access_mapping,
                     &event_types,
@@ -124,6 +126,7 @@ pub fn query_events_field() -> Field {
                     after_sequence,
                     &bounded_context_events,
                     |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                    &private_field_grants,
                 )
                 .map_err(to_graphql_error)?;
 
@@ -246,11 +249,15 @@ pub fn inspect_event_field() -> Field {
             )
             .await?;
 
-            let inspected =
-                skilj_core::event_store::inspect_event(&access_mapping, &event, |sk, sv| {
-                    data_keys.get(&(sk.to_string(), sv.to_string())).cloned()
-                })
-                .map_err(to_graphql_error)?;
+            let private_field_grants =
+                super::load_private_field_grants(&state.pool, &bounded_context_name).await?;
+            let inspected = skilj_core::event_store::inspect_event(
+                &access_mapping,
+                &event,
+                |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                &private_field_grants,
+            )
+            .map_err(to_graphql_error)?;
 
             Ok(Some(FieldValue::owned_any(InspectedEventData {
                 event: inspected.event,

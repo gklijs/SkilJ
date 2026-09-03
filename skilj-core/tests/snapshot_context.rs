@@ -43,6 +43,14 @@ impl SnapshotDispatcher for TestSnapshotDispatcher {
         (snapshot_name == "Balance").then_some(self.tag_key)
     }
 
+    fn owner_tag_key(
+        &self,
+        _bounded_context: &str,
+        snapshot_name: &str,
+    ) -> Option<Option<&'static str>> {
+        (snapshot_name == "Balance").then_some(None)
+    }
+
     fn version(&self, _bounded_context: &str, snapshot_name: &str) -> Option<u64> {
         (snapshot_name == "Balance").then_some(self.version)
     }
@@ -196,6 +204,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str, tag_key: 
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
         system_triggered_allowed: false,

@@ -473,6 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &command_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             Utc::now(),
         )?;
         db::insert_command_token(&pool, &token).await?;

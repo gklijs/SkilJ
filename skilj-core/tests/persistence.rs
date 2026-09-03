@@ -31,8 +31,8 @@
 
 use chrono::{SubsecRound, Utc};
 use skilj_core::access_control::{
-    AccessLevel, DirectCreationToken, EventReadToken, ExternalEventToken, Role, RoleAccessMapping,
-    RoleStatus, TokenStatus,
+    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken, Role,
+    RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, AccessTokenKind, Pool};
@@ -182,6 +182,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
         system_triggered_allowed: false,
@@ -204,6 +205,7 @@ async fn seed_command_type(pool: &Pool, bc: &BoundedContext) -> CommandType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         rest_trigger_allowed: true,
     };
     db::upsert_command_type(pool, &ct).await.unwrap();
@@ -484,6 +486,11 @@ fn round_trips_an_external_event_token_and_its_kind() {
             created_at: test_now(),
             revoked_at: None,
             event_type: et,
+            // A real value, not just None - cross-tenant write fix
+            // (docs/architecture.md's own write-up of these passes):
+            // proves the shared access_tokens.scope column actually
+            // round-trips for this kind now too, not only `event_read`.
+            scope: Some("acme".into()),
         };
         db::insert_external_event_token(&pool, &token)
             .await
@@ -528,6 +535,7 @@ fn round_trips_a_direct_creation_token() {
             created_at: test_now(),
             revoked_at: None,
             event_type: et,
+            scope: None,
         };
         db::insert_direct_creation_token(&pool, &token)
             .await
@@ -551,6 +559,54 @@ fn round_trips_a_direct_creation_token() {
         assert_eq!(
             loaded,
             DirectCreationToken {
+                secret: loaded.secret.clone(),
+                ..token
+            }
+        );
+    });
+}
+
+/// No prior round-trip test existed for `CommandToken` at all - this is
+/// new coverage, not just a scope addition, for `insert_command_token`/
+/// `get_command_token` (the write-side pass changed both: `scope` joined
+/// `insert_command_token`'s own hand-written `INSERT`, which previously
+/// wrote no `scope` column at all, unlike the three `insert_access_token_row`-
+/// backed kinds - see `insert_command_token`'s own doc comment for why
+/// it stays hand-written).
+#[test]
+fn round_trips_a_command_token() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let ct = seed_command_type(&pool, &bc).await;
+        let token = CommandToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            command_type: ct,
+            scope: Some("acme".into()),
+        };
+        db::insert_command_token(&pool, &token).await.unwrap();
+
+        assert_eq!(
+            db::access_token_kind(&pool, &token.id).await.unwrap(),
+            Some(AccessTokenKind::Command)
+        );
+        let loaded = db::get_command_token(&pool, &token.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.secret,
+            skilj_core::shared::hash_secret(&token.secret)
+        );
+        assert_eq!(
+            loaded,
+            CommandToken {
                 secret: loaded.secret.clone(),
                 ..token
             }
@@ -622,6 +678,7 @@ fn getting_a_token_by_the_wrong_kind_returns_none() {
             created_at: test_now(),
             revoked_at: None,
             event_type: et,
+            scope: None,
         };
         db::insert_external_event_token(&pool, &token)
             .await
@@ -1585,6 +1642,7 @@ fn hard_delete_drops_the_schema_and_cascades_the_registry_row() {
             created_at: test_now(),
             revoked_at: None,
             event_type: et.clone(),
+            scope: None,
         };
         db::insert_external_event_token(&pool, &token)
             .await

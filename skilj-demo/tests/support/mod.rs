@@ -242,6 +242,7 @@ pub async fn mint_command_token(
         &command_type,
         generate_token_id(),
         generate_token_secret(),
+        None,
         test_now(),
     )
     .unwrap();

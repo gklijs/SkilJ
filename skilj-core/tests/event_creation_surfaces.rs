@@ -5,11 +5,11 @@
 //! `DirectlyCreated`, rules `CreateExternalEvent`/`CreateDirectEvent`.
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
-//! filtered to this pair of surfaces' ten source constructs): 22 total
-//! (18 from the original pass, plus rule-failure.CreateExternalEvent.4/5
-//! and CreateDirectEvent.4/5 - `valid_payload`'s own requires clause on
-//! both rules, renumbered to .5 once the drift audit's P4 batch added
-//! `event_type.bounded_context.status = active` at .4 on each).
+//! filtered to this pair of surfaces' ten source constructs): 24 total
+//! (22 from the prior count, plus rule-failure.CreateExternalEvent.6 and
+//! CreateDirectEvent.6 - the cross-tenant write fix's own new
+//! `tag_owner_scope_satisfied` requires clause on both rules,
+//! docs/architecture.md's own write-up of these passes).
 //! Uncovered this pass, with reason - see the doc comment at the bottom
 //! of this file: `surface-actor`/`surface-provides` for each surface (4),
 //! same REST-scaffolding gap as EventFetch's three uncovered obligations.
@@ -42,6 +42,7 @@ fn event_type(external_creation_allowed: bool, direct_creation_allowed: bool) ->
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed,
         direct_creation_allowed,
         system_triggered_allowed: false,
@@ -65,6 +66,7 @@ fn external_token(status: TokenStatus, event_type: EventType) -> ExternalEventTo
         created_at: timestamp(0),
         revoked_at: None,
         event_type,
+        scope: None,
     }
 }
 
@@ -76,6 +78,7 @@ fn direct_token(status: TokenStatus, event_type: EventType) -> DirectCreationTok
         created_at: timestamp(0),
         revoked_at: None,
         event_type,
+        scope: None,
     }
 }
 
@@ -307,6 +310,77 @@ fn create_external_event_derives_real_tags_from_a_real_tag_mapping() {
     );
 }
 
+/// rule-failure.CreateExternalEvent.6 - `requires:
+/// tag_owner_scope_satisfied(tags, event_type.owner_tag_key, adapter.scope)` -
+/// cross-tenant write fix (docs/architecture.md's own write-up of these
+/// passes). A token scoped to one company cannot create an event whose
+/// own derived owner tag names another.
+#[test]
+fn create_external_event_rejects_an_event_whose_owner_does_not_match_the_tokens_scope() {
+    let et = EventType {
+        owner_tag_key: Some("company".into()),
+        tag_mappings: vec![skilj_core::shared::TagMapping {
+            key: "company".into(),
+            field: "company_id".into(),
+        }],
+        ..event_type(true, false)
+    };
+    let adapter = ExternalEventToken {
+        scope: Some("acme".into()),
+        ..external_token(TokenStatus::Active, et)
+    };
+
+    let err = event_store::create_external_event(
+        &adapter,
+        r#"{"company_id":"globex"}"#.into(),
+        "raw".into(),
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
+}
+
+/// The success half of the same obligation - a matching owner still
+/// creates the event normally.
+#[test]
+fn create_external_event_succeeds_when_the_owner_matches_the_tokens_scope() {
+    let et = EventType {
+        owner_tag_key: Some("company".into()),
+        tag_mappings: vec![skilj_core::shared::TagMapping {
+            key: "company".into(),
+            field: "company_id".into(),
+        }],
+        ..event_type(true, false)
+    };
+    let adapter = ExternalEventToken {
+        scope: Some("acme".into()),
+        ..external_token(TokenStatus::Active, et)
+    };
+
+    let event = event_store::create_external_event(
+        &adapter,
+        r#"{"company_id":"acme"}"#.into(),
+        "raw".into(),
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        event.tags,
+        vec![skilj_core::shared::Tag {
+            key: "company".into(),
+            value: Some("acme".into()),
+        }]
+    );
+}
+
 // ---------------------------------------------------------------------
 // rule-success.CreateDirectEvent / rule-failure.CreateDirectEvent.{1,2,3,4,5}
 // / rule-entity-creation.CreateDirectEvent.1 / sum-type-variant.DirectlyCreated
@@ -448,6 +522,96 @@ fn create_direct_event_rejects_a_payload_that_does_not_match_the_schema() {
         err.code(),
         event_store::Error::PayloadDoesNotMatchSchema.code()
     );
+}
+
+/// rule-failure.CreateDirectEvent.6 - `requires:
+/// tag_owner_scope_satisfied(tags, event_type.owner_tag_key, adapter.scope)` -
+/// same obligation as `CreateExternalEvent`'s own above, checked against
+/// a `DirectCreationToken` instead.
+#[test]
+fn create_direct_event_rejects_an_event_whose_owner_does_not_match_the_tokens_scope() {
+    let et = EventType {
+        owner_tag_key: Some("company".into()),
+        tag_mappings: vec![skilj_core::shared::TagMapping {
+            key: "company".into(),
+            field: "company_id".into(),
+        }],
+        ..event_type(false, true)
+    };
+    let adapter = DirectCreationToken {
+        scope: Some("acme".into()),
+        ..direct_token(TokenStatus::Active, et)
+    };
+
+    let err = event_store::create_direct_event(
+        &adapter,
+        r#"{"company_id":"globex"}"#.into(),
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
+}
+
+/// The success half - a matching owner, and a payload naming no owner at
+/// all (so no tag is derived) rejected the identical fail-closed way as
+/// a mismatch.
+#[test]
+fn create_direct_event_succeeds_when_the_owner_matches_the_tokens_scope() {
+    let et = EventType {
+        owner_tag_key: Some("company".into()),
+        tag_mappings: vec![skilj_core::shared::TagMapping {
+            key: "company".into(),
+            field: "company_id".into(),
+        }],
+        ..event_type(false, true)
+    };
+    let adapter = DirectCreationToken {
+        scope: Some("acme".into()),
+        ..direct_token(TokenStatus::Active, et)
+    };
+
+    let event = event_store::create_direct_event(
+        &adapter,
+        r#"{"company_id":"acme"}"#.into(),
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        event.tags,
+        vec![skilj_core::shared::Tag {
+            key: "company".into(),
+            value: Some("acme".into()),
+        }]
+    );
+}
+
+#[test]
+fn create_direct_event_rejects_a_payload_naming_no_owner_at_all_when_scoped() {
+    let et = EventType {
+        owner_tag_key: Some("company".into()),
+        tag_mappings: vec![skilj_core::shared::TagMapping {
+            key: "company".into(),
+            field: "company_id".into(),
+        }],
+        ..event_type(false, true)
+    };
+    let adapter = DirectCreationToken {
+        scope: Some("acme".into()),
+        ..direct_token(TokenStatus::Active, et)
+    };
+
+    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
+        unreachable!("no sensitive fields in this test")
+    })
+    .unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
 }
 
 // ---------------------------------------------------------------------

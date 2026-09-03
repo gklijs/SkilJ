@@ -325,6 +325,7 @@ fn subject_erasure_end_to_end() {
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();

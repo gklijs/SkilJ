@@ -85,6 +85,18 @@ impl CommandType for WithdrawMoney {
             field: "amount".into(),
         }]
     }
+    /// Cross-tenant write fix (docs/architecture.md's own write-up of
+    /// these passes) - reuses the existing `amount` tag mapping as the
+    /// owner dimension, purely so `command_trigger_rejects_...`/
+    /// `command_trigger_succeeds_when_...` below have a real declared
+    /// owner to test a scoped `CommandToken` against, over the actual
+    /// REST surface. Every *other* test in this file mints its token
+    /// with `scope: None` (`setup()`'s own default), so this is
+    /// vacuously true for them - no behaviour change to anything already
+    /// passing here.
+    fn owner_tag_key() -> Option<&'static str> {
+        Some("amount")
+    }
     /// Deliberately simple: rejects anything over 1000, otherwise emits
     /// one `MoneyDeposited` event carrying the same amount - just enough
     /// behaviour to exercise both `CommandTrigger` outcomes (§5.4/§7.3)
@@ -214,8 +226,19 @@ fn test_now() -> chrono::DateTime<Utc> {
 /// Builds a fully reconciled `Skilj` (both `MoneyDeposited`/`WithdrawMoney`
 /// registered) plus a real, minted `CommandToken` for `WithdrawMoney` -
 /// everything a `POST /v1/commands/trigger` test needs to send a real
-/// request against a real router.
-async fn setup() -> (Skilj, String, Pool, String) {
+/// request against a real router. The trailing `RoleAccessMapping`/
+/// `CommandType` are for callers that need to mint a second,
+/// differently-scoped token of their own (cross-tenant write fix,
+/// docs/architecture.md's own write-up of these passes) - every other
+/// test in this file only destructures the first four.
+async fn setup() -> (
+    Skilj,
+    String,
+    Pool,
+    String,
+    RoleAccessMapping,
+    skilj_core::event_store::CommandType,
+) {
     let (database_url, pool) = test_db()
         .await
         .expect("test_db() must be Some - caller already checked");
@@ -276,13 +299,14 @@ async fn setup() -> (Skilj, String, Pool, String) {
         &command_type,
         generate_token_id(),
         generate_token_secret(),
+        None,
         test_now(),
     )
     .unwrap();
     db::insert_command_token(&pool, &token).await.unwrap();
 
     let credential = format!("{}.{}", token.id, token.secret);
-    (skilj, credential, pool, bc_name)
+    (skilj, credential, pool, bc_name, mapping, command_type)
 }
 
 #[test]
@@ -291,7 +315,7 @@ fn command_trigger_accepts_and_persists_triggered_events() {
         if test_db().await.is_none() {
             return;
         }
-        let (skilj, credential, pool, bc_name) = setup().await;
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
         let router = skilj.rest_router();
 
         let request = Request::builder()
@@ -341,7 +365,7 @@ fn command_trigger_deduplicates_a_repeated_idempotency_key() {
         if test_db().await.is_none() {
             return;
         }
-        let (skilj, credential, pool, bc_name) = setup().await;
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
         let router = skilj.rest_router();
 
         let request = || {
@@ -414,7 +438,7 @@ fn command_trigger_rejects_a_payload_that_does_not_match_the_schema_with_400() {
         if test_db().await.is_none() {
             return;
         }
-        let (skilj, credential, _pool, _bc_name) = setup().await;
+        let (skilj, credential, _pool, _bc_name, _, _) = setup().await;
         let router = skilj.rest_router();
 
         let request = Request::builder()
@@ -446,7 +470,7 @@ fn command_trigger_derives_real_tags_from_a_real_tag_mapping() {
         if test_db().await.is_none() {
             return;
         }
-        let (skilj, credential, pool, bc_name) = setup().await;
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
         let router = skilj.rest_router();
 
         let request = Request::builder()
@@ -479,13 +503,116 @@ fn command_trigger_derives_real_tags_from_a_real_tag_mapping() {
     });
 }
 
+/// Cross-tenant write fix (docs/architecture.md's own write-up of these
+/// passes), the real end-to-end proof - the previously open gap this
+/// pass closes: `setup()`'s own token has `scope: None`, so this mints a
+/// *second*, real `CommandToken` scoped to `"20"` and proves it can no
+/// longer trigger `WithdrawMoney` for a *different* owner - over the
+/// actual REST surface and a real HTTP status, not just
+/// `authorise_command_trigger`'s own pure-function unit tests in
+/// `skilj-core/tests/command_processing.rs`. Also the regression test
+/// for a real bug this same pass found while writing it:
+/// `Error::GrantScopeMismatch` had no entry in `skilj-rest`'s own
+/// `status_for` table, so it fell through to 500 instead of 403 the
+/// first time this became reachable over REST at all - see that table's
+/// own comment.
+#[test]
+fn command_trigger_rejects_a_command_whose_owner_does_not_match_the_tokens_scope() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, _credential, pool, bc_name, mapping, command_type) = setup().await;
+        let scoped_token = access_control::create_command_token(
+            &mapping,
+            &command_type,
+            generate_token_id(),
+            generate_token_secret(),
+            Some("20".into()),
+            test_now(),
+        )
+        .unwrap();
+        db::insert_command_token(&pool, &scoped_token)
+            .await
+            .unwrap();
+        let scoped_credential = format!("{}.{}", scoped_token.id, scoped_token.secret);
+        let router = skilj.rest_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/commands/trigger")
+            .header("authorization", format!("Bearer {scoped_credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"payload":{"amount":999}}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "grant_scope_mismatch");
+
+        // Nothing was written - a rejected authorisation never reaches
+        // process_command at all.
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+    });
+}
+
+/// The success half of the same obligation - the identical scoped token
+/// triggers normally when the payload's own derived owner tag matches.
+#[test]
+fn command_trigger_succeeds_when_the_owner_matches_the_tokens_scope() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, _credential, pool, bc_name, mapping, command_type) = setup().await;
+        let scoped_token = access_control::create_command_token(
+            &mapping,
+            &command_type,
+            generate_token_id(),
+            generate_token_secret(),
+            Some("20".into()),
+            test_now(),
+        )
+        .unwrap();
+        db::insert_command_token(&pool, &scoped_token)
+            .await
+            .unwrap();
+        let scoped_credential = format!("{}.{}", scoped_token.id, scoped_token.secret);
+        let router = skilj.rest_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/commands/trigger")
+            .header("authorization", format!("Bearer {scoped_credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"payload":{"amount":20}}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["accepted"], true);
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    });
+}
+
 #[test]
 fn command_trigger_returns_a_rejection_as_200_not_an_error() {
     runtime().block_on(async {
         if test_db().await.is_none() {
             return;
         }
-        let (skilj, credential, _pool, _bc_name) = setup().await;
+        let (skilj, credential, _pool, _bc_name, _, _) = setup().await;
         let router = skilj.rest_router();
 
         let request = Request::builder()
@@ -513,7 +640,7 @@ fn command_trigger_rejects_a_malformed_credential() {
         if test_db().await.is_none() {
             return;
         }
-        let (skilj, _credential, _pool, _bc_name) = setup().await;
+        let (skilj, _credential, _pool, _bc_name, _, _) = setup().await;
         let router = skilj.rest_router();
 
         let request = Request::builder()
@@ -540,7 +667,7 @@ fn command_dispatcher_required_role_reflects_the_requires_role_attribute() {
         if test_db().await.is_none() {
             return;
         }
-        let (skilj, _credential, _pool, bc_name) = setup().await;
+        let (skilj, _credential, _pool, bc_name, _, _) = setup().await;
         let dispatcher = skilj.command_dispatcher();
 
         // #[requires_role("treasury_officer")] on CloseAccount...

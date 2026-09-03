@@ -52,6 +52,7 @@ fn scheduled_event_type(
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: true,

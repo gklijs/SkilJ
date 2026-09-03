@@ -258,10 +258,27 @@ pub fn all_events_field() -> SubscriptionField {
                             if let Subscription::AllEventsSubscription(s) = &mut current {
                                 s.access_mapping = fresh_mapping;
                             }
+                            // Same "live, never snapshot-at-subscribe-time"
+                            // treatment as `fresh_mapping` above - a grant
+                            // made or revoked after this connection opened
+                            // still takes effect on the very next delivery.
+                            let private_field_grants = match skilj_core::db::list_private_field_grants_for_context(
+                                &state.pool,
+                                &bounded_context_name,
+                            )
+                            .await
+                            {
+                                Ok(grants) => grants,
+                                Err(err) => {
+                                    yielder.yield_error(to_graphql_error(err)).await;
+                                    return Ok(());
+                                }
+                            };
                             for delivered in event_store::deliver_to_subscriptions(
                                 &event,
                                 std::slice::from_ref(&current),
                                 |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                                &private_field_grants,
                             ) {
                                 yielder
                                     .yield_ok(FieldValue::owned_any((
@@ -422,10 +439,24 @@ pub fn events_by_type_field() -> SubscriptionField {
                             if let Subscription::EventTypeSubscription(s) = &mut current {
                                 s.access_mapping = fresh_mapping;
                             }
+                            // See `all_events_field`'s own identical comment.
+                            let private_field_grants = match skilj_core::db::list_private_field_grants_for_context(
+                                &state.pool,
+                                &bounded_context_name,
+                            )
+                            .await
+                            {
+                                Ok(grants) => grants,
+                                Err(err) => {
+                                    yielder.yield_error(to_graphql_error(err)).await;
+                                    return Ok(());
+                                }
+                            };
                             for delivered in event_store::deliver_to_subscriptions(
                                 &event,
                                 std::slice::from_ref(&current),
                                 |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                                &private_field_grants,
                             ) {
                                 yielder
                                     .yield_ok(FieldValue::owned_any((

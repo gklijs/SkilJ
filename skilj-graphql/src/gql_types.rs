@@ -29,8 +29,8 @@ use async_graphql::dynamic::{
 };
 use async_graphql::Value;
 use skilj_core::access_control::{
-    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken, Role,
-    RoleAccessMapping, RoleStatus, TokenStatus,
+    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
+    PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{
@@ -38,7 +38,7 @@ use skilj_core::event_store::{
     EventType, MissedOccurrencePolicy,
 };
 use skilj_core::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
-use skilj_core::shared::{SensitiveField, TagMapping};
+use skilj_core::shared::{PrivateField, PrivateFieldKind, SensitiveField, TagMapping};
 use skilj_macros::gql_object;
 
 /// A scalar (or nullable-scalar) field resolved synchronously from the
@@ -324,6 +324,70 @@ pub fn sensitive_field_input() -> InputObject {
         ))
 }
 
+/// `enum PrivateFieldKind`.
+pub fn private_field_kind_enum() -> Enum {
+    Enum::new("PrivateFieldKind")
+        .item("OWN")
+        .item("TEAM")
+        .item("ADDRESSED")
+}
+
+fn private_field_kind_name(kind: PrivateFieldKind) -> &'static str {
+    match kind {
+        PrivateFieldKind::Own => "OWN",
+        PrivateFieldKind::Team => "TEAM",
+        PrivateFieldKind::Addressed => "ADDRESSED",
+    }
+}
+
+/// `value PrivateField`. See `tag_mapping_object`'s own doc comment -
+/// same input/output split.
+pub fn private_field_object() -> Object {
+    gql_object!(PrivateField => "PrivateField" {
+        scalar "field": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.field.clone()),
+        scalar "kind": TypeRef::named_nn("PrivateFieldKind") => |p| Value::from(private_field_kind_name(p.kind)),
+        scalar "team": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.team.clone()),
+        scalar "addresseeField": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.addressee_field.clone()),
+    })
+}
+
+pub fn private_field_input() -> InputObject {
+    InputObject::new("PrivateFieldInput")
+        .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
+        .field(InputValue::new(
+            "kind",
+            TypeRef::named_nn("PrivateFieldKind"),
+        ))
+        .field(InputValue::new("team", TypeRef::named(TypeRef::STRING)))
+        .field(InputValue::new(
+            "addresseeField",
+            TypeRef::named(TypeRef::STRING),
+        ))
+}
+
+/// `entity PrivateFieldGrant`, minus `boundedContext` - the same "already
+/// nested under the context it belongs to" omission
+/// `role_access_mapping_object` makes. `eventSequence`/`commandId` are
+/// this crate's own wire names for the Rust-side `event_sequence`/
+/// `command_id` identity fields - see `access_control::PrivateFieldGrant`'s
+/// own doc comment for why those stand in for the spec's `event: Event?`/
+/// `command: Command?`.
+pub fn private_field_grant_object() -> Object {
+    gql_object!(PrivateFieldGrant => "PrivateFieldGrant" {
+        scalar "id": TypeRef::named_nn(TypeRef::ID) => |g| Value::from(g.id.clone()),
+        object "grantor": TypeRef::named_nn("Role") => |g| Some(g.grantor.clone()),
+        object "grantee": TypeRef::named_nn("Role") => |g| Some(g.grantee.clone()),
+        scalar "eventSequence": TypeRef::named(TypeRef::INT) => |g| match g.event_sequence {
+            Some(seq) => Value::from(seq),
+            None => Value::Null,
+        },
+        scalar "commandId": TypeRef::named(TypeRef::ID) => |g| optional_string(g.command_id.clone()),
+        scalar "status": TypeRef::named_nn("AccessTokenStatus") => |g| Value::from(access_token_status_name(g.status)),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |g| Value::from(g.created_at.to_rfc3339()),
+        scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |g| optional_timestamp(g.revoked_at),
+    })
+}
+
 /// `entity EventType`, minus the relationship projections
 /// (`*_tokens`) - the same "caller resolves it, not a stored field"
 /// treatment every relationship projection gets elsewhere in this
@@ -350,6 +414,7 @@ pub fn event_type_object() -> Object {
         scalar "schedulePosition": TypeRef::named(TypeRef::STRING) => |et| optional_timestamp(et.schedule_position),
         scalar "lastFiredAt": TypeRef::named(TypeRef::STRING) => |et| optional_timestamp(et.last_fired_at),
         scalar "eventReadAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.event_read_allowed),
+        list "privateFields": TypeRef::named_nn_list_nn("PrivateField") => |et| et.private_fields.clone(),
     })
 }
 
@@ -363,6 +428,7 @@ pub fn command_type_object() -> Object {
         scalar "ownerTagKey": TypeRef::named(TypeRef::STRING) => |ct| optional_string(ct.owner_tag_key.clone()),
         list "sensitiveFields": TypeRef::named_nn_list_nn("SensitiveField") => |ct| ct.sensitive_fields.clone(),
         scalar "restTriggerAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |ct| Value::from(ct.rest_trigger_allowed),
+        list "privateFields": TypeRef::named_nn_list_nn("PrivateField") => |ct| ct.private_fields.clone(),
     })
 }
 
@@ -441,9 +507,18 @@ pub fn projection_registration_result_object() -> Object {
 }
 
 /// One `Object` per `AccessToken` variant, sharing the same base fields
-/// (`id`/`secret`/`status`/`createdAt`/`revokedAt`) plus one type-specific
-/// nested field - the same "the enum variant tag is the GraphQL type"
-/// treatment the `AccessToken` union below relies on.
+/// (`id`/`secret`/`status`/`createdAt`/`revokedAt`/`scope`) plus one
+/// type-specific nested field - the same "the enum variant tag is the
+/// GraphQL type" treatment the `AccessToken` union below relies on.
+/// `scope` used to be `EventReadToken`'s alone (cross-tenant read fix,
+/// docs/architecture.md's own write-up of these passes) but was never
+/// actually exposed here even for that one kind - a real admin read-back
+/// gap this macro closes for all four at once, the write-side pass
+/// giving `ExternalEventToken`/`DirectCreationToken`/`CommandToken` the
+/// same Rust field made it obviously wrong to leave any of the four
+/// unreadable, the same "why leave three gaps when one fix closes all
+/// four" reasoning `§26`'s own admin read-back fix already applied to
+/// `owner_tag_key`.
 macro_rules! token_object {
     ($object_name:literal, $rust_type:ty, $scoped_field_name:literal, $scoped_type:literal, $scoped_accessor:expr) => {
         Object::new($object_name)
@@ -471,6 +546,11 @@ macro_rules! token_object {
                 "revokedAt",
                 TypeRef::named(TypeRef::STRING),
                 |t: &$rust_type| optional_timestamp(t.revoked_at),
+            ))
+            .field(scalar_field(
+                "scope",
+                TypeRef::named(TypeRef::STRING),
+                |t: &$rust_type| optional_string(t.scope.clone()),
             ))
             .field(object_field(
                 $scoped_field_name,

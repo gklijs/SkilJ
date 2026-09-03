@@ -282,6 +282,21 @@ const CREATE_FROM_TEMPLATE_MUTATION: &str = "\
         } \
     }";
 
+/// Same as `CREATE_FROM_TEMPLATE_MUTATION` above, plus the optional
+/// `scope` argument and its own read-back - cross-tenant read fix
+/// (docs/architecture.md's own write-up of these passes). A separate
+/// constant rather than adding `$scope` to the shared one above: every
+/// other caller of that one passes no `scope` at all, and this keeps
+/// their own query shape - and so their own `accessMappings` selection
+/// set - untouched.
+const CREATE_FROM_TEMPLATE_WITH_SCOPE_MUTATION: &str = "\
+    mutation($template: String!, $name: String!, $roleId: ID!, $level: AccessLevel!, $scope: String) { \
+        createBoundedContextFromTemplate(template: $template, name: $name, roleId: $roleId, \
+            level: $level, canReadSensitive: false, scope: $scope) { \
+            name accessMappings { scope } \
+        } \
+    }";
+
 const RESYNC_MUTATION: &str = "\
     mutation($bc: String!) { \
         resyncBoundedContextFromTemplate(boundedContext: $bc) { name } \
@@ -572,7 +587,7 @@ fn resync_bounded_context_from_template_pulls_in_a_later_schema_change() {
             mutation($bc: String!) { \
                 registerEventType(boundedContext: $bc, name: \"ResyncFixtureEvent\", \
                     schema: \"{\\\"properties\\\":{\\\"amount\\\":{\\\"type\\\":\\\"number\\\"}}}\", \
-                    tagMappings: [], sensitiveFields: [], externalCreationAllowed: true, \
+                    tagMappings: [], sensitiveFields: [], privateFields: [], externalCreationAllowed: true, \
                     directCreationAllowed: true, systemTriggeredAllowed: false, \
                     eventReadAllowed: true) { name } \
             }";
@@ -612,7 +627,7 @@ fn resync_bounded_context_from_template_pulls_in_a_later_schema_change() {
             mutation($bc: String!) { \
                 registerEventType(boundedContext: $bc, name: \"ResyncFixtureEvent\", \
                     schema: \"{\\\"properties\\\":{\\\"amount\\\":{\\\"type\\\":\\\"number\\\"},\\\"note\\\":{\\\"type\\\":\\\"string\\\"}}}\", \
-                    tagMappings: [], sensitiveFields: [], externalCreationAllowed: true, \
+                    tagMappings: [], sensitiveFields: [], privateFields: [], externalCreationAllowed: true, \
                     directCreationAllowed: true, systemTriggeredAllowed: false, \
                     eventReadAllowed: true) { name schemaVersion } \
             }";
@@ -865,5 +880,95 @@ fn deleting_a_template_does_not_break_its_tenants_own_dispatch() {
             "unexpected errors: {response:?}"
         );
         assert_eq!(response["data"]["submitCommand"]["accepted"], true);
+    });
+}
+
+/// `createBoundedContextFromTemplate`'s own optional `scope` argument
+/// (cross-tenant read fix, docs/architecture.md's own write-up of these
+/// passes): a tenant's initial grant can be created already-scoped, in
+/// this one call, and reads back correctly on the returned
+/// `accessMappings`. Omitting `scope` still creates an unrestricted
+/// grant, exactly as before this argument existed.
+#[test]
+fn create_bounded_context_from_template_carries_scope_onto_the_initial_grant() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let jwks_url = serve_jwks().await;
+
+        let template_name = unique_name("sctpl");
+        insert_bounded_context(&pool, &template_name).await;
+        let (_superadmin, superadmin_jwt) = insert_role(&pool, true, "Superadmin").await;
+        let (scoped_role, _scoped_jwt) = insert_role(&pool, false, "Scoped Tenant Operator").await;
+        let (unscoped_role, _unscoped_jwt) =
+            insert_role(&pool, false, "Unscoped Tenant Operator").await;
+
+        let (skilj, _report) = Skilj::builder(database_url)
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+
+        // A real scope, carried through in the same call.
+        let tenant_name = unique_name("sctnt");
+        let response = graphql_request(
+            &router,
+            &superadmin_jwt,
+            CREATE_FROM_TEMPLATE_WITH_SCOPE_MUTATION,
+            json!({
+                "template": template_name,
+                "name": tenant_name,
+                "roleId": scoped_role.id,
+                "level": "ADMIN",
+                "scope": "company-a",
+            }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["createBoundedContextFromTemplate"]["name"],
+            tenant_name
+        );
+        assert_eq!(
+            response["data"]["createBoundedContextFromTemplate"]["accessMappings"][0]["scope"],
+            "company-a"
+        );
+
+        // Omitted entirely: still unrestricted, exactly as before this
+        // argument existed - a second, independent tenant/role pair so
+        // this assertion can't be satisfied by accidentally reading the
+        // grant above back.
+        let unscoped_tenant_name = unique_name("uctnt");
+        let response = graphql_request(
+            &router,
+            &superadmin_jwt,
+            CREATE_FROM_TEMPLATE_WITH_SCOPE_MUTATION,
+            json!({
+                "template": template_name,
+                "name": unscoped_tenant_name,
+                "roleId": unscoped_role.id,
+                "level": "ADMIN",
+                "scope": null,
+            }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+        assert!(
+            response["data"]["createBoundedContextFromTemplate"]["accessMappings"][0]["scope"]
+                .is_null()
+        );
     });
 }

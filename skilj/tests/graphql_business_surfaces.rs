@@ -134,6 +134,71 @@ impl CommandType for CloseAccount {
     }
 }
 
+// --- a small, separate fixture for the private-field mechanism
+// (docs/architecture.md's own write-up of this pass) - `note` is an
+// `own`-kind private field, visible by default only to whoever submitted
+// the `AddTicketNote` command that created it.
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct TicketNoteAddedPayload {
+    note: String,
+}
+
+struct TicketNoteAdded;
+
+impl EventType for TicketNoteAdded {
+    type Payload = TicketNoteAddedPayload;
+    const NAME: &'static str = "TicketNoteAdded";
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+    fn private_fields() -> Vec<skilj_core::shared::PrivateField> {
+        vec![skilj_core::shared::PrivateField {
+            field: "note".to_string(),
+            kind: skilj_core::shared::PrivateFieldKind::Own,
+            team: None,
+            addressee_field: None,
+        }]
+    }
+}
+
+enum TicketNoteEvent {
+    #[allow(dead_code)]
+    TicketNoteAdded(TicketNoteAddedPayload),
+}
+
+impl BoundedContextEvent for TicketNoteEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "TicketNoteAdded" => {
+                Some(serde_json::from_str(&event.payload).map(TicketNoteEvent::TicketNoteAdded))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct AddTicketNotePayload {
+    note: String,
+}
+
+struct AddTicketNote;
+
+impl CommandType for AddTicketNote {
+    type Payload = AddTicketNotePayload;
+    type Event = TicketNoteEvent;
+    const NAME: &'static str = "AddTicketNote";
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "TicketNoteAdded".to_string(),
+                payload: serde_json::json!({ "note": payload.note }),
+            }],
+        }
+    }
+}
+
 // --- a small, separate fixture for inspectSnapshot (docs/architecture.md
 // §19) - not `BankingEvent`/`WithdrawMoney` above, deliberately: those
 // carry no tags at all, and `Snapshot` needs a real one to scope
@@ -248,6 +313,105 @@ fn do_thing_decision(payload: &DoThingFastPayload, _total: i64) -> CommandDecisi
             event_type: "ThingHappened".to_string(),
             payload: serde_json::json!({ "thing_id": payload.thing_id, "amount": payload.amount }),
         }],
+    }
+}
+
+// --- a second, separate fixture for `inspectSnapshot`'s own owner-tag
+// scoping (cross-tenant read fix, docs/architecture.md's own write-up of
+// these passes) - not `ThingHappened`/`ThingTotalSnapshot` above,
+// deliberately: those carry only one tag ("thing", the snapshot's own
+// `TAG_KEY`), and owner-scoping needs a *second*, distinct tag key to
+// prove the derivation doesn't just default to `TAG_KEY` itself.
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct TicketOpenedPayload {
+    ticket_id: String,
+    company_id: String,
+    amount: i64,
+}
+
+struct TicketOpened;
+
+impl EventType for TicketOpened {
+    type Payload = TicketOpenedPayload;
+    const NAME: &'static str = "TicketOpened";
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+    fn tag_mappings() -> Vec<TagMapping> {
+        vec![
+            TagMapping {
+                key: "ticket".to_string(),
+                field: "ticket_id".to_string(),
+            },
+            TagMapping {
+                key: "company".to_string(),
+                field: "company_id".to_string(),
+            },
+        ]
+    }
+}
+
+enum TicketEvent {
+    TicketOpened(TicketOpenedPayload),
+}
+
+impl BoundedContextEvent for TicketEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "TicketOpened" => {
+                Some(serde_json::from_str(&event.payload).map(TicketEvent::TicketOpened))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct TicketTotalState {
+    total: i64,
+}
+
+struct TicketTotalSnapshot;
+
+impl Snapshot for TicketTotalSnapshot {
+    type State = TicketTotalState;
+    type Event = TicketEvent;
+    const NAME: &'static str = "TicketTotalSnapshot";
+    const TAG_KEY: &'static str = "ticket";
+    const OWNER_TAG_KEY: Option<&'static str> = Some("company");
+    const VERSION: u64 = 1;
+    fn fold(state: &mut Self::State, event: &Self::Event) {
+        match event {
+            TicketEvent::TicketOpened(p) => state.total += p.amount,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct OpenTicketPayload {
+    ticket_id: String,
+    company_id: String,
+    amount: i64,
+}
+
+struct OpenTicket;
+
+impl CommandType for OpenTicket {
+    type Payload = OpenTicketPayload;
+    type Event = TicketEvent;
+    const NAME: &'static str = "OpenTicket";
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "TicketOpened".to_string(),
+                payload: serde_json::json!({
+                    "ticket_id": payload.ticket_id,
+                    "company_id": payload.company_id,
+                    "amount": payload.amount,
+                }),
+            }],
+        }
     }
 }
 
@@ -445,9 +609,14 @@ async fn setup() -> (Skilj, Pool, String, String, Role) {
         .event_type::<MoneyDeposited>()
         .command_type::<WithdrawMoney>()
         .command_type::<CloseAccount>()
+        .event_type::<TicketNoteAdded>()
+        .command_type::<AddTicketNote>()
         .event_type::<ThingHappened>()
         .snapshot::<ThingTotalSnapshot>()
         .command_type::<DoThingFast>()
+        .event_type::<TicketOpened>()
+        .snapshot::<TicketTotalSnapshot>()
+        .command_type::<OpenTicket>()
         .reconciliation_role(admin_subject)
         .build()
         .await
@@ -969,5 +1138,381 @@ fn inspect_snapshot_is_admin_gated_null_when_cold_and_a_real_error_when_unregist
         )
         .await;
         assert_eq!(response["errors"][0]["extensions"]["code"], "grant_not_active");
+    });
+}
+
+/// `inspectSnapshot`'s own owner-tag scoping (cross-tenant read fix,
+/// docs/architecture.md's own write-up of these passes) - the real
+/// vulnerability this whole pass fixes, end to end: before
+/// `RoleAccessMapping.scope`/`Snapshot::OWNER_TAG_KEY` existed, any
+/// active admin-level grant on this bounded context - `company-b`'s own
+/// included - could inspect `company-a`'s own ticket snapshot by
+/// `tagValue` alone. Uses `TicketTotalSnapshot` (`TAG_KEY: "ticket"`,
+/// `OWNER_TAG_KEY: Some("company")`) - a distinct owner tag from the
+/// snapshot's own keying tag, proving the derivation reads the *right*
+/// one, not just `TAG_KEY` by coincidence.
+#[test]
+fn inspect_snapshot_scopes_by_owner_tag_and_fails_closed_on_an_unproven_one() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, admin_jwt, _admin_role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let bc = skilj_core::db::get_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .unwrap();
+
+        const INSPECT_SNAPSHOT: &str = "\
+            query($bc: String!, $name: String!, $tagValue: String!) { \
+                inspectSnapshot(boundedContext: $bc, snapshotName: $name, tagValue: $tagValue) { \
+                    state \
+                } \
+            }";
+
+        let ticket_id = unique_name("ticket");
+
+        // A real TicketOpened for company-a, then force the background
+        // catch-up tick, so a real row exists to inspect.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "name": "OpenTicket", "payload": format!(
+                r#"{{"ticket_id":"{ticket_id}","company_id":"company-a","amount":100}}"#
+            ) }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true);
+
+        skilj_core::db::catch_up_snapshots(&pool, &bc_name, skilj.snapshot_dispatcher().as_ref())
+            .await
+            .unwrap();
+
+        // Helper: a fresh Role with its own admin-level RoleAccessMapping
+        // at the given `scope`, mirroring this file's own officer/write-only
+        // fixture pattern.
+        async fn scoped_admin_jwt(pool: &Pool, bc: &BoundedContext, scope: Option<&str>) -> String {
+            let subject = unique_name("scoped-admin");
+            let role = Role {
+                id: generate_token_id(),
+                external_subject: subject.clone(),
+                name: "ScopedAdmin".to_string(),
+                superadmin: false,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            };
+            skilj_core::db::insert_role(pool, &role).await.unwrap();
+            let mapping = RoleAccessMapping {
+                role,
+                bounded_context: bc.clone(),
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: scope.map(str::to_string),
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            };
+            skilj_core::db::insert_role_access_mapping(pool, &mapping)
+                .await
+                .unwrap();
+            sign_jwt(&subject)
+        }
+
+        // Its own company: allowed, real state.
+        let company_a_jwt = scoped_admin_jwt(&pool, &bc, Some("company-a")).await;
+        let response = graphql_request(
+            &router,
+            Some(&company_a_jwt),
+            INSPECT_SNAPSHOT,
+            json!({ "bc": bc_name, "name": "TicketTotalSnapshot", "tagValue": ticket_id }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let state: serde_json::Value =
+            serde_json::from_str(response["data"]["inspectSnapshot"]["state"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(state["total"], 100);
+
+        // Company B's ticket: rejected - the concrete cross-tenant read
+        // this pass closes.
+        let company_b_jwt = scoped_admin_jwt(&pool, &bc, Some("company-b")).await;
+        let response = graphql_request(
+            &router,
+            Some(&company_b_jwt),
+            INSPECT_SNAPSHOT,
+            json!({ "bc": bc_name, "name": "TicketTotalSnapshot", "tagValue": ticket_id }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "grant_scope_mismatch"
+        );
+
+        // A never-touched tag_value: fail-closed the same way, not the
+        // ordinary "cold" null - a scoped caller can't tell the two
+        // apart (see SnapshotInspection's own GrantScopedToOwnerWhenDeclared).
+        let response = graphql_request(
+            &router,
+            Some(&company_a_jwt),
+            INSPECT_SNAPSHOT,
+            json!({ "bc": bc_name, "name": "TicketTotalSnapshot", "tagValue": unique_name("never-touched") }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "grant_scope_mismatch"
+        );
+
+        // An unscoped admin grant is unrestricted, deliberately - the
+        // original admin fixture from setup().
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            INSPECT_SNAPSHOT,
+            json!({ "bc": bc_name, "name": "TicketTotalSnapshot", "tagValue": ticket_id }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let state: serde_json::Value =
+            serde_json::from_str(response["data"]["inspectSnapshot"]["state"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(state["total"], 100);
+    });
+}
+
+/// The private-field mechanism's own real end-to-end proof
+/// (docs/architecture.md's own write-up of this pass): an `own`-kind
+/// field defaults to visible only to its creator; a colleague sees it
+/// only after a real `grantPrivateFieldAccessForEvent`, loses it again
+/// after `revokePrivateFieldAccess`, and `listPrivateFieldGrants` reads
+/// both states back.
+#[test]
+fn private_field_grant_lifecycle_end_to_end() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, creator_jwt, creator_role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let bc = skilj_core::db::get_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A second, ordinary Role on the same bounded context - the
+        // colleague this test shares (and stops sharing) the note with.
+        let colleague_subject = unique_name("colleague");
+        let colleague_role = Role {
+            id: generate_token_id(),
+            external_subject: colleague_subject.clone(),
+            name: "Colleague".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &colleague_role)
+            .await
+            .unwrap();
+        let colleague_mapping = RoleAccessMapping {
+            role: colleague_role.clone(),
+            bounded_context: bc,
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &colleague_mapping)
+            .await
+            .unwrap();
+        let colleague_jwt = sign_jwt(&colleague_subject);
+
+        const INSPECT_EVENT: &str = "\
+            query($bc: String!, $seq: Int!) { \
+                inspectEvent(boundedContext: $bc, sequence: $seq) { renderedPayload } \
+            }";
+
+        // The creator submits the command that creates the note.
+        let response = graphql_request(
+            &router,
+            Some(&creator_jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "name": "AddTicketNote", "payload": r#"{"note":"call back Monday"}"# }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true);
+        let sequence = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+
+        // The creator reads its own note back in full.
+        let response = graphql_request(
+            &router,
+            Some(&creator_jwt),
+            INSPECT_EVENT,
+            json!({ "bc": bc_name, "seq": sequence }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["inspectEvent"]["renderedPayload"],
+            r#"{"note":"call back Monday"}"#
+        );
+
+        // The colleague, with no grant yet, gets the record with the
+        // private leaf redacted to null - not withheld, not an error.
+        let response = graphql_request(
+            &router,
+            Some(&colleague_jwt),
+            INSPECT_EVENT,
+            json!({ "bc": bc_name, "seq": sequence }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["inspectEvent"]["renderedPayload"],
+            r#"{"note":null}"#
+        );
+
+        // The creator shares this one record with the colleague.
+        const GRANT_FOR_EVENT: &str = "\
+            mutation($bc: String!, $grantee: ID!, $seq: Int!) { \
+                grantPrivateFieldAccessForEvent(boundedContext: $bc, granteeRoleId: $grantee, eventSequence: $seq) { \
+                    id status grantee { id } \
+                } \
+            }";
+        let response = graphql_request(
+            &router,
+            Some(&creator_jwt),
+            GRANT_FOR_EVENT,
+            json!({ "bc": bc_name, "grantee": colleague_role.id, "seq": sequence }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["grantPrivateFieldAccessForEvent"]["status"],
+            "ACTIVE"
+        );
+        assert_eq!(
+            response["data"]["grantPrivateFieldAccessForEvent"]["grantee"]["id"],
+            colleague_role.id
+        );
+        let grant_id = response["data"]["grantPrivateFieldAccessForEvent"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The colleague now reads the note in full.
+        let response = graphql_request(
+            &router,
+            Some(&colleague_jwt),
+            INSPECT_EVENT,
+            json!({ "bc": bc_name, "seq": sequence }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["inspectEvent"]["renderedPayload"],
+            r#"{"note":"call back Monday"}"#
+        );
+
+        // The creator lists its own outgoing grants and finds it, active.
+        const LIST_GRANTS: &str = "\
+            query($bc: String!) { \
+                listPrivateFieldGrants(boundedContext: $bc) { id status grantee { id } } \
+            }";
+        let response = graphql_request(
+            &router,
+            Some(&creator_jwt),
+            LIST_GRANTS,
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let grants = response["data"]["listPrivateFieldGrants"].as_array().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0]["id"], grant_id);
+        assert_eq!(grants[0]["status"], "ACTIVE");
+
+        // The creator revokes it.
+        const REVOKE_GRANT: &str = "\
+            mutation($bc: String!, $id: ID!) { \
+                revokePrivateFieldAccess(boundedContext: $bc, grantId: $id) { status } \
+            }";
+        let response = graphql_request(
+            &router,
+            Some(&creator_jwt),
+            REVOKE_GRANT,
+            json!({ "bc": bc_name, "id": grant_id }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["revokePrivateFieldAccess"]["status"],
+            "REVOKED"
+        );
+
+        // The colleague is redacted again - the same fail-closed answer
+        // as before any grant ever existed.
+        let response = graphql_request(
+            &router,
+            Some(&colleague_jwt),
+            INSPECT_EVENT,
+            json!({ "bc": bc_name, "seq": sequence }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["inspectEvent"]["renderedPayload"],
+            r#"{"note":null}"#
+        );
+
+        // A colleague with no grant of their own may not revoke - a
+        // grantor-only action - nor may they list someone else's grants
+        // without admin level, even though this colleague happens to
+        // hold Admin here: naming a different grantor still requires it,
+        // and this colleague is not that grantor's own admin.
+        let response = graphql_request(
+            &router,
+            Some(&colleague_jwt),
+            LIST_GRANTS,
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        // The colleague's own outgoing grants: none made.
+        assert_eq!(
+            response["data"]["listPrivateFieldGrants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // Naming the creator as grantor from the colleague's own
+        // (admin-level) mapping succeeds - any admin may audit any
+        // grantor in its own bounded context.
+        const LIST_GRANTS_FOR: &str = "\
+            query($bc: String!, $grantor: ID!) { \
+                listPrivateFieldGrants(boundedContext: $bc, grantorRoleId: $grantor) { id status } \
+            }";
+        let response = graphql_request(
+            &router,
+            Some(&colleague_jwt),
+            LIST_GRANTS_FOR,
+            json!({ "bc": bc_name, "grantor": creator_role.id }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let grants = response["data"]["listPrivateFieldGrants"].as_array().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0]["status"], "REVOKED");
     });
 }

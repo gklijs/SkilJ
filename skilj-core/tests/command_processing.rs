@@ -10,10 +10,11 @@
 //! fully covered here via the `CommandToken` one.
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
-//! filtered to this pass's source constructs): 27 total (25 from the
-//! original pass, plus rule-failure.AuthoriseCommandTrigger.5/
-//! AuthoriseCommandSubmission.5 - `valid_payload`'s own new requires
-//! clause on both rules).
+//! filtered to this pass's source constructs): 29 total (27 from the
+//! prior count, plus rule-failure.AuthoriseCommandTrigger.6/
+//! AuthoriseCommandSubmission.6 - the cross-tenant write fix's own new
+//! `tag_owner_scope_satisfied` requires clause on both rules,
+//! docs/architecture.md's own write-up of these passes).
 //! Uncovered/deferred, with reason - see the doc comment at the bottom of
 //! this file:
 //!   - `surface-actor`/`surface-provides.CommandTrigger` (2) - REST-
@@ -66,6 +67,7 @@ fn command_type(
         tag_mappings,
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         rest_trigger_allowed,
     }
 }
@@ -78,6 +80,7 @@ fn command_token(status: TokenStatus, command_type: CommandType) -> CommandToken
         created_at: timestamp(0),
         revoked_at: None,
         command_type,
+        scope: None,
     }
 }
 
@@ -90,6 +93,7 @@ fn event_type() -> EventType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,
@@ -262,6 +266,92 @@ fn authorise_command_trigger_rejects_a_payload_that_does_not_match_the_schema() 
     );
 }
 
+/// rule-failure.AuthoriseCommandTrigger.6 - `requires:
+/// tag_owner_scope_satisfied(consistency_tags, command_type.owner_tag_key,
+/// token.scope)` - cross-tenant write fix (docs/architecture.md's own
+/// write-up of these passes). A token scoped to one company cannot
+/// trigger a command whose own derived owner tag names another.
+#[test]
+fn authorise_command_trigger_rejects_a_command_whose_owner_does_not_match_the_tokens_scope() {
+    let ct = CommandType {
+        owner_tag_key: Some("company".into()),
+        ..command_type(
+            true,
+            vec![skilj_core::shared::TagMapping {
+                key: "company".into(),
+                field: "company_id".into(),
+            }],
+        )
+    };
+    let token = CommandToken {
+        scope: Some("acme".into()),
+        ..command_token(TokenStatus::Active, ct)
+    };
+
+    let err = event_store::authorise_command_trigger(&token, r#"{"company_id":"globex"}"#.into())
+        .unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
+}
+
+/// The success half of the same obligation - a matching owner still
+/// triggers normally, and a payload naming no owner at all (so no tag is
+/// derived) is rejected the identical fail-closed way as a mismatch, not
+/// treated as vacuously fine.
+#[test]
+fn authorise_command_trigger_succeeds_when_the_owner_matches_the_tokens_scope() {
+    let ct = CommandType {
+        owner_tag_key: Some("company".into()),
+        ..command_type(
+            true,
+            vec![skilj_core::shared::TagMapping {
+                key: "company".into(),
+                field: "company_id".into(),
+            }],
+        )
+    };
+    let token = CommandToken {
+        scope: Some("acme".into()),
+        ..command_token(TokenStatus::Active, ct)
+    };
+
+    let authorised =
+        event_store::authorise_command_trigger(&token, r#"{"company_id":"acme"}"#.into()).unwrap();
+
+    assert_eq!(
+        authorised.consistency_tags,
+        vec![skilj_core::shared::Tag {
+            key: "company".into(),
+            value: Some("acme".into()),
+        }]
+    );
+}
+
+#[test]
+fn authorise_command_trigger_rejects_a_payload_naming_no_owner_at_all_when_scoped() {
+    let ct = CommandType {
+        owner_tag_key: Some("company".into()),
+        ..command_type(
+            true,
+            vec![skilj_core::shared::TagMapping {
+                key: "company".into(),
+                field: "company_id".into(),
+            }],
+        )
+    };
+    let token = CommandToken {
+        scope: Some("acme".into()),
+        ..command_token(TokenStatus::Active, ct)
+    };
+
+    // No company_id field at all in the payload - derive_tags produces no
+    // "company" tag, so there is nothing to affirmatively match "acme"
+    // against. Fails closed, the same as a real mismatch.
+    let err = event_store::authorise_command_trigger(&token, "{}".into()).unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
+}
+
 // ---------------------------------------------------------------------
 // rule-success.AuthoriseCommandSubmission / rule-failure.AuthoriseCommandSubmission.{1,2,3,4,5}
 // ---------------------------------------------------------------------
@@ -392,6 +482,116 @@ fn authorise_command_submission_rejects_a_payload_that_does_not_match_the_schema
         err.code(),
         event_store::Error::PayloadDoesNotMatchSchema.code()
     );
+}
+
+/// rule-failure.AuthoriseCommandSubmission.6 - `requires:
+/// tag_owner_scope_satisfied(consistency_tags, command_type.owner_tag_key,
+/// access_mapping.scope)` - cross-tenant write fix (docs/architecture.md's
+/// own write-up of these passes), the write-side counterpart to
+/// `authorise_command_trigger`'s identical new obligation above. A grant
+/// scoped to one company cannot submit a command whose own derived owner
+/// tag names another - the previously-open gap: this grant could no
+/// longer *read* another company's records after the read-side passes,
+/// but could still blindly submit commands that mutated them.
+#[test]
+fn authorise_command_submission_rejects_a_command_whose_owner_does_not_match_the_grants_scope() {
+    let ct = CommandType {
+        owner_tag_key: Some("company".into()),
+        ..command_type(
+            true,
+            vec![skilj_core::shared::TagMapping {
+                key: "company".into(),
+                field: "company_id".into(),
+            }],
+        )
+    };
+    let mapping = RoleAccessMapping {
+        scope: Some("acme".into()),
+        ..access_mapping(
+            RoleStatus::Active,
+            AccessLevel::Write,
+            ct.bounded_context.clone(),
+        )
+    };
+
+    let err = event_store::authorise_command_submission(
+        &mapping,
+        &ct,
+        r#"{"company_id":"globex"}"#.into(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
+}
+
+/// The success half - a matching owner still submits normally, and the
+/// returned `consistency_tags` (the Rust-only field carrying what would
+/// otherwise be recomputed by every caller - see `CommandAuthorised`'s
+/// own doc comment) reflects the derived tag.
+#[test]
+fn authorise_command_submission_succeeds_when_the_owner_matches_the_grants_scope() {
+    let ct = CommandType {
+        owner_tag_key: Some("company".into()),
+        ..command_type(
+            true,
+            vec![skilj_core::shared::TagMapping {
+                key: "company".into(),
+                field: "company_id".into(),
+            }],
+        )
+    };
+    let mapping = RoleAccessMapping {
+        scope: Some("acme".into()),
+        ..access_mapping(
+            RoleStatus::Active,
+            AccessLevel::Write,
+            ct.bounded_context.clone(),
+        )
+    };
+
+    let authorised =
+        event_store::authorise_command_submission(&mapping, &ct, r#"{"company_id":"acme"}"#.into())
+            .unwrap();
+
+    assert_eq!(
+        authorised.consistency_tags,
+        vec![skilj_core::shared::Tag {
+            key: "company".into(),
+            value: Some("acme".into()),
+        }]
+    );
+}
+
+/// An unscoped grant (`scope: None`, every grant's behaviour before this
+/// fix existed) remains fully unrestricted, even against an owner-tagged
+/// command type - vacuously true, not a regression for every existing
+/// caller.
+#[test]
+fn authorise_command_submission_is_unrestricted_for_a_grant_naming_no_scope() {
+    let ct = CommandType {
+        owner_tag_key: Some("company".into()),
+        ..command_type(
+            true,
+            vec![skilj_core::shared::TagMapping {
+                key: "company".into(),
+                field: "company_id".into(),
+            }],
+        )
+    };
+    let mapping = access_mapping(
+        RoleStatus::Active,
+        AccessLevel::Write,
+        ct.bounded_context.clone(),
+    );
+
+    let authorised = event_store::authorise_command_submission(
+        &mapping,
+        &ct,
+        r#"{"company_id":"globex"}"#.into(),
+    )
+    .unwrap();
+
+    assert_eq!(authorised.command_type, ct);
 }
 
 // ---------------------------------------------------------------------

@@ -282,6 +282,7 @@ const REGISTER_EVENT_TYPE_MUTATION: &str = "\
     mutation($bc: String!, $name: String!) { \
         registerEventType(boundedContext: $bc, name: $name, schema: \"{\\\"properties\\\":{\\\"amount\\\":{\\\"type\\\":\\\"number\\\"},\\\"account_id\\\":{\\\"type\\\":\\\"string\\\"}}}\", \
             tagMappings: [{key: \"account\", field: \"account_id\"}], ownerTagKey: \"account\", sensitiveFields: [], \
+            privateFields: [], \
             externalCreationAllowed: true, directCreationAllowed: true, systemTriggeredAllowed: false, \
             eventReadAllowed: true) { \
             name schemaVersion tagMappings { key field } ownerTagKey externalCreationAllowed \
@@ -334,7 +335,7 @@ fn full_type_registration_lifecycle_end_to_end() {
             Some(&jwt),
             "mutation($bc: String!, $name: String!) { \
                 registerCommandType(boundedContext: $bc, name: $name, schema: \"{}\", \
-                    tagMappings: [], sensitiveFields: [], restTriggerAllowed: true) { \
+                    tagMappings: [], sensitiveFields: [], privateFields: [], restTriggerAllowed: true) { \
                     name schemaVersion restTriggerAllowed \
                 } \
             }",
@@ -478,12 +479,17 @@ fn full_type_registration_lifecycle_end_to_end() {
         assert_eq!(listed["buildingRebuild"]["status"], "BUILDING");
 
         // createExternalEventToken / createDirectCreationToken / createEventReadToken.
+        // `scope` (cross-tenant write fix, docs/architecture.md's own
+        // write-up of these passes): a real, non-null value, also proving
+        // the admin read-back gap this same pass found and closed - the
+        // mutation echoes back the scope it minted the token with, not
+        // just accepting the argument silently.
         let response = graphql_request(
             &router,
             Some(&jwt),
             "mutation($bc: String!, $name: String!) { \
-                createExternalEventToken(boundedContext: $bc, eventTypeName: $name) { \
-                    id secret status eventType { name } \
+                createExternalEventToken(boundedContext: $bc, eventTypeName: $name, scope: \"acme\") { \
+                    id secret status scope eventType { name } \
                 } \
             }",
             json!({ "bc": bc_name, "name": "MoneyDeposited" }),
@@ -491,6 +497,7 @@ fn full_type_registration_lifecycle_end_to_end() {
         .await;
         assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
         assert_eq!(response["data"]["createExternalEventToken"]["status"], "ACTIVE");
+        assert_eq!(response["data"]["createExternalEventToken"]["scope"], "acme");
         assert_eq!(
             response["data"]["createExternalEventToken"]["eventType"]["name"],
             "MoneyDeposited"
@@ -504,13 +511,15 @@ fn full_type_registration_lifecycle_end_to_end() {
             .unwrap()
             .to_string();
 
-        // createCommandToken.
+        // createCommandToken - omitting scope entirely still works and
+        // reads back null, the default every token minted before this
+        // argument existed carries.
         let response = graphql_request(
             &router,
             Some(&jwt),
             "mutation($bc: String!, $name: String!) { \
                 createCommandToken(boundedContext: $bc, commandTypeName: $name) { \
-                    id status commandType { name } \
+                    id status scope commandType { name } \
                 } \
             }",
             json!({ "bc": bc_name, "name": "WithdrawMoney" }),
@@ -521,6 +530,7 @@ fn full_type_registration_lifecycle_end_to_end() {
             response["data"]["createCommandToken"]["commandType"]["name"],
             "WithdrawMoney"
         );
+        assert!(response["data"]["createCommandToken"]["scope"].is_null());
 
         // revokeToken - the union return type, queried via an inline fragment.
         let response = graphql_request(
@@ -618,6 +628,7 @@ fn register_event_type_rejects_a_sensitive_field_on_a_non_string_leaf() {
                     schema: \"{\\\"properties\\\":{\\\"amount\\\":{\\\"type\\\":\\\"number\\\"},\\\"account_id\\\":{\\\"type\\\":\\\"string\\\"}}}\", \
                     tagMappings: [], \
                     sensitiveFields: [{field: \"amount\", subjectKey: \"account\", subjectField: \"account_id\"}], \
+                    privateFields: [], \
                     externalCreationAllowed: true, directCreationAllowed: true, systemTriggeredAllowed: false, \
                     eventReadAllowed: true) { name } \
             }",
@@ -656,6 +667,7 @@ fn register_event_type_rejects_a_malformed_schema_with_no_tag_mappings_or_sensit
                     schema: \"not json at all\", \
                     tagMappings: [], \
                     sensitiveFields: [], \
+                    privateFields: [], \
                     externalCreationAllowed: true, directCreationAllowed: true, systemTriggeredAllowed: false, \
                     eventReadAllowed: true) { name } \
             }",
@@ -762,7 +774,7 @@ fn event_types_and_command_types_list_every_registered_type() {
             Some(&jwt),
             "mutation($bc: String!, $name: String!) { \
                 registerCommandType(boundedContext: $bc, name: $name, schema: \"{}\", \
-                    tagMappings: [], sensitiveFields: [], restTriggerAllowed: true) { name } \
+                    tagMappings: [], sensitiveFields: [], privateFields: [], restTriggerAllowed: true) { name } \
             }",
             json!({ "bc": bc_name, "name": "WithdrawMoney" }),
         )

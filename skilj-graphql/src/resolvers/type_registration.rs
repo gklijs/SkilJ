@@ -19,8 +19,8 @@
 //! lookup's luck.
 
 use super::{
-    not_found, parse_missed_occurrence_policy, parse_sensitive_fields, parse_tag_mappings,
-    require_admin_mapping,
+    not_found, parse_missed_occurrence_policy, parse_private_fields, parse_sensitive_fields,
+    parse_tag_mappings, require_admin_mapping,
 };
 use crate::error::to_graphql_error;
 use crate::gql_types::{ProjectionRegistrationResult, ProjectionWithRebuild};
@@ -53,6 +53,7 @@ pub fn register_event_type_field() -> Field {
                 .map(|v| v.string().map(str::to_string))
                 .transpose()?;
             let sensitive_fields = parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
+            let private_fields = parse_private_fields(&ctx.args.try_get("privateFields")?)?;
             let external_creation_allowed =
                 ctx.args.try_get("externalCreationAllowed")?.boolean()?;
             let direct_creation_allowed = ctx.args.try_get("directCreationAllowed")?.boolean()?;
@@ -91,6 +92,7 @@ pub fn register_event_type_field() -> Field {
                 tag_mappings,
                 owner_tag_key,
                 sensitive_fields,
+                private_fields,
                 external_creation_allowed,
                 direct_creation_allowed,
                 system_triggered_allowed,
@@ -130,6 +132,10 @@ pub fn register_event_type_field() -> Field {
     .argument(InputValue::new(
         "sensitiveFields",
         TypeRef::named_nn_list_nn("SensitiveFieldInput"),
+    ))
+    .argument(InputValue::new(
+        "privateFields",
+        TypeRef::named_nn_list_nn("PrivateFieldInput"),
     ))
     .argument(InputValue::new(
         "externalCreationAllowed",
@@ -185,6 +191,7 @@ pub fn register_command_type_field() -> Field {
                     .transpose()?;
                 let sensitive_fields =
                     parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
+                let private_fields = parse_private_fields(&ctx.args.try_get("privateFields")?)?;
                 let rest_trigger_allowed = ctx.args.try_get("restTriggerAllowed")?.boolean()?;
 
                 let bounded_context =
@@ -205,6 +212,7 @@ pub fn register_command_type_field() -> Field {
                     tag_mappings,
                     owner_tag_key,
                     sensitive_fields,
+                    private_fields,
                     rest_trigger_allowed,
                     existing.as_ref(),
                 )
@@ -239,6 +247,10 @@ pub fn register_command_type_field() -> Field {
     .argument(InputValue::new(
         "sensitiveFields",
         TypeRef::named_nn_list_nn("SensitiveFieldInput"),
+    ))
+    .argument(InputValue::new(
+        "privateFields",
+        TypeRef::named_nn_list_nn("PrivateFieldInput"),
     ))
     .argument(InputValue::new(
         "restTriggerAllowed",

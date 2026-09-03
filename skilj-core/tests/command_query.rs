@@ -65,6 +65,7 @@ fn command_type(name: &str) -> CommandType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         rest_trigger_allowed: false,
     }
 }
@@ -78,6 +79,7 @@ fn event_type(name: &str) -> EventType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,
@@ -160,7 +162,7 @@ fn render_command_passes_the_payload_through_unchanged_when_no_fields_are_sensit
     let c = command(command_type("PlaceOrder"), r#"{"amount":10}"#, 0);
 
     assert_eq!(
-        event_store::render_command(&c, &mapping, &|_, _| unreachable!()),
+        event_store::render_command(&c, &mapping, &|_, _| unreachable!(), &[]),
         r#"{"amount":10}"#
     );
 }
@@ -183,6 +185,7 @@ fn fetch_commands_returns_every_matching_command_rendered() {
         None,
         &commands,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -207,6 +210,7 @@ fn fetch_commands_with_empty_command_types_matches_every_type() {
         None,
         &commands,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -228,6 +232,7 @@ fn fetch_commands_filters_by_named_command_type() {
         None,
         &commands,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -255,6 +260,7 @@ fn fetch_commands_filters_by_created_at_window_inclusive_on_both_ends() {
         None,
         &commands,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -282,6 +288,7 @@ fn fetch_commands_filters_by_triggered_event() {
         Some(&triggered_event),
         &commands,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -322,6 +329,7 @@ fn fetch_commands_filters_by_triggered_event_even_when_another_command_has_ident
         Some(&triggered_event),
         &commands,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -348,6 +356,7 @@ fn fetch_commands_triggered_event_conjuncts_with_other_filters() {
         Some(&triggered_event),
         &commands,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -370,6 +379,7 @@ fn fetch_commands_triggered_event_matches_nothing_for_a_non_command_triggered_ev
         Some(&unrelated_event),
         &commands,
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -397,6 +407,7 @@ fn fetch_commands_never_returns_commands_from_another_bounded_context() {
         None,
         &[foreign_command],
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap();
 
@@ -408,9 +419,17 @@ fn fetch_commands_never_returns_commands_from_another_bounded_context() {
 fn fetch_commands_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Admin);
 
-    let err =
-        event_store::fetch_commands(&mapping, &[], None, None, None, &[], |_, _| unreachable!())
-            .unwrap_err();
+    let err = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &[],
+        |_, _| unreachable!(),
+        &[],
+    )
+    .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -420,9 +439,17 @@ fn fetch_commands_rejects_a_revoked_mapping() {
 fn fetch_commands_rejects_a_write_level_mapping() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write);
 
-    let err =
-        event_store::fetch_commands(&mapping, &[], None, None, None, &[], |_, _| unreachable!())
-            .unwrap_err();
+    let err = event_store::fetch_commands(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &[],
+        |_, _| unreachable!(),
+        &[],
+    )
+    .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -451,6 +478,7 @@ fn fetch_commands_rejects_a_named_command_type_from_another_bounded_context() {
         None,
         &[],
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap_err();
 
@@ -481,6 +509,7 @@ fn fetch_commands_rejects_a_triggered_event_from_another_bounded_context() {
         Some(&foreign_event),
         &[],
         |_, _| unreachable!(),
+        &[],
     )
     .unwrap_err();
 

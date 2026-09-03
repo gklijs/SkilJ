@@ -23,7 +23,13 @@
 --   per-field sensitivity marking on events and commands alike - both
 --   resolving to the same per-subject EncryptionKey, so crypto-shredding
 --   erases both at once (SensitiveField, EncryptionKey,
---   right-to-be-forgotten via ForgetSubject) - admin-facing retrieval of
+--   right-to-be-forgotten via ForgetSubject) - per-field private marking
+--   on events and commands alike, the plain read-time redaction rule
+--   standing beside that cryptographic one for a field that should be
+--   visible only to whoever created the record, only to a named team, or
+--   only to the one other party the record itself names, with sharing and
+--   revocation the creator drives itself and no encryption or erasure
+--   involved anywhere (PrivateField, PrivateFieldGrant) - admin-facing retrieval of
 --   stored commands, by command type, by time window, or by the event a
 --   command produced (CommandQuery), an optional caller-supplied
 --   idempotency key on command submission over either track, so a caller
@@ -312,6 +318,66 @@ value EncryptedPayload {
                                           -- subject a sensitive field referenced
 }
 
+-- The third field-level protection mechanism, and deliberately the
+-- cheapest of the three. SensitiveField above protects a third party's
+-- PII with real encryption, because that protection has to survive a
+-- database compromise and a legal erasure request - it is what
+-- crypto-shredding shreds (see EncryptionKey and ForgetSubject).
+-- RoleAccessMapping.scope, the second, decides which whole records a
+-- grant reaches at all. This one does neither. It decides, per field and
+-- at read time, whether an ordinary application-level reader sees a leaf
+-- that was stored in plaintext all along.
+--
+-- Nothing here involves EncryptionKey, resolve_data_key or ForgetSubject
+-- anywhere, and that is the whole point of it rather than an omission. A
+-- private field is not about surviving a stolen database or answering an
+-- erasure request; it is about who, among the callers this library
+-- already authenticates, is meant to look at a field. So it needs no key
+-- to provision, none to destroy, and nothing to be undone when a subject
+-- is forgotten.
+--
+-- What it does at read time is the identical shape to what
+-- render_event/render_command already do for a sensitive field, one rule
+-- along: for a caller who is not entitled, the JSON leaf is replaced by
+-- null, exactly where an unentitled caller already finds a sensitive
+-- field's leaf left as stored ciphertext. One leaf, and only that leaf -
+-- never the enclosing object, never the whole record, and never withheld
+-- rather than redacted (see the render_event note above rule
+-- DeliverToSubscriptions for the full three-rule test).
+--
+-- A payload field is at most one of the three. private_fields may not
+-- overlap tag_mappings, and may not overlap sensitive_fields either, both
+-- refused at registration and for the same leak reason the existing
+-- tag_mappings/sensitive_fields overlap is - see the note above rule
+-- RegisterEventType.
+value PrivateField {
+    field: String                -- name of the payload field to redact from a reader
+                                  -- who is not entitled to it. Written under the same
+                                  -- convention SensitiveField.field is: a bare
+                                  -- top-level field name or a two-segment dotted path
+                                  -- reaching one leaf inside a nested shape (e.g.
+                                  -- address.country) - never deeper, and never a
+                                  -- nested-object-typed field itself, since a whole
+                                  -- nested object cannot be made private any more than
+                                  -- it can be made sensitive (see the payload schema
+                                  -- shape note above entity CommandType)
+    kind: PrivateFieldKind       -- which of the three visibility rules this field
+                                  -- follows - see the enum for what each means
+    team: String?                -- the Role.name this field is visible to, and set
+                                  -- exactly when kind = team; null for the other two
+                                  -- kinds. Checked at every registration by
+                                  -- valid_private_fields (see rule RegisterEventType)
+    addressee_field: String?     -- name of the payload field this type reads the
+                                  -- addressee's own identifier from - the identical
+                                  -- role SensitiveField.subject_field plays for a
+                                  -- sensitive field's subject, addressed with the same
+                                  -- dotted-path convention, and matched at read time
+                                  -- against Role.external_subject the same way a
+                                  -- sensitive field's subject already is. Set exactly
+                                  -- when kind = addressed; null for the other two
+                                  -- kinds, and checked the same way
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -321,6 +387,52 @@ enum FilterOperator { equals | contains | is_like | greater_than | less_than | n
 enum AccessLevel { read | write | admin }
 
 enum AckMode { auto_advance | manual_ack }
+
+-- Which visibility rule a PrivateField follows. Named rather than inline
+-- because three separate things read it: valid_private_fields at
+-- registration, is_default_private_reader at grant time and at read time,
+-- and the render step itself when it decides what to redact.
+--
+--   - own. Visible by default only to whoever created the record: the
+--     Role.id sitting in Event.metadata.client_id or
+--     Command.metadata.client_id, which is access_mapping.role.id for
+--     anything a GraphQL caller produced (see rule
+--     AuthoriseCommandSubmission). Shareable, and shareable by that
+--     creator alone: it may grant another Role read access to one
+--     specific record or to every record of its own it has made or will
+--     make, and revoke that again later.
+--   - team. Visible to any Role whose own name equals the fixed string
+--     the field declares in PrivateField.team. Nothing is granted and
+--     nothing needs to be: membership is the grant, instantly and
+--     automatically, and it stops the moment the Role is no longer named
+--     that. A "staff-only" field is one instance of this rather than a
+--     mechanism of its own.
+--   - addressed. Visible by default to the one other party the payload
+--     itself names, read from the second payload field
+--     PrivateField.addressee_field points at and compared against the
+--     reader's own Role.external_subject - the same identifier space, and
+--     the same comparison, a sensitive field's subject already uses (see
+--     the render_event note above rule DeliverToSubscriptions). Shareable
+--     exactly as own is, by the addressee once the payload has determined
+--     who that is.
+--
+-- Each of the three is decidable from the stored record and the reading
+-- caller's own identity alone. Nothing else is consulted - no projection,
+-- no other record, no clock - which is what makes them cheap enough to
+-- evaluate on every field of every record a read returns.
+--
+-- A fourth kind, draft - a field visible only until some external status
+-- changes - is a real and deliberately deferred future kind rather than
+-- one considered and rejected. What defers it is its shape rather than
+-- its worth: answering it needs a live lookup into Projection state at
+-- the moment of every read, so its answer can change while nothing about
+-- the record or the caller has changed at all. That is a materially
+-- different evaluability register from the three above, with its own
+-- questions about staleness and about what a read owes when the
+-- projection it depends on is lagging, and it is left whole for a later
+-- pass rather than built halfway here. Nothing in this file is shaped
+-- around it and nothing in this file forecloses it.
+enum PrivateFieldKind { own | team | addressed }
 
 -- What a scheduled EventType owes for an occurrence of its own schedule
 -- that passed while nothing was watching for it. Named rather than inline
@@ -604,6 +716,19 @@ entity CommandType {
     -- (see the protect_sensitive_fields note above the rules).
     sensitive_fields: Set<SensitiveField>
 
+    -- Opt-in, in the same shape as EventType.private_fields and standing
+    -- beside sensitive_fields above rather than inside it: a plain
+    -- read-time redaction rule with no encryption and no erasure anywhere
+    -- behind it (see value PrivateField). Unlike sensitive_fields, this
+    -- declaration is not a fact about how a command was stored - a
+    -- private field is stored in plaintext, whenever it was submitted -
+    -- so adding, changing or removing an entry here changes what every
+    -- reader sees of this type's whole history immediately, not merely of
+    -- the commands submitted next. There is nothing on a stored Command
+    -- to tell historical ones apart the way Command.encryption_keys does
+    -- for sensitivity, and nothing that needs to be.
+    private_fields: Set<PrivateField>
+
     -- Opt-in, mirroring EventType.external_creation_allowed: submitting
     -- this command over GraphQL with a write-level RoleAccessMapping is
     -- always permitted, but letting an automated caller trigger it over
@@ -657,6 +782,23 @@ entity EventType {
     -- before sensitive data starts flowing through the type (see the
     -- protect_sensitive_fields note above the rules).
     sensitive_fields: Set<SensitiveField>
+
+    -- Opt-in, mirrors sensitive_fields in shape and stands beside it
+    -- rather than inside it: a plain read-time redaction rule, with no
+    -- encryption, no EncryptionKey and no erasure anywhere behind it (see
+    -- value PrivateField). The difference from sensitive_fields that
+    -- matters most is in which direction each reaches. Marking a field
+    -- sensitive protects the future only, never the past, because
+    -- protection happens at write time and events are immutable. Marking
+    -- one private reaches the past and the future alike, because
+    -- protection happens at read time: adding, changing or removing an
+    -- entry here changes what every reader sees of this type's whole
+    -- history from that moment on. That is the same live-declaration
+    -- treatment owner_tag_key above already has, and for the same reason
+    -- - nothing about it is snapshotted onto an event when the event is
+    -- written, so there is no Event.encryption_keys equivalent to tell
+    -- historical events apart, and none is needed.
+    private_fields: Set<PrivateField>
 
     -- Command-triggered origin is always permitted; the other three
     -- origins require explicit opt-in per event type.
@@ -747,10 +889,35 @@ variant ExternalEventToken : AccessToken {
     -- ExternalEventIngestion and fail independently if its own
     -- dependency is unavailable.
     event_type: EventType
+
+    -- The REST track's counterpart to RoleAccessMapping.scope, in the same
+    -- register and with the same meaning as EventReadToken.scope below, but
+    -- restricting creation rather than reads: where event_type above says
+    -- which type this token may submit, this one narrows which of that
+    -- type's events it may create. Null - which is what every token holds
+    -- unless the minting admin named a value (see rule
+    -- CreateExternalEventToken) - means unrestricted within that type,
+    -- exactly as every token created before this field existed. A value
+    -- means this token may create only those events whose own derived owner
+    -- value equals it, and only for an event type that declares an owner
+    -- dimension at all; a type declaring none is unaffected by this field
+    -- whatever it holds (see EventType.owner_tag_key). The value itself is
+    -- an opaque caller-chosen string this library compares for equality and
+    -- never interprets, the same treatment RoleAccessMapping.scope gets
+    -- (see rule AuthoriseCommandSubmission's guidance on
+    -- tag_owner_scope_satisfied for the full contract, and rule
+    -- CreateExternalEvent for where it is applied).
+    scope: String?
 }
 
 variant DirectCreationToken : AccessToken {
     event_type: EventType
+
+    -- Exactly ExternalEventToken.scope above, on the same terms and with
+    -- the same null meaning, applied to direct creation instead of external
+    -- ingestion - see rule CreateDirectEvent for where it is checked and
+    -- rule CreateDirectCreationToken for where it is set.
+    scope: String?
 }
 
 variant CommandToken : AccessToken {
@@ -759,6 +926,17 @@ variant CommandToken : AccessToken {
     -- exactly as a GraphQL-submitted one (see ProcessCommand); only the
     -- authentication differs.
     command_type: CommandType
+
+    -- ExternalEventToken.scope above, on the command side: it narrows which
+    -- of its one command type's commands this token may trigger. Null, as
+    -- every token holds unless the minting admin named a value (see rule
+    -- CreateCommandToken), means unrestricted within that type. A value
+    -- means only commands whose own derived owner value equals it may be
+    -- triggered, and only for a command type declaring an owner dimension
+    -- at all (see CommandType.owner_tag_key); the value is opaque and
+    -- compared for equality alone. See rule AuthoriseCommandTrigger for
+    -- where it is checked.
+    scope: String?
 }
 
 variant EventReadToken : AccessToken {
@@ -912,10 +1090,13 @@ entity RoleAccessMapping {
                                              -- context, this one narrows which projection
                                              -- instances it may read there. Null - which is
                                              -- what every grant holds unless a superadmin
-                                             -- named a value (see rule
-                                             -- GrantRoleAccessMapping) - means unrestricted
-                                             -- within the bounded context, exactly as every
-                                             -- grant read before this field existed. A value
+                                             -- named a value (see rules
+                                             -- GrantRoleAccessMapping and
+                                             -- CreateBoundedContextFromTemplate, the two
+                                             -- places a grant comes into being) - means
+                                             -- unrestricted within the bounded context,
+                                             -- exactly as every grant read before this field
+                                             -- existed. A value
                                              -- means this grant may read only those
                                              -- projection instances whose own derived owner
                                              -- value equals it, and only for a projection
@@ -1311,6 +1492,58 @@ entity ReadCursor {
     updated_at: Timestamp                  -- when this cursor last moved
 }
 
+-- One Role letting another read the private fields of a record it is
+-- itself the default reader of. The only entity the private-field
+-- mechanism needs, and only two of the three kinds ever produce one: own
+-- and addressed are shareable, team is not, because a team field has
+-- nothing to share - a Role either carries the name or it does not, and
+-- no grant could change that either way (see enum PrivateFieldKind).
+--
+-- Self-service, and that is the defining difference from every other
+-- grant in this file. A RoleAccessMapping is made for a Role by a
+-- superadmin as a separately audited act (see surface AccessManagement's
+-- SuperadminOnly), and an AccessToken is minted for a type by an admin.
+-- This one is made by the ordinary caller who already holds the thing
+-- being shared, needs no admin anywhere, and is revocable only by that
+-- same caller (see rule RevokePrivateFieldAccess).
+entity PrivateFieldGrant {
+    bounded_context: BoundedContext        -- the context the shared record lives in, and the
+                                            -- one the grantor's own grant was scoped to when it
+                                            -- made this. A grant never spans contexts, the same
+                                            -- as everything else here
+    grantor: Role                          -- the Role that made this grant, and the only Role
+                                            -- that can ever revoke it
+    grantee: Role                          -- the Role being let in
+
+    -- At most one of the two below is ever set, and both may be null.
+    -- Naming one is a per-record grant: this grantee may read the private
+    -- fields of exactly this record and no other. Naming neither is a
+    -- blanket grant: every record of any type the grantor is itself the
+    -- default private reader of, present and future alike. Naming both is
+    -- meaningless and never written - see invariant
+    -- PrivateFieldGrantNamesAtMostOneRecord.
+    --
+    -- A blanket grant is a convenience, not a wider trust boundary. It
+    -- cannot be checked against records that do not exist yet, so it is
+    -- trusted when it is made and re-derived at every read against the
+    -- specific record being read: the grantor must still be that record's
+    -- own default private reader for the grant to let anyone through it
+    -- (see the render_event note above rule DeliverToSubscriptions). So it
+    -- never reaches further than the same grantor could have reached one
+    -- record at a time.
+    event: Event?
+    command: Command?
+
+    status: active | revoked
+    created_at: Timestamp
+    revoked_at: Timestamp? when status = revoked
+
+    transitions status {
+        active -> revoked
+        terminal: revoked
+    }
+}
+
 ------------------------------------------------------------
 -- Defaults
 ------------------------------------------------------------
@@ -1643,6 +1876,18 @@ rule CreateExternalEvent {
     requires: valid_payload(event_type.schema, payload)
 
     let protected = protect_sensitive_fields(event_type, payload)
+    let tags = derive_tags(event_type, payload)
+
+    -- The ownership check, and the write-side counterpart to EventFetch's
+    -- own EventsScopedToOwnerWhenDeclared: a token that names a scope (see
+    -- variant ExternalEventToken.scope) may create events only for the
+    -- owner it names, checked against the very same tags the event is about
+    -- to be written with. Single-record, so it rejects rather than filters,
+    -- for the reason rule AuthoriseCommandSubmission's own note gives in
+    -- full rather than a second copy of it here. Vacuously true for a token
+    -- that names no scope, which is every token unless the minting admin
+    -- named one, and for an event type that declares no owner dimension.
+    requires: tag_owner_scope_satisfied(tags, event_type.owner_tag_key, adapter.scope)
 
     -- Every sync projection consuming this event type is updated inline,
     -- in this same transaction - see the project() note above the rules.
@@ -1658,7 +1903,7 @@ rule CreateExternalEvent {
                 created_at: now
             },
             sequence: next_sequence(event_type.bounded_context),
-            tags: derive_tags(event_type, payload),
+            tags: tags,
             encryption_keys: protected.encryption_keys,
             source_content: source_content,
             source_context: source_context
@@ -1674,6 +1919,13 @@ rule CreateDirectEvent {
     requires: valid_payload(event_type.schema, payload)
 
     let protected = protect_sensitive_fields(event_type, payload)
+    let tags = derive_tags(event_type, payload)
+
+    -- The same ownership check CreateExternalEvent applies just above, on
+    -- the same terms and against the same declaration, differing only in
+    -- which token variant carries the scope - see variant
+    -- DirectCreationToken.scope. Its note above is not restated here.
+    requires: tag_owner_scope_satisfied(tags, event_type.owner_tag_key, adapter.scope)
 
     -- Sync projection updates happen inline here too - see the project()
     -- note above the rules.
@@ -1689,7 +1941,7 @@ rule CreateDirectEvent {
                 created_at: now
             },
             sequence: next_sequence(event_type.bounded_context),
-            tags: derive_tags(event_type, payload),
+            tags: tags,
             encryption_keys: protected.encryption_keys
         )
 }
@@ -2050,13 +2302,51 @@ rule FetchEvents {
     -- unless the minting admin named one, and for an event type that
     -- declares no owner dimension. See rule QueryEvents' guidance on
     -- event_owner_scope_satisfied.
+    let served = filter(candidates, e =>
+        matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope))
+
     ensures:
         EventsDelivered(
             token: token,
             event_type: read_type,
-            events: filter(candidates, e =>
-                matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope))
+            events: map(served, e => redact_private_fields(e))
         )
+
+    @guidance
+        -- redact_private_fields(record) is the REST track's counterpart to
+        -- render_event, and its signature is the whole of its contract: it
+        -- takes the record and nothing else. There is no access_mapping
+        -- argument because there is no caller identity to pass one from,
+        -- and that absence is what makes the result unconditional rather
+        -- than merely strict. It returns the payload with every leaf named
+        -- by the record's type's private_fields set to null, for every
+        -- caller, on every call.
+        --
+        -- Every one of the three private-field kinds fails closed here
+        -- structurally rather than by omission, which is why nothing needs
+        -- to be decided per call. An EventReadToken is scoped to an
+        -- EventType and tied to no Role: it is nobody's metadata.client_id,
+        -- so no own-kind field can match; it carries no Role.name, so no
+        -- team-kind field can match; and it carries no external_subject, so
+        -- no addressed-kind field can match. No PrivateFieldGrant can reach
+        -- it either, since a grant names a Role as its grantee and there is
+        -- no Role here to be named. So evaluating the three tests per field
+        -- would redact every one of them anyway, and the black box states
+        -- that outcome directly instead of computing a foregone conclusion.
+        --
+        -- This is the same structural argument EventFetch's
+        -- SensitiveFieldsStayEncrypted already makes about decryption,
+        -- reaching the same place by the opposite route. A sensitive field
+        -- needs no redaction step on this track because it was protected at
+        -- write time and is simply delivered as stored; a private field is
+        -- stored in plaintext and so needs this step to reach the same
+        -- outcome. A caller needing either reads it over GraphQL. See
+        -- EventFetch's PrivateFieldsStayRedacted.
+        --
+        -- It is a black box in the same register as render_event and
+        -- render_command: this library owns that an unentitled caller never
+        -- receives a private field's value, not how a JSON leaf is nulled
+        -- out on the way to the wire.
 }
 
 -- Server-side read cursors: the second and third way to read the very
@@ -2106,6 +2396,11 @@ rule FetchEvents {
 -- per-bounded-context event cache FetchEvents is (see the note above the
 -- rules), and both leave sensitive fields as stored ciphertext for the
 -- same structural reason (see EventFetch's SensitiveFieldsStayEncrypted).
+-- Both redact every private field unconditionally for that same reason
+-- read the other way round, since a private field is stored in plaintext
+-- and so needs a step to reach the outcome a sensitive field reaches by
+-- being stored encrypted (see EventFetch's PrivateFieldsStayRedacted and
+-- the guidance above rule FetchEvents).
 --
 -- A revoked token's cursor needs no disposal path and gets none. Both
 -- rules require token.status = active and revocation is terminal, so the
@@ -2164,11 +2459,20 @@ rule ConsumeEvents {
         if mode = auto_advance: highest_sequence(served) ?? position
         else: position
 
+    -- Redacted on the way out, unconditionally and by the very same black
+    -- box FetchEvents applies - two ways to read one stream under one
+    -- permission model serve the same set, so they redact it identically
+    -- (see the guidance above rule FetchEvents). Deliberately applied at
+    -- the delivery site alone and not to served above: what a caller is
+    -- allowed to see must never move a cursor. next_position is derived
+    -- from the unredacted set, so a private field nobody may read still
+    -- counts as an event that was served, and consuming never stalls on
+    -- one.
     ensures:
         EventsConsumed(
             token: token,
             event_type: token.event_type,
-            events: served
+            events: map(served, e => redact_private_fields(e))
         )
         if is_new:
             ReadCursor.created(
@@ -2427,6 +2731,65 @@ rule CreateEventTypeSubscription {
 -- rather than a gap left open - see EventFetch's
 -- SensitiveFieldsStayEncrypted.
 --
+-- A third redaction rule runs alongside that one, per entry in the
+-- record's type's private_fields, and it is a plain visibility rule
+-- rather than a cryptographic one. Nothing in it involves an
+-- EncryptionKey, resolve_data_key or ForgetSubject anywhere - there is no
+-- ciphertext to decrypt, because a private field is stored in plaintext
+-- exactly as written - and that absence is the whole point of the
+-- mechanism rather than a shortcut taken within it (see value
+-- PrivateField). It decides one thing per field: whether this caller is
+-- entitled to see the leaf.
+--
+-- For an own-kind or addressed-kind field, the caller is entitled when
+-- any of three things is true:
+--   - is_default_private_reader(record, access_mapping) holds - the
+--     caller is the record's own creator, or the party its payload
+--     addressed (see the guidance on rule
+--     GrantPrivateFieldAccessForEvent for that predicate in full), or
+--   - an active PrivateFieldGrant names this exact record and this
+--     caller's Role as grantee, or
+--   - an active blanket PrivateFieldGrant - one naming neither an event
+--     nor a command - names this caller's Role as grantee, and its own
+--     grantor independently satisfies is_default_private_reader for this
+--     same record. The grantor's standing is re-derived here, against the
+--     record actually being read, rather than trusted from when the grant
+--     was made. That is what keeps a blanket grant a convenience instead
+--     of a wider trust boundary: it can never let a grantee see something
+--     its grantor could not have handed over one record at a time.
+-- For a team-kind field, the caller is entitled when
+-- access_mapping.role.name equals that field's own declared team, and
+-- there is no grant to look for - membership is the grant (see enum
+-- PrivateFieldKind).
+--
+-- A caller with none of those gets the record, with that one JSON leaf
+-- set to null. Not the enclosing object, not the whole record withheld,
+-- and not ciphertext either, since none was ever produced - exactly the
+-- shape and exactly the place an unentitled caller already finds a
+-- sensitive field's leaf left as stored ciphertext, one rule up.
+--
+-- The REST track reaches the same outcome by a different route, and the
+-- difference is in the mechanism rather than in what a caller ends up
+-- holding. A sensitive field is protected at rest, so FetchEvents and
+-- ConsumeEvents are safe by handing back what is stored and doing nothing
+-- else. A private field is stored in plaintext, so handing it back as
+-- stored would disclose it - and those two rules therefore apply
+-- redact_private_fields instead, which nulls every private leaf
+-- unconditionally, for every caller, with no access_mapping argument to
+-- condition it on (see the guidance above rule FetchEvents and
+-- EventFetch's PrivateFieldsStayRedacted).
+--
+-- That is not a stricter policy bolted onto that track but the same three
+-- tests reaching their only possible answer there. Each is stated in
+-- terms of a Role, and an EventReadToken is tied to none: it is nobody's
+-- client_id, carries no Role.name and carries no external_subject, and no
+-- PrivateFieldGrant can name it as a grantee. So all three fail closed
+-- structurally, and the black box states that outcome directly rather
+-- than computing a foregone conclusion per field. Declaring
+-- private_fields on a REST-readable event type is therefore safe rather
+-- than merely permitted: the declaration holds against every reader on
+-- both tracks, and event_read_allowed does not weaken it.
+--
 -- DeliverToSubscriptions runs outside the transaction that committed the
 -- triggering event, the same register as an async projection's update:
 -- best-effort, after the fact, for every still-active subscription whose
@@ -2504,6 +2867,31 @@ rule AuthoriseCommandSubmission {
     requires: command_type.bounded_context.status = active
     requires: valid_payload(command_type.schema, payload)
 
+    -- The very same derivation ProcessCommand performs downstream, over
+    -- the very same payload - see the derive_tags note above the rules.
+    let consistency_tags = derive_tags(command_type, payload)
+
+    -- The ownership check, and the write-side counterpart to CommandQuery's
+    -- own CommandsScopedToOwnerWhenDeclared: a grant that names a scope may
+    -- submit commands only for the owner it names. It is checked against
+    -- the very same CommandType.owner_tag_key and the very same derived
+    -- tags the read side already reads back with
+    -- command_owner_scope_satisfied (see rule FetchCommands' guidance) -
+    -- just before the record exists rather than after it does, which is the
+    -- whole reason it takes the tags and the key directly instead of a
+    -- Command to read them off.
+    --
+    -- Single-record, so it rejects outright rather than filtering: there is
+    -- exactly one command being authorised here, not a range, and nothing
+    -- to filter it out of - the same treatment InspectEvent and
+    -- InspectSnapshot give their own single reads. Vacuously true, the same
+    -- as always, for a grant that names no scope, which is every grant
+    -- unless a superadmin named one, and for a command type that declares
+    -- no owner dimension.
+    requires:
+        tag_owner_scope_satisfied(
+            consistency_tags, command_type.owner_tag_key, access_mapping.scope)
+
     -- idempotency_key is carried through untouched and unvalidated: it is
     -- the caller's own opaque value, not part of the command's payload and
     -- so no business of valid_payload's, and null whenever the caller
@@ -2516,6 +2904,65 @@ rule AuthoriseCommandSubmission {
             client_id: access_mapping.role.id,
             idempotency_key: idempotency_key
         )
+
+    @guidance
+        -- tag_owner_scope_satisfied(tags, owner_tag_key, scope) is a black
+        -- box in the same register as event_owner_scope_satisfied and
+        -- command_owner_scope_satisfied, and carries the identical
+        -- three-holds/fails-closed contract those two do. It is documented
+        -- here once, because this is the first rule that reaches for it;
+        -- AuthoriseCommandTrigger, CreateExternalEvent and CreateDirectEvent
+        -- refer back to this paragraph rather than repeating it, and so do
+        -- the surface guarantees over those.
+        --
+        -- What differs from its two read-side siblings is only what it is
+        -- handed, never what it decides. Each of those takes a stored record
+        -- and reads both halves off it - the owner dimension from the
+        -- record's own type, the owner value from Event.tags or
+        -- Command.consistency_tags. At every call site of this one there is
+        -- no such record yet: the check is what decides whether the record
+        -- comes into being at all, so the tags and the owner tag key are
+        -- passed in directly. The tags passed are always derive_tags over
+        -- the very payload about to be written, so the value tested is
+        -- exactly the value the read side will later read back - one
+        -- derive_tags produces both (see the derive_tags note above the
+        -- rules), which is what makes a write refused here and a read
+        -- refused there agree about who owns what.
+        --
+        -- The predicate holds, and the write proceeds, when any of three
+        -- things is true: scope is null, so the caller is unrestricted
+        -- within whatever it may already write and writes exactly as it did
+        -- before scope existed; or owner_tag_key is null, so the type
+        -- declares no owner dimension for a scope to select within; or the
+        -- derived tags contain a Tag whose key equals owner_tag_key and
+        -- whose value equals scope. It does not hold, and the write is
+        -- rejected, when scope is non-null, the type does declare an owner
+        -- tag key, and no derived tag carries that key with a matching
+        -- value - covering alike a tag under that key holding a different
+        -- value, a tag under that key holding null (the never-set state a
+        -- Tag can legitimately be in - see value Tag), and no tag under that
+        -- key at all, which is what a payload that maps nothing to it
+        -- yields. Ownership must be affirmatively provable, not merely
+        -- un-contradicted, the same framing owner_scope_satisfied and
+        -- event_owner_scope_satisfied already use and for the same reason:
+        -- an owner nothing established is the case an attacker reaches for,
+        -- so it fails closed. A scoped caller therefore cannot write a
+        -- record it would then be unable to read.
+        --
+        -- Which caller's scope is checked depends on the track, and the
+        -- predicate itself neither knows nor cares - exactly as on the read
+        -- side. On the GraphQL track it is the grant's,
+        -- RoleAccessMapping.scope, here. On the REST track it is the
+        -- token's own - CommandToken.scope in AuthoriseCommandTrigger,
+        -- ExternalEventToken.scope and DirectCreationToken.scope in the two
+        -- event-creating rules. Both are opaque caller-chosen strings
+        -- compared for equality and never interpreted.
+        --
+        -- Decided live against the type's current declaration, never
+        -- snapshotted: changing or clearing owner_tag_key at a later
+        -- registration changes who may write the type from that point on,
+        -- the same way it already changes who may read its whole history
+        -- (see rule QueryEvents' guidance).
 }
 
 rule AuthoriseCommandTrigger {
@@ -2525,6 +2972,26 @@ rule AuthoriseCommandTrigger {
     requires: command_type.rest_trigger_allowed = true
     requires: command_type.bounded_context.status = active
     requires: valid_payload(command_type.schema, payload)
+
+    let consistency_tags = derive_tags(command_type, payload)
+
+    -- The ownership check, on exactly the terms and for exactly the reasons
+    -- rule AuthoriseCommandSubmission's own note above gives in full -
+    -- write-side counterpart to CommandQuery's
+    -- CommandsScopedToOwnerWhenDeclared, single-record so rejecting rather
+    -- than filtering, vacuously true for a caller naming no scope or a
+    -- command type declaring no owner dimension. None of that is restated
+    -- here.
+    --
+    -- The one real difference is whose scope is checked: the token's own,
+    -- not a RoleAccessMapping's. That is the identical "the token's own
+    -- scope, not the minting admin's" independence rule CreateEventReadToken's
+    -- own note already establishes for reading, applied here to triggering -
+    -- see variant CommandToken.scope.
+    requires:
+        tag_owner_scope_satisfied(
+            consistency_tags, command_type.owner_tag_key, token.scope)
+
     ensures:
         CommandAuthorised(
             command_type: command_type,
@@ -2644,7 +3111,8 @@ rule ProcessCommand {
     -- Postgres lock. Every other black box in this file (project(),
     -- read_projection, render_event, render_command, derive_tags, valid_filters,
     -- valid_tag_mappings, valid_sensitive_fields, valid_payload, next_sequence,
-    -- scheduled_payload, next_occurrence_after, generate_token_secret) is
+    -- scheduled_payload, next_occurrence_after, generate_token_secret,
+    -- tag_owner_scope_satisfied) is
     -- documented exactly this way; decide() is not special enough to earn a different treatment.
     --
     -- decide() always observes matching_events exactly as computed above -
@@ -2824,6 +3292,18 @@ rule FetchCommands {
         -- grant here any more than it is on a projection:
         -- can_read_sensitive is orthogonal to level (see
         -- RoleAccessMapping).
+        --
+        -- It applies that note's third redaction rule too, per entry in
+        -- CommandType.private_fields, and on the same terms: a leaf this
+        -- caller is not entitled to comes back as null rather than as
+        -- ciphertext, because a private field was never encrypted in the
+        -- first place. Which callers are entitled - the record's own
+        -- creator or addressee, a Role a grant names, a Role carrying a
+        -- team field's declared name - is stated there in full and is not
+        -- restated here. An admin grant is not one of those entitlements
+        -- either: this is the same orthogonality can_read_sensitive has to
+        -- level, applied to a mechanism that has no level of its own at
+        -- all.
         --
         -- map(candidates, ...) is the same collection-combinator register
         -- as filter(candidates, ...) in FetchEvents: the library owns
@@ -3416,7 +3896,7 @@ rule DeleteBoundedContext {
 
 rule CreateBoundedContextFromTemplate {
     when: CreateBoundedContextFromTemplate(caller, template, name, role, level,
-        can_read_sensitive)
+        can_read_sensitive, scope?)
     requires: caller.status = active
     requires: caller.superadmin = true
 
@@ -3443,6 +3923,26 @@ rule CreateBoundedContextFromTemplate {
     -- vacuous here, since the context this grants on does not exist yet.
     requires: role.status = active
 
+    -- scope is carried through unvalidated, the identical treatment
+    -- GrantRoleAccessMapping gives the scope it records: an opaque
+    -- caller-chosen string compared for equality at read time and never
+    -- interpreted here (see entity RoleAccessMapping, and rule
+    -- QueryProjection's guidance on owner_scope_satisfied). Omitted, the
+    -- grant below is created unrestricted within the tenant context -
+    -- which is what every grant this rule made before this argument
+    -- existed is.
+    --
+    -- It is named here rather than left to a GrantRoleAccessMapping call
+    -- afterwards because that call could not do the same thing. This rule
+    -- is one of exactly two places a RoleAccessMapping comes into being,
+    -- and invariant UniqueActiveAccessPerRoleAndContext refuses a second
+    -- active mapping for a pair that already has one - so a later grant
+    -- cannot rescope the one made here, and nothing else amends a mapping
+    -- in place either. Revoking it and granting again is the only path
+    -- that would, and skipping that pair of calls for the ordinary case is
+    -- what this argument is for: a templated tenant is exactly the
+    -- deployment where an owner-scoped grant is wanted from the first
+    -- moment the tenant exists.
     ensures:
         let creator = SuperadminCreator.created(role: caller)
         let tenant = BoundedContext.created(
@@ -3457,6 +3957,7 @@ rule CreateBoundedContextFromTemplate {
             bounded_context: tenant,
             level: level,
             can_read_sensitive: can_read_sensitive,
+            scope: scope,
             status: active,
             created_at: now
         )
@@ -3832,6 +4333,70 @@ rule ApplyTemplateRegistrations {
 -- encrypted field. This is not a blanket "don't tag identifying fields"
 -- rule; only overlap with SensitiveField.field is forbidden.
 --
+-- Two more overlap constraints stand alongside that one, arriving with
+-- private_fields and resting on the very same argument rather than a new
+-- one. A registration is rejected when any PrivateField.field names the
+-- same payload field as a TagMapping.field on that same type, and
+-- rejected again when it names the same payload field as a
+-- SensitiveField.field. The tag half is the identical leak rather than a
+-- comparable one: derive_tags reads the plaintext payload, and Event.tags
+-- / Command.consistency_tags carry no per-field redaction at all, so a
+-- field that was both tagged and private would hand its plaintext value
+-- to every reader through the tag copy while the payload leaf beside it
+-- was dutifully being nulled out. The sensitive half closes the other
+-- side of the same shape: a field already stored as ciphertext has
+-- nothing left for a plaintext redaction rule to protect, and declaring
+-- both would only make it ambiguous which of two different mechanisms a
+-- given reader's leaf came back from - one that leaves ciphertext
+-- standing, one that replaces the leaf with null. So a payload field is
+-- at most one of the three: tagged, sensitive or private.
+--
+-- Each constraint is on PrivateField.field alone, exactly as the original
+-- is on SensitiveField.field alone. PrivateField.addressee_field is a
+-- different field and is unconstrained, for the identical reason
+-- subject_field is: it is the plaintext identifier the visibility test is
+-- resolved by, so it has to stay readable to be compared at all, and
+-- tagging on it - or marking it sensitive - is a separate and perfectly
+-- ordinary choice.
+--
+-- valid_private_fields(schema, private_fields) is the fourth member of
+-- the valid_schema / valid_tag_mappings / valid_sensitive_fields family,
+-- and a black box in exactly that register. It asks the same existence
+-- question those two ask - every PrivateField.field, and every
+-- PrivateField.addressee_field where the kind declares one, must resolve
+-- in the schema being registered, with a two-segment dotted path
+-- resolving whole one level deeper the same way SensitiveField.field and
+-- subject_field do - and it asks one further question they have no
+-- counterpart for, because PrivateField is the first of these value types
+-- whose own fields are conditional on a kind. That further question needs
+-- no schema knowledge at all, only the declaration's own shape: team is
+-- set and addressee_field is null exactly when kind = team,
+-- addressee_field is set and team is null exactly when kind = addressed,
+-- and both are null when kind = own. Anything else is rejected outright,
+-- the same as an invalid tag mapping is, rather than registered as a rule
+-- no reader could evaluate - a team field naming no team, or an addressed
+-- field naming no addressee field, is one nobody could ever be entitled
+-- to, so it would silently redact itself from everybody forever.
+--
+-- private_fields is reconciled across re-registrations exactly the way
+-- sensitive_fields is, and deliberately so rather than by inheriting the
+-- shape by accident: assigned to whatever the call carries, with no
+-- additive-only guard over it and no schema_version bump. The reason is
+-- the identical one. Additive-only exists to protect what history already
+-- carries - tag keys accumulate because stored events and commands
+-- already carry tags under them and an invariant checks those against the
+-- type's current mappings - and neither sensitive_fields nor
+-- private_fields has any such stored counterpart to strand. Where the two
+-- do differ is which way a change reaches, and that is a consequence of
+-- when each mechanism runs rather than of how either is reconciled: a
+-- sensitive_fields change affects writes from that point forward only,
+-- because encryption happens at write time and stored payloads are never
+-- rewritten, while a private_fields change affects every read from that
+-- point forward across the type's whole history, because redaction
+-- happens at read time. That is the same live-declaration behaviour
+-- owner_tag_key already has, argued in full on EventType.private_fields
+-- and not restated in the rule below.
+--
 -- All three are gated by an admin-level RoleAccessMapping for the target
 -- bounded context, the same as the rules above. A RoleAccessMapping scoped
 -- to the admin bounded context itself deliberately gains no new meaning
@@ -3884,7 +4449,7 @@ rule ApplyTemplateRegistrations {
 
 rule RegisterEventType {
     when: RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
-        sensitive_fields, external_creation_allowed, direct_creation_allowed,
+        sensitive_fields, private_fields, external_creation_allowed, direct_creation_allowed,
         system_triggered_allowed, event_read_allowed, system_triggered_schedule?,
         missed_occurrence_policy?, owner_tag_key?)
     requires: access_mapping.status = active
@@ -3894,6 +4459,15 @@ rule RegisterEventType {
     requires: valid_schema(schema)
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
+
+    -- Every named field must exist in the schema being registered, and
+    -- each entry's kind-conditional fields must be the ones its kind
+    -- calls for - see the valid_private_fields paragraph in the note
+    -- above. Required rather than optional as an argument, exactly as
+    -- sensitive_fields is: a type declaring no private fields passes an
+    -- empty set and is checked vacuously, rather than leaving "declared
+    -- nothing" and "said nothing" as two different registrations.
+    requires: valid_private_fields(schema, private_fields)
 
     -- valid_owner_tag_key(tag_mappings, owner_tag_key) holds when
     -- owner_tag_key is null - the type declares no owner dimension, which
@@ -3915,6 +4489,18 @@ rule RegisterEventType {
     -- SensitiveField.field is off limits, never subject_field - see the
     -- note above.
     requires: not tag_mappings.any(m => sensitive_fields.any(s => s.field = m.field))
+
+    -- And no TagMapping may read a field private_fields redacts, for the
+    -- identical reason: the tag copy carries no per-field redaction, so
+    -- the plaintext would reach every reader through Event.tags while the
+    -- payload leaf was being nulled out beside it.
+    requires: not tag_mappings.any(m => private_fields.any(p => p.field = m.field))
+
+    -- And a field is at most one of the three: what is already stored as
+    -- ciphertext is not also redacted from plaintext. Only
+    -- PrivateField.field is off limits here, never addressee_field - see
+    -- the note above.
+    requires: not sensitive_fields.any(s => private_fields.any(p => p.field = s.field))
 
     -- Scheduling is opted into whole: a type that says it fires on a
     -- schedule has to say when, and what a missed occurrence means. No
@@ -3975,6 +4561,7 @@ rule RegisterEventType {
             existing.tag_mappings = tag_mappings
             existing.owner_tag_key = owner_tag_key
             existing.sensitive_fields = sensitive_fields
+            existing.private_fields = private_fields
             existing.external_creation_allowed = external_creation_allowed
             existing.direct_creation_allowed = direct_creation_allowed
             existing.system_triggered_allowed = system_triggered_allowed
@@ -3992,6 +4579,7 @@ rule RegisterEventType {
                 tag_mappings: tag_mappings,
                 owner_tag_key: owner_tag_key,
                 sensitive_fields: sensitive_fields,
+                private_fields: private_fields,
                 external_creation_allowed: external_creation_allowed,
                 direct_creation_allowed: direct_creation_allowed,
                 system_triggered_allowed: system_triggered_allowed,
@@ -4005,7 +4593,7 @@ rule RegisterEventType {
 
 rule RegisterCommandType {
     when: RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
-        sensitive_fields, rest_trigger_allowed, owner_tag_key?)
+        sensitive_fields, private_fields, rest_trigger_allowed, owner_tag_key?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = bounded_context
@@ -4013,6 +4601,16 @@ rule RegisterCommandType {
     requires: valid_schema(schema)
     requires: valid_tag_mappings(schema, tag_mappings)
     requires: valid_sensitive_fields(schema, sensitive_fields)
+
+    -- The very same valid_private_fields RegisterEventType applies,
+    -- reused unchanged rather than mirrored: it asks a question about a
+    -- schema and a Set<PrivateField>, and a CommandType declares the
+    -- identical shape an EventType does - the same reason
+    -- valid_sensitive_fields and valid_owner_tag_key are shared. Its
+    -- contract is stated once above rule RegisterEventType and is not
+    -- restated here. Required rather than optional for the same reason
+    -- sensitive_fields is.
+    requires: valid_private_fields(schema, private_fields)
 
     -- The very same valid_owner_tag_key RegisterEventType applies, reused
     -- unchanged rather than mirrored: it asks a question about a
@@ -4031,6 +4629,14 @@ rule RegisterCommandType {
     -- command's consistency_tags are derived from its plaintext payload
     -- and are not reached by ForgetSubject either.
     requires: not tag_mappings.any(m => sensitive_fields.any(s => s.field = m.field))
+
+    -- And the same two private_fields overlap constraints, on the same
+    -- terms: Command.consistency_tags carry no per-field redaction any
+    -- more than Event.tags do, and a field already stored as ciphertext
+    -- has nothing for a plaintext redaction rule to protect. See the note
+    -- above rule RegisterEventType rather than a second copy here.
+    requires: not tag_mappings.any(m => private_fields.any(p => p.field = m.field))
+    requires: not sensitive_fields.any(s => private_fields.any(p => p.field = s.field))
 
     let existing = CommandType{bounded_context: bounded_context, name: name}
 
@@ -4072,6 +4678,7 @@ rule RegisterCommandType {
             existing.tag_mappings = tag_mappings
             existing.owner_tag_key = owner_tag_key
             existing.sensitive_fields = sensitive_fields
+            existing.private_fields = private_fields
             existing.rest_trigger_allowed = rest_trigger_allowed
         else:
             CommandType.created(
@@ -4082,6 +4689,7 @@ rule RegisterCommandType {
                 tag_mappings: tag_mappings,
                 owner_tag_key: owner_tag_key,
                 sensitive_fields: sensitive_fields,
+                private_fields: private_fields,
                 rest_trigger_allowed: rest_trigger_allowed
             )
 }
@@ -4419,45 +5027,63 @@ rule DiscardProjectionRebuild {
 -- never issues its own credentials.
 
 rule CreateExternalEventToken {
-    when: CreateExternalEventToken(access_mapping, event_type)
+    when: CreateExternalEventToken(access_mapping, event_type, scope?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = event_type.bounded_context
+
+    -- scope is carried through unvalidated and is the minted token's own,
+    -- independent of the minting admin's - see rule CreateEventReadToken's
+    -- own note below, which states that reasoning once for all four of
+    -- these rules. What a scoped token here may then do with it is restrict
+    -- what it creates rather than what it reads (see variant
+    -- ExternalEventToken.scope).
     ensures:
         ExternalEventToken.created(
             id: generate_token_id(),
             event_type: event_type,
             secret: generate_token_secret(),
+            scope: scope,
             status: active,
             created_at: now
         )
 }
 
 rule CreateDirectCreationToken {
-    when: CreateDirectCreationToken(access_mapping, event_type)
+    when: CreateDirectCreationToken(access_mapping, event_type, scope?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = event_type.bounded_context
+
+    -- scope on the same terms as the rule above - see rule
+    -- CreateEventReadToken's own note below, and variant
+    -- DirectCreationToken.scope.
     ensures:
         DirectCreationToken.created(
             id: generate_token_id(),
             event_type: event_type,
             secret: generate_token_secret(),
+            scope: scope,
             status: active,
             created_at: now
         )
 }
 
 rule CreateCommandToken {
-    when: CreateCommandToken(access_mapping, command_type)
+    when: CreateCommandToken(access_mapping, command_type, scope?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = command_type.bounded_context
+
+    -- scope on the same terms as the two rules above, restricting what may
+    -- be triggered - see rule CreateEventReadToken's own note below, and
+    -- variant CommandToken.scope.
     ensures:
         CommandToken.created(
             id: generate_token_id(),
             command_type: command_type,
             secret: generate_token_secret(),
+            scope: scope,
             status: active,
             created_at: now
         )
@@ -4471,7 +5097,7 @@ rule CreateEventReadToken {
 
     -- scope is carried through unvalidated, the same treatment
     -- GrantRoleAccessMapping gives the scope it records: an opaque
-    -- caller-chosen string compared for equality at read time and never
+    -- caller-chosen string compared for equality at use time and never
     -- interpreted here (see variant EventReadToken, and rule QueryEvents'
     -- guidance on event_owner_scope_satisfied). Omitted, the token is
     -- minted unrestricted within its event type - which is what every
@@ -4479,12 +5105,19 @@ rule CreateEventReadToken {
     --
     -- It is the minted token's own scope, and independent of the minting
     -- admin's: the grant authorising this call is checked for level and
-    -- bounded context alone, exactly as the three token-minting rules
-    -- above are, and access_mapping.scope has no bearing on what may be
-    -- named here. An admin holding an unscoped staff grant may mint a
-    -- company-scoped token, and that is the ordinary case rather than an
-    -- oversight - narrowing a REST reader is an act of issuing a
-    -- credential, not an act of delegating the issuer's own reach.
+    -- bounded context alone, and access_mapping.scope has no bearing on
+    -- what may be named here. An admin holding an unscoped staff grant may
+    -- mint a company-scoped token, and that is the ordinary case rather
+    -- than an oversight - narrowing a REST credential is an act of issuing
+    -- one, not an act of delegating the issuer's own reach.
+    --
+    -- Both paragraphs above are stated here once and hold for all four
+    -- token-minting rules, not for this one alone: the three above take a
+    -- scope on precisely these terms, and each refers back here rather than
+    -- repeating them. They differ only in what a scoped token may then do
+    -- with it - restrict what it creates or triggers, rather than what it
+    -- reads (see rule AuthoriseCommandSubmission's guidance on
+    -- tag_owner_scope_satisfied for the write-side half).
     ensures:
         EventReadToken.created(
             id: generate_token_id(),
@@ -4728,6 +5361,238 @@ rule ForgetSubject {
     ensures:
         key.status = destroyed
         key.destroyed_at = now
+}
+
+-- The four rules below are the whole of the private-field mechanism's own
+-- behaviour. Everything else about it is declaration (EventType and
+-- CommandType's private_fields, validated at registration) or rendering
+-- (the third redaction rule in render_event and render_command), and
+-- neither of those needs a rule of its own.
+--
+-- Two of the three kinds are shareable and one is not, which is why there
+-- are two minting rules rather than three: own and addressed each have a
+-- determinate default reader who can decide to let someone else in, while
+-- a team field has nobody to do the deciding - the team's name is the
+-- grant, and a Role either carries it or does not (see enum
+-- PrivateFieldKind). ListPrivateFieldGrants therefore never has anything
+-- to list for a team field, and that is a property of the mechanism
+-- rather than a gap in the listing.
+--
+-- Events and commands get a rule each rather than one polymorphic rule
+-- over both, the same shape and for the same reason CreateExternalEvent
+-- and CreateDirectEvent are two rules: what is being pointed at differs,
+-- everything after it is identical, and folding the two into one would
+-- mean a rule whose parameters contradict each other in every call. The
+-- revocation half needs no such split - it names an existing grant, which
+-- already knows which of the two it holds - so there is one of it.
+--
+-- None of the three is admin-gated, anywhere, and that is the defining
+-- trait of the mechanism rather than an omission. Every other grant in
+-- this file is made for a caller by someone with more authority than it -
+-- a superadmin for a RoleAccessMapping, an admin for an AccessToken -
+-- because those grants hand out capabilities the recipient never had. A
+-- private-field grant hands out nothing the grantor did not already hold:
+-- it lets a second Role see exactly what the first one can already see of
+-- one record, or of the records it is itself the default reader of. There
+-- is nothing for an admin to be protecting, so requiring one would only
+-- make the ordinary case - a caller sharing its own record with a
+-- colleague - an administrative ticket.
+
+rule GrantPrivateFieldAccessForEvent {
+    when: GrantPrivateFieldAccessForEvent(access_mapping, grantee, event?)
+    requires: access_mapping.status = active
+    requires: grantee.status = active
+
+    -- A grant never spans bounded contexts, the same as everything else
+    -- here: a named event must belong to the grantor's own. Vacuous for a
+    -- blanket grant, which names no event to check - it is bound to the
+    -- grantor's context by the mapping it was made under instead.
+    requires:
+        event = null
+        or event?.bounded_context = access_mapping.bounded_context
+
+    -- The grantor must genuinely be this record's own default private
+    -- reader. Checked only when a record is named: a blanket grant cannot
+    -- be checked against records that do not exist yet, so it is trusted
+    -- here and re-derived at every read instead - see the guidance below.
+    requires:
+        event = null
+        or is_default_private_reader(event, access_mapping)
+
+    ensures:
+        PrivateFieldGrant.created(
+            bounded_context: access_mapping.bounded_context,
+            grantor: access_mapping.role,
+            grantee: grantee,
+            event: event,
+            command: null,
+            status: active,
+            created_at: now
+        )
+
+    @guidance
+        -- is_default_private_reader(record, access_mapping) is a black box
+        -- in the same register as event_owner_scope_satisfied and
+        -- command_owner_scope_satisfied, and it is documented here once
+        -- because this is the first rule that reaches for it.
+        -- GrantPrivateFieldAccessForCommand below, and the render step in
+        -- render_event and render_command, refer back to this paragraph
+        -- rather than repeating it - one predicate with several call
+        -- sites, never two implementations of the same question.
+        --
+        -- It takes an Event and a Command interchangeably, and that is
+        -- load-bearing rather than convenient, the same way it is for
+        -- protect_sensitive_fields: private_fields is declared identically
+        -- on EventType and CommandType, and both records carry the two
+        -- things the predicate reads - a metadata.client_id and a payload.
+        --
+        -- It holds when either of two things is true, checked against the
+        -- record's own type's private_fields:
+        --   - some own-kind field is declared and
+        --     record.metadata.client_id equals access_mapping.role.id.
+        --     The caller is the record's creator. client_id is the Role's
+        --     internal id for anything a GraphQL caller produced (see rule
+        --     AuthoriseCommandSubmission), never a value the caller
+        --     reading it supplies.
+        --   - some addressed-kind field is declared and
+        --     access_mapping.role.external_subject equals the value that
+        --     field's own addressee_field names in this record's payload.
+        --     The caller is the party the record itself addressed. This is
+        --     the identical match a sensitive field's subject already gets
+        --     against external_subject in render_event, resolved against a
+        --     payload field rather than an EncryptionKey's subject_value.
+        --
+        -- It does not hold otherwise, and in particular does not hold at
+        -- all for a record whose type declares only team-kind private
+        -- fields, or none: there is no default reader to be, so there is
+        -- nothing to share and the grant is refused rather than made
+        -- empty. Nor does it hold for a caller presenting no Role - a REST
+        -- bearer token is nobody's client_id and carries no
+        -- external_subject - which is the same fail-closed treatment the
+        -- owner-scope predicates already give an owner nothing
+        -- established.
+        --
+        -- Decided live against the record's type's current declaration,
+        -- never snapshotted, exactly as owner_tag_key is: a registration
+        -- that adds or drops a private field changes who is a default
+        -- reader of that type's whole history from that moment on, and so
+        -- changes which grants can still be made over it. Grants already
+        -- made are unaffected as rows and re-derived as reach - see the
+        -- render-time re-check in the render_event note above rule
+        -- DeliverToSubscriptions.
+        --
+        -- A blanket grant - event and command both null - is the one call
+        -- that reaches no such check, because there is no record to ask
+        -- about. It is trusted when made and re-derived per record at
+        -- every read, which is what stops it being a wider trust boundary
+        -- than the per-record form: a reader coming through a blanket
+        -- grant sees a private field only where the grantor would itself
+        -- have been that record's default reader, so the grant never
+        -- reaches past what the grantor could have handed over one record
+        -- at a time.
+}
+
+rule GrantPrivateFieldAccessForCommand {
+    when: GrantPrivateFieldAccessForCommand(access_mapping, grantee, command?)
+    requires: access_mapping.status = active
+    requires: grantee.status = active
+
+    -- The same two checks GrantPrivateFieldAccessForEvent applies just
+    -- above, on the same terms and against the same predicate, differing
+    -- only in which record is being pointed at. Its guidance is not
+    -- restated here.
+    requires:
+        command = null
+        or command?.bounded_context = access_mapping.bounded_context
+    requires:
+        command = null
+        or is_default_private_reader(command, access_mapping)
+
+    ensures:
+        PrivateFieldGrant.created(
+            bounded_context: access_mapping.bounded_context,
+            grantor: access_mapping.role,
+            grantee: grantee,
+            event: null,
+            command: command,
+            status: active,
+            created_at: now
+        )
+}
+
+rule RevokePrivateFieldAccess {
+    when: RevokePrivateFieldAccess(access_mapping, grant)
+    requires: access_mapping.status = active
+
+    -- Only the Role that made the grant may end it. Not an admin, not a
+    -- superadmin, and not the grantee - the exact counterpart to the
+    -- mechanism being self-service on the way in. A grant is one caller's
+    -- own decision about its own records in both directions.
+    requires: access_mapping.role = grant.grantor
+
+    requires: grant.status = active
+    ensures:
+        grant.status = revoked
+        grant.revoked_at = now
+}
+
+-- Reading back what has been shared, and the one rule here that writes
+-- nothing. It follows ListBoundedContexts' shape rather than the rules
+-- around it, and for the same reason that one does: there is nothing to
+-- dogfood into an Event when nothing changes.
+--
+-- Two audiences, one rule. A caller listing its own outgoing grants is
+-- reading its own decisions back, which no level should have to be
+-- granted for - so any active mapping may do it. A caller listing someone
+-- else's is doing compliance or oversight, which is what every other
+-- listing in this file gates behind admin, and this one is gated the
+-- same. The distinction is a stated precondition rather than an implicit
+-- one, and it is one rule rather than two because two rules sharing a
+-- trigger with overlapping preconditions is an ambiguity, not a
+-- clarification: the admin case genuinely includes the self case.
+--
+-- Nothing is ever listed for a team-kind private field, and nothing is
+-- missing when nothing is: team membership is the grant, so there is no
+-- row for it to have made and none for this to find (see enum
+-- PrivateFieldKind).
+
+rule ListPrivateFieldGrants {
+    when: ListPrivateFieldGrants(access_mapping, grantor?)
+    requires: access_mapping.status = active
+
+    -- Own grants to anyone; anyone else's to an admin only.
+    requires:
+        grantor = null
+        or grantor = access_mapping.role
+        or access_mapping.level = admin
+
+    -- Bound before the collection below so the caller's choice stays
+    -- nameable inside it, where grantor is each grant's own field - the
+    -- same shape QueryEvents uses for its tags argument.
+    let subject = grantor ?? access_mapping.role
+
+    let listed =
+        PrivateFieldGrants where bounded_context = access_mapping.bounded_context
+            and grantor = subject
+
+    ensures:
+        PrivateFieldGrantsListed(
+            access_mapping: access_mapping,
+            grants: listed
+        )
+
+    @guidance
+        -- Scoped to the caller's own bounded context, the same as every
+        -- other read on this track: a grant made in another context is
+        -- not merely unlisted but invisible, even to an admin, since an
+        -- admin grant is per context too.
+        --
+        -- Revoked grants are listed alongside active ones rather than
+        -- filtered out. What this answers is "what have I shared, and what
+        -- have I stopped sharing" - and a revocation nobody can see is a
+        -- revocation nobody can confirm happened. Filtering by status is
+        -- part of the wire contract this spec leaves deferred, along with
+        -- result shape and paging (see the scope header's exclusions).
 }
 
 ------------------------------------------------------------
@@ -4978,6 +5843,19 @@ invariant UniqueReadCursorPerToken {
             a != b implies a.token != b.token
 }
 
+invariant PrivateFieldGrantNamesAtMostOneRecord {
+    -- A grant points at one event, at one command, or at neither - never
+    -- at both. Neither is the blanket form rather than a malformed one,
+    -- which is why this bounds the pair rather than requiring one of them
+    -- (see entity PrivateFieldGrant). Both minting rules already write
+    -- null into whichever field they are not for, so nothing this
+    -- specification does can violate it; it is stated because the shape it
+    -- rules out is one a reader of the entity would otherwise have to
+    -- infer from those two rules being the only writers.
+    for g in PrivateFieldGrants:
+        not (g.event != null and g.command != null)
+}
+
 ------------------------------------------------------------
 -- Actor Declarations
 ------------------------------------------------------------
@@ -5063,6 +5941,28 @@ surface ExternalEventIngestion {
         -- A token only authorises submitting events for the EventType it
         -- was issued for; it grants no other capability.
 
+    @guarantee WriteScopedToOwnerWhenDeclared
+        -- Within the one type it was issued for, a token that names a scope
+        -- (see ExternalEventToken.scope) may create events only for the
+        -- owner it names. This is the write-side half of the mechanism
+        -- EventFetch's EventsScopedToOwnerWhenDeclared describes on the read
+        -- side - one owner dimension, declared on the event type and
+        -- validated against its own tag mappings, governing both what a
+        -- scoped token may write and what a scoped reader may later see. The
+        -- general write-side reasoning, including why a single-record write
+        -- rejects rather than filters, is stated in full by
+        -- CommandSubmission's guarantee of this name and is not repeated
+        -- here.
+        --
+        -- The scope checked is the token's own, as it is on EventFetch and
+        -- for the same reason: a bearer credential carries no
+        -- RoleAccessMapping, and the minting admin's own scope has no
+        -- bearing on what the token it issued may create (see rule
+        -- CreateEventReadToken, whose note covers all four minting rules).
+        -- A token naming no scope, which is every token unless the minting
+        -- admin named one, submits exactly as it always has; so does any
+        -- submission for an event type that declares no owner dimension.
+
     @guidance
         -- REST only. Token-authenticated capabilities are deliberately
         -- kept off the GraphQL surface: GraphQL is the Role/
@@ -5084,6 +5984,22 @@ surface DirectEventCreation {
     @guarantee TokenScopedToEventType
         -- A token only authorises creating events for the EventType it
         -- was issued for; it grants no other capability.
+
+    @guarantee WriteScopedToOwnerWhenDeclared
+        -- Within the one type it was issued for, a token that names a scope
+        -- (see DirectCreationToken.scope) may create events only for the
+        -- owner it names - the read-side sibling being EventFetch's
+        -- EventsScopedToOwnerWhenDeclared, and the general write-side
+        -- reasoning being CommandSubmission's guarantee of this name. This
+        -- is ExternalEventIngestion's guarantee of this name applied
+        -- unchanged to direct creation, differing only in which token
+        -- variant carries the scope, and restates neither.
+        --
+        -- The scope checked is the token's own, not the minting admin's (see
+        -- rule CreateEventReadToken). A token naming no scope, which is
+        -- every token unless the minting admin named one, creates exactly as
+        -- it always has; so does any creation for an event type that
+        -- declares no owner dimension.
 
     @guidance
         -- REST only, the same as external event ingestion, including the
@@ -5153,6 +6069,35 @@ surface EventFetch {
         -- and tied to no Role, so there is no verified caller identity to
         -- match against a field's subject. A caller needing its own
         -- sensitive data reads it over GraphQL.
+
+    @guarantee PrivateFieldsStayRedacted
+        -- A field its EventType marked private is delivered as null here,
+        -- always, to every caller, on both the fetch and the consume path.
+        -- Not narrowed, not conditional and not grantable: there is no
+        -- call that reaches one, and no grant anyone can be given that
+        -- would.
+        --
+        -- The reasoning is the sibling of SensitiveFieldsStayEncrypted's
+        -- above, arriving at the same place from the opposite direction. A
+        -- sensitive field is safe on this track by being stored encrypted,
+        -- so delivering it as stored is already enough. A private field is
+        -- stored in plaintext - it needs no key and survives no erasure,
+        -- which is the whole point of it (see value PrivateField) - so
+        -- delivering it as stored would disclose it, and it is redacted on
+        -- the way out instead.
+        --
+        -- All three of the ways a caller can be entitled to a private
+        -- field are stated in terms of a Role, and this track has none, so
+        -- each fails closed structurally rather than by omission. An
+        -- EventReadToken is scoped to an EventType and tied to no Role: it
+        -- is nobody's client_id, so it is no record's creator; it carries
+        -- no Role.name, so it is in no team; and it carries no
+        -- external_subject, so it is nobody's addressee. A
+        -- PrivateFieldGrant cannot reach it either, since a grant names a
+        -- Role as its grantee and there is no Role here to name - so no
+        -- amount of sharing on the GraphQL side ever opens a private field
+        -- on this one. A caller needing one reads it over GraphQL, exactly
+        -- as a caller needing its own sensitive data does.
 
     @guarantee LatestEventsAlwaysAvailable
         -- A fetch always sees every committed event of its type that
@@ -5654,6 +6599,57 @@ surface SnapshotInspection {
         -- context clause (see the guidance below for why this surface
         -- has none).
 
+    @guarantee GrantScopedToOwnerWhenDeclared
+        -- Within its own bounded context, a grant that names a scope (see
+        -- RoleAccessMapping.scope) only authorises inspecting summaries
+        -- that belong to it. A summary may declare which tag key names its
+        -- "owner" dimension - in deployed configuration only, with no field
+        -- on any entity here and no registration surface to read it back
+        -- from, the same register the tag key the summary is itself keyed
+        -- on is already drawn from (see the guidance below for why this
+        -- surface has nothing registered behind it at all). That key need
+        -- not be the one the summary is keyed on: a summary keyed per
+        -- account may still be owner-scoped by company. Each recorded
+        -- summary's own owner value is derived as events are folded into
+        -- it - from the tag, on whichever event touched it, whose key
+        -- matches that declaration - and is never supplied by the caller
+        -- inspecting it, exactly as the projection-side owner value is
+        -- derived rather than sent. That is the closest sibling to this
+        -- one, declaration and all: see rule QueryProjection's guidance on
+        -- owner_scope_satisfied for the three-holds/fails-closed contract,
+        -- which this surface applies unchanged rather than restating.
+        --
+        -- This surface names one summary rather than ranging over many -
+        -- there is only ever the one record behind a (snapshot_name,
+        -- tag_value) pair - so unmet ownership rejects the read outright
+        -- and filters nothing, the same single-record treatment
+        -- inspectEvent and QueryProjection give. What a rejected caller is
+        -- left with is the framing another bounded context's summaries
+        -- already get above: invisible, not merely unreadable. Ownership
+        -- has to be affirmatively provable here, not merely unrefuted.
+        --
+        -- One consequence worth stating plainly: for a scoped caller, a
+        -- summary owned by someone else and a genuinely cold tag_value
+        -- nothing has touched yet fail closed alike, and are not
+        -- distinguishable from each other. The cold case does not get the
+        -- "nothing recorded yet, not a failure" answer UnknownNameIsAnError
+        -- below describes, because an owner nothing has established is the
+        -- case an attacker reaches for - the same stricter treatment
+        -- QueryProjection gives its own untouched key. Both stay distinct
+        -- from naming a snapshot_name that was never defined for this
+        -- bounded context at all, which remains the real, reported error
+        -- UnknownNameIsAnError makes it; a rejection here is neither that
+        -- error nor the cold answer.
+        --
+        -- A grant naming no scope, which is every grant unless a superadmin
+        -- named one, inspects exactly as it always has; so does any
+        -- inspection of a summary that declares no owner dimension,
+        -- whatever the grant's scope holds. This is layered on top of
+        -- GrantScopedToBoundedContext above rather than instead of it: that
+        -- scoping holds unchanged, and a scope only narrows further within
+        -- it - the same relationship ProjectionQuery's own two guarantees
+        -- have.
+
     @guarantee UnknownNameIsAnError
         -- snapshot_name naming something that was never defined for this
         -- bounded context at all is a real, reported error - distinct
@@ -5712,6 +6708,34 @@ surface CommandSubmission {
     @guarantee GrantScopedToBoundedContext
         -- A write-level grant only authorises submitting commands for
         -- CommandTypes belonging to its own bounded context.
+
+    @guarantee WriteScopedToOwnerWhenDeclared
+        -- Within its own bounded context, a grant that names a scope (see
+        -- RoleAccessMapping.scope) may submit commands only for the owner it
+        -- names. This is the write-side half of the mechanism CommandQuery's
+        -- CommandsScopedToOwnerWhenDeclared describes on the read side, the
+        -- same way that guarantee is itself the command-side half of
+        -- EventQuery's EventsScopedToOwnerWhenDeclared - one owner dimension,
+        -- declared once on the command type and validated against its own
+        -- tag mappings, governing both what a scoped caller may write and
+        -- what it may later read back. The owner value is derived from the
+        -- submitted payload exactly as every tag is, never named separately
+        -- by the caller, so it is not something a submitter can assert
+        -- around.
+        --
+        -- It rejects rather than filters: exactly one command is being
+        -- authorised here, not a range, so there is nothing to filter it out
+        -- of and the submission is refused outright. That is the same
+        -- single-record treatment inspectEvent and SnapshotInspection give
+        -- their own reads, and the counterpart to the filtering
+        -- CommandsScopedToOwnerWhenDeclared does over many commands. A
+        -- rejection on this ground is reported as such rather than as a
+        -- decide() rejection: nothing reaches decide() at all.
+        --
+        -- A grant naming no scope, which is every grant unless a superadmin
+        -- named one, submits exactly as it always has; so does any
+        -- submission for a command type that declares no owner dimension,
+        -- whatever the grant's scope holds.
 
     @guarantee OmittingTheKeyChangesNothing
         -- idempotency_key is optional, and omitting it is a supported,
@@ -5785,6 +6809,24 @@ surface CommandTrigger {
         -- A token only authorises triggering the one CommandType it was
         -- issued for; it grants no other capability, and in particular no
         -- way to read anything back beyond the command's own outcome.
+
+    @guarantee WriteScopedToOwnerWhenDeclared
+        -- Within the one type it was issued for, a token that names a scope
+        -- (see CommandToken.scope) may trigger commands only for the owner
+        -- it names. This is the REST track's half of the guarantee of this
+        -- name on CommandSubmission, which states the reasoning in full -
+        -- the shared owner dimension with CommandQuery's read side, the
+        -- derived-not-asserted owner value, and why a single-record write
+        -- rejects rather than filters - and is not restated here.
+        --
+        -- The one difference is whose scope is checked: the token's own, not
+        -- the grant's, since a bearer credential carries no
+        -- RoleAccessMapping and the minting admin's own scope has no bearing
+        -- on what the token it issued may trigger (see rule
+        -- CreateEventReadToken, whose note covers all four minting rules).
+        -- A token naming no scope, which is every token unless the minting
+        -- admin named one, triggers exactly as it always has; so does any
+        -- trigger of a command type that declares no owner dimension.
 
     @guarantee OmittingTheKeyChangesNothing
         -- idempotency_key is optional here too, with exactly the force it
@@ -5928,6 +6970,7 @@ surface TypeRegistration {
             event_type.tag_mappings
             event_type.owner_tag_key
             event_type.sensitive_fields
+            event_type.private_fields
             event_type.external_creation_allowed
             event_type.direct_creation_allowed
             event_type.system_triggered_allowed
@@ -5940,16 +6983,17 @@ surface TypeRegistration {
             command_type.tag_mappings
             command_type.owner_tag_key
             command_type.sensitive_fields
+            command_type.private_fields
             command_type.rest_trigger_allowed
 
     provides:
         RegisterEventType(access_mapping, bounded_context, name, schema, tag_mappings,
-            sensitive_fields, external_creation_allowed, direct_creation_allowed,
+            sensitive_fields, private_fields, external_creation_allowed, direct_creation_allowed,
             system_triggered_allowed, event_read_allowed, system_triggered_schedule?,
             missed_occurrence_policy?, owner_tag_key?)
             when bounded_context.status = active
         RegisterCommandType(access_mapping, bounded_context, name, schema, tag_mappings,
-            sensitive_fields, rest_trigger_allowed, owner_tag_key?)
+            sensitive_fields, private_fields, rest_trigger_allowed, owner_tag_key?)
             when bounded_context.status = active
         RegisterProjection(access_mapping, bounded_context, name, schema,
             consumed_event_types, sync)
@@ -6139,8 +7183,8 @@ surface EventTypeAdminOperations {
         where bounded_context = access_mapping.bounded_context
 
     provides:
-        CreateExternalEventToken(access_mapping, event_type)
-        CreateDirectCreationToken(access_mapping, event_type)
+        CreateExternalEventToken(access_mapping, event_type, scope?)
+        CreateDirectCreationToken(access_mapping, event_type, scope?)
         CreateEventReadToken(access_mapping, event_type, scope?)
 
     @guarantee GrantScopedToBoundedContext
@@ -6159,7 +7203,7 @@ surface CommandTypeAdminOperations {
         where bounded_context = access_mapping.bounded_context
 
     provides:
-        CreateCommandToken(access_mapping, command_type)
+        CreateCommandToken(access_mapping, command_type, scope?)
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises minting tokens for
@@ -6329,7 +7373,7 @@ surface BoundedContextTemplating {
 
     provides:
         CreateBoundedContextFromTemplate(caller, template, name, role, level,
-            can_read_sensitive)
+            can_read_sensitive, scope?)
         ResyncBoundedContextFromTemplate(caller, bounded_context)
 
     @guarantee SuperadminOnly
@@ -6352,10 +7396,18 @@ surface BoundedContextTemplating {
         -- erosion of it: AddBoundedContext still grants nothing to
         -- anybody, and nothing here grants anything to the caller. What
         -- this action does is let a superadmin name the tenant context and
-        -- the Role that operates it in one audited decision, at a level
-        -- and sensitivity it chose explicitly. There is still no
-        -- self-service path and no grant that arrives as a by-product of
-        -- something else.
+        -- the Role that operates it in one audited decision, at a level, a
+        -- sensitivity and a read scope it chose explicitly. There is still
+        -- no self-service path and no grant that arrives as a by-product
+        -- of something else.
+        --
+        -- The scope is settable here rather than only on
+        -- GrantRoleAccessMapping because no later call could set it on
+        -- this grant: invariant UniqueActiveAccessPerRoleAndContext
+        -- refuses a second active mapping for the pair, so the grant a
+        -- tenant is created with is the grant it keeps short of a revoke
+        -- and a re-grant (see the note above rule
+        -- CreateBoundedContextFromTemplate).
 
     @guarantee TemplateIsNeverATenant
         -- A context named as a template has no template of its own, so
@@ -6485,6 +7537,122 @@ surface AccessManagement {
         -- SuperadminBootstrap instead, claimed with a secret SkilJ prints
         -- to its own startup log rather than any caller-supplied value.
         -- See the note above rule CreateSuperadmin for the full mechanism.
+}
+
+surface PrivateFieldGrantManagement {
+    facing access_mapping: ReadAccess
+
+    let own_grants =
+        PrivateFieldGrants where bounded_context = access_mapping.bounded_context
+            and grantor = access_mapping.role
+
+    exposes:
+        for grant in own_grants:
+            grant.grantee.id
+            grant.grantee.name
+            grant.event
+            grant.command
+            grant.status
+            grant.created_at
+
+    provides:
+        GrantPrivateFieldAccessForEvent(access_mapping, grantee, event?)
+        GrantPrivateFieldAccessForCommand(access_mapping, grantee, command?)
+        RevokePrivateFieldAccess(access_mapping, grant)
+        ListPrivateFieldGrants(access_mapping, grantor?)
+
+    @guarantee SharingIsSelfServiceAndRevocationIsTheGrantorsAlone
+        -- The only surface in this file where a grant is made with no
+        -- admin and no superadmin anywhere in the call, and deliberately
+        -- so: a caller sharing a private field hands over nothing it did
+        -- not already hold itself, so there is nothing for a higher
+        -- authority to be protecting (see the note above rule
+        -- GrantPrivateFieldAccessForEvent). The same asymmetry governs the
+        -- way out. A grant is revocable only by the Role that made it -
+        -- not by an admin, not by a superadmin, and not by the grantee -
+        -- so nobody can quietly end a sharing decision on someone else's
+        -- behalf.
+        --
+        -- A grantor may only ever name a record it is genuinely the
+        -- default private reader of: the creator of an own-kind field's
+        -- record, or the party an addressed-kind field points at. Naming
+        -- anything else is refused outright rather than recorded and
+        -- silently ignored at read time.
+
+    @guarantee BlanketGrantsAreReDerivedAtRenderTime
+        -- A grant naming no record at all is a convenience, never a wider
+        -- trust boundary. It cannot be checked when it is made, because
+        -- the records it covers need not exist yet, so it is checked
+        -- instead at every read against the specific record being read:
+        -- the grantee sees a private field only where the grantor would
+        -- itself have been that record's default reader at that moment. A
+        -- blanket grant therefore never reaches past what the same grantor
+        -- could have handed over one record at a time, and it stops
+        -- reaching a record the moment the grantor stops being its default
+        -- reader - including when a re-registration changes what the type
+        -- declares private (see the render_event note above rule
+        -- DeliverToSubscriptions).
+
+    @guarantee TeamFieldsNeedNoGrant
+        -- A team-kind private field is visible to any Role whose own name
+        -- is the one the field declares, immediately and automatically,
+        -- with nothing granted and nothing to grant. Membership is the
+        -- grant. So nothing here shares a team field, nothing here revokes
+        -- one, and ListPrivateFieldGrants never lists anything for one -
+        -- not because the listing is incomplete but because there is no
+        -- row and never was. Changing who sees a team field means changing
+        -- which Roles carry that name, which is surface AccessManagement's
+        -- business rather than this one's.
+
+    @guarantee ListingScopedToGrantorUnlessAdmin
+        -- Any active grant may list its own outgoing grants, at any level:
+        -- reading back a decision you made yourself needs no authority
+        -- beyond having made it. Listing a different Role's grants is the
+        -- oversight half and requires admin level, the same as every other
+        -- cross-caller listing on this track. Either way it is scoped to
+        -- the caller's own bounded context - a grant made in another
+        -- context is invisible here, admin or not.
+
+    @guidance
+        -- GraphQL only, and by construction rather than by policy: all
+        -- three visibility rules a private field can follow are stated in
+        -- terms of a Role - its id as a record's creator, its name as a
+        -- team, its external_subject as an addressee - so a REST bearer
+        -- token has no identity for any of them to test, and there is
+        -- nothing for a REST counterpart to this surface to authenticate.
+        --
+        -- Faced by ReadAccess - any active mapping, at any level - rather
+        -- than by a write-level one, and that is a deliberate choice
+        -- rather than the loosest available default. The two shareable
+        -- kinds reach their default readers by different routes. An
+        -- own-kind field's default reader is always write-level or above
+        -- already, because producing the record in the first place took a
+        -- write grant (see rule AuthoriseCommandSubmission), so facing
+        -- WriteAccess would have cost that kind nothing. An addressed-kind
+        -- field's default reader is whoever the payload named, and a
+        -- payload can name anyone the bounded context does business with,
+        -- at whatever level their own grant happens to hold. Blocking a
+        -- read-level addressee from re-sharing something it was
+        -- personally and individually entitled to read would be a
+        -- restriction with no reason behind it: the real gate on sharing
+        -- is is_default_private_reader, which asks whether this caller is
+        -- the record's creator or its addressee, not what level its grant
+        -- carries. Every rule this surface provides checks that gate and
+        -- checks no level, so the facing bound and the rules agree.
+        --
+        -- A revoked Role loses its outgoing grants' effect without those
+        -- grants being touched, and needs no cascade of its own for that.
+        -- RevokeRole already revokes every RoleAccessMapping the Role
+        -- holds, and every read on this track is gated by an active
+        -- mapping, so a revoked grantee reaches no surface to read a
+        -- shared field through. The grant rows stay standing and stay
+        -- listable, which is what an audit of who was shared with wants.
+        --
+        -- Deliberately coarse on the wire contract, as everywhere else on
+        -- this track: this establishes the capability, who may exercise it
+        -- and how far it reaches, not how the mutations and the query are
+        -- named, shaped, paged or filtered (see the scope header's
+        -- exclusions).
 }
 
 ------------------------------------------------------------

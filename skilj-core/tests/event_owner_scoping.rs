@@ -64,6 +64,7 @@ fn ticket_opened() -> EventType {
         }],
         owner_tag_key: Some("company".into()),
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: true,
         direct_creation_allowed: true,
         system_triggered_allowed: false,
@@ -218,7 +219,8 @@ fn query_events_filters_out_events_owned_by_a_different_scope() {
     let mapping = access_mapping(AccessLevel::Admin, Some("company-a"));
 
     let result =
-        event_store::query_events(&mapping, &[], None, None, &events, resolve_data_key).unwrap();
+        event_store::query_events(&mapping, &[], None, None, &events, resolve_data_key, &[])
+            .unwrap();
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].0, 0);
@@ -234,7 +236,8 @@ fn query_events_returns_everything_for_an_unscoped_grant() {
     let mapping = access_mapping(AccessLevel::Admin, None);
 
     let result =
-        event_store::query_events(&mapping, &[], None, None, &events, resolve_data_key).unwrap();
+        event_store::query_events(&mapping, &[], None, None, &events, resolve_data_key, &[])
+            .unwrap();
 
     assert_eq!(result.len(), 2);
 }
@@ -264,7 +267,7 @@ fn inspect_event_rejects_an_event_owned_by_a_different_scope() {
     let e = event(&et, 0, Some("company-b"));
     let mapping = access_mapping(AccessLevel::Admin, Some("company-a"));
 
-    let err = event_store::inspect_event(&mapping, &e, resolve_data_key).unwrap_err();
+    let err = event_store::inspect_event(&mapping, &e, resolve_data_key, &[]).unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
 }
@@ -275,7 +278,7 @@ fn inspect_event_succeeds_when_the_owner_matches() {
     let e = event(&et, 0, Some("company-a"));
     let mapping = access_mapping(AccessLevel::Admin, Some("company-a"));
 
-    event_store::inspect_event(&mapping, &e, resolve_data_key).unwrap();
+    event_store::inspect_event(&mapping, &e, resolve_data_key, &[]).unwrap();
 }
 
 // ---------------------------------------------------------------------
@@ -352,7 +355,8 @@ fn deliver_to_subscriptions_skips_a_scoped_subscription_for_a_different_companys
         event_types: Vec::new(),
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[subscription], resolve_data_key);
+    let delivered =
+        event_store::deliver_to_subscriptions(&e, &[subscription], resolve_data_key, &[]);
 
     assert!(delivered.is_empty());
 }
@@ -370,7 +374,8 @@ fn deliver_to_subscriptions_delivers_a_scoped_subscriptions_own_company_event() 
         event_types: Vec::new(),
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[subscription], resolve_data_key);
+    let delivered =
+        event_store::deliver_to_subscriptions(&e, &[subscription], resolve_data_key, &[]);
 
     assert_eq!(delivered.len(), 1);
 }
@@ -388,7 +393,8 @@ fn deliver_to_subscriptions_delivers_to_an_unscoped_subscription_regardless_of_o
         event_types: Vec::new(),
     }));
 
-    let delivered = event_store::deliver_to_subscriptions(&e, &[subscription], resolve_data_key);
+    let delivered =
+        event_store::deliver_to_subscriptions(&e, &[subscription], resolve_data_key, &[]);
 
     assert_eq!(delivered.len(), 1);
 }

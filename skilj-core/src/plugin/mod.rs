@@ -3,7 +3,7 @@
 //! reasoning behind this shape.
 
 use crate::event_store::{Event, MissedOccurrencePolicy};
-use crate::shared::{CommandDecision, SensitiveField, TagMapping};
+use crate::shared::{CommandDecision, PrivateField, SensitiveField, TagMapping};
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -112,6 +112,12 @@ pub trait CommandType {
     }
 
     fn sensitive_fields() -> Vec<SensitiveField> {
+        Vec::new()
+    }
+
+    /// See `EventType::private_fields()`'s own doc comment - identical
+    /// role, for `Command.payload` instead of `Event.payload`.
+    fn private_fields() -> Vec<PrivateField> {
         Vec::new()
     }
 
@@ -236,6 +242,14 @@ pub trait EventType {
     }
 
     fn sensitive_fields() -> Vec<SensitiveField> {
+        Vec::new()
+    }
+
+    /// See `value PrivateField`'s own doc comment - a plain read-time
+    /// redaction rule, opt-in per field, default empty like
+    /// `sensitive_fields()` above. Private-field mechanism
+    /// (docs/architecture.md's own write-up of this pass).
+    fn private_fields() -> Vec<PrivateField> {
         Vec::new()
     }
 
@@ -455,6 +469,25 @@ pub trait Snapshot {
     /// implement here the way `Projection` needs one.
     const TAG_KEY: &'static str;
 
+    /// Which tag key names this snapshot's "owner" dimension, if it has
+    /// one and it differs from `TAG_KEY` itself - `None` (the default)
+    /// for a snapshot with no such notion. Deliberately Rust-only, no
+    /// spec entity field and no registration surface, the identical
+    /// treatment `TAG_KEY` itself already gets (`Snapshot` is compiled,
+    /// deployed configuration throughout - see this trait's own doc
+    /// comment). When set, each stored row's own owner value is derived
+    /// at fold time from whichever event touched it: the value of the
+    /// tag on `event.tags` whose key matches this one, if present - not
+    /// necessarily the same tag `TAG_KEY` itself reads (a snapshot keyed
+    /// by `"account"` might still need owner-scoping by `"company"`).
+    /// `inspectSnapshot` rejects a `scope`-restricted `RoleAccessMapping`
+    /// whose `scope` does not match a stored row's own derived owner -
+    /// see `access_control::scope_matches_owner` and
+    /// `snapshot_query::inspect_snapshot_field`'s own doc comment. Cross-
+    /// tenant read fix (docs/architecture.md's own write-up of these
+    /// passes).
+    const OWNER_TAG_KEY: Option<&'static str> = None;
+
     /// Bumped by hand whenever `fold()`'s own logic or `State`'s shape
     /// changes - a stored row at an older version is treated as if it
     /// doesn't exist (see `CommandType::decide_from_snapshot`'s own doc
@@ -630,6 +663,18 @@ pub trait SnapshotDispatcher: Send + Sync {
 
     /// The registered snapshot's own `Snapshot::TAG_KEY`.
     fn tag_key(&self, bounded_context: &str, snapshot_name: &str) -> Option<&'static str>;
+
+    /// The registered snapshot's own `Snapshot::OWNER_TAG_KEY` -
+    /// `ProjectionDispatcher::owner_tag_key`'s identical `Option<Option<_>>`
+    /// shape: outer `None` for the same "pair isn't registered at all"
+    /// case every method here already has, inner `None` when the
+    /// snapshot is registered but declares no owner dimension (the
+    /// default, and every snapshot that predates this).
+    fn owner_tag_key(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+    ) -> Option<Option<&'static str>>;
 
     /// The registered snapshot's own `Snapshot::VERSION` - compared
     /// against a stored row's `snapshot_version` to decide whether it's

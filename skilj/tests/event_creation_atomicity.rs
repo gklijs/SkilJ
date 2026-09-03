@@ -216,6 +216,7 @@ fn a_rejected_direct_event_creation_leaves_no_sequence_gap() {
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();
@@ -237,6 +238,7 @@ fn a_rejected_direct_event_creation_leaves_no_sequence_gap() {
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();

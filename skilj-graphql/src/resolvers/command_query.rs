@@ -107,6 +107,8 @@ pub fn fetch_commands_field() -> Field {
                     .await?;
                 }
 
+                let private_field_grants =
+                    super::load_private_field_grants(&state.pool, &bounded_context_name).await?;
                 let rendered = skilj_core::event_store::fetch_commands(
                     &access_mapping,
                     &command_types,
@@ -115,6 +117,7 @@ pub fn fetch_commands_field() -> Field {
                     triggered_event.as_ref(),
                     &bounded_context_commands,
                     |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                    &private_field_grants,
                 )
                 .map_err(to_graphql_error)?;
 

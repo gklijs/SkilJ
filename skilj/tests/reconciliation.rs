@@ -508,6 +508,7 @@ fn reconciliation_folds_pre_existing_history_into_a_first_time_sync_projection()
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();

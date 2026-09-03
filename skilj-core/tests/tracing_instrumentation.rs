@@ -91,6 +91,7 @@ fn command_type() -> CommandType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         rest_trigger_allowed: true,
     }
 }

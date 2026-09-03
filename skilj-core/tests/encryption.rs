@@ -188,6 +188,7 @@ fn event_type_with_sensitive_field() -> EventType {
             subject_key: "user".into(),
             subject_field: "user_id".into(),
         }],
+        private_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: true,
         system_triggered_allowed: false,
@@ -265,6 +266,7 @@ fn command_type_with_sensitive_field() -> CommandType {
             subject_key: "user".into(),
             subject_field: "user_id".into(),
         }],
+        private_fields: Vec::new(),
         rest_trigger_allowed: false,
     }
 }
@@ -323,7 +325,7 @@ fn render_event_leaves_ciphertext_untouched_with_neither_grant() {
     let event = event_with_payload(r#"{"email":"ZmFrZS1jaXBoZXJ0ZXh0","user_id":"42"}"#);
     let mapping = access_mapping(false, "someone-else");
 
-    let rendered = event_store::render_event(&event, &mapping, &|_, _| unreachable!());
+    let rendered = event_store::render_event(&event, &mapping, &|_, _| unreachable!(), &[]);
     assert_eq!(rendered, event.payload);
 }
 
@@ -336,10 +338,15 @@ fn render_event_decrypts_under_can_read_sensitive() {
     let event = event_with_real_ciphertext(&data_key);
     let mapping = access_mapping(true, "not-the-subject");
 
-    let rendered = event_store::render_event(&event, &mapping, &|sk, sv| {
-        assert_eq!((sk, sv), ("user", "42"));
-        Some(data_key.clone())
-    });
+    let rendered = event_store::render_event(
+        &event,
+        &mapping,
+        &|sk, sv| {
+            assert_eq!((sk, sv), ("user", "42"));
+            Some(data_key.clone())
+        },
+        &[],
+    );
 
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(parsed["email"], "person@example.com");
@@ -356,7 +363,7 @@ fn render_event_decrypts_under_matching_external_subject() {
     let event = event_with_real_ciphertext(&data_key);
     let mapping = access_mapping(false, "42");
 
-    let rendered = event_store::render_event(&event, &mapping, &|_, _| Some(data_key.clone()));
+    let rendered = event_store::render_event(&event, &mapping, &|_, _| Some(data_key.clone()), &[]);
 
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(parsed["email"], "person@example.com");
@@ -373,7 +380,7 @@ fn render_event_leaves_ciphertext_when_granted_but_no_active_key() {
     let event = event_with_real_ciphertext(&data_key);
     let mapping = access_mapping(true, "not-the-subject");
 
-    let rendered = event_store::render_event(&event, &mapping, &|_, _| None);
+    let rendered = event_store::render_event(&event, &mapping, &|_, _| None, &[]);
     assert_eq!(rendered, event.payload);
 }
 
@@ -390,7 +397,7 @@ fn render_event_leaves_a_historical_plaintext_leaf_untouched_even_when_granted()
     let event = event_with_payload(r#"{"email":"person@example.com","user_id":"42"}"#);
     let mapping = access_mapping(true, "not-the-subject");
 
-    let rendered = event_store::render_event(&event, &mapping, &|_, _| Some(data_key.clone()));
+    let rendered = event_store::render_event(&event, &mapping, &|_, _| Some(data_key.clone()), &[]);
     assert_eq!(rendered, event.payload);
 }
 
@@ -404,7 +411,8 @@ fn render_command_decrypts_under_can_read_sensitive() {
     let command = command_with_real_ciphertext(&data_key);
     let mapping = access_mapping(true, "not-the-subject");
 
-    let rendered = event_store::render_command(&command, &mapping, &|_, _| Some(data_key.clone()));
+    let rendered =
+        event_store::render_command(&command, &mapping, &|_, _| Some(data_key.clone()), &[]);
 
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(parsed["email"], "person@example.com");

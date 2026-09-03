@@ -97,6 +97,7 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
         .field(resolvers::event_query::inspect_event_field())
         .field(resolvers::snapshot_query::inspect_snapshot_field())
         .field(resolvers::command_query::fetch_commands_field())
+        .field(resolvers::private_field_grant_management::list_private_field_grants_field())
         .field(resolvers::projection_query::schema_field());
     if projection_types.is_some() {
         query = query.field(resolvers::projection_query::field());
@@ -123,7 +124,15 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
         .field(resolvers::command_type_admin_operations::create_command_token_field())
         .field(resolvers::token_revocation::revoke_token_field())
         .field(resolvers::command_submission::submit_command_field())
-        .field(resolvers::subject_erasure::field());
+        .field(resolvers::subject_erasure::field())
+        .field(
+            resolvers::private_field_grant_management::grant_private_field_access_for_event_field(),
+        )
+        .field(
+            resolvers::private_field_grant_management::grant_private_field_access_for_command_field(
+            ),
+        )
+        .field(resolvers::private_field_grant_management::revoke_private_field_access_field());
     let subscription = Subscription::new("Subscription")
         .field(resolvers::event_subscription::all_events_field())
         .field(resolvers::event_subscription::events_by_type_field());
@@ -153,6 +162,10 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
     .register(gql_types::tag_mapping_input())
     .register(gql_types::sensitive_field_object())
     .register(gql_types::sensitive_field_input())
+    .register(gql_types::private_field_kind_enum())
+    .register(gql_types::private_field_object())
+    .register(gql_types::private_field_input())
+    .register(gql_types::private_field_grant_object())
     .register(gql_types::event_type_object())
     .register(gql_types::command_type_object())
     .register(gql_types::projection_object())

@@ -254,6 +254,7 @@ fn triggering_a_command_eventually_updates_a_real_async_projection_through_rest(
             &command_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();

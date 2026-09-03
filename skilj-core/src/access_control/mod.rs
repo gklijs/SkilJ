@@ -99,7 +99,57 @@ pub struct RoleAccessMapping {
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// See `entity AccessToken`'s `status` field/transition graph.
+/// See `entity PrivateFieldGrant`. One Role letting another read the
+/// private fields of a record it is itself the default reader of - the
+/// only entity the private-field mechanism needs (see `value PrivateField`
+/// in the spec). Self-service, unlike every other grant in this module:
+/// made by the ordinary caller who already holds the thing being shared,
+/// needing no admin/superadmin anywhere, and revocable only by that same
+/// caller (see `revoke_private_field_access`).
+///
+/// `id` is a Rust/DB-only addressing detail the spec entity itself
+/// doesn't name - `RevokePrivateFieldAccess`'s own `grant` parameter has
+/// to unambiguously identify one grant among however many a
+/// `(grantor, grantee)` pair may have accumulated over time (unlike
+/// `RoleAccessMapping`, there is no "at most one active" uniqueness
+/// constraint here - a grantor may grant the same grantee several
+/// different records, or re-grant after revoking), so a synthetic id is
+/// the same practical elaboration `AccessToken`'s own `id` already is,
+/// not a new domain fact.
+///
+/// `event_sequence`/`command_id` stand in for the spec's own `event:
+/// Event?`/`command: Command?` - a deliberate Rust/DB elaboration, not a
+/// narrower domain fact: every real use of the record a per-record grant
+/// names is an identity comparison alone (`render_event`/`render_command`'s
+/// own `matches_this_record` closure - "does this grant name exactly the
+/// record being read", never any of that record's own fields), so
+/// carrying `Event.sequence`/`Command.id` is exactly as capable as
+/// embedding the whole value and needs no extra load to reconstruct one
+/// at read time - the same trade-off `CommandAuthorised.consistency_tags`
+/// already made in an earlier pass (docs/architecture.md's own write-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateFieldGrant {
+    pub id: String,
+    pub bounded_context: BoundedContext,
+    pub grantor: Role,
+    pub grantee: Role,
+    /// At most one of the two is ever set - see the invariant
+    /// `PrivateFieldGrantNamesAtMostOneRecord` in the spec. Both `None` is
+    /// a blanket grant: every record of any type `grantor` is itself the
+    /// default private reader of, present and future alike, re-derived at
+    /// every read rather than trusted from grant time (see
+    /// `event_store::is_default_private_reader`'s own doc comment).
+    pub event_sequence: Option<i64>,
+    pub command_id: Option<String>,
+    pub status: TokenStatus,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// See `entity AccessToken`'s `status` field/transition graph. Reused by
+/// `PrivateFieldGrant` too - both are the identical `active | revoked`
+/// shape, the same "no need for a third type to tell them apart"
+/// reasoning `RoleAccessMapping` reusing `RoleStatus` already gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenStatus {
     Active,
@@ -140,10 +190,19 @@ pub struct ExternalEventToken {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub event_type: crate::event_store::EventType,
+    /// Cross-tenant write fix (docs/architecture.md's own write-up of
+    /// these passes) - `EventReadToken.scope`'s own write-side
+    /// counterpart: set at minting time (`create_external_event_token`)
+    /// by whichever admin issues this token, independent of that
+    /// admin's own `access_mapping.scope`. Same null-is-unrestricted
+    /// semantics, checked by `event_store::owner_scope_satisfied` in
+    /// `create_external_event` - a token naming a scope may create
+    /// events only for the owner it names.
+    pub scope: Option<String>,
 }
 
 /// See `variant DirectCreationToken`. Same shape as `ExternalEventToken`
-/// above.
+/// above, `scope` included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectCreationToken {
     pub id: String,
@@ -152,11 +211,13 @@ pub struct DirectCreationToken {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub event_type: crate::event_store::EventType,
+    pub scope: Option<String>,
 }
 
 /// See `variant CommandToken`. Same shape as `ExternalEventToken`/
 /// `DirectCreationToken` above, scoped to a `CommandType` instead of an
-/// `EventType`.
+/// `EventType`, `scope` included - checked by
+/// `event_store::owner_scope_satisfied` in `authorise_command_trigger`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandToken {
     pub id: String,
@@ -165,6 +226,7 @@ pub struct CommandToken {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub command_type: crate::event_store::CommandType,
+    pub scope: Option<String>,
 }
 
 /// See `entity AccessToken`'s `purpose` field - a Rust sum type over the
@@ -224,20 +286,51 @@ pub enum Error {
     #[error("this RoleAccessMapping is scoped to a different bounded context")]
     GrantBoundedContextMismatch,
 
-    /// Cross-tenant read fix (docs/architecture.md's own write-up of
-    /// these passes): a grant/token names a `scope`, the record's own
+    /// Cross-tenant read/write fix (docs/architecture.md's own write-up
+    /// of these passes): a grant/token names a `scope`, the record's own
     /// type declares an owner dimension, and the record's own derived
     /// owner either differs from `scope` or is not yet established -
     /// fail-closed, the same "affirmatively provable, not merely
     /// un-contradicted" framing every caller of this variant shares. A
     /// single-record surface (`projections::query_projection`,
-    /// `event_store::inspect_event`) rejects outright with this;
-    /// multi-record ones (`event_store::query_events`/`count_events`/
+    /// `event_store::inspect_event`, `event_store::authorise_command_submission`/
+    /// `authorise_command_trigger`/`create_external_event`/`create_direct_event`,
+    /// the write side always having exactly one record to authorise
+    /// rather than a range) rejects outright with this; multi-record read
+    /// surfaces (`event_store::query_events`/`count_events`/
     /// `deliver_to_subscriptions`/`fetch_events`/`consume_events`) never
     /// construct it at all - a record that fails this check is filtered
     /// out of the result, not a reason to fail the whole call.
     #[error("this grant is scoped to a value that does not match this record's own owner")]
     GrantScopeMismatch,
+
+    /// The private-field mechanism's own grant-time check: `event =
+    /// null or is_default_private_reader(event, access_mapping)` (and the
+    /// `command` sibling) from `rule GrantPrivateFieldAccessForEvent`/
+    /// `GrantPrivateFieldAccessForCommand`. Only ever constructed for a
+    /// per-record grant - a blanket one (naming neither) names nothing to
+    /// check yet, and is trusted at grant time, re-derived at every read
+    /// instead (see `event_store::is_default_private_reader`'s own doc
+    /// comment).
+    #[error("the caller is not this record's own default private reader")]
+    NotDefaultPrivateReader,
+
+    /// `rule RevokePrivateFieldAccess`'s own guard: only the `Role` that
+    /// made a `PrivateFieldGrant` may end it - not the grantee, and not an
+    /// admin. The self-service counterpart to every other grant in this
+    /// module needing a superadmin/admin to revoke it.
+    #[error("only the Role that made this PrivateFieldGrant may revoke it")]
+    NotGrantor,
+
+    #[error("this PrivateFieldGrant is not active")]
+    PrivateFieldGrantNotActive,
+
+    /// A named `event`/`command` belongs to a different bounded context
+    /// than the grantor's own `access_mapping` - the `PrivateFieldGrant`
+    /// counterpart to `GrantBoundedContextMismatch` above, kept distinct
+    /// since the message names the right entity.
+    #[error("this record does not belong to the grantor's own bounded context")]
+    PrivateFieldRecordWrongBoundedContext,
 
     #[error("this AccessToken is not active")]
     TokenNotActive,
@@ -284,6 +377,12 @@ impl SkiljRejection for Error {
             Error::InsufficientAccessLevel => "insufficient_access_level",
             Error::GrantBoundedContextMismatch => "grant_bounded_context_mismatch",
             Error::GrantScopeMismatch => "grant_scope_mismatch",
+            Error::NotDefaultPrivateReader => "not_default_private_reader",
+            Error::NotGrantor => "not_grantor",
+            Error::PrivateFieldGrantNotActive => "private_field_grant_not_active",
+            Error::PrivateFieldRecordWrongBoundedContext => {
+                "private_field_record_wrong_bounded_context"
+            }
             Error::TokenNotActive => "token_not_active",
             Error::NotSuperadmin => "not_superadmin",
             Error::UnrecognisedSubject => "unrecognised_subject",
@@ -300,6 +399,28 @@ impl SkiljRejection for Error {
 
     fn message(&self) -> String {
         self.to_string()
+    }
+}
+
+/// Cross-tenant read fix (docs/architecture.md's own write-up of these
+/// passes) - `snapshot_query::inspect_snapshot_field`'s own enforcement,
+/// the identical single-record, fail-closed shape
+/// `projections::query_projection`'s inline `access_mapping.scope`-vs-
+/// instance-owner check already has (kept as its own tiny function here,
+/// rather than inlined the same way, only because `inspectSnapshot` has
+/// no other pure-function layer of its own for it to join - `event_owner_scope_satisfied`/
+/// `command_owner_scope_satisfied` are functions in their own right for
+/// the opposite reason, several call sites each). Holds when `scope` is
+/// `None` (unrestricted - every caller's behaviour before `scope`
+/// existed), or `owner` is `Some` and equal to it. Does not hold - fails
+/// closed - when `scope` is `Some` and `owner` is either a different
+/// value or `None` (not yet established): the identical "affirmatively
+/// provable, not merely un-contradicted" stance every sibling in this
+/// pass already takes.
+pub fn scope_matches_owner(owner: Option<&str>, scope: Option<&str>) -> bool {
+    match scope {
+        None => true,
+        Some(scope) => owner == Some(scope),
     }
 }
 
@@ -689,6 +810,138 @@ pub fn revoke_role_access_mapping(
     })
 }
 
+/// See `rule GrantPrivateFieldAccessForEvent`. `id` is the caller's own
+/// `generate_token_id()` output, not this function's to generate - the
+/// same treatment `create_role`'s `id`/every `create_*_token` function's
+/// `id` already gets. `event: None` mints a blanket grant; `Some` a
+/// per-record one, checked against `is_default_private_reader` below.
+pub fn grant_private_field_access_for_event(
+    access_mapping: &RoleAccessMapping,
+    grantee: &Role,
+    event: Option<&crate::event_store::Event>,
+    id: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::error::Result<PrivateFieldGrant> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(Error::GrantNotActive.into());
+    }
+    if grantee.status != RoleStatus::Active {
+        return Err(Error::RoleNotActive.into());
+    }
+    if let Some(event) = event {
+        if event.bounded_context != access_mapping.bounded_context {
+            return Err(Error::PrivateFieldRecordWrongBoundedContext.into());
+        }
+        if !crate::event_store::is_default_private_reader(event, &access_mapping.role) {
+            return Err(Error::NotDefaultPrivateReader.into());
+        }
+    }
+    Ok(PrivateFieldGrant {
+        id,
+        bounded_context: access_mapping.bounded_context.clone(),
+        grantor: access_mapping.role.clone(),
+        grantee: grantee.clone(),
+        event_sequence: event.map(|e| e.sequence),
+        command_id: None,
+        status: TokenStatus::Active,
+        created_at: now,
+        revoked_at: None,
+    })
+}
+
+/// See `rule GrantPrivateFieldAccessForCommand` - same shape and
+/// reasoning as `grant_private_field_access_for_event` above, checked
+/// against a `Command` instead of an `Event`.
+pub fn grant_private_field_access_for_command(
+    access_mapping: &RoleAccessMapping,
+    grantee: &Role,
+    command: Option<&crate::event_store::Command>,
+    id: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::error::Result<PrivateFieldGrant> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(Error::GrantNotActive.into());
+    }
+    if grantee.status != RoleStatus::Active {
+        return Err(Error::RoleNotActive.into());
+    }
+    if let Some(command) = command {
+        if command.bounded_context != access_mapping.bounded_context {
+            return Err(Error::PrivateFieldRecordWrongBoundedContext.into());
+        }
+        if !crate::event_store::is_default_private_reader(command, &access_mapping.role) {
+            return Err(Error::NotDefaultPrivateReader.into());
+        }
+    }
+    Ok(PrivateFieldGrant {
+        id,
+        bounded_context: access_mapping.bounded_context.clone(),
+        grantor: access_mapping.role.clone(),
+        grantee: grantee.clone(),
+        event_sequence: None,
+        command_id: command.map(|c| c.id.clone()),
+        status: TokenStatus::Active,
+        created_at: now,
+        revoked_at: None,
+    })
+}
+
+/// See `rule RevokePrivateFieldAccess`. Only the Role that made a grant
+/// may end it - not the grantee, and not an admin (`Error::NotGrantor`) -
+/// the self-service counterpart to `revoke_role_access_mapping`'s own
+/// superadmin-only guard just below.
+pub fn revoke_private_field_access(
+    access_mapping: &RoleAccessMapping,
+    grant: &PrivateFieldGrant,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::error::Result<PrivateFieldGrant> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(Error::GrantNotActive.into());
+    }
+    if access_mapping.role != grant.grantor {
+        return Err(Error::NotGrantor.into());
+    }
+    if grant.status != TokenStatus::Active {
+        return Err(Error::PrivateFieldGrantNotActive.into());
+    }
+    Ok(PrivateFieldGrant {
+        status: TokenStatus::Revoked,
+        revoked_at: Some(now),
+        ..grant.clone()
+    })
+}
+
+/// See `rule ListPrivateFieldGrants`. `all_grants_in_context` is the
+/// caller's own already-loaded snapshot - this bounded context's rows
+/// alone, the same "pure function, I/O resolved before the call" split
+/// every other rule in this crate follows - filtered here down to
+/// `grantor`'s own (or, when `grantor` is omitted, the caller's own).
+/// Naming a *different* grantor requires `access_mapping.level = admin`;
+/// naming none, or naming oneself, needs no particular level - reading
+/// back one's own decisions needs no grant beyond having made them.
+/// Revoked grants are included, not filtered out - see the rule's own
+/// `@guidance` for why.
+pub fn list_private_field_grants(
+    access_mapping: &RoleAccessMapping,
+    grantor: Option<&Role>,
+    all_grants_in_context: &[PrivateFieldGrant],
+) -> crate::error::Result<Vec<PrivateFieldGrant>> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(Error::GrantNotActive.into());
+    }
+    let subject = match grantor {
+        None => &access_mapping.role,
+        Some(named) if named == &access_mapping.role => named,
+        Some(named) if access_mapping.level == AccessLevel::Admin => named,
+        Some(_) => return Err(Error::InsufficientAccessLevel.into()),
+    };
+    Ok(all_grants_in_context
+        .iter()
+        .filter(|g| &g.grantor == subject)
+        .cloned()
+        .collect())
+}
+
 /// One now-inactive `RoleAccessMapping`, identified the same way a live
 /// `EventSubscription` connection already scopes itself - `role_id` plus
 /// `bounded_context` name, never the full entity. `RevocationBroadcaster`'s
@@ -789,12 +1042,17 @@ fn require_active_admin(access_mapping: &RoleAccessMapping) -> crate::error::Res
 /// See `rule CreateExternalEventToken`. `id`/`secret` are the caller's own
 /// `generate_token_id()`/`generate_token_secret()` output - not this
 /// function's to generate, the same treatment `create_role`'s `id` gets
-/// (see its own doc comment; both are real, in `crate::shared`).
+/// (see its own doc comment; both are real, in `crate::shared`). `scope`
+/// is carried through unvalidated - `ExternalEventToken.scope`'s own doc
+/// comment, and `create_event_read_token`'s below for the full
+/// "independent of the minting admin's own scope" reasoning, shared by
+/// all four token-minting functions alike.
 pub fn create_external_event_token(
     access_mapping: &RoleAccessMapping,
     event_type: &crate::event_store::EventType,
     id: String,
     secret: String,
+    scope: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<ExternalEventToken> {
     require_active_admin(access_mapping)?;
@@ -809,6 +1067,7 @@ pub fn create_external_event_token(
         created_at: now,
         revoked_at: None,
         event_type: event_type.clone(),
+        scope,
     })
 }
 
@@ -819,6 +1078,7 @@ pub fn create_direct_creation_token(
     event_type: &crate::event_store::EventType,
     id: String,
     secret: String,
+    scope: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<DirectCreationToken> {
     require_active_admin(access_mapping)?;
@@ -833,6 +1093,7 @@ pub fn create_direct_creation_token(
         created_at: now,
         revoked_at: None,
         event_type: event_type.clone(),
+        scope,
     })
 }
 
@@ -841,6 +1102,12 @@ pub fn create_direct_creation_token(
 /// `EventReadToken.scope`'s own doc comment - carried through
 /// unvalidated, the same "no validation on this value" treatment
 /// `RoleAccessMapping.scope` already gets from `grant_role_access_mapping`.
+/// It is the minted token's own scope, independent of the minting
+/// admin's own `access_mapping.scope`: the grant authorising this call
+/// (and every other token-minting call in this module) is checked for
+/// level and bounded context alone, and has no bearing on what may be
+/// named here - an admin holding an unscoped staff grant may mint a
+/// company-scoped token, and that is the ordinary case, not an oversight.
 pub fn create_event_read_token(
     access_mapping: &RoleAccessMapping,
     event_type: &crate::event_store::EventType,
@@ -873,6 +1140,7 @@ pub fn create_command_token(
     command_type: &crate::event_store::CommandType,
     id: String,
     secret: String,
+    scope: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<CommandToken> {
     require_active_admin(access_mapping)?;
@@ -887,6 +1155,7 @@ pub fn create_command_token(
         created_at: now,
         revoked_at: None,
         command_type: command_type.clone(),
+        scope,
     })
 }
 

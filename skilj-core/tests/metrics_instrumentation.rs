@@ -111,6 +111,7 @@ async fn appending_an_event_records_the_events_appended_counter() {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,

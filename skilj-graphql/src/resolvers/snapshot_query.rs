@@ -23,7 +23,21 @@ use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef
 /// legitimate case: a real, registered snapshot that's simply never had
 /// a row written for this `tagValue` yet (cold - see
 /// `CommandType::decide_from_snapshot`'s own doc comment on why a
-/// missing snapshot is never an error there either).
+/// missing snapshot is never an error there either) - unless the reject
+/// below fires first (see the next paragraph): those two "nothing to
+/// show" outcomes stay distinguishable from each other, but a
+/// `scope`-restricted caller can't tell "cold" from "not mine" apart -
+/// deliberately, the identical "invisible, not merely unreadable"
+/// framing every sibling in this pass already gives an owner mismatch.
+///
+/// Cross-tenant read fix (docs/architecture.md's own write-up of these
+/// passes): `Snapshot::OWNER_TAG_KEY`, when declared, names which of a
+/// folding event's own tags becomes a stored row's derived `owner` (see
+/// `db::catch_up_snapshots`). A `scope`-restricted `RoleAccessMapping`
+/// whose `scope` doesn't match a found row's own `owner` is rejected
+/// with `GrantScopeMismatch` - see `access_control::scope_matches_owner`'s
+/// own doc comment for the full fail-closed contract, identical to
+/// `projections::query_projection`'s.
 ///
 /// Deliberately shows the *raw stored row*, including its own recorded
 /// `version`, even when that no longer matches the currently-registered
@@ -41,7 +55,8 @@ pub fn inspect_snapshot_field() -> Field {
                 let state = ctx.data::<GraphqlState>()?;
                 let bounded_context_name =
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                let access_mapping =
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
                 let snapshot_name = ctx.args.try_get("snapshotName")?.string()?.to_string();
                 let tag_value = ctx.args.try_get("tagValue")?.string()?.to_string();
 
@@ -51,8 +66,12 @@ pub fn inspect_snapshot_field() -> Field {
                 else {
                     return Err(not_found("Snapshot", &snapshot_name));
                 };
+                let owner_tag_key = state
+                    .snapshot_dispatcher
+                    .owner_tag_key(&bounded_context_name, &snapshot_name)
+                    .flatten();
 
-                let stored = skilj_core::db::get_snapshot_state(
+                let stored = skilj_core::db::get_snapshot_state_and_owner(
                     &state.pool,
                     &bounded_context_name,
                     &snapshot_name,
@@ -62,16 +81,44 @@ pub fn inspect_snapshot_field() -> Field {
                 .await
                 .map_err(to_graphql_error)?;
 
-                Ok(stored.map(|(version, as_of_sequence, state, updated_at)| {
-                    FieldValue::owned_any(InspectedSnapshotData {
-                        tag_key: tag_key.to_string(),
-                        tag_value,
-                        version: version as i64,
-                        as_of_sequence,
-                        state,
-                        updated_at,
-                    })
-                }))
+                // Cross-tenant read fix (docs/architecture.md's own
+                // write-up of these passes): a `scope`-restricted grant
+                // querying an owner-declaring snapshot can't tell "cold"
+                // from "not mine" apart - both fail closed alike, rather
+                // than the ordinary "nothing recorded yet" `null`
+                // `stored.is_none()` otherwise answers with. See
+                // `surface SnapshotInspection`'s own
+                // `GrantScopedToOwnerWhenDeclared` guarantee.
+                let scope_restricted = owner_tag_key.is_some() && access_mapping.scope.is_some();
+
+                let Some(((version, as_of_sequence, state_json, updated_at), owner)) = stored
+                else {
+                    if scope_restricted {
+                        return Err(to_graphql_error(
+                            skilj_core::access_control::Error::GrantScopeMismatch,
+                        ));
+                    }
+                    return Ok(None);
+                };
+                if scope_restricted
+                    && !skilj_core::access_control::scope_matches_owner(
+                        owner.as_deref(),
+                        access_mapping.scope.as_deref(),
+                    )
+                {
+                    return Err(to_graphql_error(
+                        skilj_core::access_control::Error::GrantScopeMismatch,
+                    ));
+                }
+
+                Ok(Some(FieldValue::owned_any(InspectedSnapshotData {
+                    tag_key: tag_key.to_string(),
+                    tag_value,
+                    version: version as i64,
+                    as_of_sequence,
+                    state: state_json,
+                    updated_at,
+                })))
             })
         },
     )

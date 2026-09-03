@@ -209,6 +209,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
                 subject_key: "user".to_string(),
                 subject_field: "user_id".to_string(),
             }],
+            Vec::new(),
             false,
             true,
             false,
@@ -232,6 +233,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             vec![],
             None,
             vec![],
+            Vec::new(),
             true,
             None,
         )
@@ -272,6 +274,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();

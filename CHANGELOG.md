@@ -8,6 +8,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Cross-tenant read access: any grant with bounded-context-level access
+  (`RoleAccessMapping`/`EventReadToken`) could read another tenant's
+  projection instances, raw events, commands, or snapshots, regardless
+  of who they actually belonged to. `RoleAccessMapping.scope`/
+  `EventReadToken.scope` now gate every read against a per-record
+  derived owner (a declared `owner_tag_key`), fail-closed whenever
+  ownership can't be affirmatively proven. Applied consistently across
+  `ProjectionQuery`, `QueryEvents`/`CountEvents`/`InspectEvent`,
+  `FetchEvents`/`ConsumeEvents`, `EventSubscription`, `CommandQuery`/
+  `FetchCommands`, `InspectSnapshot`, and the initial grant
+  `createBoundedContextFromTemplate` makes for a new tenant.
+- Cross-tenant write access: the identical gap existed on the write
+  side - even after the read-side fix above, a scope-restricted grant
+  or token could still blindly submit a command or create an event for
+  another tenant's records. Closed across `submitCommand`, REST command
+  triggering, and REST event creation (`ExternalEventToken`/
+  `DirectCreationToken`), using the same owner-tag mechanism.
+- A REST scope-mismatch rejection returned an HTTP 500 instead of 403 -
+  latent until the write-side fix above made it reachable at all; fixed
+  alongside it.
+
+### Added
+
+- Private fields: a new field-level visibility mechanism alongside
+  `sensitive_fields` - a field visible by default only to its own
+  creator (`own`), to any Role in a named team (`team`), or to the
+  party its own payload addresses (`addressed`), with self-service
+  sharing (`grantPrivateFieldAccessForEvent`/`ForCommand`,
+  `revokePrivateFieldAccess`, `listPrivateFieldGrants`) and no
+  encryption involved anywhere - a plain read-time redaction, not a
+  cryptographic one, since none of the three need to survive an
+  erasure request the way `sensitive_fields` does.
+- `EventType`/`CommandType.owner_tag_key` and `RoleAccessMapping.scope`/
+  `EventReadToken.scope`/`ExternalEventToken.scope`/
+  `DirectCreationToken.scope`/`CommandToken.scope`, all exposed on the
+  wire (`registerEventType`/`registerCommandType`'s own `ownerTagKey`
+  argument, and each token's own `scope` field on the object returned
+  by minting it).
+- `createBoundedContextFromTemplate` accepts an optional `scope` for the
+  tenant's own initial grant.
+
+### Fixed
+
+- A panic (`role_access_mappings row references a bounded_contexts row
+  that no longer exists`) when a bounded context was hard-deleted while
+  an unrelated concurrent read was in flight - a stale row is now
+  treated as gone rather than corrupt.
+
 ## [0.0.2] - 2026-08-30
 
 ### Added

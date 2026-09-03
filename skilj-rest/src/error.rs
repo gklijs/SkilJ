@@ -102,6 +102,18 @@ fn status_for(err: &CoreError) -> StatusCode {
             AccessControlError::GrantNotActive => StatusCode::FORBIDDEN,
             AccessControlError::InsufficientAccessLevel => StatusCode::FORBIDDEN,
             AccessControlError::GrantBoundedContextMismatch => StatusCode::FORBIDDEN,
+            // Cross-tenant write fix (docs/architecture.md's own write-up
+            // of these passes): newly reachable over REST by this pass -
+            // authorise_command_trigger/create_external_event/
+            // create_direct_event are the first Error::GrantScopeMismatch
+            // sources on the REST track that actually reject rather than
+            // filter (EventFetch's own fetch_events/consume_events only
+            // ever filter - see event_owner_scope_satisfied's own doc
+            // comment - so this variant was unreachable over REST before
+            // the write side existed). Same meaning as
+            // GrantBoundedContextMismatch above: a caller a token no
+            // longer covers.
+            AccessControlError::GrantScopeMismatch => StatusCode::FORBIDDEN,
             AccessControlError::NotSuperadmin => StatusCode::FORBIDDEN,
             AccessControlError::RoleNotActive => StatusCode::FORBIDDEN,
             AccessControlError::UnrecognisedSubject => StatusCode::UNAUTHORIZED,

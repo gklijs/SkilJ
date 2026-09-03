@@ -41,6 +41,7 @@ fn event_type() -> EventType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,
@@ -219,6 +220,7 @@ async fn subscribing_before_the_snapshot_catches_a_racing_event_without_deliveri
         &received,
         &[Subscription::AllEventsSubscription(Box::new(subscription))],
         |_, _| None,
+        &[],
     );
     assert!(
         delivered.is_empty(),

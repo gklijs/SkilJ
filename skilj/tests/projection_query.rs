@@ -957,6 +957,7 @@ fn keyed_projection_end_to_end() {
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();
@@ -1222,6 +1223,7 @@ fn keyed_projection_decrypt_on_read_end_to_end() {
             &event_type,
             generate_token_id(),
             generate_token_secret(),
+            None,
             test_now(),
         )
         .unwrap();

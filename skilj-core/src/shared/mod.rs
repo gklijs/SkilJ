@@ -89,6 +89,39 @@ pub struct SensitiveField {
     pub subject_field: FieldPath,
 }
 
+/// See `value PrivateField` in the spec - the private-field mechanism's
+/// own three-way visibility rule, standing beside `SensitiveField` rather
+/// than inside it: a plain read-time redaction, no `EncryptionKey`
+/// anywhere behind it. `team`/`addressee_field` are each set exactly when
+/// `kind` calls for them, checked by `event_store::valid_private_fields`
+/// at registration - `None` for whichever the other two kinds leave
+/// unused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PrivateField {
+    pub field: FieldPath,
+    pub kind: PrivateFieldKind,
+    pub team: Option<String>,
+    pub addressee_field: Option<FieldPath>,
+}
+
+/// See `enum PrivateFieldKind` in the spec for what each variant means in
+/// full - `Own` (default reader: the record's own creator),
+/// `Team` (default reader: any `Role` named `PrivateField.team`),
+/// `Addressed` (default reader: the party `PrivateField.addressee_field`
+/// names in the payload). A fourth kind, `Draft` - visible only until an
+/// external status changes - is a real, deliberately deferred future
+/// kind: it needs a live `Projection` lookup at read time, a materially
+/// different evaluability shape from these three, which are decidable
+/// from the record and the reading caller's own identity alone. Nothing
+/// here is shaped around it and nothing here forecloses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateFieldKind {
+    Own,
+    Team,
+    Addressed,
+}
+
 /// The whole contract a bounded context's `decide()` returns - see
 /// `value CommandDecision` in the spec, and docs/architecture.md
 /// §4.1/§5.4/§7.3 for why a rejection is typed data, never a

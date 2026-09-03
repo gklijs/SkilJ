@@ -65,6 +65,7 @@ pub mod command_type_admin_operations;
 pub mod event_query;
 pub mod event_subscription;
 pub mod event_type_admin_operations;
+pub mod private_field_grant_management;
 pub mod projection_query;
 pub mod snapshot_query;
 pub mod subject_erasure;
@@ -76,11 +77,15 @@ use crate::error::to_graphql_error;
 use crate::gql_types::BoundedContextWithMappings;
 use async_graphql::dynamic::{ResolverContext, ValueAccessor};
 use async_graphql::ErrorExtensions;
-use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
+use skilj_core::access_control::{
+    AccessLevel, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus,
+};
 use skilj_core::db::Pool;
 use skilj_core::encryption::{DataKey, EncryptionMasterKey};
 use skilj_core::event_store::MissedOccurrencePolicy;
-use skilj_core::shared::{Filter, FilterOperator, SensitiveField, TagMapping};
+use skilj_core::shared::{
+    Filter, FilterOperator, PrivateField, PrivateFieldKind, SensitiveField, TagMapping,
+};
 
 /// The resolved caller for every gated resolver in this crate except
 /// `createSuperadmin` - `Err` (an "unauthenticated" GraphQL error) when
@@ -235,6 +240,53 @@ pub fn parse_sensitive_fields(value: &ValueAccessor) -> async_graphql::Result<Ve
     Ok(fields)
 }
 
+/// Parses a `[PrivateFieldInput!]!` argument into `Vec<PrivateField>` -
+/// shared by `registerEventType`/`registerCommandType`, the same role
+/// `parse_sensitive_fields` plays for `sensitive_fields`.
+pub fn parse_private_fields(value: &ValueAccessor) -> async_graphql::Result<Vec<PrivateField>> {
+    let mut fields = Vec::new();
+    for item in value.list()?.iter() {
+        let obj = item.object()?;
+        let kind = match obj.try_get("kind")?.enum_name()? {
+            "TEAM" => PrivateFieldKind::Team,
+            "ADDRESSED" => PrivateFieldKind::Addressed,
+            _ => PrivateFieldKind::Own,
+        };
+        let team = obj
+            .get("team")
+            .filter(|v| !v.is_null())
+            .map(|v| v.string().map(str::to_string))
+            .transpose()?;
+        let addressee_field = obj
+            .get("addresseeField")
+            .filter(|v| !v.is_null())
+            .map(|v| v.string().map(str::to_string))
+            .transpose()?;
+        fields.push(PrivateField {
+            field: obj.try_get("field")?.string()?.to_string(),
+            kind,
+            team,
+            addressee_field,
+        });
+    }
+    Ok(fields)
+}
+
+/// Every active `PrivateFieldGrant` in `bounded_context_name` - the
+/// shared snapshot `query_events`/`inspect_event`/`fetch_commands`/
+/// `deliver_to_subscriptions`'s own callers all pre-load once per request
+/// and pass straight through to `render_event`/`render_command` (see
+/// those functions' own doc comments for why one list serves every
+/// caller/subscriber alike, filtered internally by grantee).
+pub async fn load_private_field_grants(
+    pool: &Pool,
+    bounded_context_name: &str,
+) -> async_graphql::Result<Vec<PrivateFieldGrant>> {
+    skilj_core::db::list_private_field_grants_for_context(pool, bounded_context_name)
+        .await
+        .map_err(to_graphql_error)
+}
+
 /// Parses a `[FilterInput!]` argument into `Vec<Filter>` - used by
 /// `event_subscription::events_by_type_field`'s own `filters` argument.
 /// Real wire-shape (matching `CreateEventTypeSubscription`'s own
@@ -296,23 +348,26 @@ pub fn not_found(entity: &str, key: &str) -> async_graphql::Error {
 }
 
 /// Shared by `event_type_admin_operations`/`command_type_admin_operations` -
-/// three of the four `create*Token` mutations (`createExternalEventToken`,
-/// `createDirectCreationToken`, `createCommandToken`) differ only in
-/// which type they resolve (`EventType`/`CommandType`, hence
-/// `$type_arg_name`/`$type_label`/`$get_type_fn`) and which
+/// all four `create*Token` mutations (`createExternalEventToken`,
+/// `createDirectCreationToken`, `createCommandToken`, `createEventReadToken`)
+/// differ only in which type they resolve (`EventType`/`CommandType`,
+/// hence `$type_arg_name`/`$type_label`/`$get_type_fn`) and which
 /// `access_control::create_*_token`/`db::insert_*_token` pair they call.
 /// Originally two separate, near-identical macros/hand-written bodies
 /// (one file's own doc comment used to say so explicitly) - unified here
 /// since `command_type_admin_operations` only ever needed the identical
 /// shape with different type parameters, not a genuinely different one.
 ///
-/// `createEventReadToken` is the fourth, hand-written below
-/// (`create_event_read_token_field`) rather than a macro invocation -
-/// `EventReadToken` alone carries `scope` (cross-tenant read fix,
-/// docs/architecture.md's own write-up of these passes), and this
-/// macro's fixed argument list has no way to vary that one field between
-/// invocations, the same reasoning `db::get_event_type_access_token!`
-/// already gives for its own identical exception.
+/// `createEventReadToken` used to be a fourth, hand-written exception -
+/// `EventReadToken` alone carried `scope` (cross-tenant read fix,
+/// docs/architecture.md's own write-up of these passes) and this macro's
+/// fixed argument list had no way to vary that one field between
+/// invocations. The write-side half of that same series gave the other
+/// three token kinds `scope` too (`ExternalEventToken`/
+/// `DirectCreationToken`/`CommandToken`), so the field is no longer one
+/// invocation's alone to vary - every `create_*_token` function now takes
+/// an identical `scope: Option<String>` parameter in the same position,
+/// and this macro parses and threads it uniformly for all four.
 macro_rules! create_type_token_field {
     (
         $field_name:literal,
@@ -338,6 +393,12 @@ macro_rules! create_type_token_field {
                     )
                     .await?;
                     let type_name = ctx.args.try_get($type_arg_name)?.string()?.to_string();
+                    let scope = ctx
+                        .args
+                        .get("scope")
+                        .filter(|v| !v.is_null())
+                        .map(|v| v.string().map(str::to_string))
+                        .transpose()?;
 
                     let target_type = $get_type_fn(&state.pool, &bounded_context_name, &type_name)
                         .await
@@ -349,6 +410,7 @@ macro_rules! create_type_token_field {
                         &target_type,
                         ::skilj_core::shared::generate_token_id(),
                         ::skilj_core::shared::generate_token_secret(),
+                        scope,
                         chrono::Utc::now(),
                     )
                     .map_err($crate::error::to_graphql_error)?;
@@ -367,6 +429,10 @@ macro_rules! create_type_token_field {
         .argument(::async_graphql::dynamic::InputValue::new(
             $type_arg_name,
             ::async_graphql::dynamic::TypeRef::named_nn(::async_graphql::dynamic::TypeRef::STRING),
+        ))
+        .argument(::async_graphql::dynamic::InputValue::new(
+            "scope",
+            ::async_graphql::dynamic::TypeRef::named(::async_graphql::dynamic::TypeRef::STRING),
         ))
     };
 }

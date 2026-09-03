@@ -74,6 +74,7 @@ fn event_type() -> EventType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         external_creation_allowed: false,
         direct_creation_allowed: false,
         system_triggered_allowed: false,
@@ -94,6 +95,7 @@ fn command_type() -> CommandType {
         tag_mappings: Vec::new(),
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
         rest_trigger_allowed: false,
     }
 }
@@ -139,6 +141,7 @@ fn create_external_event_token_succeeds_and_stamps_the_full_entity_shape() {
         &et,
         "token-1".into(),
         "s3cr3t".into(),
+        None,
         timestamp(1000),
     )
     .unwrap();
@@ -162,6 +165,7 @@ fn create_external_event_token_rejects_a_revoked_mapping() {
         &event_type(),
         "token-1".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -179,6 +183,7 @@ fn create_external_event_token_rejects_a_write_level_mapping() {
         &event_type(),
         "token-1".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -199,6 +204,7 @@ fn create_external_event_token_rejects_an_event_type_from_another_bounded_contex
         &other_bounded_context_event_type(),
         "token-1".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -229,6 +235,7 @@ fn create_direct_creation_token_succeeds_and_stamps_the_full_entity_shape() {
         &et,
         "token-2".into(),
         "s3cr3t".into(),
+        None,
         timestamp(1000),
     )
     .unwrap();
@@ -250,6 +257,7 @@ fn create_direct_creation_token_rejects_a_revoked_mapping() {
         &event_type(),
         "token-2".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -266,6 +274,7 @@ fn create_direct_creation_token_rejects_a_write_level_mapping() {
         &event_type(),
         "token-2".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -285,6 +294,7 @@ fn create_direct_creation_token_rejects_an_event_type_from_another_bounded_conte
         &other_bounded_context_event_type(),
         "token-2".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -418,6 +428,7 @@ fn create_command_token_succeeds_and_stamps_the_full_entity_shape() {
         &ct,
         "token-4".into(),
         "s3cr3t".into(),
+        None,
         timestamp(1000),
     )
     .unwrap();
@@ -439,6 +450,7 @@ fn create_command_token_rejects_a_revoked_mapping() {
         &command_type(),
         "token-4".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -455,6 +467,7 @@ fn create_command_token_rejects_a_write_level_mapping() {
         &command_type(),
         "token-4".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -474,6 +487,7 @@ fn create_command_token_rejects_a_command_type_from_another_bounded_context() {
         &other_bounded_context_command_type(),
         "token-4".into(),
         "s3cr3t".into(),
+        None,
         timestamp(0),
     )
     .unwrap_err();
@@ -502,6 +516,7 @@ fn revoke_token_succeeds_for_every_variant_and_stamps_revoked_at() {
             created_at: timestamp(0),
             revoked_at: None,
             event_type: event_type(),
+            scope: None,
         }),
         AccessToken::DirectCreationToken(DirectCreationToken {
             id: "t".into(),
@@ -510,6 +525,7 @@ fn revoke_token_succeeds_for_every_variant_and_stamps_revoked_at() {
             created_at: timestamp(0),
             revoked_at: None,
             event_type: event_type(),
+            scope: None,
         }),
         AccessToken::CommandToken(CommandToken {
             id: "t".into(),
@@ -518,6 +534,7 @@ fn revoke_token_succeeds_for_every_variant_and_stamps_revoked_at() {
             created_at: timestamp(0),
             revoked_at: None,
             command_type: command_type(),
+            scope: None,
         }),
         AccessToken::EventReadToken(EventReadToken {
             id: "t".into(),
@@ -558,6 +575,7 @@ fn access_token_revoked_at_is_absent_while_active() {
         created_at: timestamp(0),
         revoked_at: None,
         event_type: event_type(),
+        scope: None,
     };
 
     assert_eq!(token.status, TokenStatus::Active);

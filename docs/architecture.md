@@ -4553,3 +4553,539 @@ for a type that never set one, covering the unset path. `cargo
 build/clippy/test --workspace` and `cargo fmt --check` clean; `allium
 check`/`plan`/`analyse` independently re-verified - clean, obligation
 count unchanged, same 4 pre-existing `analyse` findings.
+
+## 27. Cross-tenant read fix, part five: `SnapshotInspection`
+
+A gap the first four passes didn't cover, found by re-checking every
+`AdminAccess`-facing single-record read surface for the same shape after
+§26 closed the read-back gap: `inspectSnapshot`'s resolver
+(`skilj-graphql/src/resolvers/snapshot_query.rs`) only ever checked
+`require_admin_mapping` - bounded-context-level - then fetched a stored
+row by a caller-supplied `tagValue` directly, with no check that the
+value belonged to the caller. In skilj-helpdesk's shape, any admin-level
+grant could inspect any other company's snapshot by tag value alone.
+
+**Design**: `Snapshot::OWNER_TAG_KEY: Option<&'static str>`
+(`skilj-core/src/plugin/mod.rs`) - deliberately Rust-only, the identical
+treatment `Snapshot::TAG_KEY` itself already gets (no spec field, no
+registration surface: `Snapshot` is compiled, deployed configuration
+throughout, unlike `EventType`/`CommandType`'s registered
+`owner_tag_key` from §24/§25). Genuinely a separate dimension from
+`TAG_KEY`: a snapshot keyed by `"account"` can still need owner-scoping
+by `"company"` - `catch_up_snapshots` (`skilj-core/src/db/mod.rs`)
+derives each stored row's own `owner` at fold time from whichever tag on
+the folding event matches `OWNER_TAG_KEY`, independent of the tag it
+already reads for `TAG_KEY`/`tag_value` itself, using the identical
+"leave an established owner untouched when a later event lacks the tag"
+rule `apply_projection_fold_update` set in §23.
+
+Unlike the other four surfaces, `inspectSnapshot` had no pure-function
+authorization layer in `skilj-core` at all to extend - its whole check
+lived inline in the resolver. Rather than force a new named predicate
+into `event_store`/`projections` for a single call site, the comparison
+itself is a tiny reusable function,
+`access_control::scope_matches_owner(owner, scope) -> bool` - the same
+fail-closed contract as `query_projection`'s own inline check, factored
+out only because this surface had nowhere else to put it. `db::get_snapshot_state_and_owner`
+is a new sibling to `get_snapshot_state`, not a replacement: that
+function's other caller, `submit_command`'s snapshot-accelerated
+`decide_from_snapshot` path, is a write-path internal accelerator, not a
+caller read, and stays untouched - the identical "`ProcessCommand`'s
+`matching_events` is deliberately untouched" principle §24 already
+applied to the analogous case on the command side.
+
+Single-record surface, so this rejects rather than filters, the same
+shape `inspectEvent`/`QueryProjection` already have - but with one
+real wrinkle worth naming: a `scope`-restricted caller querying a
+never-touched `tagValue` must **not** get the ordinary "cold, not a
+failure" `null` `inspectSnapshot` already answers an unscoped caller
+with, because that would let a scoped caller distinguish "nothing
+recorded yet" from "something recorded but not mine" - an oracle this
+fix exists to close, not preserve by accident. So the resolver checks
+`owner_tag_key.is_some() && access_mapping.scope.is_some()` once, up
+front, and fails closed on *both* "no row at all" and "a row whose owner
+doesn't match" alike whenever that holds - only an unscoped caller, or a
+snapshot declaring no owner dimension, still gets the original
+null-when-cold behaviour.
+
+**Verified**: `skilj-core/tests/snapshot_owner_scoping.rs` (8 tests, no
+new provisioning harness - `TAG_KEY`-vs-`OWNER_TAG_KEY` fold-time
+derivation via `catch_up_snapshots`, including a tag key genuinely
+different from `TAG_KEY` itself and the "later untagged event doesn't
+clear an established owner" case) plus `access_control::scope_matches_owner`
+unit-tested in isolation. `skilj/tests/graphql_business_surfaces.rs`
+gained a new real end-to-end test and its own self-contained fixture
+(`TicketOpened`/`TicketTotalSnapshot`/`OpenTicket`, distinct from the
+file's existing `ThingHappened`/`ThingTotalSnapshot` - not modified) -
+the concrete cross-tenant scenario over real HTTP: a scoped admin reads
+its own company's snapshot, is rejected reading another company's, is
+rejected the identical way for a never-touched `tagValue`, and an
+unscoped admin remains unrestricted. `cargo build/clippy/test --workspace`
+and `cargo fmt --check` clean; `allium check`/`plan`/`analyse`
+independently re-verified - clean, obligation count unchanged (this
+guarantee is prose, not a `requires` clause, since `OWNER_TAG_KEY` is
+Rust-only - enforcement lives entirely in the test suite above, the same
+as every guarantee over `Projection`'s own Rust-only declaration
+already does), same 4 pre-existing `analyse` findings.
+
+This closes the fifth and, as far as a deliberate re-check of every
+`AdminAccess`-facing single-record read surface found, final instance of
+the cross-tenant read gap.
+
+## 28. Cross-tenant read fix, part six: `CreateBoundedContextFromTemplate`'s always-unscoped grant
+
+A gap found by re-checking, symmetrically to §27's sweep, every place a
+`RoleAccessMapping` comes into being rather than every place one is read:
+`GrantRoleAccessMapping` (§23) lets an admin set `scope` on a grant it
+creates, but `CreateBoundedContextFromTemplate`'s own grant to the
+tenant's first role - the only *other* rule that creates one - had no
+such parameter and always passed `None`. A caller stamping a tenant from
+a template had no way to hand that tenant's own first role a scoped
+grant at creation time, and no way to fix that afterwards either:
+`UniqueActiveAccessPerRoleAndContext` blocks a follow-up
+`GrantRoleAccessMapping` call for the same `(role, bounded_context)` pair
+while the original grant is still active, so rescoping meant revoking
+and re-granting - workable, but not what "the tenant's first grant is
+scoped from the moment the tenant exists" should require.
+
+**Design**: identical mechanism to every prior pass - `scope` stays the
+unvalidated, opaque, caller-chosen string `RoleAccessMapping.scope`
+already is, just accepted here too. `specs/skilj.allium`:
+`CreateBoundedContextFromTemplate`'s `when:` gains `scope?`, threaded
+onto the `RoleAccessMapping.created(...)` its `ensures:` produces; a
+prose note (mirroring `GrantRoleAccessMapping`'s own) explains why it
+has to be settable here rather than left to a follow-up grant, for the
+`UniqueActiveAccessPerRoleAndContext` reason above; `@guarantee
+AccessGrantedWithCreation` gains a clause naming the read scope the
+caller chose explicitly, alongside the level and sensitivity it already
+named. `skilj-graphql/src/resolvers/bounded_context_templating.rs`:
+`finish_creating_tenant()` gains a `scope: Option<String>` parameter,
+passed through to its `grant_role_access_mapping()` call instead of a
+hardcoded `None`; `create_bounded_context_from_template_field()` parses
+an optional `scope: String` GraphQL argument the same way
+`grantRoleAccessMapping` already does and threads it through. No
+`skilj-core` change at all - `grant_role_access_mapping()` already took
+a `scope` parameter from §23; this pass only stops one of its two
+callers from silently discarding it.
+
+**Verified**: `skilj/tests/bounded_context_templating.rs` gained
+`create_bounded_context_from_template_carries_scope_onto_the_initial_grant`,
+calling `createBoundedContextFromTemplate` twice against one live
+`Skilj` instance - once with `scope: "company-a"`, once with
+`scope: null` - asserting the returned grant's `scope` each time.
+`cargo build/clippy/test --workspace` and `cargo fmt --check` clean;
+`allium check`/`plan`/`analyse` independently re-verified against the
+diff - obligation count unchanged (404, same as the last committed
+spec: no new `requires` clause, since `scope` stays unvalidated the same
+way it already is on `GrantRoleAccessMapping`), same 11
+warnings/8 infos/0 findings on `check`, same 4 pre-existing findings on
+`analyse`.
+
+## 29. Hardening: `list_role_access_mappings` no longer panics on a concurrent bounded-context deletion
+
+Found while chasing an intermittent panic that surfaced during §28's own
+test-suite verification, in a test §28 didn't touch:
+`RoleAccessMappingRow::into_domain` (`skilj-core/src/db/mod.rs`) read a
+`role_access_mappings` row, then made a *separate* follow-up query to
+load the `bounded_contexts` row it names, and `.expect()`-panicked if
+that came back empty. `hard_delete_bounded_context`'s `DROP SCHEMA` +
+`DELETE` + `ON DELETE CASCADE` guarantees no *committed* state ever has
+a `role_access_mappings` row outliving its `bounded_contexts` row - but
+those are two unsynchronized queries against the pool, not one snapshot,
+so a `hard_delete_bounded_context` committing in the gap between them is
+exactly this: a row legitimately read a moment ago, legitimately gone by
+the next query. `list_role_access_mappings` in particular reads
+*every* mapping in the system regardless of which bounded context a
+caller asked about (`load_bounded_context_with_mappings`, its own
+resolver-facing wrapper, filters by name only after every row has
+already been resolved) - so any admin operation that lists mappings
+could be made to panic by an unrelated concurrent tenant deletion
+anywhere else in the system, not just its own. This is a real
+robustness gap independent of tests: nothing about it requires two
+things racing in the same test file, only two things racing in the same
+process, and skilj is a library other applications embed and run
+concurrent requests against.
+
+**Fix**: `into_domain` returns `Ok(None)` instead of panicking when
+either the role or the bounded context it names has vanished by the
+time of its own lookup, treating that row as if it hadn't been in the
+snapshot to begin with rather than as a corrupt one. Its three callers
+(`get_active_role_access_mapping`, `list_role_access_mappings`,
+`list_active_role_access_mappings_for_role`) already had the right
+shape to absorb this: the first already returns `Option`, so a `None`
+row folds in as "no active mapping" with no new branch; the other two
+already build a `Vec` in a loop, so they skip a `None` instead of
+pushing it.
+
+**Verified**: this was caught and fixed by re-running
+`skilj/tests/bounded_context_templating.rs` - the file whose test count
+this session's own additions had just grown from 4 to 5 - directly:
+50 consecutive default-threaded (parallel) runs clean after the fix,
+against an observed ~10-20% failure rate on the same command before it
+(both the pre-existing `resync_bounded_context_from_template_pulls_in_a_later_schema_change`
+and this pass's own new test were each observed panicking with the
+identical signature across different runs, confirming the race was
+cross-test, not specific to either). `cargo build/clippy/test
+--workspace` and `cargo fmt --check` clean, full workspace suite (92
+test binaries/suites) green with no `FAILED`/panicked entries anywhere,
+not just the one file.
+
+## 30. Cross-tenant write fix: owner-tag scoping on `SubmitCommand`/`TriggerCommand`/`CreateExternalEvent`/`CreateDirectEvent`
+
+The read-side series (§23-§29) closed every instance of "any grant on the
+bounded context reads any record in it" it found - but never touched the
+mirror-image gap on the *write* side: a `scope`-restricted grant or token
+could no longer read another owner's records after those passes, yet
+could still blindly submit a command or create an event that mutated
+one, as long as it knew or could guess the record's own identifying
+tags. In skilj-helpdesk terms, a company-scoped `WriteAccess` role could
+no longer read company B's tickets, but could still open or modify one
+by command - a caller-visible IDOR on write, arguably worse than the
+original read one since it requires no read access at all.
+
+**Design**: the identical mechanism as every prior pass, applied to the
+four surfaces that create a record rather than read one -
+`SubmitCommand` (GraphQL, `RoleAccessMapping`), `TriggerCommand` (REST,
+`CommandToken`), `SubmitExternalEvent`/`SubmitDirectEvent` (REST,
+`ExternalEventToken`/`DirectCreationToken`). A new shared predicate,
+`event_store::tag_owner_scope_satisfied(tags, owner_tag_key, scope) ->
+bool` (`skilj-core/src/event_store/mod.rs`) - the same three-way
+fail-closed logic `event_owner_scope_satisfied`/`command_owner_scope_satisfied`
+already have (both now delegate to it), but taking the derived `tags`
+and the type's own `owner_tag_key` as plain values rather than reading
+them off an already-materialized `Event`/`Command`, since none of these
+four call sites have one yet - the record does not exist until after
+the check passes. Named `tag_owner_scope_satisfied` in the spec (not
+`owner_scope_satisfied`, already taken by `QueryProjection`'s
+unrelated, differently-shaped `owner_scope_satisfied(projection, key,
+access_mapping)` predicate - a real naming collision the `allium:tend`
+agent building this pass's spec diff caught and avoided).
+
+`authorise_command_submission`/`authorise_command_trigger` each gained a
+`let consistency_tags = derive_tags(...)` (previously computed only by
+the *caller*, after authorisation returned) plus the new check, and
+`CommandAuthorised` gained a Rust-only `consistency_tags: Vec<Tag>`
+field so the value is computed once and reused, not recomputed by every
+caller as before - a small efficiency side-effect of the fix, not a
+separate change. `create_external_event`/`create_direct_event` gained
+the identical check just before constructing the `Event`, reusing a new
+`let tags = derive_tags(...)` binding their own `ensures`-equivalent
+construction already needed. Single-record surfaces throughout, so every
+one of the four rejects outright on a mismatch (`Error::GrantScopeMismatch`,
+reused unchanged) rather than filtering - there is exactly one record
+being authorised at each of these call sites, never a range.
+
+`CommandToken`/`ExternalEventToken`/`DirectCreationToken` each gained a
+`scope: Option<String>` field, minted the same way
+`EventReadToken.scope` already is: an independent, unvalidated,
+caller-chosen string, set by whichever admin mints the token and
+unrelated to that admin's own `access_mapping.scope` (an unscoped staff
+admin may mint a scoped token - see `create_event_read_token`'s own doc
+comment, now shared by all four minting functions rather than
+`EventReadToken`'s alone). The shared `access_tokens.scope` Postgres
+column (added in §24 for `EventReadToken` alone) already existed for
+every token kind; this pass just started writing and reading it for the
+other three (`insert_command_token`'s own hand-written `INSERT` needed a
+literal new `scope` column added - the three `insert_access_token_row`-backed
+kinds only needed their callers to stop passing `None` unconditionally).
+
+**A real bug found and fixed along the way, independent of the owner-tag
+mechanism itself**: `skilj-rest`'s `status_for` HTTP-status table
+(`skilj-rest/src/error.rs`) had no entry for `Error::GrantScopeMismatch`
+at all, so it fell through to the wildcard `_ => StatusCode::INTERNAL_SERVER_ERROR`
+- a 500 instead of the 403 every other authorisation rejection in that
+table gets. This was latent, not yet caller-visible, because the
+variant was previously only ever *filtered* on the REST track
+(`fetch_events`/`consume_events`), never actually raised as an error -
+this pass's `authorise_command_trigger`/`create_external_event`/
+`create_direct_event` are the first REST-reachable sources that reject
+outright with it. Fixed by adding the missing match arm; decisively
+verified by reverting the fix and confirming
+`command_trigger_rejects_a_command_whose_owner_does_not_match_the_tokens_scope`
+actually fails with 500 before restoring it.
+
+**A second gap found while writing this pass's own GraphQL test**:
+`EventReadToken.scope` (§24) was never actually exposed on the GraphQL
+wire at all - `createEventReadToken`'s own mutation accepted and
+persisted the argument, but the returned `EventReadToken` object had no
+`scope` field to read it back, the identical class of admin read-back
+gap §26 closed for `owner_tag_key`. Fixed in the one place all four
+token GraphQL objects are built (`gql_types.rs`'s shared `token_object!`
+macro) rather than four separate patches, closing it for
+`EventReadToken` retroactively and for the three new token kinds at
+once.
+
+**Mechanical**: `create_type_token_field!` (`skilj-graphql/src/resolvers/mod.rs`),
+the macro backing three of the four `create*Token` GraphQL mutations,
+gained `scope` argument parsing and threading, uniform across all four
+now that every `create_*_token` function takes the identical parameter
+- `createEventReadToken` (`event_type_admin_operations.rs`), hand-written
+since §24 specifically because it alone needed this argument, folded
+back into the macro now that the asymmetry that justified the exception
+is gone. `db::get_event_type_access_token!` (`skilj-core/src/db/mod.rs`)
+gained the same third invocation for the identical reason, on the read
+side.
+
+**Verified**: `skilj-core/tests/command_processing.rs`/`event_creation_surfaces.rs`
+gained pure unit tests for all four rules' new obligations (mismatch
+rejects, a matching owner still succeeds, an untagged payload fails
+closed the same as a real mismatch, an unscoped grant/token stays fully
+unrestricted) - `command_processing.rs`'s own obligation count moved
+27→29, `event_creation_surfaces.rs`'s 22→24, both exactly the +2 each
+`allium plan`'s own new `rule-failure.*.6` obligations predict.
+`skilj-core/tests/persistence.rs` gained a new `round_trips_a_command_token`
+test (no prior round-trip test existed for `CommandToken` at all) and
+upgraded `round_trips_an_external_event_token_and_its_kind` to a real
+non-null scope value, proving the shared column round-trips for every
+kind now, not just `event_read`. Two new real end-to-end tests over
+actual HTTP (`skilj/tests/command_trigger.rs`,
+`skilj/tests/payload_validation.rs`) mint a second, differently-scoped
+token against a live `Skilj` instance and prove the rejection is real
+over the wire, with the right status code - not just at the
+pure-function layer. `skilj/tests/graphql_type_registration.rs`'s
+existing lifecycle test now passes a real `scope` to
+`createExternalEventToken` and asserts it reads back unchanged.
+`cargo build/clippy/test --workspace` and `cargo fmt --check` clean (92
+test binaries/suites, 3 consecutive full-workspace runs with zero
+failures); `allium check`/`plan`/`analyse` independently re-verified
+against the diff myself, not taken on the `allium:tend` agent's own
+report alone - `check` byte-identical to baseline (11 warnings/8
+infos/0 findings), `plan` obligation count 404→408 (exactly the four
+new `requires` clauses, nothing else), `analyse` the same 4 pre-existing
+findings, no new ones.
+
+This closes the write-side mirror of the entire cross-tenant read-fix
+series - between this pass and §23-§29, every surface that either reads
+or creates a record now respects the same owner-tag scoping, read and
+write alike.
+
+## 31. Private fields: a third field-level protection, alongside `sensitive_fields` and the owner-tag `scope` series
+
+A genuinely new mechanism, not a bugfix - user-initiated, prompted by a
+Codeberg issue proposing a whole-*projection* staff-only gate
+(`Projection::PRIVATE`/`can_read_private`, a single bounded-context-wide
+boolean) that turned out, on inspection, to be one instance of a broader
+and more useful primitive: a field visible by default only to a
+*specific* default reader determined per record, with that reader able
+to *share* it further. `sensitive_fields` (crypto-shredding-shaped PII
+protection, subject named by the payload, real `EncryptionKey`s, GDPR
+erasure) and the owner-tag `scope` series (§23-30, cross-tenant/company
+scoping) both already exist; neither fits "my own note, visible to me
+alone until I choose otherwise."
+
+**Three kinds**, each a different default reader, decidable from the
+record and the reading caller's own identity alone - no projection, no
+other record, no clock:
+
+- **`own`** - visible by default only to whoever created the record
+  (`Event.metadata.client_id`/`Command.metadata.client_id`, the Role's
+  own internal id for anything GraphQL-originated). Shareable: the
+  creator may grant another Role read access, to one specific record or
+  to every record of its own, present and future, and revoke that again.
+- **`team`** - visible to any Role whose own `name` equals a fixed
+  string the field declares. Nothing is granted and nothing needs to be
+  - membership is the grant, instantly and automatically, and it stops
+    the moment the Role is no longer named that. The originally-proposed
+  "staff-only projection" is one instance of this (`team: "staff"`),
+  not a mechanism of its own - the issue's own proposal is absorbed here
+  rather than built separately.
+- **`addressed`** - visible by default to the one other party the
+  payload itself names, read from a second payload field and matched
+  against the reader's own `Role.external_subject` - the identical
+  match a sensitive field's subject already gets, minus the encryption:
+  "who this is for," not "whose PII this is."
+
+A fourth kind, `draft` - visible only until some external status
+changes - is a real, deliberately deferred future kind, not one
+considered and rejected: it needs a live `Projection` lookup at read
+time, a materially different evaluability shape from the three built
+here, with its own open questions about staleness. Nothing here forecloses
+it; nothing here is shaped around it either.
+
+**Design decision, made explicit early and load-bearing throughout**: no
+encryption, anywhere. `sensitive_fields` earns its `EncryptionKey`/
+ciphertext-at-rest weight from GDPR erasure - none of these three kinds
+need to survive a legal erasure request or protect against a raw
+database compromise, only express an ordinary application-level
+visibility rule. Reaching for real crypto to do that would mean
+provisioning master-key infrastructure to solve a problem that has
+nothing to do with encryption - the same reasoning the original issue's
+own proposal already gave for not reusing `sensitive_fields`, generalised
+to all three kinds rather than the one it was written about. A private
+field is stored in plaintext exactly as written; protection is a
+read-time redaction to `null`, the identical place and shape an
+unentitled caller already finds a *sensitive* field's leaf left as
+stored ciphertext - never the enclosing object, never the whole record
+withheld.
+
+**Entities and fields** (`specs/skilj.allium`, `skilj-core/src/shared/mod.rs`):
+`value PrivateField { field, kind: PrivateFieldKind, team: String?,
+addressee_field: String? }` and `enum PrivateFieldKind { own | team |
+addressed }`; `EventType`/`CommandType` each gain `private_fields:
+Set<PrivateField>` alongside `sensitive_fields`, opt-in per field.
+`RegisterEventType`/`RegisterCommandType` gained a `private_fields`
+parameter, a new `valid_private_fields` validation black box (schema-leaf
+checks plus the kind-specific field-presence rule -
+`team`/`addressee_field` set exactly when `kind` calls for them), and two
+new overlap `requires` clauses - a private field may not also be a
+`tag_mappings` key or a `sensitive_fields` entry, the identical leak
+`SensitiveFieldTagOverlap` already guards against (a tag or ciphertext
+leaf carries no per-field redaction, so an overlapping field's plaintext
+would leak through regardless of what `private_fields` says).
+
+**Sharing - the entity the mechanism actually needs, and only one**:
+`entity PrivateFieldGrant { bounded_context, grantor: Role, grantee:
+Role, event: Event?, command: Command?, status, created_at, revoked_at }`
+- at most one of `event`/`command` ever set (both null is a *blanket*
+grant: every record of any type the grantor is itself the default
+reader of, present and future). Only `own`/`addressed` ever produce one;
+`team` has nothing to share, a Role either carries the name or it does
+not. Self-service throughout - the defining trait separating this from
+every other grant in the codebase: no admin, no superadmin, anywhere.
+Every other grant here hands out a capability the recipient never had
+(a superadmin for `RoleAccessMapping`, an admin for an `AccessToken`); a
+private-field grant hands out nothing the grantor did not already hold
+itself, so requiring an admin would only turn "share my own note with a
+colleague" into an administrative ticket. `grant_private_field_access_for_event`/
+`_for_command` (two minting rules, the same `CreateExternalEvent`/
+`CreateDirectEvent` paired-rule shape, not one polymorphic rule) check
+the grantor is genuinely the named record's own default reader via a new
+shared predicate, `is_default_private_reader(record, role)` - generic
+over `Event`/`Command` via a small `PrivateFieldRecord` trait
+(`skilj-core/src/event_store/mod.rs`), one predicate reused at grant
+time and render time alike, never two implementations of the same
+question. A blanket grant cannot be checked against records that do not
+exist yet, so it is trusted when made and *re-derived per record at
+every read* instead - what stops it being a wider trust boundary than
+the per-record form: a reader coming through a blanket grant sees a
+field only where the grantor would itself have been that exact record's
+default reader. `revoke_private_field_access` - only the grantor may end
+it, not the grantee, not an admin. `list_private_field_grants` - a
+caller's own outgoing grants need no particular level; naming a
+*different* grantor needs `access_mapping.level = admin`, the
+compliance/oversight half. Revoked grants are listed too, not filtered
+out - "what have I shared, and what have I stopped sharing" needs both
+answers.
+
+Rust/DB elaboration beyond the spec's own entity shape, both
+deliberate: `PrivateFieldGrant.id` is a synthetic id the spec doesn't
+name (needed because, unlike `RoleAccessMapping`, there is no "at most
+one active" uniqueness constraint here - a grantor may re-grant after
+revoking); `event_sequence: Option<i64>`/`command_id: Option<String>`
+stand in for the spec's own `event: Event?`/`command: Command?` - every
+real use of the record a per-record grant names is an identity
+comparison alone, never any of that record's own fields, so carrying
+the identity is exactly as capable as embedding the whole value and
+needs no extra load to reconstruct one at read time.
+
+**Render-time integration**: `render_event`/`render_command` each gained
+a `grants: &[PrivateFieldGrant]` parameter and a third redaction pass
+after the existing sensitive-field one - per `PrivateField` entry,
+`Team`-kind checks `access_mapping.role.name` directly; `Own`/`Addressed`
+check `is_default_private_reader` first, then any active grant naming
+this exact record or (re-derived) a matching blanket one. Every call
+site that already threaded `access_mapping ` through now also loads and
+threads a `Vec<PrivateFieldGrant>` snapshot - `query_events`/
+`inspect_event`/`fetch_commands`/`deliver_to_subscriptions`'s own
+resolvers, each a small addition since `render_event`/`render_command`
+already filter the passed-in list down to `grantee = access_mapping.role`
+internally, so one shared snapshot serves every caller (and, for
+subscriptions, every differently-entitled subscriber) in one request
+without a per-caller query.
+
+**The REST track's own gap, found and closed in the same pass**: a
+private field is stored in plaintext, so `FetchEvents`/`ConsumeEvents`
+- which are "safe by construction" for *sensitive* fields only because
+those are ciphertext at rest - would otherwise hand a private field's
+real value to any `EventReadToken` holder outright. New black box
+`redact_private_fields(record)`, applied unconditionally in both rules:
+no `access_mapping`/`Role` argument at all, deliberately, since there is
+none to condition it on - an `EventReadToken` is tied to no `Role`, so
+all three kinds fail closed *structurally*, not by omission (nobody's
+`client_id`, no `Role.name`, no `external_subject`, and no
+`PrivateFieldGrant` can name a bearer token as a grantee). Declaring
+`private_fields` on a REST-readable event type is therefore safe rather
+than merely permitted. Applied at the delivery site only, never to the
+served set itself - `ConsumeEvents`' own cursor still advances over the
+*unredacted* set, so what a caller is allowed to see never influences
+where the cursor sits.
+
+**A real, pre-existing admin read-back gap, found and closed for all
+four token kinds at once**: while wiring `PrivateFieldGrant`'s own
+GraphQL object, `EventReadToken.scope` (§24) turned out never to have
+been exposed on the wire at all - `createEventReadToken`'s own mutation
+accepted and persisted the argument, but the returned object had no
+`scope` field to read it back, the identical class of gap §26 already
+closed for `owner_tag_key`. Fixed once, in the one place all four token
+GraphQL objects are built (`gql_types.rs`'s shared `token_object!`
+macro), closing it for `EventReadToken` retroactively and for
+`ExternalEventToken`/`DirectCreationToken`/`CommandToken` at once -
+these three needed the field added regardless, for their own new
+`scope` (§30).
+
+**Mechanical**: `EventType.private_fields`/`CommandType.private_fields`
+persisted as `JSONB`, the identical `Json<Vec<T>>` treatment
+`sensitive_fields`/`tag_mappings` already get; a new
+`private_field_grants` table per bounded context (`id`,
+`grantor_role_id`/`grantee_role_id` - cross-schema `REFERENCES
+public.roles (id)`, freely allowed in Postgres - `event_sequence`,
+`command_id` referencing `commands`' own internal `BIGSERIAL`, `status`,
+`created_at`, `revoked_at`), provisioned for a new bounded context and
+patched into an existing one at every `build()`, the same
+`ensure_*_table`/`ensure_*_columns` idempotent-migration pattern every
+prior pass's own schema addition already uses. `PrivateFieldGrantRow::
+into_domain` returns `Ok(None)` rather than panicking when a referenced
+`Role` is gone by the time it's looked up - proactively applying §29's
+own hardening pattern to this new row type rather than waiting to
+rediscover the same race. `registerEventType`/`registerCommandType`
+gained a required `privateFields: [PrivateFieldInput!]!` GraphQL
+argument (mirroring `sensitiveFields`'s own shape); the shared
+`create_type_token_field!` macro backing all four `create*Token`
+mutations already needed no change for this pass, but `EventType`/
+`CommandType`'s own construction sites across the whole workspace -
+tests, `skilj-demo`, the plugin trait's own default methods - needed the
+usual mechanical sweep, the same shape §23's own ~40-call-site pass
+already established.
+
+**Verified**: a new `skilj-core/tests/private_field_visibility.rs` (47
+pure tests, no Postgres) covers every kind's default-reader logic in
+isolation, `render_event`/`render_command`'s full redaction pass
+(per-record grant, blanket grant re-derivation, a blanket grant never
+reaching past its own grantor's standing, revocation), `redact_private_fields`'s
+unconditional REST-track behaviour, and the grant/revoke/list functions'
+own authorisation rejections (`NotDefaultPrivateReader`, `NotGrantor`,
+`PrivateFieldGrantNotActive`, `PrivateFieldRecordWrongBoundedContext`,
+the admin-vs-self listing split). A new real end-to-end test in
+`skilj/tests/graphql_business_surfaces.rs`, over actual HTTP and
+Postgres, with two independently-authenticated Roles (real signed
+JWTs): a creator submits a command producing an `own`-kind private
+field, a colleague reads it back redacted to `null`, the creator grants
+access, the colleague now reads it in full, the creator revokes it, the
+colleague is redacted again, and `listPrivateFieldGrants` reads both
+the creator's own view and (as the colleague, admin-level, naming the
+creator explicitly) the same grant's history back correctly. `cargo
+build/clippy/test --workspace` and `cargo fmt --check` clean (93 test
+binaries/suites, full run green); `allium check`/`plan`/`analyse`
+independently re-verified against the diff, not taken on the
+`allium:tend` agent's own two reports alone - `check` 13
+warnings/8 infos/0 findings (2 new warnings, both the same pre-existing
+checker name-resolution artefact §16's own `AccessToken`/
+`RoleAccessMapping` findings already have, confirmed by testing the fix
+that clears them and choosing not to take it - see the spec's own
+`entity PrivateFieldGrant` comment), `plan` obligation count 448 (from
+408 before this pass), `analyse` 5 findings (4 pre-existing plus the
+identical one new artefact, no others).
+
+**A real bug found and fixed mid-pass, independent of the mechanism
+itself**: two hand-rolled Python sweep scripts used to thread the new
+`private_fields`/`&[PrivateFieldGrant]` arguments through several dozen
+existing call sites corrupted a handful of them - an off-by-one byte
+offset in one script silently reordered adjacent arguments in test
+calls carrying scheduling booleans, and a second script's blind
+trailing-comma insertion produced outright invalid syntax in one more.
+Both were caught before landing: the first by an independent audit
+script diffing every touched call's own argument list against `git
+show HEAD` (not by trusting either sweep script's own success), the
+second by the compiler itself. All affected files were reverted and
+re-swept with a corrected, insertion-only (never whole-span-replacing)
+script, then re-audited clean.
