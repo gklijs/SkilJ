@@ -405,6 +405,38 @@ pub trait Projection {
     /// `owner_scope_satisfied`.
     const OWNER_TAG_KEY: Option<&'static str> = None;
 
+    /// The `Role.name` required to query this projection at all, if any -
+    /// `None` (the default, and every projection that predates this) for
+    /// one with no such notion. Deliberately Rust-only, no spec entity
+    /// field and no registration/admin-visible surface, the identical
+    /// treatment `OWNER_TAG_KEY` just above gets and for the same reason.
+    ///
+    /// Unlike `OWNER_TAG_KEY`, which is derived per-instance from folded
+    /// event tags, this is a fixed, whole-projection gate: it names no
+    /// dimension to look up per instance, just one required team, so
+    /// either every instance of this projection is reachable by a
+    /// matching Role or none are - never a per-instance answer.
+    /// Composes with `OWNER_TAG_KEY` rather than replacing it: a
+    /// projection may declare both (staff-only *and* company-scoped),
+    /// and `query_projection` checks both independently. See that
+    /// function's own doc comment and specs/skilj.allium's
+    /// `team_only_satisfied`.
+    ///
+    /// Genuinely different in kind from `private_fields`' own `Team`
+    /// kind, even though the membership test is identical
+    /// (`Role.name` equality) - `private_fields` redacts one field of
+    /// one raw event/command, for one reader, traced back to who created
+    /// that specific record; a projection's stored state is one shared
+    /// value folded from possibly many events by `project()`, with no
+    /// single record each field individually traces back to, so nothing
+    /// short of a whole-instance gate generalizes to it (Codeberg issue
+    /// #17's own finding, closing the gap left by `private_fields`
+    /// itself: it protects `queryEvents`/`fetchCommands`, surfaces no
+    /// `Write`-level Role can reach anyway, while `ProjectionQuery` - the
+    /// one surface a `Write`-level Role *can* reach - stayed exactly as
+    /// open as before).
+    const TEAM_ONLY: Option<&'static str> = None;
+
     /// `key` is which instance is currently being folded - one of
     /// `Self::keys(event)`'s own return values, handed back so `project()`
     /// can tell them apart when an event touches more than one (compare
@@ -640,6 +672,15 @@ pub trait ProjectionDispatcher: Send + Sync {
     /// projection is registered but declares no owner dimension (the
     /// default, and every projection that predates this).
     fn owner_tag_key(
+        &self,
+        bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<Option<&'static str>>;
+
+    /// The registered projection's own `Projection::TEAM_ONLY` - the
+    /// identical `Option<Option<_>>` shape `owner_tag_key` just above
+    /// already has, for the same reason.
+    fn team_only(
         &self,
         bounded_context: &str,
         projection_name: &str,

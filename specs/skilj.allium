@@ -2541,6 +2541,15 @@ rule QueryProjection {
     -- declares no owner dimension.
     requires: owner_scope_satisfied(projection, instance_key, access_mapping)
 
+    -- The membership check, decided against the querying grant's own Role
+    -- name and covering the projection whole rather than any one instance
+    -- of it - see the team_only_satisfied paragraphs in the guidance
+    -- below. Independent of the ownership check above and failing
+    -- separately from it: a projection may declare both, and a query must
+    -- satisfy both. Vacuously true for any projection that declares no
+    -- required team, which is every projection unless one names one.
+    requires: team_only_satisfied(projection, access_mapping)
+
     -- Blocks until the projection has caught up, and fails the query if
     -- it does not within the configured wait - see the
     -- await_projection_caught_up note above the rules. Vacuously true
@@ -2637,6 +2646,36 @@ rule QueryProjection {
         -- caller with is the same framing another context's projections
         -- already get - invisible, not merely unreadable - see
         -- GrantScopedToOwnerWhenDeclared on surface ProjectionQuery.
+        --
+        -- team_only_satisfied(projection, access_mapping) is a black box
+        -- in that same register, and gates the projection whole rather
+        -- than one instance of it. A projection may optionally declare
+        -- which Role name is required to query it at all - "support", say,
+        -- or "operations". That declaration gets identical treatment to
+        -- the owner tag key described just above: deliberately not a field
+        -- on entity Projection, with no registration and no admin-visible
+        -- surface anywhere, compiled and deployed configuration only. It
+        -- reuses a team-kind private field's own semantics exactly (see
+        -- enum PrivateFieldKind) - membership is the grant, decided by
+        -- Role.name equality, with nothing to share, nothing to revoke,
+        -- and entitlement ending the moment the Role is no longer named
+        -- that. What differs is only what it covers: one projection
+        -- entire, rather than one field of one record.
+        --
+        -- The predicate holds, and the query proceeds, when either of two
+        -- things is true: the projection declares no required team at all,
+        -- so there is no membership to hold and it reads exactly as every
+        -- projection read before this existed; or it does declare one and
+        -- access_mapping.role.name equals it exactly. It does not hold,
+        -- and the query is rejected, when the projection declares a
+        -- required team and the querying grant's own Role carries a
+        -- different name. This is a separate test from the ownership one
+        -- above rather than a refinement of it - a projection declaring
+        -- both is answered only when both hold - and what a rejected query
+        -- leaves the caller with is the same framing the owner mismatch
+        -- gets: invisible, not merely unreadable - see
+        -- TeamGatedWhenDeclared on surface ProjectionQuery, which states
+        -- it in the same terms GrantScopedToOwnerWhenDeclared does.
 }
 
 -- CreateAllEventsSubscription and CreateEventTypeSubscription register a
@@ -6214,6 +6253,28 @@ surface ProjectionQuery {
         -- SensitiveFieldsStayProtected below decides what an answering
         -- instance may show (see rule QueryProjection's guidance on
         -- owner_scope_satisfied).
+
+    @guarantee TeamGatedWhenDeclared
+        -- Within its own bounded context, a projection may declare which
+        -- Role name is required to query it at all - in deployed
+        -- configuration only, with no registration surface and nothing an
+        -- admin can read it back from, exactly as the owner tag key above
+        -- - and one that declares a required team only answers queries
+        -- from a grant whose own Role.name equals it exactly. Membership
+        -- is the grant: there is nothing to share and nothing to revoke,
+        -- and entitlement ends the moment the Role is no longer named
+        -- that, which is the same semantics a team-kind private field
+        -- already carries, applied to the whole projection rather than to
+        -- one field of one record. To a Role named anything else the
+        -- projection is not merely unreadable but invisible, exactly as a
+        -- projection in another bounded context is above. A projection
+        -- that declares no required team is unrestricted by this
+        -- guarantee, which is every projection today. This is independent
+        -- of GrantScopedToOwnerWhenDeclared above rather than a refinement
+        -- of it: a projection may declare both an owner dimension and a
+        -- required team, and a query must satisfy both - neither
+        -- substitutes for the other, and failing either rejects (see rule
+        -- QueryProjection's guidance on team_only_satisfied).
 
     @guarantee SensitiveFieldsStayProtected
         -- A projection built from a field its source EventType marked

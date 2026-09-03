@@ -128,6 +128,17 @@ impl ProjectionDispatcher for TestDispatcher {
             _ => None,
         }
     }
+
+    fn team_only(
+        &self,
+        _bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        match projection_name {
+            "AccountBalance" | "EventCount" | "TransferBalances" => Some(None),
+            _ => None,
+        }
+    }
 }
 
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---

@@ -90,6 +90,7 @@ fn query_projection_succeeds_and_returns_the_supplied_result_when_no_sequence_is
         false, // caught_up is irrelevant when nothing was requested
         false, // this projection declares no owner dimension
         None,
+        None, // this projection declares no required team
         r#"{"total":42}"#.into(),
     )
     .unwrap();
@@ -112,6 +113,7 @@ fn query_projection_succeeds_when_caught_up_to_the_requested_sequence() {
         true, // await_projection_caught_up already resolved true
         false,
         None,
+        None,
         r#"{"total":99}"#.into(),
     )
     .unwrap();
@@ -127,9 +129,18 @@ fn query_projection_succeeds_for_every_access_level() {
         let mapping = access_mapping(RoleStatus::Active, level);
         let p = projection();
 
-        let result =
-            projections::query_projection(&mapping, &p, "", None, false, false, None, "ok".into())
-                .unwrap();
+        let result = projections::query_projection(
+            &mapping,
+            &p,
+            "",
+            None,
+            false,
+            false,
+            None,
+            None,
+            "ok".into(),
+        )
+        .unwrap();
 
         assert_eq!(result, "ok");
     }
@@ -141,8 +152,9 @@ fn query_projection_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Read);
     let p = projection();
 
-    let err = projections::query_projection(&mapping, &p, "", None, false, false, None, "x".into())
-        .unwrap_err();
+    let err =
+        projections::query_projection(&mapping, &p, "", None, false, false, None, None, "x".into())
+            .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -159,8 +171,9 @@ fn query_projection_rejects_a_mapping_scoped_to_a_different_bounded_context() {
     };
     let p = projection();
 
-    let err = projections::query_projection(&mapping, &p, "", None, false, false, None, "x".into())
-        .unwrap_err();
+    let err =
+        projections::query_projection(&mapping, &p, "", None, false, false, None, None, "x".into())
+            .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -184,6 +197,7 @@ fn query_projection_rejects_with_a_distinguishable_timeout_when_not_caught_up_in
         Some(10),
         false, // await_projection_caught_up resolved false (timed out)
         false,
+        None,
         None,
         "x".into(),
     )
@@ -210,6 +224,7 @@ fn query_projection_never_times_out_when_no_sequence_was_requested() {
         None,
         false,
         false,
+        None,
         None,
         "whatever".into(),
     )
@@ -241,6 +256,7 @@ fn query_projection_succeeds_when_the_grant_has_no_scope() {
         false,
         true, // projection declares an owner dimension
         Some("company-b"),
+        None,
         "x".into(),
     )
     .unwrap();
@@ -265,6 +281,7 @@ fn query_projection_succeeds_when_the_projection_declares_no_owner_dimension() {
         None,
         false,
         false, // no owner dimension declared
+        None,
         None,
         "x".into(),
     )
@@ -291,6 +308,7 @@ fn query_projection_succeeds_when_the_instance_owner_matches_the_grants_scope() 
         false,
         true,
         Some("company-a"),
+        None,
         "x".into(),
     )
     .unwrap();
@@ -319,6 +337,7 @@ fn query_projection_rejects_an_instance_owned_by_a_different_scope() {
         false,
         true,
         Some("company-b"),
+        None,
         "x".into(),
     )
     .unwrap_err();
@@ -347,6 +366,7 @@ fn query_projection_rejects_an_unestablished_owner_for_a_scoped_grant() {
         false,
         true,
         None, // no owner established yet
+        None,
         "x".into(),
     )
     .unwrap_err();

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `ProjectionQuery` had no whole-projection access gate: a projection
+  could declare a `team`-kind private field on the events/commands it
+  was built from, but nothing stopped a Role of any name from reading
+  the projection itself. New `Projection.TEAM_ONLY` (deployed
+  configuration only, not a spec field) rejects a query unless the
+  caller's Role carries the required name, composing with the existing
+  owner-scope check rather than replacing it (Codeberg issue #17).
+
 ## [0.0.3] - 2026-09-03
 
 ### Security

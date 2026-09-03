@@ -95,6 +95,14 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     ) -> Option<Option<&'static str>> {
         None
     }
+
+    fn team_only(
+        &self,
+        _bounded_context: &str,
+        _projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        None
+    }
 }
 
 struct NoopSnapshotDispatcher;

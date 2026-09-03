@@ -145,6 +145,10 @@ pub fn field() -> Field {
                 .projection_dispatcher
                 .owner_tag_key(&bounded_context_name, &name)
                 .flatten();
+            let team_only = state
+                .projection_dispatcher
+                .team_only(&bounded_context_name, &name)
+                .flatten();
 
             // Real decrypt-on-read - automatic, no `Projection.sensitive_fields`
             // declaration anywhere (see this field's own doc comment).
@@ -174,6 +178,7 @@ pub fn field() -> Field {
                 caught_up,
                 owner_tag_key.is_some(),
                 instance_owner.as_deref(),
+                team_only,
                 state_json,
             )
             .map_err(to_graphql_error)?;

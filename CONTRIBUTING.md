@@ -13,10 +13,19 @@ cargo fmt --check
 ```
 
 Some integration tests spin up a real, embedded Postgres via
-`postgresql_embedded`. If they fail to start, see the
-`LD_LIBRARY_PATH`/embedded-Postgres notes in
-[`docs/architecture.md`](docs/architecture.md) - this is a
-known environment quirk on some Linux setups, not a code problem.
+`postgresql_embedded`. On some Linux setups (observed on WSL after a
+distro package upgrade) the cached `postgres` binary was built against
+an older libxml2 ABI (`libxml2.so.2`) than the one the system now
+provides (e.g. `libxml2.so.16`), and fails to start with `error while
+loading shared libraries: libxml2.so.2: cannot open shared object
+file`. Affected tests catch this and skip gracefully rather than fail,
+so the symptom is quietly-passing tests that never actually touched a
+real database - not a hard failure. To get real coverage back, point
+`LD_LIBRARY_PATH` at any directory that still has a `libxml2.so.2` on
+it (a JetBrains IDE's bundled LLDB often ships one, e.g. under
+`~/.cache/JetBrains/*/bin/lldb/linux/x64/lib`; `find / -iname
+'libxml2.so.2*' 2>/dev/null` locates one) - this is a known environment
+quirk, not a code problem, and not specific to this project.
 
 ## Where things live
 

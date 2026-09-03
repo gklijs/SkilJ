@@ -415,6 +415,24 @@ pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey
 /// affirmatively proven (including one nothing has touched yet) is
 /// treated the same as a proven mismatch, not the same as a proven
 /// match.
+///
+/// `team_only` (Codeberg issue #17's own gap, docs/architecture.md's own
+/// write-up of this pass): the projection's own `Projection::TEAM_ONLY`,
+/// already resolved by the caller - `None` when the projection declares
+/// no required team (every projection before this pass, and most after
+/// it), in which case this check is vacuously satisfied regardless of
+/// the caller's own Role. When `Some`, the query is rejected unless
+/// `access_mapping.role.name` equals it exactly. Unlike the owner-scope
+/// check above, this is a whole-*projection* gate, not a per-*instance*
+/// one - there is no `team` column on a stored instance the way there is
+/// an `owner` one, since a required team names no dimension to derive
+/// per instance, just one fixed membership test every instance shares.
+/// Independent of and composable with the owner-scope check: a
+/// projection may declare both `OWNER_TAG_KEY` and `TEAM_ONLY`
+/// (company-scoped *and* staff-only), and a query must satisfy both,
+/// the same way `sensitive_fields` and `scope` already coexist without
+/// one subsuming the other. See specs/skilj.allium's
+/// `team_only_satisfied`.
 #[allow(clippy::too_many_arguments)]
 pub fn query_projection(
     access_mapping: &RoleAccessMapping,
@@ -424,6 +442,7 @@ pub fn query_projection(
     caught_up: bool,
     projection_declares_owner: bool,
     instance_owner: Option<&str>,
+    team_only: Option<&str>,
     read_projection_result: String,
 ) -> crate::error::Result<String> {
     if access_mapping.status != RoleStatus::Active {
@@ -437,6 +456,15 @@ pub fn query_projection(
             if instance_owner != Some(scope.as_str()) {
                 return Err(crate::access_control::Error::GrantScopeMismatch.into());
             }
+        }
+    }
+    // Whole-instance team gate (Codeberg issue #17, docs/architecture.md's
+    // own write-up of this pass) - independent from the owner-scope check
+    // just above, not a replacement for it: a projection may declare
+    // both, and both must hold. See this function's own doc comment.
+    if let Some(team) = team_only {
+        if access_mapping.role.name != team {
+            return Err(crate::access_control::Error::NotOnRequiredTeam.into());
         }
     }
     if wait_for_sequence.is_some() && !caught_up {

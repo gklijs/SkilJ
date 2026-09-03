@@ -304,6 +304,21 @@ pub enum Error {
     #[error("this grant is scoped to a value that does not match this record's own owner")]
     GrantScopeMismatch,
 
+    /// `projections::query_projection`'s own whole-instance team gate
+    /// (Codeberg issue #17, docs/architecture.md's own write-up of this
+    /// pass): a projection declares `Projection::TEAM_ONLY` and the
+    /// querying `access_mapping.role.name` doesn't match it. Kept
+    /// distinct from `GrantScopeMismatch` above even though both reject
+    /// a `query_projection` call - that one is about tenant ownership of
+    /// one instance, this one is about team membership to query the
+    /// projection at all, and the two are independent, composable checks
+    /// (a projection may declare both). `ProjectionQuery` is GraphQL-only,
+    /// so unlike `GrantScopeMismatch` this never needed a
+    /// `skilj-rest::error::status_for` arm - `to_graphql_error` renders
+    /// any `SkiljRejection` generically via `code()`/`message()`.
+    #[error("this grant's Role is not on the team this projection requires to query it")]
+    NotOnRequiredTeam,
+
     /// The private-field mechanism's own grant-time check: `event =
     /// null or is_default_private_reader(event, access_mapping)` (and the
     /// `command` sibling) from `rule GrantPrivateFieldAccessForEvent`/
@@ -377,6 +392,7 @@ impl SkiljRejection for Error {
             Error::InsufficientAccessLevel => "insufficient_access_level",
             Error::GrantBoundedContextMismatch => "grant_bounded_context_mismatch",
             Error::GrantScopeMismatch => "grant_scope_mismatch",
+            Error::NotOnRequiredTeam => "not_on_required_team",
             Error::NotDefaultPrivateReader => "not_default_private_reader",
             Error::NotGrantor => "not_grantor",
             Error::PrivateFieldGrantNotActive => "private_field_grant_not_active",

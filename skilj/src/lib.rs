@@ -334,6 +334,20 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
             .get(&(bounded_context, projection_name.to_string()))?;
         Some(registered.owner_tag_key)
     }
+
+    fn team_only(
+        &self,
+        bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        let registered = self
+            .projections
+            .get(&(bounded_context, projection_name.to_string()))?;
+        Some(registered.team_only)
+    }
 }
 
 /// `EventDispatcher`'s own implementer - same shape and reasoning as
@@ -803,6 +817,7 @@ struct RegisteredProjection {
     sync: bool,
     default_state_json: String,
     owner_tag_key: Option<&'static str>,
+    team_only: Option<&'static str>,
     keys: KeysFn,
     project: ProjectFn,
 }
@@ -820,6 +835,7 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
         sync: T::sync(),
         default_state_json,
         owner_tag_key: T::OWNER_TAG_KEY,
+        team_only: T::TEAM_ONLY,
         keys: Box::new(move |event| {
             if !consumed_for_keys
                 .iter()

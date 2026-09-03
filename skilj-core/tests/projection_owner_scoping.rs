@@ -35,11 +35,14 @@ use skilj_core::plugin::ProjectionDispatcher;
 use skilj_core::projections::{self, Projection};
 use skilj_core::shared::{generate_token_id, Metadata, Tag, TagMapping};
 
-/// One owner-scoped projection, `"TicketSummary"`, keyed by the payload's
-/// own `ticket_id` - folds `"TicketOpened"` (tagged `company`, the
+/// Two owner-scoped projections, both keyed by the payload's own
+/// `ticket_id` and folding `"TicketOpened"` (tagged `company`, the
 /// declared owner dimension) and `"TicketCommented"` (untagged, proving
 /// an owner already established survives a fold from an event that
-/// carries none).
+/// carries none): `"TicketSummary"` declares no required team - the
+/// pre-issue-#17 baseline every test above this line exercises unchanged
+/// - and `"StaffTicketSummary"` additionally declares `TEAM_ONLY =
+/// Some("staff")`, for the composability tests below.
 struct TestDispatcher;
 
 impl ProjectionDispatcher for TestDispatcher {
@@ -50,7 +53,7 @@ impl ProjectionDispatcher for TestDispatcher {
         event: &Event,
     ) -> Option<Vec<String>> {
         match projection_name {
-            "TicketSummary" => {
+            "TicketSummary" | "StaffTicketSummary" => {
                 let payload: serde_json::Value =
                     serde_json::from_str(&event.payload).expect("test payload is always JSON");
                 Some(vec![payload["ticket_id"]
@@ -71,7 +74,7 @@ impl ProjectionDispatcher for TestDispatcher {
         _key: &str,
     ) -> Option<skilj_core::error::Result<String>> {
         match projection_name {
-            "TicketSummary" => {
+            "TicketSummary" | "StaffTicketSummary" => {
                 let current: i64 = state_json.parse().unwrap_or(0);
                 Some(Ok((current + 1).to_string()))
             }
@@ -81,7 +84,7 @@ impl ProjectionDispatcher for TestDispatcher {
 
     fn default_state(&self, _bounded_context: &str, projection_name: &str) -> Option<String> {
         match projection_name {
-            "TicketSummary" => Some("0".to_string()),
+            "TicketSummary" | "StaffTicketSummary" => Some("0".to_string()),
             _ => None,
         }
     }
@@ -92,7 +95,19 @@ impl ProjectionDispatcher for TestDispatcher {
         projection_name: &str,
     ) -> Option<Option<&'static str>> {
         match projection_name {
-            "TicketSummary" => Some(Some("company")),
+            "TicketSummary" | "StaffTicketSummary" => Some(Some("company")),
+            _ => None,
+        }
+    }
+
+    fn team_only(
+        &self,
+        _bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        match projection_name {
+            "TicketSummary" => Some(None),
+            "StaffTicketSummary" => Some(Some("staff")),
             _ => None,
         }
     }
@@ -252,14 +267,20 @@ async fn seed_ticket_commented(pool: &Pool, bc: &BoundedContext) -> EventType {
     et
 }
 
-async fn seed_ticket_summary(
+/// Parametrized by `name` so the same helper seeds either
+/// `"TicketSummary"` (no required team) or `"StaffTicketSummary"`
+/// (`TEAM_ONLY = Some("staff")`, resolved via `TestDispatcher::team_only`).
+/// There's no field on `Projection` itself to set, exactly as
+/// `owner_tag_key` already isn't.
+async fn seed_projection(
     pool: &Pool,
     bc: &BoundedContext,
+    name: &str,
     consumed: Vec<EventType>,
 ) -> Projection {
     let projection = Projection {
         bounded_context: bc.clone(),
-        name: "TicketSummary".to_string(),
+        name: name.to_string(),
         schema: r#"{"properties":{}}"#.to_string(),
         schema_version: 1,
         consumed_event_types: consumed,
@@ -346,11 +367,19 @@ async fn insert_ticket_commented(
 }
 
 fn scoped_mapping(bc: &BoundedContext, scope: Option<&str>) -> RoleAccessMapping {
+    named_mapping(bc, "Reader", scope)
+}
+
+/// `scoped_mapping`'s own general form - a `Role.name` lever, for the
+/// team-gate tests below (`scoped_mapping` keeps its own signature, still
+/// always naming its Role `"Reader"`, since no test before this pass
+/// cared what it was called).
+fn named_mapping(bc: &BoundedContext, role_name: &str, scope: Option<&str>) -> RoleAccessMapping {
     RoleAccessMapping {
         role: Role {
             id: unique_name("role"),
             external_subject: unique_name("subject"),
-            name: "Reader".to_string(),
+            name: role_name.to_string(),
             superadmin: false,
             status: RoleStatus::Active,
             created_at: test_now(),
@@ -379,7 +408,7 @@ fn folding_a_tagged_event_derives_and_persists_the_instance_owner() {
         };
         let bc = seed_bounded_context(&pool).await;
         let opened = seed_ticket_opened(&pool, &bc).await;
-        seed_ticket_summary(&pool, &bc, vec![opened.clone()]).await;
+        seed_projection(&pool, &bc, "TicketSummary", vec![opened.clone()]).await;
 
         insert_ticket_opened(&pool, &bc, &opened, "t1", "company-a").await;
         insert_ticket_opened(&pool, &bc, &opened, "t2", "company-b").await;
@@ -420,7 +449,13 @@ fn folding_an_untagged_event_leaves_an_established_owner_untouched() {
         let bc = seed_bounded_context(&pool).await;
         let opened = seed_ticket_opened(&pool, &bc).await;
         let commented = seed_ticket_commented(&pool, &bc).await;
-        seed_ticket_summary(&pool, &bc, vec![opened.clone(), commented.clone()]).await;
+        seed_projection(
+            &pool,
+            &bc,
+            "TicketSummary",
+            vec![opened.clone(), commented.clone()],
+        )
+        .await;
 
         insert_ticket_opened(&pool, &bc, &opened, "t1", "company-a").await;
         insert_ticket_commented(&pool, &bc, &commented, "t1").await;
@@ -449,7 +484,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
         };
         let bc = seed_bounded_context(&pool).await;
         let opened = seed_ticket_opened(&pool, &bc).await;
-        let projection = seed_ticket_summary(&pool, &bc, vec![opened.clone()]).await;
+        let projection = seed_projection(&pool, &bc, "TicketSummary", vec![opened.clone()]).await;
 
         insert_ticket_opened(&pool, &bc, &opened, "t1", "company-a").await;
         insert_ticket_opened(&pool, &bc, &opened, "t2", "company-b").await;
@@ -476,6 +511,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             false,
             true,
             owner_t1.as_deref(),
+            None,
             "ok".into(),
         )
         .unwrap();
@@ -490,6 +526,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             false,
             true,
             owner_t2.as_deref(),
+            None,
             "leaked".into(),
         )
         .unwrap_err();
@@ -510,6 +547,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             false,
             true,
             owner_t3.as_deref(),
+            None,
             "leaked".into(),
         )
         .unwrap_err();
@@ -527,9 +565,153 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
                 false,
                 true,
                 owner,
+                None,
                 "ok".into(),
             )
             .unwrap();
         }
+    });
+}
+
+/// Codeberg issue #17's own gap and fix, end to end: `private_fields`
+/// (0.0.3) protects `queryEvents`/`fetchCommands` - surfaces no
+/// `Write`-level Role can reach anyway - while leaving `ProjectionQuery`,
+/// the one surface such a Role *can* reach, exactly as open as before
+/// issue #16 was filed. `StaffTicketSummary` declares both a required
+/// team (`"staff"`) and an owner dimension (`"company"`) - independent
+/// checks, both of which must hold.
+#[test]
+fn a_team_only_projection_rejects_a_role_not_on_the_team() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let opened = seed_ticket_opened(&pool, &bc).await;
+        let projection =
+            seed_projection(&pool, &bc, "StaffTicketSummary", vec![opened.clone()]).await;
+
+        insert_ticket_opened(&pool, &bc, &opened, "t1", "company-a").await;
+
+        let (_, owner_t1) =
+            db::get_projection_state_and_owner(&pool, &bc.name, "StaffTicketSummary", "t1")
+                .await
+                .unwrap()
+                .unwrap();
+
+        // A staff Role, unscoped: reads fine - on the team, and no owner
+        // restriction narrows it further.
+        let staff = named_mapping(&bc, "staff", None);
+        projections::query_projection(
+            &staff,
+            &projection,
+            "t1",
+            None,
+            false,
+            true,
+            owner_t1.as_deref(),
+            Some("staff"),
+            "ok".into(),
+        )
+        .unwrap();
+
+        // A Role with any other name: rejected outright, regardless of
+        // scope - team membership, not ownership, is what failed.
+        let customer = named_mapping(&bc, "Reader", Some("company-a"));
+        let err = projections::query_projection(
+            &customer,
+            &projection,
+            "t1",
+            None,
+            false,
+            true,
+            owner_t1.as_deref(),
+            Some("staff"),
+            "leaked".into(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), access_control::Error::NotOnRequiredTeam.code());
+    });
+}
+
+/// Composability: `TEAM_ONLY` and `OWNER_TAG_KEY` are independent checks
+/// on the same projection, and both must hold - neither substitutes for
+/// the other (`docs/architecture.md`'s own write-up of this pass, and
+/// `Projection::TEAM_ONLY`'s own doc comment).
+#[test]
+fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let opened = seed_ticket_opened(&pool, &bc).await;
+        let projection =
+            seed_projection(&pool, &bc, "StaffTicketSummary", vec![opened.clone()]).await;
+
+        insert_ticket_opened(&pool, &bc, &opened, "t1", "company-a").await;
+        insert_ticket_opened(&pool, &bc, &opened, "t2", "company-b").await;
+
+        let (_, owner_t1) =
+            db::get_projection_state_and_owner(&pool, &bc.name, "StaffTicketSummary", "t1")
+                .await
+                .unwrap()
+                .unwrap();
+        let (_, owner_t2) =
+            db::get_projection_state_and_owner(&pool, &bc.name, "StaffTicketSummary", "t2")
+                .await
+                .unwrap()
+                .unwrap();
+
+        // A staff Role scoped to company-a: on the team AND owns t1 -
+        // both checks hold, reads fine.
+        let staff_company_a = named_mapping(&bc, "staff", Some("company-a"));
+        projections::query_projection(
+            &staff_company_a,
+            &projection,
+            "t1",
+            None,
+            false,
+            true,
+            owner_t1.as_deref(),
+            Some("staff"),
+            "ok".into(),
+        )
+        .unwrap();
+
+        // The same staff Role, company-b's ticket: on the team, but the
+        // owner check alone rejects it - team membership was never in
+        // question here.
+        let err = projections::query_projection(
+            &staff_company_a,
+            &projection,
+            "t2",
+            None,
+            false,
+            true,
+            owner_t2.as_deref(),
+            Some("staff"),
+            "leaked".into(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
+
+        // A non-staff Role scoped to company-a, querying its own
+        // company's ticket: owns t1, but the team check alone rejects it
+        // - ownership was never in question here either.
+        let customer_company_a = named_mapping(&bc, "Reader", Some("company-a"));
+        let err = projections::query_projection(
+            &customer_company_a,
+            &projection,
+            "t1",
+            None,
+            false,
+            true,
+            owner_t1.as_deref(),
+            Some("staff"),
+            "leaked".into(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), access_control::Error::NotOnRequiredTeam.code());
     });
 }

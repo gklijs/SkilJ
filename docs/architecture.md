@@ -2483,7 +2483,8 @@ calls a new `TelemetryProviders::shutdown()` - flushing/tearing down all
 three providers, logging (not propagating) any failure - once
 `axum::serve` returns. Verified for real, not just built: a real
 Postgres (started by hand from the `postgresql_embedded`-cached binary,
-same libxml2/`LD_LIBRARY_PATH` workaround as always), the actual compiled
+same libxml2/`LD_LIBRARY_PATH` workaround as always - see
+[`CONTRIBUTING.md`](../CONTRIBUTING.md)), the actual compiled
 `server` binary launched as a subprocess, a live request confirmed
 against it, then `SIGTERM` - exits promptly both with no
 `OTEL_EXPORTER_OTLP_ENDPOINT` set, and with one set to an unreachable
@@ -5089,3 +5090,81 @@ show HEAD` (not by trusting either sweep script's own success), the
 second by the compiler itself. All affected files were reverted and
 re-swept with a corrected, insertion-only (never whole-span-replacing)
 script, then re-audited clean.
+
+## 32. Closing `ProjectionQuery`'s own team gate (Codeberg issue #17)
+
+A real, pre-existing gap left by §31 rather than a new proposal: that
+pass's `team`-kind private field redacts one field of one raw
+event/command to any Role not carrying the required name, protecting
+`queryEvents`/`fetchCommands` - surfaces no `Write`-level Role can reach
+anyway, since both need read-level access at minimum. `ProjectionQuery`,
+the one surface a `Write`-level Role *can* reach, was never touched by
+that mechanism at all: nothing stopped a Role of any name from reading
+any projection instance its `RoleAccessMapping` otherwise covered. The
+original Codeberg issue that prompted §31 - a whole-*projection*
+staff-only gate - was absorbed into the `team` private-field kind on the
+understanding that it covered every reader-facing surface; issue #17 is
+the finding that it didn't.
+
+**The fix, in kind rather than in shape**: a whole-*projection* gate,
+not a private field of any one record - a stored projection instance has
+no single record each field individually traces back to (it is folded
+from possibly many events by `project()`), so nothing short of gating
+the whole instance generalises the way a private field does. New
+`Projection::TEAM_ONLY: Option<&'static str>` (`skilj-core/src/plugin/mod.rs`),
+identical treatment to `OWNER_TAG_KEY` right above it: Rust-only, no
+field on the spec's own `entity Projection`, no registration argument,
+nothing an admin can read back - compiled and deployed configuration
+only. `ProjectionDispatcher` gained a matching `team_only` method
+(`skilj`'s own `ProjectionDispatcherImpl`, the same `Option<Option<_>>`
+shape `owner_tag_key` already returns), and `projections::query_projection`
+gained a `team_only: Option<&str>` parameter and one new check: when
+`Some`, reject unless `access_mapping.role.name` equals it exactly. New
+`access_control::Error::NotOnRequiredTeam`.
+
+**Independent of, not a refinement of, the existing owner-scope check**:
+a projection may declare both `OWNER_TAG_KEY` and `TEAM_ONLY` (company-
+scoped *and* staff-only), and a query must satisfy both - the two checks
+run one after the other in `query_projection`, each failing on its own
+terms (`GrantScopeMismatch` vs. `NotOnRequiredTeam`), neither able to
+compensate for the other. No superadmin bypass, deliberately: unlike
+`scope`, which a superadmin grant simply never carries, team membership
+is decided by `Role.name` equality alone, an orthogonal axis - the same
+"vacuously true unless a projection names one" framing `owner_scope_satisfied`
+already gets, not a privilege escalation lever.
+
+**Spec**: `rule QueryProjection` gained `requires:
+team_only_satisfied(projection, access_mapping)` alongside the existing
+`owner_scope_satisfied` clause, and `surface ProjectionQuery` gained
+`@guarantee TeamGatedWhenDeclared`, stated in the identical register
+`GrantScopedToOwnerWhenDeclared` already uses - to a Role named anything
+else the projection is invisible, not merely unreadable, the same
+framing a cross-bounded-context query already gets.
+
+**Wiring**: `skilj-graphql`'s `projection_query` resolver resolves
+`team_only` from the dispatcher alongside its existing `owner_tag_key`
+lookup and threads it through unchanged. `NotOnRequiredTeam` needed no
+`skilj-rest::error::status_for` arm - `ProjectionQuery` is GraphQL-only
+(confirmed in `status_for`'s own `CoreError::Projections(_)` comment),
+so `to_graphql_error`'s generic `code()`/`message()` rendering is the
+only path this error ever takes.
+
+**Verified**: two new tests in `skilj-core/tests/projection_owner_scoping.rs`,
+against real Postgres - a `StaffTicketSummary` projection declaring both
+`TEAM_ONLY = Some("staff")` and `OWNER_TAG_KEY = Some("company")`
+confirms a non-staff Role is rejected regardless of scope, and that the
+owner-scope and team checks fail independently of one another (a staff
+Role scoped to the wrong company still gets `GrantScopeMismatch`; a
+correctly-scoped non-staff Role still gets `NotOnRequiredTeam`). Every
+other `ProjectionDispatcher` test double across the workspace (`skilj-core`'s
+`sync_projections.rs`/`async_projections.rs`/`submit_command.rs`/
+`metrics_instrumentation.rs`, `skilj-rest`'s `metrics_middleware.rs`/
+`tracing_middleware.rs`, `skilj-inspector`'s `data.rs`) picked up the new
+trait method; `skilj-core/tests/projection_query.rs`'s dozen pre-existing
+`query_projection` call sites picked up the new parameter. `cargo
+build/clippy/test --workspace` and `cargo fmt --check` clean, real
+Postgres throughout (not skipped - see `CONTRIBUTING.md`'s note on the
+embedded-Postgres/libxml2 workaround this environment needed); `allium check` 13
+warnings/8 infos/0 findings, `analyse` 5 findings, both identical to
+§31's own baseline (no new drift); `plan` obligation count 449 (from 448
+before this pass, the one new `requires` clause).

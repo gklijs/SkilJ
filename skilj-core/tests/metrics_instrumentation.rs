@@ -53,6 +53,10 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     fn owner_tag_key(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
         None
     }
+
+    fn team_only(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
 }
 
 async fn provisioned_pool() -> Option<(db::Pool, Option<postgresql_embedded::PostgreSQL>)> {
