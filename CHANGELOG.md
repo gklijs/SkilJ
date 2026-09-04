@@ -8,26 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Security
 
-- `plugin::CrossContextRoute`: a single-hop, stateless reaction - when a
-  registered `EventType` commits in its own bounded context, submit a
-  `CommandType`'s own payload into a *different* bounded context, going
-  through that command's real `decide()`/`submit_command` path like any
-  other caller. The answer to "cross bounded contexts without an
-  external system like Temporal" for the common single-hop case;
-  deliberately not a Saga/process manager - a route that needs more than
-  one hop should reach for the `skilj-temporal` pairing instead. Driven
-  by a new shared background task (`SkiljBuilder::cross_context_route::<R>()`,
-  `.cross_context_route_poll_interval(Duration)`) with its own durable,
-  per-route cursor and idempotency-keyed submissions, so a
-  redelivered/retried catch-up tick is exactly as safe as any other
-  idempotency-keyed submission already is. See docs/architecture.md §36.
-- `skilj_core::db::decide_and_submit_command`: the "optimistic `decide()`,
-  then locked `submit_command`" sequence `skilj-rest`'s command-trigger
-  route and `skilj-graphql`'s `submitCommand` resolver each ran inline is
-  now one shared, real-Postgres-tested function, used by both of them
-  and by `CrossContextRoute`'s own background task.
+- `CrossContextRoute`'s background task (0.0.4) derived its own
+  idempotency key as `"{route.name}:{sequence}"` into the same shared
+  `idempotency_keys` table `submitCommand`/command triggering write
+  into - which has no caller/client_id column at all. A Write-level
+  caller who knew or guessed a route's name and an upcoming sequence
+  number could pre-plant that exact key, causing the route's real
+  delivery to be silently deduplicated away with no error. Fixed by
+  reserving a `skilj-cross-context-route:` key prefix for the route's
+  own internal use and rejecting any caller-supplied idempotency key
+  that uses it, at both the REST trigger and `submitCommand` GraphQL
+  wire boundaries. See docs/architecture.md §36.
 
 ## [0.0.4] - 2026-09-04
 
@@ -48,6 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `plugin::CrossContextRoute`: a single-hop, stateless reaction - when a
+  registered `EventType` commits in its own bounded context, submit a
+  `CommandType`'s own payload into a *different* bounded context, going
+  through that command's real `decide()`/`submit_command` path like any
+  other caller. The answer to "cross bounded contexts without an
+  external system like Temporal" for the common single-hop case;
+  deliberately not a Saga/process manager - a route that needs more than
+  one hop should reach for the `skilj-temporal` pairing instead. Driven
+  by a new shared background task (`SkiljBuilder::cross_context_route::<R>()`,
+  `.cross_context_route_poll_interval(Duration)`) with its own durable,
+  per-route cursor and idempotency-keyed submissions, so a
+  redelivered/retried catch-up tick is exactly as safe as any other
+  idempotency-keyed submission already is. See docs/architecture.md §36.
+- `skilj_core::db::decide_and_submit_command`: the "optimistic `decide()`,
+  then locked `submit_command`" sequence `skilj-rest`'s command-trigger
+  route and `skilj-graphql`'s `submitCommand` resolver each ran inline is
+  now one shared, real-Postgres-tested function, used by both of them
+  and by `CrossContextRoute`'s own background task.
 - `plugin::upcast_payload`/`UpcastStep`: sugar for a hand-written
   `BoundedContextEvent::try_from_event` that needs to interpret a
   payload differently depending on which schema_version it was written

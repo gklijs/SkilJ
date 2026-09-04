@@ -5797,3 +5797,51 @@ after several poll intervals' worth of margin), and a third, ordinary
 occurrence afterward still gets processed - proof a skip never stalls the
 cursor. `cargo build/clippy -D warnings/test --workspace` and `cargo fmt
 --check` clean.
+
+**Security-review follow-up: the shared `idempotency_keys` namespace has
+no caller column.** `idempotency_keys`'s primary key is
+`(command_type_name, idempotency_key)` - no `client_id`/caller column at
+all, because every prior caller (Codeberg issue #12's design, and the
+`skilj-temporal` bridge in §34) only ever collided with its *own* past
+submissions, so nothing needed to scope the namespace by who wrote a
+key. `CrossContextRoute`'s background task is the first caller to place
+an *unauthenticated internal* key into that same shared table
+(`"{route.name}:{sequence}"`, unpredictable only in the sense that an
+outside caller wouldn't know a given route's name or the sequence
+number its next occurrence would land on - not a secret). An ordinary
+Write-level caller who *did* know or guess both could pre-plant that
+exact key via `submitCommand`'s `idempotencyKey`/the REST trigger's
+`Idempotency-Key` header ahead of time; when the route's own poll task
+later tried to submit under the same key, `submit_command`'s existing
+dedup logic would treat it as an already-seen request and silently
+return `Deduplicated` - the route's cursor would still advance (an
+error would correctly leave it retried, but a dedup hit isn't an error),
+so the real cross-context delivery would be dropped with nothing in the
+logs pointing at why.
+
+Fixed by reserving a namespace rather than trying to make the key
+unguessable: `catch_up_cross_context_route` now derives its key as
+`"{RESERVED_IDEMPOTENCY_KEY_PREFIX}{route.name}:{sequence}"`
+(`skilj_core::event_store::RESERVED_IDEMPOTENCY_KEY_PREFIX`, currently
+`"skilj-cross-context-route:"`), and a new
+`reject_reserved_idempotency_key` is called at both wire boundaries -
+`skilj-rest`'s `post_commands_trigger` and `skilj-graphql`'s
+`submitCommand` resolver, immediately after each reads its own
+caller-supplied idempotency key - rejecting any caller-supplied key that
+starts with the reserved prefix outright (`Error::ReservedIdempotencyKeyPrefix`,
+400 over REST, a normal GraphQL error over GraphQL) before it ever
+reaches the shared `idempotency_keys` lookup. Checked at the call site
+rather than folded into `authorise_command_trigger`/
+`authorise_command_submission` themselves - the same register
+`submitCommand`'s own `required_role` gate already uses (above) - since
+those two functions are also what the route's own internal caller path
+would otherwise have to route around. `catch_up_cross_context_route`
+additionally logs a warning (not an error - the cursor still correctly
+advances) if it ever *does* see its own key deduplicated, as defence in
+depth: with the prefix reserved this should now be unreachable, since
+nothing else can write into that namespace. Verified by a real
+Postgres-backed test on each wire boundary
+(`command_trigger_rejects_a_reserved_idempotency_key_prefix`,
+`submit_command_rejects_a_reserved_idempotency_key_prefix_over_graphql`)
+asserting both the specific error code and that nothing was written to
+the event store at all.

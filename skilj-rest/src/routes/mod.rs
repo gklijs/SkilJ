@@ -698,6 +698,14 @@ async fn post_commands_trigger(
     // rather than a hard error - this is a caller convenience, not a
     // load-bearing part of the request.
     let idempotency_key = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok());
+    // A security-review finding on CrossContextRoute (docs/architecture.md
+    // §36): its own background task's internally-derived idempotency keys
+    // share this same table's namespace, unscoped by caller - reject a
+    // caller-supplied key that impersonates one before it ever reaches
+    // the shared idempotency lookup, rather than letting an ordinary
+    // Write-level caller pre-plant one and silently swallow a real route
+    // delivery. See `reject_reserved_idempotency_key`'s own doc comment.
+    event_store::reject_reserved_idempotency_key(idempotency_key)?;
 
     let authorised = event_store::authorise_command_trigger(&token, payload)?;
     let bounded_context_name = authorised.command_type.bounded_context.name.clone();

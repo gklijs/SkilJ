@@ -424,6 +424,51 @@ fn command_trigger_deduplicates_a_repeated_idempotency_key() {
     });
 }
 
+/// Security-review finding on `CrossContextRoute` (docs/architecture.md
+/// §36): a caller-supplied `Idempotency-Key` using the reserved
+/// `skilj-cross-context-route:` prefix must be rejected outright, not
+/// silently accepted into the same shared `idempotency_keys` table
+/// `CrossContextRoute`'s own background task writes into - see
+/// `skilj_core::event_store::reject_reserved_idempotency_key`'s own doc
+/// comment for why this matters (without it, an ordinary Write-level
+/// caller could pre-plant a route's own future key and silently
+/// swallow a real cross-context delivery).
+#[test]
+fn command_trigger_rejects_a_reserved_idempotency_key_prefix() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let router = skilj.rest_router();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/commands/trigger")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .header(
+                "Idempotency-Key",
+                "skilj-cross-context-route:some-other-route:42",
+            )
+            .body(Body::from(r#"{"payload":{"amount":20}}"#))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "reserved_idempotency_key_prefix");
+
+        // Nothing was written under that key, or at all - the rejection
+        // happens before dispatch, the same as any other authorisation
+        // failure.
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 0);
+    });
+}
+
 /// Real end-to-end proof of the drift audit's #10 fix (`valid_payload` -
 /// see project memory `skilj-drift-audit-2026-08-18`): the request body
 /// is decoded as generic JSON at the wire layer (`CommandTriggerRequest.

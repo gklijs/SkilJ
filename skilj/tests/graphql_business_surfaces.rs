@@ -917,6 +917,49 @@ fn submit_command_deduplicates_a_repeated_idempotency_key_over_graphql() {
     });
 }
 
+/// Security-review finding on `CrossContextRoute` (docs/architecture.md
+/// §36): a caller-supplied `idempotencyKey` using the reserved
+/// `skilj-cross-context-route:` prefix must be rejected outright, not
+/// silently accepted into the same shared `idempotency_keys` table
+/// `CrossContextRoute`'s own background task writes into - see
+/// `skilj_core::event_store::reject_reserved_idempotency_key`'s own doc
+/// comment for why this matters.
+#[test]
+fn submit_command_rejects_a_reserved_idempotency_key_prefix_over_graphql() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _admin_role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let variables = json!({
+            "bc": bc_name,
+            "name": "WithdrawMoney",
+            "payload": r#"{"amount":20}"#,
+            "key": "skilj-cross-context-route:some-other-route:42",
+        });
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_WITH_IDEMPOTENCY_KEY_MUTATION,
+            variables,
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "reserved_idempotency_key_prefix"
+        );
+
+        // Nothing was written under that key, or at all.
+        let events = skilj_core::db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 0);
+    });
+}
+
 /// A rejection's `matchingEvents` (Codeberg issue #7's DCB conflict
 /// visualizer) is full raw event content - the same visibility
 /// `queryEvents`/`countEvents`/`inspectEvent` require `Admin` level for.

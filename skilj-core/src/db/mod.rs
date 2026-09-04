@@ -5514,8 +5514,23 @@ pub async fn catch_up_cross_context_route(
                     .await?;
                     continue;
                 };
-                let idempotency_key = format!("{}:{}", route.name, event.sequence);
-                decide_and_submit_command(
+                // Prefixed with `RESERVED_IDEMPOTENCY_KEY_PREFIX` - a
+                // security-review finding: the shared `idempotency_keys`
+                // table has no caller/client_id column at all, so
+                // without this reservation an ordinary Write-level
+                // caller could pre-plant `"{route.name}:{sequence}"` via
+                // `submitCommand`/`Idempotency-Key` ahead of time and
+                // silently swallow this submission as a `Deduplicated`
+                // no-op. `reject_reserved_idempotency_key` is what keeps
+                // that namespace exclusively this task's own - see its
+                // own doc comment.
+                let idempotency_key = format!(
+                    "{}{}:{}",
+                    crate::event_store::RESERVED_IDEMPOTENCY_KEY_PREFIX,
+                    route.name,
+                    event.sequence
+                );
+                let outcome = decide_and_submit_command(
                     pool,
                     command_dispatcher,
                     projection_dispatcher,
@@ -5530,6 +5545,20 @@ pub async fn catch_up_cross_context_route(
                     Some(&idempotency_key),
                 )
                 .await?;
+                // Defence in depth: with the reserved prefix in place
+                // this should never actually happen (nothing else can
+                // write into this namespace) - a fresh key is derived
+                // from this route's own name and this occurrence's own
+                // sequence, never reused within one tick. Warned, not
+                // treated as an error, since the cursor still correctly
+                // advances past this occurrence either way.
+                if matches!(outcome, SubmitCommandOutcome::Deduplicated { .. }) {
+                    tracing::warn!(
+                        sequence = event.sequence,
+                        "cross-context route's own idempotency key was already present - \
+                         this should be unreachable now the key space is reserved"
+                    );
+                }
             }
         }
         update_cross_context_route_cursor(

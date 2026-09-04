@@ -139,6 +139,7 @@ fn status_for(err: &CoreError) -> StatusCode {
             EventStoreError::InvalidTagMapping => StatusCode::BAD_REQUEST,
             EventStoreError::InvalidSensitiveField => StatusCode::BAD_REQUEST,
             EventStoreError::PayloadDoesNotMatchSchema => StatusCode::BAD_REQUEST,
+            EventStoreError::ReservedIdempotencyKeyPrefix => StatusCode::BAD_REQUEST,
             // Not reachable over REST today - RegisterEventType is
             // GraphQL-only (TypeRegistration) - but matched explicitly
             // rather than left to the wildcard below, the same "each

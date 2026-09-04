@@ -71,6 +71,19 @@ pub fn submit_command_field() -> Field {
                     .filter(|v| !v.is_null())
                     .and_then(|v| v.string().ok())
                     .map(|s| s.to_string());
+                // A security-review finding on CrossContextRoute
+                // (docs/architecture.md §36): its own background task's
+                // internally-derived idempotency keys share this same
+                // table's namespace, unscoped by caller - reject a
+                // caller-supplied key that impersonates one before it
+                // ever reaches the shared idempotency lookup, rather
+                // than letting an ordinary Write-level caller pre-plant
+                // one and silently swallow a real route delivery. See
+                // `reject_reserved_idempotency_key`'s own doc comment.
+                skilj_core::event_store::reject_reserved_idempotency_key(
+                    idempotency_key.as_deref(),
+                )
+                .map_err(to_graphql_error)?;
 
                 // WriteAccess: any active mapping, any level -
                 // authorise_command_submission itself enforces
