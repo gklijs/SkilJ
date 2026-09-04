@@ -12,7 +12,13 @@ deleting it - keeps a record of what this list already caught.
 
 ## Pending
 
-*(nothing pending)*
+- **List `skilj-temporal` on Temporal's own integrations page.** Mirrors
+  the already-done DCB community listing below - Temporal maintains a
+  browsable integrations page (<https://docs.temporal.io/integrations>)
+  and a community org for third-party projects
+  (<https://github.com/temporal-community>) to submit to. Worth doing
+  once `skilj-temporal` is actually published to crates.io (see
+  `RELEASING.md`), not before.
 
 ## Done
 

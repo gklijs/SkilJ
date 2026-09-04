@@ -25,6 +25,13 @@ jobs:
       - name: Install rustfmt and clippy
         run: rustup component add rustfmt clippy
 
+      - name: Install protoc
+        # skilj-temporal needs this at build time - one of its
+        # dependencies (prost-wkt-types, via temporalio-client) generates
+        # Rust from .proto files in its own build script and doesn't
+        # vendor protoc itself. See CONTRIBUTING.md's own note.
+        run: apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
