@@ -1,10 +1,10 @@
 # Releasing
 
-The workspace has 9 crates. 8 are published to crates.io:
+The workspace has 10 crates. 9 are published to crates.io:
 `skilj-macros`, `skilj-core`, `skilj-graphql`, `skilj-rest`, `skilj`,
-`skilj-codegen`, `skilj-tui`, `skilj-inspector`. `skilj-demo` is not
-(`publish = false` in its `Cargo.toml` - it's a worked example, not a
-library anyone should depend on).
+`skilj-codegen`, `skilj-tui`, `skilj-inspector`, `skilj-temporal`.
+`skilj-demo` is not (`publish = false` in its `Cargo.toml` - it's a
+worked example, not a library anyone should depend on).
 
 ## Version sync
 
@@ -20,13 +20,14 @@ therefore:
    member depends on; `skilj-tui`/`skilj-inspector` have no internal
    dependents and need no such entry).
 
-Not 9 separate per-crate edits - one field plus 6 matching version
-strings.
+Not 10 separate per-crate edits - one field plus 6 matching version
+strings (`skilj-temporal` has no internal dependents either, the same
+reason `skilj-tui`/`skilj-inspector` need no entry).
 
 ### Doing this with `cargo-release`
 
 The manual version above is correct but tedious and easy to get wrong
-by hand across 8 crates. [`cargo-release`](https://github.com/crate-ci/cargo-release)
+by hand across 9 crates. [`cargo-release`](https://github.com/crate-ci/cargo-release)
 (`cargo install cargo-release`) automates it: it bumps every
 workspace-member version together, updates the internal path
 dependencies' `version` fields to match, publishes each crate in true
@@ -52,7 +53,9 @@ Derived from the real internal dependency graph:
 4. `skilj` (depends on `skilj-core`, `skilj-graphql`, `skilj-rest`,
    `skilj-macros`)
 5. `skilj-tui` (zero internal deps), `skilj-inspector` (depends on
-   `skilj-core` only) - independent of each other and of `skilj`
+   `skilj-core` only), `skilj-temporal` (zero internal deps - it speaks
+   only skilj's wire protocol, the same posture as `skilj-tui`) -
+   independent of each other and of `skilj`
 
 Wait for each crate to finish indexing on crates.io
 (`cargo search <crate>` or the crates.io page) before publishing
@@ -71,7 +74,15 @@ cargo publish -p skilj-codegen
 cargo publish -p skilj
 cargo publish -p skilj-tui
 cargo publish -p skilj-inspector
+cargo publish -p skilj-temporal
 ```
+
+`skilj-temporal` needs a `protoc` binary on `PATH` (or `PROTOC` set) to
+build at all - one of its dependencies generates Rust from `.proto`
+files in its own build script. `cargo publish` builds the crate as part
+of its own verification step, so this has to be true wherever the
+publish actually runs, not just wherever it was developed. See
+CONTRIBUTING.md's own note for how to get one without root.
 
 ## After publishing
 

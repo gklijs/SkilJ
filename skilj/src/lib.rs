@@ -472,6 +472,7 @@ impl Skilj {
             encryption_master_key: None,
             event_broadcast_capacity: 1024,
             event_cache_warm_up_count: 1000,
+            pool_options: None,
         }
     }
 
@@ -982,6 +983,7 @@ pub struct SkiljBuilder {
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
+    pool_options: Option<skilj_core::db::PgPoolOptions>,
 }
 
 impl SkiljBuilder {
@@ -1174,13 +1176,29 @@ impl SkiljBuilder {
         self
     }
 
+    /// Connection pool sizing/timeouts (`max_connections`,
+    /// `min_connections`, `acquire_timeout`, `idle_timeout`, ...) -
+    /// `sqlx::postgres::PgPoolOptions`, unset by default (`sqlx`'s own
+    /// bare default: a 10-connection cap, no configured timeouts).
+    /// Worth setting explicitly for real production load: the
+    /// background async-projection/snapshot/scheduler pollers this
+    /// same `.build()` spawns already compete with every foreground
+    /// GraphQL/REST request for whatever this pool provides.
+    pub fn pool_options(mut self, options: skilj_core::db::PgPoolOptions) -> Self {
+        self.pool_options = Some(options);
+        self
+    }
+
     /// Runs the startup reconciliation loop automatically (§1.5). Returns
     /// `Err` only for a genuine registration rejection (e.g. an
     /// incompatible schema change) - a bounded context the reconciliation
     /// Role has no admin access to yet is reported in
     /// `ReconciliationReport`, not an error.
     pub async fn build(self) -> Result<(Skilj, ReconciliationReport), skilj_core::Error> {
-        let pool = skilj_core::db::connect(&self.database_url).await?;
+        let pool = match self.pool_options {
+            Some(options) => skilj_core::db::connect_with(&self.database_url, options).await?,
+            None => skilj_core::db::connect(&self.database_url).await?,
+        };
         skilj_core::db::migrate(&pool).await?;
 
         // `default BoundedContext admin`'s own `created_at`/`created_by`

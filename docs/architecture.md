@@ -5573,3 +5573,39 @@ Re-verified after all four fixes: `cargo build/clippy -D warnings/test
 --workspace` and `cargo fmt --check` clean, 11 `skilj-temporal` tests
 (up from 9), real Postgres and the real ephemeral Temporal service
 throughout, `allium check`/`plan` still unchanged (449 obligations).
+
+## 35. Configurable connection pool sizing
+
+Found while reviewing what's worth doing before a release: `db::connect`
+was `sqlx::PgPool::connect(database_url)` with no configuration
+whatsoever - `sqlx`'s own bare default (a 10-connection cap, no
+configured `acquire_timeout`/`idle_timeout`), and no way for a caller to
+change it at all. Inconsistent with the rest of `SkiljBuilder`, where
+every other tunable (`async_projection_poll_interval`,
+`snapshot_poll_interval`, `scheduler_poll_interval`,
+`event_broadcast_capacity`, `event_cache_warm_up_count`) already has a
+sensible default plus an escape hatch - arguably the most load-bearing
+one for real production throughput was the one exception. The
+background async-projection/snapshot/scheduler pollers `.build()` already
+spawns compete with every foreground GraphQL/REST request for whatever
+the pool provides, so a fixed cap of 10 is a real ceiling on real load,
+not a hypothetical one.
+
+**Fix**: `db::connect_with(database_url, PgPoolOptions)` alongside the
+unchanged `db::connect` (now just `connect_with(url, PgPoolOptions::new())`
+- `sqlx`'s own bare default, byte-identical behaviour for every existing
+caller); `PgPoolOptions` re-exported from `skilj_core::db` the same way
+`Pool` already is, so `skilj` itself needs no direct `sqlx` dependency to
+accept one. `SkiljBuilder::pool_options(PgPoolOptions)`, unset by
+default, threading through to `connect_with` in `.build()` when set.
+
+**Verified**: `skilj-core/tests/pool_options.rs`, two real-Postgres
+tests - `connect_with` actually carries the caller's own options,
+confirmed by reading them straight back off the live pool
+(`Pool::options().get_max_connections()`), not just trusting
+construction didn't error; and `connect` itself is unchanged, confirmed
+against `PgPoolOptions::new()`'s own default. `cargo
+build/clippy -D warnings/test --workspace` and `cargo fmt --check`
+clean. No spec change - pool sizing is deployment configuration, the
+same "process-start knob, not a registered value" register every other
+`SkiljBuilder` tunable already lives in.

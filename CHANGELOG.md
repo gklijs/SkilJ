@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gRPC client, never the full `temporalio-sdk` worker/Activity-authoring
   crate - zero dependency on any other skilj crate, independently
   usable like `skilj-tui`.
+- `SkiljBuilder::pool_options`/`db::connect_with`: configurable Postgres
+  connection pool sizing/timeouts (`sqlx::postgres::PgPoolOptions` -
+  `max_connections`, `min_connections`, `acquire_timeout`, ...),
+  previously hardcoded to `sqlx`'s own bare default (10 connections, no
+  timeouts) with no way to tune it at all. `db::connect`'s own default
+  behaviour is unchanged for every existing caller.
 
 ## [0.0.3] - 2026-09-03
 

@@ -203,9 +203,31 @@ pub async fn notify_revocation(
 /// database driver.
 pub type Pool = sqlx::PgPool;
 
+/// Re-exported for the identical reason `Pool` is - `SkiljBuilder::
+/// pool_options` (skilj's own builder) accepts one of these without
+/// `skilj` itself depending on `sqlx` directly.
+pub use sqlx::postgres::PgPoolOptions;
+
+/// `sqlx`'s own bare default (`PgPoolOptions::new()`, currently a
+/// 10-connection cap with no configured timeouts) - unchanged behaviour
+/// for every existing caller. Callers that need to tune pool sizing for
+/// real production load (background pollers - async-projection,
+/// snapshot, scheduler - already compete with foreground requests for
+/// whatever this pool provides) use [`connect_with`] instead, the same
+/// "sensible default, escape hatch alongside it" register every other
+/// `SkiljBuilder` tunable (`async_projection_poll_interval`,
+/// `event_broadcast_capacity`, ...) already uses.
 #[tracing::instrument(skip_all)]
 pub async fn connect(database_url: &str) -> Result<Pool, sqlx::Error> {
-    sqlx::PgPool::connect(database_url).await
+    connect_with(database_url, PgPoolOptions::new()).await
+}
+
+/// [`connect`] with caller-supplied pool options (`max_connections`,
+/// `min_connections`, `acquire_timeout`, `idle_timeout`, ...) - see that
+/// function's own doc comment for why this exists alongside it.
+#[tracing::instrument(skip_all)]
+pub async fn connect_with(database_url: &str, options: PgPoolOptions) -> Result<Pool, sqlx::Error> {
+    options.connect(database_url).await
 }
 
 /// Runs every embedded migration under `skilj-core/migrations/` - see
