@@ -112,6 +112,8 @@ banking and courses) if you want to see more before committing.
   sections assume you've read the earlier ones.
 - [`docs/rest-event-reading.md`](docs/rest-event-reading.md) - the three ways to consume the REST
   event stream and when to use each.
+- [`docs/temporal-integration.md`](docs/temporal-integration.md) - pairing skilj with
+  [Temporal](https://temporal.io) for long-running, cross-system processes.
 
 ## Contributing
 

@@ -116,6 +116,27 @@
 --     the old one (see EventSubscription's DeliveryIsAtMostOnce). What
 --     stays excluded is its wire contract, alongside the GraphQL wire
 --     contract already excluded above
+--   - Orchestrating a long-running, multi-step business process that
+--     spans real I/O, real time, or another system entirely (reserve
+--     inventory, call an external payment gateway, wait up to a day for
+--     a webhook, ship or compensate): excluded by design, not an
+--     oversight. decide()'s own synchronous, no-I/O contract already
+--     rules it out structurally, and it is a different problem from the
+--     one DCB tagging solves - a command deriving more than one tag
+--     already lets decide() check several facts in one synchronous,
+--     same-database transaction (see the note above rule ProcessCommand
+--     on consistency_tags/matching_events), replacing the classic
+--     saga/process-manager need for exactly that case, never for a
+--     process that cannot be one transaction at all. What
+--     is in scope, and already built, is the one piece such a process
+--     from outside SkilJ actually needs: an idempotency key on command
+--     submission (see the note above rule ProcessCommand), which an
+--     external orchestrator (Temporal or otherwise) uses the same way
+--     any other retrying caller does. Orchestrating the process itself -
+--     durable timers, retries, compensation, fan-out/fan-in - is left to
+--     that external system entirely; SkilJ's own event store stays the
+--     system of record for what happened to the domain, never for what
+--     a process did to get there
 -- Dependencies: none yet
 
 ------------------------------------------------------------
