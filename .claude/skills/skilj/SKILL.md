@@ -7,7 +7,8 @@ description: >
   #[auto_register], and what a rejected command's error actually means.
   Triggers on "add an event type", "add a command type", "add a
   projection", "register a new event/command", "why did my command get
-  rejected with <error>", or reading/extending skilj-demo's banking.rs/
+  rejected with <error>", "evolve/rename/version a payload field",
+  "SchemaIncompatible", or reading/extending skilj-demo's banking.rs/
   courses.rs as a pattern. Do NOT use for: creating a brand-new bounded
   context, IdP/access-control/RoleAccessMapping setup, the GraphQL/REST
   wire contract itself, skilj-tui usage, or the cross-instance/inspector

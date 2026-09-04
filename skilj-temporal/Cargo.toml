@@ -1,0 +1,31 @@
+[package]
+name = "skilj-temporal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "A bridge between skilj's own event stream and Temporal, correlating a running Temporal workflow execution to a skilj bounded context's own DCB tags. See docs/architecture.md §34."
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+temporalio-client = "0.8.0"
+temporalio-common = "0.8.0"
+
+[lib]
+name = "skilj_temporal"
+path = "src/lib.rs"
+
+[dev-dependencies]
+# Dev-only: proves this crate's Temporal calls against a real ephemeral
+# Temporal service - never a production dependency of skilj-temporal
+# itself (which speaks only `temporalio-client`, the thin gRPC client -
+# see docs/architecture.md §34's own note on why `temporalio-sdk`, the
+# worker/Activity-authoring crate, is deliberately not depended on).
+temporalio-sdk-core = { version = "0.8.0", features = ["ephemeral-server"] }
+axum = { workspace = true }

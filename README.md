@@ -100,6 +100,7 @@ banking and courses) if you want to see more before committing.
 | [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file instead of hand-writing it. |
 | [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a terminal console (GraphQL client) for browsing and operating a running deployment. |
 | [`skilj-inspector`](skilj-inspector) | `cargo install skilj-inspector` - a terminal console that reads straight from Postgres, for when the GraphQL server isn't running. |
+| [`skilj-temporal`](skilj-temporal) | Optional: a bridge from skilj's own event stream to [Temporal](https://temporal.io) - start or signal a workflow execution correlated by a DCB tag. See `docs/architecture.md` §34. |
 | [`skilj-macros`](skilj-macros) | Internal proc-macros, re-exported through `skilj-core`/`skilj` (not uniformly - each macro picks whichever crate it applies to) - you won't normally add this directly. |
 
 ## Documentation

@@ -5339,3 +5339,237 @@ build/clippy -D warnings/test --workspace` and `cargo fmt --check`
 clean. No spec change - `upcast_payload` is pure application-facing
 Rust with no registration, storage, or wire surface of its own to
 obligate.
+
+## 34. `skilj-temporal`: a plan, partially built (long-running/cross-system processes)
+
+Investigated whether skilj should grow something like AxonIQ Framework's
+new "Workflows" feature - a durable-execution engine for long-running,
+multi-step business processes that survive crashes and resume exactly
+where they left off (steps recorded as events; imperative top-down code
+in place of the classic scattered-event-handler Saga). The motivating
+gap is real: `decide()`'s "synchronous, no I/O" rule (§1.1) means DCB
+(the thing that already replaces a saga/process manager for
+same-transaction, same-database invariants - `skilj-demo/src/courses.rs`'s
+own worked example) has nothing to say about a process that spans real
+I/O, real time, or another system entirely - reserve inventory, call an
+external payment gateway, wait up to 24h for a webhook, ship or
+compensate.
+
+**Decided against building a first-class `Process`/`Saga` trait inside
+skilj-core.** It would tie two things together that shouldn't be tied:
+skilj's job is being a correct, auditable event store with an atomic
+effect boundary; a process's job is tracking multi-step state, retries,
+and durable waits. Temporal already does the second job well, and
+skilj already has the one piece a Temporal integration actually needs -
+idempotent command submission (Codeberg issue #12, §21). The plan below
+is a thin bridge between two systems that each keep their own history,
+correlated by convention, not a shared abstraction.
+
+**The one already-perfect fit**: Temporal's own documented idempotency
+guidance is to derive an Activity's idempotency key from `Workflow Run
+ID + Activity ID` - stable across retries, unique per invocation. Run
+ID, deliberately, not Workflow ID alone: a Workflow ID can outlive more
+than one Run (continue-as-new, a reset), and an Activity ID is only
+unique *within* one run, so Workflow ID alone would let two different
+runs that reuse the same Activity ID naming collide. That derivation is
+a direct, drop-in match for skilj's existing `Idempotency-Key` header on
+`submitCommand`. A Temporal Activity that calls skilj passes
+`"{run_id}:{activity_id}"` as the key, and Temporal's own at-least-once
+Activity retry becomes safe for free, using infrastructure skilj
+already shipped. Zero new skilj-core code needed for this half -
+documentation and a worked example only. (Phase 2/3's own
+`workflow_id`-based correlation convention below is a related but
+distinct concern - *which running execution to signal or start*, not
+*which retry this is* - and Workflow ID is the right key for that one,
+since Temporal guarantees at most one open run per Workflow ID at a
+time.)
+
+**Plan, in phases:**
+
+1. **Command-side (docs + example, no new crate) - built.**
+   `docs/temporal-integration.md` documents the
+   `"{run_id}:{activity_id}"` -> `Idempotency-Key` pattern;
+   `skilj/tests/temporal_activity_idempotency_example.rs` is the
+   runnable proof - a simulated Temporal Activity retry (identical Run
+   ID and Activity ID) is deduplicated with no double-apply, a different
+   Activity ID in the same run is not coalesced, and the same Activity
+   ID in two different runs is not coalesced either (the reason Run ID,
+   not just Workflow ID, is part of the key). Real Postgres, no Temporal
+   dependency - the test composes the header exactly as an Activity
+   implementation in any language would, over the real REST surface.
+
+2. **`skilj-temporal`, a new workspace crate - built**, for the two
+   directions that do need reusable glue - reading skilj's own event
+   stream and calling Temporal's client API:
+   - **Event-to-signal**: a configured `EventTypeMapping` names which
+     `EventType`s become a Temporal `SignalWorkflowExecution` call
+     (signal name + which one of the event's own `tags` supplies the
+     correlation value) - the "await external event / human-in-the-loop"
+     leg Axon's `awaitEvent` covers, done by Temporal instead.
+   - **Event-to-start**: the same mapping, naming which `EventType`s
+     become a `StartWorkflowExecution` call instead (workflow type +
+     task queue) - skilj's `OrderPlaced` triggering a fresh
+     `OrderFulfillment` workflow, the way Axon's
+     `@Workflow(startOnEvent = ...)` does.
+   - **Correlation convention, fixed, not caller-configured**:
+     `workflow_id = "{bounded_context}:{tag_key}:{tag_value}"` for
+     whichever one `tag_key` a mapping entry names - the same
+     "automatically derived from a DCB tag, not a fresh concept"
+     register `owner_tag_key` already established (§23 and others).
+     Reusing this same ID for both the start and every later signal is
+     what makes Temporal's own idempotent-start-by-workflow-ID semantics
+     apply for free - no dedup work of skilj's own to write.
+   - **Delivery mechanism**: `GET /v1/events/consume?mode=manual` +
+     `POST /v1/events/consume/ack` (`skilj-rest/src/routes/mod.rs`),
+     not a GraphQL `EventSubscription` - a polling loop needs no
+     persistent connection management, and manual-ack's own "redeliver
+     on crash before ack, handler must be safe to run twice" contract
+     (`docs/rest-event-reading.md`) composes cleanly with
+     signal/start's own idempotent-by-workflow-ID delivery: don't ack
+     until the Temporal call succeeds, and a redelivered event just
+     repeats an already-idempotent call.
+   - **Dependency**: Temporal's own `temporalio-client`/`temporalio-common`
+     crates (not the full `temporalio-sdk` worker/Activity-authoring
+     crate) - a thin wrapper over Temporal's gRPC service for exactly
+     `start_workflow`/`signal_workflow`, the only two calls this bridge
+     makes, using each crate's own `Untyped*` marker types
+     (`UntypedWorkflow`/`UntypedSignal`/`RawValue`) rather than the
+     generated, statically-typed workflow definitions those crates
+     otherwise favour - this bridge's whole point is dispatching to
+     workflow/signal names only known at runtime, from a config, not
+     compiled in. Both crates are "Public Preview" per Temporal's own
+     docs as of this investigation (2026-09) - re-check maturity before
+     depending on it for real, and expect to track breaking changes;
+     this was the one real risk named in the plan, and turned out real
+     in one concrete way: building against this crate needs a local
+     `protoc` binary at compile time (`prost-wkt-types`'s own build
+     script) - see CONTRIBUTING.md's new note.
+   - **Signal idempotency, a detail the plan didn't originally name**:
+     `Start`'s redelivery-safety comes for free from
+     `WorkflowIdConflictPolicy::UseExisting`, but `Signal` has no
+     equivalent dedup-by-workflow-id - Temporal's own answer is
+     `WorkflowSignalOptions::request_id`, which this bridge derives from
+     the event's own `(bounded_context, event_type, sequence)`: stable
+     across a redelivery of the identical event, unique across every
+     other one - the identical `"{run_id}:{activity_id}"` reasoning
+     phase 1's own idempotency key already uses, one level further out.
+     An unmapped/absent correlation tag is acknowledged anyway rather
+     than retried forever (logged, not silently dropped) - retrying
+     can never produce a tag value the event itself never carried.
+
+3. **What deliberately stays Temporal's job, unbuilt here**: durable
+   timers/sleep, retry policies, compensation logic, fan-out/fan-in,
+   human-approval escalation - all in the Temporal workflow definition
+   itself, in whichever language a team writes those in (Temporal's Go/
+   Java/TypeScript/Python/.NET SDKs are stable; Rust's is not, so
+   workflow/Activity *authoring* in Rust is a choice to make separately
+   from building `skilj-temporal`, which only ever needs the client).
+   skilj's own event store and Temporal's own workflow history stay two
+   separate, independently-queryable audit trails, correlated by the ID
+   convention above rather than merged into one - a deliberate design
+   point, not a gap.
+
+**Phase 1 verified**: `skilj/tests/temporal_activity_idempotency_example.rs`,
+3 tests, real Postgres, over the actual `POST /v1/commands/trigger`
+REST surface (no in-process shortcut) - a redelivered Activity Task
+(same Run ID and Activity ID) is deduplicated with identical
+`triggeredEventSequences` and exactly one stored event; a different
+Activity ID within the same run is not coalesced (two events); the same
+Activity ID across two different runs is not coalesced either (two
+events) - the case that motivates keying on Run ID rather than Workflow
+ID alone. `cargo build/clippy -D warnings/test --workspace` and `cargo
+fmt --check` clean. No spec change - this is client-side usage of
+`submitCommand`'s already-spec'd idempotency behaviour, not a new
+surface.
+
+**Phases 2-3 verified**: the new `skilj-temporal` crate
+(`skilj-temporal/src/lib.rs`) - `poll_once`/`run`, `EventTypeMapping`/
+`MappingAction`, `correlation_workflow_id` - has 6 pure unit tests (no
+network, the correlation convention's own edge cases: matching tag,
+absent tag, `null`-valued tag, bounded-context-qualifies the id,
+`signal_request_id` stable across a simulated redelivery and distinct
+per event) plus 3 real end-to-end tests
+(`skilj-temporal/tests/temporal_bridge.rs`) against a *real*, ephemeral
+Temporal service (`temporalio_sdk_core::ephemeral_server::TestServerConfig`,
+dev-dependency only - never linked into the shipped crate) and a small
+local mock of skilj's own REST surface (the same "wire protocol only,
+no real skilj crate" treatment `skilj-tui`'s own
+`tests/subscription.rs` already gives its GraphQL half, since skilj's
+own consume/ack contract is already exhaustively tested elsewhere):
+an `OrderPlaced` event really starts a Temporal workflow execution
+(confirmed via a real `describe()` call, not just "no error"), a later
+`PaymentConfirmed` event really signals that same running execution
+rather than starting a second one, both events are acknowledged by
+their own token/sequence only after a successful dispatch, a second
+bounded context reusing the identical tag value derives a different,
+independent workflow id, and an event with no matching correlation tag
+is acknowledged (not redelivered forever) while never reaching Temporal
+at all. Downloads a small (~25MB) test-server
+binary on first run, cached outside `/tmp` (see this pass's own
+CONTRIBUTING.md note); skips gracefully, matching this workspace's
+existing embedded-Postgres tolerance, if that download can't reach the
+network. `cargo build/clippy -D warnings/test --workspace` and `cargo
+fmt --check` clean (with `PROTOC` set - see CONTRIBUTING.md). No spec
+change - `skilj-temporal` has no registration/storage/wire surface of
+skilj's own to obligate; it is only ever a caller of surfaces that
+already exist.
+
+**A `/code-review high` pass on this diff found 4 real gaps**, verified
+by reading the pinned `temporalio-client`/`temporalio-common` 0.8.0
+source directly rather than trusting the crate's own doc comments at
+face value - all fixed, 2 with new regression tests:
+
+- **`Start`'s redelivery-after-completion gap**: `id_conflict_policy`
+  alone (`WorkflowIdConflictPolicy::UseExisting`) only governs a
+  workflow *currently running* under this id - it says nothing about
+  one that already *closed* under it, which defaults to
+  `WorkflowIdReusePolicy::AllowDuplicate` (Temporal's own proto
+  comment: "allow starting a workflow execution using the same
+  workflow id"). A `Start` redelivered after the original run had
+  already finished would silently create a *second*, independent
+  execution - directly contradicting this module's own "gets this for
+  free" doc comment. Fixed: `id_reuse_policy(WorkflowIdReusePolicy::RejectDuplicate)`
+  alongside the existing conflict policy, with `dispatch`'s `Start` arm
+  now catching the resulting `WorkflowStartError::AlreadyStarted` and
+  treating it as the success it actually is - "a workflow exists for
+  this business entity" already held either way. New test:
+  `a_redelivered_start_while_the_workflow_is_still_running_does_not_error`
+  (the closed-and-redelivered half of this fix is verified by reading
+  Temporal's own enum documentation rather than a live test, since
+  driving a workflow to actually close would need a real Worker,
+  pulling in the worker/Activity-authoring SDK this crate deliberately
+  keeps out of even its own tests).
+- **`run` died forever on one transient error**: a single `BridgeError`
+  from `poll_once` (a momentary network blip against skilj or Temporal)
+  propagated straight out of the polling loop via `?`, ending that
+  mapping's own processing permanently with no supervisor to notice.
+  Fixed: `run` now logs and continues, backing off `poll_interval`
+  before retrying - it never returns at all now (`-> !`), a stronger
+  guarantee than "returns `Result`" ever was.
+- **A `Signal` racing ahead of its own correlated `Start`** (both
+  mappings polled independently; backlog catch-up or ordinary latency
+  skew can deliver `PaymentConfirmed` before `OrderPlaced` finishes
+  dispatching) is exactly the failure mode the `run` fix above turns
+  from "permanently stuck" into "self-healing on the next poll interval" -
+  documented explicitly in `run`'s own doc comment, including why
+  Temporal's `signal_with_start_workflow` (considered as the "fix the
+  race at its root" alternative) was *not* adopted: it would need
+  fabricating the workflow's own starting input from whichever event's
+  payload lost the race, silently starting the workflow from the wrong
+  shape exactly when the race actually happens - worse than a
+  self-healing delay.
+- **`EventTypeMapping::event_type` was dead configuration**: declared
+  by every caller, documented as load-bearing, never actually checked
+  against anything - a mapping wired to the wrong credential (copy-paste
+  between two mappings) would silently apply the wrong `MappingAction`/
+  `correlation_tag_key` to whatever events that credential really
+  serves. Fixed: `poll_once` now checks `ConsumeResponse::event_type_name`
+  (skilj's own echoed-back token scope, already on the wire, previously
+  just not read) against `mapping.event_type`, rejecting outright with
+  a new `BridgeError::EventTypeMismatch` before looking at a single
+  event. New test: `a_mapping_whose_event_type_does_not_match_its_credential_is_rejected`.
+
+Re-verified after all four fixes: `cargo build/clippy -D warnings/test
+--workspace` and `cargo fmt --check` clean, 11 `skilj-temporal` tests
+(up from 9), real Postgres and the real ephemeral Temporal service
+throughout, `allium check`/`plan` still unchanged (449 obligations).

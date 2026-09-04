@@ -27,6 +27,34 @@ it (a JetBrains IDE's bundled LLDB often ships one, e.g. under
 'libxml2.so.2*' 2>/dev/null` locates one) - this is a known environment
 quirk, not a code problem, and not specific to this project.
 
+Building `skilj-temporal` (docs/architecture.md §34) needs a `protoc`
+binary at compile time - one of Temporal's own dependencies
+(`prost-wkt-types`) generates Rust from `.proto` files during its build
+script, and doesn't vendor `protoc` itself. Install it via your system
+package manager (`apt-get install protobuf-compiler` on Debian/Ubuntu)
+or, with no root available, download a prebuilt release directly (e.g.
+`https://github.com/protocolbuffers/protobuf/releases`, a
+`protoc-*-linux-x86_64.zip`) and point `PROTOC` at the extracted
+`bin/protoc`. `skilj-temporal`'s own real-Temporal-service tests
+(`skilj-temporal/tests/temporal_bridge.rs`) separately download a small
+ephemeral test-server binary on first run, cached under
+`~/.cache/skilj-temporal-test-server` (deliberately never `/tmp` - see
+the note on `/tmp` filling up below) for 15 days; they skip gracefully,
+the same tolerance the embedded-Postgres tests above already have, if
+that download can't reach the network.
+
+A `postgresql_embedded`-backed test process's own data directory lives
+under `/tmp` by default. On a small `/tmp` (a tmpfs capped well under
+the host's real disk, common in a container or a WSL distro) a long
+testing session can fill it entirely - observed as `cargo test` runs
+slowing down or a test's own temp-file writes failing with `ENOSPC`,
+not as a clean `skipping:` message the way the libxml2 issue above is.
+`df -h /tmp` to check, and `rm -rf /tmp/.tmp*` plus killing any
+still-running `postgres`/embedded-server child processes
+(`pkill -9 -f postgresql` or similar) to clear it - safe, since nothing
+under `/tmp` from these tests is meant to survive past the run that
+created it.
+
 ## Where things live
 
 - [`specs/skilj.allium`](specs/skilj.allium) is the behavioural

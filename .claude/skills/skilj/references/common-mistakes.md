@@ -28,10 +28,18 @@ exactly what's allowed.
 encrypted field pointing at the same conceptual subject.
 
 **`SchemaIncompatible`** - re-registering an existing type with a schema
-change that would break an existing reader: a field removed, or an
-existing field tightened from optional to required. Fix: add new fields
-as `Option<T>`, never remove or narrow an existing one - if the old
-field genuinely needs to go, that's a new type, not an edit to this one.
+change that would break an existing reader: a field removed, an existing
+field tightened from optional to required, or a field's type changed.
+Fix: add new fields as `Option<T>`, never remove, narrow, or retype an
+existing one. If you need a genuine reshape (rename a field, change its
+type, split/merge fields) rather than an additive change, that's not
+something a schema revision can express at all - see
+`docs/architecture.md` §33 for the full menu of options (a new,
+differently-named type; a custom serde `Deserialize`; reshaping inside
+`Projection::project()`; or `skilj_core::plugin::upcast_payload`/
+`UpcastStep`, sugar for branching on `event.metadata.version` inside a
+hand-written `BoundedContextEvent::try_from_event` to interpret an old
+payload differently without a new registered type at all).
 
 **`TagMappingKeyDropped`** - re-registering with a `tag_mappings()` that
 drops a `key` an earlier registration already used. A tag key, once

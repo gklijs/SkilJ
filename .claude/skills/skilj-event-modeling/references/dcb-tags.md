@@ -59,6 +59,21 @@ module doc comment explains it in exactly these terms, and
 a course's last seat to prove the atomicity holds under real
 concurrency, not just in a single-threaded reading of the code.)
 
+## Where DCB's answer stops applying
+
+DCB replaces the saga/process-manager need only for facts that can be
+checked in one synchronous, same-database transaction. If part of the
+process genuinely can't happen there - calling an external payment
+gateway, waiting hours or days for a webhook or a human approval - that
+is not a DCB tagging problem to solve by finding one more tag, and DCB
+has nothing to say about it. Don't reach for a bigger tag set or a
+second `decide()` call to paper over that; it's a different kind of
+problem. skilj's own answer there is pairing with an external durable-
+execution system (Temporal) rather than building process-manager
+machinery of its own - see `docs/architecture.md` §34 and
+`docs/temporal-integration.md` if the domain conversation surfaces a
+step like this.
+
 ## What this means for the modeling conversation
 
 - **An event or command can have more than one tag.** Don't stop at the

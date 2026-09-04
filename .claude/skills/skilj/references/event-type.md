@@ -154,3 +154,12 @@ changed since the last registration, and re-registering with an
 incompatible change (removing a field, tightening optional to required)
 is rejected outright rather than silently accepted
 (`SchemaIncompatible`). A newly added field must be `Option<T>`.
+
+Additive-only is a deliberate, permanent limitation, not a bug to work
+around by force - a genuine reshape (rename, retype, split/merge a
+field) is never a legal revision of an existing type. See
+`references/common-mistakes.md`'s own `SchemaIncompatible` entry and
+`docs/architecture.md` §33 for the real options, including
+`skilj_core::plugin::upcast_payload` for interpreting an old payload
+differently based on `event.metadata.version` without minting a new
+type at all.

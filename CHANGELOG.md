@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schema_is_backwards_compatible`'s additive-only contract or touch
   registration in any way; operates entirely on the raw JSON before
   final deserialization (Codeberg issue #14).
+- `docs/temporal-integration.md`: documents pairing skilj with Temporal
+  via its existing `Idempotency-Key` on `submitCommand`/command
+  triggering, keyed by `{run_id}:{activity_id}` per Temporal's own
+  documented Activity-idempotency guidance - no new skilj code, phase 1
+  of the plan in `docs/architecture.md` §34.
+- New `skilj-temporal` crate (phases 2-3 of the same plan): a bridge
+  from skilj's own event stream (`GET /v1/events/consume`/`POST
+  /v1/events/consume/ack`) to Temporal's client API, starting or
+  signaling a workflow execution correlated by a fixed
+  `"{bounded_context}:{tag_key}:{tag_value}"` convention over a
+  configured DCB tag. Speaks only Temporal's thin `temporalio-client`
+  gRPC client, never the full `temporalio-sdk` worker/Activity-authoring
+  crate - zero dependency on any other skilj crate, independently
+  usable like `skilj-tui`.
 
 ## [0.0.3] - 2026-09-03
 

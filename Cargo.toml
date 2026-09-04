@@ -10,6 +10,7 @@ members = [
     "skilj-tui",
     "skilj-inspector",
     "skilj-codegen",
+    "skilj-temporal",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -41,6 +42,15 @@ members = [
 #                 real EventType/CommandType impls + the shared event
 #                 enum. Used as a build-dependency by a consumer's own
 #                 build.rs, not linked into the running binary itself.
+# skilj-temporal - a bridge from skilj's own event stream (REST
+#                 consume/ack) to Temporal's client API
+#                 (start/signal a workflow execution), correlated by a
+#                 fixed convention over a skilj DCB tag (§34, phase 2/3
+#                 of the plan - Temporal's own client crate is still
+#                 Public Preview as of this writing). Speaks skilj's
+#                 wire protocol only, zero dependency on any other
+#                 skilj crate - the same "independently usable"
+#                 posture skilj-tui already has, from the outside.
 
 [workspace.package]
 version = "0.0.3"
