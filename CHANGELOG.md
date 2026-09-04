@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `plugin::CrossContextRoute`: a single-hop, stateless reaction - when a
+  registered `EventType` commits in its own bounded context, submit a
+  `CommandType`'s own payload into a *different* bounded context, going
+  through that command's real `decide()`/`submit_command` path like any
+  other caller. The answer to "cross bounded contexts without an
+  external system like Temporal" for the common single-hop case;
+  deliberately not a Saga/process manager - a route that needs more than
+  one hop should reach for the `skilj-temporal` pairing instead. Driven
+  by a new shared background task (`SkiljBuilder::cross_context_route::<R>()`,
+  `.cross_context_route_poll_interval(Duration)`) with its own durable,
+  per-route cursor and idempotency-keyed submissions, so a
+  redelivered/retried catch-up tick is exactly as safe as any other
+  idempotency-keyed submission already is. See docs/architecture.md §36.
+- `skilj_core::db::decide_and_submit_command`: the "optimistic `decide()`,
+  then locked `submit_command`" sequence `skilj-rest`'s command-trigger
+  route and `skilj-graphql`'s `submitCommand` resolver each ran inline is
+  now one shared, real-Postgres-tested function, used by both of them
+  and by `CrossContextRoute`'s own background task.
+
+## [0.0.4] - 2026-09-04
+
 ### Security
 
 - `ProjectionQuery` had no whole-projection access gate: a projection
@@ -53,6 +76,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously hardcoded to `sqlx`'s own bare default (10 connections, no
   timeouts) with no way to tune it at all. `db::connect`'s own default
   behaviour is unchanged for every existing caller.
+
+### Changed
+
+- Every direct dependency brought to its latest major version:
+  `thiserror` 1→2, `base64` 0.22→0.23, `toml` 0.8→1, `prettyplease`
+  0.2→0.3, `syn` 2→3, `tokio-tungstenite` 0.29→0.30, `reqwest` 0.12→0.13,
+  `axum-extra` 0.10→0.12, `jsonwebtoken` 9→11, `schemars` 0.8→1, `sqlx`
+  0.8→0.9. Most were drop-in; `jsonwebtoken` 11 now requires explicitly
+  selecting a crypto backend (`aws_lc_rs`, already used elsewhere in the
+  dependency graph); `schemars` 1's JSON Schema output moved `$ref`
+  targets from `#/definitions/` to `#/$defs/` (handled for both the new
+  and old shape, since a schema stored under 0.8 keeps its old shape
+  until next re-registered); `sqlx` 0.9 requires proof that dynamic SQL
+  strings aren't injectable - every schema-qualified query (a per-tenant
+  Postgres schema name interpolated via `format!`) now wrapped in
+  `AssertSqlSafe`, independently audited against the pre-change source
+  to confirm no other content moved. No behavior change from any of
+  this - verified via the full existing test suite, unchanged.
 
 ## [0.0.3] - 2026-09-03
 
@@ -157,7 +198,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.3...HEAD
+[Unreleased]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.4...HEAD
+[0.0.4]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.3...v0.0.4
 [0.0.3]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.2...v0.0.3
 [0.0.2]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.1...v0.0.2
 [0.0.1]: https://codeberg.org/gklijs/SklilJ/releases/tag/v0.0.1

@@ -86,6 +86,7 @@ listed separately here; see that section itself for its own structure.
 - [33. Payload upcasting (Codeberg issue #14): every option, and the one built](#33-payload-upcasting-codeberg-issue-14-every-option-and-the-one-built)
 - [34. `skilj-temporal`: a plan, partially built (long-running/cross-system processes)](#34-skilj-temporal-a-plan-partially-built-long-runningcross-system-processes)
 - [35. Configurable connection pool sizing](#35-configurable-connection-pool-sizing)
+- [36. `CrossContextRoute`: crossing bounded contexts without an external system](#36-crosscontextroute-crossing-bounded-contexts-without-an-external-system)
 
 ---
 
@@ -5683,3 +5684,116 @@ build/clippy -D warnings/test --workspace` and `cargo fmt --check`
 clean. No spec change - pool sizing is deployment configuration, the
 same "process-start knob, not a registered value" register every other
 `SkiljBuilder` tunable already lives in.
+
+## 36. `CrossContextRoute`: crossing bounded contexts without an external system
+
+Prompted by "is there something we could do to make it easier to have
+messages cross bounded contexts, without needing Temporal?" - §34's
+`skilj-temporal` pairing is the right answer for a *process*: multiple
+steps, retries, compensation, state that outlives any one command. Most
+cross-context needs in practice are much smaller than that - "when
+`OrderPlaced` happens over here, submit `ReserveStock` over there" - and
+paying for an external workflow engine, a worker process, and its own
+operational surface for a single hop is a real tax with nothing to show
+for it. DCB's own tags are structurally scoped to *one* bounded context
+(§0/spec - two bounded contexts sharing a tag key still never interact),
+so nothing already in skilj closes this gap on its own.
+
+**Design**: `skilj_core::plugin::CrossContextRoute` - a new plugin trait,
+alongside `EventType`/`CommandType`/`Projection`/`Snapshot`:
+
+```rust
+pub trait CrossContextRoute {
+    type Source: EventType;
+    type Target: CommandType;
+    const NAME: &'static str;
+    fn route(source_payload: &<Self::Source as EventType>::Payload)
+        -> Option<<Self::Target as CommandType>::Payload>;
+}
+```
+
+Deliberately **not** a Saga/process manager - one hop, `Source` commits
+in its own bounded context, `route()` decides `None` (skip) or
+`Some(payload)`, and that payload goes through `Target`'s own real
+`decide()`/`submit_command` path in *its* bounded context, exactly like
+any other caller of `Target`. No multi-step state, no compensation, no
+retry policy of its own - `route()` is a pure, synchronous function of
+one event's payload, so the entire "what happens next" question is
+answered the instant `Source` commits, not carried forward as state a
+process has to keep re-evaluating. Reaching for a Saga/Process trait here
+was considered and rejected on the same grounds §34 already settled for
+Temporal: state/retry complexity belongs somewhere it can be owned
+properly (an external orchestrator, when a real multi-step process is
+actually needed), not folded into skilj's own plugin surface as a
+half-measure. A route that needs more than one hop is a process - use
+§34's `skilj-temporal` pairing instead, which already leverages the same
+idempotent-command-submission mechanism this feature also relies on.
+
+`Source`/`Target` are typed against each other's own bounded context via
+their existing `const BOUNDED_CONTEXT: &'static str` (§1.3.3's
+`auto_register` default), *not* the builder's "current bounded context" chain
+`.event_type::<T>()`/`.command_type::<T>()` use - a route by definition
+spans two bounded contexts, so there's no single "current" one to infer
+it from. `SkiljBuilder::cross_context_route::<R>()` registers it (keyed
+by `R::NAME`, last registration for a given key wins, same convention
+every other `HashMap`-backed registry here already has); `.cross_context_route_poll_interval(Duration)`
+tunes the poll rate (default 500ms, same shape as `async_projection_poll_interval`/
+`snapshot_poll_interval`).
+
+**Delivery mechanism**: a durable cursor per route
+(`{Source::BOUNDED_CONTEXT}.cross_context_route_cursors`, one row per
+`route_name`, mirroring `idempotency_keys`'s own per-bounded-context
+table), driven by one new shared background task `SkiljBuilder::build()`
+spawns - same shape as the async-projection/snapshot tasks (§8 item 6,
+§19): one task for every registered route, not one per route, ticking on
+`cross_context_route_poll_interval`, `stream::iter(...).for_each_concurrent`
+over the fixed route list (read once at spawn time, since routes have no
+runtime registration surface - the same "compiled in, fixed at startup"
+model `EventType`/`CommandType`/`Projection`/`Snapshot` already have).
+Each tick: read the cursor, fetch `Source` events after it, and for each
+one call `route()` through the type-erased `CrossContextRouteDispatcher`;
+`None` advances the cursor with nothing submitted, `Some(payload)` submits
+`Target` via `skilj_core::db::decide_and_submit_command` (below) with an
+idempotency key of `"{NAME}:{source_event_sequence}"` before advancing
+the cursor - so a redelivered/retried tick is exactly as safe as any
+other idempotency-keyed submission already is, and a real error from the
+submission itself leaves the cursor where it was, retried next tick
+rather than silently skipped.
+
+**`decide_and_submit_command`**: the route's own submission needed the
+identical "optimistic `decide()`, then locked `submit_command`" sequence
+`skilj-rest`'s `post_commands_trigger` and `skilj-graphql`'s
+`submitCommand` resolver each already ran inline - `derive_tags`,
+resolve an optional snapshot context, fetch matching events, dispatch,
+then `submit_command`. Rather than a third copy, that whole sequence is
+now `skilj_core::db::decide_and_submit_command`, and both existing
+callers were refactored onto it (behaviour-preserving - verified against
+each one's own existing test suite, unchanged pass/fail and unchanged
+error codes/messages). `submitCommand`'s own `required_role` check
+(§1.3.1) stays outside the shared helper, checked before calling it - REST
+triggering never needs it, and the route caller (`client_id:
+"cross-context-route"`) bypasses both REST/GraphQL authorisation
+entirely, submitting directly the same way the background pollers already
+reach `Target`'s `decide()` without going through a token.
+
+**No spec entity** - like `Snapshot` (§19) and the owner-tag scoping
+series, `CrossContextRoute` has no registration surface a spec `contract`
+would describe (no GraphQL mutation registers one, no REST endpoint lists
+them); it's a Rust-only construct layered on top of DCB, not a change to
+DCB's own model. The spec's existing "two bounded contexts sharing a tag
+key never interact" statement stays true - a route reacts to an event
+*after* it commits, it doesn't let `Target`'s `decide()` see `Source`'s
+tags or history.
+
+**Verified**: `skilj/tests/cross_context_route.rs`, a real end-to-end
+test against Postgres with two real bounded contexts ("shipping",
+"inventory") wired into one `Skilj` instance - a directly-created
+`OrderShipped` event in "shipping" is picked up by the route's own poll
+task and turned into a real `ReserveStock` command submission in
+"inventory", observed through a real (`sync: true`) projection there.
+A second case in the same test proves the `route() -> None` skip path:
+a backorder occurrence produces no command (projection state unchanged
+after several poll intervals' worth of margin), and a third, ordinary
+occurrence afterward still gets processed - proof a skip never stalls the
+cursor. `cargo build/clippy -D warnings/test --workspace` and `cargo fmt
+--check` clean.

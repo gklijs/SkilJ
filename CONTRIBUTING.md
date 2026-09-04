@@ -67,6 +67,18 @@ still-running `postgres`/embedded-server child processes
 under `/tmp` from these tests is meant to survive past the run that
 created it.
 
+A separate, easier-to-miss disk-space issue: `target/` lives on the
+*real* root filesystem, not `/tmp`, and a long session doing many full
+workspace rebuilds (a dependency bump, a version bump touching every
+crate's own `Cargo.toml`, several `cargo clean`s) can grow it far
+larger than expected - observed once at over 800GB, filling the actual
+disk to 100% and turning an otherwise-ordinary `cargo build` into a
+confusing "No space left on device" failure with no relation to the
+code being built. `df -h` (not just `df -h /tmp`) to check; `rm -rf
+target` reclaims it unconditionally - it is pure build cache, never
+source or data, and the next `cargo build` regenerates whatever it
+needs, just slower for that one run.
+
 ## Where things live
 
 - [`specs/skilj.allium`](specs/skilj.allium) is the behavioural

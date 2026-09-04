@@ -116,116 +116,27 @@ pub fn submit_command_field() -> Field {
                     Some(_) => {}
                 }
 
-                // docs/architecture.md §19's "Problem 1" fix: derive_tags
-                // runs first so the fetch below can go straight to the
-                // tag-indexed query instead of pulling the whole bounded
-                // context and filtering in memory - `bounded_context_events`
-                // is already tag-scoped from here on, not literally every
-                // event in the bounded context.
-                let consistency_tags = skilj_core::event_store::derive_tags(
-                    &authorised.command_type.tag_mappings,
-                    &authorised.payload,
-                );
-
-                // docs/architecture.md §19's "Problem 2" - resolved
-                // once, shared with skilj-rest's own identical branch
-                // via skilj_core::db::resolve_snapshot_context. `None`
-                // either when this command type doesn't opt into
-                // snapshotting at all, or opts in but its own derived
-                // tags don't match the snapshot's single tag key
-                // exactly (a silent fallback to the ordinary path, not
-                // an error - see CommandType::snapshot()'s own doc
-                // comment).
-                let snapshot_context = match state
-                    .dispatcher
-                    .snapshot_name(&bounded_context_name, &authorised.command_type.name)
-                {
-                    Some(Some(snapshot_name)) => skilj_core::db::resolve_snapshot_context(
-                        &state.pool,
-                        &bounded_context_name,
-                        state.snapshot_dispatcher.as_ref(),
-                        snapshot_name,
-                        &consistency_tags,
-                    )
-                    .await
-                    .map_err(to_graphql_error)?,
-                    _ => None,
-                };
-
-                // The tag-indexed fetch (§19's "Problem 1") already
-                // supports an `after_sequence` bound for exactly this
-                // reason - `events_since_snapshot` when a snapshot
-                // context resolved, the full tag-scoped set otherwise.
-                // `matching_events` names it either way, since it's the
-                // one thing both `dispatch`/`dispatch_from_snapshot`
-                // below are fed.
-                let bounded_context_events =
-                    skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
-                        &state.pool,
-                        &state.event_cache,
-                        &bounded_context_name,
-                        &consistency_tags,
-                        snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
-                    )
-                    .await
-                    .map_err(to_graphql_error)?;
-                let (_boundary, matching_events) =
-                    skilj_core::event_store::consistency_boundary_and_matching_events(
-                        &bounded_context_events,
-                        &consistency_tags,
-                    );
-
-                let decision = match &snapshot_context {
-                    Some(ctx) => match state.dispatcher.dispatch_from_snapshot(
-                        &bounded_context_name,
-                        &authorised.command_type.name,
-                        &authorised.payload,
-                        &ctx.state_json,
-                        &matching_events,
-                    ) {
-                        None => return Err(no_decider_registered_error()),
-                        Some(Err(e)) => return Err(to_graphql_error(e)),
-                        Some(Ok(decision)) => decision,
-                    },
-                    None => match state.dispatcher.dispatch(
-                        &bounded_context_name,
-                        &authorised.command_type.name,
-                        &authorised.payload,
-                        &matching_events,
-                    ) {
-                        None => return Err(no_decider_registered_error()),
-                        Some(Err(e)) => return Err(to_graphql_error(e)),
-                        Some(Ok(decision)) => decision,
-                    },
-                };
-
-                // The optimistic, unlocked half ends here - `decision`
-                // above is dispatch()'s own first call. skilj_core::db::
-                // submit_command below re-checks this under
-                // next_sequence's own lock and redispatches if a DCB
-                // conflict actually happened in between (see its own doc
-                // comment) before persisting anything.
-                let outcome = skilj_core::db::submit_command(
+                // The full "optimistic decide, then locked submit"
+                // sequence (docs/architecture.md §19's own "Problem 1"/
+                // "Problem 2" fixes), shared with skilj-rest's identical
+                // branch (and the cross-context event router) via
+                // skilj_core::db::decide_and_submit_command rather than
+                // each duplicating the dance. `required_role` above is
+                // still this resolver's own concern - checked before
+                // this call, not folded into it, since REST triggering
+                // never needs it (§1.3.1).
+                let outcome = skilj_core::db::decide_and_submit_command(
                     &state.pool,
                     state.dispatcher.as_ref(),
                     state.projection_dispatcher.as_ref(),
+                    state.snapshot_dispatcher.as_ref(),
                     &state.event_broadcaster,
                     &state.event_cache,
                     &authorised.command_type,
                     &authorised.payload,
                     &authorised.client_id,
-                    &bounded_context_events,
-                    &consistency_tags,
-                    &matching_events,
-                    decision,
                     state.encryption_master_key.as_ref(),
                     Utc::now(),
-                    snapshot_context
-                        .as_ref()
-                        .map(|ctx| skilj_core::db::SnapshotContext {
-                            state_json: &ctx.state_json,
-                            as_of_sequence: ctx.as_of_sequence,
-                        }),
                     idempotency_key.as_deref(),
                 )
                 .await

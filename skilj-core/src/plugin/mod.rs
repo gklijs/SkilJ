@@ -833,3 +833,101 @@ pub trait SnapshotDispatcher: Send + Sync {
     /// "pair isn't registered at all" case.
     fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String>;
 }
+
+/// A single-hop, stateless reaction: when `Source` commits in its own
+/// bounded context, submit `Target`'s own command into *its* bounded
+/// context - the answer to "make messages cross bounded contexts
+/// without needing an external system like Temporal" (docs/architecture.md's
+/// own write-up of this pass) for the case that never needed Temporal's
+/// own durable-timer/retry/compensation machinery in the first place:
+/// both bounded contexts already live in the same Postgres database,
+/// often the same process, so relaying one committed fact into another
+/// bounded context's own command needs nothing more than a durable
+/// cursor and the same `submit_command` path every other caller already
+/// goes through.
+///
+/// Deliberately **not** a Saga/process manager - see this trait's own
+/// design note in docs/architecture.md: no multi-step state is tracked
+/// across calls, no compensation, no retry beyond `submit_command`'s own
+/// idempotency-key mechanism. One commit causes at most one more commit
+/// elsewhere, the same bounded, single-hop shape `submit_command`'s own
+/// DCB-conflict retry already has - not an open-ended state machine.
+///
+/// A `Target` command that gets rejected by its own `decide()` is a
+/// legitimate business outcome here too (§5.4's own "a business
+/// rejection is not an error" register), not a failure to retry -
+/// `route()` translating `Source`'s payload into a `Target` payload
+/// `Target::decide()` goes on to reject is exactly as valid an outcome
+/// as one it accepts.
+pub trait CrossContextRoute {
+    /// The `EventType` this route reacts to, in its own bounded context.
+    type Source: EventType;
+    /// The `CommandType` this route submits, in *its* bounded context -
+    /// deliberately a command, not a raw event: `Target`'s own
+    /// `decide()` still gets to accept, reject, or reshape the outcome,
+    /// the same as every other command submission. A route that skipped
+    /// straight to creating an event would bypass whatever domain rules
+    /// the target bounded context wants to enforce on its own history.
+    type Target: CommandType;
+
+    /// This route's own stable identity - names its durable cursor row
+    /// (`{Source::BOUNDED_CONTEXT}.cross_context_route_cursors`) and the
+    /// idempotency key derived for every command it submits
+    /// (`"{NAME}:{source_event_sequence}"`), so a redelivered/retried
+    /// catch-up tick is exactly as safe as any other idempotency-keyed
+    /// submission already is.
+    const NAME: &'static str;
+
+    /// `None` skips this occurrence of `Source` entirely - no command
+    /// submitted, cursor still advances (retrying can never produce a
+    /// target payload for an occurrence this route itself decided
+    /// doesn't apply). `Some(payload)` submits `Target` with that
+    /// payload, going through the identical `decide()`/`submit_command`
+    /// path every other caller of `Target` already does.
+    fn route(
+        source_payload: &<Self::Source as EventType>::Payload,
+    ) -> Option<<Self::Target as CommandType>::Payload>;
+}
+
+/// One registered route's own static identity - `CrossContextRouteDispatcher::routes()`'s
+/// own element type, enumerated once at startup by the background
+/// catch-up loop (`db::catch_up_cross_context_route`).
+#[derive(Debug, Clone, Copy)]
+pub struct CrossContextRouteInfo {
+    pub name: &'static str,
+    pub source_bounded_context: &'static str,
+    pub source_event_type: &'static str,
+    pub target_bounded_context: &'static str,
+    pub target_command_type: &'static str,
+}
+
+/// Type-erased dispatch to a bounded context's own typed
+/// `CrossContextRoute::route` - the same "outer `None` = not registered
+/// at all" convention every other dispatcher trait in this module
+/// already uses, one level deeper here since `route()` itself can also
+/// legitimately produce nothing for a given occurrence.
+pub trait CrossContextRouteDispatcher: Send + Sync {
+    /// Every registered route, across every bounded context - routes
+    /// aren't scoped to one bounded context the way `EventType`/
+    /// `CommandType`/`Projection` are (a route by definition spans two),
+    /// so unlike `ProjectionDispatcher::keys` and friends there is no
+    /// `bounded_context` parameter to filter by here; the background
+    /// catch-up loop calls this once and iterates the full list itself.
+    fn routes(&self) -> Vec<CrossContextRouteInfo>;
+
+    /// `route_name` names one of `routes()`'s own entries;
+    /// `source_payload_json` is the triggering `Source` event's own
+    /// stored payload. Outer `None` - `route_name` isn't registered at
+    /// all (defensive; the caller only ever names one of its own
+    /// `routes()`). `Some(Err(e))` - the stored payload didn't
+    /// deserialize into `Source::Payload` (see `BoundedContextEvent::
+    /// try_from_event`'s own doc comment on why this is still reachable
+    /// even though payloads are schema-checked at write time). `Some(Ok(None))` -
+    /// `route()` itself decided this occurrence doesn't apply. `Some(Ok(Some(payload)))` -
+    /// the `Target` command's own JSON payload, ready to submit.
+    fn route(
+        &self,
+        route_name: &str,
+        source_payload_json: &str,
+    ) -> Option<Result<Option<String>, serde_json::Error>>;
+}

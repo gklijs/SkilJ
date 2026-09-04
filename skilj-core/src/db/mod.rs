@@ -437,6 +437,7 @@ async fn provision_bounded_context_schema(
     .execute(&mut **tx)
     .await?;
     ensure_idempotency_keys_table(&mut **tx, bounded_context).await?;
+    ensure_cross_context_route_cursors_table(&mut **tx, bounded_context).await?;
     // `EncryptionKey` is a real, independently-lived entity (its own
     // status/lifecycle - see `entity EncryptionKey`), so it's referenced
     // here, not JSONB-embedded like `tag_mappings`/`sensitive_fields` -
@@ -1019,6 +1020,35 @@ pub async fn ensure_idempotency_keys_table<'e>(
             triggered_event_sequences BIGINT[] NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (command_type_name, idempotency_key)
+        )"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `cross_context_route_cursors` - one row per registered
+/// `CrossContextRoute`, in its own `Source`'s bounded-context schema
+/// (the same "cursor lives with whoever's reading" register `ReadCursor`
+/// already establishes, just for an internal reader rather than an
+/// external `EventReadToken` holder). `last_dispatched_sequence` uses
+/// the same `-1` "nothing yet" sentinel `sequence`/`caught_up_to`
+/// already use throughout this codebase, rather than a nullable column.
+/// `ensure_idempotency_keys_table`'s own doc comment's "no general
+/// per-bounded-context schema migration mechanism" applies identically
+/// here - `CREATE TABLE IF NOT EXISTS`, patched into every bounded
+/// context on every `build()`, is the whole migration story.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_cross_context_route_cursors_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.cross_context_route_cursors (
+            route_name TEXT PRIMARY KEY,
+            last_dispatched_sequence BIGINT NOT NULL DEFAULT -1,
+            updated_at TIMESTAMPTZ NOT NULL
         )"
     )))
     .execute(executor)
@@ -5228,6 +5258,290 @@ pub async fn submit_command(
         command: Box::new(result.command),
         events: result.events,
     })
+}
+
+/// The full "optimistic decide, then locked submit" sequence
+/// `ProcessCommand` describes end to end, for a caller that already has
+/// a resolved `CommandType` and a JSON payload in hand: derive
+/// consistency tags, resolve a snapshot context if one applies
+/// (`resolve_snapshot_context`), fetch matching events (tag-indexed -
+/// docs/architecture.md §19's own "Problem 1" fix), `dispatch()` once
+/// optimistically, then hand off to [`submit_command`] for the real,
+/// locked recheck-and-retry.
+///
+/// Previously this exact sequence was independently duplicated by
+/// `skilj-rest`'s `post_commands_trigger` and `skilj-graphql`'s
+/// `submitCommand` resolver (each one's own comments cross-referenced
+/// the other as "the identical branch") - both now call through here
+/// instead, and it is also what `SkiljBuilder`'s cross-context event
+/// router (docs/architecture.md's own write-up of that pass) uses to
+/// submit a routed command in-process, a third caller with no REST/
+/// GraphQL wire concerns of its own to keep separate from this. `None`
+/// from `dispatch`/`dispatch_from_snapshot` (no decider registered for
+/// this `(bounded_context, command_type)` pair - `CommandDispatcher::
+/// dispatch`'s own doc comment on why that's reachable in principle)
+/// surfaces as `Error::NoDeciderRegistered`, the same variant every
+/// caller already converts into its own wire error today.
+#[allow(clippy::too_many_arguments)]
+pub async fn decide_and_submit_command(
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+    idempotency_key: Option<&str>,
+) -> crate::error::Result<SubmitCommandOutcome> {
+    let bounded_context_name = command_type.bounded_context.name.clone();
+    let consistency_tags = crate::event_store::derive_tags(&command_type.tag_mappings, payload);
+
+    let snapshot_context = match dispatcher.snapshot_name(&bounded_context_name, &command_type.name)
+    {
+        Some(Some(snapshot_name)) => {
+            resolve_snapshot_context(
+                pool,
+                &bounded_context_name,
+                snapshot_dispatcher,
+                snapshot_name,
+                &consistency_tags,
+            )
+            .await?
+        }
+        _ => None,
+    };
+
+    let bounded_context_events = list_events_for_bounded_context_matching_tags_cached(
+        pool,
+        event_cache,
+        &bounded_context_name,
+        &consistency_tags,
+        snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
+    )
+    .await?;
+    let (_boundary, matching_events) = crate::event_store::consistency_boundary_and_matching_events(
+        &bounded_context_events,
+        &consistency_tags,
+    );
+
+    let decision = match &snapshot_context {
+        Some(ctx) => dispatcher
+            .dispatch_from_snapshot(
+                &bounded_context_name,
+                &command_type.name,
+                payload,
+                &ctx.state_json,
+                &matching_events,
+            )
+            .ok_or(crate::error::Error::NoDeciderRegistered)??,
+        None => dispatcher
+            .dispatch(
+                &bounded_context_name,
+                &command_type.name,
+                payload,
+                &matching_events,
+            )
+            .ok_or(crate::error::Error::NoDeciderRegistered)??,
+    };
+
+    submit_command(
+        pool,
+        dispatcher,
+        projection_dispatcher,
+        broadcaster,
+        event_cache,
+        command_type,
+        payload,
+        client_id,
+        &bounded_context_events,
+        &consistency_tags,
+        &matching_events,
+        decision,
+        encryption_master_key,
+        now,
+        snapshot_context.as_ref().map(|ctx| SnapshotContext {
+            state_json: &ctx.state_json,
+            as_of_sequence: ctx.as_of_sequence,
+        }),
+        idempotency_key,
+    )
+    .await
+}
+
+/// `cross_context_route_cursors`'s own read - `-1` (the same "nothing
+/// yet" sentinel `sequence`/`caught_up_to` already use) when this route
+/// has never dispatched anything yet, whether because no row exists at
+/// all or because `updated_at` predates the table's own creation for
+/// this bounded context (patched in retroactively - see
+/// `ensure_cross_context_route_cursors_table`'s own doc comment).
+async fn get_cross_context_route_cursor(
+    pool: &Pool,
+    source_bounded_context: &str,
+    route_name: &str,
+) -> crate::error::Result<i64> {
+    let schema = schema_ident(source_bounded_context);
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT last_dispatched_sequence FROM {schema}.cross_context_route_cursors \
+         WHERE route_name = $1"
+    )))
+    .bind(route_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(seq,)| seq).unwrap_or(-1))
+}
+
+async fn update_cross_context_route_cursor(
+    pool: &Pool,
+    source_bounded_context: &str,
+    route_name: &str,
+    sequence: i64,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(source_bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.cross_context_route_cursors \
+         (route_name, last_dispatched_sequence, updated_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (route_name) DO UPDATE SET \
+         last_dispatched_sequence = EXCLUDED.last_dispatched_sequence, \
+         updated_at = EXCLUDED.updated_at"
+    )))
+    .bind(route_name)
+    .bind(sequence)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One catch-up tick for one registered [`crate::plugin::CrossContextRoute`] -
+/// called in a loop, on a timer, by the single shared background task
+/// `SkiljBuilder::build()` spawns (docs/architecture.md's own write-up
+/// of this pass), the same "one shared task, not one per route" register
+/// `catch_up_bounded_context`/`catch_up_snapshots` already use.
+///
+/// Fetches every `Source` occurrence since this route's own cursor
+/// (`list_events_cached`, already filtered to `Source`'s own event type -
+/// the identical read path `EventReadToken`-based REST consumption
+/// already uses), and for each one, in sequence order: asks the
+/// type-erased dispatcher to translate the payload
+/// (`CrossContextRouteDispatcher::route`), submits `Target`'s own
+/// command through [`decide_and_submit_command`] when it produces one,
+/// then advances the cursor to that occurrence's own sequence
+/// regardless of the outcome - a skip, a rejection, and an accepted
+/// submission are all equally "this occurrence is done", only a real
+/// `Err` (a transient failure worth retrying next tick) leaves the
+/// cursor where it was, stopping this route's own catch-up for this
+/// tick without losing anything (the next tick re-fetches from the same
+/// cursor).
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(route = %route.name))]
+pub async fn catch_up_cross_context_route(
+    pool: &Pool,
+    route: &crate::plugin::CrossContextRouteInfo,
+    route_dispatcher: &dyn crate::plugin::CrossContextRouteDispatcher,
+    command_dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<()> {
+    let cursor =
+        get_cross_context_route_cursor(pool, route.source_bounded_context, route.name).await?;
+    let events = list_events_cached(
+        pool,
+        event_cache,
+        route.source_bounded_context,
+        route.source_event_type,
+        cursor,
+    )
+    .await?;
+
+    for event in &events {
+        match route_dispatcher.route(route.name, &event.payload) {
+            None => {
+                // Defensive only - `route.name` came from this same
+                // dispatcher's own `routes()` list, so this should never
+                // actually happen. Still advances the cursor below
+                // rather than looping on it forever.
+                tracing::warn!(
+                    sequence = event.sequence,
+                    "cross-context route not found in its own dispatcher - skipping"
+                );
+            }
+            Some(Err(e)) => {
+                // The stored payload didn't deserialize into `Source::
+                // Payload` - see `BoundedContextEvent::try_from_event`'s
+                // own doc comment on why this is reachable. Retrying can
+                // never fix a payload the event itself was stored with,
+                // so this is logged and skipped, not retried forever.
+                tracing::warn!(
+                    sequence = event.sequence,
+                    error = %e,
+                    "cross-context route: source payload did not deserialize - skipping"
+                );
+            }
+            Some(Ok(None)) => {
+                // `route()` itself decided this occurrence doesn't
+                // apply - a real, expected outcome, not an error.
+            }
+            Some(Ok(Some(target_payload))) => {
+                let Some(target_command_type) = get_command_type(
+                    pool,
+                    route.target_bounded_context,
+                    route.target_command_type,
+                )
+                .await?
+                else {
+                    tracing::warn!(
+                        sequence = event.sequence,
+                        target_bounded_context = route.target_bounded_context,
+                        target_command_type = route.target_command_type,
+                        "cross-context route's own target CommandType isn't registered - \
+                         skipping this occurrence, cursor still advances"
+                    );
+                    update_cross_context_route_cursor(
+                        pool,
+                        route.source_bounded_context,
+                        route.name,
+                        event.sequence,
+                        Utc::now(),
+                    )
+                    .await?;
+                    continue;
+                };
+                let idempotency_key = format!("{}:{}", route.name, event.sequence);
+                decide_and_submit_command(
+                    pool,
+                    command_dispatcher,
+                    projection_dispatcher,
+                    snapshot_dispatcher,
+                    broadcaster,
+                    event_cache,
+                    &target_command_type,
+                    &target_payload,
+                    "cross-context-route",
+                    encryption_master_key,
+                    Utc::now(),
+                    Some(&idempotency_key),
+                )
+                .await?;
+            }
+        }
+        update_cross_context_route_cursor(
+            pool,
+            route.source_bounded_context,
+            route.name,
+            event.sequence,
+            Utc::now(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// A hit returns the stored `triggered_event_sequences` from a prior

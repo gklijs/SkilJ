@@ -705,98 +705,24 @@ async fn post_commands_trigger(
     span.record("bounded_context", bounded_context_name.as_str());
     span.record("command_type", authorised.command_type.name.as_str());
 
-    // The optimistic, unlocked half: read matching events and call
-    // dispatch() once, same as always - see the note above the rules in
-    // specs/skilj.allium ("reading matching events and running decide()
-    // beforehand does not [need the lock]"). `db::submit_command` below
-    // is what re-checks this under `next_sequence`'s own lock and
-    // redispatches if a DCB conflict actually happened in between.
-    // docs/architecture.md §19's "Problem 1" fix: derive_tags runs first
-    // so the fetch below can go straight to the tag-indexed query
-    // instead of pulling the whole bounded context and filtering in
-    // memory - `bounded_context_events` is already tag-scoped from here
-    // on, not literally every event in the bounded context. Mirrors
-    // `skilj-graphql`'s `command_submission.rs` own identical change.
-    let consistency_tags =
-        event_store::derive_tags(&authorised.command_type.tag_mappings, &authorised.payload);
-
-    // docs/architecture.md §19's "Problem 2" - see skilj-graphql's own
-    // identical branch in command_submission.rs for the full reasoning;
-    // shared via skilj_core::db::resolve_snapshot_context so this logic
-    // lives once, not duplicated per surface.
-    let snapshot_context = match state
-        .dispatcher
-        .snapshot_name(&bounded_context_name, &authorised.command_type.name)
-    {
-        Some(Some(snapshot_name)) => {
-            db::resolve_snapshot_context(
-                &state.pool,
-                &bounded_context_name,
-                state.snapshot_dispatcher.as_ref(),
-                snapshot_name,
-                &consistency_tags,
-            )
-            .await?
-        }
-        _ => None,
-    };
-
-    let bounded_context_events = db::list_events_for_bounded_context_matching_tags_cached(
-        &state.pool,
-        &state.event_cache,
-        &bounded_context_name,
-        &consistency_tags,
-        snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
-    )
-    .await?;
-    let (_boundary, matching_events) = event_store::consistency_boundary_and_matching_events(
-        &bounded_context_events,
-        &consistency_tags,
-    );
-
-    let decision = match &snapshot_context {
-        Some(ctx) => match state.dispatcher.dispatch_from_snapshot(
-            &bounded_context_name,
-            &authorised.command_type.name,
-            &authorised.payload,
-            &ctx.state_json,
-            &matching_events,
-        ) {
-            None => return Err(RestError::NoDeciderRegistered),
-            Some(Err(e)) => return Err(e.into()),
-            Some(Ok(decision)) => decision,
-        },
-        None => match state.dispatcher.dispatch(
-            &bounded_context_name,
-            &authorised.command_type.name,
-            &authorised.payload,
-            &matching_events,
-        ) {
-            None => return Err(RestError::NoDeciderRegistered),
-            Some(Err(e)) => return Err(e.into()),
-            Some(Ok(decision)) => decision,
-        },
-    };
-
-    let outcome = db::submit_command(
+    // The full "optimistic decide, then locked submit" sequence -
+    // docs/architecture.md §19's own "Problem 1"/"Problem 2" fixes
+    // (tag-indexed fetch, snapshot-context resolution), now shared with
+    // `skilj-graphql`'s identical `submitCommand` resolver (and the
+    // cross-context event router) via `skilj_core::db::
+    // decide_and_submit_command` rather than each duplicating the dance.
+    let outcome = db::decide_and_submit_command(
         &state.pool,
         state.dispatcher.as_ref(),
         state.projection_dispatcher.as_ref(),
+        state.snapshot_dispatcher.as_ref(),
         &state.event_broadcaster,
         &state.event_cache,
         &authorised.command_type,
         &authorised.payload,
         &authorised.client_id,
-        &bounded_context_events,
-        &consistency_tags,
-        &matching_events,
-        decision,
         state.encryption_master_key.as_ref(),
         Utc::now(),
-        snapshot_context.as_ref().map(|ctx| db::SnapshotContext {
-            state_json: &ctx.state_json,
-            as_of_sequence: ctx.as_of_sequence,
-        }),
         idempotency_key,
     )
     .await?;

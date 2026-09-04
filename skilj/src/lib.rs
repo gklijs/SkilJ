@@ -73,7 +73,8 @@ pub use inventory;
 pub use skilj_core::access_control::{IdpConfig, SigningAlgorithm};
 pub use skilj_core::encryption::EncryptionMasterKey;
 pub use skilj_core::plugin::{
-    requires_role, CommandType, EventType, Projection, Snapshot, DEFAULT_BOUNDED_CONTEXT,
+    requires_role, CommandType, CrossContextRoute, EventType, Projection, Snapshot,
+    DEFAULT_BOUNDED_CONTEXT,
 };
 /// See `skilj_macros::auto_register`'s own doc comment - unlike
 /// `requires_role` above, this one is facade-specific (its expansion
@@ -454,6 +455,33 @@ impl skilj_core::plugin::SnapshotDispatcher for SnapshotDispatcherImpl {
     }
 }
 
+/// `CrossContextRouteDispatcher`'s own implementer - a thin wrapper
+/// around the registry `SkiljBuilder::build()` builds and hands to the
+/// one background task that ever reads it (docs/architecture.md's own
+/// write-up of this pass). Deliberately not template-aware
+/// (`template_cache`-free, unlike `SnapshotDispatcherImpl`/
+/// `ProjectionDispatcherImpl` above) - a route's own `Source`/`Target`
+/// bounded contexts are fixed Rust constants, not resolved per request
+/// the way a caller-supplied bounded context name is elsewhere.
+struct CrossContextRouteDispatcherImpl {
+    routes: Arc<HashMap<String, RegisteredCrossContextRoute>>,
+}
+
+impl skilj_core::plugin::CrossContextRouteDispatcher for CrossContextRouteDispatcherImpl {
+    fn routes(&self) -> Vec<skilj_core::plugin::CrossContextRouteInfo> {
+        self.routes.values().map(|r| r.info).collect()
+    }
+
+    fn route(
+        &self,
+        route_name: &str,
+        source_payload_json: &str,
+    ) -> Option<Result<Option<String>, serde_json::Error>> {
+        let registered = self.routes.get(route_name)?;
+        Some((registered.route)(source_payload_json))
+    }
+}
+
 impl Skilj {
     pub fn builder(database_url: impl Into<String>) -> SkiljBuilder {
         SkiljBuilder {
@@ -465,8 +493,10 @@ impl Skilj {
             command_types: HashMap::new(),
             projections: HashMap::new(),
             snapshots: HashMap::new(),
+            cross_context_routes: HashMap::new(),
             async_projection_poll_interval: std::time::Duration::from_millis(500),
             snapshot_poll_interval: std::time::Duration::from_millis(500),
+            cross_context_route_poll_interval: std::time::Duration::from_millis(500),
             scheduler_poll_interval: std::time::Duration::from_secs(1),
             projection_query_wait_timeout: std::time::Duration::from_secs(5),
             encryption_master_key: None,
@@ -941,6 +971,37 @@ fn registered_snapshot<T: Snapshot + 'static>() -> RegisteredSnapshot {
     }
 }
 
+/// One registered `CrossContextRoute` - the type-erased closure
+/// captures `R::route` plus `R::Source::Payload`/`R::Target::Payload`'s
+/// own (de)serialization, so `skilj_core::plugin::CrossContextRouteDispatcher::route`
+/// (the trait `Skilj` implements over this registry, mirroring
+/// `RegisteredSnapshot`'s own shape) needs nothing generic at its own
+/// call site.
+struct RegisteredCrossContextRoute {
+    info: skilj_core::plugin::CrossContextRouteInfo,
+    route: fn(&str) -> Result<Option<String>, serde_json::Error>,
+}
+
+fn registered_cross_context_route<R: CrossContextRoute + 'static>() -> RegisteredCrossContextRoute {
+    RegisteredCrossContextRoute {
+        info: skilj_core::plugin::CrossContextRouteInfo {
+            name: R::NAME,
+            source_bounded_context: R::Source::BOUNDED_CONTEXT,
+            source_event_type: R::Source::NAME,
+            target_bounded_context: R::Target::BOUNDED_CONTEXT,
+            target_command_type: R::Target::NAME,
+        },
+        route: |payload_json| {
+            let source_payload: <R::Source as EventType>::Payload =
+                serde_json::from_str(payload_json)?;
+            match R::route(&source_payload) {
+                None => Ok(None),
+                Some(target_payload) => Ok(Some(serde_json::to_string(&target_payload)?)),
+            }
+        },
+    }
+}
+
 /// One `#[auto_register]`-tagged `EventType` impl's own contribution -
 /// the type-erased equivalent of one
 /// `.bounded_context(T::BOUNDED_CONTEXT).event_type::<T>()` call, as a
@@ -976,8 +1037,15 @@ pub struct SkiljBuilder {
     command_types: HashMap<(String, String), RegisteredCommandType>,
     projections: HashMap<(String, String), RegisteredProjection>,
     snapshots: HashMap<(String, String), RegisteredSnapshot>,
+    /// Keyed by `CrossContextRoute::NAME` alone, not `(bounded_context,
+    /// name)` the way `event_types`/`command_types`/`projections`/
+    /// `snapshots` are - a route by definition spans two bounded
+    /// contexts, so there is no single one to key it against the way
+    /// `.bounded_context(...)` scopes every other registration.
+    cross_context_routes: HashMap<String, RegisteredCrossContextRoute>,
     async_projection_poll_interval: std::time::Duration,
     snapshot_poll_interval: std::time::Duration,
+    cross_context_route_poll_interval: std::time::Duration,
     scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
     encryption_master_key: Option<EncryptionMasterKey>,
@@ -1058,6 +1126,20 @@ impl SkiljBuilder {
         self
     }
 
+    /// Registers a [`CrossContextRoute`] - unlike `event_type`/
+    /// `command_type`/`projection`/`snapshot`, never scoped by the
+    /// current `.bounded_context(...)` chain, since a route's own
+    /// `Source`/`Target` already each know their own bounded context.
+    /// Keyed by `R::NAME` - registering two routes under the same name
+    /// silently replaces the first, the same "last registration for a
+    /// given key wins" convention every other `HashMap`-backed registry
+    /// here already has.
+    pub fn cross_context_route<R: CrossContextRoute + 'static>(mut self) -> Self {
+        self.cross_context_routes
+            .insert(R::NAME.to_string(), registered_cross_context_route::<R>());
+        self
+    }
+
     /// The Role the startup reconciliation loop authenticates as - named
     /// by `external_subject`, the same identifier every other identity
     /// resolution in the spec keys on. Optional: omitting it skips
@@ -1104,6 +1186,17 @@ impl SkiljBuilder {
     /// reason.
     pub fn snapshot_poll_interval(mut self, interval: std::time::Duration) -> Self {
         self.snapshot_poll_interval = interval;
+        self
+    }
+
+    /// How often the single shared background task `.build()` spawns
+    /// polls every registered [`CrossContextRoute`] to catch up -
+    /// `db::catch_up_cross_context_route`'s own wake mechanism, the
+    /// `CrossContextRoute` equivalent of `snapshot_poll_interval` above.
+    /// Defaults to 500ms, matching that default for the identical
+    /// reason.
+    pub fn cross_context_route_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.cross_context_route_poll_interval = interval;
         self
     }
 
@@ -1379,6 +1472,13 @@ impl SkiljBuilder {
                     // comments.
                     skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
                     skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
+                    // Cross-context event router (docs/architecture.md's
+                    // own write-up of this pass) - same "patched into
+                    // every bounded context, every startup" treatment.
+                    // See `ensure_cross_context_route_cursors_table`'s
+                    // own doc comment.
+                    skilj_core::db::ensure_cross_context_route_cursors_table(pool, &bc.name)
+                        .await?;
                     Ok::<(), skilj_core::Error>(())
                 }
             })
@@ -1593,6 +1693,87 @@ impl SkiljBuilder {
                     &[KeyValue::new("task", "snapshot")],
                 );
                 tokio::time::sleep(snapshot_interval).await;
+            }
+        });
+
+        // The background task driving `CrossContextRoute`s - this
+        // crate's own answer to "make messages cross bounded contexts
+        // without needing an external system like Temporal" (see
+        // `skilj_core::plugin::CrossContextRoute`'s own doc comment for
+        // why this stays a single-hop reaction, not a Saga/process
+        // manager). One shared task, not one per route, for the same
+        // reasons the async projection task above is; detached, runs
+        // for the process's lifetime, same as every other background
+        // task here. The route list itself is fixed at `.build()` time
+        // (registered via `SkiljBuilder::cross_context_route`, no
+        // runtime registration surface, matching every other plugin
+        // trait), so it's read once here rather than re-listed every
+        // tick the way bounded contexts are.
+        let route_pool = skilj.pool.clone();
+        let route_command_dispatcher = skilj.command_dispatcher();
+        let route_projection_dispatcher = skilj.projection_dispatcher();
+        let route_snapshot_dispatcher = skilj.snapshot_dispatcher();
+        let route_broadcaster = skilj.event_broadcaster.clone();
+        let route_event_cache = skilj.event_cache.clone();
+        let route_encryption_master_key = skilj.encryption_master_key.clone();
+        let route_dispatcher: Arc<dyn skilj_core::plugin::CrossContextRouteDispatcher> =
+            Arc::new(CrossContextRouteDispatcherImpl {
+                routes: Arc::new(self.cross_context_routes),
+            });
+        let routes = route_dispatcher.routes();
+        let route_interval = self.cross_context_route_poll_interval;
+        tokio::spawn(async move {
+            loop {
+                let start = std::time::Instant::now();
+                async {
+                    stream::iter(routes.clone())
+                        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |route| {
+                            let route_pool = route_pool.clone();
+                            let route_dispatcher = route_dispatcher.clone();
+                            let route_command_dispatcher = route_command_dispatcher.clone();
+                            let route_projection_dispatcher = route_projection_dispatcher.clone();
+                            let route_snapshot_dispatcher = route_snapshot_dispatcher.clone();
+                            let route_broadcaster = route_broadcaster.clone();
+                            let route_event_cache = route_event_cache.clone();
+                            let route_encryption_master_key = route_encryption_master_key.clone();
+                            async move {
+                                if let Err(e) = skilj_core::db::catch_up_cross_context_route(
+                                    &route_pool,
+                                    &route,
+                                    route_dispatcher.as_ref(),
+                                    route_command_dispatcher.as_ref(),
+                                    route_projection_dispatcher.as_ref(),
+                                    route_snapshot_dispatcher.as_ref(),
+                                    &route_broadcaster,
+                                    &route_event_cache,
+                                    route_encryption_master_key.as_ref(),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        route = %route.name,
+                                        error = %e,
+                                        "cross-context route catch-up failed"
+                                    );
+                                    BACKGROUND_TASK_ERRORS.add(
+                                        1,
+                                        &[
+                                            KeyValue::new("task", "cross_context_route"),
+                                            KeyValue::new("reason", "catch_up_failed"),
+                                        ],
+                                    );
+                                }
+                            }
+                        })
+                        .await;
+                }
+                .instrument(tracing::info_span!("cross_context_route_tick"))
+                .await;
+                BACKGROUND_TASK_TICK_DURATION.record(
+                    start.elapsed().as_secs_f64(),
+                    &[KeyValue::new("task", "cross_context_route")],
+                );
+                tokio::time::sleep(route_interval).await;
             }
         });
 
