@@ -13,6 +13,80 @@ update this document to match it, not the other way round.
 Status: living document, filled in incrementally as design decisions are
 made in conversation. Sections marked **Open** have not been decided yet.
 
+## Table of contents
+
+Numbered sections only - a pass's own internal subheadings (a "Method"/
+"Verified"/"Recommendation" inside a single numbered section) aren't
+listed separately here; see that section itself for its own structure.
+
+- [1. The plugin API: `decide()` and `project()`](#1-the-plugin-api-decide-and-project)
+  - [1.1 Both are synchronous](#11-both-are-synchronous)
+  - [1.2 JSON Schema is derived from the Rust type, not hand-written](#12-json-schema-is-derived-from-the-rust-type-not-hand-written)
+  - [1.3 Trait-per-type, not closures, not a builder DSL](#13-trait-per-type-not-closures-not-a-builder-dsl)
+  - [1.3.1 `#[requires_role(...)]`](#131-requires_role)
+  - [1.3.2 `gql_object!` — internal wire-type codegen, a different register entirely](#132-gql_object-internal-wire-type-codegen-a-different-register-entirely)
+  - [1.3.3 `#[auto_register]` + `BOUNDED_CONTEXT` — reopening §1.3's "no macros" call, deliberately](#133-auto_register-bounded_context-reopening-13s-no-macros-call-deliberately)
+  - [1.4 `matching_events` is a generated per-bounded-context enum](#14-matching_events-is-a-generated-per-bounded-context-enum)
+  - [1.5 Startup registration is a builder](#15-startup-registration-is-a-builder)
+  - [1.6 Raw `Event` → typed `Event`: the `BoundedContextEvent` trait](#16-raw-event-typed-event-the-boundedcontextevent-trait)
+  - [1.7 The builder's internal registry, and the decide()-dispatch bridge](#17-the-builders-internal-registry-and-the-decide-dispatch-bridge)
+- [2. Ecosystem choices](#2-ecosystem-choices)
+  - [2.1 Web framework: `axum`](#21-web-framework-axum)
+  - [2.2 Database layer: `sqlx`](#22-database-layer-sqlx)
+  - [2.2.1 Every `Integer` is `i64`/`BIGINT`, uniformly](#221-every-integer-is-i64bigint-uniformly)
+  - [2.2.2 Schema-per-bounded-context storage](#222-schema-per-bounded-context-storage)
+  - [2.3 Property-based testing: `proptest`](#23-property-based-testing-proptest)
+  - [2.4 Configuration: a plain builder, not a config-loading crate](#24-configuration-a-plain-builder-not-a-config-loading-crate)
+- [3. Crate and module structure](#3-crate-and-module-structure)
+  - [3.1 Four crates, not one](#31-four-crates-not-one)
+  - [3.2 `skilj-core`: grouped by domain concern](#32-skilj-core-grouped-by-domain-concern)
+  - [3.3 `skilj-graphql` and `skilj-rest`](#33-skilj-graphql-and-skilj-rest)
+- [4. Error handling](#4-error-handling)
+  - [4.1 Two tiers, because the spec already draws this line](#41-two-tiers-because-the-spec-already-draws-this-line)
+  - [4.2 One shared trait unifies both tiers for rendering](#42-one-shared-trait-unifies-both-tiers-for-rendering)
+- [5. The GraphQL wire contract](#5-the-graphql-wire-contract)
+  - [5.1 One unified schema, rebuilt at runtime](#51-one-unified-schema-rebuilt-at-runtime)
+  - [5.2 Namespacing: nested per bounded context — corrected](#52-namespacing-nested-per-bounded-context-corrected)
+  - [5.3 Pagination: Relay-style cursor connections](#53-pagination-relay-style-cursor-connections)
+  - [5.4 Error shape — and a correction: business rejections aren't errors](#54-error-shape-and-a-correction-business-rejections-arent-errors)
+- [6. IdP trust configuration](#6-idp-trust-configuration)
+- [7. The REST wire contract](#7-the-rest-wire-contract)
+  - [7.1 Purpose: narrowly-scoped agents and automated callers, not general access](#71-purpose-narrowly-scoped-agents-and-automated-callers-not-general-access)
+  - [7.2 Routing: capability-based, not type-or-context-in-path](#72-routing-capability-based-not-type-or-context-in-path)
+  - [7.3 Request/response bodies](#73-requestresponse-bodies)
+  - [7.4 Three ways to read events, on purpose](#74-three-ways-to-read-events-on-purpose)
+  - [7.5 Error mapping](#75-error-mapping)
+- [8. Open for a future pass](#8-open-for-a-future-pass)
+- [9. Next steps](#9-next-steps)
+- [10. Dynamic Consistency Boundary (DCB) alignment](#10-dynamic-consistency-boundary-dcb-alignment)
+- [10b. OpenTelemetry tracing, logging, and metrics](#10b-opentelemetry-tracing-logging-and-metrics)
+  - [10b.1 Four smaller follow-ups](#10b1-four-smaller-follow-ups)
+- [11. `skilj-tui` - a Ratatui operator console](#11-skilj-tui---a-ratatui-operator-console)
+- [12. Cross-instance push completeness (Codeberg issue #2)](#12-cross-instance-push-completeness-codeberg-issue-2)
+- [13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (Codeberg issue #6, "5a")](#13-self-describing-graphql-surface-eventtypescommandtypes-codeberg-issue-6-5a)
+- [14. `skilj-inspector` - a standalone read-only Postgres console (Codeberg issue #6, "5b")](#14-skilj-inspector---a-standalone-read-only-postgres-console-codeberg-issue-6-5b)
+- [15. `skilj-tui` debugging enhancements (Codeberg issue #7)](#15-skilj-tui-debugging-enhancements-codeberg-issue-7)
+- [16. Declarative bounded-context format + codegen: a prototype, not a build (Codeberg issue #5)](#16-declarative-bounded-context-format-codegen-a-prototype-not-a-build-codeberg-issue-5)
+- [17. Event/command codegen, for real: the narrower cut (Codeberg issue #5)](#17-eventcommand-codegen-for-real-the-narrower-cut-codeberg-issue-5)
+- [18. Ultra-review fixes: an access-control leak, a duplicate-delivery bug, and two nits](#18-ultra-review-fixes-an-access-control-leak-a-duplicate-delivery-bug-and-two-nits)
+- [19. Optional snapshotting for `matching_events`: a discussion, not a build](#19-optional-snapshotting-for-matching_events-a-discussion-not-a-build)
+- [20. Four new filter operators: geo, color, IP subnet, and generic `in`](#20-four-new-filter-operators-geo-color-ip-subnet-and-generic-in)
+- [21. Optional idempotency key for command submission (Codeberg issue #12)](#21-optional-idempotency-key-for-command-submission-codeberg-issue-12)
+- [22. Background-polling and startup scaling (Codeberg issue #15)](#22-background-polling-and-startup-scaling-codeberg-issue-15)
+- [23. Cross-tenant projection read fix: owner-tag scoping on `RoleAccessMapping`](#23-cross-tenant-projection-read-fix-owner-tag-scoping-on-roleaccessmapping)
+- [24. Cross-tenant read fix, part two: raw events (`FetchEvents`, `QueryEvents`/`CountEvents`/`InspectEvent`, `EventSubscription`)](#24-cross-tenant-read-fix-part-two-raw-events-fetchevents-queryeventscounteventsinspectevent-eventsubscription)
+- [25. Cross-tenant read fix, part three: `CommandQuery`/`FetchCommands`](#25-cross-tenant-read-fix-part-three-commandqueryfetchcommands)
+- [26. Closing the admin read-back gap on `owner_tag_key`](#26-closing-the-admin-read-back-gap-on-owner_tag_key)
+- [27. Cross-tenant read fix, part five: `SnapshotInspection`](#27-cross-tenant-read-fix-part-five-snapshotinspection)
+- [28. Cross-tenant read fix, part six: `CreateBoundedContextFromTemplate`'s always-unscoped grant](#28-cross-tenant-read-fix-part-six-createboundedcontextfromtemplates-always-unscoped-grant)
+- [29. Hardening: `list_role_access_mappings` no longer panics on a concurrent bounded-context deletion](#29-hardening-list_role_access_mappings-no-longer-panics-on-a-concurrent-bounded-context-deletion)
+- [30. Cross-tenant write fix: owner-tag scoping on `SubmitCommand`/`TriggerCommand`/`CreateExternalEvent`/`CreateDirectEvent`](#30-cross-tenant-write-fix-owner-tag-scoping-on-submitcommandtriggercommandcreateexternaleventcreatedirectevent)
+- [31. Private fields: a third field-level protection, alongside `sensitive_fields` and the owner-tag `scope` series](#31-private-fields-a-third-field-level-protection-alongside-sensitive_fields-and-the-owner-tag-scope-series)
+- [32. Closing `ProjectionQuery`'s own team gate (Codeberg issue #17)](#32-closing-projectionquerys-own-team-gate-codeberg-issue-17)
+- [33. Payload upcasting (Codeberg issue #14): every option, and the one built](#33-payload-upcasting-codeberg-issue-14-every-option-and-the-one-built)
+- [34. `skilj-temporal`: a plan, partially built (long-running/cross-system processes)](#34-skilj-temporal-a-plan-partially-built-long-runningcross-system-processes)
+- [35. Configurable connection pool sizing](#35-configurable-connection-pool-sizing)
+
 ---
 
 ## 1. The plugin API: `decide()` and `project()`
@@ -2227,7 +2301,7 @@ Whether to list skilj there too is tracked separately in
 `docs/open-source-todo.md`, gated on this repository actually being
 public - a link to a private repo serves no one who'd read that list.
 
-## 10. OpenTelemetry tracing, logging, and metrics
+## 10b. OpenTelemetry tracing, logging, and metrics
 
 Added in a later pass: real distributed tracing across the HTTP surfaces,
 the domain engine, and the two background tasks, exported as
@@ -2442,7 +2516,7 @@ attributes - `skilj-graphql` skipped its own copy here, identical
 `tracing_background_tasks.rs`'s own harness, asserting both background
 loops' `skilj.background_task.tick.duration` data points appear).
 
-### 10.1 Four smaller follow-ups
+### 10b.1 Four smaller follow-ups
 
 Four further, smaller observability gaps, closed in the same later pass:
 
@@ -2665,7 +2739,7 @@ to be listed here too - closed by Codeberg issue #8, see above.
 
 ## 12. Cross-instance push completeness (Codeberg issue #2)
 
-**A deliberate reversal, not a drift fix.** §10's own `EventBroadcaster`
+**A deliberate reversal, not a drift fix.** §8's own `EventBroadcaster`
 writeup and the async-projection poller's writeup both cite the spec's
 former blanket "Multi-instance / distributed deployment" exclusion as
 the reason real-time delivery was single-process, in-memory only. That

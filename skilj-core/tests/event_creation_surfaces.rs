@@ -10,9 +10,11 @@
 //! CreateDirectEvent.6 - the cross-tenant write fix's own new
 //! `tag_owner_scope_satisfied` requires clause on both rules,
 //! docs/architecture.md's own write-up of these passes).
-//! Uncovered this pass, with reason - see the doc comment at the bottom
-//! of this file: `surface-actor`/`surface-provides` for each surface (4),
-//! same REST-scaffolding gap as EventFetch's three uncovered obligations.
+//! `surface-actor`/`surface-provides` for each surface (4) were left
+//! unbookkept here, pending REST scaffolding that didn't exist yet at
+//! the time - see the doc comment at the bottom of this file for why
+//! that reasoning is now stale, and where these four are actually
+//! exercised today.
 
 use chrono::{TimeZone, Utc};
 use skilj_core::access_control::{self, DirectCreationToken, ExternalEventToken, TokenStatus};
@@ -616,14 +618,19 @@ fn create_direct_event_rejects_a_payload_naming_no_owner_at_all_when_scoped() {
 
 // ---------------------------------------------------------------------
 // surface-actor / surface-provides for ExternalEventIngestion and
-// DirectEventCreation - uncovered this pass
+// DirectEventCreation - stale note, corrected
 // ---------------------------------------------------------------------
 //
-// Same reason as EventFetch's three uncovered surface-level obligations:
-// neither surface has any REST scaffolding yet to test against (no
-// bearer extractor, no route table - skilj-rest/src/auth.rs and
-// skilj-rest/src/routes/mod.rs are still `// TODO` in full). Missing
-// implementation, and specifically shared infrastructure across every
-// REST surface rather than something either surface owns individually -
-// revisit once skilj-rest's basic scaffolding lands, alongside
-// EventFetch's own deferred surface tests.
+// This used to say these four obligations were uncovered because
+// skilj-rest didn't exist yet ("still `// TODO` in full"). That's long
+// since untrue - skilj-rest is a real, published, extensively tested
+// crate, and real end-to-end REST tests against exactly these two
+// surfaces already exist: `skilj/tests/payload_validation.rs`
+// (`direct_event_creation_rejects_a_payload_that_does_not_match_the_schema_with_400`/
+// `..._rejects_an_event_whose_owner_does_not_match_the_tokens_scope`) and
+// `skilj/tests/event_creation_atomicity.rs`. What's still true is
+// narrower than the old note claimed: these four obligation *ids*
+// specifically aren't bookkept as covered by name in any pass's own
+// "obligations covered here" count - a documentation gap to close with
+// a fresh pass over `allium plan`'s own output, not a missing-
+// implementation one.

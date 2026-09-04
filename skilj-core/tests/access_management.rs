@@ -12,12 +12,11 @@
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
 //! filtered to this pass's source constructs): 36 total.
-//! Uncovered this pass, with reason - see the doc comment at the bottom
-//! of this file: `Role.access_mappings` (1, a relationship projection,
-//! deferred the same way every other one in this codebase has been) and
-//! `surface-actor`/`surface-provides.AccessManagement` (2, the GraphQL
-//! counterpart to every prior surface's REST-scaffolding gap - no
-//! resolver/schema wiring in `skilj-graphql` yet either).
+//! `Role.access_mappings` (1, a relationship projection, deferred the
+//! same way every other one in this codebase has been) and
+//! `surface-actor`/`surface-provides.AccessManagement` (2) were left
+//! unbookkept here - see the doc comment at the bottom of this file for
+//! why the reason originally given for the latter pair is now stale.
 //! `resolve_role_by_external_subject` isn't a spec `rule`, so it adds no
 //! obligations to that count - see its own test section above the
 //! uncovered one at the bottom of this file.
@@ -719,7 +718,19 @@ fn resolve_role_by_external_subject_rejects_when_no_roles_exist_at_all() {
 // caller already has the relevant mappings as whatever it passed in to
 // revoke_role/grant_role_access_mapping.
 //
-// surface-actor/surface-provides.AccessManagement need GraphQL
-// scaffolding that doesn't exist yet - skilj-graphql/src/resolvers/mod.rs
-// and schema.rs are still `// TODO` in full, the GraphQL-track
-// counterpart to every REST surface's deferred obligations so far.
+// surface-actor/surface-provides.AccessManagement - stale note,
+// corrected. This used to say these needed GraphQL scaffolding that
+// didn't exist yet ("skilj-graphql/src/resolvers/mod.rs and schema.rs
+// are still `// TODO` in full"). Long since untrue - skilj-graphql is a
+// real, published, extensively tested crate, and
+// `skilj/tests/graphql_admin_console.rs`'s own
+// `full_admin_console_lifecycle_end_to_end` already exercises real
+// access control over these exact mutations end to end (an
+// unauthenticated caller rejected, a non-superadmin caller rejected
+// distinctly, then a real superadmin's own createRole/grantRoleAccessMapping/
+// revokeRoleAccessMapping/revokeRole calls succeeding). What's still
+// true is narrower than the old note claimed: these two obligation ids
+// specifically aren't bookkept as covered by name in any pass's own
+// "obligations covered here" count - a documentation gap to close with
+// a fresh pass over `allium plan`'s own output, not a missing-
+// implementation one.

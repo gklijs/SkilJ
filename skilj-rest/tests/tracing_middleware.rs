@@ -211,7 +211,7 @@ async fn a_request_with_a_traceparent_header_continues_that_trace() {
     // The unreachable pool makes `db::access_token_kind` fail with a real
     // `Database` error inside `resolve_token` - a genuine 500, not a
     // business rejection or an auth 4xx - so `trace_request` should have
-    // marked this span's own OTel status as errored (§10's "a 5xx is the
+    // marked this span's own OTel status as errored (§10b's "a 5xx is the
     // one status class that's always a genuine, unexpected server-side
     // failure").
     assert!(

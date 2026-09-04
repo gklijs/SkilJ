@@ -7,9 +7,11 @@
 //!
 //! Obligations covered here (from `allium plan specs/skilj.allium`,
 //! filtered to this surface's five source constructs): 21 total.
-//! Uncovered this pass, with reason - see the doc comment at the bottom
-//! of this file: `surface-actor.EventFetch`, `surface-exposure.EventFetch`,
-//! `surface-provides.EventFetch` (3).
+//! `surface-actor.EventFetch`/`surface-exposure.EventFetch`/
+//! `surface-provides.EventFetch` (3) were left unbookkept here, pending
+//! REST scaffolding that didn't exist yet at the time - see the doc
+//! comment at the bottom of this file for why that reasoning is now
+//! stale, and where these three are actually exercised today.
 
 use chrono::{TimeZone, Utc};
 use proptest::prelude::*;
@@ -580,19 +582,21 @@ proptest! {
 
 // ---------------------------------------------------------------------
 // surface-actor.EventFetch / surface-exposure.EventFetch /
-// surface-provides.EventFetch - uncovered this pass
+// surface-provides.EventFetch - stale note, corrected
 // ---------------------------------------------------------------------
 //
-// These three obligations need REST-boundary scaffolding that doesn't
-// exist yet anywhere in `skilj-rest` - not just EventFetch's own
-// handlers, but the bearer-token extractor and route table every REST
-// surface shares (skilj-rest/src/auth.rs, skilj-rest/src/routes/mod.rs
-// are both still `// TODO` in full). Classification: missing
-// implementation, and specifically infrastructure shared across all REST
-// surfaces rather than something EventFetch-specific - better built once,
-// when skilj-rest's basic scaffolding lands, than duplicated ad hoc by
-// this pilot. Revisit alongside that work: an axum `tower::ServiceExt::
-// oneshot` test per route, asserting a wrong-token-variant 403, a correct
-// EventFetch surface returning `event_type.name`/`schema`/
-// `schema_version`, and each of `FetchEvents`/`ConsumeEvents`/
-// `AcknowledgeEvents` appearing at their routes.
+// This used to say these three needed REST-boundary scaffolding that
+// didn't exist anywhere yet ("skilj-rest/src/auth.rs and
+// skilj-rest/src/routes/mod.rs are both still `// TODO` in full"). Long
+// since untrue - skilj-rest is a real, published, extensively tested
+// crate. The exact axum `tower::ServiceExt::oneshot` tests this note
+// asked for already exist: `skilj/tests/event_fetch_rest.rs` covers a
+// wrong-secret 401 (`get_events_rejects_a_wrong_secret_for_a_known_token_id_with_401`),
+// a correct EventFetch response returning `event_type.name`/`schema`/
+// `schema_version` (`get_events_and_consume_expose_the_real_event_type_schema`),
+// and `FetchEvents`/`ConsumeEvents`/`AcknowledgeEvents` all appearing at
+// their real routes. What's still true is narrower than the old note
+// claimed: these three obligation *ids* specifically aren't bookkept as
+// covered by name in any pass's own "obligations covered here" count -
+// a documentation gap to close with a fresh pass over `allium plan`'s
+// own output, not a missing-implementation one.
