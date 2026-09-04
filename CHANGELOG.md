@@ -8,20 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- `CrossContextRoute`'s background task (0.0.4) derived its own
-  idempotency key as `"{route.name}:{sequence}"` into the same shared
-  `idempotency_keys` table `submitCommand`/command triggering write
-  into - which has no caller/client_id column at all. A Write-level
-  caller who knew or guessed a route's name and an upcoming sequence
-  number could pre-plant that exact key, causing the route's real
-  delivery to be silently deduplicated away with no error. Fixed by
-  reserving a `skilj-cross-context-route:` key prefix for the route's
-  own internal use and rejecting any caller-supplied idempotency key
-  that uses it, at both the REST trigger and `submitCommand` GraphQL
-  wire boundaries. See docs/architecture.md §36.
-
 ## [0.0.4] - 2026-09-04
 
 ### Security
@@ -38,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared name/schema/schemaVersion through it even though `projection`
   itself correctly refused the same projection's data. Now gated
   identically to `projection`.
+- `CrossContextRoute`'s own background task (added below) derived its
+  idempotency key as `"{route.name}:{sequence}"` into the same shared
+  `idempotency_keys` table `submitCommand`/command triggering write
+  into - which has no caller/client_id column at all. A Write-level
+  caller who knew or guessed a route's name and an upcoming sequence
+  number could pre-plant that exact key, causing the route's real
+  delivery to be silently deduplicated away with no error. Caught and
+  fixed before this release: a reserved `skilj-cross-context-route:`
+  key prefix for the route's own internal use, rejecting any
+  caller-supplied idempotency key that uses it at both the REST trigger
+  and `submitCommand` GraphQL wire boundaries. See docs/architecture.md
+  §36.
 
 ### Added
 
@@ -51,9 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one hop should reach for the `skilj-temporal` pairing instead. Driven
   by a new shared background task (`SkiljBuilder::cross_context_route::<R>()`,
   `.cross_context_route_poll_interval(Duration)`) with its own durable,
-  per-route cursor and idempotency-keyed submissions, so a
-  redelivered/retried catch-up tick is exactly as safe as any other
-  idempotency-keyed submission already is. See docs/architecture.md §36.
+  per-route cursor and idempotency-keyed submissions (the Security
+  entry above covers a namespace-collision issue in this mechanism,
+  found and closed before release), so a redelivered/retried catch-up
+  tick is exactly as safe as any other idempotency-keyed submission
+  already is. See docs/architecture.md §36.
 - `skilj_core::db::decide_and_submit_command`: the "optimistic `decide()`,
   then locked `submit_command`" sequence `skilj-rest`'s command-trigger
   route and `skilj-graphql`'s `submitCommand` resolver each ran inline is

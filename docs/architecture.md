@@ -5823,7 +5823,10 @@ Fixed by reserving a namespace rather than trying to make the key
 unguessable: `catch_up_cross_context_route` now derives its key as
 `"{RESERVED_IDEMPOTENCY_KEY_PREFIX}{route.name}:{sequence}"`
 (`skilj_core::event_store::RESERVED_IDEMPOTENCY_KEY_PREFIX`, currently
-`"skilj-cross-context-route:"`), and a new
+`"skilj-cross-context-route:"` - not a guarantee against a legitimate
+caller who happens to pick a key starting with that exact literal, who
+gets rejected the same as an attacker would; low enough odds in
+practice to accept as this mechanism's tradeoff), and a new
 `reject_reserved_idempotency_key` is called at both wire boundaries -
 `skilj-rest`'s `post_commands_trigger` and `skilj-graphql`'s
 `submitCommand` resolver, immediately after each reads its own
@@ -5832,16 +5835,38 @@ starts with the reserved prefix outright (`Error::ReservedIdempotencyKeyPrefix`,
 400 over REST, a normal GraphQL error over GraphQL) before it ever
 reaches the shared `idempotency_keys` lookup. Checked at the call site
 rather than folded into `authorise_command_trigger`/
-`authorise_command_submission` themselves - the same register
-`submitCommand`'s own `required_role` gate already uses (above) - since
-those two functions are also what the route's own internal caller path
-would otherwise have to route around. `catch_up_cross_context_route`
+`authorise_command_submission` themselves - purely to match the same
+"wire-boundary concern" register `submitCommand`'s own `required_role`
+gate already uses (above), not out of necessity: the route's own
+internal caller reaches `decide_and_submit_command` directly and never
+calls either of those two functions, so centralising the check there
+would have been just as safe. `catch_up_cross_context_route`
 additionally logs a warning (not an error - the cursor still correctly
-advances) if it ever *does* see its own key deduplicated, as defence in
-depth: with the prefix reserved this should now be unreachable, since
-nothing else can write into that namespace. Verified by a real
+advances) if it ever *does* see its own key deduplicated - expected,
+not anomalous, after an ordinary crash/restart between a prior
+submission committing and its cursor advance (the two are separate,
+non-transactional writes); unexpected for any other reason, since
+nothing else can write into the reserved namespace. Verified by a real
 Postgres-backed test on each wire boundary
 (`command_trigger_rejects_a_reserved_idempotency_key_prefix`,
 `submit_command_rejects_a_reserved_idempotency_key_prefix_over_graphql`)
 asserting both the specific error code and that nothing was written to
 the event store at all.
+
+**Known limitation, not closed here**: the fix above patches the two
+existing callers, not the shared `idempotency_keys` table's own
+structural gap - its primary key is still `(command_type_name,
+idempotency_key)` with no caller/client_id column, even though
+`client_id` is already threaded through every `submit_command`/
+`decide_and_submit_command` call site for the resulting event's own
+metadata. A future caller of the public `submit_command`/
+`decide_and_submit_command` API that forwards a caller-supplied
+idempotency key without independently re-adding a
+`reject_reserved_idempotency_key` call compiles and passes the existing
+test suite while silently reopening this same class of bug - nothing
+enforces that obligation beyond the doc comment on
+`ensure_idempotency_keys_table` saying so. Widening the table's key to
+include `client_id` would close this structurally; not done here since
+exactly one internal caller (`CrossContextRoute`) has needed it so far,
+and a schema change for one caller felt premature - revisit if a second
+one ever does.

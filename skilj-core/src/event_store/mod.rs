@@ -1087,22 +1087,25 @@ pub fn valid_payload(schema: &str, payload: &str) -> bool {
 /// this needs to be reserved at all. Chosen to be something no ordinary
 /// caller-meaningful idempotency key (a Temporal `run_id:activity_id`,
 /// an app's own UUID, anything human-chosen) would plausibly start
-/// with, and impossible for a well-formed one to collide with by
-/// accident.
+/// with by accident - not a guarantee against a caller who deliberately
+/// (or coincidentally) picks a key starting with this exact literal
+/// prefix, who gets rejected same as an attacker would; low enough
+/// odds in practice to accept as this mechanism's tradeoff.
 pub const RESERVED_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-cross-context-route:";
 
 /// Checked by `authorise_command_trigger`/`authorise_command_submission`'s
-/// own two REST/GraphQL callers, immediately before either reads a
+/// own two REST/GraphQL callers, immediately after either reads a
 /// caller-supplied `idempotencyKey`/`Idempotency-Key` value - never
-/// folded into those two functions themselves, the same "wire-boundary
-/// concern, checked at the call site" register `submitCommand`'s own
-/// `required_role` gate already uses (see that resolver's own doc
-/// comment), since `decide_and_submit_command`'s internal
-/// `CrossContextRoute` caller constructs a key *starting* with this
-/// exact prefix and must never be rejected by it. `Ok(())` for `None` -
-/// omitting an idempotency key entirely is always fine, the same
-/// "unchanged behaviour when absent" every other idempotency-key
-/// caller already gets.
+/// folded into those two functions themselves, since neither is on
+/// `decide_and_submit_command`'s internal `CrossContextRoute` caller's
+/// own path (that caller reaches `decide_and_submit_command` directly,
+/// bypassing both), so centralising there would have been safe; kept
+/// at the call site instead purely to match the "wire-boundary concern"
+/// register `submitCommand`'s own `required_role` gate already uses
+/// (see that resolver's own doc comment) rather than out of necessity.
+/// `Ok(())` for `None` - omitting an idempotency key entirely is always
+/// fine, the same "unchanged behaviour when absent" every other
+/// idempotency-key caller already gets.
 pub fn reject_reserved_idempotency_key(idempotency_key: Option<&str>) -> crate::error::Result<()> {
     match idempotency_key {
         Some(key) if key.starts_with(RESERVED_IDEMPOTENCY_KEY_PREFIX) => {

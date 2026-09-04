@@ -994,6 +994,22 @@ pub async fn update_private_field_grant(
 /// stored `triggered_event_sequences` rather than being re-decided -
 /// see `submit_command`'s own doc comment for the full design.
 ///
+/// Deliberately no caller/client_id column - every caller of
+/// `submit_command`/`decide_and_submit_command` to date has only ever
+/// needed to collide with its *own* past submissions. `CrossContextRoute`
+/// (docs/architecture.md §36) broke that assumption first, placing an
+/// unauthenticated internal key into this same caller-writable
+/// namespace, which is why `event_store::reject_reserved_idempotency_key`
+/// exists - see its own doc comment. **Any future caller that forwards a
+/// caller-supplied `idempotency_key` into `submit_command`/
+/// `decide_and_submit_command` must call `reject_reserved_idempotency_key`
+/// on it first**, the same as `skilj-rest`'s and `skilj-graphql`'s own
+/// wire handlers already do; nothing here enforces that at the type
+/// level, so it's a convention, not a guarantee - widening this table's
+/// key to include a caller/client_id column would close the gap
+/// structurally instead, at the cost of a schema migration not yet
+/// justified by more than one internal caller needing it.
+///
 /// `impl PgExecutor`, the same "works on `&Pool` autocommit or inside a
 /// caller's own open `Transaction`" treatment `update_role` already
 /// gets: `provision_bounded_context_schema` above needs the latter (one
@@ -5545,18 +5561,23 @@ pub async fn catch_up_cross_context_route(
                     Some(&idempotency_key),
                 )
                 .await?;
-                // Defence in depth: with the reserved prefix in place
-                // this should never actually happen (nothing else can
-                // write into this namespace) - a fresh key is derived
-                // from this route's own name and this occurrence's own
-                // sequence, never reused within one tick. Warned, not
-                // treated as an error, since the cursor still correctly
-                // advances past this occurrence either way.
+                // Defence in depth, not solely a bypass signal: with the
+                // prefix reserved, nothing *else* can write into this
+                // namespace, but this route's own past attempt at this
+                // exact occurrence can - a process crash/restart between
+                // this submission committing and the cursor advancing
+                // below leaves the cursor pointing at this same source
+                // event, so the next tick re-derives the identical key
+                // and correctly lands here. That's ordinary, benign
+                // crash recovery, not an anomaly - warned rather than
+                // errored either way, since the cursor still correctly
+                // advances past this occurrence.
                 if matches!(outcome, SubmitCommandOutcome::Deduplicated { .. }) {
                     tracing::warn!(
                         sequence = event.sequence,
                         "cross-context route's own idempotency key was already present - \
-                         this should be unreachable now the key space is reserved"
+                         expected after a crash/restart between a prior submission and its \
+                         cursor advance; unexpected otherwise, since the key space is reserved"
                     );
                 }
             }
