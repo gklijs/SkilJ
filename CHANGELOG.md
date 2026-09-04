@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself correctly refused the same projection's data. Now gated
   identically to `projection`.
 
+### Added
+
+- `plugin::upcast_payload`/`UpcastStep`: sugar for a hand-written
+  `BoundedContextEvent::try_from_event` that needs to interpret a
+  payload differently depending on which schema_version it was written
+  under (`Metadata.version`) - a declared chain of pure JSON transforms
+  instead of a repeated `match` per event type. Doesn't relax
+  `schema_is_backwards_compatible`'s additive-only contract or touch
+  registration in any way; operates entirely on the raw JSON before
+  final deserialization (Codeberg issue #14).
+
 ## [0.0.3] - 2026-09-03
 
 ### Security

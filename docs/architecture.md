@@ -5210,3 +5210,132 @@ fmt --check` clean, real Postgres throughout; `allium check`/`plan`
 unchanged (spec untouched - `team_only_satisfied` already covers
 `ProjectionQuery` surface-agnostically, so no new `requires` clause was
 needed to close a gap that was purely in the Rust wiring).
+
+## 33. Payload upcasting (Codeberg issue #14): every option, and the one built
+
+Issue #14 names a real trade-off and deliberately doesn't resolve it:
+`schema_is_backwards_compatible` (§ note above `entity CommandType` in
+specs/skilj.allium) enforces additive-only evolution - a field can be
+added or loosened, never removed, tightened or retyped - and forbids
+genuine reshapes (rename a field, change its type, split or merge
+fields, restructure a nested shape) as a revision of an existing type.
+Most event-sourcing frameworks answer this with upcasting: a versioned
+transform chain applied at read time. The issue's own "why this isn't a
+clear yes" is real too - upcaster chains accumulate indefinitely in
+practice and are rarely retired. This section is the investigation the
+issue asked for, closing with "stay additive-only, but make the existing
+escape hatch easier to use" rather than building first-class upcasting.
+
+**The scenario that motivates it**: `MoneyDeposited { amount: f64 }`
+where `amount` was dollars, and eighteen months later you want
+`amount_cents: i64` - same concept, different name, different type.
+Not addable-alongside in any painless way, and the textbook case
+additive-only categorically can't do.
+
+**Grounding fact, already settled by the spec** (specs/skilj.allium,
+the note above `entity CommandType`'s payload-schema-shape section):
+because a type's current schema is always a superset of every schema it
+has ever had, `Metadata.version` - the schema_version a payload was
+actually written under - is stamped "for audit and provenance... not a
+key a reader resolves to something before it can interpret the
+payload." Nothing in the spec reads it back to validate against, and
+nothing needs to, for any payload that only ever grew additively. It
+does, however, sit right there on every stored `Event` a hand-written
+`BoundedContextEvent::try_from_event` already receives in full - which
+is what makes option 5 below possible with zero framework changes.
+
+**Options with the current implementation, no framework changes
+needed:**
+
+1. **A new event type name** (`MoneyDeposited2`, say). A first-time
+   registration, so no backward-compatibility check applies to it at
+   all - it can have any shape. `decide()`/`project()` match arms handle
+   both variants forever, each interpreting its own shape. This is the
+   escape hatch `schema_is_backwards_compatible`'s own spec commentary
+   implies, and the one this issue's own reporter proposed instead of
+   building anything.
+2. **An additive shadow field, normalized on read.** Add
+   `amount_cents: Option<i64>` to the *same* type (legal - a new
+   optional field), have new commands populate it, and have
+   `decide()`/`project()` derive it from `amount` when `None`. No new
+   type, but every reader carries the derivation branch forever - a
+   real cost, arguably worse long-term than option 1 since it's silent
+   per-read logic rather than a visible type distinction in the wire
+   schema.
+3. **Custom `Deserialize`, entirely inside serde.**
+   `schema_is_backwards_compatible` only ever compares two JSON Schema
+   *documents* `schemars` derives from `Payload`'s field names/types; it
+   never looks at how `Payload` actually deserializes. `#[serde(alias =
+   "amount")]`, `#[serde(default)]`, or a hand-written
+   `deserialize_with` can absorb a rename or an old/new shape switch
+   inside one Rust struct, with zero schema registration change - as
+   long as what schemars derives from the struct still only grows.
+   Covers renames and defaulting cleanly; doesn't cover a genuine type
+   change (string -> int), since that changes the derived schema.
+4. **Reshape inside `project()`, not the event.** `Projection::State` is
+   a completely separate Rust type from `Payload` - `project()` is
+   already a free-form fold function with no obligation to mirror the
+   event's own shape. A projection can normalize old and new event
+   shapes into one canonical `State` today; this was always the one
+   surface meant to look however it wants to.
+5. **Branch on `event.metadata.version` inside a hand-written
+   `try_from_event`.** The strongest of the five: `try_from_event`
+   already receives the *whole* `Event`, `metadata.version` included, so
+   `match event.metadata.version { 1 => old_shape_transform(&event.payload), _ => serde_json::from_str(&event.payload) }`
+   works today, no registration or storage change needed. This is the
+   one option this section turns into real, tested sugar - see below.
+
+**Heavier tiers, evaluated and declined:**
+
+- **Sugar around option 5** (a declared chain instead of hand-written
+  `match` boilerplate) - genuinely worth building, since it costs
+  nothing framework-side and removes real per-type repetition. Built;
+  see below.
+- **Real first-class upcasting** - relax
+  `schema_is_backwards_compatible` to accept a breaking change only
+  alongside a required `migrate(old_payload) -> new_payload` function,
+  applied lazily at read time. This is the feature the issue actually
+  names, and it reintroduces exactly the "upcasters accumulate forever,
+  rarely retired" cost the issue itself warns about, for no scenario
+  options 1-5 don't already cover. It would also break the spec's own
+  clean argument that no historical schema text needs to be kept - a
+  registered migration function needs to know what it's migrating
+  *from*, which means keeping old schema/struct definitions around
+  indefinitely, the exact accumulation the issue is skeptical of.
+  Declined: no code, no spec change.
+
+**What got built**: `plugin::upcast_payload<T>(payload: &str,
+written_at_version: i64, chain: &[UpcastStep])` and `UpcastStep {
+to_version: i64, transform: fn(serde_json::Value) -> serde_json::Value
+}` (`skilj-core/src/plugin/mod.rs`, next to `BoundedContextEvent` since
+it exists to be called from inside `try_from_event`). Deserializes
+`payload` to a `serde_json::Value` first, walks `chain` in the order
+given applying every step whose `to_version` is strictly greater than
+`written_at_version`, then deserializes the result into `T`. A payload
+written at version 1 against a `[to 2, to 3]` chain runs both steps; one
+already at version 3 runs neither. Steps are trusted to be given in
+ascending `to_version` order - not sorted, the same "caller's own
+responsibility" register `consumed_event_types()` already carries for
+its own list.
+
+Deliberately a plain generic function plus a plain struct, not a macro:
+the boilerplate this removes is a `match` arm's worth of branching, not
+a whole trait impl the way `#[auto_register]`/`gql_object!` justify
+their own existence (docs/architecture.md §1.3.3/§1.3.1) - a function
+call already reads as tersely as a macro invocation would here, so
+there was nothing a macro would have bought.
+
+**Verified**: `skilj-core/tests/payload_upcasting.rs`, 9 pure unit
+tests, no Postgres involved (the same "pure logic, no DB fixture
+needed" register `type_registration.rs`'s neighbouring
+`schema_is_backwards_compatible` tests already use, just in their own
+file since this isn't a `RegisterEventType`/`RegisterCommandType`
+obligation) - a single-step chain applied/skipped/skipped-entirely by
+version, an empty chain reducing to a plain deserialize, malformed JSON
+and a still-unsatisfied target shape both surfacing as ordinary
+`serde_json::Error`s, and a two-step chain confirming each version runs
+exactly its own remaining suffix of steps, in order. `cargo
+build/clippy -D warnings/test --workspace` and `cargo fmt --check`
+clean. No spec change - `upcast_payload` is pure application-facing
+Rust with no registration, storage, or wire surface of its own to
+obligate.

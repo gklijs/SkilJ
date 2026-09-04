@@ -58,6 +58,89 @@ pub trait BoundedContextEvent: Sized {
     fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>>;
 }
 
+/// One step in an `upcast_payload` chain - see that function's own doc
+/// comment. `to_version` is the schema_version this step's `transform`
+/// produces: a payload whose own `Metadata.version` is strictly less
+/// than `to_version` needs this step applied before whichever step (or
+/// final deserialization) comes next.
+#[derive(Clone, Copy)]
+pub struct UpcastStep {
+    pub to_version: i64,
+    pub transform: fn(serde_json::Value) -> serde_json::Value,
+}
+
+/// Sugar around the one pattern a hand-written `BoundedContextEvent::
+/// try_from_event` already has every ingredient for: `event.metadata.version`
+/// records the schema_version a payload was actually written under
+/// (specs/skilj.allium's own note above, "that is what Metadata.version
+/// is for"), and nothing stops a `try_from_event` arm from branching on
+/// it before deserializing. This is that branch, generalised into a
+/// declared chain of pure JSON transforms instead of a repeated
+/// `match metadata.version { ... }` per event type. See
+/// docs/architecture.md §33 for the full "why not first-class
+/// upcasting" investigation this is the one built piece of.
+///
+/// Not a replacement for `schema_is_backwards_compatible`'s additive-only
+/// contract, and doesn't need to be: a genuinely reshaping change
+/// (rename, retype, split/merge a field) still can't be registered as a
+/// revision of an existing type - `Self::Payload`'s own derived JSON
+/// Schema only ever has to describe the *current*, already-reshaped
+/// value, because this runs entirely on the raw `serde_json::Value`
+/// before `serde_json::from_value::<T>` ever sees it. The transform
+/// chain lives in application code only; nothing about the registered
+/// schema, `RegisterEventType`, or `RegisterCommandType` changes.
+///
+/// `chain` is walked once, in the order given, applying every step whose
+/// `to_version` is strictly greater than `written_at_version` - a
+/// payload written at version 1 runs every step in a `[..to 2, ..to 3]`
+/// chain, one written at version 2 runs only the second, one written at
+/// version 3 (or later) runs none. Steps are expected in ascending
+/// `to_version` order; this does not sort them - an out-of-order chain
+/// applies transforms in the wrong sequence, the same "caller's own
+/// responsibility" register `consumed_event_types()` already trusts the
+/// caller to get right.
+///
+/// ```ignore
+/// // MoneyDeposited moved from a float-dollar `amount` (schema_version 1)
+/// // to an integer-cent `amount_cents` (schema_version 2) - a genuine
+/// // reshape schema_is_backwards_compatible would reject as a revision
+/// // of the same type, handled here entirely in application code:
+/// const MONEY_DEPOSITED_UPCASTS: &[UpcastStep] = &[UpcastStep {
+///     to_version: 2,
+///     transform: |mut v| {
+///         if let Some(amount) = v.get("amount").and_then(|a| a.as_f64()) {
+///             if let Some(obj) = v.as_object_mut() {
+///                 obj.remove("amount");
+///                 obj.insert("amount_cents".into(), ((amount * 100.0).round() as i64).into());
+///             }
+///         }
+///         v
+///     },
+/// }];
+///
+/// "MoneyDeposited" => Some(
+///     skilj_core::plugin::upcast_payload(
+///         &event.payload,
+///         event.metadata.version,
+///         MONEY_DEPOSITED_UPCASTS,
+///     )
+///     .map(Self::MoneyDeposited),
+/// ),
+/// ```
+pub fn upcast_payload<T: DeserializeOwned>(
+    payload: &str,
+    written_at_version: i64,
+    chain: &[UpcastStep],
+) -> Result<T, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(payload)?;
+    for step in chain {
+        if written_at_version < step.to_version {
+            value = (step.transform)(value);
+        }
+    }
+    serde_json::from_value(value)
+}
+
 /// One command type a bounded context registers.
 ///
 /// `decide()` is synchronous and pure: it receives only `payload` and
