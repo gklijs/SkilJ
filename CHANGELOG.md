@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration only, not a spec field) rejects a query unless the
   caller's Role carries the required name, composing with the existing
   owner-scope check rather than replacing it (Codeberg issue #17).
+- The `projectionSchema` GraphQL field was missed by the fix above: a
+  Role off the required team could still read a `TEAM_ONLY` projection's
+  declared name/schema/schemaVersion through it even though `projection`
+  itself correctly refused the same projection's data. Now gated
+  identically to `projection`.
 
 ## [0.0.3] - 2026-09-03
 

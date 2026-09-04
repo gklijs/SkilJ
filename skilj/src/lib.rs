@@ -278,6 +278,27 @@ struct ProjectionDispatcherImpl {
     template_cache: skilj_core::template_cache::TemplateCache,
 }
 
+impl ProjectionDispatcherImpl {
+    /// The one `effective_bounded_context` + registry lookup every
+    /// accessor below needs, shared rather than repeated per accessor -
+    /// each of `keys`/`project`/`default_state`/`owner_tag_key`/
+    /// `team_only` becomes a one-line wrapper around this plus whatever
+    /// it does with the field it wants, so the next per-projection
+    /// config knob added to `ProjectionDispatcher` costs one small
+    /// method here, not another full copy of the lookup.
+    fn registered(
+        &self,
+        bounded_context: &str,
+        projection_name: &str,
+    ) -> Option<&RegisteredProjection> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        self.projections
+            .get(&(bounded_context, projection_name.to_string()))
+    }
+}
+
 impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
     fn keys(
         &self,
@@ -285,13 +306,9 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
         projection_name: &str,
         event: &Event,
     ) -> Option<Vec<String>> {
-        let bounded_context = self
-            .template_cache
-            .effective_bounded_context(bounded_context);
-        let registered = self
-            .projections
-            .get(&(bounded_context, projection_name.to_string()))?;
-        Some((registered.keys)(event))
+        Some((self.registered(bounded_context, projection_name)?.keys)(
+            event,
+        ))
     }
 
     fn project(
@@ -302,23 +319,15 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
         event: &Event,
         key: &str,
     ) -> Option<skilj_core::error::Result<String>> {
-        let bounded_context = self
-            .template_cache
-            .effective_bounded_context(bounded_context);
-        let registered = self
-            .projections
-            .get(&(bounded_context, projection_name.to_string()))?;
-        Some((registered.project)(state_json, event, key))
+        Some((self.registered(bounded_context, projection_name)?.project)(state_json, event, key))
     }
 
     fn default_state(&self, bounded_context: &str, projection_name: &str) -> Option<String> {
-        let bounded_context = self
-            .template_cache
-            .effective_bounded_context(bounded_context);
-        let registered = self
-            .projections
-            .get(&(bounded_context, projection_name.to_string()))?;
-        Some(registered.default_state_json.clone())
+        Some(
+            self.registered(bounded_context, projection_name)?
+                .default_state_json
+                .clone(),
+        )
     }
 
     fn owner_tag_key(
@@ -326,13 +335,10 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
         bounded_context: &str,
         projection_name: &str,
     ) -> Option<Option<&'static str>> {
-        let bounded_context = self
-            .template_cache
-            .effective_bounded_context(bounded_context);
-        let registered = self
-            .projections
-            .get(&(bounded_context, projection_name.to_string()))?;
-        Some(registered.owner_tag_key)
+        Some(
+            self.registered(bounded_context, projection_name)?
+                .owner_tag_key,
+        )
     }
 
     fn team_only(
@@ -340,13 +346,7 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
         bounded_context: &str,
         projection_name: &str,
     ) -> Option<Option<&'static str>> {
-        let bounded_context = self
-            .template_cache
-            .effective_bounded_context(bounded_context);
-        let registered = self
-            .projections
-            .get(&(bounded_context, projection_name.to_string()))?;
-        Some(registered.team_only)
+        Some(self.registered(bounded_context, projection_name)?.team_only)
     }
 }
 

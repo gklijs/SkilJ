@@ -5168,3 +5168,45 @@ embedded-Postgres/libxml2 workaround this environment needed); `allium check` 13
 warnings/8 infos/0 findings, `analyse` 5 findings, both identical to
 §31's own baseline (no new drift); `plan` obligation count 449 (from 448
 before this pass, the one new `requires` clause).
+
+**Addendum, found immediately after committing the above**: the
+`projection` field's own `TEAM_ONLY` check has a sibling on the same
+GraphQL surface - `projectionSchema`, which returns a projection's
+declared name/schema/schemaVersion without touching any stored instance
+at all. It was never wired to `team_only` in the pass above, so a Role
+off the required team could still learn a `TEAM_ONLY` projection's shape
+through `projectionSchema` even though `projection` correctly refused
+its data - a real gap in `TeamGatedWhenDeclared`'s own "invisible, not
+merely unreadable" promise, on the very surface §32 exists to close, not
+a new proposal. Fixed the same way: `schema_field()`'s resolver now
+resolves `team_only` from the dispatcher and rejects with
+`NotOnRequiredTeam` before calling `get_projection`, identical to
+`field()`'s own check (and reordered ahead of `get_projection` there too,
+so a rejected caller no longer pays for the DB round trip, `waitForSequence`
+poll, or a sensitive-field decrypt first).
+
+Also consolidated the equality test itself: `PrivateFieldKind::Team`'s
+own check (§31) and this one were the identical `role.name == required`
+comparison, arrived at independently in two different passes with no
+shared definition. New `access_control::role_matches_required_team(role,
+required)` - `true` when `required` is `None`, `role.name == name`
+otherwise - is now the one place either call site tests it, and
+`query_projection`'s three/four related parameters
+(`declares_owner`/`instance_owner`/`team_only`) moved into one
+`ProjectionAccessScope` struct so they can't be silently transposed at a
+call site the way same-typed positional arguments could. `ProjectionDispatcher::
+team_only` also gained a default (`None`) matching `owner_tag_key`'s own
+already-defaulted sibling shape, since every test-double implementation
+across the workspace overrode it with the identical `None` body anyway.
+
+**Verified**: new `skilj/tests/projection_query.rs` end-to-end test
+(`team_only_projection_gates_both_projection_and_projection_schema_end_to_end`)
+drives both `projection` and `projectionSchema` over real HTTP against a
+`TEAM_ONLY`-declaring projection, confirming a same-team Role reads both
+fields and an off-team Role is rejected on both with `not_on_required_team`
+- the second assertion is the one that would have failed before this
+addendum. `cargo build/clippy -D warnings/test --workspace` and `cargo
+fmt --check` clean, real Postgres throughout; `allium check`/`plan`
+unchanged (spec untouched - `team_only_satisfied` already covers
+`ProjectionQuery` surface-agnostically, so no new `requires` clause was
+needed to close a gap that was purely in the Rust wiring).

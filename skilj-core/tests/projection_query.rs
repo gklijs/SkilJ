@@ -20,7 +20,7 @@ use chrono::{TimeZone, Utc};
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
-use skilj_core::projections::{self, Projection};
+use skilj_core::projections::{self, Projection, ProjectionAccessScope};
 
 // ---------------------------------------------------------------------
 // Fixtures
@@ -73,6 +73,17 @@ fn projection() -> Projection {
     }
 }
 
+/// No owner dimension, no required team - the pre-issue-#17 baseline
+/// every test in this file that isn't specifically about one of those
+/// two checks exercises.
+fn no_access_restriction() -> ProjectionAccessScope<'static> {
+    ProjectionAccessScope {
+        declares_owner: false,
+        instance_owner: None,
+        team_only: None,
+    }
+}
+
 // ---------------------------------------------------------------------
 // rule-success.QueryProjection / rule-failure.QueryProjection.{1,2,3}
 // ---------------------------------------------------------------------
@@ -88,9 +99,7 @@ fn query_projection_succeeds_and_returns_the_supplied_result_when_no_sequence_is
         "",
         None,  // no wait_for_sequence
         false, // caught_up is irrelevant when nothing was requested
-        false, // this projection declares no owner dimension
-        None,
-        None, // this projection declares no required team
+        no_access_restriction(),
         r#"{"total":42}"#.into(),
     )
     .unwrap();
@@ -111,9 +120,7 @@ fn query_projection_succeeds_when_caught_up_to_the_requested_sequence() {
         "",
         Some(10),
         true, // await_projection_caught_up already resolved true
-        false,
-        None,
-        None,
+        no_access_restriction(),
         r#"{"total":99}"#.into(),
     )
     .unwrap();
@@ -135,9 +142,7 @@ fn query_projection_succeeds_for_every_access_level() {
             "",
             None,
             false,
-            false,
-            None,
-            None,
+            no_access_restriction(),
             "ok".into(),
         )
         .unwrap();
@@ -152,9 +157,16 @@ fn query_projection_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Read);
     let p = projection();
 
-    let err =
-        projections::query_projection(&mapping, &p, "", None, false, false, None, None, "x".into())
-            .unwrap_err();
+    let err = projections::query_projection(
+        &mapping,
+        &p,
+        "",
+        None,
+        false,
+        no_access_restriction(),
+        "x".into(),
+    )
+    .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -171,9 +183,16 @@ fn query_projection_rejects_a_mapping_scoped_to_a_different_bounded_context() {
     };
     let p = projection();
 
-    let err =
-        projections::query_projection(&mapping, &p, "", None, false, false, None, None, "x".into())
-            .unwrap_err();
+    let err = projections::query_projection(
+        &mapping,
+        &p,
+        "",
+        None,
+        false,
+        no_access_restriction(),
+        "x".into(),
+    )
+    .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -196,9 +215,7 @@ fn query_projection_rejects_with_a_distinguishable_timeout_when_not_caught_up_in
         "",
         Some(10),
         false, // await_projection_caught_up resolved false (timed out)
-        false,
-        None,
-        None,
+        no_access_restriction(),
         "x".into(),
     )
     .unwrap_err();
@@ -223,9 +240,7 @@ fn query_projection_never_times_out_when_no_sequence_was_requested() {
         "",
         None,
         false,
-        false,
-        None,
-        None,
+        no_access_restriction(),
         "whatever".into(),
     )
     .unwrap();
@@ -254,9 +269,11 @@ fn query_projection_succeeds_when_the_grant_has_no_scope() {
         "company-a",
         None,
         false,
-        true, // projection declares an owner dimension
-        Some("company-b"),
-        None,
+        ProjectionAccessScope {
+            declares_owner: true, // projection declares an owner dimension
+            instance_owner: Some("company-b"),
+            team_only: None,
+        },
         "x".into(),
     )
     .unwrap();
@@ -280,9 +297,7 @@ fn query_projection_succeeds_when_the_projection_declares_no_owner_dimension() {
         "",
         None,
         false,
-        false, // no owner dimension declared
-        None,
-        None,
+        no_access_restriction(), // no owner dimension declared
         "x".into(),
     )
     .unwrap();
@@ -306,9 +321,11 @@ fn query_projection_succeeds_when_the_instance_owner_matches_the_grants_scope() 
         "ticket-1",
         None,
         false,
-        true,
-        Some("company-a"),
-        None,
+        ProjectionAccessScope {
+            declares_owner: true,
+            instance_owner: Some("company-a"),
+            team_only: None,
+        },
         "x".into(),
     )
     .unwrap();
@@ -335,9 +352,11 @@ fn query_projection_rejects_an_instance_owned_by_a_different_scope() {
         "ticket-1",
         None,
         false,
-        true,
-        Some("company-b"),
-        None,
+        ProjectionAccessScope {
+            declares_owner: true,
+            instance_owner: Some("company-b"),
+            team_only: None,
+        },
         "x".into(),
     )
     .unwrap_err();
@@ -364,9 +383,11 @@ fn query_projection_rejects_an_unestablished_owner_for_a_scoped_grant() {
         "ticket-1",
         None,
         false,
-        true,
-        None, // no owner established yet
-        None,
+        ProjectionAccessScope {
+            declares_owner: true,
+            instance_owner: None, // no owner established yet
+            team_only: None,
+        },
         "x".into(),
     )
     .unwrap_err();

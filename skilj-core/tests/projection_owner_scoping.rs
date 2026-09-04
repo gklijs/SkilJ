@@ -32,7 +32,7 @@ use skilj_core::event_store::{
     BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType,
 };
 use skilj_core::plugin::ProjectionDispatcher;
-use skilj_core::projections::{self, Projection};
+use skilj_core::projections::{self, Projection, ProjectionAccessScope};
 use skilj_core::shared::{generate_token_id, Metadata, Tag, TagMapping};
 
 /// Two owner-scoped projections, both keyed by the payload's own
@@ -509,9 +509,11 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             "t1",
             None,
             false,
-            true,
-            owner_t1.as_deref(),
-            None,
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t1.as_deref(),
+                team_only: None,
+            },
             "ok".into(),
         )
         .unwrap();
@@ -524,9 +526,11 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             "t2",
             None,
             false,
-            true,
-            owner_t2.as_deref(),
-            None,
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t2.as_deref(),
+                team_only: None,
+            },
             "leaked".into(),
         )
         .unwrap_err();
@@ -545,9 +549,11 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
             "t3",
             None,
             false,
-            true,
-            owner_t3.as_deref(),
-            None,
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t3.as_deref(),
+                team_only: None,
+            },
             "leaked".into(),
         )
         .unwrap_err();
@@ -563,9 +569,11 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
                 key,
                 None,
                 false,
-                true,
-                owner,
-                None,
+                ProjectionAccessScope {
+                    declares_owner: true,
+                    instance_owner: owner,
+                    team_only: None,
+                },
                 "ok".into(),
             )
             .unwrap();
@@ -608,9 +616,11 @@ fn a_team_only_projection_rejects_a_role_not_on_the_team() {
             "t1",
             None,
             false,
-            true,
-            owner_t1.as_deref(),
-            Some("staff"),
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t1.as_deref(),
+                team_only: Some("staff"),
+            },
             "ok".into(),
         )
         .unwrap();
@@ -624,9 +634,11 @@ fn a_team_only_projection_rejects_a_role_not_on_the_team() {
             "t1",
             None,
             false,
-            true,
-            owner_t1.as_deref(),
-            Some("staff"),
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t1.as_deref(),
+                team_only: Some("staff"),
+            },
             "leaked".into(),
         )
         .unwrap_err();
@@ -672,9 +684,11 @@ fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
             "t1",
             None,
             false,
-            true,
-            owner_t1.as_deref(),
-            Some("staff"),
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t1.as_deref(),
+                team_only: Some("staff"),
+            },
             "ok".into(),
         )
         .unwrap();
@@ -688,9 +702,11 @@ fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
             "t2",
             None,
             false,
-            true,
-            owner_t2.as_deref(),
-            Some("staff"),
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t2.as_deref(),
+                team_only: Some("staff"),
+            },
             "leaked".into(),
         )
         .unwrap_err();
@@ -706,9 +722,11 @@ fn a_team_only_projection_also_enforces_its_own_owner_scope_independently() {
             "t1",
             None,
             false,
-            true,
-            owner_t1.as_deref(),
-            Some("staff"),
+            ProjectionAccessScope {
+                declares_owner: true,
+                instance_owner: owner_t1.as_deref(),
+                team_only: Some("staff"),
+            },
             "leaked".into(),
         )
         .unwrap_err();

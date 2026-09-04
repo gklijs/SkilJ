@@ -100,6 +100,28 @@ pub fn field() -> Field {
                 .map(|v| v.i64())
                 .transpose()?;
 
+            // `team_only` is a plain in-memory `ProjectionDispatcher`
+            // lookup, no DB round trip - checked first and rejected
+            // outright before any of the DB work below runs, rather than
+            // waiting for `query_projection`'s own copy of this same
+            // check at the very end. A caller who was never going to be
+            // authorized shouldn't pay for `get_projection`, the
+            // `waitForSequence` poll loop (up to `state.
+            // projection_query_wait_timeout`), the state fetch, or a
+            // sensitive-field decrypt just to be told no.
+            let team_only = state
+                .projection_dispatcher
+                .team_only(&bounded_context_name, &name)
+                .flatten();
+            if !skilj_core::access_control::role_matches_required_team(
+                &access_mapping.role,
+                team_only,
+            ) {
+                return Err(to_graphql_error(
+                    skilj_core::access_control::Error::NotOnRequiredTeam,
+                ));
+            }
+
             let projection =
                 skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)
                     .await
@@ -145,10 +167,6 @@ pub fn field() -> Field {
                 .projection_dispatcher
                 .owner_tag_key(&bounded_context_name, &name)
                 .flatten();
-            let team_only = state
-                .projection_dispatcher
-                .team_only(&bounded_context_name, &name)
-                .flatten();
 
             // Real decrypt-on-read - automatic, no `Projection.sensitive_fields`
             // declaration anywhere (see this field's own doc comment).
@@ -176,9 +194,11 @@ pub fn field() -> Field {
                 &key,
                 wait_for_sequence,
                 caught_up,
-                owner_tag_key.is_some(),
-                instance_owner.as_deref(),
-                team_only,
+                skilj_core::projections::ProjectionAccessScope {
+                    declares_owner: owner_tag_key.is_some(),
+                    instance_owner: instance_owner.as_deref(),
+                    team_only,
+                },
                 state_json,
             )
             .map_err(to_graphql_error)?;
@@ -223,13 +243,36 @@ pub fn field() -> Field {
 /// caller querying those two fields through this field gets nothing
 /// rather than a second, narrower gate response readers would have to
 /// reason about differently from `projections`' own.
+///
+/// `TEAM_ONLY`-gated exactly like the `projection` field above (Codeberg
+/// issue #17): a projection's own declared schema is whole-projection
+/// data, the same thing the gate protects there, so a Role not on the
+/// required team gets the identical rejection here rather than being
+/// able to learn the projection's name/schema/version through this
+/// field while `projection` itself refuses it - `TeamGatedWhenDeclared`'s
+/// own "invisible, not merely unreadable" promise would otherwise hold
+/// for one field and not the other on the same surface.
 pub fn schema_field() -> Field {
     Field::new("projectionSchema", TypeRef::named("Projection"), |ctx| {
         FieldFuture::new(async move {
             let state = ctx.data::<GraphqlState>()?;
             let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
-            require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+            let access_mapping =
+                require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
             let name = ctx.args.try_get("name")?.string()?.to_string();
+
+            let team_only = state
+                .projection_dispatcher
+                .team_only(&bounded_context_name, &name)
+                .flatten();
+            if !skilj_core::access_control::role_matches_required_team(
+                &access_mapping.role,
+                team_only,
+            ) {
+                return Err(to_graphql_error(
+                    skilj_core::access_control::Error::NotOnRequiredTeam,
+                ));
+            }
 
             let projection =
                 skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)

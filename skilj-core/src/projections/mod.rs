@@ -400,49 +400,63 @@ pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey
 /// carries it alongside `result`, so the caller echoes it back in its own
 /// response shape.
 ///
-/// `owner_scope_satisfied(projection, key, access_mapping)` (cross-tenant
-/// projection read fix, docs/architecture.md's own write-up of this
-/// pass): `projection_declares_owner` is whether this projection
-/// registered an `OWNER_TAG_KEY` at all (from `ProjectionDispatcher::
-/// owner_tag_key`, the caller's own already-resolved lookup); `instance_owner`
-/// is the queried instance's own stored `owner` column, or `None` for a
-/// row that doesn't exist yet or has never had one derived. When the
-/// projection declares no owner dimension, `access_mapping.scope` is
-/// irrelevant here regardless of its own value - it only ever restricts
-/// an owner-declaring projection. When it does, and `access_mapping.scope`
-/// is `Some`, the query is rejected unless `instance_owner` is `Some` and
-/// equal to it - fail-closed: an instance whose ownership can't be
-/// affirmatively proven (including one nothing has touched yet) is
-/// treated the same as a proven mismatch, not the same as a proven
-/// match.
+/// `owner_scope_satisfied(projection, key, access_mapping)`'s three
+/// caller-resolved inputs (cross-tenant projection read fix,
+/// docs/architecture.md's own write-up of this pass) plus `team_only`
+/// (Codeberg issue #17), grouped into one value rather than three/four
+/// adjacent positional parameters on `query_projection` itself -
+/// `instance_owner`/`team_only` are both `Option<&str>` and answer
+/// unrelated questions, so left as bare positional arguments they could
+/// be silently transposed at a call site with no compile error; named
+/// fields on a struct rule that out.
 ///
-/// `team_only` (Codeberg issue #17's own gap, docs/architecture.md's own
-/// write-up of this pass): the projection's own `Projection::TEAM_ONLY`,
-/// already resolved by the caller - `None` when the projection declares
-/// no required team (every projection before this pass, and most after
-/// it), in which case this check is vacuously satisfied regardless of
-/// the caller's own Role. When `Some`, the query is rejected unless
-/// `access_mapping.role.name` equals it exactly. Unlike the owner-scope
-/// check above, this is a whole-*projection* gate, not a per-*instance*
-/// one - there is no `team` column on a stored instance the way there is
-/// an `owner` one, since a required team names no dimension to derive
-/// per instance, just one fixed membership test every instance shares.
-/// Independent of and composable with the owner-scope check: a
-/// projection may declare both `OWNER_TAG_KEY` and `TEAM_ONLY`
-/// (company-scoped *and* staff-only), and a query must satisfy both,
-/// the same way `sensitive_fields` and `scope` already coexist without
-/// one subsuming the other. See specs/skilj.allium's
-/// `team_only_satisfied`.
-#[allow(clippy::too_many_arguments)]
+/// `declares_owner` is whether this projection registered an
+/// `OWNER_TAG_KEY` at all (from `ProjectionDispatcher::owner_tag_key`,
+/// the caller's own already-resolved lookup); `instance_owner` is the
+/// queried instance's own stored `owner` column, or `None` for a row
+/// that doesn't exist yet or has never had one derived. `team_only` is
+/// the projection's own `Projection::TEAM_ONLY` (`ProjectionDispatcher::
+/// team_only`, likewise already resolved), or `None` when it declares no
+/// required team - every projection before this pass, and most after
+/// it.
+pub struct ProjectionAccessScope<'a> {
+    pub declares_owner: bool,
+    pub instance_owner: Option<&'a str>,
+    pub team_only: Option<&'a str>,
+}
+
+/// When the projection declares no owner dimension, `access_mapping.scope`
+/// is irrelevant here regardless of its own value - it only ever
+/// restricts an owner-declaring projection. When it does, and
+/// `access_mapping.scope` is `Some`, the query is rejected unless
+/// `access.instance_owner` is `Some` and equal to it - fail-closed: an
+/// instance whose ownership can't be affirmatively proven (including one
+/// nothing has touched yet) is treated the same as a proven mismatch,
+/// not the same as a proven match.
+///
+/// `access.team_only` (Codeberg issue #17's own gap, docs/architecture.md's
+/// own write-up of this pass): vacuously satisfied when `None`,
+/// regardless of the caller's own Role. When `Some`, the query is
+/// rejected unless `access_mapping.role.name` equals it exactly
+/// (`access_control::role_matches_required_team` - the identical test
+/// a `team`-kind private field's own entitlement check already uses).
+/// Unlike the owner-scope check above, this is a whole-*projection*
+/// gate, not a per-*instance* one - there is no `team` column on a
+/// stored instance the way there is an `owner` one, since a required
+/// team names no dimension to derive per instance, just one fixed
+/// membership test every instance shares. Independent of and composable
+/// with the owner-scope check: a projection may declare both
+/// `OWNER_TAG_KEY` and `TEAM_ONLY` (company-scoped *and* staff-only),
+/// and a query must satisfy both, the same way `sensitive_fields` and
+/// `scope` already coexist without one subsuming the other. See
+/// specs/skilj.allium's `team_only_satisfied`.
 pub fn query_projection(
     access_mapping: &RoleAccessMapping,
     projection: &Projection,
     _key: &str,
     wait_for_sequence: Option<i64>,
     caught_up: bool,
-    projection_declares_owner: bool,
-    instance_owner: Option<&str>,
-    team_only: Option<&str>,
+    access: ProjectionAccessScope<'_>,
     read_projection_result: String,
 ) -> crate::error::Result<String> {
     if access_mapping.status != RoleStatus::Active {
@@ -451,9 +465,9 @@ pub fn query_projection(
     if access_mapping.bounded_context != projection.bounded_context {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
-    if projection_declares_owner {
+    if access.declares_owner {
         if let Some(scope) = &access_mapping.scope {
-            if instance_owner != Some(scope.as_str()) {
+            if access.instance_owner != Some(scope.as_str()) {
                 return Err(crate::access_control::Error::GrantScopeMismatch.into());
             }
         }
@@ -462,10 +476,8 @@ pub fn query_projection(
     // own write-up of this pass) - independent from the owner-scope check
     // just above, not a replacement for it: a projection may declare
     // both, and both must hold. See this function's own doc comment.
-    if let Some(team) = team_only {
-        if access_mapping.role.name != team {
-            return Err(crate::access_control::Error::NotOnRequiredTeam.into());
-        }
+    if !crate::access_control::role_matches_required_team(&access_mapping.role, access.team_only) {
+        return Err(crate::access_control::Error::NotOnRequiredTeam.into());
     }
     if wait_for_sequence.is_some() && !caught_up {
         return Err(Error::ProjectionCaughtUpTimedOut.into());

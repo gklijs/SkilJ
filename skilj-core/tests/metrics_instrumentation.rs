@@ -54,9 +54,9 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
         None
     }
 
-    fn team_only(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
-        None
-    }
+    // `team_only` intentionally not overridden - the trait's own default
+    // (`None`) already reads identically to what a plain-`None` override
+    // here would return.
 }
 
 async fn provisioned_pool() -> Option<(db::Pool, Option<postgresql_embedded::PostgreSQL>)> {

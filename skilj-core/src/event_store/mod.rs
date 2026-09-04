@@ -1730,7 +1730,9 @@ fn entitled_to_read_private_field<R: PrivateFieldRecord>(
     matches_this_record: impl Fn(&PrivateFieldGrant) -> bool,
 ) -> bool {
     match kind {
-        PrivateFieldKind::Team => Some(access_mapping.role.name.as_str()) == team,
+        PrivateFieldKind::Team => {
+            crate::access_control::role_matches_required_team(&access_mapping.role, team)
+        }
         PrivateFieldKind::Own | PrivateFieldKind::Addressed => {
             is_default_private_reader(record, &access_mapping.role)
                 || grants.iter().any(|g| {

@@ -440,6 +440,24 @@ pub fn scope_matches_owner(owner: Option<&str>, scope: Option<&str>) -> bool {
     }
 }
 
+/// The one `Role.name` equality test "does this Role belong to the
+/// required team" ever comes down to, shared by two independently-arrived-at
+/// call sites that both needed it: `event_store::entitled_to_read_private_field`'s
+/// `PrivateFieldKind::Team` arm (a `PrivateField`'s own declared `team`)
+/// and `projections::query_projection`'s `team_only` check
+/// (`Projection::TEAM_ONLY`, Codeberg issue #17). Kept as one function
+/// specifically so a future change to what "matching a team" means
+/// (case-insensitive names, multiple teams per Role, team hierarchies)
+/// has exactly one definition to update rather than two that could drift
+/// apart. Vacuously true when `required` is `None` - no team named, no
+/// membership to hold.
+pub fn role_matches_required_team(role: &Role, required: Option<&str>) -> bool {
+    match required {
+        None => true,
+        Some(name) => role.name == name,
+    }
+}
+
 /// `pub(crate)`: reused by `bootstrap::add_bounded_context`/
 /// `bootstrap::list_bounded_contexts` (both `facing caller: Superadmin`,
 /// the same actor every rule in this module already checks this way).

@@ -144,13 +144,9 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
         None
     }
 
-    fn team_only(
-        &self,
-        _bounded_context: &str,
-        _projection_name: &str,
-    ) -> Option<Option<&'static str>> {
-        None
-    }
+    // `team_only` intentionally not overridden - the trait's own default
+    // (`None`) already reads identically to what a plain-`None` override
+    // here would return.
 }
 
 #[test]

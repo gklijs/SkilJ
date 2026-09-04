@@ -212,6 +212,33 @@ impl Projection for AccountBalance {
     }
 }
 
+/// Identical to `AccountBalance` in every way except `TEAM_ONLY` -
+/// exists purely to exercise Codeberg issue #17's whole-projection team
+/// gate end to end, on both the `projection` field and (the fix itself)
+/// `projectionSchema`.
+struct StaffOnlyBalance;
+
+impl Projection for StaffOnlyBalance {
+    type State = AccountBalanceState;
+    type Event = BankingEvent;
+    const NAME: &'static str = "StaffOnlyBalance";
+    const TEAM_ONLY: Option<&'static str> = Some("support");
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["MoneyDeposited"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        if let BankingEvent::MoneyDeposited(payload) = event {
+            state.total += payload.amount;
+            state.last_deposit = LastDeposit {
+                amount: payload.amount,
+            };
+        }
+    }
+}
+
 /// Keyed by `customer_id` - §9's own "keyed / multi-row Projections"
 /// pass, exercised end-to-end: `ItemPurchased`'s own `customer_id` field
 /// names which customer's row an event belongs to, so each customer gets
@@ -870,6 +897,231 @@ fn projection_schema_end_to_end() {
         assert_eq!(
             response["errors"][0]["extensions"]["code"],
             "Projection_not_found"
+        );
+    });
+}
+
+/// Codeberg issue #17's own gap and fix, end to end over real HTTP: a
+/// `TEAM_ONLY`-declaring projection rejects a Role not carrying the
+/// required name on *both* `projection` and `projectionSchema`. Before
+/// the fix, `projectionSchema` skipped this check entirely while
+/// `projection` enforced it - a wrong-team caller could still learn the
+/// projection's declared shape (name/schema/schemaVersion) even though
+/// its actual data was correctly refused, contradicting
+/// `TeamGatedWhenDeclared`'s "invisible, not merely unreadable" promise
+/// for one field on the same surface.
+#[test]
+fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+
+        let admin_mapping = RoleAccessMapping {
+            role: admin_role.clone(),
+            bounded_context: bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &admin_mapping)
+            .await
+            .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<WithdrawMoney>()
+            .projection::<StaffOnlyBalance>()
+            .reconciliation_role(admin_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let admin_jwt = sign_jwt(&admin_role.external_subject);
+        let router = skilj.graphql_router().await.unwrap();
+
+        // Produce real state so an authorized read below proves it sees
+        // actual data, not just an untouched default.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "payload": r#"{"amount":30}"# }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "unexpected errors: {response:?}"
+        );
+
+        let type_name =
+            skilj_graphql::projection_types::graphql_type_name(&bc_name, "StaffOnlyBalance");
+        let data_query = format!(
+            "query($bc: String!, $name: String!) {{ \
+                projection(boundedContext: $bc, name: $name) {{ \
+                    ... on {type_name} {{ total }} \
+                }} \
+            }}"
+        );
+        let schema_query = "query($bc: String!, $name: String!) { \
+            projectionSchema(boundedContext: $bc, name: $name) { name schema } \
+        }";
+
+        // A "support" Role, plain read-level: on the team - both fields
+        // succeed.
+        let support_subject = unique_name("support");
+        let support_role = Role {
+            id: generate_token_id(),
+            external_subject: support_subject.clone(),
+            name: "support".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &support_role)
+            .await
+            .unwrap();
+        let support_mapping = RoleAccessMapping {
+            role: support_role,
+            bounded_context: bc.clone(),
+            level: AccessLevel::Read,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &support_mapping)
+            .await
+            .unwrap();
+        let support_jwt = sign_jwt(&support_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&support_jwt),
+            &data_query,
+            json!({ "bc": bc_name, "name": "StaffOnlyBalance" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "support role should read the data: {response:?}"
+        );
+        assert_eq!(response["data"]["projection"]["total"], 30);
+
+        let response = graphql_request(
+            &router,
+            Some(&support_jwt),
+            schema_query,
+            json!({ "bc": bc_name, "name": "StaffOnlyBalance" }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_none(),
+            "support role should read the schema: {response:?}"
+        );
+        assert_eq!(
+            response["data"]["projectionSchema"]["name"],
+            "StaffOnlyBalance"
+        );
+
+        // A read-level Role with any other name: rejected on both
+        // fields - `projectionSchema` is the fix this test exists to pin
+        // down, `projection` is the pre-existing behaviour it must not
+        // regress.
+        let reader_subject = unique_name("reader");
+        let reader_role = Role {
+            id: generate_token_id(),
+            external_subject: reader_subject.clone(),
+            name: "Reader".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &reader_role)
+            .await
+            .unwrap();
+        let reader_mapping = RoleAccessMapping {
+            role: reader_role,
+            bounded_context: bc.clone(),
+            level: AccessLevel::Read,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role_access_mapping(&pool, &reader_mapping)
+            .await
+            .unwrap();
+        let reader_jwt = sign_jwt(&reader_subject);
+
+        let response = graphql_request(
+            &router,
+            Some(&reader_jwt),
+            &data_query,
+            json!({ "bc": bc_name, "name": "StaffOnlyBalance" }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "not_on_required_team"
+        );
+
+        // The fix itself: before it, this query still reached
+        // `get_projection` and returned the schema regardless of team
+        // membership.
+        let response = graphql_request(
+            &router,
+            Some(&reader_jwt),
+            schema_query,
+            json!({ "bc": bc_name, "name": "StaffOnlyBalance" }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "not_on_required_team"
         );
     });
 }

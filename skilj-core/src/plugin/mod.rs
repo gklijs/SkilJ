@@ -679,12 +679,19 @@ pub trait ProjectionDispatcher: Send + Sync {
 
     /// The registered projection's own `Projection::TEAM_ONLY` - the
     /// identical `Option<Option<_>>` shape `owner_tag_key` just above
-    /// already has, for the same reason.
+    /// already has, for the same reason. Defaulted to `None` (unlike
+    /// `owner_tag_key`, which has no default) - every call site here
+    /// only ever `.flatten()`s the result, for which the outer "pair
+    /// isn't registered" `None` and the inner "registered, no team
+    /// declared" `Some(None)` already read identically, so a dispatcher
+    /// with nothing team-gated needs no explicit override at all.
     fn team_only(
         &self,
-        bounded_context: &str,
-        projection_name: &str,
-    ) -> Option<Option<&'static str>>;
+        _bounded_context: &str,
+        _projection_name: &str,
+    ) -> Option<Option<&'static str>> {
+        None
+    }
 }
 
 /// Type-erased dispatch to a bounded context's own typed `Snapshot::fold` -
