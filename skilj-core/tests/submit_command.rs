@@ -1060,6 +1060,97 @@ fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
     });
 }
 
+/// docs/architecture.md §37: a real fleet runs more than one skilj
+/// instance, which could race this same migration against the same
+/// shared Postgres at startup - untested by the migration test above,
+/// which only ever calls it from one caller at a time. Genuinely races
+/// several concurrent callers (`tokio::spawn`, each its own task, this
+/// test's own runtime is the standard multi-threaded one - a real race,
+/// not just interleaved awaits on a single thread) against the same
+/// pre-migration table, and proves every one of them succeeds (no
+/// error - confirmed separately, by testing, that this is actually true
+/// even with `migrate_idempotency_keys_client_id_scoping`'s own
+/// `pg_advisory_xact_lock` removed, since `DROP CONSTRAINT IF EXISTS`
+/// plus Postgres's own whole-transaction table locking already make the
+/// raw ALTER sequence race-safe on their own - see that function's own
+/// doc comment for the lock's real, more modest purpose) and the final
+/// shape is correct exactly once, not corrupted or double-applied.
+#[test]
+fn migrate_idempotency_keys_client_id_scoping_is_safe_under_concurrent_callers() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+
+        // Roll the table back to its pre-fix shape, same as the test
+        // above.
+        let schema = format!("\"bc_{}\"", bc.name);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE {schema}.idempotency_keys"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {schema}.idempotency_keys (
+                command_type_name TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                triggered_event_sequences BIGINT[] NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (command_type_name, idempotency_key)
+            )"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A real fleet's own shape: several instances calling this at
+        // once against the same shared Postgres, each its own spawned
+        // task (and, since `Pool` is a real connection pool, plausibly
+        // its own physical connection) - a genuine race, not merely
+        // this function being called several times in a row.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                let name = bc.name.clone();
+                tokio::spawn(async move {
+                    db::migrate_idempotency_keys_client_id_scoping(&pool, &name).await
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .await
+                .expect("task panicked")
+                .expect("the advisory lock must serialise concurrent migrators, not error");
+        }
+
+        // Exactly the final shape, once - not corrupted, not double-applied.
+        let pk_columns: Vec<(String,)> = sqlx::query_as(
+            "SELECT column_name FROM information_schema.key_column_usage \
+             WHERE table_schema = $1 AND table_name = 'idempotency_keys' \
+               AND constraint_name = 'idempotency_keys_pkey' \
+             ORDER BY ordinal_position",
+        )
+        .bind(format!("bc_{}", bc.name))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pk_columns,
+            vec![
+                ("command_type_name".to_string(),),
+                ("client_id".to_string(),),
+                ("idempotency_key".to_string(),),
+            ],
+            "the primary key must end up with exactly these three columns, in this \
+             order, regardless of how many concurrent callers raced to get there"
+        );
+    });
+}
+
 /// The direct counterpart to the test above: no `idempotency_key` at all
 /// (the default for every existing caller) must show today's unchanged
 /// double-processing behaviour - two full `Accepted` outcomes, two real

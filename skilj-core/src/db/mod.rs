@@ -1099,21 +1099,34 @@ pub async fn ensure_idempotency_keys_table<'e>(
 /// Wrapped in one transaction (fine - Postgres DDL is fully
 /// transactional, unlike MySQL's) holding a `pg_advisory_xact_lock`
 /// keyed by this bounded context's own schema name for its entire
-/// duration: two skilj instances patching the same shared Postgres at
-/// startup (the existing concurrent-bounded-context warm-up loop in
-/// `skilj/src/lib.rs`, Codeberg issue #15, only protects against a race
-/// *within* one process - a real fleet runs more than one) would
-/// otherwise race the `PRIMARY KEY` swap below, which has no idempotent
-/// form: a second `ADD PRIMARY KEY` after a first one already committed
-/// is a hard Postgres error ("multiple primary keys ... not allowed"),
-/// not a silent no-op the way `ADD COLUMN IF NOT EXISTS` is elsewhere in
-/// this file. `_xact` (transaction-scoped, not session-scoped) releases
-/// automatically at this function's own commit or rollback and is
-/// guaranteed to run on the same connection as the statements it
-/// protects, both being inside the one transaction - unlike a bare
-/// `pg_advisory_lock` against a `&Pool`, where the lock and the work it
-/// protects could each be handed a different pooled connection
-/// entirely, making the lock meaningless.
+/// duration - not because skipping it would be unsafe (verified
+/// directly, not assumed: with the lock removed, several concurrent
+/// callers racing the exact same pre-migration table in a real test
+/// never errored, because `DROP CONSTRAINT IF EXISTS` before `ADD
+/// PRIMARY KEY` means there is never an *existing* primary key for a
+/// second `ADD PRIMARY KEY` to collide with, and Postgres's own
+/// whole-transaction-duration `ACCESS EXCLUSIVE` table lock from the
+/// first `ALTER TABLE` already fully serializes every concurrent
+/// instance's 3-statement sequence against this same table). The real,
+/// more modest reason to keep it: without it, every *loser* of that
+/// natural serialization still repeats the whole `DROP CONSTRAINT`/`ADD
+/// PRIMARY KEY` dance once it's their turn (each is a genuine
+/// idempotent no-op end state, but a real catalog write nonetheless,
+/// once per racer) - the lock lets every loser's own upfront
+/// `already_migrated` recheck below see the winner's now-committed
+/// change and skip straight to a plain read, so only the first instance
+/// through ever does real DDL work, and two skilj instances patching
+/// the same shared Postgres at startup (the existing
+/// concurrent-bounded-context warm-up loop in `skilj/src/lib.rs`,
+/// Codeberg issue #15, only protects against a race *within* one
+/// process - a real fleet runs more than one) don't churn the catalog
+/// once each for no reason. `_xact` (transaction-scoped, not
+/// session-scoped) releases automatically at this function's own commit
+/// or rollback and is guaranteed to run on the same connection as the
+/// statements it protects, both being inside the one transaction -
+/// unlike a bare `pg_advisory_lock` against a `&Pool`, where the lock
+/// and the work it protects could each be handed a different pooled
+/// connection entirely, making the lock meaningless.
 #[tracing::instrument(skip_all)]
 pub async fn migrate_idempotency_keys_client_id_scoping(
     pool: &Pool,

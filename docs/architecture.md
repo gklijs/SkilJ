@@ -5933,15 +5933,27 @@ DEFAULT ''` + `DROP CONSTRAINT` + `ADD PRIMARY KEY` in one transaction,
 guarded by a check against `information_schema.key_column_usage` (skip
 if `client_id` is already part of the primary key) and a
 `pg_advisory_xact_lock` keyed by the bounded context's own schema name
-for the transaction's whole duration - needed because, unlike `ADD
-COLUMN IF NOT EXISTS`, a second concurrent `ADD PRIMARY KEY` after a
-first one already committed is a hard Postgres error ("multiple primary
-keys ... not allowed"), not a silent no-op; a real fleet runs more than
-one instance, and the existing per-process warm-up concurrency (Codeberg
-issue #15) only serializes work *within* one process. `_xact` (not
-plain `pg_advisory_lock`) both releases automatically at commit/rollback
-and guarantees the lock and the statements it protects share one
-connection, rather than each landing on a different one from the pool.
+for the transaction's whole duration - a real fleet runs more than one
+instance, and the existing per-process warm-up concurrency (Codeberg
+issue #15) only serializes work *within* one process. Verified directly
+that the lock isn't there because skipping it would be unsafe: a real
+test racing several concurrent callers against the same pre-migration
+table with the lock removed never errored, because `DROP CONSTRAINT IF
+EXISTS` ahead of `ADD PRIMARY KEY` means there's never an *existing*
+primary key for a second `ADD PRIMARY KEY` to collide with, and
+Postgres's own whole-transaction-duration `ACCESS EXCLUSIVE` table lock
+(held from each instance's first `ALTER TABLE` onward) already
+serializes every concurrent instance's 3-statement sequence on its own.
+The lock's real, more modest purpose: without it, every loser of that
+natural serialization still repeats the whole `DROP CONSTRAINT`/`ADD
+PRIMARY KEY` dance once its turn comes (each a genuine no-op end state,
+but a real catalog write nonetheless); with it, a loser's own
+`already_migrated` recheck sees the winner's now-committed change first
+and skips straight to a plain read, so only the first instance through
+ever does real DDL work. `_xact` (not plain `pg_advisory_lock`) both
+releases automatically at commit/rollback and guarantees the lock and
+the statements it protects share one connection, rather than each
+landing on a different one from the pool.
 
 **The legacy-row tradeoff - the user's own explicit call.** A
 pre-migration row never recorded who submitted it - not recoverable by
@@ -5978,14 +5990,23 @@ non-fallback `client_id = $2` match, nothing more.
 `submit_command_with_the_same_idempotency_key_from_two_different_clients_does_not_collide`
 (two tenants, one shared key string, both get real, independent
 `Accepted` outcomes; each tenant's own retry still correctly dedups
-against their own answer, never the other's) and
+against their own answer, never the other's),
 `migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows`
 (rolls a table back to its literal pre-fix, column-for-column 0.0.2
 shape with a real legacy row, migrates it, and proves the legacy row
 is never matched again - even by whoever originally wrote it - while
 staying physically present in the table, and that an unrelated fresh
-key works normally). The full existing `skilj-core` test suite (every
-test binary, real embedded Postgres) passes unchanged, including
-`CrossContextRoute`'s own end-to-end test and the REST/GraphQL
-idempotency-key wire tests from §36's own fix - `cargo build/clippy -D
-warnings/test` and `cargo fmt --check` clean throughout.
+key works normally), and
+`migrate_idempotency_keys_client_id_scoping_is_safe_under_concurrent_callers`
+(genuinely races several `tokio::spawn`'d concurrent callers - a real
+race, this test's runtime is the standard multi-threaded one, not
+merely interleaved awaits on one thread - against the same
+pre-migration table; this is also the test that caught the `pg_advisory_xact_lock`
+doc comment's own overclaim above, by initially passing with the lock
+removed - a claim worth re-checking by testing, not trusting the
+reasoning that motivated writing it in the first place). The full
+existing `skilj-core` test suite (every test binary, real embedded
+Postgres) passes unchanged, including `CrossContextRoute`'s own
+end-to-end test and the REST/GraphQL idempotency-key wire tests from
+§36's own fix - `cargo build/clippy -D warnings/test` and `cargo fmt
+--check` clean throughout.
