@@ -35,8 +35,11 @@
 --   idempotency key on command submission over either track, so a caller
 --   retrying a submission it never heard back from is answered with the
 --   original outcome rather than applying the command a second time
---   (see rule ProcessCommand), and two independent authentication
---   tracks:
+--   (see rule ProcessCommand), an optional caller-supplied partition key
+--   and sequence number on external event submission, so an at-least-once
+--   source redelivering a message it already delivered creates no second
+--   event (see rule CreateExternalEvent), and two independent
+--   authentication tracks:
 --   - GraphQL: identity is delegated to a trusted external identity
 --     provider. A caller presents a JWT the IdP issued; SkilJ verifies
 --     that JWT's signature against the IdP's JWKS (a black box here,
@@ -1889,7 +1892,10 @@ default SystemCreator skilj = { }
 -- immediately and always, by construction.
 
 rule CreateExternalEvent {
-    when: SubmitExternalEvent(adapter, event_type, payload, source_content, source_context?)
+    when:
+        SubmitExternalEvent(
+            adapter, event_type, payload, source_content, source_context?,
+            dedupe_partition_key?, dedupe_sequence?)
     requires: event_type.external_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
@@ -1910,25 +1916,126 @@ rule CreateExternalEvent {
     -- named one, and for an event type that declares no owner dimension.
     requires: tag_owner_scope_satisfied(tags, event_type.owner_tag_key, adapter.scope)
 
+    -- Redelivery. dedupe_partition_key and dedupe_sequence are the caller's
+    -- own values, carried here untouched from surface
+    -- ExternalEventIngestion and null whenever the adapter supplied
+    -- neither. They exist because the message sources adapters sit in front
+    -- of - Kafka, Kinesis, Pulsar and their kin - number their messages
+    -- within a partition and deliver at least once: a consumer that crashes
+    -- before committing its own read position is handed the same messages
+    -- again on restart, and without something to recognise them by, every
+    -- one of them becomes a second event standing for the same fact.
+    --
+    -- The pair is supplied together or not at all, which is what the guard
+    -- below says: dedupe_partition_key names the partition, shard or stream
+    -- the message came from, dedupe_sequence is that message's own position
+    -- within it, and neither means anything without the other. Supplying
+    -- exactly one is a malformed submission and is rejected as such - it is
+    -- the caller being told it asked for something incoherent, and is not
+    -- to be confused with the duplicate case below, which is not an error
+    -- at all.
+    requires:
+        (dedupe_partition_key = null implies dedupe_sequence = null)
+        and (dedupe_sequence = null implies dedupe_partition_key = null)
+
+    -- highest_dedupe_sequence(adapter, dedupe_partition_key) is the single
+    -- number this library remembers for that pair: the highest
+    -- dedupe_sequence any submission bearing that partition key from that
+    -- adapter has ever had an event written for, or null when the partition
+    -- key is null or when nothing has been recorded for it yet. It is a
+    -- black box in the same register as next_sequence and
+    -- recorded_acceptance - library-owned durable state whose storage shape
+    -- this spec does not reach into - rather than a plugged-in decision
+    -- like decide().
+    --
+    -- Three cases, and they are the whole of the behaviour:
+    --
+    --   Pair absent. Nothing is looked up and nothing is recorded. The
+    --   submission creates its event exactly as every submission did before
+    --   this pair existed at all. This is a guarantee rather than merely the
+    --   common case - see ExternalEventIngestion's
+    --   OmittingTheDedupePairChangesNothing.
+    --
+    --   Sequence above the watermark, or nothing recorded for the pair yet.
+    --   The event is created exactly as it always was, and this sequence
+    --   becomes the new watermark for (adapter, dedupe_partition_key) as
+    --   part of the same transaction the event is written in - so a
+    --   watermark advances exactly when the event it stands for is durable,
+    --   never before and never without it. A submission this rule rejects
+    --   for any other reason advances nothing.
+    --
+    --   Sequence at or below the watermark. This is a redelivery of a
+    --   message already accounted for, and no event is created: no
+    --   ExternalTriggered, no sequence consumed, no projection updated,
+    --   nothing written. It is not an error - the submission is accepted and
+    --   acknowledged, and an adapter replaying a partition after a crash is
+    --   doing exactly what it is supposed to do, not making a bad request.
+    --
+    -- Deliberately unlike an idempotency key hit on a command, a duplicate
+    -- here is answered with nothing describing what happened last time. A
+    -- watermark remembers one number, not which event any particular past
+    -- message produced, so there is no original outcome to return and none
+    -- is invented; see ExternalEventIngestion's
+    -- ARedeliveryProducesNoEventAndNoOutcome.
+    --
+    -- One number per pair, not a row per message, and that compactness is
+    -- the whole design rather than an optimisation of it. It is sound
+    -- because the caller's own source already guarantees strictly
+    -- increasing delivery order within one partition, which is exactly the
+    -- property that makes everything at or below the highest seen
+    -- redundant. What it buys in cheapness it gives up in generality: this
+    -- deduplicates ordered message streams and nothing else. An adapter
+    -- with arbitrary unordered identifiers to deduplicate by has no
+    -- mechanism here, and should not reach for this one by inventing an
+    -- ordering its source does not have.
+    --
+    -- The cost of a watermark, stated plainly rather than left to be
+    -- discovered: a message arriving out of order within its own partition
+    -- is dropped, silently and permanently, because it is indistinguishable
+    -- from a redelivery. That is the trade an adapter makes by supplying
+    -- the pair at all, and it is why the pair is optional - an adapter
+    -- whose source cannot promise in-partition ordering supplies neither
+    -- value and is never deduplicated.
+    --
+    -- Scoped to the adapter and the partition key, and to nothing else.
+    -- Deliberately not per event type: an ExternalEventToken is already
+    -- issued for exactly one EventType (see variant ExternalEventToken), so
+    -- scoping by adapter is at least as narrow, and scoping by type instead
+    -- would let two unrelated adapters for the same type collide on a
+    -- partition key string they each chose independently. The obligation
+    -- this puts on an adapter is to keep its own partition keys stable
+    -- across restarts, since a fresh key starts a fresh watermark.
+    --
+    -- Nothing expires, the same treatment a recorded idempotency key gets
+    -- and for the same reason (see rule ProcessCommand). A watermark is
+    -- also not the opaque source_context blob and never parsed out of it:
+    -- an adapter that puts its Kafka topic/partition/offset in there for
+    -- provenance has said nothing to this mechanism, which acts only on
+    -- values named separately and explicitly (see variant
+    -- ExternalTriggered).
+    let watermark = highest_dedupe_sequence(adapter, dedupe_partition_key)
+    let is_redelivery = watermark != null and dedupe_sequence <= watermark
+
     -- Every sync projection consuming this event type is updated inline,
     -- in this same transaction - see the project() note above the rules.
     ensures:
-        ExternalTriggered.created(
-            bounded_context: event_type.bounded_context,
-            event_type: event_type,
-            payload: protected.payload,
-            metadata: {
-                type: event_type.name,
-                version: event_type.schema_version,
-                client_id: adapter.id,
-                created_at: now
-            },
-            sequence: next_sequence(event_type.bounded_context),
-            tags: tags,
-            encryption_keys: protected.encryption_keys,
-            source_content: source_content,
-            source_context: source_context
-        )
+        if not is_redelivery:
+            ExternalTriggered.created(
+                bounded_context: event_type.bounded_context,
+                event_type: event_type,
+                payload: protected.payload,
+                metadata: {
+                    type: event_type.name,
+                    version: event_type.schema_version,
+                    client_id: adapter.id,
+                    created_at: now
+                },
+                sequence: next_sequence(event_type.bounded_context),
+                tags: tags,
+                encryption_keys: protected.encryption_keys,
+                source_content: source_content,
+                source_context: source_context
+            )
 }
 
 rule CreateDirectEvent {
@@ -5995,7 +6102,9 @@ surface ExternalEventIngestion {
         where this = adapter.event_type and external_creation_allowed = true and adapter.status = active
 
     provides:
-        SubmitExternalEvent(adapter, event_type, payload, source_content, source_context?)
+        SubmitExternalEvent(
+            adapter, event_type, payload, source_content, source_context?,
+            dedupe_partition_key?, dedupe_sequence?)
 
     @guarantee TokenScopedToEventType
         -- A token only authorises submitting events for the EventType it
@@ -6022,6 +6131,41 @@ surface ExternalEventIngestion {
         -- A token naming no scope, which is every token unless the minting
         -- admin named one, submits exactly as it always has; so does any
         -- submission for an event type that declares no owner dimension.
+
+    @guarantee OmittingTheDedupePairChangesNothing
+        -- dedupe_partition_key and dedupe_sequence are optional, and
+        -- omitting them is a supported, permanent way to submit rather than
+        -- a legacy shape: a submission carrying neither has nothing looked
+        -- up and nothing recorded against it, and creates its event every
+        -- single time, exactly as every submission behaved before the pair
+        -- existed. An adapter that never supplies them is never
+        -- deduplicated, never has a submission silently produce no event,
+        -- and never has to opt out of anything to keep that.
+        --
+        -- They travel as a pair. An adapter supplying exactly one of them
+        -- is refused outright, which is a rejection of a malformed request
+        -- and is not the same thing as the accepted no-op below.
+
+    @guarantee ARedeliveryProducesNoEventAndNoOutcome
+        -- A submission whose dedupe_sequence is at or below the highest
+        -- this adapter has had an event written for under this
+        -- dedupe_partition_key creates no event at all: no
+        -- ExternalTriggered, no sequence consumed, no projection updated,
+        -- nothing written. It is accepted rather than refused: an
+        -- at-least-once source replaying a partition after a crash is doing
+        -- what it is meant to do, and being told it made a bad request
+        -- would be untrue.
+        --
+        -- What it is not answered with is any account of what an earlier
+        -- message did. Unlike a duplicate idempotency key on
+        -- CommandSubmission, which returns the original outcome, a
+        -- watermark remembers one number and not which event any particular
+        -- past message produced, so there is no original outcome to return
+        -- and none is fabricated (see rule CreateExternalEvent).
+        --
+        -- Scoped to this adapter and this partition key alone, so two
+        -- adapters that independently chose the same partition key string
+        -- never deduplicate each other's messages.
 
     @guidance
         -- REST only. Token-authenticated capabilities are deliberately

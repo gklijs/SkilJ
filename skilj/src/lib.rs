@@ -1489,6 +1489,14 @@ impl SkiljBuilder {
                     // own doc comment.
                     skilj_core::db::ensure_cross_context_route_cursors_table(pool, &bc.name)
                         .await?;
+                    // External-message dedup (docs/architecture.md §39,
+                    // specs/skilj.allium's own rule CreateExternalEvent) -
+                    // same "patched into every bounded context, every
+                    // startup" treatment, for a brand-new table that needs
+                    // no migration dance. See
+                    // `ensure_external_message_cursors_table`'s own doc
+                    // comment.
+                    skilj_core::db::ensure_external_message_cursors_table(pool, &bc.name).await?;
                     Ok::<(), skilj_core::Error>(())
                 }
             })

@@ -88,6 +88,8 @@ listed separately here; see that section itself for its own structure.
 - [35. Configurable connection pool sizing](#35-configurable-connection-pool-sizing)
 - [36. `CrossContextRoute`: crossing bounded contexts without an external system](#36-crosscontextroute-crossing-bounded-contexts-without-an-external-system)
 - [37. `idempotency_keys` gets `client_id`-scoped: a real cross-tenant collision, live since 0.0.2](#37-idempotency_keys-gets-client_id-scoped-a-real-cross-tenant-collision-live-since-002)
+- [38. Message-broker bridges (Kafka/Solace/etc.): investigation, not yet built](#38-message-broker-bridges-kafkasolaceetc-investigation-not-yet-built)
+- [39. Built into skilj instead: external-message dedup on `CreateExternalEvent`](#39-built-into-skilj-instead-external-message-dedup-on-createexternalevent)
 
 ---
 
@@ -6010,3 +6012,223 @@ Postgres) passes unchanged, including `CrossContextRoute`'s own
 end-to-end test and the REST/GraphQL idempotency-key wire tests from
 §36's own fix - `cargo build/clippy -D warnings/test` and `cargo fmt
 --check` clean throughout.
+
+## 38. Message-broker bridges (Kafka/Solace/etc.): investigation, not yet built
+
+Prompted by "investigate other modules that would make skilj easier to
+use and integrate - with Kafka, to send out events and retrieve
+external events through it, or things like Solace, look for
+things/crates used a lot with Rust." Investigation only - nothing built
+yet, findings below to ground a decision on scope before any code.
+
+**Nothing new needed on skilj's own side - the hook points already
+exist**, the same "broker-agnostic, already built" realisation §34
+started from for Temporal:
+
+- **Outbound** (a skilj event reaching an external system): `GET
+  /v1/events/consume?mode=manual` + `POST /v1/events/consume/ack`
+  (`skilj-rest/src/routes/mod.rs`) - server-tracked polling, no
+  persistent connection management, "redeliver on crash before ack"
+  composing cleanly with whatever at-least-once delivery a broker
+  client already gives a producer.
+- **Inbound** (an external system's own message becoming a skilj
+  event): `POST /v1/events/external` (`ExternalEventIngestion`, opt-in
+  per `EventType.external_creation_allowed`) for "this fact already
+  happened externally, record it" - the direct analogue of `CreateExternalEvent`
+  in the spec. `POST /v1/commands/trigger` is the other inbound door,
+  for "this message should be *decided upon*" rather than recorded
+  verbatim - which one a given mapping wants is a modelling choice per
+  message type, not something the bridge itself needs an opinion on.
+- **Correlation/idempotency conventions already established, directly
+  reusable**: §34's `workflow_id = "{bounded_context}:{tag_key}:{tag_value}"`
+  pattern (deriving a stable external identity from a DCB tag) maps
+  onto a Kafka message key, an AMQP routing key, or a NATS subject the
+  same way it maps onto a Temporal workflow ID. §34's `Signal`
+  idempotency fix - deriving a request id from `(bounded_context,
+  event_type, sequence)` - is the same shape a Kafka producer's own
+  idempotent-produce config or a consumer-side dedup key would want.
+  Inbound, the exact `"{run_id}:{activity_id}"` -> `Idempotency-Key`
+  realisation (§21/§34 phase 1) generalises to `"{topic}:{partition}:{offset}"`
+  for Kafka, or whatever a given broker's own stable per-message
+  identity is - the pattern, not the Temporal specifics, is what's
+  reusable.
+
+**Rust crate ecosystem, checked directly (crates.io download counts and
+last-release dates, 2026-09), not assumed**:
+
+| System | Crate | Total downloads | 90-day downloads | Last release |
+|---|---|---|---|---|
+| Kafka | `rdkafka` | 35.7M | 6.46M | Jan 2026 |
+| NATS | `async-nats` | 46.5M | 5.55M | Jul 2026 |
+| AWS SQS | `aws-sdk-sqs` | 17.2M | 5.82M | Sep 2026 |
+| RabbitMQ (AMQP 0-9-1) | `lapin` | 12.2M | 2.08M | May 2026 |
+| MQTT | `rumqttc` | 8.0M | 1.91M | Nov 2025 |
+| Google Cloud Pub/Sub | `google-cloud-pubsub` | 6.8M | 1.66M | Aug 2026 |
+| AMQP 1.0 (Solace/Azure Service Bus/Artemis) | `fe2o3-amqp` | 2.36M | 0.83M | Aug 2026 |
+| Apache Pulsar | `pulsar` | 2.35M | 0.42M | Aug 2026 |
+| Solace-specific | `solace-rs` | 35K | 142 | May 2025 (stale) |
+
+**Solace, specifically**: no healthy Solace-specific Rust crate exists
+- `solace-rs` is an unofficial FFI wrapper needing Solace's own
+  proprietary C SDK installed separately, essentially unused (142
+  downloads in 90 days) and over a year stale. The actually practical
+  path is protocol-level, not vendor-crate-level: Solace PubSub+
+  natively speaks AMQP 1.0 (and MQTT) as first-class protocols
+  alongside its own proprietary one, so `fe2o3-amqp` (pure Rust, no C
+  dependency, healthy and active) talks to a Solace broker the same way
+  it talks to Azure Service Bus or ActiveMQ Artemis - one dependency
+  covering three "enterprise" brokers via a shared open standard,
+  rather than a dedicated, much weaker Solace-only crate.
+
+**Recommendation, not yet decided with the user**: mirror §34's own
+shape - a small, thin bridge crate per *protocol family* (not
+skilj-core changes, no shared cross-broker abstraction forced over
+systems with genuinely different delivery semantics - partitioned logs
+vs. exchange/routing-key vs. subject-based pub/sub - the same reasoning
+that ruled out a shared `Process`/`Saga` trait in §34). Candidate first
+build, ranked by the table above and by matching the user's own named
+example: `skilj-kafka` on `rdkafka` - highest combined maturity and
+category fit for "the thing most people mean by event streaming
+integration." `skilj-amqp` on `fe2o3-amqp` would be the second,
+covering Solace/Azure Service Bus/Artemis/RabbitMQ-via-AMQP-1.0-plugin
+in one crate rather than one-per-vendor. NATS (`async-nats`, actually
+*more* total downloads than `rdkafka`, and a materially simpler
+deployment story - no Zookeeper/KRaft, a single static binary) is worth
+naming as a real contender for "first build" too, not just an
+also-ran, if simplicity/ops-overhead matters more than Kafka's own
+partitioned-log/replay semantics for a given adopter.
+
+**Open questions for the user, not resolved here**: which
+broker/protocol to build first (Kafka, per the user's own example, or
+NATS, per the raw download numbers and simpler ops story); whether
+"send out"/"retrieve" should be one crate per broker (both directions)
+or split; and whether inbound messages should default to
+`ExternalEventIngestion`, `CommandTrigger`, or be a per-mapping choice
+the way §34's own `EventTypeMapping` names signal-vs-start per
+`EventType`.
+
+## 39. Built into skilj instead: external-message dedup on `CreateExternalEvent`
+
+§38's own investigation flagged that `ExternalEventIngestion` has no
+dedup mechanism at all - a real problem for any at-least-once broker
+bridge (Kafka included) recording facts via it, since a redelivery after
+a crash-before-commit would create a second event for the same message.
+The plan at the time was to leave this to each bridge crate's own
+responsibility, the same way a bridge author handles anything else
+specific to their own broker. Told directly this was the wrong call:
+"most external messages have some unique identifier we could store in a
+table... these things are great to have baked in, and not leave to the
+responsibility of users." Built into `CreateExternalEvent` itself
+instead - no bridge crate needed this to exist first.
+
+**The insight that makes it cheap**: most message-streaming systems
+(Kafka, Kinesis, Pulsar, Azure Event Hubs) share one shape - messages
+are numbered *within a partition*, strictly increasing, and a consumer
+only ever needs to know the highest number it has already handled for a
+given partition to recognise every redelivery below it. That's a single
+integer per partition, not a row per message - `idempotency_keys`'
+own shape would have worked (one row per message key, kept forever) but
+wastes space and a write per message for information a watermark
+already implies for free.
+
+**Spec first, delegated to `allium:tend`, independently re-verified -
+not implemented off a private design.** `SubmitExternalEvent` gains an
+optional `dedupe_partition_key?`/`dedupe_sequence?` pair (both-or-neither,
+a real `requires` guard), a `highest_dedupe_sequence(adapter,
+dedupe_partition_key)` black box in the same register as
+`next_sequence`/`recorded_acceptance`, and a conditional `ensures` -
+`ExternalTriggered` is created only when the sequence is above the
+recorded watermark, mirroring `RegisterProjection`'s own precedent for
+conditional entity creation rather than `ProcessCommand`'s `requires`-
+based short-circuit (a `requires` failure on an *external stimulus*
+trigger is a caller error, per the language reference - a redelivery is
+not one). Independently re-verified after the agent's own report, not
+trusted at face value: `allium check`/`allium analyse` byte-identical to
+baseline (0 findings both, same 21/5 diagnostics), `allium plan` still
+449 obligations with the expected shift (`+rule-failure.CreateExternalEvent.7`
+for the new guard, `-rule-entity-creation.CreateExternalEvent.1` since
+the planner doesn't emit that obligation for a conditionally-created
+entity - already true of `RegisterProjection`/`RegisterEventType`/
+`RegisterCommandType` in this same spec, not something this change
+uniquely introduces).
+
+**Storage**: `external_message_cursors`, one row per `(adapter_id,
+partition_key)` pair, storing only `last_sequence`. A brand-new table,
+so no migration dance the way §37's `idempotency_keys` retrofit needed -
+`ensure_external_message_cursors_table`'s own `CREATE TABLE IF NOT
+EXISTS` is the whole story, wired into `provision_bounded_context_schema`
+and the `SkiljBuilder::build()` startup loop exactly like every other
+table in this file. Scoped by `adapter_id`, not `event_type_name` - an
+`ExternalEventToken` is already issued for exactly one `EventType`, so
+scoping by adapter is at least as narrow, and the alternative would let
+two unrelated adapters for the same event type collide on a partition
+key string they each chose independently (the identical cross-tenant
+collision class §37 closed for `idempotency_keys`, verified not
+reachable here for real: `two_different_adapters_sharing_a_partition_key_string_do_not_collide`,
+`skilj-core/tests/external_event_dedup.rs`).
+
+**Mechanism**, entirely in `db::create_and_insert_external_event` -
+`event_store::create_external_event`'s own pure signature is untouched,
+exactly mirroring where `submit_command`'s own idempotency check lives
+relative to `event_store::process_command`. Checked right after
+`next_sequence`'s own row lock is acquired (the same "earliest race-free
+point" `lookup_idempotency_key` already uses): a watermark hit rolls the
+transaction back (nothing else was written) and returns
+`CreateExternalEventOutcome::Redelivered`, without ever calling the pure
+`create_external_event` function at all; a miss proceeds exactly as
+before, plus one more write - `advance_dedupe_watermark`, an upsert
+(`ON CONFLICT ... DO UPDATE`, since a given partition is written many
+times over its life, unlike `insert_idempotency_key`'s plain
+once-per-key insert) - before the same commit.
+
+**Both-or-neither, satisfied structurally, not by a runtime check.**
+`DedupeCursor<'a> { partition_key: &'a str, sequence: i64 }` has no
+`Option` fields - there is no way to construct one with only one of the
+two present. The REST wire mirrors this: `ExternalEventRequest.dedupe:
+Option<DedupeRequest>`, and `DedupeRequest`'s own two fields are
+non-optional, so a JSON body naming exactly one of them fails ordinary
+deserialization (a 400) before the handler is ever reached. The spec's
+own `requires` guard for this case is satisfied by construction here,
+not duplicated as application logic.
+
+**Deliberately not `SubmitCommandOutcome`'s shape reused.** A duplicate
+idempotency-key hit returns the *original* `triggered_event_sequences` -
+`CreateExternalEventOutcome::Redelivered` carries nothing, because a
+watermark remembers only the highest sequence seen, not which event any
+particular past message produced; inventing an answer would mean
+storing per-message state again, the exact cost this design exists to
+avoid. `skilj-rest`'s `POST /v1/events/external` response reflects
+this: `{ sequence: Option<i64>, redelivered: bool }`, `sequence: null`
+on a redelivery - and still a 201, not an error, since
+`ARedeliveryProducesNoEventAndNoOutcome` is explicit that a replaying
+adapter is doing exactly what an at-least-once source is supposed to
+do.
+
+**A cost stated plainly, not discovered later**: the watermark cannot
+distinguish "redelivery" from "a message that genuinely arrived out of
+order within its own partition" - both look identical (a sequence at or
+below the highest already seen), and the latter is silently dropped
+just the same. This is the trade an adapter makes by supplying the pair
+at all; one whose source cannot promise in-partition ordering supplies
+neither value and is never deduplicated. `allium:tend` documented this
+in the rule itself as a stated cost of the design rather than raising it
+as an open question, since it's inherent to the compactness asked for,
+not something a different implementation choice would avoid for free.
+
+**Verified**: `skilj-core/tests/external_event_dedup.rs` (5 tests
+against `db::create_and_insert_external_event` directly - omitting the
+pair changes nothing; a new higher sequence creates and advances the
+watermark; a redelivered *or* stale-lower sequence creates nothing; two
+adapters sharing a partition key string don't collide; two partitions
+from the same adapter have independent watermarks) and
+`skilj/tests/external_event_dedup.rs` (2 tests over the real REST wire,
+mirroring `command_trigger.rs`'s own "layer in isolation, then the real
+wire" split - the JSON `dedupe` shape and the `sequence`/`redelivered`
+response fields, end to end through `Skilj::rest_router()`). The central
+claim in both files - a redelivery creates nothing - was confirmed
+non-vacuous the same way as every other fix this session: the check
+disabled, the test rerun and shown to fail with the exact expected
+assertion, then restored and reconfirmed green. Full existing
+`skilj-core` test suite (every binary, real embedded Postgres) passes
+unchanged. `cargo build/clippy -D warnings/fmt --check` clean
+throughout.

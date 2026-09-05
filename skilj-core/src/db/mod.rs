@@ -438,6 +438,7 @@ async fn provision_bounded_context_schema(
     .await?;
     ensure_idempotency_keys_table(&mut **tx, bounded_context).await?;
     ensure_cross_context_route_cursors_table(&mut **tx, bounded_context).await?;
+    ensure_external_message_cursors_table(&mut **tx, bounded_context).await?;
     // `EncryptionKey` is a real, independently-lived entity (its own
     // status/lifecycle - see `entity EncryptionKey`), so it's referenced
     // here, not JSONB-embedded like `tag_mappings`/`sensitive_fields` -
@@ -1211,6 +1212,50 @@ pub async fn ensure_cross_context_route_cursors_table<'e>(
             route_name TEXT PRIMARY KEY,
             last_dispatched_sequence BIGINT NOT NULL DEFAULT -1,
             updated_at TIMESTAMPTZ NOT NULL
+        )"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `external_message_cursors` - the durable state behind
+/// `highest_dedupe_sequence(adapter, dedupe_partition_key)` in
+/// specs/skilj.allium's own `rule CreateExternalEvent`
+/// (docs/architecture.md §39). One row per `(adapter_id, partition_key)`
+/// pair that has ever had an event written under it, storing only the
+/// highest `dedupe_sequence` seen so far - a compact watermark, not a row
+/// per message the way `idempotency_keys` is: sound only because the
+/// caller's own external source (Kafka, Kinesis, Pulsar and their kin)
+/// already guarantees strictly increasing delivery order within one
+/// partition, which is exactly the property that makes remembering
+/// anything below the highest seen unnecessary. See
+/// `db::create_and_insert_external_event`'s own doc comment for the full
+/// mechanism this table backs.
+///
+/// `impl PgExecutor`, the same "works on `&Pool` autocommit or inside a
+/// caller's own open `Transaction`" treatment `ensure_idempotency_keys_table`
+/// already gets, for the identical reason: `provision_bounded_context_schema`
+/// above needs the latter (a brand-new bounded context), the
+/// per-bounded-context startup loop in `skilj/src/lib.rs` needs the
+/// former (patching a bounded context provisioned before this feature
+/// existed). `CREATE TABLE IF NOT EXISTS`, called unconditionally on
+/// every `build()`, is the whole migration story - a fresh table with no
+/// existing rows needs no `ALTER TABLE` dance the way `idempotency_keys`'
+/// own `client_id` retrofit did (docs/architecture.md §37).
+#[tracing::instrument(skip_all)]
+pub async fn ensure_external_message_cursors_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.external_message_cursors (
+            adapter_id TEXT NOT NULL,
+            partition_key TEXT NOT NULL,
+            last_sequence BIGINT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (adapter_id, partition_key)
         )"
     )))
     .execute(executor)
@@ -4857,6 +4902,115 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
     Ok(())
 }
 
+/// The `dedupe_partition_key`/`dedupe_sequence` pair from
+/// specs/skilj.allium's own `SubmitExternalEvent` trigger
+/// (`rule CreateExternalEvent`, docs/architecture.md §39) - always
+/// supplied together or not at all. That "both or neither" `requires`
+/// guard in the spec is satisfied structurally here, not by a separate
+/// runtime check: there is no way to construct one of these fields
+/// without the other through this type (or, at the REST wire boundary,
+/// through `ExternalEventRequest`'s own `dedupe: Option<DedupeRequest>`
+/// shape) - a caller supplying exactly one on the wire fails ordinary
+/// JSON deserialization before this type is ever built, the same
+/// "malformed request, not this crate's rejection to model" register
+/// any other structurally-invalid request body already gets.
+pub struct DedupeCursor<'a> {
+    /// Names the partition, shard, or stream this message came from -
+    /// e.g. `"{topic}:{partition}"` for Kafka, a shard id for Kinesis.
+    pub partition_key: &'a str,
+    /// This message's own position within `partition_key` - must be
+    /// strictly increasing per partition for the caller's own external
+    /// source, the property this whole mechanism relies on and cannot
+    /// verify itself (see `highest_dedupe_sequence`'s own doc comment).
+    pub sequence: i64,
+}
+
+/// What `create_and_insert_external_event` settles on - either a real
+/// insert (`Created`, already persisted by the time this returns) or a
+/// redelivery this rule recognises and accepts without creating anything
+/// (`Redelivered`). Not `SubmitCommandOutcome`'s two-way split
+/// (`Accepted`/`Deduplicated`) reused, deliberately: a genuine business
+/// rejection has no equivalent here (`create_external_event`'s own
+/// failure modes - `TokenNotActive`, `ExternalCreationNotAllowed`, a bad
+/// payload - are real errors, returned as `Err`, not a third outcome
+/// variant), and calling this case "Deduplicated" would invite comparing
+/// it to `SubmitCommandOutcome::Deduplicated`, which returns the
+/// original outcome's own triggered sequences - this outcome carries
+/// nothing, on purpose, since a watermark remembers only the highest
+/// sequence seen, not which event any particular past message produced.
+/// See specs/skilj.allium's own `ExternalEventIngestion.ARedeliveryProducesNoEventAndNoOutcome`.
+#[derive(Debug)]
+pub enum CreateExternalEventOutcome {
+    Created(Box<Event>),
+    Redelivered,
+}
+
+/// `highest_dedupe_sequence(adapter, dedupe_partition_key)` from
+/// specs/skilj.allium's own `rule CreateExternalEvent` - a black box in
+/// the same register as `next_sequence`/`recorded_acceptance`: durable
+/// state this library owns, whose storage shape the spec doesn't reach
+/// into. `None` when nothing has been recorded yet for this
+/// `(adapter_id, partition_key)` pair - the spec's own "or when the
+/// partition key is null" clause is handled by the caller never calling
+/// this at all when `dedupe` is `None`, not by this function.
+///
+/// Must be called after the bounded context's own `sequence` row lock is
+/// already held (`next_sequence`, inside `create_and_insert_external_event`'s
+/// own transaction) - the identical "no lock of its own, rides on the
+/// one already held" register `lookup_idempotency_key` already uses, for
+/// the same reason: every write into this bounded context is already
+/// serialised by that lock, so a plain, unlocked `SELECT` here is
+/// race-free.
+async fn highest_dedupe_sequence<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    schema: &str,
+    adapter_id: &str,
+    partition_key: &str,
+) -> crate::error::Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT last_sequence FROM {schema}.external_message_cursors \
+         WHERE adapter_id = $1 AND partition_key = $2"
+    )))
+    .bind(adapter_id)
+    .bind(partition_key)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(|(seq,)| seq))
+}
+
+/// Records `sequence` as the new watermark for `(adapter_id,
+/// partition_key)`, inside the same transaction as the `Event` it
+/// stands for - a watermark advances exactly when the event it
+/// represents is durable, never before and never without it (see
+/// `create_and_insert_external_event`'s own doc comment). `ON CONFLICT
+/// ... DO UPDATE`, not a plain insert the way `insert_idempotency_key`
+/// is - unlike that table, a given `(adapter_id, partition_key)` pair is
+/// expected to be written many times over its life, once per message
+/// from a real partition, not once ever.
+async fn advance_dedupe_watermark<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    schema: &str,
+    adapter_id: &str,
+    partition_key: &str,
+    sequence: i64,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.external_message_cursors \
+         (adapter_id, partition_key, last_sequence, updated_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (adapter_id, partition_key) \
+         DO UPDATE SET last_sequence = EXCLUDED.last_sequence, updated_at = EXCLUDED.updated_at"
+    )))
+    .bind(adapter_id)
+    .bind(partition_key)
+    .bind(sequence)
+    .bind(now)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// `CreateExternalEvent`'s own atomic whole: `next_sequence`'s row lock,
 /// `event_store::create_external_event`'s pure construction (which needs
 /// that lock's own allocated sequence baked into the `Event` it builds),
@@ -4880,6 +5034,23 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
 /// than in that crate per docs/architecture.md §3.1/§3.2: `skilj-core`
 /// is the only crate that owns the database driver, so no other crate
 /// ever opens a `Transaction` itself.
+///
+/// **`dedupe`** (docs/architecture.md §39, specs/skilj.allium's own
+/// `rule CreateExternalEvent`): `None` reproduces every existing
+/// caller's own behaviour exactly, byte for byte - no lookup, no write
+/// to `external_message_cursors`, an event created every single time,
+/// the same "omitting it changes nothing" guarantee `submit_command`'s
+/// own `idempotency_key: None` already gives (see
+/// `ExternalEventIngestion.OmittingTheDedupePairChangesNothing`).
+/// `Some(cursor)`: checked against `highest_dedupe_sequence` right after
+/// `next_sequence`'s own lock is acquired - the earliest point that's
+/// race-free, mirroring exactly where `submit_command`'s own idempotency
+/// check runs relative to that same lock. A watermark hit rolls `tx`
+/// back (dropped, nothing else was written) and returns
+/// `CreateExternalEventOutcome::Redelivered` without ever calling
+/// `event_store::create_external_event` at all; a miss proceeds exactly
+/// as `None` would, plus one more write in the same transaction -
+/// `advance_dedupe_watermark` - before `tx.commit()`.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 pub async fn create_and_insert_external_event(
@@ -4891,10 +5062,12 @@ pub async fn create_and_insert_external_event(
     payload: String,
     source_content: String,
     source_context: Option<String>,
+    dedupe: Option<DedupeCursor<'_>>,
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
-) -> crate::error::Result<Event> {
+) -> crate::error::Result<CreateExternalEventOutcome> {
     let bounded_context_name = adapter.event_type.bounded_context.name.clone();
+    let schema = schema_ident(&bounded_context_name);
 
     let mut resolved = std::collections::HashMap::new();
     resolve_encryption_keys(
@@ -4909,6 +5082,19 @@ pub async fn create_and_insert_external_event(
 
     let mut tx = pool.begin().await?;
     let next_seq = next_sequence(&mut *tx, &bounded_context_name).await?;
+
+    if let Some(cursor) = &dedupe {
+        let watermark =
+            highest_dedupe_sequence(&mut *tx, &schema, &adapter.id, cursor.partition_key).await?;
+        if watermark.is_some_and(|w| cursor.sequence <= w) {
+            // Implicit rollback - nothing else was written, the same
+            // "a hit is a cached prior answer, not a new decision, tx is
+            // simply dropped" treatment `submit_command`'s own
+            // idempotency-key check already uses.
+            return Ok(CreateExternalEventOutcome::Redelivered);
+        }
+    }
+
     let event = crate::event_store::create_external_event(
         adapter,
         payload,
@@ -4936,13 +5122,24 @@ pub async fn create_and_insert_external_event(
         &encryption_key_ids,
     )
     .await?;
+    if let Some(cursor) = &dedupe {
+        advance_dedupe_watermark(
+            &mut *tx,
+            &schema,
+            &adapter.id,
+            cursor.partition_key,
+            cursor.sequence,
+            now,
+        )
+        .await?;
+    }
     tx.commit().await?;
     broadcaster.publish(&event);
     record_event_appended(&event);
     notify_event_appended(pool, &event, broadcaster.instance_id()).await;
     event_cache.append(&event).await;
 
-    Ok(event)
+    Ok(CreateExternalEventOutcome::Created(Box::new(event)))
 }
 
 /// `CreateDirectEvent`'s own twin of `create_and_insert_external_event`

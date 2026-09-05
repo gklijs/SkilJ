@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional `dedupe: { partitionKey, sequence }` on `POST /v1/events/external`
+  (`ExternalEventIngestion`): lets an adapter for an at-least-once
+  message source (Kafka, Kinesis, Pulsar, and similar partitioned-log
+  systems) submit a message's own partition and sequence number so a
+  redelivery after a crash-before-commit creates no second event,
+  instead of the caller needing to build this themselves. A compact
+  per-`(adapter, partition)` watermark, not a row per message - sound
+  because these sources already guarantee strictly increasing delivery
+  order within one partition. Response gains `redelivered: bool`;
+  `sequence` is `null` on a redelivery. Omitting the pair changes
+  nothing. See docs/architecture.md §39.
+
 ## [0.0.4] - 2026-09-04
 
 ### Security

@@ -313,6 +313,31 @@ struct ExternalEventRequest {
     payload: serde_json::Value,
     source_content: String,
     source_context: Option<String>,
+    // docs/architecture.md §39, specs/skilj.allium's own rule
+    // CreateExternalEvent - both-or-neither by construction, not by a
+    // runtime check: `DedupeRequest`'s own two fields are non-optional,
+    // so a request supplying exactly one of them fails ordinary JSON
+    // deserialization (a 400, the same as any other malformed body)
+    // before this handler ever sees it - see db::DedupeCursor's own doc
+    // comment for the full reasoning.
+    dedupe: Option<DedupeRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DedupeRequest {
+    partition_key: String,
+    sequence: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalEventResponse {
+    // `None` only for a `redelivered` response - nothing was created, so
+    // there is no sequence to report, the same "no outcome to describe"
+    // register CreateExternalEventOutcome::Redelivered itself uses.
+    sequence: Option<i64>,
+    redelivered: bool,
 }
 
 #[derive(Deserialize)]
@@ -515,7 +540,7 @@ async fn post_events_external(
     // now - see `db::create_and_insert_external_event`'s own doc
     // comment for why a rejection here no longer burns a sequence
     // number the way it used to.
-    let event = db::create_and_insert_external_event(
+    let outcome = db::create_and_insert_external_event(
         &state.pool,
         state.projection_dispatcher.as_ref(),
         &state.event_broadcaster,
@@ -524,15 +549,30 @@ async fn post_events_external(
         payload,
         body.source_content,
         body.source_context,
+        body.dedupe.as_ref().map(|d| db::DedupeCursor {
+            partition_key: &d.partition_key,
+            sequence: d.sequence,
+        }),
         Utc::now(),
         state.encryption_master_key.as_ref(),
     )
     .await?;
 
+    // A redelivery is still a 201 - the submission was accepted, exactly
+    // as specs/skilj.allium's own ARedeliveryProducesNoEventAndNoOutcome
+    // guarantee describes; it's just that nothing was created. Neither
+    // outcome is an error, so both share this one success response shape,
+    // distinguished by `redelivered` rather than by status code.
+    let (sequence, redelivered) = match outcome {
+        db::CreateExternalEventOutcome::Created(event) => (Some(event.sequence), false),
+        db::CreateExternalEventOutcome::Redelivered => (None, true),
+    };
+
     Ok((
         StatusCode::CREATED,
-        Json(SequenceResponse {
-            sequence: event.sequence,
+        Json(ExternalEventResponse {
+            sequence,
+            redelivered,
         }),
     ))
 }
