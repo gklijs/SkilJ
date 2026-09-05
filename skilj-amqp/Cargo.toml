@@ -1,0 +1,34 @@
+[package]
+name = "skilj-amqp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "A bridge between skilj's own event stream and any AMQP 1.0 broker (Solace PubSub+, Azure Service Bus, ActiveMQ Artemis, ...) - producing mapped EventTypes to an address, and consuming an address into ExternalEventIngestion/CommandTrigger. See docs/architecture.md §42."
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+# rustls, not native-tls: the same TLS backend choice this workspace's
+# own `reqwest`/`jsonwebtoken` dependencies already make - Solace/Azure
+# Service Bus both require TLS (`amqps://`) in any real deployment.
+fe2o3-amqp = { version = "0.17", features = ["rustls"] }
+fe2o3-amqp-types = "0.17"
+
+[lib]
+name = "skilj_amqp"
+path = "src/lib.rs"
+
+[dev-dependencies]
+# Dev-only: proves this crate's AMQP 1.0 calls against a real, ephemeral
+# broker - never a production dependency of skilj-amqp itself. See
+# skilj-kafka's own Cargo.toml for the identical "mock skilj, real
+# external system" reasoning, and CONTRIBUTING.md for the DOCKER_HOST
+# quirk this needs working around on WSL.
+testcontainers = "0.27"
+axum = { workspace = true }

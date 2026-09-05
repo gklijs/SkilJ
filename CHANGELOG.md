@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   above) or `CommandTrigger` (redelivery-safe via `Idempotency-Key`),
   a per-mapping choice - both derive their own key from the message's
   own `"{topic}:{partition}"`/offset. See docs/architecture.md §40.
+- New `skilj-amqp` crate: `skilj-kafka`'s own sibling for any AMQP 1.0
+  broker (Solace PubSub+, Azure Service Bus, ActiveMQ Artemis) via
+  `fe2o3-amqp` (pure Rust). Outbound, a mapped `EventType` is sent to an
+  AMQP address with a DCB tag as `group-id` and the event's own sequence
+  as `group-sequence`. Inbound, an address maps to `ExternalEventIngestion`
+  or `CommandTrigger`; both use the message's own `group-id`/
+  `group-sequence` or `message-id` properties for redelivery safety when
+  the sender populated them (optional in AMQP 1.0, unlike Kafka's own
+  broker-guaranteed offsets - omitted gracefully when absent, never an
+  error). See docs/architecture.md §42.
 
 ## [0.0.4] - 2026-09-04
 

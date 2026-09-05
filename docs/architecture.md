@@ -91,6 +91,8 @@ listed separately here; see that section itself for its own structure.
 - [38. Message-broker bridges (Kafka/Solace/etc.): investigation, not yet built](#38-message-broker-bridges-kafkasolaceetc-investigation-not-yet-built)
 - [39. Built into skilj instead: external-message dedup on `CreateExternalEvent`](#39-built-into-skilj-instead-external-message-dedup-on-createexternalevent)
 - [40. `skilj-kafka`: a bridge to Kafka, both directions](#40-skilj-kafka-a-bridge-to-kafka-both-directions)
+- [41. A skilj "Build-Kit" for eventmodelers.ai: plan, not yet built](#41-a-skilj-build-kit-for-eventmodelersai-plan-not-yet-built)
+- [42. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)](#42-skilj-amqp-a-bridge-to-any-amqp-10-broker-solaceazure-service-busartemis)
 
 ---
 
@@ -6334,3 +6336,180 @@ gets its own uniquely-named topic, so nothing is lost by sharing the
 broker, and the fix is also just faster (~7s for the suite, versus
 20-60s per run before, with the multi-container version's own worst
 case timing out entirely under load).
+
+## 41. A skilj "Build-Kit" for eventmodelers.ai: plan, not yet built
+
+Prompted by a LinkedIn post (Martin Dilger, author of *Understanding
+Eventsourcing*) about "Build-Kits" - reusable, per-language/framework
+packages that let an AI coding agent generate an application from an
+Event Modeling board - with a comment on that post already naming
+Rust/skilj as wanted. Investigated the actual mechanism directly rather
+than planning off the LinkedIn summary alone: traced through
+`eventmodelers.ai` (Nebulit's own platform, distinct from the older
+`eventmodeling.org`/`eventmodeling-toolkit` - two related but separate
+projects, easy to conflate) to a real, working example -
+[`ortegacmanuel/eventmodelers-elixir-fact-kit`](https://github.com/ortegacmanuel/eventmodelers-elixir-fact-kit)
+- and read its actual file tree and `SKILL.md` content, not just its
+README's own description of itself.
+
+**What a Build-Kit actually is - a real finding, not what the name
+suggests**: not a template-engine codegen tool. A git repository
+consumed via `npx @eventmodelers/cli init --stack <name> --git
+<repo>`, containing:
+
+```
+stack.json                              # manifest: label, kitSubdir, needsBoardId
+templates/build-kit/AGENTS.md/CLAUDE.md # top-level orchestration prompt
+templates/.claude/skills/
+  build-state-change/SKILL.md           # write slice: command -> event(s)
+  build-state-view/SKILL.md             # read slice: readmodel/query
+  build-webhook/SKILL.md                # inbound external event
+  build-automation/SKILL.md             # processors/automations
+templates/root/                         # the scaffolded app template itself
+```
+
+A **Claude Code Skill package**, the identical mechanism this
+repository's own `.claude/skills/` already uses - each `SKILL.md`
+teaches an agent how to turn one `slice.json` (exported from a visual
+event-modeling board) into real code for that stack, not a parser+
+template pipeline generating code deterministically.
+
+**The architectural fit is real, checked against the actual
+`build-state-change/SKILL.md` content, not assumed from the concept
+alone**:
+
+| Build-Kit concept | skilj's own concept |
+|---|---|
+| `idAttribute: true` fields -> tags like `"entity:#{id}"` | DCB `tag_mappings` - the identical idea |
+| `Core` module: pure `query`/`initial_state`/`apply_event`/`execute` | `CommandType::decide()` - §1.1's own "synchronous, no I/O" rule |
+| `Context` module wraps execution, owns generated ids/timestamps | `db::submit_command` - the impure layer around a pure `decide()` |
+| Event struct implements `to_fact` (type + tags) | `EventType` + `tag_mappings` |
+| Tests from board-provided example scenarios (`SPEC_ERROR` cases) | matches `skilj-event-modeling`'s own skill, which already elicits named examples this way |
+
+Two existing skilj assets already cover much of what four of a
+Build-Kit's own `SKILL.md` files would need to say, just packaged for a
+different consumer: `.claude/skills/skilj/` (Codeberg issue #3 -
+`EventType`/`CommandType`/`Projection` shapes, `tag_mappings`, schema
+evolution, `#[auto_register]`) and `.claude/skills/skilj-event-modeling/`
+(issue #4 - naming events/commands, `dcb-tags.md`'s own worked
+dual-tag example). `templates/skilj-template/` (issue #10's `cargo
+generate` scaffold) is most of what `templates/root/` would need to be.
+
+**Proposed mapping, one skilj concept per Build-Kit skill**:
+
+- `build-state-change` -> a `CommandType` (the slice's own command) plus
+  the `EventType`(s) its `decide()` can emit; `idAttribute: true`
+  fields become `tag_mappings` entries exactly as `dcb-tags.md` already
+  teaches.
+- `build-state-view` -> a `Projection` (§8 item 6's own
+  keyed/multi-row shape already covers "one instance per id").
+- `build-webhook` -> an `EventType` with `external_creation_allowed =
+  true` (`ExternalEventIngestion`, §39's own `dedupe` mechanism is the
+  natural redelivery-safety answer if the inbound source is itself
+  partitioned/ordered - not assumed necessary for every webhook, a
+  plain one-shot HTTP webhook has no such structure to lean on).
+- `build-automation` -> `EventType.system_triggered_allowed`
+  (scheduled) for a time-based automation, or `CrossContextRoute` (§36)
+  for an event-reacts-to-event one - genuinely two different skilj
+  mechanisms depending on what the board's own automation slice
+  actually describes, not a single answer.
+
+**What's real vs. what's still assumed**: the mapping above is grounded
+in the one real `SKILL.md` actually read
+(`build-state-change`) - `build-state-view`/`build-webhook`/
+`build-automation`'s own equivalents were not fetched (network access
+into that specific repo's remaining files wasn't pursued once the
+pattern was clear), and no literal `slice.json` file was ever found or
+read, anywhere - every source describes its shape in prose
+(`idAttribute`, `commands`/`events`/`readmodels`/`queries`/`processors`,
+`specifications`), never as an actual example. Asked the user directly
+whether a real one was available to ground this before writing
+anything concrete; none was - proceeding on the documented shape,
+flagged here explicitly as the one real risk: field names, nesting, or
+a construct entirely absent from every description read could be wrong
+until checked against a real export.
+
+**Decided, not yet built**: a new, standalone repository (matching
+every existing kit's own one-repo-per-stack convention, referenced via
+its own `--git` flag) - not a directory inside this one. Working name
+`skilj-build-kit`.
+
+## 42. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)
+
+§38's own investigation named AMQP 1.0 (`fe2o3-amqp`, pure Rust) as the
+practical path to Solace specifically, since no healthy Solace-only
+Rust crate exists - the unofficial `solace-rs` needs Solace's own
+proprietary C SDK installed separately and is essentially unused (142
+downloads in 90 days, stale since May 2025). Solace PubSub+ natively
+speaks AMQP 1.0 as a first-class protocol alongside its own
+proprietary one, and so do Azure Service Bus and ActiveMQ Artemis - one
+dependency covers all three via the shared open standard, the user's
+own second choice of protocol to build after `skilj-kafka` (§40).
+
+**A genuinely different delivery model, not just a different
+library.** Confirmed directly against `fe2o3-amqp`'s own real source
+(`Properties`/`Delivery`/`Sender`/`Receiver` APIs), not assumed from
+the concept: AMQP 1.0 has no partitions or broker-assigned offsets - a
+queue/topic *address* instead, and messages that carry only whatever
+metadata their own sender chose to set. The closest analogue of
+Kafka's own broker-assigned `(topic, partition, offset)` is the AMQP
+1.0 standard's own `group-id`/`group-sequence` message properties pair
+(§3.2.4) - real and standard, but *opt-in*: nothing forces a sender to
+populate them, unlike Kafka's own broker-guaranteed offsets. This
+crate's own outbound half always sets them (skilj, not the broker,
+assigns the sequence, so it always can); the inbound half can only use
+them for §39's own `dedupe` mechanism when whatever upstream sender
+populated a given address did too. `message-id` (also standard, far
+more commonly populated in practice - often a UUID) is the fallback for
+`Idempotency-Key` (§21), usable on its own without needing
+`group-sequence`'s own ordering guarantee.
+
+**A real protocol-level limit, documented rather than silently
+handled**: AMQP 1.0's `group-sequence` is a 32-bit field
+(`fe2o3_amqp_types::definitions::SequenceNo = u32`), unlike Kafka's own
+64-bit offsets - confirmed against the actual type alias, not assumed.
+A bounded context whose own sequence exceeds `u32::MAX` has
+`produce_once` omit `group-sequence` rather than silently wrap it into
+a value a downstream consumer could mistake for a genuine, smaller
+ordering.
+
+**`InboundMessageMeta`, not `(topic, partition, offset)`**: since every
+field a message might carry is genuinely optional here (unlike Kafka's
+own always-present triple), `dispatch_inbound_message` takes a plain
+struct of `Option`s rather than deriving guaranteed values itself. A
+`Record` action with no `group-id`/`group-sequence` pair, or a
+`Trigger` action with no `message-id`, simply omits the corresponding
+skilj mechanism (`dedupe`/`Idempotency-Key`) - never an error, the same
+"omitting it is always fine, just not redelivery-safe" register both
+mechanisms already have on skilj's own side.
+
+**Dependency**: `fe2o3-amqp` with the `rustls` feature - the identical
+TLS backend choice this workspace's own `reqwest`/`jsonwebtoken`
+dependencies already make, needed for any real deployment (`amqps://`)
+against Solace/Azure Service Bus.
+
+**Verified against a real, ephemeral AMQP 1.0 broker** - Apache
+ActiveMQ Artemis (`apache/artemis:latest-alpine`, `ANONYMOUS_LOGIN=true`
+for the test's own simplicity), via a plain `testcontainers::GenericImage`
+- no dedicated `testcontainers-modules` feature exists for any AMQP
+broker, confirmed by checking that crate's own full feature list rather
+than assuming one would exist the way it did for Kafka.
+`skilj-amqp/tests/amqp_bridge.rs` mirrors `skilj-kafka/tests/kafka_bridge.rs`'s
+own shape exactly, including its already-learned lesson: one shared
+broker container for the whole file (`OnceCell`) from the start, not
+one per test. Three tests: an outbound event round-trips with its own
+DCB tag as `group-id` and its own skilj sequence as `group-sequence`;
+both inbound actions read a real message's own real AMQP properties
+(sent exactly as an upstream, non-skilj sender would) as their
+dedupe/idempotency key.
+
+**A second real bug caught by testing, immediately after the
+concurrency lesson already learned from `skilj-kafka`**: every test
+failed identically on a first run - `SessionStopped(ConnectionStopped(Closed))`
+- because the test's own `connect()` helper returned only a
+`SessionHandle`, dropping the `ConnectionHandle` (which implements
+`Drop` specifically to close the connection) as soon as the helper
+returned. Fixed by returning both handles and keeping both alive for
+the test's own duration - a real Rust ownership bug in the test
+harness, not the library, caught by running the tests for real rather
+than assuming a compiling test proves anything.

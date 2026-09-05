@@ -12,6 +12,7 @@ members = [
     "skilj-codegen",
     "skilj-temporal",
     "skilj-kafka",
+    "skilj-amqp",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -61,6 +62,11 @@ members = [
 #                 mechanism and §21's Idempotency-Key respectively.
 #                 Speaks skilj's wire protocol and rdkafka only, zero
 #                 dependency on any other skilj crate.
+# skilj-amqp    - skilj-kafka's own sibling (§42), same shape, for any
+#                 AMQP 1.0 broker instead (Solace PubSub+, Azure Service
+#                 Bus, ActiveMQ Artemis) via fe2o3-amqp (pure Rust) - one
+#                 crate covers all three via the shared standard
+#                 protocol rather than a vendor-specific one per target.
 
 [workspace.package]
 version = "0.0.4"
