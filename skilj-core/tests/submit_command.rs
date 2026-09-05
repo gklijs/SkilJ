@@ -728,6 +728,338 @@ fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original
     });
 }
 
+/// docs/architecture.md §37: two different `client_id`s (two different
+/// tenants, in the real multi-tenant shape owner-tag scoping
+/// (`RoleAccessMapping`/`CommandToken`) actually supports) submitting
+/// the *same* `CommandType` with the *same* idempotency-key string must
+/// not collide - the real, already-shipped-since-0.0.2 bug behind this
+/// fix, distinct from `CrossContextRoute`'s own narrower predictable-key
+/// variant (§36). Before `client_id`-scoping, the second tenant's real
+/// submission would have silently short-circuited to the first tenant's
+/// own stored `triggered_event_sequences` instead of ever calling
+/// `decide()`.
+#[test]
+fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_not_collide() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+
+        // A shared, business-derived key - exactly the kind of thing two
+        // unrelated tenants could plausibly pick independently (an order
+        // id, an invoice number), not a random UUID.
+        let key = "invoice-2024-01";
+
+        let tenant_a_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, r#"{"order_id":"A"}"#, &[])
+            .unwrap()
+            .unwrap();
+        let tenant_a_outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            r#"{"order_id":"A"}"#,
+            "tenant-a",
+            &[],
+            &[],
+            &[],
+            tenant_a_decision,
+            None,
+            test_now(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(tenant_a_outcome, SubmitCommandOutcome::Accepted { .. }),
+            "tenant a's first use of this key must be accepted, got {tenant_a_outcome:?}"
+        );
+
+        // Tenant B, a completely unrelated caller (own client_id), reuses
+        // the exact same key string for their own, unrelated order - must
+        // be decided for real, not silently deduplicated against tenant
+        // A's own stored answer.
+        let tenant_b_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, r#"{"order_id":"B"}"#, &[])
+            .unwrap()
+            .unwrap();
+        let tenant_b_outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            r#"{"order_id":"B"}"#,
+            "tenant-b",
+            &[],
+            &[],
+            &[],
+            tenant_b_decision,
+            None,
+            test_now(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap();
+        let SubmitCommandOutcome::Accepted {
+            events: tenant_b_events,
+            ..
+        } = tenant_b_outcome
+        else {
+            panic!(
+                "tenant b's own, unrelated submission must be decided for real, not \
+                 deduplicated against tenant a's - got {tenant_b_outcome:?}"
+            );
+        };
+        assert_eq!(
+            tenant_b_events.len(),
+            1,
+            "tenant b's own OrderShipped must actually have been inserted"
+        );
+
+        // Both tenants' own real submissions are independently persisted -
+        // two Commands, not one dedup hit swallowing the second.
+        let commands = db::list_commands_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.len(),
+            2,
+            "two different clients' own submissions under the same key string \
+             must both actually persist"
+        );
+
+        // Each client retrying their own key still deduplicates correctly
+        // against their own prior answer, not the other's.
+        let tenant_a_retry_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, r#"{"order_id":"A"}"#, &[])
+            .unwrap()
+            .unwrap();
+        let tenant_a_retry_outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            r#"{"order_id":"A"}"#,
+            "tenant-a",
+            &[],
+            &[],
+            &[],
+            tenant_a_retry_decision,
+            None,
+            test_now(),
+            None,
+            Some(key),
+        )
+        .await
+        .unwrap();
+        let SubmitCommandOutcome::Accepted {
+            events: tenant_a_events,
+            ..
+        } = tenant_a_outcome
+        else {
+            unreachable!("checked above");
+        };
+        let tenant_a_sequences: Vec<i64> = tenant_a_events.iter().map(|e| e.sequence).collect();
+        let SubmitCommandOutcome::Deduplicated {
+            triggered_event_sequences,
+        } = tenant_a_retry_outcome
+        else {
+            panic!(
+                "tenant a retrying their own key must still deduplicate against \
+                 their own answer, got {tenant_a_retry_outcome:?}"
+            );
+        };
+        assert_eq!(
+            triggered_event_sequences, tenant_a_sequences,
+            "must dedup to tenant a's own sequences, never tenant b's"
+        );
+    });
+}
+
+/// docs/architecture.md §37: an already-provisioned bounded context's
+/// `idempotency_keys` (a real table since 0.0.2) gets patched onto the
+/// `client_id`-scoped shape - the security-review-driven follow-up to
+/// `ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_this_feature`
+/// above, this time simulating a table that already has *rows* from
+/// before this fix shipped, not just an absent table. Proves the
+/// migration is safe to run against a populated table, and that a
+/// pre-migration row is genuinely retired rather than merely reshuffled -
+/// the user's own explicit call (over preserving it as a fallback for
+/// whoever retries it first) to fully close the cross-tenant collision
+/// class this fix exists for, accepting in exchange that a *genuine*
+/// retry of a pre-migration submission arriving after this migration
+/// runs won't be recognised as a duplicate. See
+/// `migrate_idempotency_keys_client_id_scoping`'s own doc comment for
+/// the full tradeoff.
+#[test]
+fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+
+        // Roll the table back to its pre-fix, 0.0.2-era shape and insert
+        // a row the way that era's own `insert_idempotency_key` would
+        // have - no `client_id` column at all.
+        let schema = format!("\"bc_{}\"", bc.name);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE {schema}.idempotency_keys"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {schema}.idempotency_keys (
+                command_type_name TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                triggered_event_sequences BIGINT[] NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (command_type_name, idempotency_key)
+            )"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.idempotency_keys \
+             (command_type_name, idempotency_key, triggered_event_sequences, created_at) \
+             VALUES ($1, $2, $3, $4)"
+        )))
+        .bind(&ct.name)
+        .bind("legacy-key")
+        .bind([42_i64].as_slice())
+        .bind(test_now())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // What SkiljBuilder::build()'s own startup loop does, per
+        // bounded context, every time - in the real order, since
+        // `ensure_idempotency_keys_table` must run first (it's a no-op
+        // here, the table already exists) before the migration checks
+        // for what it might need to patch.
+        db::ensure_idempotency_keys_table(&pool, &bc.name)
+            .await
+            .unwrap();
+        db::migrate_idempotency_keys_client_id_scoping(&pool, &bc.name)
+            .await
+            .unwrap();
+
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+        let payload = r#"{"order_id":"A"}"#;
+
+        // Even the caller who originally wrote the legacy row (were they
+        // to retry with the exact same key string) gets a fresh,
+        // real Accepted outcome, not Deduplicated - the pre-migration
+        // row is never matched by anyone again, on purpose, by the
+        // user's own explicit choice (see this test's own doc comment).
+        let decision = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+        let outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "whoever-originally-submitted-this",
+            &[],
+            &[],
+            &[],
+            decision,
+            None,
+            test_now(),
+            None,
+            Some("legacy-key"),
+        )
+        .await
+        .unwrap();
+        let SubmitCommandOutcome::Accepted {
+            events: retried_events,
+            ..
+        } = outcome
+        else {
+            panic!(
+                "a pre-migration row must never be matched again - decide() runs for \
+                 real, got {outcome:?}"
+            );
+        };
+        assert_eq!(
+            retried_events.len(),
+            1,
+            "the retry actually persisted a real new event, not a cached answer"
+        );
+
+        // The row itself is untouched, not deleted - this codebase's own
+        // "nothing is ever deleted" precedent still holds; it's simply
+        // never looked up again.
+        let legacy_row_still_present: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT triggered_event_sequences[1] FROM {schema}.idempotency_keys \
+             WHERE client_id = '' AND idempotency_key = 'legacy-key'"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_row_still_present.0, 42);
+
+        // A different client using a key string that was never claimed
+        // pre-migration gets decided for real too - ordinary, unaffected
+        // behaviour for any key that isn't a pre-migration leftover.
+        let fresh_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, r#"{"order_id":"B"}"#, &[])
+            .unwrap()
+            .unwrap();
+        let fresh_outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            r#"{"order_id":"B"}"#,
+            "a-different-client",
+            &[],
+            &[],
+            &[],
+            fresh_decision,
+            None,
+            test_now(),
+            None,
+            Some("a-different-key-this-client-owns"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(fresh_outcome, SubmitCommandOutcome::Accepted { .. }),
+            "a different client's own, never-before-seen key must be decided for real, \
+             got {fresh_outcome:?}"
+        );
+    });
+}
+
 /// The direct counterpart to the test above: no `idempotency_key` at all
 /// (the default for every existing caller) must show today's unchanged
 /// double-processing behaviour - two full `Accepted` outcomes, two real

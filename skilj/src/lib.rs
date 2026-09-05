@@ -1450,6 +1450,16 @@ impl SkiljBuilder {
                     // free once the table already exists - see
                     // `ensure_idempotency_keys_table`'s own doc comment.
                     skilj_core::db::ensure_idempotency_keys_table(pool, &bc.name).await?;
+                    // docs/architecture.md §37: patches an already-
+                    // provisioned bounded context's `idempotency_keys`
+                    // (a real table since 0.0.2) onto the `client_id`-
+                    // scoped shape `ensure_idempotency_keys_table` above
+                    // already gives a brand-new one directly - a no-op
+                    // for one that already has it, migrated or fresh.
+                    // See `migrate_idempotency_keys_client_id_scoping`'s
+                    // own doc comment.
+                    skilj_core::db::migrate_idempotency_keys_client_id_scoping(pool, &bc.name)
+                        .await?;
                     // Cross-tenant projection read fix
                     // (docs/architecture.md's own write-up of this pass):
                     // same "patched into every bounded context, every

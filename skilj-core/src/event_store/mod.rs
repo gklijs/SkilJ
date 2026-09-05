@@ -1091,6 +1091,16 @@ pub fn valid_payload(schema: &str, payload: &str) -> bool {
 /// (or coincidentally) picks a key starting with this exact literal
 /// prefix, who gets rejected same as an attacker would; low enough
 /// odds in practice to accept as this mechanism's tradeoff.
+///
+/// **No longer load-bearing** since docs/architecture.md §37's
+/// `client_id`-scoped `idempotency_keys` (`db::ensure_idempotency_keys_table`'s
+/// own doc comment) - no external caller's `client_id` is ever
+/// caller-suppliable, so no external submission could land under
+/// `CrossContextRoute`'s own partition regardless of what
+/// `idempotency_key` string it used, prefix or not. Kept anyway as
+/// harmless defense-in-depth (the same register the `Deduplicated`
+/// warning in `catch_up_cross_context_route` already keeps for a
+/// scenario the reservation itself is meant to make unreachable).
 pub const RESERVED_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-cross-context-route:";
 
 /// Checked by `authorise_command_trigger`/`authorise_command_submission`'s
@@ -1105,7 +1115,9 @@ pub const RESERVED_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-cross-context-route:";
 /// (see that resolver's own doc comment) rather than out of necessity.
 /// `Ok(())` for `None` - omitting an idempotency key entirely is always
 /// fine, the same "unchanged behaviour when absent" every other
-/// idempotency-key caller already gets.
+/// idempotency-key caller already gets. See `RESERVED_IDEMPOTENCY_KEY_PREFIX`'s
+/// own doc comment for why this check is no longer this mechanism's
+/// real defense, just a harmless second layer on top of it.
 pub fn reject_reserved_idempotency_key(idempotency_key: Option<&str>) -> crate::error::Result<()> {
     match idempotency_key {
         Some(key) if key.starts_with(RESERVED_IDEMPOTENCY_KEY_PREFIX) => {

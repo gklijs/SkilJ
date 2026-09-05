@@ -87,6 +87,7 @@ listed separately here; see that section itself for its own structure.
 - [34. `skilj-temporal`: a plan, partially built (long-running/cross-system processes)](#34-skilj-temporal-a-plan-partially-built-long-runningcross-system-processes)
 - [35. Configurable connection pool sizing](#35-configurable-connection-pool-sizing)
 - [36. `CrossContextRoute`: crossing bounded contexts without an external system](#36-crosscontextroute-crossing-bounded-contexts-without-an-external-system)
+- [37. `idempotency_keys` gets `client_id`-scoped: a real cross-tenant collision, live since 0.0.2](#37-idempotency_keys-gets-client_id-scoped-a-real-cross-tenant-collision-live-since-002)
 
 ---
 
@@ -5853,20 +5854,138 @@ Postgres-backed test on each wire boundary
 asserting both the specific error code and that nothing was written to
 the event store at all.
 
-**Known limitation, not closed here**: the fix above patches the two
+**Follow-up, closed for real in §37**: the fix above patched the two
 existing callers, not the shared `idempotency_keys` table's own
-structural gap - its primary key is still `(command_type_name,
-idempotency_key)` with no caller/client_id column, even though
-`client_id` is already threaded through every `submit_command`/
-`decide_and_submit_command` call site for the resulting event's own
-metadata. A future caller of the public `submit_command`/
-`decide_and_submit_command` API that forwards a caller-supplied
-idempotency key without independently re-adding a
-`reject_reserved_idempotency_key` call compiles and passes the existing
-test suite while silently reopening this same class of bug - nothing
-enforces that obligation beyond the doc comment on
-`ensure_idempotency_keys_table` saying so. Widening the table's key to
-include `client_id` would close this structurally; not done here since
-exactly one internal caller (`CrossContextRoute`) has needed it so far,
-and a schema change for one caller felt premature - revisit if a second
-one ever does.
+structural gap - investigating that gap further surfaced a second, more
+serious bug already live since 0.0.2, not merely a future risk. See §37.
+
+## 37. `idempotency_keys` gets `client_id`-scoped: a real cross-tenant collision, live since 0.0.2
+
+Prompted by asking "investigate the primary key with no caller/client_id
+- what is the potential real problem?" of §36's own "known limitation"
+note above, rather than accepting that note's framing (a future-caller
+risk) at face value.
+
+**The original decision, and why it held up at the time.** §21 (issue
+#12) explicitly decided `idempotency_keys` scoping would be
+`(bounded_context, command_type)` only, "not also per-caller" - resolved
+with the user directly, not an oversight. That held up fine under its
+own assumption: a well-randomized caller-chosen key (a UUID) practically
+never collides with another caller's by accident, so *which* caller
+wrote a row was never something the lookup needed to know.
+
+**What broke the assumption.** Owner-tag multi-tenancy (§23/§25/§30),
+built *after* issue #12, means many distinct tenants can legitimately
+submit the *same* `CommandType` in one bounded context - each with their
+own `CommandToken`/`RoleAccessMapping`, disambiguated only by that
+grant's own `scope` (`authorise_command_trigger`/
+`authorise_command_submission`, skilj-core/src/event_store/mod.rs),
+invisible to `idempotency_keys`. A business-derived idempotency key (an
+order id, an invoice number - a common, even recommended, convention)
+from one tenant can plausibly coincide with an unrelated tenant's own,
+with no attacker, guessing, or malice needed at all. Verified this was
+actually reachable, not merely plausible, by reading the real
+authorization code rather than assuming: `CommandToken.scope`/
+`RoleAccessMapping.scope` are the *only* thing distinguishing two
+tenants hitting the same `CommandType`, and `client_id` in
+`CommandAuthorised` (`token.id` for REST, `access_mapping.role.id` for
+GraphQL) is a real, already-existing, per-tenant-grant identifier -
+already threaded through `submit_command`/`decide_and_submit_command`
+for the resulting event's own metadata, just never used to scope the
+idempotency lookup.
+
+**The actual bug.** Two tenants, same `CommandType`, same key string:
+the second tenant's real submission silently short-circuits to
+`Deduplicated`, returning the *first* tenant's own `triggered_event_sequences`.
+Two harms, not one: the second tenant's real command never runs at all
+(`decide()` never executes, nothing persists) while the API reports
+`accepted: true` - a silent write-loss/correctness bug, not merely a
+leak - and the second tenant also receives sequence numbers belonging to
+an unrelated tenant's own event stream, a minor cross-tenant
+disclosure (existence/ordering, not payload). This has been live since
+**0.0.2** (2026-08-30, when issue #12 shipped) - `CrossContextRoute`'s
+own predictable-key variant of the same root cause (§36) is narrower and
+newer, not the original or the more consequential form of this bug.
+
+**The fix**: `idempotency_keys`' primary key becomes `(command_type_name,
+client_id, idempotency_key)`. `client_id` was already available at
+every call site for other reasons - this is purely a matter of finally
+scoping the lookup by it. A useful side effect: this structurally closes
+`CrossContextRoute`'s own §36 issue too, on a firmer footing than the
+reserved-prefix convention that fix shipped with - no external caller's
+`client_id` is ever caller-suppliable (always derived server-side from
+an authenticated token/role), so no external submission can ever land
+under `"cross-context-route"`'s own partition regardless of what
+`idempotency_key` string it uses, prefix or not.
+`RESERVED_IDEMPOTENCY_KEY_PREFIX`/`reject_reserved_idempotency_key` stay
+in place as harmless defense-in-depth, no longer load-bearing.
+
+**Migrating an already-provisioned bounded context** (real ones exist,
+back to 0.0.2) needed more than this codebase's established `ALTER
+TABLE ... ADD COLUMN IF NOT EXISTS` idiom
+(`ensure_projection_state_owner_columns`/`ensure_event_scoping_columns`)
+covers - the whole point is `client_id` must be *part of the primary
+key*, and Postgres has no `ADD CONSTRAINT IF NOT EXISTS`/`ALTER PRIMARY
+KEY` form to lean on for that half. `db::migrate_idempotency_keys_client_id_scoping`
+(called from `SkiljBuilder::build()`'s own per-bounded-context startup
+loop, right after `ensure_idempotency_keys_table`) wraps `ADD COLUMN ...
+DEFAULT ''` + `DROP CONSTRAINT` + `ADD PRIMARY KEY` in one transaction,
+guarded by a check against `information_schema.key_column_usage` (skip
+if `client_id` is already part of the primary key) and a
+`pg_advisory_xact_lock` keyed by the bounded context's own schema name
+for the transaction's whole duration - needed because, unlike `ADD
+COLUMN IF NOT EXISTS`, a second concurrent `ADD PRIMARY KEY` after a
+first one already committed is a hard Postgres error ("multiple primary
+keys ... not allowed"), not a silent no-op; a real fleet runs more than
+one instance, and the existing per-process warm-up concurrency (Codeberg
+issue #15) only serializes work *within* one process. `_xact` (not
+plain `pg_advisory_lock`) both releases automatically at commit/rollback
+and guarantees the lock and the statements it protects share one
+connection, rather than each landing on a different one from the pool.
+
+**The legacy-row tradeoff - the user's own explicit call.** A
+pre-migration row never recorded who submitted it - not recoverable by
+any cleverer migration, the information was simply never written.
+Backfilled to `client_id = ''` (this codebase's own "nothing is ever
+deleted" precedent, §21) rather than deleted, but two genuinely
+different failure modes were on the table for what `lookup_idempotency_key`
+does with that backfilled row afterward, and there's no third option
+that avoids both:
+
+- Keep it matchable as a fallback for whoever retries that same string
+  first: preserves dedup power for a genuine old retry (avoiding a
+  double-execution), but leaves a frozen, never-growing set of
+  already-used key strings still able to collide across unrelated
+  *future* callers who happen to reuse one of those specific strings -
+  proven directly in an early draft of this fix's own test suite, then
+  corrected once the implication was surfaced.
+- Retire it permanently, matched by no one ever again: fully closes the
+  collision class this fix exists for, with no residual, shrinking or
+  not - at the cost that a genuine retry of a request submitted just
+  before this migration runs won't be recognised as a duplicate,
+  possibly double-executing a real command.
+
+Asked directly rather than decided unilaterally (the first draft of
+this fix chose the fallback and only surfaced the tradeoff after a test
+written to prove it "worked" instead proved the residual collision was
+real): the user chose to retire pre-migration rows outright, prioritising
+fully closing the cross-tenant collision class over preserving legacy
+retry-safety at its edges. The row itself stays in the table, permanently
+orphaned rather than deleted - `lookup_idempotency_key` is a plain,
+non-fallback `client_id = $2` match, nothing more.
+
+**Verified**: `skilj-core/tests/submit_command.rs` -
+`submit_command_with_the_same_idempotency_key_from_two_different_clients_does_not_collide`
+(two tenants, one shared key string, both get real, independent
+`Accepted` outcomes; each tenant's own retry still correctly dedups
+against their own answer, never the other's) and
+`migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows`
+(rolls a table back to its literal pre-fix, column-for-column 0.0.2
+shape with a real legacy row, migrates it, and proves the legacy row
+is never matched again - even by whoever originally wrote it - while
+staying physically present in the table, and that an unrelated fresh
+key works normally). The full existing `skilj-core` test suite (every
+test binary, real embedded Postgres) passes unchanged, including
+`CrossContextRoute`'s own end-to-end test and the REST/GraphQL
+idempotency-key wire tests from §36's own fix - `cargo build/clippy -D
+warnings/test` and `cargo fmt --check` clean throughout.

@@ -989,26 +989,46 @@ pub async fn update_private_field_grant(
 
 /// `idempotency_keys` - a caller-supplied idempotency key on command
 /// submission (Codeberg issue #12), one row per `(command_type_name,
-/// idempotency_key)` that has ever produced a real `Accepted` outcome. A
-/// duplicate submission bearing the same key short-circuits to the
-/// stored `triggered_event_sequences` rather than being re-decided -
-/// see `submit_command`'s own doc comment for the full design.
+/// client_id, idempotency_key)` that has ever produced a real `Accepted`
+/// outcome. A duplicate submission bearing the same key from the same
+/// caller short-circuits to the stored `triggered_event_sequences`
+/// rather than being re-decided - see `submit_command`'s own doc
+/// comment for the full design.
 ///
-/// Deliberately no caller/client_id column - every caller of
-/// `submit_command`/`decide_and_submit_command` to date has only ever
-/// needed to collide with its *own* past submissions. `CrossContextRoute`
-/// (docs/architecture.md §36) broke that assumption first, placing an
-/// unauthenticated internal key into this same caller-writable
-/// namespace, which is why `event_store::reject_reserved_idempotency_key`
-/// exists - see its own doc comment. **Any future caller that forwards a
-/// caller-supplied `idempotency_key` into `submit_command`/
-/// `decide_and_submit_command` must call `reject_reserved_idempotency_key`
-/// on it first**, the same as `skilj-rest`'s and `skilj-graphql`'s own
-/// wire handlers already do; nothing here enforces that at the type
-/// level, so it's a convention, not a guarantee - widening this table's
-/// key to include a caller/client_id column would close the gap
-/// structurally instead, at the cost of a schema migration not yet
-/// justified by more than one internal caller needing it.
+/// `client_id`-scoped since docs/architecture.md §37 - originally
+/// `(command_type_name, idempotency_key)` only (issue #12's own
+/// deliberate call: "not also per-caller"), which held up fine under
+/// that decision's own assumption - a well-randomized caller-chosen key
+/// (a UUID, say) never collides with another caller's by accident. Owner-
+/// tag multi-tenancy (§23/§25/§30), built after issue #12, broke that
+/// assumption: many distinct tenants (distinct `CommandToken`s/
+/// `RoleAccessMapping`s, disambiguated only by their own `scope`,
+/// invisible to this table) routinely submit the *same* `CommandType`,
+/// and a business-derived key (an order id, an invoice number - a
+/// common, even recommended, idempotency-key convention) from one
+/// tenant can plausibly coincide with an unrelated tenant's own, with no
+/// attacker needed at all. A collision silently swallowed the second
+/// tenant's real submission as a `Deduplicated` hit against the first
+/// tenant's own stored sequences - a live bug since issue #12 shipped in
+/// 0.0.2, not merely `CrossContextRoute`'s narrower predictable-key
+/// variant (§36) of the same root cause. `client_id` (`token.id` for
+/// REST, `access_mapping.role.id` for GraphQL, `"cross-context-route"`
+/// for that internal caller - `authorise_command_trigger`/
+/// `authorise_command_submission`'s own `CommandAuthorised.client_id`)
+/// was already threaded through every caller for the resulting event's
+/// own metadata; it's simply never scoped the idempotency lookup before
+/// now. This structurally closes `CrossContextRoute`'s own issue too,
+/// since no external caller's `client_id` is ever caller-suppliable -
+/// it's always derived server-side from an authenticated token/role, so
+/// no external submission can ever land under `"cross-context-route"`'s
+/// own partition regardless of what `idempotency_key` string it uses.
+/// `RESERVED_IDEMPOTENCY_KEY_PREFIX`/`reject_reserved_idempotency_key`
+/// stay in place as harmless defense-in-depth, no longer load-bearing.
+///
+/// See `migrate_idempotency_keys_client_id_scoping` for how an
+/// already-provisioned bounded context (real ones exist, back to 0.0.2)
+/// gets patched onto this shape - this function alone only ever governs
+/// a brand-new one.
 ///
 /// `impl PgExecutor`, the same "works on `&Pool` autocommit or inside a
 /// caller's own open `Transaction`" treatment `update_role` already
@@ -1018,11 +1038,11 @@ pub async fn update_private_field_grant(
 /// `skilj/src/lib.rs` needs the former, patching a bounded context
 /// provisioned *before* this feature existed. `CREATE TABLE IF NOT
 /// EXISTS`, called unconditionally on every `build()`, is the whole
-/// migration story here - there's no general per-bounded-context schema
-/// migration mechanism in this codebase (`provision_bounded_context_schema`
-/// itself only ever runs once, at creation), and this deliberately isn't
-/// one either, just a small, targeted, idempotent patch for this one
-/// table.
+/// migration story for a table that doesn't exist yet at all - there's
+/// no general per-bounded-context schema migration mechanism in this
+/// codebase (`provision_bounded_context_schema` itself only ever runs
+/// once, at creation), and this deliberately isn't one either, just a
+/// small, targeted, idempotent patch for this one table's existence.
 #[tracing::instrument(skip_all)]
 pub async fn ensure_idempotency_keys_table<'e>(
     executor: impl sqlx::PgExecutor<'e>,
@@ -1032,14 +1052,127 @@ pub async fn ensure_idempotency_keys_table<'e>(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS {schema}.idempotency_keys (
             command_type_name TEXT NOT NULL,
+            client_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
             triggered_event_sequences BIGINT[] NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
-            PRIMARY KEY (command_type_name, idempotency_key)
+            PRIMARY KEY (command_type_name, client_id, idempotency_key)
         )"
     )))
     .execute(executor)
     .await?;
+    Ok(())
+}
+
+/// Patches an already-provisioned bounded context's `idempotency_keys`
+/// (real ones exist, back to 0.0.2 - see `ensure_idempotency_keys_table`'s
+/// own doc comment for the full story) onto the `client_id`-scoped shape
+/// a brand-new one gets directly. `ALTER TABLE ... ADD COLUMN IF NOT
+/// EXISTS`, this file's own established idempotent-patch idiom
+/// (`ensure_projection_state_owner_columns`/`ensure_event_scoping_columns`),
+/// isn't enough by itself here - the whole point is this column must be
+/// *part of the primary key*, and Postgres has no `ADD CONSTRAINT IF NOT
+/// EXISTS`/`ALTER PRIMARY KEY` form to lean on for that half.
+///
+/// Backfilled `''` (never a real `client_id` - always a server-derived
+/// token/role id or `"cross-context-route"`, never empty) rather than
+/// deleted, matching this codebase's own explicit "no retention/TTL,
+/// nothing is ever deleted" precedent (§21) - but, on the user's own
+/// explicit call, deliberately left permanently *unmatchable* by
+/// `lookup_idempotency_key` rather than kept as a fallback for whichever
+/// caller retries that same string first. Two ways to fail were on the
+/// table for a row this migration cannot attribute to its original
+/// caller (that information was simply never recorded pre-migration,
+/// not recoverable by any cleverer migration): keep it matchable for
+/// anyone, which fully closes future double-execution risk but leaves a
+/// frozen, non-growing set of already-used key strings still able to
+/// collide across unrelated future callers; or retire it, which fully
+/// closes *that* risk but means a genuine retry of a request submitted
+/// just before this migration ran won't be recognised as a duplicate -
+/// `decide()` runs again, possibly inserting a real command's events
+/// twice. Chosen: retire it - this fix exists specifically to close the
+/// cross-tenant collision class, and leaving any part of it open, even
+/// a shrinking one, was judged worse than the narrower, one-time
+/// migration-boundary risk. The row stays in the table (never deleted),
+/// permanently orphaned rather than reachable.
+///
+/// Wrapped in one transaction (fine - Postgres DDL is fully
+/// transactional, unlike MySQL's) holding a `pg_advisory_xact_lock`
+/// keyed by this bounded context's own schema name for its entire
+/// duration: two skilj instances patching the same shared Postgres at
+/// startup (the existing concurrent-bounded-context warm-up loop in
+/// `skilj/src/lib.rs`, Codeberg issue #15, only protects against a race
+/// *within* one process - a real fleet runs more than one) would
+/// otherwise race the `PRIMARY KEY` swap below, which has no idempotent
+/// form: a second `ADD PRIMARY KEY` after a first one already committed
+/// is a hard Postgres error ("multiple primary keys ... not allowed"),
+/// not a silent no-op the way `ADD COLUMN IF NOT EXISTS` is elsewhere in
+/// this file. `_xact` (transaction-scoped, not session-scoped) releases
+/// automatically at this function's own commit or rollback and is
+/// guaranteed to run on the same connection as the statements it
+/// protects, both being inside the one transaction - unlike a bare
+/// `pg_advisory_lock` against a `&Pool`, where the lock and the work it
+/// protects could each be handed a different pooled connection
+/// entirely, making the lock meaningless.
+#[tracing::instrument(skip_all)]
+pub async fn migrate_idempotency_keys_client_id_scoping(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    // Mirrors `schema_ident`'s own `"bc_{bounded_context}"` shape, minus
+    // the quoting - `information_schema` stores identifiers unquoted
+    // (quoting is parse-time syntax, not a stored property), so a query
+    // against it needs the raw name, not the `format!`-ready quoted one
+    // every DDL string above uses.
+    let raw_schema = format!("bc_{bounded_context}");
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&raw_schema)
+        .execute(&mut *tx)
+        .await?;
+
+    // Checked against the primary key specifically, not merely the
+    // column's existence - robust even against a hypothetical partially-
+    // applied prior attempt (column added, PK swap not yet reached).
+    let already_migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.key_column_usage
+            WHERE table_schema = $1 AND table_name = 'idempotency_keys'
+              AND constraint_name = 'idempotency_keys_pkey'
+              AND column_name = 'client_id'
+        )",
+    )
+    .bind(&raw_schema)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if already_migrated {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.idempotency_keys \
+         ADD COLUMN IF NOT EXISTS client_id TEXT NOT NULL DEFAULT ''"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.idempotency_keys DROP CONSTRAINT IF EXISTS idempotency_keys_pkey"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.idempotency_keys \
+         ADD PRIMARY KEY (command_type_name, client_id, idempotency_key)"
+    )))
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -5020,7 +5153,7 @@ pub async fn submit_command(
     // every other early return in this function; nothing was written.
     if let Some(key) = idempotency_key {
         if let Some(triggered_event_sequences) =
-            lookup_idempotency_key(&mut *tx, &schema, &command_type.name, key).await?
+            lookup_idempotency_key(&mut *tx, &schema, &command_type.name, client_id, key).await?
         {
             return Ok(SubmitCommandOutcome::Deduplicated {
                 triggered_event_sequences,
@@ -5242,6 +5375,7 @@ pub async fn submit_command(
             &mut *tx,
             &schema,
             &command_type.name,
+            client_id,
             key,
             &triggered_event_sequences,
             now,
@@ -5531,15 +5665,17 @@ pub async fn catch_up_cross_context_route(
                     continue;
                 };
                 // Prefixed with `RESERVED_IDEMPOTENCY_KEY_PREFIX` - a
-                // security-review finding: the shared `idempotency_keys`
-                // table has no caller/client_id column at all, so
-                // without this reservation an ordinary Write-level
-                // caller could pre-plant `"{route.name}:{sequence}"` via
-                // `submitCommand`/`Idempotency-Key` ahead of time and
+                // Historical note (docs/architecture.md §36/§37): this
+                // prefix originally existed because `idempotency_keys`
+                // had no caller/client_id column at all, so an ordinary
+                // Write-level caller could pre-plant `"{route.name}:{sequence}"`
+                // via `submitCommand`/`Idempotency-Key` ahead of time and
                 // silently swallow this submission as a `Deduplicated`
-                // no-op. `reject_reserved_idempotency_key` is what keeps
-                // that namespace exclusively this task's own - see its
-                // own doc comment.
+                // no-op. `idempotency_keys` is `client_id`-scoped now (this
+                // call's own `client_id` below is always `"cross-context-route"`,
+                // never externally suppliable), which closes that gap
+                // structurally - this reservation is kept as a harmless
+                // second layer, not the load-bearing defense it was.
                 let idempotency_key = format!(
                     "{}{}:{}",
                     crate::event_store::RESERVED_IDEMPOTENCY_KEY_PREFIX,
@@ -5595,24 +5731,33 @@ pub async fn catch_up_cross_context_route(
 }
 
 /// A hit returns the stored `triggered_event_sequences` from a prior
-/// `Accepted` outcome for this exact `(command_type_name,
-/// idempotency_key)` pair - `submit_command`'s own short-circuit. Must
+/// `Accepted` outcome for this exact `(command_type_name, client_id,
+/// idempotency_key)` triple - `submit_command`'s own short-circuit. Must
 /// only be called after the bounded context's own `sequence` row lock
 /// is already held (see `submit_command`'s own doc comment) - that lock
 /// is what makes this plain, unlocked `SELECT` race-free, the same way
 /// it already makes the DCB-conflict recheck a few lines below it
 /// race-free.
+///
+/// A real `client_id`-only match, never a `client_id = ''` legacy row -
+/// see `migrate_idempotency_keys_client_id_scoping`'s own doc comment
+/// for why a pre-migration row is deliberately left permanently
+/// unmatchable rather than kept as a fallback: the user's own explicit
+/// call, choosing to fully close the cross-tenant collision this whole
+/// fix exists for over preserving those specific rows' dedup power.
 async fn lookup_idempotency_key<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     schema: &str,
     command_type_name: &str,
+    client_id: &str,
     idempotency_key: &str,
 ) -> crate::error::Result<Option<Vec<i64>>> {
     let row: Option<(Vec<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT triggered_event_sequences FROM {schema}.idempotency_keys \
-         WHERE command_type_name = $1 AND idempotency_key = $2"
+         WHERE command_type_name = $1 AND client_id = $2 AND idempotency_key = $3"
     )))
     .bind(command_type_name)
+    .bind(client_id)
     .bind(idempotency_key)
     .fetch_optional(executor)
     .await?;
@@ -5621,27 +5766,29 @@ async fn lookup_idempotency_key<'e>(
 
 /// Records a real `Accepted` outcome against its idempotency key, inside
 /// the same transaction as the `Command`/`Event` rows it describes - a
-/// later duplicate submission bearing this key short-circuits to
-/// `triggered_event_sequences` via `lookup_idempotency_key` instead of
-/// being re-decided. No `ON CONFLICT` - the sequence row lock already
-/// rules out a concurrent duplicate reaching here (`lookup_idempotency_key`
-/// would already have caught it); a real conflict here would mean a bug
-/// in that check, worth surfacing as a hard error rather than silently
-/// swallowing.
+/// later duplicate submission bearing this key from this same
+/// `client_id` short-circuits to `triggered_event_sequences` via
+/// `lookup_idempotency_key` instead of being re-decided. No `ON
+/// CONFLICT` - the sequence row lock already rules out a concurrent
+/// duplicate reaching here (`lookup_idempotency_key` would already have
+/// caught it); a real conflict here would mean a bug in that check,
+/// worth surfacing as a hard error rather than silently swallowing.
 async fn insert_idempotency_key<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     schema: &str,
     command_type_name: &str,
+    client_id: &str,
     idempotency_key: &str,
     triggered_event_sequences: &[i64],
     now: DateTime<Utc>,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.idempotency_keys \
-         (command_type_name, idempotency_key, triggered_event_sequences, created_at) \
-         VALUES ($1, $2, $3, $4)"
+         (command_type_name, client_id, idempotency_key, triggered_event_sequences, created_at) \
+         VALUES ($1, $2, $3, $4, $5)"
     )))
     .bind(command_type_name)
+    .bind(client_id)
     .bind(idempotency_key)
     .bind(triggered_event_sequences)
     .bind(now)

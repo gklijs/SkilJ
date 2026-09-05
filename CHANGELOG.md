@@ -36,6 +36,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller-supplied idempotency key that uses it at both the REST trigger
   and `submitCommand` GraphQL wire boundaries. See docs/architecture.md
   §36.
+- Investigating the fix above surfaced a second, more serious,
+  **already-shipped** issue in `idempotency_keys` (live since 0.0.2, not
+  new to this release): its key was `(command_type_name,
+  idempotency_key)` only, not scoped per caller at all. In a bounded
+  context with multiple tenants (owner-tag scoping,
+  `RoleAccessMapping`/`CommandToken` `scope`) submitting the same
+  `CommandType`, two unrelated tenants choosing the same idempotency-key
+  string - plausible with business-derived keys (an order id, an
+  invoice number), no attacker needed - would silently collide: the
+  second tenant's real command never ran, and they received sequence
+  numbers belonging to the first tenant's own event stream. Fixed by
+  scoping `idempotency_keys`' key to `(command_type_name, client_id,
+  idempotency_key)`, migrated onto every already-provisioned bounded
+  context (self-hosted deployments on 0.0.2/0.0.3 should upgrade).
+  **Breaking, deliberately, for one edge case**: a genuine retry of a
+  request submitted just before this migration runs will no longer be
+  recognised as a duplicate (pre-migration rows are retired, not
+  reused) - accepted in exchange for fully closing the collision above
+  rather than leaving any part of it open. See docs/architecture.md §37.
 
 ### Added
 
