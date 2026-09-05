@@ -1,10 +1,11 @@
 # Releasing
 
-The workspace has 10 crates. 9 are published to crates.io:
+The workspace has 11 crates. 10 are published to crates.io:
 `skilj-macros`, `skilj-core`, `skilj-graphql`, `skilj-rest`, `skilj`,
-`skilj-codegen`, `skilj-tui`, `skilj-inspector`, `skilj-temporal`.
-`skilj-demo` is not (`publish = false` in its `Cargo.toml` - it's a
-worked example, not a library anyone should depend on).
+`skilj-codegen`, `skilj-tui`, `skilj-inspector`, `skilj-temporal`,
+`skilj-kafka`. `skilj-demo` is not (`publish = false` in its
+`Cargo.toml` - it's a worked example, not a library anyone should
+depend on).
 
 ## Version sync
 
@@ -54,8 +55,9 @@ Derived from the real internal dependency graph:
    `skilj-macros`)
 5. `skilj-tui` (zero internal deps), `skilj-inspector` (depends on
    `skilj-core` only), `skilj-temporal` (zero internal deps - it speaks
-   only skilj's wire protocol, the same posture as `skilj-tui`) -
-   independent of each other and of `skilj`
+   only skilj's wire protocol, the same posture as `skilj-tui`),
+   `skilj-kafka` (zero internal deps, the same posture as
+   `skilj-temporal`) - independent of each other and of `skilj`
 
 Wait for each crate to finish indexing on crates.io
 (`cargo search <crate>` or the crates.io page) before publishing
@@ -75,6 +77,7 @@ cargo publish -p skilj
 cargo publish -p skilj-tui
 cargo publish -p skilj-inspector
 cargo publish -p skilj-temporal
+cargo publish -p skilj-kafka
 ```
 
 `skilj-temporal` needs a `protoc` binary on `PATH` (or `PROTOC` set) to
@@ -92,6 +95,13 @@ touching any of the three as something to actually review, not the
 same "trust semver, move on" confidence the rest of this workspace's
 dependencies warrant - a patch-level bump there is more likely than
 usual to need a real code change here, not just a version bump.
+
+`skilj-kafka` needs a C compiler that can see `curl/curl.h` at build
+time - `rdkafka`'s vendored `librdkafka` (the `cmake-build` feature)
+includes that header unconditionally regardless of CURL support being
+compiled out. See CONTRIBUTING.md's own note for the workaround with no
+root available; wherever the publish actually runs needs this too,
+`cargo publish` builds the crate as part of its own verification step.
 
 ## After publishing
 

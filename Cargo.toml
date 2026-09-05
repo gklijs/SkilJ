@@ -11,6 +11,7 @@ members = [
     "skilj-inspector",
     "skilj-codegen",
     "skilj-temporal",
+    "skilj-kafka",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -51,6 +52,15 @@ members = [
 #                 wire protocol only, zero dependency on any other
 #                 skilj crate - the same "independently usable"
 #                 posture skilj-tui already has, from the outside.
+# skilj-kafka   - skilj-temporal's own direct sibling (§40): a bridge
+#                 between skilj's own event stream and Kafka, both
+#                 directions - producing mapped EventTypes to topics
+#                 (REST consume/ack, the identical delivery mechanism)
+#                 and consuming topics into ExternalEventIngestion/
+#                 CommandTrigger, redelivery-safe via §39's dedupe
+#                 mechanism and §21's Idempotency-Key respectively.
+#                 Speaks skilj's wire protocol and rdkafka only, zero
+#                 dependency on any other skilj crate.
 
 [workspace.package]
 version = "0.0.4"

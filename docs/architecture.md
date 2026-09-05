@@ -90,6 +90,7 @@ listed separately here; see that section itself for its own structure.
 - [37. `idempotency_keys` gets `client_id`-scoped: a real cross-tenant collision, live since 0.0.2](#37-idempotency_keys-gets-client_id-scoped-a-real-cross-tenant-collision-live-since-002)
 - [38. Message-broker bridges (Kafka/Solace/etc.): investigation, not yet built](#38-message-broker-bridges-kafkasolaceetc-investigation-not-yet-built)
 - [39. Built into skilj instead: external-message dedup on `CreateExternalEvent`](#39-built-into-skilj-instead-external-message-dedup-on-createexternalevent)
+- [40. `skilj-kafka`: a bridge to Kafka, both directions](#40-skilj-kafka-a-bridge-to-kafka-both-directions)
 
 ---
 
@@ -6232,3 +6233,104 @@ assertion, then restored and reconfirmed green. Full existing
 `skilj-core` test suite (every binary, real embedded Postgres) passes
 unchanged. `cargo build/clippy -D warnings/fmt --check` clean
 throughout.
+
+## 40. `skilj-kafka`: a bridge to Kafka, both directions
+
+§38's own investigation ranked `rdkafka` as the most-downloaded, most
+actively-maintained crate for the category the user's own example named
+(Kafka); §39 closed the one real gap that would have made an inbound
+bridge unsafe. This section builds the crate itself -
+`skilj-temporal`'s (§34) direct sibling, same posture (wire-protocol
+client only, zero dependency on any other skilj crate), one real
+difference in shape: `skilj-temporal` only ever reacts to skilj's own
+events (one direction), where a message broker genuinely needs both.
+
+**Outbound** (`OutboundMapping`/`produce_once`/`run_outbound`): a skilj
+`EventType` -> a Kafka topic, via the identical `GET
+/v1/events/consume`/`POST /v1/events/consume/ack` delivery mechanism
+`skilj_temporal::poll_once`/`run` already establish - produces to Kafka
+*before* acknowledging to skilj, never the reverse order, so a crash
+between the two redelivers the same event next cycle rather than
+silently dropping it. Kafka's own analogue of a Temporal workflow id is
+the *message key* (drives partition assignment) - derived from one of
+the event's own DCB tags (`correlation_key`), the identical "derived
+from a tag, not a fresh concept" register `correlation_workflow_id`
+already uses, just without that function's own "no correlation tag is
+an error" rule: an unkeyed Kafka message is still perfectly valid,
+Kafka itself just gets to place it.
+
+**Inbound** (`InboundMapping`/`dispatch_inbound_message`/`run_inbound`):
+no equivalent in `skilj-temporal`. A Kafka topic maps to one of two
+skilj actions, a per-mapping choice mirroring `MappingAction`'s own
+signal-vs-start split - both now genuinely safe under Kafka's
+at-least-once redelivery, which is precisely why §39 had to exist
+before this could be built responsibly:
+
+- `InboundAction::Record` - `POST /v1/events/external`, redelivery-safe
+  via §39's own `dedupe` mechanism.
+- `InboundAction::Trigger` - `POST /v1/commands/trigger`,
+  redelivery-safe via `Idempotency-Key` (§21), itself `client_id`-scoped
+  since §37 so this mapping's own traffic can never collide with an
+  unrelated caller's.
+
+Both derive their own redelivery-safety key identically:
+`"{topic}:{partition}"` as the partition key, the message's own
+`offset` as the sequence - Kafka's guarantee of strictly increasing,
+in-order delivery within one partition is exactly the property both
+mechanisms need, the same one `skilj_temporal`'s own
+`"{run_id}:{activity_id}"` convention (§34 phase 1) leans on one level
+further out. The Kafka offset itself is committed (`run_inbound`) only
+after skilj confirms the call succeeded, so a redelivery calls skilj
+again rather than skipping the message - safe *because* the skilj-side
+mechanisms make that redelivered call a no-op, not because this loop is
+itself clever about it. A `Trigger` business rejection (`200 {
+accepted: false, ... }`) is not inspected or retried - the message was
+successfully delivered and decided upon, which is all this bridge ever
+promises, so the offset still commits.
+
+**Dependency and a real build-time snag, worked around, not routed
+around**: `rdkafka` with the `cmake-build` feature (vendors and
+compiles `librdkafka` from source - no system package needed). Hit
+exactly the kind of environment quirk this project's own CONTRIBUTING.md
+already tracks a few of: this librdkafka version `#include`s
+`curl/curl.h` unconditionally in `rdkafka_conf.c`, even with
+`WITH_CURL=0` passed - a real upstream quirk, confirmed by reading the
+actual C source, not a Cargo feature misconfiguration. With no root
+available in this environment: `apt-get download
+libcurl4-openssl-dev` (no root needed) + `dpkg-deb -x` to extract just
+the headers, `CPATH` pointed at them. See CONTRIBUTING.md's own new
+note for the full recipe.
+
+**Verified against a real, ephemeral Kafka broker, not mocked at the
+protocol level that matters** - `testcontainers-modules`' `kafka`
+feature (KRaft mode, no ZooKeeper), dev-dependency only. Getting Docker
+itself reachable in this sandbox needed its own real investigation, not
+an assumption: the `docker` CLI on `PATH` here is a wrapper script
+hardcoding a stale WSL Docker Desktop `DOCKER_HOST` that no longer
+resolves - `unset DOCKER_HOST` falls back to the real, working socket
+at `/var/run/docker.sock`, confirmed with `docker run hello-world`
+before trusting it for anything real. `skilj-kafka/tests/kafka_bridge.rs`
+mirrors `skilj-temporal/tests/temporal_bridge.rs`'s own "mock skilj +
+real external system" shape exactly - skilj's own wire contracts are
+each already exhaustively tested elsewhere, so this crate's own job is
+proving it calls them correctly with real Kafka messages on the other
+end. Three tests: an outbound event round-trips through a real topic
+with its own tag as the key, and both inbound actions carry a real
+message's own real partition/offset as their dedupe/idempotency key -
+not synthesised values, obtained by actually producing and consuming a
+real message and reading its own fields back.
+
+**A real concurrency finding along the way, fixed properly rather than
+documented as a limitation**: an early draft started one Kafka
+container per test (three total) rather than sharing one across the
+file - unlike every embedded-Postgres-backed test suite in this
+workspace, which already shares one `OnceCell`-provisioned instance per
+file. Running three containers concurrently (`cargo test`'s own default
+parallelism) genuinely starved this sandbox's Docker daemon
+(`OperationTimedOut` on topic creation, reproduced across repeated
+runs, not a one-off). Refactored to the established one-shared-instance
+shape instead of just recommending `--test-threads=1` - each test still
+gets its own uniquely-named topic, so nothing is lost by sharing the
+broker, and the fix is also just faster (~7s for the suite, versus
+20-60s per run before, with the multi-container version's own worst
+case timing out entirely under load).

@@ -25,12 +25,17 @@ jobs:
       - name: Install rustfmt and clippy
         run: rustup component add rustfmt clippy
 
-      - name: Install protoc
-        # skilj-temporal needs this at build time - one of its
-        # dependencies (prost-wkt-types, via temporalio-client) generates
-        # Rust from .proto files in its own build script and doesn't
-        # vendor protoc itself. See CONTRIBUTING.md's own note.
-        run: apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+      - name: Install protoc and libcurl headers
+        # protobuf-compiler: skilj-temporal needs this at build time - one
+        # of its dependencies (prost-wkt-types, via temporalio-client)
+        # generates Rust from .proto files in its own build script and
+        # doesn't vendor protoc itself.
+        # libcurl4-openssl-dev: skilj-kafka's rdkafka dependency vendors
+        # librdkafka from source (cmake-build), which #includes
+        # curl/curl.h unconditionally even with CURL support compiled
+        # out - a real upstream quirk, not something this crate's own
+        # Cargo features avoid. See CONTRIBUTING.md's own notes on both.
+        run: apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libcurl4-openssl-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check

@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order within one partition. Response gains `redelivered: bool`;
   `sequence` is `null` on a redelivery. Omitting the pair changes
   nothing. See docs/architecture.md §39.
+- New `skilj-kafka` crate: a bridge between skilj's own event stream and
+  Kafka, both directions. Outbound, a mapped `EventType` is produced to
+  a Kafka topic (message key derived from a DCB tag) via the same
+  `GET /v1/events/consume`/`POST /v1/events/consume/ack` mechanism
+  `skilj-temporal` already uses. Inbound, a Kafka topic maps to either
+  `ExternalEventIngestion` (redelivery-safe via the `dedupe` mechanism
+  above) or `CommandTrigger` (redelivery-safe via `Idempotency-Key`),
+  a per-mapping choice - both derive their own key from the message's
+  own `"{topic}:{partition}"`/offset. See docs/architecture.md §40.
 
 ## [0.0.4] - 2026-09-04
 

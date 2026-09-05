@@ -55,6 +55,40 @@ the note on `/tmp` filling up below) for 15 days; they skip gracefully,
 the same tolerance the embedded-Postgres tests above already have, if
 that download can't reach the network.
 
+Building `skilj-kafka` (docs/architecture.md §39/§40) needs a C compiler
+that can see `curl/curl.h` at build time - `rdkafka-sys`'s own vendored
+`librdkafka` (`cmake-build` feature, which compiles it from source
+rather than needing a system `libcurl4-openssl-dev` package broadly
+installed) includes that header unconditionally in `rdkafka_conf.c`
+even with CURL support itself compiled out (`WITH_CURL=0`) - a real
+upstream quirk in this librdkafka version, not something a Cargo
+feature avoids. With no root available: `apt-get download
+libcurl4-openssl-dev` (no root needed, downloads the `.deb` to the
+current directory without installing it) then `dpkg-deb -x
+libcurl4-openssl-dev_*.deb extracted` and point `CPATH` at
+`extracted/usr/include` (and, on a multiarch system,
+`extracted/usr/include/x86_64-linux-gnu` too, where the actual
+`curl/curl.h` lives) - `CPATH` is a plain GCC/Clang env var honoured by
+angle-bracket `#include`s regardless of the build system driving the
+compiler, so no `cmake`/`rdkafka-sys` configuration is needed beyond
+setting it. Confirmed by testing, not assumed: a full real-Kafka
+integration test (produce, consume, assert the payload round-trips)
+compiled and ran clean with only this env var set.
+
+`skilj-kafka`'s own real-Kafka tests (`skilj-kafka/tests/`) need a
+reachable Docker daemon (`testcontainers-modules`' `kafka` feature - a
+real, ephemeral, KRaft-mode Kafka container, no ZooKeeper). On WSL with
+Docker Desktop, the `docker` CLI on `PATH` may be a wrapper script that
+hardcodes a stale `DOCKER_HOST` (observed pointing at a
+`docker-desktop-bind-mounts` socket path that no longer exists) -
+`unset DOCKER_HOST` before running these tests lets the client fall
+back to the real, working socket at `/var/run/docker.sock` (confirmed
+present and reachable via `docker version`/`docker run hello-world`
+once unset). A known environment quirk, not a code problem - these
+tests skip gracefully (the same `skipping:` tolerance every other
+real-dependency test in this codebase already has) if Docker still
+can't be reached after that.
+
 A `postgresql_embedded`-backed test process's own data directory lives
 under `/tmp` by default. On a small `/tmp` (a tmpfs capped well under
 the host's real disk, common in a container or a WSL distro) a long
