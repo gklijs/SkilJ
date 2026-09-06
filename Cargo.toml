@@ -13,6 +13,7 @@ members = [
     "skilj-temporal",
     "skilj-kafka",
     "skilj-amqp",
+    "skilj-nats",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -67,6 +68,11 @@ members = [
 #                 Bus, ActiveMQ Artemis) via fe2o3-amqp (pure Rust) - one
 #                 crate covers all three via the shared standard
 #                 protocol rather than a vendor-specific one per target.
+# skilj-nats    - a third sibling (§43), for NATS JetStream - a
+#                 genuinely different delivery model again (no
+#                 partitions; broker-assigned (stream, stream-sequence)
+#                 on every message, unlike AMQP's sender-optional
+#                 group-id/group-sequence).
 
 [workspace.package]
 version = "0.0.4"

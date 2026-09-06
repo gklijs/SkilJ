@@ -40,6 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sender populated them (optional in AMQP 1.0, unlike Kafka's own
   broker-guaranteed offsets - omitted gracefully when absent, never an
   error). See docs/architecture.md §42.
+- New `skilj-nats` crate: a third bridge sibling, for NATS JetStream via
+  `async-nats`. Outbound, a mapped `EventType` is published to a subject
+  with a DCB tag as a `Skilj-Correlation-Key` header and
+  `"{bounded_context}:{sequence}"` as `Nats-Msg-Id` (getting JetStream's
+  own native, server-side idempotent-publish deduplication for free).
+  Inbound, a subject maps to `ExternalEventIngestion` (always
+  redelivery-safe - JetStream's own `(stream, stream_sequence)` is
+  broker-assigned on every message, never optional) or `CommandTrigger`
+  (via `Nats-Msg-Id` when an upstream sender populated one). See
+  docs/architecture.md §43.
 
 ## [0.0.4] - 2026-09-04
 

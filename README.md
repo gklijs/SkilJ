@@ -103,6 +103,7 @@ banking and courses) if you want to see more before committing.
 | [`skilj-temporal`](skilj-temporal) | Optional: a bridge from skilj's own event stream to [Temporal](https://temporal.io) - start or signal a workflow execution correlated by a DCB tag. See `docs/architecture.md` §34. |
 | [`skilj-kafka`](skilj-kafka) | Optional: a bridge between skilj's own event stream and Kafka, both directions - produce mapped events to a topic, consume a topic into `ExternalEventIngestion`/`CommandTrigger`. See `docs/architecture.md` §40. |
 | [`skilj-amqp`](skilj-amqp) | Optional: `skilj-kafka`'s own sibling for any AMQP 1.0 broker - Solace PubSub+, Azure Service Bus, ActiveMQ Artemis. See `docs/architecture.md` §42. |
+| [`skilj-nats`](skilj-nats) | Optional: a third bridge sibling, for NATS JetStream. See `docs/architecture.md` §43. |
 | [`skilj-macros`](skilj-macros) | Internal proc-macros, re-exported through `skilj-core`/`skilj` (not uniformly - each macro picks whichever crate it applies to) - you won't normally add this directly. |
 
 ## Documentation

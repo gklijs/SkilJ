@@ -1,11 +1,11 @@
 # Releasing
 
-The workspace has 12 crates. 11 are published to crates.io:
+The workspace has 13 crates. 12 are published to crates.io:
 `skilj-macros`, `skilj-core`, `skilj-graphql`, `skilj-rest`, `skilj`,
 `skilj-codegen`, `skilj-tui`, `skilj-inspector`, `skilj-temporal`,
-`skilj-kafka`, `skilj-amqp`. `skilj-demo` is not (`publish = false` in
-its `Cargo.toml` - it's a worked example, not a library anyone should
-depend on).
+`skilj-kafka`, `skilj-amqp`, `skilj-nats`. `skilj-demo` is not
+(`publish = false` in its `Cargo.toml` - it's a worked example, not a
+library anyone should depend on).
 
 ## Version sync
 
@@ -56,8 +56,9 @@ Derived from the real internal dependency graph:
 5. `skilj-tui` (zero internal deps), `skilj-inspector` (depends on
    `skilj-core` only), `skilj-temporal` (zero internal deps - it speaks
    only skilj's wire protocol, the same posture as `skilj-tui`),
-   `skilj-kafka`/`skilj-amqp` (zero internal deps, the same posture as
-   `skilj-temporal`) - independent of each other and of `skilj`
+   `skilj-kafka`/`skilj-amqp`/`skilj-nats` (zero internal deps, the same
+   posture as `skilj-temporal`) - independent of each other and of
+   `skilj`
 
 Wait for each crate to finish indexing on crates.io
 (`cargo search <crate>` or the crates.io page) before publishing
@@ -79,6 +80,7 @@ cargo publish -p skilj-inspector
 cargo publish -p skilj-temporal
 cargo publish -p skilj-kafka
 cargo publish -p skilj-amqp
+cargo publish -p skilj-nats
 ```
 
 `skilj-temporal` needs a `protoc` binary on `PATH` (or `PROTOC` set) to

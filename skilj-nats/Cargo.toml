@@ -1,0 +1,30 @@
+[package]
+name = "skilj-nats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "A bridge between skilj's own event stream and NATS JetStream - producing mapped EventTypes to a subject, and consuming a subject into ExternalEventIngestion/CommandTrigger. See docs/architecture.md §43."
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+futures-util.workspace = true
+async-nats = "0.50"
+
+[lib]
+name = "skilj_nats"
+path = "src/lib.rs"
+
+[dev-dependencies]
+# Dev-only: proves this crate's JetStream calls against a real,
+# ephemeral NATS server - never a production dependency of skilj-nats
+# itself. See skilj-kafka's own Cargo.toml for the identical "mock
+# skilj, real external system" reasoning.
+testcontainers-modules = { version = "0.15", features = ["nats"] }
+axum = { workspace = true }

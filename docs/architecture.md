@@ -93,6 +93,7 @@ listed separately here; see that section itself for its own structure.
 - [40. `skilj-kafka`: a bridge to Kafka, both directions](#40-skilj-kafka-a-bridge-to-kafka-both-directions)
 - [41. A skilj "Build-Kit" for eventmodelers.ai: plan, not yet built](#41-a-skilj-build-kit-for-eventmodelersai-plan-not-yet-built)
 - [42. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)](#42-skilj-amqp-a-bridge-to-any-amqp-10-broker-solaceazure-service-busartemis)
+- [43. `skilj-nats`: a bridge to NATS JetStream](#43-skilj-nats-a-bridge-to-nats-jetstream)
 
 ---
 
@@ -6513,3 +6514,92 @@ returned. Fixed by returning both handles and keeping both alive for
 the test's own duration - a real Rust ownership bug in the test
 harness, not the library, caught by running the tests for real rather
 than assuming a compiling test proves anything.
+
+## 43. `skilj-nats`: a bridge to NATS JetStream
+
+§38's third named candidate (`async-nats` actually out-downloads
+`rdkafka`, pure Rust, a much simpler ops story than either Kafka or an
+enterprise AMQP broker - no ZooKeeper/KRaft, no broker cluster to run).
+`skilj-kafka`'s (§40)/`skilj-amqp`'s (§42) third sibling - a third
+delivery model again, confirmed against `async-nats`'s own real source
+(pulled locally, mirroring how both prior bridges were researched) and
+a real example already inside the `testcontainers-modules` crate's own
+test suite for the exact JetStream flow this bridge needed.
+
+**Core NATS pub/sub is the wrong layer, on purpose not used at all** -
+fire-and-forget, no redelivery concept whatsoever, which makes every
+mechanism this whole family of bridges exists to use (`dedupe`, §39;
+`Idempotency-Key`, §21) meaningless: there is nothing to guard against
+redelivering if delivery was never guaranteed once. JetStream, NATS's
+own persistence layer, is what actually gives an at-least-once
+guarantee worth building around - `skilj-nats` speaks JetStream only.
+
+**A third delivery model, not a copy of either prior one**: JetStream
+has no partition concept at all - one stream is one ordered sequence,
+addressed by subject. Every message a `PullConsumer` ever delivers
+carries a real, broker-assigned `(stream, stream_sequence)` pair
+(`Message::info()`, confirmed against the real `Info` struct - never
+optional, closer to Kafka's own guaranteed-metadata story than AMQP's
+sender-optional `group-id`/`group-sequence`). The one genuinely
+optional piece is `Nats-Msg-Id` (a header) - used for `Idempotency-Key`
+on the inbound `Trigger` path the same way AMQP's `message-id` already
+is, and - a real, favourable difference from both prior bridges - by
+this crate's own *outbound* half too, to get JetStream's own native,
+server-side idempotent-publish deduplication for free
+(`PublishAck.duplicate`): neither Kafka's producer-side idempotence
+(unbounded for one producer session) nor AMQP (no built-in publish-side
+dedup at all) offers this.
+
+**Correlation, honestly not a routing mechanism here**: NATS has no
+Kafka-style "key routes to a partition" concept - JetStream streams
+aren't partitioned, so a DCB tag maps onto a plain
+`Skilj-Correlation-Key` header instead, informational for whatever
+downstream consumer wants to filter or group by it, not something this
+crate or NATS itself acts on. Documented as a real, narrower thing than
+Kafka's own key or AMQP's `group-id`, not oversold as equivalent.
+
+**Redelivery safety**: outbound sets `Nats-Msg-Id` to
+`"{bounded_context}:{sequence}"` (the same shape `skilj_temporal::signal_request_id`
+already uses, one field narrower - a stream has no separate event-type
+dimension to disambiguate); inbound `Record` always has `dedupe`
+available (JetStream's own guaranteed `(stream, stream_sequence)`),
+`Trigger` uses `Nats-Msg-Id` only when an upstream sender populated one -
+the identical "omit rather than fabricate" register both prior bridges
+already have, `InboundMessageMeta::from_message` made `pub` so a caller
+holding a real delivery (a test, or code outside `run_inbound`'s own
+loop) can build one directly.
+
+**`run_inbound` takes one `InboundMapping`, not a lookup table** - a
+genuine, structural simplification over `skilj_kafka::run_inbound`'s
+own `HashMap<String, InboundMapping>`: a JetStream `PullConsumer` is
+already bound to its own stream and subject filter at creation, unlike
+an `rdkafka` consumer that can subscribe to several topics on one
+connection, so there's no per-address dispatch this crate needs to do
+itself.
+
+**Verified against a real, ephemeral NATS server with JetStream
+enabled** (`testcontainers_modules::nats`, which has a dedicated
+feature unlike AMQP) - `skilj-nats/tests/nats_bridge.rs` mirrors both
+prior bridges' own "mock skilj, real external system" shape, applying
+the shared-container lesson from the very first draft this time (no
+repeat of `skilj-kafka`'s own first-draft mistake). Three tests: an
+outbound event publishes with its own DCB tag as
+`Skilj-Correlation-Key` and `"{bounded_context}:{sequence}"` as
+`Nats-Msg-Id`; both inbound actions read a real message's own real
+JetStream metadata (sent exactly as an upstream, non-skilj sender
+would) as their dedupe/idempotency key.
+
+**One real bug caught immediately by actually running the test, not
+just compiling it**: `InboundMessageMeta::from_message` was originally
+private, written only for `run_inbound`'s own internal use - the test
+file's own need to call it directly from outside the crate surfaced
+that it needed to be `pub`, exactly the same "a real caller with a
+delivery in hand needs this too" reasoning that shaped the rest of this
+crate's own public API.
+
+**Verified**: 3 unit tests (correlation-key derivation) + 3 real
+end-to-end tests against a real ephemeral NATS+JetStream server, all
+passing reliably across repeated runs, default and single-threaded
+parallelism, and fast (under a second per run once the image is
+cached) thanks to the shared-container pattern applied from the start.
+Full workspace build/clippy -D warnings/fmt --check/allium check clean.
