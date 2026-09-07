@@ -63,12 +63,12 @@ members = [
 #                 mechanism and §21's Idempotency-Key respectively.
 #                 Speaks skilj's wire protocol and rdkafka only, zero
 #                 dependency on any other skilj crate.
-# skilj-amqp    - skilj-kafka's own sibling (§42), same shape, for any
+# skilj-amqp    - skilj-kafka's own sibling (§41), same shape, for any
 #                 AMQP 1.0 broker instead (Solace PubSub+, Azure Service
 #                 Bus, ActiveMQ Artemis) via fe2o3-amqp (pure Rust) - one
 #                 crate covers all three via the shared standard
 #                 protocol rather than a vendor-specific one per target.
-# skilj-nats    - a third sibling (§43), for NATS JetStream - a
+# skilj-nats    - a third sibling (§42), for NATS JetStream - a
 #                 genuinely different delivery model again (no
 #                 partitions; broker-assigned (stream, stream-sequence)
 #                 on every message, unlike AMQP's sender-optional

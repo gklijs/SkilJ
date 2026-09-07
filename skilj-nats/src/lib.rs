@@ -1,6 +1,6 @@
 //! A bridge between skilj's own event stream and NATS JetStream -
-//! docs/architecture.md §43, a third sibling alongside `skilj-kafka`
-//! (§40) and `skilj-amqp` (§42), each for a genuinely different
+//! docs/architecture.md §42, a third sibling alongside `skilj-kafka`
+//! (§40) and `skilj-amqp` (§41), each for a genuinely different
 //! delivery model. Wire-protocol client only, on both sides: zero
 //! dependency on any other skilj crate, the same "independently usable"
 //! posture the other two bridges already have.

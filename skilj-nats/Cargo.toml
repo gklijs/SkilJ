@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "A bridge between skilj's own event stream and NATS JetStream - producing mapped EventTypes to a subject, and consuming a subject into ExternalEventIngestion/CommandTrigger. See docs/architecture.md §43."
+description = "A bridge between skilj's own event stream and NATS JetStream - producing mapped EventTypes to a subject, and consuming a subject into ExternalEventIngestion/CommandTrigger. See docs/architecture.md §42."
 
 [dependencies]
 tokio.workspace = true

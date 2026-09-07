@@ -1,6 +1,6 @@
 //! A bridge between skilj's own event stream and any AMQP 1.0 broker
 //! (Solace PubSub+, Azure Service Bus, ActiveMQ Artemis, and any other
-//! AMQP 1.0-compliant broker) - docs/architecture.md §42,
+//! AMQP 1.0-compliant broker) - docs/architecture.md §41,
 //! `skilj-kafka`'s (§40) sibling for a genuinely different delivery
 //! model. Wire-protocol client only, on both sides: zero dependency on
 //! any other skilj crate, the same "independently usable" posture

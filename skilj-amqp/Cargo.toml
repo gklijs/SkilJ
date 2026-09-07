@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "A bridge between skilj's own event stream and any AMQP 1.0 broker (Solace PubSub+, Azure Service Bus, ActiveMQ Artemis, ...) - producing mapped EventTypes to an address, and consuming an address into ExternalEventIngestion/CommandTrigger. See docs/architecture.md §42."
+description = "A bridge between skilj's own event stream and any AMQP 1.0 broker (Solace PubSub+, Azure Service Bus, ActiveMQ Artemis, ...) - producing mapped EventTypes to an address, and consuming an address into ExternalEventIngestion/CommandTrigger. See docs/architecture.md §41."
 
 [dependencies]
 tokio.workspace = true
