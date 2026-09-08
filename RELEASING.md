@@ -83,12 +83,10 @@ cargo publish -p skilj-amqp
 cargo publish -p skilj-nats
 ```
 
-`skilj-temporal` needs a `protoc` binary on `PATH` (or `PROTOC` set) to
-build at all - one of its dependencies generates Rust from `.proto`
-files in its own build script. `cargo publish` builds the crate as part
-of its own verification step, so this has to be true wherever the
-publish actually runs, not just wherever it was developed. See
-CONTRIBUTING.md's own note for how to get one without root.
+`skilj-temporal` no longer needs a system `protoc` binary as of 0.0.5 -
+it builds via `temporalio-client`'s own `vendored-protox` feature
+instead (pure-Rust `protox`, no external compiler). See
+CONTRIBUTING.md's own note.
 
 `skilj-temporal`'s own dependencies - `temporalio-client`/
 `temporalio-common`/`temporalio-sdk-core` (dev-only) - are "Public

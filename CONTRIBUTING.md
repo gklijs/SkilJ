@@ -27,27 +27,21 @@ it (a JetBrains IDE's bundled LLDB often ships one, e.g. under
 'libxml2.so.2*' 2>/dev/null` locates one) - this is a known environment
 quirk, not a code problem, and not specific to this project.
 
-Building `skilj-temporal` ([docs/architecture.md §34](docs/architecture.md#skilj-temporal-plan)) needs a `protoc`
-binary at compile time - `temporalio-protos` (a `temporalio-client`
-dependency) compiles Temporal's own `.proto` files in its own build
-script and doesn't vendor `protoc` itself, nor expose a feature to
-(tried unifying in a `vendored-protox` feature via a feature-only
-`prost-wkt-types` dependency, the trick that crate itself supports -
-that only fixes `prost-wkt-types`'s own smaller build step, not
-`temporalio-protos`'s, which has no such escape hatch and `links =
-"temporalio_protos"`, so nothing downstream can inject one either;
-confirmed by testing, not assumed). Install it via your system package
-manager (`apt-get install protobuf-compiler` on Debian/Ubuntu, `apk add
-protoc` on Alpine) or, with no root available, download a prebuilt
-release directly (e.g.
-`https://github.com/protocolbuffers/protobuf/releases`, a
-`protoc-*-linux-x86_64.zip`) and point `PROTOC` at the extracted
-`bin/protoc`. This is purely a build-time compiler - the compiled
-binary has no runtime dependency on `protoc`/`libprotobuf` at all
-(confirmed with `ldd`), so a multi-stage Docker build only needs this
-in the *builder* stage; a genuinely `FROM scratch` final image (see
-`templates/skilj-template/Dockerfile`) is completely unaffected either
-way. `skilj-temporal`'s own real-Temporal-service tests
+Building `skilj-temporal` ([docs/architecture.md §34](docs/architecture.md#skilj-temporal-plan)) no longer needs a
+system `protoc` binary: `temporalio-client`/`temporalio-common` 1.0.0
+(bumped from 0.8.0 as part of 0.0.5) added a `vendored-protox` feature,
+which this crate now enables - it forwards down to `temporalio-protos`'s
+own `vendored-protox` (pulling in the pure-Rust `protox` compiler
+instead of shelling out to a system `protoc`) via
+[sdk-rust#1590](https://github.com/temporalio/sdk-rust/pull/1590).
+Confirmed by testing, not assumed: a full `cargo build`/`cargo
+test -p skilj-temporal` (including the real-ephemeral-Temporal-service
+integration tests below) passes clean with no `protoc` anywhere on
+`PATH` and no `PROTOC` env var set. The 1.0.0 bump did need one small
+source change - `WorkflowIdConflictPolicy`/`WorkflowIdReusePolicy` moved
+from a `temporalio_common::protos::...` re-export to being owned
+directly by `temporalio_client` - see `skilj-temporal/src/lib.rs`'s
+imports. `skilj-temporal`'s own real-Temporal-service tests
 (`skilj-temporal/tests/temporal_bridge.rs`) separately download a small
 ephemeral test-server binary on first run, cached under
 `~/.cache/skilj-temporal-test-server` (deliberately never `/tmp` - see

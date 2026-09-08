@@ -43,11 +43,11 @@
 use serde::Deserialize;
 use std::time::Duration;
 use temporalio_client::errors::{WorkflowInteractionError, WorkflowStartError};
-use temporalio_client::{Client, UntypedSignal, WorkflowSignalOptions, WorkflowStartOptions};
-use temporalio_common::data_converters::{PayloadConverter, RawValue};
-use temporalio_common::protos::temporal::api::enums::v1::{
-    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+use temporalio_client::{
+    Client, UntypedSignal, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    WorkflowSignalOptions, WorkflowStartOptions,
 };
+use temporalio_common::data_converters::{PayloadConverter, RawValue};
 use temporalio_common::UntypedWorkflow;
 
 /// One skilj `EventType`'s own mapping to a Temporal action.

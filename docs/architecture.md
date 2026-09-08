@@ -5690,6 +5690,24 @@ Re-verified after all four fixes: `cargo build/clippy -D warnings/test
 (up from 9), real Postgres and the real ephemeral Temporal service
 throughout, `allium check`/`plan` still unchanged (449 obligations).
 
+**Addendum (0.0.5): the `protoc` requirement above is gone.** A user
+tip pointed at [sdk-rust#1589](https://github.com/temporalio/sdk-rust/issues/1589),
+closed via [#1590](https://github.com/temporalio/sdk-rust/pull/1590):
+`temporalio-client`/`temporalio-common` 1.0.0 (up from 0.8.0) added a
+`vendored-protox` feature, forwarding down to `temporalio-protos`'s own
+`vendored-protox` - the pure-Rust `protox` compiler instead of shelling
+out to a system `protoc`. Enabled in `skilj-temporal/Cargo.toml`;
+confirmed by testing, not assumed - `cargo build/clippy -D
+warnings/test -p skilj-temporal` (including the real-ephemeral-Temporal
+integration tests) passes clean with no `protoc` on `PATH` and no
+`PROTOC` set. The 1.0.0 bump needed one real source change:
+`WorkflowIdConflictPolicy`/`WorkflowIdReusePolicy` moved from a
+`temporalio_common::protos::...` re-export to being owned directly by
+`temporalio_client` - a two-line import fix, no behavior change. Still
+"Public Preview" caution applies going forward (see RELEASING.md) - this
+was a welcome upstream fix landing four days before this release, not a
+signal the API has stopped evolving.
+
 <a id="connection-pool-sizing"></a>
 ## 35. Configurable connection pool sizing
 

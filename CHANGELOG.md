@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-09-08
+
 ### Added
 
 - Optional `dedupe: { partitionKey, sequence }` on `POST /v1/events/external`
@@ -271,7 +273,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.4...HEAD
+[Unreleased]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.5...HEAD
+[0.0.5]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.4...v0.0.5
 [0.0.4]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.3...v0.0.4
 [0.0.3]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.2...v0.0.3
 [0.0.2]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.1...v0.0.2

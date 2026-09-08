@@ -14,8 +14,8 @@ serde_json.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-temporalio-client = "0.8.0"
-temporalio-common = "0.8.0"
+temporalio-client = { version = "1.0.0", features = ["vendored-protox"] }
+temporalio-common = "1.0.0"
 
 [lib]
 name = "skilj_temporal"
@@ -27,5 +27,5 @@ path = "src/lib.rs"
 # itself (which speaks only `temporalio-client`, the thin gRPC client -
 # see docs/architecture.md §34's own note on why `temporalio-sdk`, the
 # worker/Activity-authoring crate, is deliberately not depended on).
-temporalio-sdk-core = { version = "0.8.0", features = ["ephemeral-server"] }
+temporalio-sdk-core = { version = "0.9.0", features = ["ephemeral-server"] }
 axum = { workspace = true }
