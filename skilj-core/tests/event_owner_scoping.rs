@@ -143,6 +143,8 @@ fn read_token(et: &EventType, scope: Option<&str>) -> EventReadToken {
         event_type: et.clone(),
         scope: scope.map(str::to_string),
         start_from: EventReadStartPosition::Beginning,
+        start_at_sequence: None,
+        start_at_time: None,
     }
 }
 
