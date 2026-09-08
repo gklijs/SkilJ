@@ -878,6 +878,23 @@ pub trait CrossContextRoute {
     /// submission already is.
     const NAME: &'static str;
 
+    /// Where this route's own durable cursor starts the first time it is
+    /// ever registered - `Beginning` (the default) replays every
+    /// `Source` occurrence ever committed, exactly what every route
+    /// registered before this const existed already does. A route whose
+    /// job is a side effect that must never re-fire for old history (the
+    /// canonical case: `UserRegistered -> SendWelcomeEmail`) overrides
+    /// this to `Latest`, the `CrossContextRoute`-side counterpart to
+    /// `EventReadStartPosition::Latest` on the spec-backed `EventReadToken`
+    /// track (docs/architecture.md's own write-up of this pass) - a
+    /// separate Rust-only type rather than reusing that one, since a
+    /// route has no spec entity of its own to hang a shared type off of
+    /// (§36's own "no spec entity" note). See
+    /// `db::catch_up_cross_context_route`'s own doc comment for exactly
+    /// when this is read - only on this route's first-ever catch-up
+    /// tick, never again once a cursor row exists.
+    const START_FROM: CrossContextRouteStartFrom = CrossContextRouteStartFrom::Beginning;
+
     /// `None` skips this occurrence of `Source` entirely - no command
     /// submitted, cursor still advances (retrying can never produce a
     /// target payload for an occurrence this route itself decided
@@ -887,6 +904,18 @@ pub trait CrossContextRoute {
     fn route(
         source_payload: &<Self::Source as EventType>::Payload,
     ) -> Option<<Self::Target as CommandType>::Payload>;
+}
+
+/// See `CrossContextRoute::START_FROM`. Deliberately not
+/// `#[derive(Default)]`: `Beginning` is the trait const's own default,
+/// spelled out explicitly at every use site (`CrossContextRouteInfo::
+/// start_from`) rather than leaned on implicitly, so a reader never has
+/// to check whether "the default" here means this type's `Default` impl
+/// or the trait const's - there is only ever one to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossContextRouteStartFrom {
+    Beginning,
+    Latest,
 }
 
 /// One registered route's own static identity - `CrossContextRouteDispatcher::routes()`'s
@@ -899,6 +928,10 @@ pub struct CrossContextRouteInfo {
     pub source_event_type: &'static str,
     pub target_bounded_context: &'static str,
     pub target_command_type: &'static str,
+    /// `CrossContextRoute::START_FROM`, carried through so
+    /// `db::catch_up_cross_context_route` can act on it without needing
+    /// the route's own concrete type.
+    pub start_from: CrossContextRouteStartFrom,
 }
 
 /// Type-erased dispatch to a bounded context's own typed

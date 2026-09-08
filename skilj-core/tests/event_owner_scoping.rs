@@ -23,7 +23,8 @@
 
 use chrono::{TimeZone, Utc};
 use skilj_core::access_control::{
-    self, AccessLevel, EventReadToken, Role, RoleAccessMapping, RoleStatus, TokenStatus,
+    self, AccessLevel, EventReadStartPosition, EventReadToken, Role, RoleAccessMapping, RoleStatus,
+    TokenStatus,
 };
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{
@@ -141,6 +142,7 @@ fn read_token(et: &EventType, scope: Option<&str>) -> EventReadToken {
         revoked_at: None,
         event_type: et.clone(),
         scope: scope.map(str::to_string),
+        start_from: EventReadStartPosition::Beginning,
     }
 }
 

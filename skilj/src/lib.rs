@@ -990,6 +990,7 @@ fn registered_cross_context_route<R: CrossContextRoute + 'static>() -> Registere
             source_event_type: R::Source::NAME,
             target_bounded_context: R::Target::BOUNDED_CONTEXT,
             target_command_type: R::Target::NAME,
+            start_from: R::START_FROM,
         },
         route: |payload_json| {
             let source_payload: <R::Source as EventType>::Payload =
@@ -1497,6 +1498,14 @@ impl SkiljBuilder {
                     // `ensure_external_message_cursors_table`'s own doc
                     // comment.
                     skilj_core::db::ensure_external_message_cursors_table(pool, &bc.name).await?;
+                    // "New subscriber replays all history" fix
+                    // (docs/architecture.md's own write-up of this pass) -
+                    // `access_tokens.start_from`, same "patched into every
+                    // bounded context, every startup" treatment. See
+                    // `ensure_event_read_token_start_from_column`'s own
+                    // doc comment.
+                    skilj_core::db::ensure_event_read_token_start_from_column(pool, &bc.name)
+                        .await?;
                     Ok::<(), skilj_core::Error>(())
                 }
             })

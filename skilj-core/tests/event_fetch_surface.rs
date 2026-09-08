@@ -15,7 +15,7 @@
 
 use chrono::{TimeZone, Utc};
 use proptest::prelude::*;
-use skilj_core::access_control::{self, EventReadToken, TokenStatus};
+use skilj_core::access_control::{self, EventReadStartPosition, EventReadToken, TokenStatus};
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{
     self, AckMode, BoundedContext, BoundedContextStatus, ConsumeEventsResult, CursorUpdate, Event,
@@ -81,6 +81,7 @@ fn token(status: TokenStatus, event_type: EventType) -> EventReadToken {
         revoked_at: None,
         event_type,
         scope: None,
+        start_from: EventReadStartPosition::Beginning,
     }
 }
 

@@ -31,8 +31,8 @@
 
 use chrono::{SubsecRound, Utc};
 use skilj_core::access_control::{
-    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken, Role,
-    RoleAccessMapping, RoleStatus, TokenStatus,
+    AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
+    ExternalEventToken, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, AccessTokenKind, Pool};
@@ -631,6 +631,7 @@ fn round_trips_a_revoked_event_read_token() {
             revoked_at: Some(now),
             event_type: et,
             scope: None,
+            start_from: EventReadStartPosition::Beginning,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -728,6 +729,7 @@ fn read_cursor_is_none_before_the_first_consume() {
             revoked_at: None,
             event_type: et,
             scope: None,
+            start_from: EventReadStartPosition::Beginning,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -751,6 +753,7 @@ fn apply_cursor_update_created_then_advanced_round_trips() {
             revoked_at: None,
             event_type: et,
             scope: None,
+            start_from: EventReadStartPosition::Beginning,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -800,6 +803,7 @@ fn record_acknowledgement_moves_the_cursor() {
             revoked_at: None,
             event_type: et,
             scope: None,
+            start_from: EventReadStartPosition::Beginning,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
         db::apply_cursor_update(

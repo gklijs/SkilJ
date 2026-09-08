@@ -179,6 +179,29 @@ pub struct EventReadToken {
     /// `event_store::event_owner_scope_satisfied` in
     /// `fetch_events`/`consume_events`.
     pub scope: Option<String>,
+    /// See `variant EventReadToken.start_from` - decided once at minting
+    /// time (`create_event_read_token`), consulted once, by
+    /// `event_store::consume_events`, on this token's own first
+    /// `ConsumeEvents` call alone. Never absent: the spec's own
+    /// `start_from ?? beginning` default substitution happens inside
+    /// `create_event_read_token` rather than being carried as an
+    /// `Option` here, the same "the entity itself never stores the
+    /// absence" treatment `consume_events`' own resolved `mode` binding
+    /// already gives `AckMode`.
+    pub start_from: EventReadStartPosition,
+}
+
+/// See `variant EventReadToken.start_from`. `Beginning` unless a minting
+/// admin names `Latest` explicitly (`create_event_read_token`) - the
+/// spec-backed counterpart to `plugin::CrossContextRouteStartFrom`,
+/// which exists because `CrossContextRoute` has no spec entity of its
+/// own to carry this one (docs/architecture.md §36's "no spec entity"
+/// note) - the two are deliberately separate types, not a shared one,
+/// since nothing here depends on the plugin module or vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventReadStartPosition {
+    Beginning,
+    Latest,
 }
 
 /// See `variant ExternalEventToken`.
@@ -1142,12 +1165,20 @@ pub fn create_direct_creation_token(
 /// level and bounded context alone, and has no bearing on what may be
 /// named here - an admin holding an unscoped staff grant may mint a
 /// company-scoped token, and that is the ordinary case, not an oversight.
+///
+/// `start_from` is the one parameter this function doesn't share with
+/// its three siblings above - see `EventReadToken.start_from`'s own doc
+/// comment for what it means. `None` (the caller omitted it, the spec's
+/// own `start_from?`) resolves to `Beginning` here, the rule's own
+/// `start_from ?? beginning` default substitution - the entity itself
+/// never stores the absence, only the resolved value.
 pub fn create_event_read_token(
     access_mapping: &RoleAccessMapping,
     event_type: &crate::event_store::EventType,
     id: String,
     secret: String,
     scope: Option<String>,
+    start_from: Option<EventReadStartPosition>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<EventReadToken> {
     require_active_admin(access_mapping)?;
@@ -1163,6 +1194,7 @@ pub fn create_event_read_token(
         revoked_at: None,
         event_type: event_type.clone(),
         scope,
+        start_from: start_from.unwrap_or(EventReadStartPosition::Beginning),
     })
 }
 

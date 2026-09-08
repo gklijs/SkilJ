@@ -14,8 +14,8 @@
 //! docs/architecture.md §3.2.
 
 use crate::access_control::{
-    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
-    PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
+    AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
+    ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use crate::encryption::DataKey;
 use crate::error::SkiljRejection;
@@ -2894,7 +2894,26 @@ pub fn consume_events(
     let mode = ack_mode
         .or_else(|| existing_cursor.map(|c| c.ack_mode))
         .expect("is_new implies ack_mode.is_some(), checked above");
-    let position = existing_cursor.map(|c| c.sequence).unwrap_or(-1);
+
+    // See `EventReadToken.start_from`'s own doc comment and rule
+    // `ConsumeEvents`' `latest_position` binding. Scoped exactly as a
+    // served event is (an event outside this token's own scope was
+    // never visible to it, so it can't count as "already seen" either),
+    // but deliberately blind to this call's own `filters` argument,
+    // which varies call to call and must never change where a `Latest`
+    // token's one-time seed lands.
+    let position = match existing_cursor {
+        Some(cursor) => cursor.sequence,
+        None if token.start_from == EventReadStartPosition::Latest => events
+            .iter()
+            .filter(|e| e.bounded_context == read_type.bounded_context)
+            .filter(|e| &e.event_type == read_type)
+            .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
+            .map(|e| e.sequence)
+            .max()
+            .unwrap_or(-1),
+        None => -1,
+    };
 
     let served: Vec<Event> = events
         .iter()

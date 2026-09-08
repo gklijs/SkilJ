@@ -412,6 +412,14 @@ enum AccessLevel { read | write | admin }
 
 enum AckMode { auto_advance | manual_ack }
 
+-- Where an EventReadToken's very first ConsumeEvents call begins reading.
+-- Named rather than inline for the same reason AckMode beside it is: one
+-- rule takes it as an argument and records it (CreateEventReadToken) and
+-- another compares against it much later (ConsumeEvents), so it reads as
+-- a type rather than as two coincidentally matching literal lists. The
+-- two values are defined in full on variant EventReadToken.start_from.
+enum EventReadStartPosition { beginning | latest }
+
 -- Which visibility rule a PrivateField follows. Named rather than inline
 -- because three separate things read it: valid_private_fields at
 -- registration, is_default_private_reader at grant time and at read time,
@@ -984,6 +992,28 @@ variant EventReadToken : AccessToken {
     -- RoleAccessMapping.scope gets (see rule QueryEvents' guidance on
     -- event_owner_scope_satisfied for the full contract).
     scope: String?
+
+    -- Where this token's very first ConsumeEvents call begins, and the
+    -- only thing this field ever decides. beginning - which is what every
+    -- token holds unless the minting admin named the other one (see rule
+    -- CreateEventReadToken) - starts that first call at position = -1,
+    -- before the first sequence of the bounded context, which is exactly
+    -- where every token minted before this field existed already starts.
+    -- latest starts it past everything already committed instead, so the
+    -- token's first call skips straight to what is committed from that
+    -- call onwards; see rule ConsumeEvents' own latest_position binding
+    -- for the precise position that resolves to.
+    --
+    -- It says where in history a token starts, never what it may read.
+    -- event_type and scope above are untouched by it, and so is every
+    -- filter, redaction and opt-in either read applies: a latest token
+    -- reaches nothing a beginning one could not, it simply does not go
+    -- back for what it was minted after. Consulted on that first call
+    -- alone and never again - from the second call on the two kinds of
+    -- token are indistinguishable. FetchEvents never consults it at all,
+    -- since that read carries the caller's own cursor rather than a
+    -- server-side one.
+    start_from: EventReadStartPosition
 }
 
 -- The bootstrap secret: the only credential SkilJ ever generates for
@@ -1512,7 +1542,10 @@ entity ReadCursor {
                                             -- DeliveryFollowsAckMode). Starts at -1, before the
                                             -- first sequence of a bounded context, the same "from
                                             -- the beginning" position FetchEvents' absent
-                                            -- after_sequence resolves to.
+                                            -- after_sequence resolves to - unless the token was
+                                            -- minted to start from latest, in which case it starts
+                                            -- past everything committed when it was provisioned
+                                            -- (see variant EventReadToken.start_from).
     updated_at: Timestamp                  -- when this cursor last moved
 }
 
@@ -2550,7 +2583,17 @@ rule ConsumeEvents {
     requires: valid_filters(token.event_type, filters)
 
     -- Null when this token has never consumed before; the ensures below
-    -- is what provisions it in that case.
+    -- is what provisions it in that case. That first call is also the
+    -- only one token.start_from is ever consulted on, and a token minted
+    -- latest therefore serves nothing at all from before that call: its
+    -- cursor is provisioned already past everything committed by then.
+    -- That is the whole point of the choice - a consumer newly attached
+    -- to a long-lived stream can start on what happens from now on
+    -- rather than grinding through every historical event to reach the
+    -- present, which is otherwise the only way it can get there. From
+    -- the second call on the two kinds of token are indistinguishable:
+    -- both continue strictly after their own stored position by the
+    -- ordinary path below, and neither looks at start_from again.
     let cursor = ReadCursor{token: token}
     let is_new = not exists cursor
 
@@ -2560,7 +2603,27 @@ rule ConsumeEvents {
     requires: is_new or ack_mode = null or ack_mode = cursor.ack_mode
 
     let mode = if is_new: ack_mode else: cursor.ack_mode
-    let position = if is_new: -1 else: cursor.sequence
+
+    -- The highest sequence this token could ever have read of its own
+    -- type, and the seed a latest token's first cursor is provisioned
+    -- at. Scoped exactly as a served event is - an event outside this
+    -- token's own scope was never visible to it, so it cannot count as
+    -- one this token has already seen either - but deliberately blind to
+    -- this call's own filters argument, which varies from call to call.
+    -- The seed is decided once and stands for the life of the cursor, so
+    -- it must not depend on which filter the caller happened to supply
+    -- on the single call that provisioned it.
+    let history =
+        Events where bounded_context = token.event_type.bounded_context
+            and event_type = token.event_type
+    let latest_position =
+        highest_sequence(filter(history, e =>
+            event_owner_scope_satisfied(e, token.scope))) ?? -1
+
+    let position =
+        if not is_new: cursor.sequence
+        else if token.start_from = latest: latest_position
+        else: -1
 
     let candidates =
         Events where bounded_context = token.event_type.bounded_context
@@ -5257,7 +5320,7 @@ rule CreateCommandToken {
 }
 
 rule CreateEventReadToken {
-    when: CreateEventReadToken(access_mapping, event_type, scope?)
+    when: CreateEventReadToken(access_mapping, event_type, scope?, start_from?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = event_type.bounded_context
@@ -5285,12 +5348,25 @@ rule CreateEventReadToken {
     -- with it - restrict what it creates or triggers, rather than what it
     -- reads (see rule AuthoriseCommandSubmission's guidance on
     -- tag_owner_scope_satisfied for the write-side half).
+    --
+    -- start_from, unlike scope, belongs to this rule alone and to no
+    -- other minting rule. It is a one-time choice made here, at minting
+    -- time, about where this token's first ConsumeEvents call begins, and
+    -- it has no bearing on what the token may ever read - only on where
+    -- in history it starts. A token minted latest is refused every
+    -- private field, served every sensitive field as stored ciphertext,
+    -- and filtered by event_read_allowed, by the caller's own filters and
+    -- by its own scope exactly as a token minted beginning is. Omitted,
+    -- it is beginning, which is where every token minted before this
+    -- argument existed starts. See variant EventReadToken.start_from and
+    -- rule ConsumeEvents.
     ensures:
         EventReadToken.created(
             id: generate_token_id(),
             event_type: event_type,
             secret: generate_token_secret(),
             scope: scope,
+            start_from: start_from ?? beginning,
             status: active,
             created_at: now
         )
@@ -7411,7 +7487,7 @@ surface EventTypeAdminOperations {
     provides:
         CreateExternalEventToken(access_mapping, event_type, scope?)
         CreateDirectCreationToken(access_mapping, event_type, scope?)
-        CreateEventReadToken(access_mapping, event_type, scope?)
+        CreateEventReadToken(access_mapping, event_type, scope?, start_from?)
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises minting tokens for

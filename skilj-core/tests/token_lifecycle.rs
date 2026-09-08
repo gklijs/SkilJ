@@ -16,8 +16,8 @@
 
 use chrono::{TimeZone, Utc};
 use skilj_core::access_control::{
-    self, AccessLevel, AccessToken, CommandToken, DirectCreationToken, EventReadToken,
-    ExternalEventToken, Role, RoleAccessMapping, RoleStatus, TokenStatus,
+    self, AccessLevel, AccessToken, CommandToken, DirectCreationToken, EventReadStartPosition,
+    EventReadToken, ExternalEventToken, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, CommandType, EventType};
@@ -321,6 +321,7 @@ fn create_event_read_token_succeeds_and_stamps_the_full_entity_shape() {
         "token-3".into(),
         "s3cr3t".into(),
         None,
+        None,
         timestamp(1000),
     )
     .unwrap();
@@ -331,6 +332,30 @@ fn create_event_read_token_succeeds_and_stamps_the_full_entity_shape() {
     assert_eq!(token.created_at, timestamp(1000));
     assert_eq!(token.revoked_at, None);
     assert_eq!(token.event_type, et);
+    // `start_from` omitted (`None`) resolves to `Beginning` - the rule's
+    // own `start_from ?? beginning` default substitution.
+    assert_eq!(token.start_from, EventReadStartPosition::Beginning);
+}
+
+/// `start_from` is the one parameter `create_event_read_token` doesn't
+/// share with its three siblings - a value explicitly given is stamped
+/// through unchanged, not silently defaulted.
+#[test]
+fn create_event_read_token_honours_an_explicit_start_from() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+
+    let token = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-4".into(),
+        "s3cr3t".into(),
+        None,
+        Some(EventReadStartPosition::Latest),
+        timestamp(1000),
+    )
+    .unwrap();
+
+    assert_eq!(token.start_from, EventReadStartPosition::Latest);
 }
 
 #[test]
@@ -342,6 +367,7 @@ fn create_event_read_token_rejects_a_revoked_mapping() {
         &event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
         None,
         timestamp(0),
     )
@@ -359,6 +385,7 @@ fn create_event_read_token_rejects_a_write_level_mapping() {
         &event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
         None,
         timestamp(0),
     )
@@ -379,6 +406,7 @@ fn create_event_read_token_rejects_an_event_type_from_another_bounded_context() 
         &other_bounded_context_event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
         None,
         timestamp(0),
     )
@@ -405,6 +433,7 @@ fn event_read_token_carries_its_variant_specific_field_through_the_access_token_
         revoked_at: None,
         event_type: et.clone(),
         scope: None,
+        start_from: EventReadStartPosition::Beginning,
     };
 
     match AccessToken::EventReadToken(token) {
@@ -544,6 +573,7 @@ fn revoke_token_succeeds_for_every_variant_and_stamps_revoked_at() {
             revoked_at: None,
             event_type: event_type(),
             scope: None,
+            start_from: EventReadStartPosition::Beginning,
         }),
     ];
 
@@ -594,6 +624,7 @@ fn revoke_token_rejects_a_revoked_mapping() {
         revoked_at: None,
         event_type: event_type(),
         scope: None,
+        start_from: EventReadStartPosition::Beginning,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -613,6 +644,7 @@ fn revoke_token_rejects_a_write_level_mapping() {
         revoked_at: None,
         event_type: event_type(),
         scope: None,
+        start_from: EventReadStartPosition::Beginning,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -635,6 +667,7 @@ fn revoke_token_rejects_a_token_scoped_to_another_bounded_context() {
         revoked_at: None,
         event_type: other_bounded_context_event_type(),
         scope: None,
+        start_from: EventReadStartPosition::Beginning,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -659,6 +692,7 @@ fn revoke_token_rejects_an_already_revoked_token() {
         revoked_at: Some(timestamp(0)),
         event_type: event_type(),
         scope: None,
+        start_from: EventReadStartPosition::Beginning,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -684,6 +718,7 @@ fn revoke_token_only_ever_produces_the_revoked_status() {
         revoked_at: None,
         event_type: event_type(),
         scope: None,
+        start_from: EventReadStartPosition::Beginning,
     });
 
     let revoked = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap();

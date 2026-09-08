@@ -156,6 +156,7 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
     .register(gql_types::access_level_enum())
     .register(gql_types::bounded_context_status_enum())
     .register(gql_types::missed_occurrence_policy_enum())
+    .register(gql_types::event_read_start_position_enum())
     .register(gql_types::access_token_status_enum())
     .register(gql_types::projection_rebuild_status_enum())
     .register(gql_types::tag_mapping_object())

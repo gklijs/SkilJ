@@ -32,8 +32,8 @@
 //! what's deliberately not here yet (`EncryptionKey`).
 
 use crate::access_control::{
-    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
-    PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
+    AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
+    ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use crate::bootstrap::ContextCreator;
 use crate::encryption::{self, DataKey, EncryptionMasterKey};
@@ -295,6 +295,20 @@ fn ack_mode_from_str(s: &str) -> AckMode {
     match s {
         "manual_ack" => AckMode::ManualAck,
         _ => AckMode::AutoAdvance,
+    }
+}
+
+fn event_read_start_position_to_str(position: EventReadStartPosition) -> &'static str {
+    match position {
+        EventReadStartPosition::Beginning => "beginning",
+        EventReadStartPosition::Latest => "latest",
+    }
+}
+
+fn event_read_start_position_from_str(s: &str) -> EventReadStartPosition {
+    match s {
+        "latest" => EventReadStartPosition::Latest,
+        _ => EventReadStartPosition::Beginning,
     }
 }
 
@@ -712,6 +726,11 @@ async fn provision_bounded_context_schema(
             -- the default for a token minted with none) means
             -- unrestricted, for every kind alike.
             scope TEXT,
+            -- EventReadToken.start_from - meaningful only for the
+            -- 'event_read' kind (see ensure_event_read_token_start_from_column's
+            -- own doc comment for why a fresh table still declares this
+            -- with the identical default a retrofitted one gets).
+            start_from TEXT NOT NULL DEFAULT 'beginning' CHECK (start_from IN ('beginning', 'latest')),
             CHECK (
                 (kind = 'command' AND command_type_name IS NOT NULL AND event_type_name IS NULL)
                 OR (kind != 'command' AND event_type_name IS NOT NULL AND command_type_name IS NULL)
@@ -1350,6 +1369,34 @@ pub async fn ensure_private_field_columns(
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `access_tokens.start_from` - `EventReadToken.start_from`
+/// (docs/architecture.md's own write-up of this pass), meaningful only
+/// for the `event_read` kind but a column on the shared `access_tokens`
+/// table exactly as `scope` already is (`EventReadToken.scope`'s own
+/// doc comment on why one column serves all four kinds). Following
+/// `ensure_event_scoping_columns`'s own pattern exactly: a targeted,
+/// idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, called
+/// unconditionally on every `build()`, for a bounded context provisioned
+/// before this column existed. `NOT NULL DEFAULT 'beginning'` rather
+/// than nullable - every row this backfills is a token minted before
+/// `start_from` existed, and `EventReadStartPosition::Beginning` is
+/// exactly what such a token already behaves as (`consume_events`' own
+/// `-1` fallback), so the column's own default and the domain default
+/// agree; `get_event_read_token` never has to handle an absent value.
+pub async fn ensure_event_read_token_start_from_column(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.access_tokens \
+         ADD COLUMN IF NOT EXISTS start_from TEXT NOT NULL DEFAULT 'beginning'"
     )))
     .execute(pool)
     .await?;
@@ -5732,17 +5779,22 @@ pub async fn decide_and_submit_command(
     .await
 }
 
-/// `cross_context_route_cursors`'s own read - `-1` (the same "nothing
-/// yet" sentinel `sequence`/`caught_up_to` already use) when this route
-/// has never dispatched anything yet, whether because no row exists at
-/// all or because `updated_at` predates the table's own creation for
-/// this bounded context (patched in retroactively - see
-/// `ensure_cross_context_route_cursors_table`'s own doc comment).
+/// `cross_context_route_cursors`'s own read - `None` when no row exists
+/// at all, which means this route has never had a single catch-up tick
+/// run for it since it was registered (a row, once written, is never
+/// deleted - see `update_cross_context_route_cursor`). Distinct from a
+/// row genuinely holding `-1` (a `CrossContextRouteStartFrom::Latest`
+/// route whose very first tick found no `Source` occurrences at all yet
+/// to seed past - see `catch_up_cross_context_route`'s own doc comment):
+/// that case has already had its one-time seeding tick, so it must never
+/// be seeded again, which is exactly why this returns `Option<i64>`
+/// rather than collapsing both into the same `-1` sentinel
+/// `sequence`/`caught_up_to` use elsewhere.
 async fn get_cross_context_route_cursor(
     pool: &Pool,
     source_bounded_context: &str,
     route_name: &str,
-) -> crate::error::Result<i64> {
+) -> crate::error::Result<Option<i64>> {
     let schema = schema_ident(source_bounded_context);
     let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT last_dispatched_sequence FROM {schema}.cross_context_route_cursors \
@@ -5751,7 +5803,7 @@ async fn get_cross_context_route_cursor(
     .bind(route_name)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(seq,)| seq).unwrap_or(-1))
+    Ok(row.map(|(seq,)| seq))
 }
 
 async fn update_cross_context_route_cursor(
@@ -5797,6 +5849,23 @@ async fn update_cross_context_route_cursor(
 /// cursor where it was, stopping this route's own catch-up for this
 /// tick without losing anything (the next tick re-fetches from the same
 /// cursor).
+///
+/// **First-ever tick, `CrossContextRoute::START_FROM = Latest`**: when
+/// `get_cross_context_route_cursor` comes back `None` (no row - this
+/// route has never ticked before) and the route asks to start from
+/// `Latest`, this tick does no dispatching at all. It instead loads
+/// `Source`'s own occurrences once (the identical `list_events_cached`
+/// call the normal path below makes, from `-1`) purely to find the
+/// highest sequence among them, seeds the cursor row at that sequence
+/// (or `-1`, unchanged, if `Source` has no occurrences at all yet), and
+/// returns - so every occurrence that already existed at registration
+/// time is treated as "already seen" without a single `route()` call or
+/// `Target` submission for any of them. This is the mechanism that stops
+/// a brand-new route like `UserRegistered -> SendWelcomeEmail` from
+/// emailing every user who has ever registered: exactly one full history
+/// load, exactly once, ever, for this route - every later tick reads the
+/// real cursor row this seeded and only ever sees genuinely new
+/// occurrences, the same as a `Beginning` route always has.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(route = %route.name))]
 pub async fn catch_up_cross_context_route(
@@ -5810,8 +5879,9 @@ pub async fn catch_up_cross_context_route(
     event_cache: &crate::event_cache::EventCache,
     encryption_master_key: Option<&EncryptionMasterKey>,
 ) -> crate::error::Result<()> {
-    let cursor =
+    let existing_cursor =
         get_cross_context_route_cursor(pool, route.source_bounded_context, route.name).await?;
+    let cursor = existing_cursor.unwrap_or(-1);
     let events = list_events_cached(
         pool,
         event_cache,
@@ -5820,6 +5890,24 @@ pub async fn catch_up_cross_context_route(
         cursor,
     )
     .await?;
+
+    if existing_cursor.is_none()
+        && route.start_from == crate::plugin::CrossContextRouteStartFrom::Latest
+    {
+        // See this function's own doc comment's "First-ever tick" note -
+        // `events` above already is the full history from `-1`, loaded
+        // for exactly this purpose; nothing in it gets dispatched.
+        let seed = events.iter().map(|e| e.sequence).max().unwrap_or(-1);
+        update_cross_context_route_cursor(
+            pool,
+            route.source_bounded_context,
+            route.name,
+            seed,
+            Utc::now(),
+        )
+        .await?;
+        return Ok(());
+    }
 
     for event in &events {
         match route_dispatcher.route(route.name, &event.payload) {
@@ -6857,6 +6945,13 @@ struct AccessTokenColumns {
     /// comment for the read-side reasoning and
     /// `ExternalEventToken.scope`'s for the write-side one.
     scope: Option<String>,
+    /// One column, all four kinds, meaningful only for `event_read` -
+    /// see `EventReadToken.start_from`'s own doc comment.
+    /// `event_read_start_position_from_str` only ever gets called on
+    /// this for a genuine `event_read` row; the other three kinds carry
+    /// whatever the column's own `DEFAULT` gave it, read here but never
+    /// interpreted.
+    start_from: String,
 }
 
 struct AccessTokenRow {
@@ -6879,7 +6974,7 @@ async fn fetch_access_token_row(
     let schema = schema_ident(&bounded_context);
     let columns: Option<AccessTokenColumns> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, kind, secret, status, created_at, revoked_at, event_type_name, \
-         command_type_name, scope FROM {schema}.access_tokens WHERE id = $1"
+         command_type_name, scope, start_from FROM {schema}.access_tokens WHERE id = $1"
     )))
     .bind(id)
     .fetch_optional(pool)
@@ -7016,24 +7111,33 @@ pub async fn insert_direct_creation_token(
     .await
 }
 
+/// Not built on `insert_access_token_row` - `EventReadToken` is the only
+/// one of the three event-type-scoped kinds that also carries
+/// `start_from`, so this hand-writes its own `INSERT` the same way
+/// `insert_command_token` already does for its own divergent shape (see
+/// that function's own doc comment).
 #[tracing::instrument(skip_all)]
 pub async fn insert_event_read_token(
     pool: &Pool,
     token: &EventReadToken,
 ) -> crate::error::Result<()> {
-    insert_access_token_row(
-        pool,
-        &token.id,
-        AccessTokenKind::EventRead,
-        &token.secret,
-        token.status,
-        token.created_at,
-        token.revoked_at,
-        &token.event_type.bounded_context.name,
-        &token.event_type.name,
-        token.scope.as_deref(),
-    )
-    .await
+    let schema = schema_ident(&token.event_type.bounded_context.name);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.access_tokens (id, kind, secret, status, created_at, revoked_at, \
+         event_type_name, scope, start_from) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"
+    )))
+    .bind(&token.id)
+    .bind(AccessTokenKind::EventRead.as_str())
+    .bind(crate::shared::hash_secret(&token.secret))
+    .bind(token_status_to_str(token.status))
+    .bind(token.created_at)
+    .bind(token.revoked_at)
+    .bind(&token.event_type.name)
+    .bind(token.scope.as_deref())
+    .bind(event_read_start_position_to_str(token.start_from))
+    .execute(pool)
+    .await?;
+    insert_token_index(pool, &token.id, &token.event_type.bounded_context.name).await
 }
 
 /// See `insert_access_token_row` above - not built on it directly, since
@@ -7066,17 +7170,15 @@ pub async fn insert_command_token(pool: &Pool, token: &CommandToken) -> crate::e
 /// isn't the expected kind - callers that need to tell those two apart
 /// (for the 401-vs-403 split - see `AccessTokenKind`'s own doc comment)
 /// call `access_token_kind` first. Covers `get_external_event_token`/
-/// `get_direct_creation_token`/`get_event_read_token`, identical apart
-/// from the `kind` string and return type - all three resolve
-/// `event_type_name` against `event_types` into an `event_type` field
-/// and now carry `scope` alike (cross-tenant read/write fix,
-/// docs/architecture.md's own write-up of these passes - `EventReadToken`
-/// was the only one of the four token kinds this was true for before
-/// that fix's write-side half, which is why this used to be two macro
-/// invocations plus a near-identical hand-written twin; now all three
-/// genuinely share one shape). `get_command_token` resolves
-/// `command_type_name` into a differently named field instead and is the
-/// only one of its own kind, so it stays hand-written below.
+/// `get_direct_creation_token`, identical apart from the `kind` string
+/// and return type - both resolve `event_type_name` against
+/// `event_types` into an `event_type` field and carry `scope` alike
+/// (cross-tenant read/write fix, docs/architecture.md's own write-up of
+/// these passes). `get_event_read_token` used to share this shape too,
+/// back when all three carried nothing but `scope` beyond the common
+/// base - `start_from` (this pass's own write-up) broke that symmetry,
+/// so it now stays hand-written below the same way `get_command_token`
+/// already does for its own divergent shape.
 macro_rules! get_event_type_access_token {
     ($fn_name:ident, $return_type:ident, $kind:literal) => {
         #[tracing::instrument(skip_all)]
@@ -7116,7 +7218,40 @@ get_event_type_access_token!(
     DirectCreationToken,
     "direct_creation"
 );
-get_event_type_access_token!(get_event_read_token, EventReadToken, "event_read");
+
+/// See `get_external_event_token`'s own doc comment's note on why this
+/// one stays hand-written - the only difference from what the macro
+/// generates is the extra `start_from` field, read via
+/// `event_read_start_position_from_str`.
+#[tracing::instrument(skip_all)]
+pub async fn get_event_read_token(
+    pool: &Pool,
+    id: &str,
+) -> crate::error::Result<Option<EventReadToken>> {
+    let Some(row) = fetch_access_token_row(pool, id).await? else {
+        return Ok(None);
+    };
+    if row.columns.kind != "event_read" {
+        return Ok(None);
+    }
+    let event_type_name = row
+        .columns
+        .event_type_name
+        .expect("event_read access_tokens row without event_type_name");
+    let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
+        .await?
+        .expect("access_tokens row references an event_type that no longer exists");
+    Ok(Some(EventReadToken {
+        id: row.columns.id,
+        secret: row.columns.secret,
+        status: token_status_from_str(&row.columns.status),
+        created_at: row.columns.created_at,
+        revoked_at: row.columns.revoked_at,
+        event_type,
+        scope: row.columns.scope,
+        start_from: event_read_start_position_from_str(&row.columns.start_from),
+    }))
+}
 
 /// See `get_external_event_token`'s own doc comment - same shape and
 /// `None` reasoning, resolving `command_type_name` against

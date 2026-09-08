@@ -38,7 +38,7 @@ use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, Rol
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
-use skilj_core::plugin::BoundedContextEvent;
+use skilj_core::plugin::{BoundedContextEvent, CrossContextRouteStartFrom};
 use skilj_core::shared::{generate_token_id, generate_token_secret, CommandDecision, EventSpec};
 use tower::ServiceExt;
 
@@ -450,5 +450,273 @@ fn an_event_in_one_bounded_context_eventually_submits_a_command_in_another() {
             }
         }
         assert_eq!(state, Some(r#"{"total":12}"#.to_string()));
+    });
+}
+
+// --- CrossContextRoute::START_FROM = Latest: the "don't email every
+// user who has ever registered" scenario ---
+
+const SHIPPING_BOUNDED_CONTEXT_LATEST: &str = "skilj_cross_context_route_test_shipping_latest";
+const INVENTORY_BOUNDED_CONTEXT_LATEST: &str = "skilj_cross_context_route_test_inventory_latest";
+
+struct OrderShippedLatest;
+
+impl EventType for OrderShippedLatest {
+    type Payload = OrderShippedPayload;
+    const NAME: &'static str = "OrderShipped";
+    const BOUNDED_CONTEXT: &'static str = SHIPPING_BOUNDED_CONTEXT_LATEST;
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+}
+
+struct ReserveStockLatest;
+
+impl CommandType for ReserveStockLatest {
+    type Payload = ReserveStockPayload;
+    type Event = InventoryEvent;
+    const NAME: &'static str = "ReserveStock";
+    const BOUNDED_CONTEXT: &'static str = INVENTORY_BOUNDED_CONTEXT_LATEST;
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "StockReserved".to_string(),
+                payload: serde_json::json!({
+                    "order_id": payload.order_id,
+                    "quantity": payload.quantity,
+                }),
+            }],
+        }
+    }
+}
+
+struct StockReservedLatest;
+
+impl EventType for StockReservedLatest {
+    type Payload = StockReservedPayload;
+    const NAME: &'static str = "StockReserved";
+    const BOUNDED_CONTEXT: &'static str = INVENTORY_BOUNDED_CONTEXT_LATEST;
+}
+
+struct ReservedTotalLatest;
+
+impl Projection for ReservedTotalLatest {
+    type State = ReservedTotalState;
+    type Event = InventoryEvent;
+    const NAME: &'static str = "ReservedTotal";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["StockReserved"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        let InventoryEvent::StockReserved(payload) = event;
+        state.total += payload.quantity;
+    }
+}
+
+struct ShippingToInventoryLatest;
+
+impl CrossContextRoute for ShippingToInventoryLatest {
+    type Source = OrderShippedLatest;
+    type Target = ReserveStockLatest;
+    const NAME: &'static str = "ShippingToInventoryLatest";
+    const START_FROM: CrossContextRouteStartFrom = CrossContextRouteStartFrom::Latest;
+    fn route(source_payload: &OrderShippedPayload) -> Option<ReserveStockPayload> {
+        Some(ReserveStockPayload {
+            order_id: source_payload.order_id.clone(),
+            quantity: source_payload.quantity,
+        })
+    }
+}
+
+/// The scenario this feature exists for: an `OrderShipped` occurrence
+/// committed *before* `ShippingToInventoryLatest` is ever registered must
+/// never be dispatched, even though nothing but this route's own
+/// `START_FROM` differs from the ordinary `Beginning` test above. Two
+/// `Skilj::builder()` calls against the same two bounded contexts, not
+/// one - the route is deliberately absent from the first (registering
+/// `OrderShippedLatest`/`ReserveStockLatest`/`StockReservedLatest`/
+/// `ReservedTotalLatest` alone, exactly enough to mint a token and post
+/// one event through), then present in the second, so the "already
+/// existed at registration time" the route needs to skip is genuine
+/// pre-existing history, not a race against the route's own first tick.
+#[test]
+fn a_latest_route_never_dispatches_history_that_predates_its_own_registration() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+
+        let shipping_bc = BoundedContext {
+            name: SHIPPING_BOUNDED_CONTEXT_LATEST.to_string(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &shipping_bc)
+            .await
+            .unwrap();
+        let inventory_bc = BoundedContext {
+            name: INVENTORY_BOUNDED_CONTEXT_LATEST.to_string(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &inventory_bc)
+            .await
+            .unwrap();
+
+        let shipping_mapping = RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: shipping_bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &shipping_mapping)
+            .await
+            .unwrap();
+        let inventory_mapping = RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: inventory_bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &inventory_mapping)
+            .await
+            .unwrap();
+
+        // First build: no route at all yet, just enough to mint a token
+        // and post one "historical" OrderShipped occurrence.
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .bounded_context(SHIPPING_BOUNDED_CONTEXT_LATEST)
+            .event_type::<OrderShippedLatest>()
+            .bounded_context(INVENTORY_BOUNDED_CONTEXT_LATEST)
+            .event_type::<StockReservedLatest>()
+            .command_type::<ReserveStockLatest>()
+            .projection::<ReservedTotalLatest>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let event_type = db::get_event_type(&pool, SHIPPING_BOUNDED_CONTEXT_LATEST, "OrderShipped")
+            .await
+            .unwrap()
+            .unwrap();
+        let direct_token = access_control::create_direct_creation_token(
+            &shipping_mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct_token)
+            .await
+            .unwrap();
+        let credential = format!("{}.{}", direct_token.id, direct_token.secret);
+
+        let router = skilj.rest_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"order_id":"order-historical","quantity":7,"backorder":false}}"#,
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Second build, same two bounded contexts: this time the route
+        // is registered too, `START_FROM: Latest`. Bound but otherwise
+        // unused - the route's own background poll task needs this
+        // second `Skilj` kept alive for the rest of the test, but every
+        // request below still goes through the first build's own
+        // `router` (both point at the same two bounded contexts).
+        let (_skilj, report) = Skilj::builder(database_url)
+            .bounded_context(SHIPPING_BOUNDED_CONTEXT_LATEST)
+            .event_type::<OrderShippedLatest>()
+            .bounded_context(INVENTORY_BOUNDED_CONTEXT_LATEST)
+            .event_type::<StockReservedLatest>()
+            .command_type::<ReserveStockLatest>()
+            .projection::<ReservedTotalLatest>()
+            .cross_context_route::<ShippingToInventoryLatest>()
+            .cross_context_route_poll_interval(std::time::Duration::from_millis(50))
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        // Several poll intervals' worth of margin, then confirm the
+        // historical occurrence was never dispatched - if it had been,
+        // this would already read {"total":7}.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let state =
+            db::get_projection_state(&pool, INVENTORY_BOUNDED_CONTEXT_LATEST, "ReservedTotal", "")
+                .await
+                .unwrap();
+        assert_ne!(state, Some(r#"{"total":7}"#.to_string()));
+
+        // A genuinely new occurrence, posted after the route exists,
+        // still gets dispatched exactly like a Beginning route's would.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"order_id":"order-new","quantity":3,"backorder":false}}"#,
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let mut state = None;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            state = db::get_projection_state(
+                &pool,
+                INVENTORY_BOUNDED_CONTEXT_LATEST,
+                "ReservedTotal",
+                "",
+            )
+            .await
+            .unwrap();
+            if state.as_deref() == Some(r#"{"total":3}"#) {
+                break;
+            }
+        }
+        // Exactly 3, not 10 - the historical 7 must never count, even
+        // once the route is fully caught up and running normally.
+        assert_eq!(state, Some(r#"{"total":3}"#.to_string()));
     });
 }

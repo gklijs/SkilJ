@@ -511,6 +511,44 @@ fn full_type_registration_lifecycle_end_to_end() {
             .unwrap()
             .to_string();
 
+        // createEventReadToken - `startFrom` is the one argument this
+        // mutation doesn't share with its three siblings above (the
+        // "new subscriber replays all history" fix, docs/architecture.md's
+        // own write-up of this pass). Omitted entirely still reads back
+        // the same `BEGINNING` default every token minted before this
+        // argument existed carries.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                createEventReadToken(boundedContext: $bc, eventTypeName: $name) { \
+                    startFrom eventType { name } \
+                } \
+            }",
+            json!({ "bc": bc_name, "name": "MoneyDeposited" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["createEventReadToken"]["startFrom"], "BEGINNING");
+
+        // An explicit `startFrom: LATEST` is stamped through unchanged,
+        // not silently defaulted - the mechanism that stops a brand-new
+        // event handler from replaying every historical event to reach
+        // it (see `EventReadToken.start_from` in specs/skilj.allium).
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                createEventReadToken(boundedContext: $bc, eventTypeName: $name, startFrom: LATEST) { \
+                    startFrom \
+                } \
+            }",
+            json!({ "bc": bc_name, "name": "MoneyDeposited" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["createEventReadToken"]["startFrom"], "LATEST");
+
         // createCommandToken - omitting scope entirely still works and
         // reads back null, the default every token minted before this
         // argument existed carries.

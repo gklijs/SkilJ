@@ -78,7 +78,7 @@ use crate::gql_types::BoundedContextWithMappings;
 use async_graphql::dynamic::{ResolverContext, ValueAccessor};
 use async_graphql::ErrorExtensions;
 use skilj_core::access_control::{
-    AccessLevel, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus,
+    AccessLevel, EventReadStartPosition, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus,
 };
 use skilj_core::db::Pool;
 use skilj_core::encryption::{DataKey, EncryptionMasterKey};
@@ -335,6 +335,19 @@ pub fn parse_missed_occurrence_policy(name: &str) -> MissedOccurrencePolicy {
     }
 }
 
+/// `EventReadStartPosition` GraphQL enum name -> domain value - same
+/// shape and reasoning as `parse_missed_occurrence_policy` above.
+/// `createEventReadToken`'s own `startFrom` argument is the only caller;
+/// omitted entirely (`None`, not one of these two names) is handled at
+/// the call site, before this ever runs - see
+/// `create_event_read_token_field`'s own doc comment.
+pub fn parse_event_read_start_position(name: &str) -> EventReadStartPosition {
+    match name {
+        "LATEST" => EventReadStartPosition::Latest,
+        _ => EventReadStartPosition::Beginning,
+    }
+}
+
 /// A `String` argument this crate treats as an entity name/id lookup key
 /// that turned out to match nothing - not a `skilj_core::Error` (no rule
 /// ever ran; there was nothing to run it against), so not something
@@ -348,26 +361,26 @@ pub fn not_found(entity: &str, key: &str) -> async_graphql::Error {
 }
 
 /// Shared by `event_type_admin_operations`/`command_type_admin_operations` -
-/// all four `create*Token` mutations (`createExternalEventToken`,
-/// `createDirectCreationToken`, `createCommandToken`, `createEventReadToken`)
-/// differ only in which type they resolve (`EventType`/`CommandType`,
-/// hence `$type_arg_name`/`$type_label`/`$get_type_fn`) and which
+/// three of the four `create*Token` mutations (`createExternalEventToken`,
+/// `createDirectCreationToken`, `createCommandToken`) differ only in
+/// which type they resolve (`EventType`/`CommandType`, hence
+/// `$type_arg_name`/`$type_label`/`$get_type_fn`) and which
 /// `access_control::create_*_token`/`db::insert_*_token` pair they call.
 /// Originally two separate, near-identical macros/hand-written bodies
 /// (one file's own doc comment used to say so explicitly) - unified here
 /// since `command_type_admin_operations` only ever needed the identical
 /// shape with different type parameters, not a genuinely different one.
 ///
-/// `createEventReadToken` used to be a fourth, hand-written exception -
-/// `EventReadToken` alone carried `scope` (cross-tenant read fix,
-/// docs/architecture.md's own write-up of these passes) and this macro's
-/// fixed argument list had no way to vary that one field between
-/// invocations. The write-side half of that same series gave the other
-/// three token kinds `scope` too (`ExternalEventToken`/
-/// `DirectCreationToken`/`CommandToken`), so the field is no longer one
-/// invocation's alone to vary - every `create_*_token` function now takes
-/// an identical `scope: Option<String>` parameter in the same position,
-/// and this macro parses and threads it uniformly for all four.
+/// `createEventReadToken` briefly joined this macro too, once the
+/// cross-tenant read/write fix gave every `create_*_token` function an
+/// identical `scope: Option<String>` parameter in the same position
+/// (docs/architecture.md's own write-up of these passes) - but the "new
+/// subscriber replays all history" fix (a later pass) gave
+/// `create_event_read_token` a `start_from` parameter none of its three
+/// siblings share, breaking the "identical parameter list" premise this
+/// macro depends on. It has stayed hand-written since - see
+/// `event_type_admin_operations::create_event_read_token_field`'s own
+/// doc comment.
 macro_rules! create_type_token_field {
     (
         $field_name:literal,

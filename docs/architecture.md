@@ -93,6 +93,7 @@ listed separately here; see that section itself for its own structure.
 - [40. `skilj-kafka`: a bridge to Kafka, both directions](#skilj-kafka-bridge)
 - [41. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)](#skilj-amqp-bridge)
 - [42. `skilj-nats`: a bridge to NATS JetStream](#skilj-nats-bridge)
+- [43. Stopping a new subscriber from replaying all of history](#new-subscriber-replay-fix)
 
 ---
 
@@ -6566,3 +6567,118 @@ passing reliably across repeated runs, default and single-threaded
 parallelism, and fast (under a second per run once the image is
 cached) thanks to the shared-container pattern applied from the start.
 Full workspace build/clippy -D warnings/fmt --check/allium check clean.
+
+<a id="new-subscriber-replay-fix"></a>
+## 43. Stopping a new subscriber from replaying all of history
+
+Prompted by a design question, not a filed issue: "you add a new
+`UserRegistered -> send a welcome email` event handler - how do you stop
+it emailing every user who has ever registered?" Answered honestly first
+(no existing mechanism prevents it) and then closed for real, on both of
+skilj's own "a new reader starts consuming a stream" mechanisms:
+`EventReadToken`'s server-tracked `ReadCursor` (rule `ConsumeEvents`) and
+`CrossContextRoute`'s own durable cursor ([§36](#cross-context-route)). Both, until this
+pass, unconditionally seeded a brand-new cursor at `position = -1` - the
+very beginning of the stream - with no way to ask for anything else.
+Wiring either mechanism to a real "send an email" side effect the day it
+ships would have replayed every historical occurrence through it once.
+
+**Spec** (`specs/skilj.allium`, delegated to `allium:tend`, independently
+re-verified): a new `enum EventReadStartPosition { beginning | latest }`,
+a new `EventReadToken.start_from` field, a new optional `start_from?`
+parameter on `rule CreateEventReadToken` (`?? beginning` default - every
+token minted before this argument existed keeps behaving exactly as it
+always has), and `rule ConsumeEvents`'s own `position` binding rewritten
+around a new `latest_position` binding: `highest_sequence` over this
+token's own event type, scoped by `token.scope` exactly as a served
+event already is (an event outside a token's scope was never visible to
+it, so it can't count as "already seen" either) but deliberately blind
+to the filters *this one call* happens to supply, since the seed is
+decided once, at the token's first call, and must not depend on which
+filter that particular call passed. A `latest` token's first
+`ConsumeEvents` call therefore serves nothing at all - its cursor is
+provisioned already past everything committed by then - and every call
+after that is completely ordinary, indistinguishable from a `beginning`
+token's.
+
+**`CrossContextRoute`** has no spec entity of its own ([§36](#cross-context-route)'s "no spec
+entity" note), so its side gets a separate, Rust-only
+`plugin::CrossContextRouteStartFrom { Beginning, Latest }` rather than
+reusing the spec-backed enum - deliberately two types, not one shared
+between a spec-derived module and a plugin-only construct that owes it
+nothing. `CrossContextRoute::START_FROM` is a defaulted associated
+const (`= Beginning`), the same "part of the trait, not a builder
+argument" register `NAME`/`Source`/`Target` already have, carried
+through `CrossContextRouteInfo::start_from` into
+`db::catch_up_cross_context_route`. `db::get_cross_context_route_cursor`
+changed its return type from `i64` (a `-1` sentinel collapsing "never
+ticked" and "ticked, seeded at -1" into one value) to `Option<i64>`,
+because this fix needs to tell those two apart: `None` (no row at all)
+on a `Latest` route's very first tick loads `Source`'s full history
+once - the identical `list_events_cached(..., -1)` call the ordinary
+path already makes - purely to find its highest sequence, seeds the
+cursor there (or leaves it at `-1`, unchanged, if `Source` has no
+occurrences yet), and returns *without dispatching a single one of
+them*. Every tick after that reads a real cursor row and behaves exactly
+as a `Beginning` route always has. A `Beginning` route's own first tick
+is untouched - the `None` branch only special-cases `Latest`, so no
+existing route's behaviour on upgrade changes at all.
+
+**Migration**: `access_tokens.start_from TEXT NOT NULL DEFAULT
+'beginning'`, `ensure_event_read_token_start_from_column` - the same
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, called unconditionally on
+every `build()`, every prior schema-evolution pass in this codebase
+already uses (`ensure_event_scoping_columns` et al.). `CrossContextRoute`
+needed no migration at all - `cross_context_route_cursors` already had
+no `start_from` column to add, since the seeding decision lives on the
+Rust-only `CrossContextRouteInfo`, never persisted.
+
+**GraphQL**: `createEventReadToken` gained a `startFrom:
+EventReadStartPosition` argument and `EventReadToken` a `startFrom`
+output field. This is the one place the fix cost real structural churn:
+`createEventReadToken` had, one pass ago, been folded into
+`create_type_token_field!` - the macro shared with
+`createExternalEventToken`/`createDirectCreationToken`/`createCommandToken` -
+on the strength of all four `create_*_token` functions taking an
+identical parameter list. `start_from` broke that premise for
+`createEventReadToken` alone, so it went back to being hand-written (see
+`event_type_admin_operations::create_event_read_token_field`'s own doc
+comment for the full history) - the second time this exact field has
+swapped between "shared macro" and "hand-written exception" as the
+underlying token shapes diverged and reconverged.
+
+**A one-time cost accepted deliberately, not overlooked**: both
+mechanisms' seeding step loads full history once to compute a highest
+sequence, then discards all of it - exactly the same read the ordinary
+`Beginning` path already pays for on a first call/tick, just without
+serving what it loads. Unlike `db::latest_sequence`'s own cheap-query
+optimisation (`catch_up_bounded_context`'s first check every poll tick,
+so a quiet context costs one small aggregate query rather than a full
+reload - see that function's own doc comment), which exists specifically
+because that check repeats on every idle poll tick forever, this seeding
+step runs exactly once, ever, per token/route
+- a fundamentally different cost profile that doesn't justify the extra
+machinery a dedicated `SELECT MAX(sequence) WHERE event_type_name = $1`
+query would add.
+
+**Verified**: `skilj-core/tests/token_lifecycle.rs`
+(`create_event_read_token_honours_an_explicit_start_from` plus the
+existing success test asserting the `?? beginning` default),
+`skilj-core/tests/event_fetch_surface.rs`/`persistence.rs` (updated
+fixtures/round-trip), `skilj/tests/event_fetch_rest.rs`
+(`a_latest_token_never_serves_history_that_predates_its_own_minting` -
+real REST `POST /v1/events/direct` then `GET /v1/events/consume`, two
+historical deposits before minting, first call serves zero, a
+post-minting deposit is served alone), `skilj/tests/
+graphql_type_registration.rs` (`createEventReadToken` over real GraphQL,
+both the default and an explicit `LATEST`), `skilj/tests/
+cross_context_route.rs`
+(`a_latest_route_never_dispatches_history_that_predates_its_own_registration` -
+two real `Skilj::builder()` calls against the same two bounded contexts,
+a historical `OrderShipped` posted between them, the `Latest`-registered
+route's projection never reflects it, a later occurrence still does).
+`cargo build/clippy -D warnings/test --workspace` and `cargo fmt --check`
+clean; `allium check` unchanged from baseline bar one checker-limitation
+warning on the new enum (an enum referenced only from a `variant` field,
+not an `entity` one, per allium 3.5.3 - confirmed on a minimal scratch
+spec, not a real defect); `allium analyse` byte-identical to baseline.

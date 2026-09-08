@@ -29,8 +29,8 @@ use async_graphql::dynamic::{
 };
 use async_graphql::Value;
 use skilj_core::access_control::{
-    AccessLevel, CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
-    PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
+    AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
+    ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{
@@ -163,6 +163,25 @@ pub fn missed_occurrence_policy_name(policy: MissedOccurrencePolicy) -> &'static
         MissedOccurrencePolicy::Skip => "SKIP",
         MissedOccurrencePolicy::FireOnce => "FIRE_ONCE",
         MissedOccurrencePolicy::ReplayBacklog => "REPLAY_BACKLOG",
+    }
+}
+
+/// `enum EventReadStartPosition` - `createEventReadToken`'s own
+/// `startFrom` argument type, and `EventReadToken.startFrom`'s own
+/// output type below (docs/architecture.md's own write-up of this
+/// pass). See `resolvers::parse_event_read_start_position` for the
+/// input-side mapping and `event_read_start_position_name` for the
+/// output-side one.
+pub fn event_read_start_position_enum() -> Enum {
+    Enum::new("EventReadStartPosition")
+        .item("BEGINNING")
+        .item("LATEST")
+}
+
+pub fn event_read_start_position_name(position: EventReadStartPosition) -> &'static str {
+    match position {
+        EventReadStartPosition::Beginning => "BEGINNING",
+        EventReadStartPosition::Latest => "LATEST",
     }
 }
 
@@ -580,6 +599,10 @@ pub fn direct_creation_token_object() -> Object {
     )
 }
 
+/// The one field `token_object!` doesn't give this type - `startFrom`,
+/// appended directly rather than folded into the macro since it's the
+/// only one of the four token kinds that has it (`EventReadToken.
+/// start_from`'s own doc comment).
 pub fn event_read_token_object() -> Object {
     token_object!(
         "EventReadToken",
@@ -588,6 +611,11 @@ pub fn event_read_token_object() -> Object {
         "EventType",
         |t: &EventReadToken| Some(t.event_type.clone())
     )
+    .field(scalar_field(
+        "startFrom",
+        TypeRef::named_nn("EventReadStartPosition"),
+        |t: &EventReadToken| Value::from(event_read_start_position_name(t.start_from)),
+    ))
 }
 
 pub fn command_token_object() -> Object {
