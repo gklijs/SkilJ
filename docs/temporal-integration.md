@@ -104,6 +104,15 @@ let signal_on_payment_confirmed = EventTypeMapping {
 };
 ```
 
+**Mint each `credential` with `startFrom: LATEST`, not the default, unless a backfill is
+genuinely what you want.** An `EventReadToken`'s first `consume` call replays its entire history
+by default (see [`docs/rest-event-reading.md`](rest-event-reading.md) and [`docs/architecture.md` §43](architecture.md#new-subscriber-replay-fix)) -
+wiring `start_on_order_placed` above against an `OrderPlaced` type that already has months of
+history would start one `OrderFulfillment` workflow execution per historical order the moment
+this mapping's first poll runs, not just for orders placed from then on. Pass `startFrom: LATEST`
+to the `createEventReadToken` GraphQL mutation when minting `order_placed_read_token`/
+`payment_confirmed_read_token` so the mapping only reacts to what happens after it goes live.
+
 `correlation_tag_key` names which of the event's own DCB tags supplies the workflow id - both
 mappings above name `"order"`, so `OrderPlaced` and `PaymentConfirmed` events carrying the same
 `order` tag value route to the *same* workflow execution: `workflow_id =

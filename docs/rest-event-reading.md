@@ -18,6 +18,15 @@ A few things that trip people up:
 - **Auto-advance and manual-ack are a one-time choice per token.** Whichever mode a token's first
   `consume` call uses is the mode it keeps for that token's lifetime. Want to switch? Use a new
   token.
+- **A brand-new token replays your entire history by default.** Its first `consume` call starts
+  at the very beginning of the stream — fine for a backfill, a footgun for a side effect that
+  must never re-fire for old events (the classic case: wiring a new `UserRegistered` handler
+  that sends a welcome email, and watching it email every user who has ever registered). Have
+  whoever mints the token pass `startFrom: LATEST` to the `createEventReadToken` GraphQL
+  mutation instead of leaving it at its `BEGINNING` default — that token's first call then skips
+  straight past everything already committed and only ever sees what happens from there on.
+  This is a one-time choice made at minting, like the ack mode above: it can't be changed on an
+  existing token, only chosen for a new one.
 - **Manual-ack can redeliver duplicates, on purpose.** If you fetch a batch and crash before
   acknowledging it, the next fetch serves the same batch again. This library doesn't de-duplicate
   for you — your handler needs to be safe to run twice on the same event (e.g. keyed by the
@@ -27,5 +36,6 @@ A few things that trip people up:
   you two positions that know nothing about each other.
 
 See [§7](architecture.md#rest-wire-contract) of [`architecture.md`](architecture.md) for the full wire contract (routes,
-request/response shapes, error codes), and `entity ReadCursor` in
-[`../specs/skilj.allium`](../specs/skilj.allium) for the underlying behavioural guarantee.
+request/response shapes, error codes), `entity ReadCursor` in
+[`../specs/skilj.allium`](../specs/skilj.allium) for the underlying behavioural guarantee, and
+[§43](architecture.md#new-subscriber-replay-fix) for the `startFrom`/`EventReadStartPosition` design.
