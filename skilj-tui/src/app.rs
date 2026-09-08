@@ -10,7 +10,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// The four v1 tabs - see docs/architecture.md §11 for what's
+/// The four v1 tabs - see [docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console) for what's
 /// deliberately not here yet (schema-driven forms, the superadmin
 /// directory, admin-console operations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +107,7 @@ fn parse_type_options(data: &Value, field: &str) -> Vec<TypeOption> {
 
 /// Query Events - Codeberg issue #8: the free-text, comma-separated
 /// `event_types` field became a real picker over `eventTypes(boundedContext)`
-/// (§13/Codeberg issue #6's "5a"). One flat struct rather than a
+/// ([§13](../../docs/architecture.md#self-describing-graphql-surface)/Codeberg issue #6's "5a"). One flat struct rather than a
 /// `CommandsTab`-style two-stage enum: picking which types to include and
 /// seeing the last query's results are never mutually exclusive views
 /// the way Commands' picker/form are - both stay visible together, the

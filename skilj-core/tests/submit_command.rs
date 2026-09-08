@@ -728,13 +728,13 @@ fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original
     });
 }
 
-/// docs/architecture.md §37: two different `client_id`s (two different
+/// [docs/architecture.md §37](../../docs/architecture.md#idempotency-keys-client-id-scoping): two different `client_id`s (two different
 /// tenants, in the real multi-tenant shape owner-tag scoping
 /// (`RoleAccessMapping`/`CommandToken`) actually supports) submitting
 /// the *same* `CommandType` with the *same* idempotency-key string must
 /// not collide - the real, already-shipped-since-0.0.2 bug behind this
 /// fix, distinct from `CrossContextRoute`'s own narrower predictable-key
-/// variant (§36). Before `client_id`-scoping, the second tenant's real
+/// variant ([§36](../../docs/architecture.md#cross-context-route)). Before `client_id`-scoping, the second tenant's real
 /// submission would have silently short-circuited to the first tenant's
 /// own stored `triggered_event_sequences` instead of ever calling
 /// `decide()`.
@@ -891,7 +891,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
     });
 }
 
-/// docs/architecture.md §37: an already-provisioned bounded context's
+/// [docs/architecture.md §37](../../docs/architecture.md#idempotency-keys-client-id-scoping): an already-provisioned bounded context's
 /// `idempotency_keys` (a real table since 0.0.2) gets patched onto the
 /// `client_id`-scoped shape - the security-review-driven follow-up to
 /// `ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_this_feature`
@@ -1060,7 +1060,7 @@ fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
     });
 }
 
-/// docs/architecture.md §37: a real fleet runs more than one skilj
+/// [docs/architecture.md §37](../../docs/architecture.md#idempotency-keys-client-id-scoping): a real fleet runs more than one skilj
 /// instance, which could race this same migration against the same
 /// shared Postgres at startup - untested by the migration test above,
 /// which only ever calls it from one caller at a time. Genuinely races

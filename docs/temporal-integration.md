@@ -1,7 +1,7 @@
 # Pairing skilj with Temporal
 
 skilj doesn't orchestrate long-running, multi-step processes itself, and doesn't try to -
-[`docs/architecture.md` §34](architecture.md) explains why, and lays out the fuller plan this page
+[`docs/architecture.md` §34](architecture.md#skilj-temporal-plan) explains why, and lays out the fuller plan this page
 is phase 1 of. This page covers what's built today: how a [Temporal](https://temporal.io) Activity
 calls skilj's command-submission surface safely, using infrastructure skilj already has.
 
@@ -31,7 +31,7 @@ Content-Type: application/json
 {"payload": {"amount": 50}}
 ```
 
-GraphQL, the same key as an argument to `submitCommand` (see `docs/architecture.md` §7/§21 for the
+GraphQL, the same key as an argument to `submitCommand` (see [`docs/architecture.md` §7](architecture.md#rest-wire-contract)/[§21](architecture.md#optional-idempotency-key-submission) for the
 full mutation shape).
 
 ## Why Run ID, not just Workflow ID
@@ -42,17 +42,17 @@ to reuse the same Activity ID naming (ordinary - Activity IDs are typically posi
 workflow definition, e.g. `"withdraw-1"` in every run) collide and dedupe against each other
 incorrectly. Run ID avoids that.
 
-This is a different concern from the *correlation* convention `docs/architecture.md` §34 plans for
+This is a different concern from the *correlation* convention [`docs/architecture.md` §34](architecture.md#skilj-temporal-plan) plans for
 phase 2/3 (which running workflow execution to signal or start) - that one is keyed on Workflow ID
 deliberately, since Temporal guarantees at most one open run per Workflow ID at a time. Don't
-conflate the two: this page's key answers "is this a retry of the same Activity attempt?"; §34's
+conflate the two: this page's key answers "is this a retry of the same Activity attempt?"; [§34](architecture.md#skilj-temporal-plan)'s
 future correlation convention answers "which workflow execution does this event belong to?".
 
 ## Getting a token
 
 The Activity needs a `CommandToken` scoped to whichever command type it calls - mint one via the
 `createCommandToken` GraphQL mutation (an `Admin`-level `RoleAccessMapping` credential does this;
-see `docs/architecture.md` §7 for the full admin-operations surface) and give the resulting
+see [`docs/architecture.md` §7](architecture.md#rest-wire-contract) for the full admin-operations surface) and give the resulting
 `{id}.{secret}` credential to wherever the Activity's Worker process reads its configuration from.
 One token per command type is enough for every Workflow that calls it - the idempotency key is
 what distinguishes one invocation from the next, not the token.
@@ -74,7 +74,7 @@ key in the first place.
 
 ## Starting or signaling a workflow from a skilj event: `skilj-temporal`
 
-The `skilj-temporal` crate (`docs/architecture.md` §34, phases 2-3) is a small bridge for the other
+The `skilj-temporal` crate ([`docs/architecture.md` §34](architecture.md#skilj-temporal-plan), phases 2-3) is a small bridge for the other
 direction: a skilj event starting a fresh Temporal workflow execution, or signaling one already
 running. It reads skilj's own `GET /v1/events/consume`/`POST /v1/events/consume/ack` (manual-ack
 mode) and calls Temporal's client - no dependency on any other skilj crate, and no dependency on

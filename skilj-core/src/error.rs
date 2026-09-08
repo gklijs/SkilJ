@@ -1,4 +1,4 @@
-//! Two-tier error handling - see docs/architecture.md §4.
+//! Two-tier error handling - see [docs/architecture.md §4](../../docs/architecture.md#error-handling).
 //!
 //! Library-level errors are enumerable, one `thiserror` enum per
 //! domain module (`access_control::Error`, `event_store::Error`,

@@ -19,7 +19,7 @@ Numbered sections only - a pass's own internal subheadings (a "Method"/
 "Verified"/"Recommendation" inside a single numbered section) aren't
 listed separately here; see that section itself for its own structure.
 
-- [1. The plugin API: `decide()` and `project()`](#1-the-plugin-api-decide-and-project)
+- [1. The plugin API: `decide()` and `project()`](#plugin-api-decide-project)
   - [1.1 Both are synchronous](#11-both-are-synchronous)
   - [1.2 JSON Schema is derived from the Rust type, not hand-written](#12-json-schema-is-derived-from-the-rust-type-not-hand-written)
   - [1.3 Trait-per-type, not closures, not a builder DSL](#13-trait-per-type-not-closures-not-a-builder-dsl)
@@ -30,72 +30,73 @@ listed separately here; see that section itself for its own structure.
   - [1.5 Startup registration is a builder](#15-startup-registration-is-a-builder)
   - [1.6 Raw `Event` → typed `Event`: the `BoundedContextEvent` trait](#16-raw-event-typed-event-the-boundedcontextevent-trait)
   - [1.7 The builder's internal registry, and the decide()-dispatch bridge](#17-the-builders-internal-registry-and-the-decide-dispatch-bridge)
-- [2. Ecosystem choices](#2-ecosystem-choices)
+- [2. Ecosystem choices](#ecosystem-choices)
   - [2.1 Web framework: `axum`](#21-web-framework-axum)
   - [2.2 Database layer: `sqlx`](#22-database-layer-sqlx)
   - [2.2.1 Every `Integer` is `i64`/`BIGINT`, uniformly](#221-every-integer-is-i64bigint-uniformly)
   - [2.2.2 Schema-per-bounded-context storage](#222-schema-per-bounded-context-storage)
   - [2.3 Property-based testing: `proptest`](#23-property-based-testing-proptest)
   - [2.4 Configuration: a plain builder, not a config-loading crate](#24-configuration-a-plain-builder-not-a-config-loading-crate)
-- [3. Crate and module structure](#3-crate-and-module-structure)
+- [3. Crate and module structure](#crate-module-structure)
   - [3.1 Four crates, not one](#31-four-crates-not-one)
   - [3.2 `skilj-core`: grouped by domain concern](#32-skilj-core-grouped-by-domain-concern)
   - [3.3 `skilj-graphql` and `skilj-rest`](#33-skilj-graphql-and-skilj-rest)
-- [4. Error handling](#4-error-handling)
+- [4. Error handling](#error-handling)
   - [4.1 Two tiers, because the spec already draws this line](#41-two-tiers-because-the-spec-already-draws-this-line)
   - [4.2 One shared trait unifies both tiers for rendering](#42-one-shared-trait-unifies-both-tiers-for-rendering)
-- [5. The GraphQL wire contract](#5-the-graphql-wire-contract)
+- [5. The GraphQL wire contract](#graphql-wire-contract)
   - [5.1 One unified schema, rebuilt at runtime](#51-one-unified-schema-rebuilt-at-runtime)
   - [5.2 Namespacing: nested per bounded context — corrected](#52-namespacing-nested-per-bounded-context-corrected)
   - [5.3 Pagination: Relay-style cursor connections](#53-pagination-relay-style-cursor-connections)
   - [5.4 Error shape — and a correction: business rejections aren't errors](#54-error-shape-and-a-correction-business-rejections-arent-errors)
-- [6. IdP trust configuration](#6-idp-trust-configuration)
-- [7. The REST wire contract](#7-the-rest-wire-contract)
+- [6. IdP trust configuration](#idp-trust-configuration)
+- [7. The REST wire contract](#rest-wire-contract)
   - [7.1 Purpose: narrowly-scoped agents and automated callers, not general access](#71-purpose-narrowly-scoped-agents-and-automated-callers-not-general-access)
   - [7.2 Routing: capability-based, not type-or-context-in-path](#72-routing-capability-based-not-type-or-context-in-path)
   - [7.3 Request/response bodies](#73-requestresponse-bodies)
   - [7.4 Three ways to read events, on purpose](#74-three-ways-to-read-events-on-purpose)
   - [7.5 Error mapping](#75-error-mapping)
-- [8. Open for a future pass](#8-open-for-a-future-pass)
-- [9. Next steps](#9-next-steps)
-- [10. Dynamic Consistency Boundary (DCB) alignment](#10-dynamic-consistency-boundary-dcb-alignment)
-- [10b. OpenTelemetry tracing, logging, and metrics](#10b-opentelemetry-tracing-logging-and-metrics)
+- [8. Open for a future pass](#open-for-a-future-pass)
+- [9. Next steps](#next-steps)
+- [10. Dynamic Consistency Boundary (DCB) alignment](#dcb-alignment)
+- [10b. OpenTelemetry tracing, logging, and metrics](#otel-tracing-logging-metrics)
   - [10b.1 Four smaller follow-ups](#10b1-four-smaller-follow-ups)
-- [11. `skilj-tui` - a Ratatui operator console](#11-skilj-tui---a-ratatui-operator-console)
-- [12. Cross-instance push completeness (Codeberg issue #2)](#12-cross-instance-push-completeness-codeberg-issue-2)
-- [13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (Codeberg issue #6, "5a")](#13-self-describing-graphql-surface-eventtypescommandtypes-codeberg-issue-6-5a)
-- [14. `skilj-inspector` - a standalone read-only Postgres console (Codeberg issue #6, "5b")](#14-skilj-inspector---a-standalone-read-only-postgres-console-codeberg-issue-6-5b)
-- [15. `skilj-tui` debugging enhancements (Codeberg issue #7)](#15-skilj-tui-debugging-enhancements-codeberg-issue-7)
-- [16. Declarative bounded-context format + codegen: a prototype, not a build (Codeberg issue #5)](#16-declarative-bounded-context-format-codegen-a-prototype-not-a-build-codeberg-issue-5)
-- [17. Event/command codegen, for real: the narrower cut (Codeberg issue #5)](#17-eventcommand-codegen-for-real-the-narrower-cut-codeberg-issue-5)
-- [18. Ultra-review fixes: an access-control leak, a duplicate-delivery bug, and two nits](#18-ultra-review-fixes-an-access-control-leak-a-duplicate-delivery-bug-and-two-nits)
-- [19. Optional snapshotting for `matching_events`: a discussion, not a build](#19-optional-snapshotting-for-matching_events-a-discussion-not-a-build)
-- [20. Four new filter operators: geo, color, IP subnet, and generic `in`](#20-four-new-filter-operators-geo-color-ip-subnet-and-generic-in)
-- [21. Optional idempotency key for command submission (Codeberg issue #12)](#21-optional-idempotency-key-for-command-submission-codeberg-issue-12)
-- [22. Background-polling and startup scaling (Codeberg issue #15)](#22-background-polling-and-startup-scaling-codeberg-issue-15)
-- [23. Cross-tenant projection read fix: owner-tag scoping on `RoleAccessMapping`](#23-cross-tenant-projection-read-fix-owner-tag-scoping-on-roleaccessmapping)
-- [24. Cross-tenant read fix, part two: raw events (`FetchEvents`, `QueryEvents`/`CountEvents`/`InspectEvent`, `EventSubscription`)](#24-cross-tenant-read-fix-part-two-raw-events-fetchevents-queryeventscounteventsinspectevent-eventsubscription)
-- [25. Cross-tenant read fix, part three: `CommandQuery`/`FetchCommands`](#25-cross-tenant-read-fix-part-three-commandqueryfetchcommands)
-- [26. Closing the admin read-back gap on `owner_tag_key`](#26-closing-the-admin-read-back-gap-on-owner_tag_key)
-- [27. Cross-tenant read fix, part five: `SnapshotInspection`](#27-cross-tenant-read-fix-part-five-snapshotinspection)
-- [28. Cross-tenant read fix, part six: `CreateBoundedContextFromTemplate`'s always-unscoped grant](#28-cross-tenant-read-fix-part-six-createboundedcontextfromtemplates-always-unscoped-grant)
-- [29. Hardening: `list_role_access_mappings` no longer panics on a concurrent bounded-context deletion](#29-hardening-list_role_access_mappings-no-longer-panics-on-a-concurrent-bounded-context-deletion)
-- [30. Cross-tenant write fix: owner-tag scoping on `SubmitCommand`/`TriggerCommand`/`CreateExternalEvent`/`CreateDirectEvent`](#30-cross-tenant-write-fix-owner-tag-scoping-on-submitcommandtriggercommandcreateexternaleventcreatedirectevent)
-- [31. Private fields: a third field-level protection, alongside `sensitive_fields` and the owner-tag `scope` series](#31-private-fields-a-third-field-level-protection-alongside-sensitive_fields-and-the-owner-tag-scope-series)
-- [32. Closing `ProjectionQuery`'s own team gate (Codeberg issue #17)](#32-closing-projectionquerys-own-team-gate-codeberg-issue-17)
-- [33. Payload upcasting (Codeberg issue #14): every option, and the one built](#33-payload-upcasting-codeberg-issue-14-every-option-and-the-one-built)
-- [34. `skilj-temporal`: a plan, partially built (long-running/cross-system processes)](#34-skilj-temporal-a-plan-partially-built-long-runningcross-system-processes)
-- [35. Configurable connection pool sizing](#35-configurable-connection-pool-sizing)
-- [36. `CrossContextRoute`: crossing bounded contexts without an external system](#36-crosscontextroute-crossing-bounded-contexts-without-an-external-system)
-- [37. `idempotency_keys` gets `client_id`-scoped: a real cross-tenant collision, live since 0.0.2](#37-idempotency_keys-gets-client_id-scoped-a-real-cross-tenant-collision-live-since-002)
-- [38. Message-broker bridges (Kafka/Solace/etc.): investigation, not yet built](#38-message-broker-bridges-kafkasolaceetc-investigation-not-yet-built)
-- [39. Built into skilj instead: external-message dedup on `CreateExternalEvent`](#39-built-into-skilj-instead-external-message-dedup-on-createexternalevent)
-- [40. `skilj-kafka`: a bridge to Kafka, both directions](#40-skilj-kafka-a-bridge-to-kafka-both-directions)
-- [41. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)](#41-skilj-amqp-a-bridge-to-any-amqp-10-broker-solaceazure-service-busartemis)
-- [42. `skilj-nats`: a bridge to NATS JetStream](#42-skilj-nats-a-bridge-to-nats-jetstream)
+- [11. `skilj-tui` - a Ratatui operator console](#skilj-tui-console)
+- [12. Cross-instance push completeness (Codeberg issue #2)](#cross-instance-push-completeness)
+- [13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (Codeberg issue #6, "5a")](#self-describing-graphql-surface)
+- [14. `skilj-inspector` - a standalone read-only Postgres console (Codeberg issue #6, "5b")](#skilj-inspector)
+- [15. `skilj-tui` debugging enhancements (Codeberg issue #7)](#skilj-tui-debugging-enhancements)
+- [16. Declarative bounded-context format + codegen: a prototype, not a build (Codeberg issue #5)](#declarative-bounded-context-codegen-prototype)
+- [17. Event/command codegen, for real: the narrower cut (Codeberg issue #5)](#event-command-codegen-real)
+- [18. Ultra-review fixes: an access-control leak, a duplicate-delivery bug, and two nits](#ultra-review-fixes)
+- [19. Optional snapshotting for `matching_events`: a discussion, not a build](#optional-snapshotting-matching-events)
+- [20. Four new filter operators: geo, color, IP subnet, and generic `in`](#four-new-filter-operators)
+- [21. Optional idempotency key for command submission (Codeberg issue #12)](#optional-idempotency-key-submission)
+- [22. Background-polling and startup scaling (Codeberg issue #15)](#background-polling-startup-scaling)
+- [23. Cross-tenant projection read fix: owner-tag scoping on `RoleAccessMapping`](#cross-tenant-projection-read-fix-owner-tag)
+- [24. Cross-tenant read fix, part two: raw events (`FetchEvents`, `QueryEvents`/`CountEvents`/`InspectEvent`, `EventSubscription`)](#cross-tenant-read-fix-raw-events)
+- [25. Cross-tenant read fix, part three: `CommandQuery`/`FetchCommands`](#cross-tenant-read-fix-command-query)
+- [26. Closing the admin read-back gap on `owner_tag_key`](#admin-read-back-owner-tag-key)
+- [27. Cross-tenant read fix, part five: `SnapshotInspection`](#cross-tenant-read-fix-snapshot-inspection)
+- [28. Cross-tenant read fix, part six: `CreateBoundedContextFromTemplate`'s always-unscoped grant](#cross-tenant-read-fix-create-bounded-context-template)
+- [29. Hardening: `list_role_access_mappings` no longer panics on a concurrent bounded-context deletion](#hardening-list-role-access-mappings)
+- [30. Cross-tenant write fix: owner-tag scoping on `SubmitCommand`/`TriggerCommand`/`CreateExternalEvent`/`CreateDirectEvent`](#cross-tenant-write-fix-owner-tag-scoping)
+- [31. Private fields: a third field-level protection, alongside `sensitive_fields` and the owner-tag `scope` series](#private-fields-third-protection)
+- [32. Closing `ProjectionQuery`'s own team gate (Codeberg issue #17)](#projection-query-team-gate)
+- [33. Payload upcasting (Codeberg issue #14): every option, and the one built](#payload-upcasting)
+- [34. `skilj-temporal`: a plan, partially built (long-running/cross-system processes)](#skilj-temporal-plan)
+- [35. Configurable connection pool sizing](#connection-pool-sizing)
+- [36. `CrossContextRoute`: crossing bounded contexts without an external system](#cross-context-route)
+- [37. `idempotency_keys` gets `client_id`-scoped: a real cross-tenant collision, live since 0.0.2](#idempotency-keys-client-id-scoping)
+- [38. Message-broker bridges (Kafka/Solace/etc.): investigation, not yet built](#message-broker-bridges-investigation)
+- [39. Built into skilj instead: external-message dedup on `CreateExternalEvent`](#external-message-dedup-create-external-event)
+- [40. `skilj-kafka`: a bridge to Kafka, both directions](#skilj-kafka-bridge)
+- [41. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)](#skilj-amqp-bridge)
+- [42. `skilj-nats`: a bridge to NATS JetStream](#skilj-nats-bridge)
 
 ---
 
+<a id="plugin-api-decide-project"></a>
 ## 1. The plugin API: `decide()` and `project()`
 
 These are the two black boxes the Allium spec names explicitly as
@@ -207,7 +208,7 @@ Two things worth being explicit about:
   command_type) -> Option<Option<&'static str>>` method (outer `None` =
   "not registered at all," mirroring `dispatch`'s own convention).
 - **Checked by `skilj-graphql`'s mutation resolver only, once it exists
-  (§8 item 5)** — before calling `CommandDispatcher::dispatch` at all, so
+  ([§8](#open-for-a-future-pass) item 5)** — before calling `CommandDispatcher::dispatch` at all, so
   an unauthorised caller never reaches `decide()`. REST triggering is
   untouched: `CommandToken` is already its own, separate per-token
   capability grant, and paying for this check there would be redundant.
@@ -308,7 +309,7 @@ manually-chained registration lands under `"default"`.
 
 **`#[auto_register]`**, a third `skilj-macros` proc-macro, applied above
 an `impl EventType for X`/`impl CommandType for X`/`impl Projection for X`/
-`impl Snapshot for X` block (the last added in the §19 pass that built
+`impl Snapshot for X` block (the last added in the [§19](#optional-snapshotting-matching-events) pass that built
 `Snapshot` for real):
 
 ```rust
@@ -481,7 +482,7 @@ reconciliation — the same rejection reaches a human admin calling
 **Done.** `roles`/`role_access_mappings` tables and their `skilj-core::db`
 functions exist, and `.build()`'s reconciliation loop is implemented for
 real in `skilj::SkiljBuilder` and verified end-to-end against a real
-Postgres (§8 item 2, `skilj/tests/reconciliation.rs`). One clarification
+Postgres ([§8](#open-for-a-future-pass) item 2, `skilj/tests/reconciliation.rs`). One clarification
 against the paragraph above worth recording: `.build()` treats a
 `.reconciliation_role(...)` naming no active Role at all as a genuine
 `Err` (`access_control::Error::UnrecognisedSubject`), not a silent skip -
@@ -588,7 +589,7 @@ far side of it, in application-shaped code, per §3.1's crate split):
   This is the whole dispatch bridge: it closes over `T` alone (no runtime
   state), so it's built once, at `.command_type::<T>()` call time, and
   stored keyed by `(bounded_context, T::NAME)`. `CommandTrigger`'s
-  handler (still to be wired — see §8) becomes: resolve the token → look
+  handler (still to be wired — see [§8](#open-for-a-future-pass)) becomes: resolve the token → look
   up the decider by `(bounded_context, command_type_name)` → call it with
   the raw payload string and this bounded context's matching events
   (`consistency_boundary_and_matching_events`, unchanged) → feed the
@@ -624,10 +625,11 @@ bounded context matching a set of tags, not one `event_type`'s events —
 (all that `EventFetch`'s routes needed). A `db::list_events_for_bounded_context`
 (or equivalent) is a straightforward addition once `CommandTrigger`'s
 implementation pass actually happens — no design question, just not
-written yet. Tracked in §8.
+written yet. Tracked in [§8](#open-for-a-future-pass).
 
 ---
 
+<a id="ecosystem-choices"></a>
 ## 2. Ecosystem choices
 
 ### 2.1 Web framework: `axum`
@@ -774,6 +776,7 @@ rather than modelled as domain state").
 
 ---
 
+<a id="crate-module-structure"></a>
 ## 3. Crate and module structure
 
 ### 3.1 Four crates, not one
@@ -856,7 +859,7 @@ skilj-core/src/
 │                       bootstrap's BootstrapSecret, which is why they
 │                       live here rather than in either
 ├── plugin/          -- the public CommandType/EventType/Projection
-│                       traits from §1 - the one module every consuming
+│                       traits from [§1](#plugin-api-decide-project) - the one module every consuming
 │                       application's own code touches directly
 ├── db/              -- sqlx queries and migrations, persistence for
 │                       every module above
@@ -890,6 +893,7 @@ skilj-rest/src/
 
 ---
 
+<a id="error-handling"></a>
 ## 4. Error handling
 
 ### 4.1 Two tiers, because the spec already draws this line
@@ -903,7 +907,7 @@ bounded context, an incompatible schema, an invalid filter, and so on)
 *is* a closed set skilj defines itself. Two tiers, not one:
 
 - **Library-level errors — enumerable, one `thiserror` enum per
-  `skilj-core` module**, matching the domain-grouped structure in §3:
+  `skilj-core` module**, matching the domain-grouped structure in [§3](#crate-module-structure):
   `access_control::Error`, `event_store::Error`, `projections::Error`,
   `bootstrap::Error`. Each lives beside the code that raises it, the same
   cohesiveness reasoning that picked domain-grouped modules over
@@ -929,7 +933,7 @@ decider's own `kind` passed through untouched. This is the one piece of
 determines how awkward or clean the wire-contract work is later, without
 committing to any wire shape itself.
 
-**Explicitly deferred to the GraphQL/REST wire contract pass** (§5,
+**Explicitly deferred to the GraphQL/REST wire contract pass** ([§5](#graphql-wire-contract),
 unchanged scope): how `code()`/`message()` actually become a GraphQL
 error's `extensions` object or a REST response's status code and JSON
 body. `skilj-core` has no web dependency and doesn't produce either
@@ -939,6 +943,7 @@ error, where one exists) to their own wire format.
 
 ---
 
+<a id="graphql-wire-contract"></a>
 ## 5. The GraphQL wire contract
 
 The spec itself name-drops "the unified-graph naming scheme" in a couple
@@ -962,7 +967,7 @@ snake_case → camelCase on the way out, matching what `async-graphql`'s
 own derive macros already do by default — no new convention invented
 there.
 
-**Built for real, §8 item 6.5's own pass**: `ProjectionQuery` is the
+**Built for real, [§8](#open-for-a-future-pass) item 6.5's own pass**: `ProjectionQuery` is the
 first surface that actually needed this mapping (`skilj-graphql/src/
 projection_types.rs`), and confirmed the mapping above against a real
 `schemars::schema_for!` output (0.8): a nested struct field is
@@ -1062,7 +1067,7 @@ one.
 
 ### 5.4 Error shape — and a correction: business rejections aren't errors
 
-Builds on §4's `code()`/`message()` trait, but only for one of the two
+Builds on [§4](#error-handling)'s `code()`/`message()` trait, but only for one of the two
 tiers. Revisiting this after designing the REST side surfaced a real gap:
 `code()`/`message()` fit library-level errors cleanly (`extensions.code`
 + the error's own top-level `message`, standard `async-graphql`
@@ -1090,12 +1095,13 @@ type SubmitCommandPayload {
 
 Library-level errors (revoked grant, wrong bounded context, malformed
 input) still go through GraphQL's real `errors` array via `code()`/
-`message()`, unchanged. The REST design in §7 mirrors this exact split —
+`message()`, unchanged. The REST design in [§7](#rest-wire-contract) mirrors this exact split —
 that's what keeps the two wire contracts consistent with each other
 rather than accidentally answering the same question two different ways.
 
 ---
 
+<a id="idp-trust-configuration"></a>
 ## 6. IdP trust configuration
 
 ```rust
@@ -1131,6 +1137,7 @@ exchange, or anything else OIDC bundles in.
 
 ---
 
+<a id="rest-wire-contract"></a>
 ## 7. The REST wire contract
 
 ### 7.1 Purpose: narrowly-scoped agents and automated callers, not general access
@@ -1227,7 +1234,7 @@ made alongside this document.
 
 ### 7.5 Error mapping
 
-Library-level errors (the `code()`/`message()` tier from §4) map to
+Library-level errors (the `code()`/`message()` tier from [§4](#error-handling)) map to
 standard HTTP semantics: 401 (missing/malformed bearer credential), 403
 (valid credential, wrong permission — revoked token, wrong token
 variant for the route, an opt-in flag like `external_creation_allowed`
@@ -1240,6 +1247,7 @@ an error status, per §7.3/§5.4.
 
 ---
 
+<a id="open-for-a-future-pass"></a>
 ## 8. Open for a future pass
 
 Every *design* question raised so far has a decision recorded above
@@ -1310,7 +1318,7 @@ implementation, in dependency order:
 5. **`skilj-graphql`** — **Phase 1 done** (see the plan at
    `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`): real JWT/JWKS
    verification (`access_control::{IdpConfig, SigningAlgorithm, JwksCache,
-   verify_and_extract_subject}`, `reqwest`-based, reactive-refresh per §6)
+   verify_and_extract_subject}`, `reqwest`-based, reactive-refresh per [§6](#idp-trust-configuration))
    and the full superadmin admin console over a real `async_graphql::dynamic`
    schema — `createSuperadmin`, `createRole`/`revokeRole`/
    `grantRoleAccessMapping`/`revokeRoleAccessMapping`, `addBoundedContext`/
@@ -1359,7 +1367,7 @@ implementation, in dependency order:
    at the time. `ProjectionQuery` needed `project()` (`todo!()` then — no
    projection state existed anywhere to query, regardless of wire shape) —
    **built in its own later pass, once `project()` existed both sync and
-   async (§8 item 6); see the Phase 4 writeup below.** `EventSubscription`
+   async ([§8](#open-for-a-future-pass) item 6); see the Phase 4 writeup below.** `EventSubscription`
    needed a real-time event-delivery mechanism (none existed — no
    broadcast channel, no Postgres `LISTEN`/`NOTIFY`) — **built in its own
    later pass too, once that mechanism existed; see the Phase 6 writeup
@@ -1539,7 +1547,7 @@ implementation, in dependency order:
    context rejected before ever reaching the lookup. **All tests pass,
    stable across repeated runs.**
 
-   **Phase 6 done: `EventSubscription`.** The last surface out of §8/§9 —
+   **Phase 6 done: `EventSubscription`.** The last surface out of [§8](#open-for-a-future-pass)/[§9](#next-steps) —
    see the plan at `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`.
    A real discovery, not assumed going in: `Subscription`/
    `AllEventsSubscription`/`EventTypeSubscription`, `create_all_events_subscription`/
@@ -1642,7 +1650,7 @@ implementation, in dependency order:
    DB update) and confirms the next matching event closes the
    subscription with a `grant_not_active`-coded error followed by a
    `complete` message, not silently. **All tests pass, stable across two
-   full workspace runs.** This closes out §8/§9 entirely — every item
+   full workspace runs.** This closes out [§8](#open-for-a-future-pass)/[§9](#next-steps) entirely — every item
    from the original backlog is done.
 6. **`project()`'s own dispatch closure** — **done, both cases** (see the
    plan at `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`):
@@ -1788,7 +1796,7 @@ implementation, in dependency order:
    short poll loop waiting on `db::get_projection_state` to reflect it,
    with no request-path code calling `project()` directly.
 
-**Real decrypt-on-read: `render_event`/`render_command`, done - not a §8
+**Real decrypt-on-read: `render_event`/`render_command`, done - not a [§8](#open-for-a-future-pass)
 item itself, but the natural follow-up once `SubjectErasure` made
 `protect_sensitive_fields` real.** The spec is unusually explicit and
 consistent about what "real" means here - identical text above
@@ -1801,7 +1809,7 @@ matching it (a caller reading their own data needs no separate grant) -
 decided *inside* the black box, never as a post-hoc redaction. Confirmed
 via `AskUserQuestion` (both recommended, before building): scoped to
 `render_event`/`render_command` only this pass, `read_projection` staying
-a separate future item (see the §9 bullet above for why); a missing
+a separate future item (see the [§9](#next-steps) bullet above for why); a missing
 `encryption_master_key` for a caller who *is* otherwise granted is a hard,
 actionable error, mirroring `resolve_encryption_keys`'s own write-side
 precedent - never triggers for an unauthorised caller, who needs no key
@@ -1865,7 +1873,7 @@ with no `encryption_master_key` at all still answers queries fine when
 nothing returned needs decrypting. **All tests pass on the first
 real-Postgres run, stable across two full workspace runs.**
 
-**Keyed / multi-row Projections - a real, user-driven correction to §8
+**Keyed / multi-row Projections - a real, user-driven correction to [§8](#open-for-a-future-pass)
 item 6's own original design, not a bug fix.** Scoping `read_projection`'s
 decrypt-on-read (above) surfaced research suggesting `projection_state`
 was structurally one shared row per `(bounded_context, projection_name)`
@@ -1958,7 +1966,7 @@ omitted) answering the same way, untouched by any customer-keyed event.
 workspace runs.**
 
 **`read_projection`'s own decrypt-on-read - automatic, not declared.**
-The very last item from §9. **First draft rejected by the user, for a
+The very last item from [§9](#next-steps). **First draft rejected by the user, for a
 real reason**: the natural mirror of `EventType`/`CommandType` - a
 `Projection.sensitive_fields` declaration the projection author fills in
 - was rejected before any code was written: an author who forgets to
@@ -2062,7 +2070,7 @@ created or triggered a matching event/command hit `derive_tags`'s own
 `todo!()` on the very first one, over REST or GraphQL alike - the
 mechanism behind Dynamic Consistency Boundaries had simply never been
 exercised for real. Found by grepping for `todo!()` across the codebase
-once §8/§9 and every follow-up it produced was genuinely closed, with
+once [§8](#open-for-a-future-pass)/[§9](#next-steps) and every follow-up it produced was genuinely closed, with
 nothing else queued; presented to the user via `AskUserQuestion`
 alongside two alternatives, picked as the recommended option.
 
@@ -2245,9 +2253,10 @@ real-Postgres run, stable across two full workspace runs.**
 
 ---
 
+<a id="next-steps"></a>
 ## 9. Next steps
 
-Every item in §8's original backlog, and every follow-up it led to, is
+Every item in [§8](#open-for-a-future-pass)'s original backlog, and every follow-up it led to, is
 now done: items 1–4 (persistence, the builder registry, REST fully
 wired), item 5 (`skilj-graphql`) through Phase 6 (`EventSubscription`),
 item 6 (`project()`, sync and async, `ProjectionRebuild` replay and
@@ -2258,7 +2267,7 @@ keyed / multi-row Projections, `read_projection`'s own decrypt-on-read,
 and now `valid_filters`/`matches_filters` for real too (the `Filter`/
 `FilterOperator` mechanism, plus the shared scalar/list-of-scalar-leaf
 retrofit it shared with `valid_tag_mappings`/`valid_sensitive_fields`) -
-see each item's own writeup for the full breakdown. **§8/§9's backlog,
+see each item's own writeup for the full breakdown. **[§8](#open-for-a-future-pass)/[§9](#next-steps)'s backlog,
 and every genuinely pre-existing `todo!()`/gap this multi-session thread
 turned up along the way, is now closed out - a fresh grep for `todo!()`
 across the whole workspace at this point finds nothing left.** The one
@@ -2276,11 +2285,12 @@ anywhere today.
 remains the right tool once code lands that a surface's obligations
 haven't been checked against yet.
 
+<a id="dcb-alignment"></a>
 ## 10. Dynamic Consistency Boundary (DCB) alignment
 
 skilj's own consistency mechanism - `Tag`s on events, a command's
 `consistency_tags` deriving a `consistency_boundary` and
-`matching_events` set that `decide()` is evaluated against (§1) - is,
+`matching_events` set that `decide()` is evaluated against ([§1](#plugin-api-decide-project)) - is,
 structurally, an implementation of the **Dynamic Consistency Boundary
 (DCB)** pattern: a named, actively-discussed approach in the event-
 sourcing community, introduced by Sara Pellegrini, with a dedicated
@@ -2308,6 +2318,7 @@ Whether to list skilj there too is tracked separately in
 `docs/open-source-todo.md`, gated on this repository actually being
 public - a link to a private repo serves no one who'd read that list.
 
+<a id="otel-tracing-logging-metrics"></a>
 ## 10b. OpenTelemetry tracing, logging, and metrics
 
 Added in a later pass: real distributed tracing across the HTTP surfaces,
@@ -2379,7 +2390,7 @@ conflict, and confined to that one leaf crate.
   that field explicitly instead, since it's cheap, structured, and
   genuinely useful for correlating a trace to a bounded context.
   `event_store::process_command` and `db::submit_command` - the domain
-  engine's own real entry points (§1) - get explicit `bounded_context`/
+  engine's own real entry points ([§1](#plugin-api-decide-project)) - get explicit `bounded_context`/
   `command_type` fields the same way, since `command_type: &CommandType`
   isn't itself a `&str` the mechanical pass could pick up.
 - `skilj`'s two background `tokio::spawn` loops (the async-projection
@@ -2594,6 +2605,7 @@ out explicitly) - the common case for either crate used standalone, or
 `current_trace_id()` helper duplicated in both crates, matching
 `trace_request`'s own precedent for why.
 
+<a id="skilj-tui-console"></a>
 ## 11. `skilj-tui` - a Ratatui operator console
 
 A sixth workspace member, added later: an interactive console for
@@ -2669,7 +2681,7 @@ included, and catching one real mismatch this way: `allEvents`'s
 schema-builder source alone didn't make that obvious).
 
 **Schema-driven command/event forms landed (Codeberg issue #8)**, once
-§13's `eventTypes`/`commandTypes` queries gave this crate something to
+[§13](#self-describing-graphql-surface)'s `eventTypes`/`commandTypes` queries gave this crate something to
 build one from - the v1 gap this same section used to name is closed,
 not just narrowed. The Commands tab's free-text type name became a real
 picker over `commandTypes(boundedContext)`; picking one runs
@@ -2711,7 +2723,7 @@ and payload assembly, `tests/schema_driven_forms.rs` for the `App`-level
 picker/form/checklist flow (including the digit-typing regression, driven
 entirely through `App::handle` the same way `main.rs`'s loop would); and
 a genuine interactive run in a real `tmux` pty (this sandbox has no TTY,
-same `skilj-inspector` precedent as §14) against a real `skilj-demo`
+same `skilj-inspector` precedent as [§14](#skilj-inspector)) against a real `skilj-demo`
 server - picked `DepositMoney`, typed `a12`/`250` into its generated
 fields (digits included, confirming the fix live), submitted, got a real
 `"accepted": true`, then toggled `MoneyDeposited` in the Query Events
@@ -2744,9 +2756,10 @@ context" core this v1 targets; an in-app IdP login flow (v1 only ever
 takes a bearer token as config). Schema-driven command/event forms used
 to be listed here too - closed by Codeberg issue #8, see above.
 
+<a id="cross-instance-push-completeness"></a>
 ## 12. Cross-instance push completeness (Codeberg issue #2)
 
-**A deliberate reversal, not a drift fix.** §8's own `EventBroadcaster`
+**A deliberate reversal, not a drift fix.** [§8](#open-for-a-future-pass)'s own `EventBroadcaster`
 writeup and the async-projection poller's writeup both cite the spec's
 former blanket "Multi-instance / distributed deployment" exclusion as
 the reason real-time delivery was single-process, in-memory only. That
@@ -2791,7 +2804,7 @@ command" concern needed new handling.
   in-memory `CommandType` cache exists anywhere to go stale. The
   genuinely stale-prone in-memory cache was `skilj-graphql`'s
   `SchemaRegistry` (§5.1's own `ArcSwap<Schema>`), which had stayed a
-  deliberate stub since Phase 6 (§9's writeup): "a projection registered
+  deliberate stub since Phase 6 ([§9](#next-steps)'s writeup): "a projection registered
   after `graphql_router()` was called won't gain a `ProjectionResult`
   member until the process restarts." Multi-instance deployment was
   simply the trigger for finally building it - which also fixes the
@@ -2871,6 +2884,7 @@ via `__type(name: "Query") { fields { name } }` introspection, polled
 briefly since the rebuild is asynchronous) without instance B ever
 restarting.
 
+<a id="self-describing-graphql-surface"></a>
 ## 13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (Codeberg issue #6, "5a")
 
 `TypeRegistration`'s `projections`/`scheduledEventTypes` queries already
@@ -2909,14 +2923,15 @@ new fields, and asserts the full registered set comes back - plus the
 empty-bounded-context and unauthenticated-caller cases every other field
 on this surface already covers.
 
+<a id="skilj-inspector"></a>
 ## 14. `skilj-inspector` - a standalone read-only Postgres console (Codeberg issue #6, "5b")
 
-Even with §13's fix, everything about a running `skilj` deployment still
+Even with [§13](#self-describing-graphql-surface)'s fix, everything about a running `skilj` deployment still
 requires `skilj-graphql` itself to be up - the exact moment an operator
 most wants to look (the app is down, Postgres isn't) has no tool at all.
 `skilj-inspector` is a second Ratatui console, built the opposite way
 from `skilj-tui` on purpose: where that crate is deliberately a pure
-GraphQL client with zero dependency on any other skilj crate (§11),
+GraphQL client with zero dependency on any other skilj crate ([§11](#skilj-tui-console)),
 `skilj-inspector` depends on `skilj-core` directly, since raw Postgres
 access *is* the whole point - there's no `Role`/`RoleAccessMapping`
 layer to authenticate against when nothing is serving GraphQL. One
@@ -2926,7 +2941,7 @@ required arg, `--database-url`/`DATABASE_URL`, no IdP config, no token.
 explicit doc comment on the crate root: every function in its `data`
 module calls only existing `skilj_core::db` read functions
 (`list_bounded_contexts`, the two new `list_*_types_for_bounded_context`
-from §13, `list_projections_for_bounded_context`,
+from [§13](#self-describing-graphql-surface), `list_projections_for_bounded_context`,
 `list_recent_events_for_bounded_context`), reusing them rather than
 re-deriving SQL in a second place, and the crate never calls
 `db::migrate` or any write path. One real gap this surfaced:
@@ -2976,10 +2991,11 @@ bounded context, cycled through all five tabs, confirmed the sensitive
 field rendered as ciphertext on screen (not just in the test assertion),
 and quit cleanly with `q`.
 
+<a id="skilj-tui-debugging-enhancements"></a>
 ## 15. `skilj-tui` debugging enhancements (Codeberg issue #7)
 
-Four independently shippable additions to §11's console, picked up right
-after §13 landed (one of them was blocked on it). **One correction to
+Four independently shippable additions to [§11](#skilj-tui-console)'s console, picked up right
+after [§13](#self-describing-graphql-surface) landed (one of them was blocked on it). **One correction to
 the issue's own framing, found while implementing, not assumed**: it
 describes all four as "no architectural change" - true for three of
 them, but the DCB conflict visualizer needed a real, small three-crate
@@ -3083,12 +3099,13 @@ tests, `skilj-tui/tests/debugging_enhancements.rs`'s `App`-level tests
 `skilj-tui/tests/projection_query.rs`'s extended mock-server coverage of
 the `wait` variable, `allium check` clean after the spec edit, and a
 real interactive `tmux` pty run against a live `skilj-demo` server
-(same no-TTY-in-this-sandbox precedent as §14) - a genuine DCB conflict
+(same no-TTY-in-this-sandbox precedent as [§14](#skilj-inspector)) - a genuine DCB conflict
 triggered and its real matching event shown, the Live Events filter
 shown hiding/showing events live, `waitForSequence: 0` shown returning
 current state rather than hanging, and real ANSI colour codes confirmed
 in the captured pane output (not just present in the test suite).
 
+<a id="declarative-bounded-context-codegen-prototype"></a>
 ## 16. Declarative bounded-context format + codegen: a prototype, not a build (Codeberg issue #5)
 
 Issue #5 proposes a small YAML/TOML format describing an event/command/
@@ -3235,9 +3252,10 @@ worth building. The final call - build the narrower first cut, or close
 (shipped this session) - is the project owner's, informed by these
 numbers rather than the issue's own upfront guess.
 
+<a id="event-command-codegen-real"></a>
 ## 17. Event/command codegen, for real: the narrower cut (Codeberg issue #5)
 
-§16's recommendation was the narrower cut - event/command type
+[§16](#declarative-bounded-context-codegen-prototype)'s recommendation was the narrower cut - event/command type
 generation only, `Projection` generation deferred (its Finding 3,
 `keyed_by`'s per-event-type map case, stays unresolved). The project
 owner chose it. This section documents the actual build, not another
@@ -3277,14 +3295,14 @@ wired" discipline, the format covers `fields`, `tags`, and
 `event_read_allowed`), scheduling, and `#[requires_role]` are real,
 legitimate parts of that API but are **deliberately deferred**, named
 here rather than silently missing: `banking.rs` never exercised any of
-them (confirmed by direct reading during §16's own prototype pass), so
+them (confirmed by direct reading during [§16](#declarative-bounded-context-codegen-prototype)'s own prototype pass), so
 building generator support for them now would be speculative,
 untested-by-anything-real surface area - the exact thing this project's
 own convention avoids. A `FieldType` closed enum
 (`string`/`i64`/`bool`) covers the scalar leaf shapes the plugin API's
 schema rules already require, not a general type system.
 
-**One deliberate deviation from §16's own draft format**: TOML, not
+**One deliberate deviation from [§16](#declarative-bounded-context-codegen-prototype)'s own draft format**: TOML, not
 YAML. `serde_yaml` - the natural choice for the prototype's own
 illustrative YAML sketch - was archived by its own maintainer in 2024,
 not a dependency to newly adopt for real, ongoing code. `toml` is
@@ -3309,7 +3327,7 @@ is a real, immediate compile error (an unresolved name) in the
 including crate, not a silent gap; and the shared per-bounded-context
 event enum (`BankingEvent`-shaped) plus its own `impl
 BoundedContextEvent for ... { fn try_from_event(...) }`, one
-variant/match-arm per event type - §16's own Finding 1, the cleanest,
+variant/match-arm per event type - [§16](#declarative-bounded-context-codegen-prototype)'s own Finding 1, the cleanest,
 least-arguable win, and Finding 4's correctness win falls out of the
 same mechanism for free: the tag reference and the payload struct are
 now derived from the same declarative source, so a typo'd field name is
@@ -3334,7 +3352,7 @@ generation is out of scope for this pass, not broken by it.
 `EnrollStudentInCourse`'s dual-invariant `decide()` - is real logic no
 declarative format generates, and its two projections
 (`CourseRoster`/`StudentSchedule`) are exactly the deferred
-`keyed_by`-map case from §16's Finding 3. Converting it would prove
+`keyed_by`-map case from [§16](#declarative-bounded-context-codegen-prototype)'s Finding 3. Converting it would prove
 nothing this pass doesn't already prove via `banking.rs`.
 
 **Verification.** `skilj-codegen` has its own test suite: 2 unit tests
@@ -3357,15 +3375,16 @@ was manually inspected after a real build and reads as genuinely clean,
 idiomatic Rust - a maintainer debugging generated code would not be lost
 in it.
 
+<a id="ultra-review-fixes"></a>
 ## 18. Ultra-review fixes: an access-control leak, a duplicate-delivery bug, and two nits
 
 A `/code-review ultra` cloud review of this session's own recent work
-(`1bcfc70`..`HEAD` - roughly everything from `skilj-tui` through §17's
+(`1bcfc70`..`HEAD` - roughly everything from `skilj-tui` through [§17](#event-command-codegen-real)'s
 `skilj-codegen`, chosen to fit the tool's diff-size cap) surfaced four
 findings, all fixed the same pass. Two were real, not nits.
 
 **`matchingEvents` leaked event payloads past `Admin` gating.**
-`CommandSubmission` (§7's DCB conflict visualizer) faces `WriteAccess`
+`CommandSubmission` ([§7](#rest-wire-contract)'s DCB conflict visualizer) faces `WriteAccess`
 for submission itself, but a rejection's `matchingEvents` is full raw
 event content - the same visibility `EventQuery`'s `queryEvents`/
 `countEvents`/`inspectEvent` require `Admin` for. The resolver populated
@@ -3386,7 +3405,7 @@ rejecting command as both an Admin- and a Write-level caller against
 real Postgres and asserts the field is present only for the former.
 
 **Cross-instance `NOTIFY` double-delivered every locally-committed
-event.** §12's write path both calls `EventBroadcaster::publish`/
+event.** [§12](#cross-instance-push-completeness)'s write path both calls `EventBroadcaster::publish`/
 `RevocationBroadcaster::publish` directly *and* `NOTIFY`s Postgres. But
 Postgres delivers a `NOTIFY` to every listening backend, including ones
 opened by the same process that sent it - so an instance's own
@@ -3426,15 +3445,16 @@ with `#[serde(deny_unknown_fields)]` on all four spec structs in
 `skilj-codegen/src/spec.rs`, plus two new regression tests in
 `skilj-codegen/tests/generate.rs`. And `skilj-demo/src/banking.rs` still
 declared a hand-written `BOUNDED_CONTEXT_NAME` const left over from
-before §17's codegen refactor - dead, unreferenced anywhere, sitting two
+before [§17](#event-command-codegen-real)'s codegen refactor - dead, unreferenced anywhere, sitting two
 lines above the real generated `BOUNDED_CONTEXT` every caller actually
 uses. Deleted.
 
 Verification for all four: `cargo build/clippy/test --workspace` clean
 (the one pre-existing `skilj-core` `explicit_auto_deref` warning noted
-in §17 is unrelated and untouched), `allium check` clean on the spec
+in [§17](#event-command-codegen-real) is unrelated and untouched), `allium check` clean on the spec
 change.
 
+<a id="optional-snapshotting-matching-events"></a>
 ## 19. Optional snapshotting for `matching_events`: a discussion, not a build
 
 User-initiated investigation, not tied to a Codeberg issue: for a
@@ -3443,7 +3463,7 @@ bounded context with a lot of history, a command's `matching_events`
 slow to assemble, especially past what `EventCache` can serve. This
 section records the investigation's findings and the design it
 converged on. **No code changes accompany this section** - it's a
-decision record, the same treatment §16 gave issue #5's prototype phase
+decision record, the same treatment [§16](#declarative-bounded-context-codegen-prototype) gave issue #5's prototype phase
 before a build was chosen.
 
 ### What actually happens today (the real bottleneck)
@@ -3458,7 +3478,7 @@ before a build was chosen.
 2. Filters that entire set *in Rust, in memory* for tag matches
    (`consistency_boundary_and_matching_events`, `event_store/mod.rs`).
 
-`EventCache` (default capacity 1000, per §8's own drift-audit-closure
+`EventCache` (default capacity 1000, per [§8](#open-for-a-future-pass)'s own drift-audit-closure
 history) is a single bounded-context-wide recent-events window, not
 scoped per tag/entity. Its `try_events_after(..., -1)` ("give me all
 history", exactly what the read above asks for) can only be served from
@@ -3599,7 +3619,7 @@ by design, so a command unioning two tags gets no snapshot benefit until
 a later pass composes multiple single-tag snapshots (feasible in
 principle - dedup the union by `sequence` - but real, unbuilt design
 work). Matches this project's own repeated "narrower cut" discipline
-(§16/§17's own precedent).
+([§16](#declarative-bounded-context-codegen-prototype)/[§17](#event-command-codegen-real)'s own precedent).
 
 **Inspection endpoint** - new and separate, Admin-gated the same way
 `EventQuery` is (a snapshot's `state` is derived business data, the same
@@ -3654,7 +3674,7 @@ own "second console for when the wire protocol isn't the point" niche.
 - **Multi-instance consistency**: unlike `EventCache` (in-memory,
   self-healing via `freshen()`), a snapshot is Postgres-backed and every
   instance must agree on "the latest trustworthy snapshot" - the same
-  bar cross-instance push (§12) and the scheduler's own
+  bar cross-instance push ([§12](#cross-instance-push-completeness)) and the scheduler's own
   `ScheduleStateIsShared` already had to clear.
 - **Real, non-optional cost even for non-adopters**: a schema migration,
   a new registration surface, a new endpoint, and spec work land on the
@@ -3722,7 +3742,7 @@ it exists. Every existing real-Postgres test across `skilj-core`/
 `courses.rs`'s dual-tag tests included - the real regression proof, per
 this session's own established discipline. `cargo build/clippy/test
 --workspace` clean throughout (the one pre-existing, unrelated
-`skilj-core` `explicit_auto_deref` warning noted in §17/§18 untouched).
+`skilj-core` `explicit_auto_deref` warning noted in [§17](#event-command-codegen-real)/[§18](#ultra-review-fixes) untouched).
 
 ### `Snapshot`, built for real
 
@@ -3866,6 +3886,7 @@ way `QueryEvents`/`CountEvents` already scope without one), with
 guarantees and a guidance note tying it back to the `ProcessCommand`
 note and explaining the deliberate `Projection` separation.
 
+<a id="four-new-filter-operators"></a>
 ## 20. Four new filter operators: geo, color, IP subnet, and generic `in`
 
 User-initiated: geo/color/IP-address filtering, brainstormed further
@@ -3878,7 +3899,7 @@ today - `classify`/`filter_operator_is_valid`/`matches_one_filter`
 (`skilj-tui`) are three independent, un-shared closed `match` statements
 over JSON-Schema `"type"`/`"format"` strings. This exact territory ("real
 GraphQL scalar types") was already investigated and deliberately
-deferred in §8/§9 as "a genuinely separate, much larger change." Decided
+deferred in [§8](#open-for-a-future-pass)/[§9](#next-steps) as "a genuinely separate, much larger change." Decided
 via `AskUserQuestion` (twice, as the scope grew): ship four concrete
 operators as contained additions to the existing `match` statements, no
 registry, `FilterOperator` stays a closed enum. The general
@@ -3991,6 +4012,7 @@ parsing plumbing, just gated to a different `format`. Full existing
 regression suite passes unchanged; `cargo build/clippy/test --workspace`
 clean; `allium check` clean on the spec change.
 
+<a id="optional-idempotency-key-submission"></a>
 ## 21. Optional idempotency key for command submission (Codeberg issue #12)
 
 Command submission had no idempotency mechanism - `Command.id` is
@@ -4142,6 +4164,7 @@ unchanged - proving the "no key ⇒ zero behaviour change" property for
 real. `cargo build/clippy/test --workspace` clean; `allium check` clean
 on the spec change.
 
+<a id="background-polling-startup-scaling"></a>
 ## 22. Background-polling and startup scaling (Codeberg issue #15)
 
 `SkiljBuilder::build()`'s startup warm-up loop and all three
@@ -4162,7 +4185,7 @@ early-exit even fired.
 Raised while investigating a "route commands to specific instances"
 idea for multi-tenancy (Codeberg issue #13) - that idea was not
 adopted: every skilj instance is fully interchangeable for any bounded
-context today, a deliberate, twice-confirmed design decision (§12), and
+context today, a deliberate, twice-confirmed design decision ([§12](#cross-instance-push-completeness)), and
 building instance routing would have reversed it for no correctness
 benefit. The real, underlying performance concern was legitimate, just
 aimed at the wrong fix - this section is that fix, entirely orthogonal
@@ -4269,6 +4292,7 @@ scheduler tests, proving the batched queries and concurrent fan-out
 preserve behaviour exactly, not just "look right." `cargo
 build/clippy/test --workspace` clean.
 
+<a id="cross-tenant-projection-read-fix-owner-tag"></a>
 ## 23. Cross-tenant projection read fix: owner-tag scoping on `RoleAccessMapping`
 
 A security review found that `ProjectionQuery`'s only access check
@@ -4416,9 +4440,10 @@ admin-bootstrap sites in `skilj-demo`/`templates/skilj-template`/
 full existing suite green with no behavioural change to any
 already-unscoped mapping or projection.
 
+<a id="cross-tenant-read-fix-raw-events"></a>
 ## 24. Cross-tenant read fix, part two: raw events (`FetchEvents`, `QueryEvents`/`CountEvents`/`InspectEvent`, `EventSubscription`)
 
-§23 closed the gap for `ProjectionQuery`; this pass closes the same gap
+[§23](#cross-tenant-projection-read-fix-owner-tag) closed the gap for `ProjectionQuery`; this pass closes the same gap
 for skilj's other read surfaces, all of which shared the identical
 shallow check (`require_read_mapping`/a bearer `EventReadToken`: "any
 active grant/token", never "does this specific *event* belong to the
@@ -4430,7 +4455,7 @@ every other company's raw events too; `FetchEvents`/`ConsumeEvents` are
 the REST track's own pull-based reads, authenticated by a bearer
 `EventReadToken` with no `Role` behind it at all.
 
-**Design**: the same `scope`-vs-derived-owner mechanism as §23, but
+**Design**: the same `scope`-vs-derived-owner mechanism as [§23](#cross-tenant-projection-read-fix-owner-tag), but
 reshaped around two differences from the projection case.
 
 First, raw events are already fully described by `EventType.tag_mappings`,
@@ -4476,7 +4501,7 @@ still succeeds, the same "redact, don't reject the whole query" register
 sensitive-field decryption already uses. `inspect_event`, the one
 single-record surface here (mirrors `query_projection`'s own shape),
 rejects outright with the relocated `access_control::Error::GrantScopeMismatch` -
-moved up from `projections::Error` (where §23 first put it) to sit
+moved up from `projections::Error` (where [§23](#cross-tenant-projection-read-fix-owner-tag) first put it) to sit
 alongside `GrantBoundedContextMismatch`, since it's now shared by both
 `projections::query_projection` and every function in this pass, the
 same cross-cutting-error convention `GrantBoundedContextMismatch` itself
@@ -4488,7 +4513,7 @@ site already passed its whole `RoleAccessMapping`/`EventReadToken`/
 `Subscription` through unchanged, so `scope` rides along for free.
 `registerEventType`'s mutation gained an optional `ownerTagKey: String`
 argument (`type_registration.rs`, mirroring `grantRoleAccessMapping`'s
-own `scope` argument from §23) and `createEventReadToken`'s gained
+own `scope` argument from [§23](#cross-tenant-projection-read-fix-owner-tag)) and `createEventReadToken`'s gained
 `scope: String` - pulled out of the shared `create_type_token_field!`
 macro into its own hand-written resolver, the same reason
 `db::get_event_type_access_token!` already has an identical exception
@@ -4525,19 +4550,20 @@ diff (not taken on the `allium:tend` report alone) - clean, 399 → 402
 obligations with exactly the three expected additions, the same 4
 pre-existing `analyse` findings unchanged.
 
+<a id="cross-tenant-read-fix-command-query"></a>
 ## 25. Cross-tenant read fix, part three: `CommandQuery`/`FetchCommands`
 
-The third and final pass. §23 covered `ProjectionQuery`, §24 covered raw
+The third and final pass. [§23](#cross-tenant-projection-read-fix-owner-tag) covered `ProjectionQuery`, [§24](#cross-tenant-read-fix-raw-events) covered raw
 events (`QueryEvents`/`CountEvents`/`InspectEvent`, `FetchEvents`/
 `ConsumeEvents`, `EventSubscription`); this one covers `CommandQuery` -
-`FetchCommands`, the only read surface for `Command`. Narrower than §24
+`FetchCommands`, the only read surface for `Command`. Narrower than [§24](#cross-tenant-read-fix-raw-events)
 in one real way: the REST track's `CommandToken` only *triggers* one
 command type and reads nothing back (`surface CommandQuery`'s own
 guidance: "the REST track has no equivalent and is not meant to grow
 one"), so there is no token-scope side to build here - one entity field,
 one rule, one surface guarantee, done.
 
-**Design**: exactly §24's mechanism, adapted to `Command`/`CommandType`
+**Design**: exactly [§24](#cross-tenant-read-fix-raw-events)'s mechanism, adapted to `Command`/`CommandType`
 in place of `Event`/`EventType`. `CommandType.owner_tag_key: Option<String>`
 (`skilj-core/src/event_store/mod.rs`) - spec'd and registered exactly
 like `EventType.owner_tag_key`, validated by the *same*
@@ -4572,7 +4598,7 @@ unchanged, mirroring the event-type wiring exactly.
 `fetchCommands` itself - it already passed the whole `RoleAccessMapping`
 through.
 
-**Same read-back gap as §23/§24, spanning all three now**: neither
+**Same read-back gap as [§23](#cross-tenant-projection-read-fix-owner-tag)/[§24](#cross-tenant-read-fix-raw-events), spanning all three now**: neither
 `EventType.owner_tag_key` nor `CommandType.owner_tag_key` is exposed by
 `TypeRegistration`'s own query side - an admin can set or clear the
 declaration but can't read back which key is currently in force. Left
@@ -4602,16 +4628,17 @@ unproven owner) applied three times, each adapted to what that surface's
 own record shape already provided rather than forcing a single
 implementation onto all three.
 
+<a id="admin-read-back-owner-tag-key"></a>
 ## 26. Closing the admin read-back gap on `owner_tag_key`
 
-§24/§25 each flagged the same small completeness gap and left it alone:
+[§24](#cross-tenant-read-fix-raw-events)/[§25](#cross-tenant-read-fix-command-query) each flagged the same small completeness gap and left it alone:
 `surface TypeRegistration`'s own `exposes:` clause never listed
 `event_type.owner_tag_key`/`command_type.owner_tag_key` alongside the
 other registered fields it already exposes (`tagMappings`,
 `sensitiveFields`, etc.) - an admin could set or clear the declaration
 via `registerEventType`/`registerCommandType` but had no way to read
 back which key was currently in force. Closed now, on both sides at
-once (per §25's own note: fixing one side only would have been worse
+once (per [§25](#cross-tenant-read-fix-command-query)'s own note: fixing one side only would have been worse
 than neither).
 
 Purely additive, no new mechanism: `exposes:` gained
@@ -4636,11 +4663,12 @@ build/clippy/test --workspace` and `cargo fmt --check` clean; `allium
 check`/`plan`/`analyse` independently re-verified - clean, obligation
 count unchanged, same 4 pre-existing `analyse` findings.
 
+<a id="cross-tenant-read-fix-snapshot-inspection"></a>
 ## 27. Cross-tenant read fix, part five: `SnapshotInspection`
 
 A gap the first four passes didn't cover, found by re-checking every
 `AdminAccess`-facing single-record read surface for the same shape after
-§26 closed the read-back gap: `inspectSnapshot`'s resolver
+[§26](#admin-read-back-owner-tag-key) closed the read-back gap: `inspectSnapshot`'s resolver
 (`skilj-graphql/src/resolvers/snapshot_query.rs`) only ever checked
 `require_admin_mapping` - bounded-context-level - then fetched a stored
 row by a caller-supplied `tagValue` directly, with no check that the
@@ -4652,14 +4680,14 @@ grant could inspect any other company's snapshot by tag value alone.
 treatment `Snapshot::TAG_KEY` itself already gets (no spec field, no
 registration surface: `Snapshot` is compiled, deployed configuration
 throughout, unlike `EventType`/`CommandType`'s registered
-`owner_tag_key` from §24/§25). Genuinely a separate dimension from
+`owner_tag_key` from [§24](#cross-tenant-read-fix-raw-events)/[§25](#cross-tenant-read-fix-command-query)). Genuinely a separate dimension from
 `TAG_KEY`: a snapshot keyed by `"account"` can still need owner-scoping
 by `"company"` - `catch_up_snapshots` (`skilj-core/src/db/mod.rs`)
 derives each stored row's own `owner` at fold time from whichever tag on
 the folding event matches `OWNER_TAG_KEY`, independent of the tag it
 already reads for `TAG_KEY`/`tag_value` itself, using the identical
 "leave an established owner untouched when a later event lacks the tag"
-rule `apply_projection_fold_update` set in §23.
+rule `apply_projection_fold_update` set in [§23](#cross-tenant-projection-read-fix-owner-tag).
 
 Unlike the other four surfaces, `inspectSnapshot` had no pure-function
 authorization layer in `skilj-core` at all to extend - its whole check
@@ -4673,7 +4701,7 @@ is a new sibling to `get_snapshot_state`, not a replacement: that
 function's other caller, `submit_command`'s snapshot-accelerated
 `decide_from_snapshot` path, is a write-path internal accelerator, not a
 caller read, and stays untouched - the identical "`ProcessCommand`'s
-`matching_events` is deliberately untouched" principle §24 already
+`matching_events` is deliberately untouched" principle [§24](#cross-tenant-read-fix-raw-events) already
 applied to the analogous case on the command side.
 
 Single-record surface, so this rejects rather than filters, the same
@@ -4714,11 +4742,12 @@ This closes the fifth and, as far as a deliberate re-check of every
 `AdminAccess`-facing single-record read surface found, final instance of
 the cross-tenant read gap.
 
+<a id="cross-tenant-read-fix-create-bounded-context-template"></a>
 ## 28. Cross-tenant read fix, part six: `CreateBoundedContextFromTemplate`'s always-unscoped grant
 
-A gap found by re-checking, symmetrically to §27's sweep, every place a
+A gap found by re-checking, symmetrically to [§27](#cross-tenant-read-fix-snapshot-inspection)'s sweep, every place a
 `RoleAccessMapping` comes into being rather than every place one is read:
-`GrantRoleAccessMapping` (§23) lets an admin set `scope` on a grant it
+`GrantRoleAccessMapping` ([§23](#cross-tenant-projection-read-fix-owner-tag)) lets an admin set `scope` on a grant it
 creates, but `CreateBoundedContextFromTemplate`'s own grant to the
 tenant's first role - the only *other* rule that creates one - had no
 such parameter and always passed `None`. A caller stamping a tenant from
@@ -4747,7 +4776,7 @@ hardcoded `None`; `create_bounded_context_from_template_field()` parses
 an optional `scope: String` GraphQL argument the same way
 `grantRoleAccessMapping` already does and threads it through. No
 `skilj-core` change at all - `grant_role_access_mapping()` already took
-a `scope` parameter from §23; this pass only stops one of its two
+a `scope` parameter from [§23](#cross-tenant-projection-read-fix-owner-tag); this pass only stops one of its two
 callers from silently discarding it.
 
 **Verified**: `skilj/tests/bounded_context_templating.rs` gained
@@ -4763,10 +4792,11 @@ way it already is on `GrantRoleAccessMapping`), same 11
 warnings/8 infos/0 findings on `check`, same 4 pre-existing findings on
 `analyse`.
 
+<a id="hardening-list-role-access-mappings"></a>
 ## 29. Hardening: `list_role_access_mappings` no longer panics on a concurrent bounded-context deletion
 
-Found while chasing an intermittent panic that surfaced during §28's own
-test-suite verification, in a test §28 didn't touch:
+Found while chasing an intermittent panic that surfaced during [§28](#cross-tenant-read-fix-create-bounded-context-template)'s own
+test-suite verification, in a test [§28](#cross-tenant-read-fix-create-bounded-context-template) didn't touch:
 `RoleAccessMappingRow::into_domain` (`skilj-core/src/db/mod.rs`) read a
 `role_access_mappings` row, then made a *separate* follow-up query to
 load the `bounded_contexts` row it names, and `.expect()`-panicked if
@@ -4812,9 +4842,10 @@ cross-test, not specific to either). `cargo build/clippy/test
 test binaries/suites) green with no `FAILED`/panicked entries anywhere,
 not just the one file.
 
+<a id="cross-tenant-write-fix-owner-tag-scoping"></a>
 ## 30. Cross-tenant write fix: owner-tag scoping on `SubmitCommand`/`TriggerCommand`/`CreateExternalEvent`/`CreateDirectEvent`
 
-The read-side series (§23-§29) closed every instance of "any grant on the
+The read-side series ([§23](#cross-tenant-projection-read-fix-owner-tag)-[§29](#hardening-list-role-access-mappings)) closed every instance of "any grant on the
 bounded context reads any record in it" it found - but never touched the
 mirror-image gap on the *write* side: a `scope`-restricted grant or token
 could no longer read another owner's records after those passes, yet
@@ -4865,7 +4896,7 @@ unrelated to that admin's own `access_mapping.scope` (an unscoped staff
 admin may mint a scoped token - see `create_event_read_token`'s own doc
 comment, now shared by all four minting functions rather than
 `EventReadToken`'s alone). The shared `access_tokens.scope` Postgres
-column (added in §24 for `EventReadToken` alone) already existed for
+column (added in [§24](#cross-tenant-read-fix-raw-events) for `EventReadToken` alone) already existed for
 every token kind; this pass just started writing and reading it for the
 other three (`insert_command_token`'s own hand-written `INSERT` needed a
 literal new `scope` column added - the three `insert_access_token_row`-backed
@@ -4887,11 +4918,11 @@ verified by reverting the fix and confirming
 actually fails with 500 before restoring it.
 
 **A second gap found while writing this pass's own GraphQL test**:
-`EventReadToken.scope` (§24) was never actually exposed on the GraphQL
+`EventReadToken.scope` ([§24](#cross-tenant-read-fix-raw-events)) was never actually exposed on the GraphQL
 wire at all - `createEventReadToken`'s own mutation accepted and
 persisted the argument, but the returned `EventReadToken` object had no
 `scope` field to read it back, the identical class of admin read-back
-gap §26 closed for `owner_tag_key`. Fixed in the one place all four
+gap [§26](#admin-read-back-owner-tag-key) closed for `owner_tag_key`. Fixed in the one place all four
 token GraphQL objects are built (`gql_types.rs`'s shared `token_object!`
 macro) rather than four separate patches, closing it for
 `EventReadToken` retroactively and for the three new token kinds at
@@ -4902,7 +4933,7 @@ the macro backing three of the four `create*Token` GraphQL mutations,
 gained `scope` argument parsing and threading, uniform across all four
 now that every `create_*_token` function takes the identical parameter
 - `createEventReadToken` (`event_type_admin_operations.rs`), hand-written
-since §24 specifically because it alone needed this argument, folded
+since [§24](#cross-tenant-read-fix-raw-events) specifically because it alone needed this argument, folded
 back into the macro now that the asymmetry that justified the exception
 is gone. `db::get_event_type_access_token!` (`skilj-core/src/db/mod.rs`)
 gained the same third invocation for the identical reason, on the read
@@ -4937,10 +4968,11 @@ new `requires` clauses, nothing else), `analyse` the same 4 pre-existing
 findings, no new ones.
 
 This closes the write-side mirror of the entire cross-tenant read-fix
-series - between this pass and §23-§29, every surface that either reads
+series - between this pass and [§23](#cross-tenant-projection-read-fix-owner-tag)-[§29](#hardening-list-role-access-mappings), every surface that either reads
 or creates a record now respects the same owner-tag scoping, read and
 write alike.
 
+<a id="private-fields-third-protection"></a>
 ## 31. Private fields: a third field-level protection, alongside `sensitive_fields` and the owner-tag `scope` series
 
 A genuinely new mechanism, not a bugfix - user-initiated, prompted by a
@@ -4951,7 +4983,7 @@ and more useful primitive: a field visible by default only to a
 *specific* default reader determined per record, with that reader able
 to *share* it further. `sensitive_fields` (crypto-shredding-shaped PII
 protection, subject named by the payload, real `EncryptionKey`s, GDPR
-erasure) and the owner-tag `scope` series (§23-30, cross-tenant/company
+erasure) and the owner-tag `scope` series ([§23](#cross-tenant-projection-read-fix-owner-tag)-30, cross-tenant/company
 scoping) both already exist; neither fits "my own note, visible to me
 alone until I choose otherwise."
 
@@ -5094,16 +5126,16 @@ where the cursor sits.
 
 **A real, pre-existing admin read-back gap, found and closed for all
 four token kinds at once**: while wiring `PrivateFieldGrant`'s own
-GraphQL object, `EventReadToken.scope` (§24) turned out never to have
+GraphQL object, `EventReadToken.scope` ([§24](#cross-tenant-read-fix-raw-events)) turned out never to have
 been exposed on the wire at all - `createEventReadToken`'s own mutation
 accepted and persisted the argument, but the returned object had no
-`scope` field to read it back, the identical class of gap §26 already
+`scope` field to read it back, the identical class of gap [§26](#admin-read-back-owner-tag-key) already
 closed for `owner_tag_key`. Fixed once, in the one place all four token
 GraphQL objects are built (`gql_types.rs`'s shared `token_object!`
 macro), closing it for `EventReadToken` retroactively and for
 `ExternalEventToken`/`DirectCreationToken`/`CommandToken` at once -
 these three needed the field added regardless, for their own new
-`scope` (§30).
+`scope` ([§30](#cross-tenant-write-fix-owner-tag-scoping)).
 
 **Mechanical**: `EventType.private_fields`/`CommandType.private_fields`
 persisted as `JSONB`, the identical `Json<Vec<T>>` treatment
@@ -5117,7 +5149,7 @@ patched into an existing one at every `build()`, the same
 `ensure_*_table`/`ensure_*_columns` idempotent-migration pattern every
 prior pass's own schema addition already uses. `PrivateFieldGrantRow::
 into_domain` returns `Ok(None)` rather than panicking when a referenced
-`Role` is gone by the time it's looked up - proactively applying §29's
+`Role` is gone by the time it's looked up - proactively applying [§29](#hardening-list-role-access-mappings)'s
 own hardening pattern to this new row type rather than waiting to
 rediscover the same race. `registerEventType`/`registerCommandType`
 gained a required `privateFields: [PrivateFieldInput!]!` GraphQL
@@ -5126,7 +5158,7 @@ argument (mirroring `sensitiveFields`'s own shape); the shared
 mutations already needed no change for this pass, but `EventType`/
 `CommandType`'s own construction sites across the whole workspace -
 tests, `skilj-demo`, the plugin trait's own default methods - needed the
-usual mechanical sweep, the same shape §23's own ~40-call-site pass
+usual mechanical sweep, the same shape [§23](#cross-tenant-projection-read-fix-owner-tag)'s own ~40-call-site pass
 already established.
 
 **Verified**: a new `skilj-core/tests/private_field_visibility.rs` (47
@@ -5151,7 +5183,7 @@ binaries/suites, full run green); `allium check`/`plan`/`analyse`
 independently re-verified against the diff, not taken on the
 `allium:tend` agent's own two reports alone - `check` 13
 warnings/8 infos/0 findings (2 new warnings, both the same pre-existing
-checker name-resolution artefact §16's own `AccessToken`/
+checker name-resolution artefact [§16](#declarative-bounded-context-codegen-prototype)'s own `AccessToken`/
 `RoleAccessMapping` findings already have, confirmed by testing the fix
 that clears them and choosing not to take it - see the spec's own
 `entity PrivateFieldGrant` comment), `plan` obligation count 448 (from
@@ -5172,9 +5204,10 @@ second by the compiler itself. All affected files were reverted and
 re-swept with a corrected, insertion-only (never whole-span-replacing)
 script, then re-audited clean.
 
+<a id="projection-query-team-gate"></a>
 ## 32. Closing `ProjectionQuery`'s own team gate (Codeberg issue #17)
 
-A real, pre-existing gap left by §31 rather than a new proposal: that
+A real, pre-existing gap left by [§31](#private-fields-third-protection) rather than a new proposal: that
 pass's `team`-kind private field redacts one field of one raw
 event/command to any Role not carrying the required name, protecting
 `queryEvents`/`fetchCommands` - surfaces no `Write`-level Role can reach
@@ -5182,7 +5215,7 @@ anyway, since both need read-level access at minimum. `ProjectionQuery`,
 the one surface a `Write`-level Role *can* reach, was never touched by
 that mechanism at all: nothing stopped a Role of any name from reading
 any projection instance its `RoleAccessMapping` otherwise covered. The
-original Codeberg issue that prompted §31 - a whole-*projection*
+original Codeberg issue that prompted [§31](#private-fields-third-protection) - a whole-*projection*
 staff-only gate - was absorbed into the `team` private-field kind on the
 understanding that it covered every reader-facing surface; issue #17 is
 the finding that it didn't.
@@ -5247,7 +5280,7 @@ build/clippy/test --workspace` and `cargo fmt --check` clean, real
 Postgres throughout (not skipped - see `CONTRIBUTING.md`'s note on the
 embedded-Postgres/libxml2 workaround this environment needed); `allium check` 13
 warnings/8 infos/0 findings, `analyse` 5 findings, both identical to
-§31's own baseline (no new drift); `plan` obligation count 449 (from 448
+[§31](#private-fields-third-protection)'s own baseline (no new drift); `plan` obligation count 449 (from 448
 before this pass, the one new `requires` clause).
 
 **Addendum, found immediately after committing the above**: the
@@ -5258,7 +5291,7 @@ at all. It was never wired to `team_only` in the pass above, so a Role
 off the required team could still learn a `TEAM_ONLY` projection's shape
 through `projectionSchema` even though `projection` correctly refused
 its data - a real gap in `TeamGatedWhenDeclared`'s own "invisible, not
-merely unreadable" promise, on the very surface §32 exists to close, not
+merely unreadable" promise, on the very surface [§32](#projection-query-team-gate) exists to close, not
 a new proposal. Fixed the same way: `schema_field()`'s resolver now
 resolves `team_only` from the dispatcher and rejects with
 `NotOnRequiredTeam` before calling `get_projection`, identical to
@@ -5267,7 +5300,7 @@ so a rejected caller no longer pays for the DB round trip, `waitForSequence`
 poll, or a sensitive-field decrypt first).
 
 Also consolidated the equality test itself: `PrivateFieldKind::Team`'s
-own check (§31) and this one were the identical `role.name == required`
+own check ([§31](#private-fields-third-protection)) and this one were the identical `role.name == required`
 comparison, arrived at independently in two different passes with no
 shared definition. New `access_control::role_matches_required_team(role,
 required)` - `true` when `required` is `None`, `role.name == name`
@@ -5292,6 +5325,7 @@ unchanged (spec untouched - `team_only_satisfied` already covers
 `ProjectionQuery` surface-agnostically, so no new `requires` clause was
 needed to close a gap that was purely in the Rust wiring).
 
+<a id="payload-upcasting"></a>
 ## 33. Payload upcasting (Codeberg issue #14): every option, and the one built
 
 Issue #14 names a real trade-off and deliberately doesn't resolve it:
@@ -5421,6 +5455,7 @@ clean. No spec change - `upcast_payload` is pure application-facing
 Rust with no registration, storage, or wire surface of its own to
 obligate.
 
+<a id="skilj-temporal-plan"></a>
 ## 34. `skilj-temporal`: a plan, partially built (long-running/cross-system processes)
 
 Investigated whether skilj should grow something like AxonIQ Framework's
@@ -5442,7 +5477,7 @@ skilj's job is being a correct, auditable event store with an atomic
 effect boundary; a process's job is tracking multi-step state, retries,
 and durable waits. Temporal already does the second job well, and
 skilj already has the one piece a Temporal integration actually needs -
-idempotent command submission (Codeberg issue #12, §21). The plan below
+idempotent command submission (Codeberg issue #12, [§21](#optional-idempotency-key-submission)). The plan below
 is a thin bridge between two systems that each keep their own history,
 correlated by convention, not a shared abstraction.
 
@@ -5496,7 +5531,7 @@ time.)
      `workflow_id = "{bounded_context}:{tag_key}:{tag_value}"` for
      whichever one `tag_key` a mapping entry names - the same
      "automatically derived from a DCB tag, not a fresh concept"
-     register `owner_tag_key` already established (§23 and others).
+     register `owner_tag_key` already established ([§23](#cross-tenant-projection-read-fix-owner-tag) and others).
      Reusing this same ID for both the start and every later signal is
      what makes Temporal's own idempotent-start-by-workflow-ID semantics
      apply for free - no dedup work of skilj's own to write.
@@ -5655,6 +5690,7 @@ Re-verified after all four fixes: `cargo build/clippy -D warnings/test
 (up from 9), real Postgres and the real ephemeral Temporal service
 throughout, `allium check`/`plan` still unchanged (449 obligations).
 
+<a id="connection-pool-sizing"></a>
 ## 35. Configurable connection pool sizing
 
 Found while reviewing what's worth doing before a release: `db::connect`
@@ -5691,10 +5727,11 @@ clean. No spec change - pool sizing is deployment configuration, the
 same "process-start knob, not a registered value" register every other
 `SkiljBuilder` tunable already lives in.
 
+<a id="cross-context-route"></a>
 ## 36. `CrossContextRoute`: crossing bounded contexts without an external system
 
 Prompted by "is there something we could do to make it easier to have
-messages cross bounded contexts, without needing Temporal?" - §34's
+messages cross bounded contexts, without needing Temporal?" - [§34](#skilj-temporal-plan)'s
 `skilj-temporal` pairing is the right answer for a *process*: multiple
 steps, retries, compensation, state that outlives any one command. Most
 cross-context needs in practice are much smaller than that - "when
@@ -5727,12 +5764,12 @@ retry policy of its own - `route()` is a pure, synchronous function of
 one event's payload, so the entire "what happens next" question is
 answered the instant `Source` commits, not carried forward as state a
 process has to keep re-evaluating. Reaching for a Saga/Process trait here
-was considered and rejected on the same grounds §34 already settled for
+was considered and rejected on the same grounds [§34](#skilj-temporal-plan) already settled for
 Temporal: state/retry complexity belongs somewhere it can be owned
 properly (an external orchestrator, when a real multi-step process is
 actually needed), not folded into skilj's own plugin surface as a
 half-measure. A route that needs more than one hop is a process - use
-§34's `skilj-temporal` pairing instead, which already leverages the same
+[§34](#skilj-temporal-plan)'s `skilj-temporal` pairing instead, which already leverages the same
 idempotent-command-submission mechanism this feature also relies on.
 
 `Source`/`Target` are typed against each other's own bounded context via
@@ -5750,8 +5787,8 @@ tunes the poll rate (default 500ms, same shape as `async_projection_poll_interva
 (`{Source::BOUNDED_CONTEXT}.cross_context_route_cursors`, one row per
 `route_name`, mirroring `idempotency_keys`'s own per-bounded-context
 table), driven by one new shared background task `SkiljBuilder::build()`
-spawns - same shape as the async-projection/snapshot tasks (§8 item 6,
-§19): one task for every registered route, not one per route, ticking on
+spawns - same shape as the async-projection/snapshot tasks ([§8](#open-for-a-future-pass) item 6,
+[§19](#optional-snapshotting-matching-events)): one task for every registered route, not one per route, ticking on
 `cross_context_route_poll_interval`, `stream::iter(...).for_each_concurrent`
 over the fixed route list (read once at spawn time, since routes have no
 runtime registration surface - the same "compiled in, fixed at startup"
@@ -5782,7 +5819,7 @@ triggering never needs it, and the route caller (`client_id:
 entirely, submitting directly the same way the background pollers already
 reach `Target`'s `decide()` without going through a token.
 
-**No spec entity** - like `Snapshot` (§19) and the owner-tag scoping
+**No spec entity** - like `Snapshot` ([§19](#optional-snapshotting-matching-events)) and the owner-tag scoping
 series, `CrossContextRoute` has no registration surface a spec `contract`
 would describe (no GraphQL mutation registers one, no REST endpoint lists
 them); it's a Rust-only construct layered on top of DCB, not a change to
@@ -5808,7 +5845,7 @@ cursor. `cargo build/clippy -D warnings/test --workspace` and `cargo fmt
 no caller column.** `idempotency_keys`'s primary key is
 `(command_type_name, idempotency_key)` - no `client_id`/caller column at
 all, because every prior caller (Codeberg issue #12's design, and the
-`skilj-temporal` bridge in §34) only ever collided with its *own* past
+`skilj-temporal` bridge in [§34](#skilj-temporal-plan)) only ever collided with its *own* past
 submissions, so nothing needed to scope the namespace by who wrote a
 key. `CrossContextRoute`'s background task is the first caller to place
 an *unauthenticated internal* key into that same shared table
@@ -5859,19 +5896,20 @@ Postgres-backed test on each wire boundary
 asserting both the specific error code and that nothing was written to
 the event store at all.
 
-**Follow-up, closed for real in §37**: the fix above patched the two
+**Follow-up, closed for real in [§37](#idempotency-keys-client-id-scoping)**: the fix above patched the two
 existing callers, not the shared `idempotency_keys` table's own
 structural gap - investigating that gap further surfaced a second, more
-serious bug already live since 0.0.2, not merely a future risk. See §37.
+serious bug already live since 0.0.2, not merely a future risk. See [§37](#idempotency-keys-client-id-scoping).
 
+<a id="idempotency-keys-client-id-scoping"></a>
 ## 37. `idempotency_keys` gets `client_id`-scoped: a real cross-tenant collision, live since 0.0.2
 
 Prompted by asking "investigate the primary key with no caller/client_id
-- what is the potential real problem?" of §36's own "known limitation"
+- what is the potential real problem?" of [§36](#cross-context-route)'s own "known limitation"
 note above, rather than accepting that note's framing (a future-caller
 risk) at face value.
 
-**The original decision, and why it held up at the time.** §21 (issue
+**The original decision, and why it held up at the time.** [§21](#optional-idempotency-key-submission) (issue
 #12) explicitly decided `idempotency_keys` scoping would be
 `(bounded_context, command_type)` only, "not also per-caller" - resolved
 with the user directly, not an oversight. That held up fine under its
@@ -5879,7 +5917,7 @@ own assumption: a well-randomized caller-chosen key (a UUID) practically
 never collides with another caller's by accident, so *which* caller
 wrote a row was never something the lookup needed to know.
 
-**What broke the assumption.** Owner-tag multi-tenancy (§23/§25/§30),
+**What broke the assumption.** Owner-tag multi-tenancy ([§23](#cross-tenant-projection-read-fix-owner-tag)/[§25](#cross-tenant-read-fix-command-query)/[§30](#cross-tenant-write-fix-owner-tag-scoping)),
 built *after* issue #12, means many distinct tenants can legitimately
 submit the *same* `CommandType` in one bounded context - each with their
 own `CommandToken`/`RoleAccessMapping`, disambiguated only by that
@@ -5909,14 +5947,14 @@ leak - and the second tenant also receives sequence numbers belonging to
 an unrelated tenant's own event stream, a minor cross-tenant
 disclosure (existence/ordering, not payload). This has been live since
 **0.0.2** (2026-08-30, when issue #12 shipped) - `CrossContextRoute`'s
-own predictable-key variant of the same root cause (§36) is narrower and
+own predictable-key variant of the same root cause ([§36](#cross-context-route)) is narrower and
 newer, not the original or the more consequential form of this bug.
 
 **The fix**: `idempotency_keys`' primary key becomes `(command_type_name,
 client_id, idempotency_key)`. `client_id` was already available at
 every call site for other reasons - this is purely a matter of finally
 scoping the lookup by it. A useful side effect: this structurally closes
-`CrossContextRoute`'s own §36 issue too, on a firmer footing than the
+`CrossContextRoute`'s own [§36](#cross-context-route) issue too, on a firmer footing than the
 reserved-prefix convention that fix shipped with - no external caller's
 `client_id` is ever caller-suppliable (always derived server-side from
 an authenticated token/role), so no external submission can ever land
@@ -5964,7 +6002,7 @@ landing on a different one from the pool.
 pre-migration row never recorded who submitted it - not recoverable by
 any cleverer migration, the information was simply never written.
 Backfilled to `client_id = ''` (this codebase's own "nothing is ever
-deleted" precedent, §21) rather than deleted, but two genuinely
+deleted" precedent, [§21](#optional-idempotency-key-submission)) rather than deleted, but two genuinely
 different failure modes were on the table for what `lookup_idempotency_key`
 does with that backfilled row afterward, and there's no third option
 that avoids both:
@@ -6013,9 +6051,10 @@ reasoning that motivated writing it in the first place). The full
 existing `skilj-core` test suite (every test binary, real embedded
 Postgres) passes unchanged, including `CrossContextRoute`'s own
 end-to-end test and the REST/GraphQL idempotency-key wire tests from
-§36's own fix - `cargo build/clippy -D warnings/test` and `cargo fmt
+[§36](#cross-context-route)'s own fix - `cargo build/clippy -D warnings/test` and `cargo fmt
 --check` clean throughout.
 
+<a id="message-broker-bridges-investigation"></a>
 ## 38. Message-broker bridges (Kafka/Solace/etc.): investigation, not yet built
 
 Prompted by "investigate other modules that would make skilj easier to
@@ -6025,7 +6064,7 @@ things/crates used a lot with Rust." Investigation only - nothing built
 yet, findings below to ground a decision on scope before any code.
 
 **Nothing new needed on skilj's own side - the hook points already
-exist**, the same "broker-agnostic, already built" realisation §34
+exist**, the same "broker-agnostic, already built" realisation [§34](#skilj-temporal-plan)
 started from for Temporal:
 
 - **Outbound** (a skilj event reaching an external system): `GET
@@ -6043,15 +6082,15 @@ started from for Temporal:
   verbatim - which one a given mapping wants is a modelling choice per
   message type, not something the bridge itself needs an opinion on.
 - **Correlation/idempotency conventions already established, directly
-  reusable**: §34's `workflow_id = "{bounded_context}:{tag_key}:{tag_value}"`
+  reusable**: [§34](#skilj-temporal-plan)'s `workflow_id = "{bounded_context}:{tag_key}:{tag_value}"`
   pattern (deriving a stable external identity from a DCB tag) maps
   onto a Kafka message key, an AMQP routing key, or a NATS subject the
-  same way it maps onto a Temporal workflow ID. §34's `Signal`
+  same way it maps onto a Temporal workflow ID. [§34](#skilj-temporal-plan)'s `Signal`
   idempotency fix - deriving a request id from `(bounded_context,
   event_type, sequence)` - is the same shape a Kafka producer's own
   idempotent-produce config or a consumer-side dedup key would want.
   Inbound, the exact `"{run_id}:{activity_id}"` -> `Idempotency-Key`
-  realisation (§21/§34 phase 1) generalises to `"{topic}:{partition}:{offset}"`
+  realisation ([§21](#optional-idempotency-key-submission)/[§34](#skilj-temporal-plan) phase 1) generalises to `"{topic}:{partition}:{offset}"`
   for Kafka, or whatever a given broker's own stable per-message
   identity is - the pattern, not the Temporal specifics, is what's
   reusable.
@@ -6083,12 +6122,12 @@ last-release dates, 2026-09), not assumed**:
   covering three "enterprise" brokers via a shared open standard,
   rather than a dedicated, much weaker Solace-only crate.
 
-**Recommendation, not yet decided with the user**: mirror §34's own
+**Recommendation, not yet decided with the user**: mirror [§34](#skilj-temporal-plan)'s own
 shape - a small, thin bridge crate per *protocol family* (not
 skilj-core changes, no shared cross-broker abstraction forced over
 systems with genuinely different delivery semantics - partitioned logs
 vs. exchange/routing-key vs. subject-based pub/sub - the same reasoning
-that ruled out a shared `Process`/`Saga` trait in §34). Candidate first
+that ruled out a shared `Process`/`Saga` trait in [§34](#skilj-temporal-plan)). Candidate first
 build, ranked by the table above and by matching the user's own named
 example: `skilj-kafka` on `rdkafka` - highest combined maturity and
 category fit for "the thing most people mean by event streaming
@@ -6107,12 +6146,13 @@ NATS, per the raw download numbers and simpler ops story); whether
 "send out"/"retrieve" should be one crate per broker (both directions)
 or split; and whether inbound messages should default to
 `ExternalEventIngestion`, `CommandTrigger`, or be a per-mapping choice
-the way §34's own `EventTypeMapping` names signal-vs-start per
+the way [§34](#skilj-temporal-plan)'s own `EventTypeMapping` names signal-vs-start per
 `EventType`.
 
+<a id="external-message-dedup-create-external-event"></a>
 ## 39. Built into skilj instead: external-message dedup on `CreateExternalEvent`
 
-§38's own investigation flagged that `ExternalEventIngestion` has no
+[§38](#message-broker-bridges-investigation)'s own investigation flagged that `ExternalEventIngestion` has no
 dedup mechanism at all - a real problem for any at-least-once broker
 bridge (Kafka included) recording facts via it, since a redelivery after
 a crash-before-commit would create a second event for the same message.
@@ -6157,7 +6197,7 @@ uniquely introduces).
 
 **Storage**: `external_message_cursors`, one row per `(adapter_id,
 partition_key)` pair, storing only `last_sequence`. A brand-new table,
-so no migration dance the way §37's `idempotency_keys` retrofit needed -
+so no migration dance the way [§37](#idempotency-keys-client-id-scoping)'s `idempotency_keys` retrofit needed -
 `ensure_external_message_cursors_table`'s own `CREATE TABLE IF NOT
 EXISTS` is the whole story, wired into `provision_bounded_context_schema`
 and the `SkiljBuilder::build()` startup loop exactly like every other
@@ -6166,7 +6206,7 @@ table in this file. Scoped by `adapter_id`, not `event_type_name` - an
 scoping by adapter is at least as narrow, and the alternative would let
 two unrelated adapters for the same event type collide on a partition
 key string they each chose independently (the identical cross-tenant
-collision class §37 closed for `idempotency_keys`, verified not
+collision class [§37](#idempotency-keys-client-id-scoping) closed for `idempotency_keys`, verified not
 reachable here for real: `two_different_adapters_sharing_a_partition_key_string_do_not_collide`,
 `skilj-core/tests/external_event_dedup.rs`).
 
@@ -6236,13 +6276,14 @@ assertion, then restored and reconfirmed green. Full existing
 unchanged. `cargo build/clippy -D warnings/fmt --check` clean
 throughout.
 
+<a id="skilj-kafka-bridge"></a>
 ## 40. `skilj-kafka`: a bridge to Kafka, both directions
 
-§38's own investigation ranked `rdkafka` as the most-downloaded, most
+[§38](#message-broker-bridges-investigation)'s own investigation ranked `rdkafka` as the most-downloaded, most
 actively-maintained crate for the category the user's own example named
-(Kafka); §39 closed the one real gap that would have made an inbound
+(Kafka); [§39](#external-message-dedup-create-external-event) closed the one real gap that would have made an inbound
 bridge unsafe. This section builds the crate itself -
-`skilj-temporal`'s (§34) direct sibling, same posture (wire-protocol
+`skilj-temporal`'s ([§34](#skilj-temporal-plan)) direct sibling, same posture (wire-protocol
 client only, zero dependency on any other skilj crate), one real
 difference in shape: `skilj-temporal` only ever reacts to skilj's own
 events (one direction), where a message broker genuinely needs both.
@@ -6265,14 +6306,14 @@ Kafka itself just gets to place it.
 no equivalent in `skilj-temporal`. A Kafka topic maps to one of two
 skilj actions, a per-mapping choice mirroring `MappingAction`'s own
 signal-vs-start split - both now genuinely safe under Kafka's
-at-least-once redelivery, which is precisely why §39 had to exist
+at-least-once redelivery, which is precisely why [§39](#external-message-dedup-create-external-event) had to exist
 before this could be built responsibly:
 
 - `InboundAction::Record` - `POST /v1/events/external`, redelivery-safe
-  via §39's own `dedupe` mechanism.
+  via [§39](#external-message-dedup-create-external-event)'s own `dedupe` mechanism.
 - `InboundAction::Trigger` - `POST /v1/commands/trigger`,
-  redelivery-safe via `Idempotency-Key` (§21), itself `client_id`-scoped
-  since §37 so this mapping's own traffic can never collide with an
+  redelivery-safe via `Idempotency-Key` ([§21](#optional-idempotency-key-submission)), itself `client_id`-scoped
+  since [§37](#idempotency-keys-client-id-scoping) so this mapping's own traffic can never collide with an
   unrelated caller's.
 
 Both derive their own redelivery-safety key identically:
@@ -6280,7 +6321,7 @@ Both derive their own redelivery-safety key identically:
 `offset` as the sequence - Kafka's guarantee of strictly increasing,
 in-order delivery within one partition is exactly the property both
 mechanisms need, the same one `skilj_temporal`'s own
-`"{run_id}:{activity_id}"` convention (§34 phase 1) leans on one level
+`"{run_id}:{activity_id}"` convention ([§34](#skilj-temporal-plan) phase 1) leans on one level
 further out. The Kafka offset itself is committed (`run_inbound`) only
 after skilj confirms the call succeeded, so a redelivery calls skilj
 again rather than skipping the message - safe *because* the skilj-side
@@ -6337,9 +6378,10 @@ broker, and the fix is also just faster (~7s for the suite, versus
 20-60s per run before, with the multi-container version's own worst
 case timing out entirely under load).
 
+<a id="skilj-amqp-bridge"></a>
 ## 41. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)
 
-§38's own investigation named AMQP 1.0 (`fe2o3-amqp`, pure Rust) as the
+[§38](#message-broker-bridges-investigation)'s own investigation named AMQP 1.0 (`fe2o3-amqp`, pure Rust) as the
 practical path to Solace specifically, since no healthy Solace-only
 Rust crate exists - the unofficial `solace-rs` needs Solace's own
 proprietary C SDK installed separately and is essentially unused (142
@@ -6347,7 +6389,7 @@ downloads in 90 days, stale since May 2025). Solace PubSub+ natively
 speaks AMQP 1.0 as a first-class protocol alongside its own
 proprietary one, and so do Azure Service Bus and ActiveMQ Artemis - one
 dependency covers all three via the shared open standard, the user's
-own second choice of protocol to build after `skilj-kafka` (§40).
+own second choice of protocol to build after `skilj-kafka` ([§40](#skilj-kafka-bridge)).
 
 **A genuinely different delivery model, not just a different
 library.** Confirmed directly against `fe2o3-amqp`'s own real source
@@ -6361,10 +6403,10 @@ Kafka's own broker-assigned `(topic, partition, offset)` is the AMQP
 populate them, unlike Kafka's own broker-guaranteed offsets. This
 crate's own outbound half always sets them (skilj, not the broker,
 assigns the sequence, so it always can); the inbound half can only use
-them for §39's own `dedupe` mechanism when whatever upstream sender
+them for [§39](#external-message-dedup-create-external-event)'s own `dedupe` mechanism when whatever upstream sender
 populated a given address did too. `message-id` (also standard, far
 more commonly populated in practice - often a UUID) is the fallback for
-`Idempotency-Key` (§21), usable on its own without needing
+`Idempotency-Key` ([§21](#optional-idempotency-key-submission)), usable on its own without needing
 `group-sequence`'s own ordering guarantee.
 
 **A real protocol-level limit, documented rather than silently
@@ -6417,12 +6459,13 @@ the test's own duration - a real Rust ownership bug in the test
 harness, not the library, caught by running the tests for real rather
 than assuming a compiling test proves anything.
 
+<a id="skilj-nats-bridge"></a>
 ## 42. `skilj-nats`: a bridge to NATS JetStream
 
-§38's third named candidate (`async-nats` actually out-downloads
+[§38](#message-broker-bridges-investigation)'s third named candidate (`async-nats` actually out-downloads
 `rdkafka`, pure Rust, a much simpler ops story than either Kafka or an
 enterprise AMQP broker - no ZooKeeper/KRaft, no broker cluster to run).
-`skilj-kafka`'s (§40)/`skilj-amqp`'s (§41) third sibling - a third
+`skilj-kafka`'s ([§40](#skilj-kafka-bridge))/`skilj-amqp`'s ([§41](#skilj-amqp-bridge)) third sibling - a third
 delivery model again, confirmed against `async-nats`'s own real source
 (pulled locally, mirroring how both prior bridges were researched) and
 a real example already inside the `testcontainers-modules` crate's own
@@ -6430,8 +6473,8 @@ test suite for the exact JetStream flow this bridge needed.
 
 **Core NATS pub/sub is the wrong layer, on purpose not used at all** -
 fire-and-forget, no redelivery concept whatsoever, which makes every
-mechanism this whole family of bridges exists to use (`dedupe`, §39;
-`Idempotency-Key`, §21) meaningless: there is nothing to guard against
+mechanism this whole family of bridges exists to use (`dedupe`, [§39](#external-message-dedup-create-external-event);
+`Idempotency-Key`, [§21](#optional-idempotency-key-submission)) meaningless: there is nothing to guard against
 redelivering if delivery was never guaranteed once. JetStream, NATS's
 own persistence layer, is what actually gives an at-least-once
 guarantee worth building around - `skilj-nats` speaks JetStream only.

@@ -1,5 +1,5 @@
 //! Tests for the `EventSubscription` surface (`specs/skilj.allium`) -
-//! propagated after `projection_query.rs` (docs/architecture.md §9):
+//! propagated after `projection_query.rs` ([docs/architecture.md §9](../../docs/architecture.md#next-steps)):
 //! entity `Subscription` (+ its two variants `AllEventsSubscription`/
 //! `EventTypeSubscription`), rules `CreateAllEventsSubscription`/
 //! `CreateEventTypeSubscription`/`DeliverToSubscriptions`.

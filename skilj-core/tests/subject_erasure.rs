@@ -1,5 +1,5 @@
 //! Tests for the `SubjectErasure` surface (`specs/skilj.allium`) -
-//! propagated after `event_subscription.rs` (docs/architecture.md §9):
+//! propagated after `event_subscription.rs` ([docs/architecture.md §9](../../docs/architecture.md#next-steps)):
 //! the full `EncryptionKey` entity (folding in `EncryptionKeyRef`'s old
 //! stand-in role - neither was populated by anything else yet) and rule
 //! `ForgetSubject`. Deliberately scoped to destruction only at the time -

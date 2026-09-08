@@ -1,5 +1,5 @@
 //! A Ratatui operator console for any `skilj-graphql` endpoint - see
-//! `src/main.rs` for the entry point and docs/architecture.md §11 for
+//! `src/main.rs` for the entry point and [docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console) for
 //! why this crate exists and what it deliberately doesn't do yet.
 //! Split into a library (this crate root) plus a thin `main.rs` purely
 //! so `tests/*.rs` can exercise `graphql`/`projection_query` directly -

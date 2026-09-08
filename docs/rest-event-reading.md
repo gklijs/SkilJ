@@ -26,6 +26,6 @@ A few things that trip people up:
   never reads or moves a token's server-side cursor, so using both against the same token gives
   you two positions that know nothing about each other.
 
-See §7 of [`architecture.md`](architecture.md) for the full wire contract (routes,
+See [§7](architecture.md#rest-wire-contract) of [`architecture.md`](architecture.md) for the full wire contract (routes,
 request/response shapes, error codes), and `entity ReadCursor` in
 [`../specs/skilj.allium`](../specs/skilj.allium) for the underlying behavioural guarantee.

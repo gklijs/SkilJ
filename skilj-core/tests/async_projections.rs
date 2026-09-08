@@ -1,5 +1,5 @@
 //! Tests for `db::catch_up_bounded_context`/`db::promote_projection_rebuild`,
-//! the async half of §8 item 6 (see the plan at
+//! the async half of [§8](../../docs/architecture.md#open-for-a-future-pass) item 6 (see the plan at
 //! `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md` and
 //! docs/architecture.md's own write-up). No `skilj-graphql`/`skilj-rest`/
 //! `SkiljBuilder` involved - a hand-rolled `ProjectionDispatcher` test
@@ -232,7 +232,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str) -> EventT
 }
 
 /// Registers a `sync = false` `Projection` consuming `consumed` - no
-/// `projection_state` seeding anymore (§9's "keyed / multi-row
+/// `projection_state` seeding anymore ([§9](../../docs/architecture.md#next-steps)'s "keyed / multi-row
 /// Projections" pass): each instance's own row is created lazily, on
 /// first touch, starting from `TestDispatcher::default_state`'s own
 /// `"0"`, the same shape `SkiljBuilder::projection::<T>()`'s own

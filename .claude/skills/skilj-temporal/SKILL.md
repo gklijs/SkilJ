@@ -21,7 +21,7 @@ and doesn't try to - DCB (`skilj-event-modeling`'s own `dcb-tags.md`)
 already replaces the saga/process-manager need for facts checkable in
 one same-database transaction, but has nothing to say once a process
 spans real I/O, real time, or another system entirely. See
-`docs/architecture.md` §34 for the full investigation and decision:
+[`docs/architecture.md` §34](../../../docs/architecture.md#skilj-temporal-plan) for the full investigation and decision:
 pair with Temporal rather than build orchestration into skilj.
 
 ## Two independent pieces - use either alone or both together
@@ -97,5 +97,5 @@ and `PaymentConfirmed` signal that exact run later.
 
 See `skilj-temporal/tests/temporal_bridge.rs` for real, passing,
 end-to-end examples against an ephemeral Temporal service, and
-`docs/architecture.md` §34 for the complete design write-up (including
+[`docs/architecture.md` §34](../../../docs/architecture.md#skilj-temporal-plan) for the complete design write-up (including
 what was built vs. deliberately declined).

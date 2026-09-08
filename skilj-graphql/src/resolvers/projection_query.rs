@@ -72,7 +72,7 @@ async fn wait_until_caught_up(
 /// existing. A key nothing has touched yet answers with
 /// `ProjectionDispatcher::default_state` (the same value a fresh instance
 /// lazily starts from) rather than a "not found" error - a customer with
-/// no purchase history yet is a legitimate, common case (§9's "keyed /
+/// no purchase history yet is a legitimate, common case ([§9](../../../docs/architecture.md#next-steps)'s "keyed /
 /// multi-row Projections" pass) - unless `query_projection` below
 /// rejects it first: for an owner-declaring projection, an untouched key
 /// is exactly the "unestablished owner" case a `scope`-restricted grant

@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check §-section references against docs/architecture.md
+        run: scripts/check-section-refs.sh
+
       - name: Cache cargo registry and target dir
         uses: actions/cache@v4
         with:

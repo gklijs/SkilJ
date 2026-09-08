@@ -2,7 +2,7 @@
 //! Postgres, for browsing a skilj deployment's registered types,
 //! projections and events when `skilj-graphql` itself isn't running (the
 //! exact moment an operator most wants to look). See docs/architecture.md
-//! §14 for the full design and Codeberg issue #6's own "5b".
+//! [§14](../../docs/architecture.md#skilj-inspector) for the full design and Codeberg issue #6's own "5b".
 //!
 //! **Read-only by construction, not just by convention**: every function
 //! in [`data`] calls only `skilj_core::db` read functions - never
@@ -13,7 +13,7 @@
 //!
 //! **Sensitive fields are never decrypted, ever** (confirmed with the
 //! project owner before building this - see the module's own design
-//! note in docs/architecture.md §14): this crate never accepts an
+//! note in [docs/architecture.md §14](../../docs/architecture.md#skilj-inspector)): this crate never accepts an
 //! `EncryptionMasterKey` and has no decryption code path at all. A
 //! sensitive field's ciphertext is already what
 //! `skilj_core::encryption::encrypt_leaf` substitutes directly into the

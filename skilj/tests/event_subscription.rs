@@ -1,5 +1,5 @@
 //! End-to-end tests for `skilj-graphql`'s `EventSubscription` - `allEvents`
-//! (the last surface out of §8/§9's backlog). Unlike every other
+//! (the last surface out of [§8](../../docs/architecture.md#open-for-a-future-pass)/[§9](../../docs/architecture.md#next-steps)'s backlog). Unlike every other
 //! `skilj/tests/graphql_*.rs` file, `tower::ServiceExt::oneshot` can't
 //! drive this: a subscription is a long-lived streaming connection, not
 //! a single request/response, so this one drives a real

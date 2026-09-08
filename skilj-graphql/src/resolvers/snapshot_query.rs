@@ -1,4 +1,4 @@
-//! `inspectSnapshot` - docs/architecture.md §19's own inspection
+//! `inspectSnapshot` - [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s own inspection
 //! endpoint for `Snapshot`. `AdminAccess`-gated, via the same shared
 //! `require_admin_mapping` helper `EventQuery`'s own `inspectEvent`
 //! uses - a snapshot's own `state` is full derived business data, the

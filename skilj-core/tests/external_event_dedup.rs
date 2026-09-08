@@ -1,5 +1,5 @@
 //! Tests for `db::create_and_insert_external_event`'s own `dedupe`
-//! parameter (docs/architecture.md §39, specs/skilj.allium's own `rule
+//! parameter ([docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event), specs/skilj.allium's own `rule
 //! CreateExternalEvent` - the `dedupe_partition_key?`/`dedupe_sequence?`
 //! pair on `SubmitExternalEvent`). `event_creation_surfaces.rs` already
 //! covers the pure `event_store::create_external_event` function (which
@@ -225,7 +225,7 @@ async fn create(
     .unwrap()
 }
 
-/// docs/architecture.md §39: a submission carrying neither
+/// [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event): a submission carrying neither
 /// `dedupe_partition_key` nor `dedupe_sequence` behaves exactly as every
 /// submission did before this mechanism existed - no lookup, no write to
 /// `external_message_cursors`, an event created every time, even for the
@@ -260,7 +260,7 @@ fn omitting_dedupe_creates_an_event_every_time() {
     });
 }
 
-/// docs/architecture.md §39: a genuinely new, higher `dedupe_sequence`
+/// [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event): a genuinely new, higher `dedupe_sequence`
 /// for a `(adapter, partition_key)` pair is created exactly as it always
 /// was, and becomes the new watermark.
 #[test]
@@ -386,11 +386,11 @@ fn a_redelivered_or_stale_sequence_creates_no_event() {
     });
 }
 
-/// docs/architecture.md §39: scoped to `(adapter, partition_key)` alone,
+/// [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event): scoped to `(adapter, partition_key)` alone,
 /// not per event type - two different adapters for the *same* event type
 /// independently choosing the identical partition key string never
 /// deduplicate each other's messages, exactly the cross-tenant collision
-/// class docs/architecture.md §37 closed for `idempotency_keys`.
+/// class [docs/architecture.md §37](../../docs/architecture.md#idempotency-keys-client-id-scoping) closed for `idempotency_keys`.
 #[test]
 fn two_different_adapters_sharing_a_partition_key_string_do_not_collide() {
     runtime().block_on(async {
@@ -446,7 +446,7 @@ fn two_different_adapters_sharing_a_partition_key_string_do_not_collide() {
     });
 }
 
-/// docs/architecture.md §39: a different `partition_key` from the *same*
+/// [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event): a different `partition_key` from the *same*
 /// adapter has its own, independent watermark - a low sequence on a
 /// fresh partition is not mistaken for a stale replay of a different,
 /// already-advanced partition.

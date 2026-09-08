@@ -3,7 +3,7 @@
 //! issue #6's "5a" - each result carries `schema` alongside `name`) -
 //! `app.rs`'s Commands/Query Events tabs both build one of these once a
 //! real registered type is picked, replacing v1's raw-JSON payload entry
-//! (docs/architecture.md §11's own "No schema-driven command/event forms
+//! ([docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console)'s own "No schema-driven command/event forms
 //! in v1" note). Pure and I/O-free, unlike `projection_query.rs`'s own
 //! generic-shape mechanism - that one *has* to be a live GraphQL
 //! introspection walk, since a projection's wire type is dynamic

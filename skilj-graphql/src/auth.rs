@@ -1,5 +1,5 @@
 //! JWT extraction and identity resolution for incoming GraphQL requests -
-//! see docs/architecture.md §6. Verification itself (JWKS fetch/cache,
+//! see [docs/architecture.md §6](../../docs/architecture.md#idp-trust-configuration). Verification itself (JWKS fetch/cache,
 //! JWT signature check) is `skilj_core::access_control`'s job, not this
 //! crate's; this module only reads the bearer header, calls into that,
 //! and resolves the verified subject to a `Role`.

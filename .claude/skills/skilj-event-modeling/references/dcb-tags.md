@@ -70,7 +70,7 @@ has nothing to say about it. Don't reach for a bigger tag set or a
 second `decide()` call to paper over that; it's a different kind of
 problem. skilj's own answer there is pairing with an external durable-
 execution system (Temporal) rather than building process-manager
-machinery of its own - see `docs/architecture.md` §34 and
+machinery of its own - see [`docs/architecture.md` §34](../../../../docs/architecture.md#skilj-temporal-plan) and
 `docs/temporal-integration.md` if the domain conversation surfaces a
 step like this.
 

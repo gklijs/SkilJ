@@ -1,6 +1,6 @@
 //! Tests for the `TypeRegistration` surface's two idempotent-upsert rules
 //! (`specs/skilj.allium`) - propagated after the bounded context lifecycle
-//! pass (docs/architecture.md §9): `RegisterEventType`/
+//! pass ([docs/architecture.md §9](../../docs/architecture.md#next-steps)): `RegisterEventType`/
 //! `RegisterCommandType`, and the schema-validation black boxes both rely
 //! on - `valid_tag_mappings`/`valid_sensitive_fields`/
 //! `schema_is_backwards_compatible` - real for both a bare field name and

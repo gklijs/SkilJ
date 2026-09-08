@@ -189,7 +189,7 @@ async fn serve_mock_skilj(state: MockSkiljState) -> String {
     format!("http://{addr}")
 }
 
-/// The scenario docs/architecture.md §34 phase 2/3 exists for: an
+/// The scenario [docs/architecture.md §34](../../docs/architecture.md#skilj-temporal-plan) phase 2/3 exists for: an
 /// `OrderPlaced` event starts a fresh Temporal workflow run, correlated
 /// by the fixed `"{bounded_context}:{tag_key}:{tag_value}"` convention -
 /// then a later `PaymentConfirmed` event, carrying the identical tag

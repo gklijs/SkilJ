@@ -222,7 +222,7 @@ impl EventCache {
         }
     }
 
-    /// docs/architecture.md §19's "Problem 1" fix -
+    /// [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 1" fix -
     /// `db::list_events_for_bounded_context_matching_tags_cached`'s own
     /// cache-first half. Delegates the actual coverage check to
     /// `try_events_after(pool, bounded_context, -1)` rather than

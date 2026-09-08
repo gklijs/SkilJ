@@ -1,7 +1,7 @@
 //! A bridge between skilj's own event stream and any AMQP 1.0 broker
 //! (Solace PubSub+, Azure Service Bus, ActiveMQ Artemis, and any other
-//! AMQP 1.0-compliant broker) - docs/architecture.md §41,
-//! `skilj-kafka`'s (§40) sibling for a genuinely different delivery
+//! AMQP 1.0-compliant broker) - [docs/architecture.md §41](../../docs/architecture.md#skilj-amqp-bridge),
+//! `skilj-kafka`'s ([§40](../../docs/architecture.md#skilj-kafka-bridge)) sibling for a genuinely different delivery
 //! model. Wire-protocol client only, on both sides: zero dependency on
 //! any other skilj crate, the same "independently usable" posture
 //! `skilj-tui`/`skilj-temporal`/`skilj-kafka` already have.
@@ -12,7 +12,7 @@
 //! first-class standard protocol alongside their own proprietary ones -
 //! one dependency (`fe2o3-amqp`, pure Rust, no C dependency) covers all
 //! three, and any other compliant broker, rather than a weaker
-//! vendor-specific crate per target. docs/architecture.md §38's own
+//! vendor-specific crate per target. [docs/architecture.md §38](../../docs/architecture.md#message-broker-bridges-investigation)'s own
 //! investigation found no healthy Solace-only Rust crate exists at
 //! all - the unofficial `solace-rs` needs Solace's own proprietary C
 //! SDK installed separately and is essentially unused.
@@ -53,10 +53,10 @@
 //! # Redelivery safety (inbound)
 //!
 //! [`InboundAction::Record`] uses `group-id`/`group-sequence` (when
-//! both are present) as docs/architecture.md §39's `dedupe` pair - the
+//! both are present) as [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)'s `dedupe` pair - the
 //! identical mechanism `skilj-kafka`'s own `"{topic}:{partition}"`/
 //! offset pair feeds. [`InboundAction::Trigger`] uses `message-id`
-//! (when present) as `Idempotency-Key` (§21) - a broader, more commonly
+//! (when present) as `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission)) - a broader, more commonly
 //! populated standard property (most senders set it, often to a UUID),
 //! usable on its own without needing the ordering `group-sequence`
 //! implies. The AMQP delivery itself is only accepted
@@ -294,13 +294,13 @@ pub struct InboundMapping {
 pub enum InboundAction {
     /// `POST /v1/events/external` - record the message verbatim as a
     /// fact. Redelivery-safe via the `dedupe` mechanism
-    /// (docs/architecture.md §39) *only when* the message carries both
+    /// ([docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)) *only when* the message carries both
     /// `group-id` and `group-sequence` - see [`InboundMessageMeta`]'s
     /// own doc comment for what happens when it doesn't.
     Record { event_type: String },
     /// `POST /v1/commands/trigger` - decide on the message via a real
-    /// `decide()`. Redelivery-safe via `Idempotency-Key` (§21, itself
-    /// `client_id`-scoped since §37) *only when* the message carries a
+    /// `decide()`. Redelivery-safe via `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission), itself
+    /// `client_id`-scoped since [§37](../../docs/architecture.md#idempotency-keys-client-id-scoping)) *only when* the message carries a
     /// `message-id` - see [`InboundMessageMeta`]'s own doc comment.
     Trigger { command_type: String },
 }
@@ -317,10 +317,10 @@ pub enum InboundAction {
 /// `group_sequence` pair calls `ExternalEventIngestion` without
 /// `dedupe` (created every time, exactly as if this crate's own dedupe
 /// support didn't exist - `ExternalEventIngestion`'s own
-/// `OmittingTheDedupePairChangesNothing` guarantee, §39); a `Trigger`
+/// `OmittingTheDedupePairChangesNothing` guarantee, [§39](../../docs/architecture.md#external-message-dedup-create-external-event)); a `Trigger`
 /// action with no `message_id` calls `CommandTrigger` without
 /// `Idempotency-Key` (accepted, just not redelivery-safe - `submitCommand`'s
-/// own long-standing "omitting it is always fine" behaviour, §21).
+/// own long-standing "omitting it is always fine" behaviour, [§21](../../docs/architecture.md#optional-idempotency-key-submission)).
 /// Never an error - a message lacking metadata this bridge would like
 /// to have is still a message worth delivering.
 #[derive(Debug, Default, Clone)]

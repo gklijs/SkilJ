@@ -147,7 +147,7 @@ fn emit_command_type(command: &CommandTypeSpec, event_enum_ident: &syn::Ident) -
 }
 
 /// The shared per-bounded-context event enum + its `BoundedContextEvent`
-/// impl - Finding 1 from the §16 prototype: entirely mechanical, one
+/// impl - Finding 1 from the [§16](../../docs/architecture.md#declarative-bounded-context-codegen-prototype) prototype: entirely mechanical, one
 /// variant/match-arm per event type, with zero hand-judgement involved.
 fn emit_event_enum(spec: &BoundedContextSpec, enum_ident: &syn::Ident) -> TokenStream {
     let variants = spec.event_types.iter().map(|e| {

@@ -1,7 +1,7 @@
 //! Tests for the `BoundedContextCreation`/`BoundedContextDirectory`/
 //! `BoundedContextArchival`/`BoundedContextDeletion`/`SuperadminBootstrap`
 //! surfaces (`specs/skilj.allium`) - propagated after the token lifecycle
-//! pass (docs/architecture.md §9): entities `BootstrapSecret`/
+//! pass ([docs/architecture.md §9](../../docs/architecture.md#next-steps)): entities `BootstrapSecret`/
 //! `ContextCreator` (+ `SuperadminCreator`/`SystemCreator`), rules
 //! `AddBoundedContext`/`ListBoundedContexts`/`ArchiveBoundedContext`/
 //! `CreateSuperadmin`. This is what grew `event_store::BoundedContext`
@@ -117,7 +117,7 @@ fn bootstrap_secret_carries_its_declared_field() {
 }
 
 /// `generate_bootstrap_secret` - added propagating `skilj-graphql`'s
-/// Phase 1 admin console (docs/architecture.md §8 item 5's own plan).
+/// Phase 1 admin console ([docs/architecture.md §8](../../docs/architecture.md#open-for-a-future-pass) item 5's own plan).
 /// `Some` when no active superadmin exists yet - the reachable case,
 /// checked here only for "produces a secret at all"; `create_superadmin`'s
 /// own tests already cover matching against a real one end-to-end.

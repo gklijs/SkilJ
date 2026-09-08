@@ -541,7 +541,7 @@ pub enum Error {
     PayloadDoesNotMatchSchema,
 
     /// Not spec-modeled: a security-review finding on `CrossContextRoute`
-    /// (docs/architecture.md §36) - the `idempotency_keys` table's own
+    /// ([docs/architecture.md §36](../../../docs/architecture.md#cross-context-route)) - the `idempotency_keys` table's own
     /// primary key is `(command_type_name, idempotency_key)` with no
     /// caller/client_id column at all (Codeberg issue #12's original
     /// design never needed one - every prior caller only ever collided
@@ -1080,7 +1080,7 @@ pub fn valid_payload(schema: &str, payload: &str) -> bool {
 }
 
 /// The idempotency-key namespace `CrossContextRoute`'s own background
-/// task (`db::catch_up_cross_context_route`, docs/architecture.md §36)
+/// task (`db::catch_up_cross_context_route`, [docs/architecture.md §36](../../../docs/architecture.md#cross-context-route))
 /// reserves for its own internally-derived keys
 /// (`"{RESERVED_IDEMPOTENCY_KEY_PREFIX}{route_name}:{source_event_sequence}"`) -
 /// see `Error::ReservedIdempotencyKeyPrefix`'s own doc comment for why
@@ -1092,7 +1092,7 @@ pub fn valid_payload(schema: &str, payload: &str) -> bool {
 /// prefix, who gets rejected same as an attacker would; low enough
 /// odds in practice to accept as this mechanism's tradeoff.
 ///
-/// **No longer load-bearing** since docs/architecture.md §37's
+/// **No longer load-bearing** since [docs/architecture.md §37](../../../docs/architecture.md#idempotency-keys-client-id-scoping)'s
 /// `client_id`-scoped `idempotency_keys` (`db::ensure_idempotency_keys_table`'s
 /// own doc comment) - no external caller's `client_id` is ever
 /// caller-suppliable, so no external submission could land under
@@ -2370,7 +2370,7 @@ pub fn forget_subject(
 /// contract" (see the surface's own guidance), but `sequence` isn't
 /// optional scenery: it's the one thing a paging caller needs back to
 /// supply as the next call's own `after_sequence`, propagating
-/// `skilj-graphql`'s `EventQuery` resolver (§8 item 5, Phase 3) - a
+/// `skilj-graphql`'s `EventQuery` resolver ([§8](../../../docs/architecture.md#open-for-a-future-pass) item 5, Phase 3) - a
 /// caller with only the rendered strings back could never page past the
 /// first call.
 #[allow(clippy::too_many_arguments)]

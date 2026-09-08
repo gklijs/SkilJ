@@ -15,7 +15,7 @@
 //! doesn't write to `roles`/`role_access_mappings` directly; instead a
 //! human claims the once-only bootstrap secret `Skilj::builder(...).build()`
 //! prints, to create the first superadmin, and everything past that
-//! happens over the GraphQL admin console. See docs/architecture.md §5/§6
+//! happens over the GraphQL admin console. See [docs/architecture.md §5](../../../../docs/architecture.md#graphql-wire-contract)/[§6](../../../../docs/architecture.md#idp-trust-configuration)
 //! in the skilj repository for the full picture, including how to wire
 //! a real `identity_provider` so GraphQL's Role-based auth (not just
 //! the REST command tokens below) actually works.

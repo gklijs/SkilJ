@@ -27,7 +27,7 @@ it (a JetBrains IDE's bundled LLDB often ships one, e.g. under
 'libxml2.so.2*' 2>/dev/null` locates one) - this is a known environment
 quirk, not a code problem, and not specific to this project.
 
-Building `skilj-temporal` (docs/architecture.md §34) needs a `protoc`
+Building `skilj-temporal` ([docs/architecture.md §34](docs/architecture.md#skilj-temporal-plan)) needs a `protoc`
 binary at compile time - `temporalio-protos` (a `temporalio-client`
 dependency) compiles Temporal's own `.proto` files in its own build
 script and doesn't vendor `protoc` itself, nor expose a feature to
@@ -55,7 +55,7 @@ the note on `/tmp` filling up below) for 15 days; they skip gracefully,
 the same tolerance the embedded-Postgres tests above already have, if
 that download can't reach the network.
 
-Building `skilj-kafka` (docs/architecture.md §39/§40) needs a C compiler
+Building `skilj-kafka` ([docs/architecture.md §39](docs/architecture.md#external-message-dedup-create-external-event)/[§40](docs/architecture.md#skilj-kafka-bridge)) needs a C compiler
 that can see `curl/curl.h` at build time - `rdkafka-sys`'s own vendored
 `librdkafka` (`cmake-build` feature, which compiles it from source
 rather than needing a system `libcurl4-openssl-dev` package broadly

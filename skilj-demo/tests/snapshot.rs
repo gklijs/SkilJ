@@ -1,4 +1,4 @@
-//! End-to-end proof of docs/architecture.md §19's `Snapshot` mechanism,
+//! End-to-end proof of [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s `Snapshot` mechanism,
 //! against the real adopter in `skilj_demo::banking`
 //! (`AccountBalanceSnapshot`/`WithdrawMoneyFast` - see that module's own
 //! doc comment for why they're hand-written rather than codegen'd).

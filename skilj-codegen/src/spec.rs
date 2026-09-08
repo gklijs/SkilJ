@@ -2,7 +2,7 @@
 //! context's event/command *shapes* only (fields, DCB tags,
 //! `rest_trigger_allowed`). Deliberately narrow (Codeberg issue #5's
 //! own "narrower cut" - see this crate's own root doc comment and
-//! docs/architecture.md §17): `decide()` bodies, `sensitive_fields`,
+//! [docs/architecture.md §17](../../docs/architecture.md#event-command-codegen-real)): `decide()` bodies, `sensitive_fields`,
 //! scheduling, `#[requires_role]`, and every `Projection` concept are
 //! all real, legitimate parts of the plugin API this format doesn't
 //! cover yet - named here as deliberately deferred, not silently

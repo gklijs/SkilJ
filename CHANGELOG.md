@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because these sources already guarantee strictly increasing delivery
   order within one partition. Response gains `redelivered: bool`;
   `sequence` is `null` on a redelivery. Omitting the pair changes
-  nothing. See docs/architecture.md §39.
+  nothing. See [docs/architecture.md §39](docs/architecture.md#external-message-dedup-create-external-event).
 - New `skilj-kafka` crate: a bridge between skilj's own event stream and
   Kafka, both directions. Outbound, a mapped `EventType` is produced to
   a Kafka topic (message key derived from a DCB tag) via the same
@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExternalEventIngestion` (redelivery-safe via the `dedupe` mechanism
   above) or `CommandTrigger` (redelivery-safe via `Idempotency-Key`),
   a per-mapping choice - both derive their own key from the message's
-  own `"{topic}:{partition}"`/offset. See docs/architecture.md §40.
+  own `"{topic}:{partition}"`/offset. See [docs/architecture.md §40](docs/architecture.md#skilj-kafka-bridge).
 - New `skilj-amqp` crate: `skilj-kafka`'s own sibling for any AMQP 1.0
   broker (Solace PubSub+, Azure Service Bus, ActiveMQ Artemis) via
   `fe2o3-amqp` (pure Rust). Outbound, a mapped `EventType` is sent to an
@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `group-sequence` or `message-id` properties for redelivery safety when
   the sender populated them (optional in AMQP 1.0, unlike Kafka's own
   broker-guaranteed offsets - omitted gracefully when absent, never an
-  error). See docs/architecture.md §41.
+  error). See [docs/architecture.md §41](docs/architecture.md#skilj-amqp-bridge).
 - New `skilj-nats` crate: a third bridge sibling, for NATS JetStream via
   `async-nats`. Outbound, a mapped `EventType` is published to a subject
   with a DCB tag as a `Skilj-Correlation-Key` header and
@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redelivery-safe - JetStream's own `(stream, stream_sequence)` is
   broker-assigned on every message, never optional) or `CommandTrigger`
   (via `Nats-Msg-Id` when an upstream sender populated one). See
-  docs/architecture.md §42.
+  [docs/architecture.md §42](docs/architecture.md#skilj-nats-bridge).
 
 ## [0.0.4] - 2026-09-04
 
@@ -78,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key prefix for the route's own internal use, rejecting any
   caller-supplied idempotency key that uses it at both the REST trigger
   and `submitCommand` GraphQL wire boundaries. See docs/architecture.md
-  §36.
+  [§36](docs/architecture.md#cross-context-route).
 - Investigating the fix above surfaced a second, more serious,
   **already-shipped** issue in `idempotency_keys` (live since 0.0.2, not
   new to this release): its key was `(command_type_name,
@@ -97,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request submitted just before this migration runs will no longer be
   recognised as a duplicate (pre-migration rows are retired, not
   reused) - accepted in exchange for fully closing the collision above
-  rather than leaving any part of it open. See docs/architecture.md §37.
+  rather than leaving any part of it open. See [docs/architecture.md §37](docs/architecture.md#idempotency-keys-client-id-scoping).
 
 ### Added
 
@@ -115,7 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry above covers a namespace-collision issue in this mechanism,
   found and closed before release), so a redelivered/retried catch-up
   tick is exactly as safe as any other idempotency-keyed submission
-  already is. See docs/architecture.md §36.
+  already is. See [docs/architecture.md §36](docs/architecture.md#cross-context-route).
 - `skilj_core::db::decide_and_submit_command`: the "optimistic `decide()`,
   then locked `submit_command`" sequence `skilj-rest`'s command-trigger
   route and `skilj-graphql`'s `submitCommand` resolver each ran inline is
@@ -133,7 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via its existing `Idempotency-Key` on `submitCommand`/command
   triggering, keyed by `{run_id}:{activity_id}` per Temporal's own
   documented Activity-idempotency guidance - no new skilj code, phase 1
-  of the plan in `docs/architecture.md` §34.
+  of the plan in [`docs/architecture.md` §34](docs/architecture.md#skilj-temporal-plan).
 - New `skilj-temporal` crate (phases 2-3 of the same plan): a bridge
   from skilj's own event stream (`GET /v1/events/consume`/`POST
   /v1/events/consume/ack`) to Temporal's client API, starting or

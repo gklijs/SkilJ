@@ -5,7 +5,7 @@
 //! then re-fetch with it - all without this crate ever having prior
 //! knowledge of the projection's shape, matching how a real
 //! `skilj-graphql` deployment's dynamically-generated per-projection
-//! types work (docs/architecture.md §11 / §5.1).
+//! types work ([docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console) / §5.1).
 
 use serde_json::{json, Value};
 use skilj_tui::graphql::Client;

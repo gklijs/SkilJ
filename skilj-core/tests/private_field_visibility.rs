@@ -2,7 +2,7 @@
 //! write-up of this pass) - a third field-level protection, alongside
 //! `sensitive_fields` (crypto-shredding-shaped PII protection, subject
 //! named by the payload) and the owner-tag `scope` cross-tenant series
-//! (§23-30). Unlike both of those, this is a plain read-time redaction
+//! ([§23](../../docs/architecture.md#cross-tenant-projection-read-fix-owner-tag)-30). Unlike both of those, this is a plain read-time redaction
 //! rule with no encryption anywhere behind it: a private field is always
 //! stored in plaintext, and `own`/`team`/`addressed` each name a
 //! different default reader for it (see `value PrivateField` in the

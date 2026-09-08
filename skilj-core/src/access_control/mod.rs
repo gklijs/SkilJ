@@ -3,7 +3,7 @@
 //! `RevokeRoleAccessMapping`, `TokenRevocation`; actor resolution
 //! (`ReadAccess`/`WriteAccess`/`AdminAccess`/`SensitiveDataAccess`/
 //! `Superadmin`) and the JWT-to-Role identity resolution entry point. See
-//! docs/architecture.md §3.2 and §6 (JWKS/JWT verification lives here,
+//! docs/architecture.md §3.2 and [§6](../../../docs/architecture.md#idp-trust-configuration) (JWKS/JWT verification lives here,
 //! behind the `jsonwebtoken` crate).
 
 use crate::error::SkiljRejection;
@@ -473,7 +473,7 @@ pub(crate) fn require_active_superadmin(caller: &Role) -> crate::error::Result<(
 
 /// A deployment's trust configuration for exactly one external IdP - see
 /// the identity resolution note above `entity Role` and docs/
-/// architecture.md §6. Runtime/library configuration, not domain state,
+/// [architecture.md §6](../../../docs/architecture.md#idp-trust-configuration). Runtime/library configuration, not domain state,
 /// the same register the spec's own note gives the in-memory event
 /// cache's startup warm-up count: nothing in the domain reads or writes
 /// these values, they only parameterise `verify_and_extract_subject`
@@ -541,7 +541,7 @@ impl SigningAlgorithm {
 }
 
 /// Caches an IdP's JWKS (JSON Web Key Set), keyed by each key's own
-/// `kid` - see docs/architecture.md §6 for why this is reactive-refresh
+/// `kid` - see [docs/architecture.md §6](../../../docs/architecture.md#idp-trust-configuration) for why this is reactive-refresh
 /// rather than a background-timer poll: a JWT whose `kid` isn't already
 /// cached triggers exactly one refetch of the whole set before giving
 /// up, rather than a task refreshing on a schedule nothing here needs to

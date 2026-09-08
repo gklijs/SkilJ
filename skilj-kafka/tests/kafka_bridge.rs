@@ -450,7 +450,7 @@ fn an_inbound_record_message_carries_its_own_real_partition_and_offset_as_dedupe
 /// The inbound `Trigger` scenario: the same real message, this time
 /// dispatched as a command trigger - proving `Idempotency-Key` is
 /// derived from the identical real partition/offset, in the
-/// `"{topic}:{partition}:{offset}"` shape `docs/architecture.md` §40
+/// `"{topic}:{partition}:{offset}"` shape [`docs/architecture.md` §40](../../docs/architecture.md#skilj-kafka-bridge)
 /// documents.
 #[test]
 fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_offset() {

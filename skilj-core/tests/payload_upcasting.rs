@@ -1,5 +1,5 @@
 //! Tests for `plugin::upcast_payload`/`UpcastStep` (docs/architecture.md
-//! §33) - sugar around the version-branch pattern a hand-written
+//! [§33](../../docs/architecture.md#payload-upcasting)) - sugar around the version-branch pattern a hand-written
 //! `BoundedContextEvent::try_from_event` already had every ingredient
 //! for by hand (`event.metadata.version` plus the raw JSON payload), not
 //! a new registration/storage/schema surface, so unlike `type_registration.rs`'s
@@ -16,7 +16,7 @@ struct MoneyDepositedV2 {
     amount_cents: i64,
 }
 
-/// The scenario docs/architecture.md §33 uses throughout: a float-dollar
+/// The scenario [docs/architecture.md §33](../../docs/architecture.md#payload-upcasting) uses throughout: a float-dollar
 /// `amount` (schema_version 1) renamed and retyped to an integer-cent
 /// `amount_cents` (schema_version 2) - a genuine reshape
 /// `schema_is_backwards_compatible` would reject as a revision of the

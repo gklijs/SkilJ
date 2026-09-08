@@ -13,12 +13,12 @@
 //! `CommandTrigger` needs an `Arc<dyn CommandDispatcher>` - `router()`'s
 //! second parameter - to actually reach a bounded context's typed
 //! `decide()`; see `CommandDispatcher`'s own doc comment
-//! (`skilj-core::plugin`) and docs/architecture.md §1.7/§8 item 4 for why
+//! (`skilj-core::plugin`) and docs/architecture.md §1.7/[§8](../../../docs/architecture.md#open-for-a-future-pass) item 4 for why
 //! that's a trait `skilj-core` owns rather than something this crate
 //! reaches into `skilj` (the facade crate that actually builds one) for
 //! directly - keeps `skilj-rest` usable standalone, per §3.1. `router()`'s
 //! third parameter, `Arc<dyn ProjectionDispatcher>`, is the identical
-//! reasoning applied to `project()` (§8 item 6) - every route that writes
+//! reasoning applied to `project()` ([§8](../../../docs/architecture.md#open-for-a-future-pass) item 6) - every route that writes
 //! an event calls `db::insert_event_and_update_sync_projections` rather
 //! than the plain `insert_event`, threading this through.
 //!

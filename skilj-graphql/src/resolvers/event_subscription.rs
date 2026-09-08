@@ -1,7 +1,7 @@
 //! `surface EventSubscription` - `allEvents`, `eventsByType`. `ReadAccess`-
 //! gated like `ProjectionQuery` (`require_read_mapping`, not
 //! `require_admin_mapping` - see the surface's own `GrantScopedToBoundedContext`
-//! guarantee). The last surface out of §8/§9's backlog - see
+//! guarantee). The last surface out of [§8](../../../docs/architecture.md#open-for-a-future-pass)/[§9](../../../docs/architecture.md#next-steps)'s backlog - see
 //! `docs/architecture.md`'s own write-up of this pass, and
 //! `skilj_core::event_store::EventBroadcaster`'s own doc comment, for why
 //! a single-process, in-memory broadcast is the architecturally correct

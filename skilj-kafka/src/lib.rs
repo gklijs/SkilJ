@@ -1,5 +1,5 @@
 //! A bridge between skilj's own event stream and Kafka -
-//! docs/architecture.md §40, `skilj-temporal`'s (§34) direct sibling.
+//! [docs/architecture.md §40](../../docs/architecture.md#skilj-kafka-bridge), `skilj-temporal`'s ([§34](../../docs/architecture.md#skilj-temporal-plan)) direct sibling.
 //! Wire-protocol client only, on both sides: this crate speaks skilj's
 //! REST surface and `rdkafka`'s own client - zero dependency on any
 //! other skilj crate, the same "independently usable, wire protocol
@@ -34,8 +34,8 @@
 //! Both [`InboundAction`] variants derive their own redelivery-safety
 //! key from the message's own stable identity - `"{topic}:{partition}"`
 //! as the partition key, the message's own `offset` as the sequence -
-//! exactly the shape docs/architecture.md §39's `dedupe` mechanism and
-//! `submitCommand`'s own `Idempotency-Key` (§21) were each built to
+//! exactly the shape [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)'s `dedupe` mechanism and
+//! `submitCommand`'s own `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission)) were each built to
 //! take, not a new mechanism invented here. [`InboundAction::Record`]
 //! sends `dedupe` on `POST /v1/events/external`; [`InboundAction::Trigger`]
 //! sends `Idempotency-Key` on `POST /v1/commands/trigger`. The Kafka
@@ -260,13 +260,13 @@ pub struct InboundMapping {
 pub enum InboundAction {
     /// `POST /v1/events/external` - record the message verbatim as a
     /// fact. Redelivery-safe via the `dedupe` mechanism
-    /// (docs/architecture.md §39) - not `ExternalEventIngestion`'s own
+    /// ([docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)) - not `ExternalEventIngestion`'s own
     /// responsibility to invent, since that mechanism already exists for
     /// exactly this.
     Record { event_type: String },
     /// `POST /v1/commands/trigger` - decide on the message via a real
-    /// `decide()`. Redelivery-safe via `Idempotency-Key` (§21), now
-    /// itself `client_id`-scoped (§37) so this mapping's own inbound
+    /// `decide()`. Redelivery-safe via `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission)), now
+    /// itself `client_id`-scoped ([§37](../../docs/architecture.md#idempotency-keys-client-id-scoping)) so this mapping's own inbound
     /// traffic can never collide with an unrelated caller's.
     Trigger { command_type: String },
 }
@@ -281,9 +281,9 @@ pub enum InboundAction {
 /// `"{topic}:{partition}"` is this message's own redelivery-safety
 /// partition key, `offset` its own sequence - Kafka's guarantee of
 /// strictly increasing, in-order delivery within one partition is
-/// exactly what both docs/architecture.md §39's `dedupe` watermark and
+/// exactly what both [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)'s `dedupe` watermark and
 /// `submitCommand`'s own idempotency key rely on, the same property
-/// `skilj_temporal`'s own `"{run_id}:{activity_id}"` convention (§34
+/// `skilj_temporal`'s own `"{run_id}:{activity_id}"` convention ([§34](../../docs/architecture.md#skilj-temporal-plan)
 /// phase 1) already leans on one level further out.
 pub async fn dispatch_inbound_message(
     http: &reqwest::Client,

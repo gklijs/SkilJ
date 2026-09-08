@@ -1,6 +1,6 @@
 //! Tests for the `CommandTrigger`/`CommandSubmission` surfaces and
 //! `ProcessCommand` (`specs/skilj.allium`) - propagated after the two
-//! event-creation surfaces (docs/architecture.md §9): entity
+//! event-creation surfaces ([docs/architecture.md §9](../../docs/architecture.md#next-steps)): entity
 //! `CommandToken`, rules `AuthoriseCommandTrigger`/`ProcessCommand`.
 //! `AuthoriseCommandSubmission` (the GraphQL/`RoleAccessMapping` path) was
 //! added in a later pass, once `access_management.rs` supplied

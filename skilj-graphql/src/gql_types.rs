@@ -517,7 +517,7 @@ pub fn projection_registration_result_object() -> Object {
 /// giving `ExternalEventToken`/`DirectCreationToken`/`CommandToken` the
 /// same Rust field made it obviously wrong to leave any of the four
 /// unreadable, the same "why leave three gaps when one fix closes all
-/// four" reasoning `§26`'s own admin read-back fix already applied to
+/// four" reasoning `[§26](../../docs/architecture.md#admin-read-back-owner-tag-key)`'s own admin read-back fix already applied to
 /// `owner_tag_key`.
 macro_rules! token_object {
     ($object_name:literal, $rust_type:ty, $scoped_field_name:literal, $scoped_type:literal, $scoped_accessor:expr) => {
@@ -728,7 +728,7 @@ pub fn inspected_event_object() -> Object {
     })
 }
 
-/// `inspectSnapshot`'s own response shape (docs/architecture.md §19) -
+/// `inspectSnapshot`'s own response shape ([docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)) -
 /// a real, stored `{schema}.snapshots` row, resolved by
 /// `resolvers::snapshot_query`. `state` is the raw JSON a `Snapshot`
 /// impl's own `fold()` produced, not decoded any further here - this

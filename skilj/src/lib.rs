@@ -119,7 +119,7 @@ pub struct Skilj {
     /// `projections`/`event_types` are - `snapshot_dispatcher()` hands
     /// out a cheap `Arc<dyn SnapshotDispatcher>`, and the background
     /// snapshot catch-up task spawned in `.build()` holds its own clone
-    /// for the process's lifetime (docs/architecture.md §19).
+    /// for the process's lifetime ([docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)).
     snapshots: Arc<HashMap<(String, String), RegisteredSnapshot>>,
     /// `bootstrap::generate_bootstrap_secret`'s output, computed once at
     /// `.build()` time and printed then too (see `SkiljBuilder::build`) -
@@ -525,7 +525,7 @@ impl Skilj {
     /// The type-erased `ProjectionDispatcher` this `Skilj` hands
     /// `rest_router()`/`graphql_router()` internally - `db::
     /// insert_event_and_update_sync_projections`'s own bridge into a
-    /// bounded context's registered `project()` implementations (§8
+    /// bounded context's registered `project()` implementations ([§8](../../docs/architecture.md#open-for-a-future-pass)
     /// item 6). Same cheap-`Arc`-clone reasoning as `command_dispatcher()`.
     pub fn projection_dispatcher(&self) -> Arc<dyn skilj_core::plugin::ProjectionDispatcher> {
         Arc::new(ProjectionDispatcherImpl {
@@ -549,7 +549,7 @@ impl Skilj {
     /// The type-erased `SnapshotDispatcher` this `Skilj` hands
     /// `graphql_router()`'s own snapshot-inspection resolver and the
     /// background snapshot catch-up task `.build()` spawns
-    /// (docs/architecture.md §19). Same cheap-`Arc`-clone reasoning as
+    /// ([docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)). Same cheap-`Arc`-clone reasoning as
     /// `command_dispatcher()`/`projection_dispatcher()`/`event_dispatcher()`.
     pub fn snapshot_dispatcher(&self) -> Arc<dyn skilj_core::plugin::SnapshotDispatcher> {
         Arc::new(SnapshotDispatcherImpl {
@@ -570,7 +570,7 @@ impl Skilj {
     }
 
     /// `skilj-rest`'s routes, mounted onto a fresh `axum::Router` - see
-    /// docs/architecture.md §7. A caller wanting the REST and GraphQL
+    /// [docs/architecture.md §7](../../docs/architecture.md#rest-wire-contract). A caller wanting the REST and GraphQL
     /// surfaces combined merges this with `graphql_router()` however
     /// `axum::Router::merge`/`nest` suits their own application.
     pub fn rest_router(&self) -> axum::Router {
@@ -586,7 +586,7 @@ impl Skilj {
     }
 
     /// `skilj-graphql`'s single unified schema, mounted onto a fresh
-    /// `axum::Router` - see docs/architecture.md §5. A caller wanting the
+    /// `axum::Router` - see [docs/architecture.md §5](../../docs/architecture.md#graphql-wire-contract). A caller wanting the
     /// REST and GraphQL surfaces combined merges this with
     /// `rest_router()` however `axum::Router::merge`/`nest` suits their
     /// own application - see `rest_router()`'s own doc comment.
@@ -711,7 +711,7 @@ fn registered_event_type<T: EventType + 'static>() -> RegisteredEventType {
 /// it costs nothing beyond the `Box` itself. Built once, at
 /// `.command_type::<T>()` call time (see `registered_command_type`
 /// below), and called by the still-to-be-wired `CommandTrigger` route
-/// (§8 item 4) once per submission: deserialize the payload into
+/// ([§8](../../docs/architecture.md#open-for-a-future-pass) item 4) once per submission: deserialize the payload into
 /// `T::Payload`, convert every matching raw `Event` into `T::Event` via
 /// `BoundedContextEvent::try_from_event`, then call `T::decide()`. Either
 /// decode step failing surfaces as `EventStoreError::PayloadDecodeFailed`,
@@ -721,7 +721,7 @@ type DeciderFn =
     Box<dyn Fn(&str, &[Event]) -> skilj_core::error::Result<CommandDecision> + Send + Sync>;
 
 /// `DeciderFn`'s own twin for `CommandType::decide_from_snapshot` -
-/// docs/architecture.md §19's "Problem 2". `(payload_json,
+/// [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2". `(payload_json,
 /// snapshot_state_json, events_since_snapshot)` - the same shape
 /// `decide_from_snapshot` itself has, just with `payload`/`events_since_snapshot`
 /// still type-erased, exactly like `DeciderFn` above.
@@ -739,7 +739,7 @@ struct RegisteredCommandType {
     /// unchanged - not persisted anywhere (see that method's own doc
     /// comment), read back only by `Dispatcher::required_role` for
     /// `skilj-graphql`'s eventual mutation resolver to check (§1.3.1,
-    /// §8 item 5).
+    /// [§8](../../docs/architecture.md#open-for-a-future-pass) item 5).
     required_role: Option<&'static str>,
     /// `CommandType::snapshot()`'s value, carried straight through
     /// unchanged - read back by `Dispatcher::snapshot_name`, the same
@@ -748,7 +748,7 @@ struct RegisteredCommandType {
     /// Called by `Dispatcher::dispatch` (this module's own
     /// `CommandDispatcher` implementer), reached from `skilj-rest`'s
     /// `CommandTrigger` route through the `Arc<dyn CommandDispatcher>`
-    /// `rest_router()` hands it - docs/architecture.md §8 item 4.
+    /// `rest_router()` hands it - [docs/architecture.md §8](../../docs/architecture.md#open-for-a-future-pass) item 4.
     decide: DeciderFn,
     /// `Dispatcher::dispatch_from_snapshot`'s own bridge into
     /// `CommandType::decide_from_snapshot` - `decide`'s own twin, called
@@ -824,7 +824,7 @@ type KeysFn = Box<dyn Fn(&Event) -> Vec<String> + Send + Sync>;
 /// `DeciderFn` above already has. Built once, at `.projection::<T>()`
 /// call time (see `registered_projection` below), called by `db::
 /// insert_event_and_update_sync_projections`/`catch_up_bounded_context`
-/// (§8 item 6) through the `ProjectionDispatcher` bridge - `Dispatcher`
+/// ([§8](../../docs/architecture.md#open-for-a-future-pass) item 6) through the `ProjectionDispatcher` bridge - `Dispatcher`
 /// below, this module's own implementer. Returns `state_json` unchanged
 /// when `event`'s own type isn't one this projection actually consumes -
 /// see `ProjectionDispatcher::project`'s own doc comment for why that
@@ -838,7 +838,7 @@ type ProjectFn = Box<dyn Fn(&str, &Event, &str) -> skilj_core::error::Result<Str
 /// once the bounded context's own admin access has already been
 /// confirmed (see `reconcile_projections` below). `default_state_json`
 /// is what a *new* instance's own `projection_state` row starts from,
-/// lazily, the first time any event touches its key (§9's own "keyed /
+/// lazily, the first time any event touches its key ([§9](../../docs/architecture.md#next-steps)'s own "keyed /
 /// multi-row Projections" pass - nothing is seeded up front anymore,
 /// since a projection's own instances aren't known until events actually
 /// name them).
@@ -913,7 +913,7 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
 /// own type-erased bridge, closing over a single `T: Snapshot` alone,
 /// the same shape `ProjectFn` above has for `Projection::project`. Built
 /// once, at `.snapshot::<T>()` call time (see `registered_snapshot`
-/// below), called by `db::catch_up_snapshots` (docs/architecture.md §19)
+/// below), called by `db::catch_up_snapshots` ([docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events))
 /// through the `SnapshotDispatcher` bridge - `SnapshotDispatcherImpl`
 /// below, this module's own implementer.
 ///
@@ -1024,7 +1024,7 @@ pub struct ProjectionRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
 inventory::collect!(ProjectionRegistrar);
 
 /// See `EventTypeRegistrar` above - same shape and reasoning, for
-/// `#[auto_register]` over a `Snapshot` impl (docs/architecture.md §19).
+/// `#[auto_register]` over a `Snapshot` impl ([docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)).
 pub struct SnapshotRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
 inventory::collect!(SnapshotRegistrar);
 
@@ -1116,7 +1116,7 @@ impl SkiljBuilder {
         self
     }
 
-    /// docs/architecture.md §19. Same shape as `.projection::<T>()`
+    /// [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events). Same shape as `.projection::<T>()`
     /// above; unlike it, has no matching GraphQL registration mutation -
     /// see `skilj_core::plugin::Snapshot`'s own doc comment for why.
     pub fn snapshot<T: Snapshot + 'static>(mut self) -> Self {
@@ -1152,7 +1152,7 @@ impl SkiljBuilder {
 
     /// The trusted external IdP `graphql_router()`'s resolvers
     /// authenticate GraphQL callers against - see docs/architecture.md
-    /// §6. Optional: omitting it means `graphql_router()` still mounts
+    /// [§6](../../docs/architecture.md#idp-trust-configuration). Optional: omitting it means `graphql_router()` still mounts
     /// (`createSuperadmin` needs no caller identity at all - see
     /// `surface SuperadminBootstrap`), but every other resolver can never
     /// authenticate anyone, since there is no bearer JWT any request
@@ -1166,7 +1166,7 @@ impl SkiljBuilder {
     /// How often the single shared background task `.build()` spawns
     /// polls for `sync: false` `Projection`s and `building`
     /// `ProjectionRebuild`s to catch up - `db::catch_up_bounded_context`'s
-    /// own wake mechanism (§8 item 6, async case). Defaults to 500ms;
+    /// own wake mechanism ([§8](../../docs/architecture.md#open-for-a-future-pass) item 6, async case). Defaults to 500ms;
     /// there is no event-delivery mechanism to wake it early (see
     /// docs/architecture.md's own write-up of this pass for why), so a
     /// caller wanting tighter freedom between an event committing and its
@@ -1181,7 +1181,7 @@ impl SkiljBuilder {
     /// How often the single shared background task `.build()` spawns
     /// polls for registered `Snapshot`s to catch up -
     /// `db::catch_up_snapshots`' own wake mechanism (docs/architecture.md
-    /// §19), the `Snapshot` equivalent of `async_projection_poll_interval`
+    /// [§19](../../docs/architecture.md#optional-snapshotting-matching-events)), the `Snapshot` equivalent of `async_projection_poll_interval`
     /// above. Defaults to 500ms, matching that default for the identical
     /// reason.
     pub fn snapshot_poll_interval(mut self, interval: std::time::Duration) -> Self {

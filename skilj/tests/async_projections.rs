@@ -1,4 +1,4 @@
-//! End-to-end test for the background consumer §8 item 6's async case
+//! End-to-end test for the background consumer [§8](../../docs/architecture.md#open-for-a-future-pass) item 6's async case
 //! spawns - a real HTTP request through `Skilj::rest_router()`, a short
 //! wait for the spawned poll task to actually run, then back out through
 //! `db::get_projection_state`. Proof the task `SkiljBuilder::build()`

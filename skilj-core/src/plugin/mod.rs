@@ -1,5 +1,5 @@
 //! The public plugin API - the one module every consuming application's
-//! own code touches directly. See docs/architecture.md §1 for the full
+//! own code touches directly. See [docs/architecture.md §1](../../../docs/architecture.md#plugin-api-decide-project) for the full
 //! reasoning behind this shape.
 
 use crate::event_store::{Event, MissedOccurrencePolicy};
@@ -77,7 +77,7 @@ pub struct UpcastStep {
 /// it before deserializing. This is that branch, generalised into a
 /// declared chain of pure JSON transforms instead of a repeated
 /// `match metadata.version { ... }` per event type. See
-/// docs/architecture.md §33 for the full "why not first-class
+/// [docs/architecture.md §33](../../../docs/architecture.md#payload-upcasting) for the full "why not first-class
 /// upcasting" investigation this is the one built piece of.
 ///
 /// Not a replacement for `schema_is_backwards_compatible`'s additive-only
@@ -224,7 +224,7 @@ pub trait CommandType {
     /// keeping role names meaningful and non-colliding - a `skilj-core`
     /// concern, not something the engine itself enforces. Checked
     /// exclusively by `skilj-graphql`'s own mutation resolver (docs/
-    /// architecture.md §1.3.1, §8 item 5) - REST triggering is untouched,
+    /// architecture.md §1.3.1, [§8](../../../docs/architecture.md#open-for-a-future-pass) item 5) - REST triggering is untouched,
     /// since `CommandToken` is already its own, separate per-token grant.
     fn required_role() -> Option<&'static str> {
         None
@@ -233,7 +233,7 @@ pub trait CommandType {
     fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision;
 
     /// Opt-in accelerator for `decide()` against a large tag-scoped
-    /// history (docs/architecture.md §19's "Problem 2") - names the
+    /// history ([docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2") - names the
     /// `Snapshot::NAME` this command type's own decide() can fold
     /// forward from instead of replaying every matching event. `None`
     /// (the default) means no snapshot; every existing `CommandType`
@@ -532,7 +532,7 @@ pub trait Projection {
 }
 
 /// A folded, tag-scoped accelerator for `CommandType::decide()` against
-/// a large `matching_events` history (docs/architecture.md §19's
+/// a large `matching_events` history ([docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s
 /// "Problem 2") - `CommandType::snapshot()`'s own doc comment is where a
 /// command type opts in.
 ///
@@ -626,7 +626,7 @@ pub trait Snapshot {
 /// concrete registry (`skilj`'s `SkiljBuilder`, today): both surface
 /// crates already depend on `skilj-core`, so this is the natural shared
 /// boundary - the same "opaque handle both sides can reach" reasoning
-/// `db::Pool` already uses. See docs/architecture.md §1.7/§8 item 4.
+/// `db::Pool` already uses. See docs/architecture.md §1.7/[§8](../../../docs/architecture.md#open-for-a-future-pass) item 4.
 ///
 /// A consumer using `skilj-core` + `skilj-rest` directly, without the
 /// `skilj` facade's builder, implements this by hand instead - nothing
@@ -666,7 +666,7 @@ pub trait CommandDispatcher: Send + Sync {
     /// if this is `Some(Some(name))` and the command's own derived tags
     /// match `SnapshotDispatcher::tag_key(bc, name)` exactly, the caller
     /// should read that snapshot and call `dispatch_from_snapshot`
-    /// instead of `dispatch` - see docs/architecture.md §19.
+    /// instead of `dispatch` - see [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events).
     fn snapshot_name(
         &self,
         bounded_context: &str,
@@ -692,7 +692,7 @@ pub trait CommandDispatcher: Send + Sync {
 /// draws the pure-function line around. What the new transactional
 /// `db::insert_event_and_update_sync_projections` calls through to
 /// actually fold an event into a `sync` projection's stored state - see
-/// docs/architecture.md's own write-up of this pass (§8 item 6).
+/// docs/architecture.md's own write-up of this pass ([§8](../../../docs/architecture.md#open-for-a-future-pass) item 6).
 ///
 /// Async (`sync: false`, the default) projections are folded by the
 /// background consumer `db::catch_up_bounded_context` - see its own doc
@@ -781,7 +781,7 @@ pub trait ProjectionDispatcher: Send + Sync {
 /// `CommandDispatcher`'s `dispatch_from_snapshot`/`snapshot_name`'s own
 /// counterpart for the other half of the type-erasure boundary, and what
 /// `db::catch_up_snapshots` (the background catch-up task -
-/// docs/architecture.md §19) calls through to actually fold an event
+/// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)) calls through to actually fold an event
 /// into a stored snapshot row. Same "outer `None` = not registered"
 /// convention every other dispatcher trait in this module already uses.
 pub trait SnapshotDispatcher: Send + Sync {

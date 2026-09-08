@@ -1,5 +1,5 @@
 //! End-to-end tests for `POST /v1/events/external`'s own `dedupe` field
-//! (docs/architecture.md §39, specs/skilj.allium's own `rule
+//! ([docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event), specs/skilj.allium's own `rule
 //! CreateExternalEvent`) - a real HTTP request, through
 //! `Skilj::rest_router()`, into `db::create_and_insert_external_event`,
 //! and back out through the real response body. `skilj-core/tests/external_event_dedup.rs`
@@ -234,7 +234,7 @@ async fn submit(
     (status, json)
 }
 
-/// docs/architecture.md §39: omitting `dedupe` entirely creates an event
+/// [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event): omitting `dedupe` entirely creates an event
 /// every time, unchanged from before this feature existed -
 /// `response.sequence` present, `response.redelivered` false.
 #[test]

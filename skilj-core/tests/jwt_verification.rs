@@ -1,7 +1,7 @@
 //! Real-network-free tests for `access_control::verify_and_extract_subject`,
 //! using a real RSA keypair, a real local `axum` server serving its JWKS,
 //! and real JWTs signed with `jsonwebtoken::encode` (docs/architecture.md
-//! §6). Genuine I/O (unlike this crate's own pure-function tests), so a
+//! [§6](../../docs/architecture.md#idp-trust-configuration)). Genuine I/O (unlike this crate's own pure-function tests), so a
 //! dedicated harness rather than `#[test] fn ... { pure_call() }` - a
 //! real server, not a mock, since `verify_and_extract_subject` genuinely
 //! fetches the JWKS document over HTTP via `reqwest`.
@@ -282,7 +282,7 @@ fn verify_and_extract_subject_rejects_a_wrong_issuer() {
     });
 }
 
-/// The reactive-refresh path (docs/architecture.md §6): a `kid` the
+/// The reactive-refresh path ([docs/architecture.md §6](../../docs/architecture.md#idp-trust-configuration)): a `kid` the
 /// cache has never seen triggers exactly one JWKS refetch before giving
 /// up - still `None` afterward here, since the test server never
 /// publishes a key under this `kid` at all.

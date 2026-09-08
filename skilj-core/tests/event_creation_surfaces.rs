@@ -1,6 +1,6 @@
 //! Tests for the `ExternalEventIngestion` and `DirectEventCreation`
 //! surfaces (`specs/skilj.allium`) - the write-side counterpart to the
-//! EventFetch pilot (docs/architecture.md §9), propagated next: entities
+//! EventFetch pilot ([docs/architecture.md §9](../../docs/architecture.md#next-steps)), propagated next: entities
 //! `ExternalEventToken`/`DirectCreationToken`/`ExternalTriggered`/
 //! `DirectlyCreated`, rules `CreateExternalEvent`/`CreateDirectEvent`.
 //!

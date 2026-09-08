@@ -1,5 +1,5 @@
 //! One module per GraphQL surface, matching `specs/skilj.allium`'s
-//! surfaces section. Phase 1 (docs/architecture.md §8 item 5's own plan)
+//! surfaces section. Phase 1 ([docs/architecture.md §8](../../../docs/architecture.md#open-for-a-future-pass) item 5's own plan)
 //! covers the superadmin admin console - the six static-typed,
 //! `Superadmin`-facing surfaces: `superadmin_bootstrap`,
 //! `access_management`, `bounded_context_creation`,
@@ -25,13 +25,13 @@
 //! described just below.
 //!
 //! `projection_query` (`ProjectionQuery`) is its own later pass, once
-//! `project()` existed both sync and async (§8 item 6) - see
+//! `project()` existed both sync and async ([§8](../../../docs/architecture.md#open-for-a-future-pass) item 6) - see
 //! `crate::projection_types` for the JSON-Schema→GraphQL-type generation
 //! mechanism it needed (§5.1's own previously-deferred piece) and this
 //! module's own `require_read_mapping` for why it's gated differently
 //! from every prior dynamic surface (`ReadAccess`, not `AdminAccess`).
 //!
-//! `event_subscription` (`EventSubscription`) closes out §8/§9 - the
+//! `event_subscription` (`EventSubscription`) closes out [§8](../../../docs/architecture.md#open-for-a-future-pass)/[§9](../../../docs/architecture.md#next-steps) - the
 //! last surface, once `skilj_core::event_store::EventBroadcaster` gave
 //! it a real-time delivery mechanism. Reuses `require_read_mapping`
 //! (same `ReadAccess` facing as `projection_query`) and this module's own

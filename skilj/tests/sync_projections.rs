@@ -1,4 +1,4 @@
-//! End-to-end test for `project()`, sync case (§8 item 6) - a real HTTP
+//! End-to-end test for `project()`, sync case ([§8](../../docs/architecture.md#open-for-a-future-pass) item 6) - a real HTTP
 //! request through `Skilj::rest_router()`, through a real registered
 //! sync `Projection`, and back out through `db::get_projection_state`.
 //! Proof this actually reaches through the real REST path, not just the

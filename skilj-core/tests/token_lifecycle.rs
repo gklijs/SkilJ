@@ -1,6 +1,6 @@
 //! Tests for the `EventTypeAdminOperations`/`CommandTypeAdminOperations`/
 //! `TokenRevocation` surfaces (`specs/skilj.allium`) - propagated after
-//! `CommandSubmission` (docs/architecture.md §9): the `AccessToken` sum
+//! `CommandSubmission` ([docs/architecture.md §9](../../docs/architecture.md#next-steps)): the `AccessToken` sum
 //! type over its four variants, and rules `CreateExternalEventToken`/
 //! `CreateDirectCreationToken`/`CreateEventReadToken`/`CreateCommandToken`/
 //! `RevokeToken`. This is what completes `AccessToken`'s entity shape -

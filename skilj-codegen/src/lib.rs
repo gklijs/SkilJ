@@ -1,6 +1,6 @@
 //! `build.rs` codegen for skilj's own declarative bounded-context
 //! format, Codeberg issue #5's "narrower cut" (see `docs/architecture.md`
-//! §17 for the full design, and §16 for the prototype that scoped it
+//! [§17](../../docs/architecture.md#event-command-codegen-real) for the full design, and [§16](../../docs/architecture.md#declarative-bounded-context-codegen-prototype) for the prototype that scoped it
 //! down to this). A `.skilj.toml` file describes one bounded context's
 //! event/command type *shapes* only, fields, DCB tags and
 //! `rest_trigger_allowed`, and this crate turns that into real Rust:
@@ -13,7 +13,7 @@
 //! (`external_creation_allowed`/`direct_creation_allowed`/
 //! `event_read_allowed`), scheduling, `#[requires_role]`, and every
 //! `Projection` concept are real, legitimate parts of the plugin API
-//! this format doesn't cover - the §16 prototype's own recommendation
+//! this format doesn't cover - the [§16](../../docs/architecture.md#declarative-bounded-context-codegen-prototype) prototype's own recommendation
 //! was to prove the mechanism on exactly what a real conversion needed
 //! (`skilj-demo/src/banking.rs`, which uses none of those), not to
 //! guess ahead of a second real use case.

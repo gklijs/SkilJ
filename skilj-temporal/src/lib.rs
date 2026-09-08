@@ -1,5 +1,5 @@
 //! A bridge from skilj's own event stream to Temporal - phase 2/3 of the
-//! plan in docs/architecture.md §34. Wire-protocol client only, on both
+//! plan in [docs/architecture.md §34](../../docs/architecture.md#skilj-temporal-plan). Wire-protocol client only, on both
 //! sides: this crate speaks skilj's REST surface (`GET /v1/events/consume`
 //! and `POST /v1/events/consume/ack`, `docs/rest-event-reading.md`) and
 //! Temporal's `temporalio-client` gRPC client - zero dependency on any
@@ -112,7 +112,7 @@ struct ConsumeResponse {
     event_type_name: String,
 }
 
-/// The fixed correlation convention (docs/architecture.md §34):
+/// The fixed correlation convention ([docs/architecture.md §34](../../docs/architecture.md#skilj-temporal-plan)):
 /// `"{bounded_context}:{tag_key}:{tag_value}"`, derived from whichever
 /// one of `event.tags` matches `tag_key`. `None` when the tag is
 /// altogether absent, or present with a `null` value (`Tag.value` is

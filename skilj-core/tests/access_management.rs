@@ -1,6 +1,6 @@
 //! Tests for the `AccessManagement` surface (`specs/skilj.allium`) -
 //! propagated after CommandTrigger/ProcessCommand (docs/architecture.md
-//! §9): entities `Role`/`RoleAccessMapping`, enum `AccessLevel`, rules
+//! [§9](../../docs/architecture.md#next-steps)): entities `Role`/`RoleAccessMapping`, enum `AccessLevel`, rules
 //! `CreateRole`/`RevokeRole`/`GrantRoleAccessMapping`/
 //! `RevokeRoleAccessMapping`. This is what unblocked
 //! `AuthoriseCommandSubmission`/`CommandSubmission`, added in

@@ -37,7 +37,7 @@
 //! once-only bootstrap secret `Skilj::builder(...).build()` prints
 //! (`ClosesPermanentlyOnFirstClaim`) to create the first superadmin, and
 //! everything past that - creating bounded contexts, granting access -
-//! happens over the GraphQL admin console (docs/architecture.md §6,
+//! happens over the GraphQL admin console ([docs/architecture.md §6](../../../docs/architecture.md#idp-trust-configuration),
 //! `entity AccessManagement`).
 //!
 //! **Also a real `identity_provider`, for the same shortcut reason.**

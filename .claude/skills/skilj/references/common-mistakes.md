@@ -34,7 +34,7 @@ Fix: add new fields as `Option<T>`, never remove, narrow, or retype an
 existing one. If you need a genuine reshape (rename a field, change its
 type, split/merge fields) rather than an additive change, that's not
 something a schema revision can express at all - see
-`docs/architecture.md` §33 for the full menu of options (a new,
+[`docs/architecture.md` §33](../../../../docs/architecture.md#payload-upcasting) for the full menu of options (a new,
 differently-named type; a custom serde `Deserialize`; reshaping inside
 `Projection::project()`; or `skilj_core::plugin::upcast_payload`/
 `UpcastStep`, sugar for branching on `event.metadata.version` inside a

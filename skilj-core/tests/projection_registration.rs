@@ -1,6 +1,6 @@
 //! Tests for `TypeRegistration`'s remaining three rules
 //! (`specs/skilj.allium`) - propagated after `type_registration.rs`
-//! (docs/architecture.md §9): entities `Projection`/`ProjectionRebuild`,
+//! ([docs/architecture.md §9](../../docs/architecture.md#next-steps)): entities `Projection`/`ProjectionRebuild`,
 //! rules `RegisterProjection`/`RebuildProjection`/`DiscardProjectionRebuild`.
 //! Promotion - a building rebuild replacing the live `Projection` once
 //! caught up - is a background-process concern per the spec's own text,

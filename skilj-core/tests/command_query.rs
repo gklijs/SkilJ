@@ -1,5 +1,5 @@
 //! Tests for the `CommandQuery` surface (`specs/skilj.allium`) -
-//! propagated after `event_query.rs` (docs/architecture.md §9): rule
+//! propagated after `event_query.rs` ([docs/architecture.md §9](../../docs/architecture.md#next-steps)): rule
 //! `FetchCommands`, and a real (empty-`sensitive_fields`-case)
 //! `render_command`.
 //!

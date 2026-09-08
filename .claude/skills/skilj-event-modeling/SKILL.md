@@ -137,5 +137,5 @@ same underlying discipline):
 - **The "single aggregate" trap** - specific to this skill, not
   borrowed: resist the urge to force every event onto one "owning"
   entity the way classic aggregate-based modeling would. Ask the DCB
-  question (§3 above) honestly for each event, even when an aggregate-ID
+  question ([§3](../../../docs/architecture.md#crate-module-structure) above) honestly for each event, even when an aggregate-ID
   habit suggests there's only one obvious tag.

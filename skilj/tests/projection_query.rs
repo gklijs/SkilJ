@@ -103,7 +103,7 @@ impl EventType for ItemPurchased {
 /// ciphertext at that point (nothing decrypts before folding) - real
 /// decrypt-on-read for a `Projection` happens entirely on the read side,
 /// automatically, with no `Projection.sensitive_fields` declaration
-/// anywhere (§9's own "read_projection's own decrypt-on-read" pass).
+/// anywhere ([§9](../../docs/architecture.md#next-steps)'s own "read_projection's own decrypt-on-read" pass).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct AccountOpenedPayload {
     customer_id: String,
@@ -185,7 +185,7 @@ struct AccountBalanceState {
 }
 
 /// `sync()`, deliberately - `ProjectionQuery` is the surface under test
-/// here, not the projection mechanism itself (§8 item 6, already covered
+/// here, not the projection mechanism itself ([§8](../../docs/architecture.md#open-for-a-future-pass) item 6, already covered
 /// by `skilj-core/tests/sync_projections.rs`/`async_projections.rs`) -
 /// `sync` keeps `caught_up_to` deterministically current the moment a
 /// command's write commits, so `waitForSequence` assertions below don't
@@ -239,7 +239,7 @@ impl Projection for StaffOnlyBalance {
     }
 }
 
-/// Keyed by `customer_id` - §9's own "keyed / multi-row Projections"
+/// Keyed by `customer_id` - [§9](../../docs/architecture.md#next-steps)'s own "keyed / multi-row Projections"
 /// pass, exercised end-to-end: `ItemPurchased`'s own `customer_id` field
 /// names which customer's row an event belongs to, so each customer gets
 /// an independently-addressed instance from the shared `ItemPurchased`
@@ -1126,7 +1126,7 @@ fn team_only_projection_gates_both_projection_and_projection_schema_end_to_end()
     });
 }
 
-/// §9's own "keyed / multi-row Projections" pass, end-to-end: three real
+/// [§9](../../docs/architecture.md#next-steps)'s own "keyed / multi-row Projections" pass, end-to-end: three real
 /// `ItemPurchased` events (two for `"alice"`, one for `"bob"`), each
 /// customer's own row queried independently, a never-touched key
 /// answering with the default (empty) state rather than an error, and
@@ -1328,7 +1328,7 @@ const FORGET_SUBJECT_MUTATION: &str = "\
         } \
     }";
 
-/// §9's own "read_projection's own decrypt-on-read" pass, end-to-end:
+/// [§9](../../docs/architecture.md#next-steps)'s own "read_projection's own decrypt-on-read" pass, end-to-end:
 /// `CustomerProfile` is keyed by `customer_id` and folds `AccountOpened`'s
 /// own sensitive `email` field straight into its own state, verbatim -
 /// with no `Projection.sensitive_fields` declared anywhere. Neither

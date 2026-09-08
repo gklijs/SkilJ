@@ -1,4 +1,4 @@
-//! Codeberg issue #5's narrower cut (docs/architecture.md §17) -
+//! Codeberg issue #5's narrower cut ([docs/architecture.md §17](../docs/architecture.md#event-command-codegen-real)) -
 //! `src/banking.skilj.toml`'s declarative event/command shape becomes
 //! real Rust here, at `$OUT_DIR/banking_generated.rs`, which
 //! `src/banking.rs` itself `include!()`s. Runs on every build (`cargo

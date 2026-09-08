@@ -1,5 +1,5 @@
 //! Tests for `db::resolve_snapshot_context`/`db::catch_up_snapshots` -
-//! docs/architecture.md §19's "Problem 2". Same "test the layer in
+//! [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2". Same "test the layer in
 //! isolation" shape `skilj-core/tests/submit_command.rs`/`tag_indexed_events.rs`
 //! already use - see either file's own doc comment for the harness
 //! details, not repeated a third time here. `skilj-demo/tests/snapshot.rs`

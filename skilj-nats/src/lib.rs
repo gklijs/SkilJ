@@ -1,6 +1,6 @@
 //! A bridge between skilj's own event stream and NATS JetStream -
-//! docs/architecture.md §42, a third sibling alongside `skilj-kafka`
-//! (§40) and `skilj-amqp` (§41), each for a genuinely different
+//! [docs/architecture.md §42](../../docs/architecture.md#skilj-nats-bridge), a third sibling alongside `skilj-kafka`
+//! ([§40](../../docs/architecture.md#skilj-kafka-bridge)) and `skilj-amqp` ([§41](../../docs/architecture.md#skilj-amqp-bridge)), each for a genuinely different
 //! delivery model. Wire-protocol client only, on both sides: zero
 //! dependency on any other skilj crate, the same "independently usable"
 //! posture the other two bridges already have.
@@ -10,8 +10,8 @@
 //! Core NATS pub/sub is fire-and-forget - a message published to a
 //! subject with no active subscriber is simply gone, and there is no
 //! concept of redelivery at all. That makes every mechanism this bridge
-//! (and `skilj-kafka`/`skilj-amqp`) exists to use - `dedupe` (§39),
-//! `Idempotency-Key` (§21) - meaningless: there is nothing to guard
+//! (and `skilj-kafka`/`skilj-amqp`) exists to use - `dedupe` ([§39](../../docs/architecture.md#external-message-dedup-create-external-event)),
+//! `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission)) - meaningless: there is nothing to guard
 //! against redelivering if delivery was never guaranteed once. JetStream,
 //! NATS's own persistence layer, is what actually gives an at-least-once
 //! guarantee worth building a redelivery-safe bridge around.
@@ -57,7 +57,7 @@
 //! server-side dedup window recognises the repeated `Nats-Msg-Id` and
 //! reports `duplicate: true` rather than storing a second message.
 //! Inbound: [`InboundAction::Record`] uses the message's own
-//! always-present `(stream, stream_sequence)` as §39's `dedupe` pair;
+//! always-present `(stream, stream_sequence)` as [§39](../../docs/architecture.md#external-message-dedup-create-external-event)'s `dedupe` pair;
 //! [`InboundAction::Trigger`] uses `Nats-Msg-Id` (when the upstream
 //! sender populated one) as `Idempotency-Key` - omitted, never
 //! fabricated, when absent, the same "omitting it is always fine"
@@ -293,13 +293,13 @@ pub struct InboundMapping {
 pub enum InboundAction {
     /// `POST /v1/events/external` - record the message verbatim as a
     /// fact. Always redelivery-safe via the `dedupe` mechanism
-    /// (docs/architecture.md §39) - JetStream's own `(stream,
+    /// ([docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)) - JetStream's own `(stream,
     /// stream_sequence)` is broker-assigned on every message, never
     /// optional the way AMQP's `group-id`/`group-sequence` are.
     Record { event_type: String },
     /// `POST /v1/commands/trigger` - decide on the message via a real
-    /// `decide()`. Redelivery-safe via `Idempotency-Key` (§21, itself
-    /// `client_id`-scoped since §37) *only when* the message carries a
+    /// `decide()`. Redelivery-safe via `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission), itself
+    /// `client_id`-scoped since [§37](../../docs/architecture.md#idempotency-keys-client-id-scoping)) *only when* the message carries a
     /// `Nats-Msg-Id` - see [`InboundMessageMeta`]'s own doc comment.
     Trigger { command_type: String },
 }

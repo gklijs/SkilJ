@@ -100,10 +100,10 @@ banking and courses) if you want to see more before committing.
 | [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file instead of hand-writing it. |
 | [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a terminal console (GraphQL client) for browsing and operating a running deployment. |
 | [`skilj-inspector`](skilj-inspector) | `cargo install skilj-inspector` - a terminal console that reads straight from Postgres, for when the GraphQL server isn't running. |
-| [`skilj-temporal`](skilj-temporal) | Optional: a bridge from skilj's own event stream to [Temporal](https://temporal.io) - start or signal a workflow execution correlated by a DCB tag. See `docs/architecture.md` §34. |
-| [`skilj-kafka`](skilj-kafka) | Optional: a bridge between skilj's own event stream and Kafka, both directions - produce mapped events to a topic, consume a topic into `ExternalEventIngestion`/`CommandTrigger`. See `docs/architecture.md` §40. |
-| [`skilj-amqp`](skilj-amqp) | Optional: `skilj-kafka`'s own sibling for any AMQP 1.0 broker - Solace PubSub+, Azure Service Bus, ActiveMQ Artemis. See `docs/architecture.md` §41. |
-| [`skilj-nats`](skilj-nats) | Optional: a third bridge sibling, for NATS JetStream. See `docs/architecture.md` §42. |
+| [`skilj-temporal`](skilj-temporal) | Optional: a bridge from skilj's own event stream to [Temporal](https://temporal.io) - start or signal a workflow execution correlated by a DCB tag. See [`docs/architecture.md` §34](docs/architecture.md#skilj-temporal-plan). |
+| [`skilj-kafka`](skilj-kafka) | Optional: a bridge between skilj's own event stream and Kafka, both directions - produce mapped events to a topic, consume a topic into `ExternalEventIngestion`/`CommandTrigger`. See [`docs/architecture.md` §40](docs/architecture.md#skilj-kafka-bridge). |
+| [`skilj-amqp`](skilj-amqp) | Optional: `skilj-kafka`'s own sibling for any AMQP 1.0 broker - Solace PubSub+, Azure Service Bus, ActiveMQ Artemis. See [`docs/architecture.md` §41](docs/architecture.md#skilj-amqp-bridge). |
+| [`skilj-nats`](skilj-nats) | Optional: a third bridge sibling, for NATS JetStream. See [`docs/architecture.md` §42](docs/architecture.md#skilj-nats-bridge). |
 | [`skilj-macros`](skilj-macros) | Internal proc-macros, re-exported through `skilj-core`/`skilj` (not uniformly - each macro picks whichever crate it applies to) - you won't normally add this directly. |
 
 ## Documentation

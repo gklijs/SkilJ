@@ -1,5 +1,5 @@
 //! Tests for the `EventQuery` surface (`specs/skilj.allium`) - propagated
-//! after `projection_registration.rs` (docs/architecture.md §9): rules
+//! after `projection_registration.rs` ([docs/architecture.md §9](../../docs/architecture.md#next-steps)): rules
 //! `QueryEvents`/`CountEvents`/`InspectEvent`, and a real (empty-
 //! `sensitive_fields`-case) `render_event`.
 //!

@@ -12,7 +12,7 @@
 //! folds `matching_events` (empty, the first time) to find the current
 //! balance, so an unopened account reads as balance zero.
 //!
-//! **Codeberg issue #5's narrower cut (docs/architecture.md §17)**: the
+//! **Codeberg issue #5's narrower cut ([docs/architecture.md §17](../../docs/architecture.md#event-command-codegen-real))**: the
 //! event/command *shape* half of this file - the payload structs, the
 //! `EventType`/`CommandType` impls' declarative fields, and the shared
 //! `BankingEvent` enum + its `BoundedContextEvent` impl - is generated
@@ -23,17 +23,17 @@
 //! these by name - see `skilj-codegen`'s own doc comment for the naming
 //! convention), the shared `apply_money_event`/`balance_of` helpers, and
 //! the `AccountBalance` projection in full (`Projection` generation is
-//! out of scope for this pass - see §17 and §16's own Finding 3 for
+//! out of scope for this pass - see [§17](../../docs/architecture.md#event-command-codegen-real) and [§16](../../docs/architecture.md#declarative-bounded-context-codegen-prototype)'s own Finding 3 for
 //! why). `courses.rs` has no `.skilj.toml` counterpart and stays fully
 //! hand-written - its own point is real, non-generatable `decide()`
 //! logic, so converting it would prove nothing this file doesn't
 //! already prove.
 //!
-//! **§19's own real adopter**: `AccountBalanceSnapshot`/`WithdrawMoneyFast`
+//! **[§19](../../docs/architecture.md#optional-snapshotting-matching-events)'s own real adopter**: `AccountBalanceSnapshot`/`WithdrawMoneyFast`
 //! near the bottom of this file are deliberately *not* part of the
 //! codegen'd shape above - `skilj-codegen` doesn't generate `snapshot()`/
 //! `decide_from_snapshot()` (out of scope for this pass, see
-//! docs/architecture.md §19's own "Files to touch"), so proving
+//! [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s own "Files to touch"), so proving
 //! snapshotting end-to-end needed one small, genuinely hand-written
 //! `CommandType` instead of retrofitting the generated `WithdrawMoney`.
 //! Same real business logic as `decide_withdraw_money` above, on
@@ -46,7 +46,7 @@ use skilj_core::shared::{CommandDecision, EventSpec};
 include!(concat!(env!("OUT_DIR"), "/banking_generated.rs"));
 
 /// One event's own effect on a running balance - `balance_of`'s per-step
-/// fold, and `AccountBalanceSnapshot::fold`'s identical one below (§19),
+/// fold, and `AccountBalanceSnapshot::fold`'s identical one below ([§19](../../docs/architecture.md#optional-snapshotting-matching-events)),
 /// factored out so the two can never drift apart the way two
 /// independently hand-maintained copies of the same match could.
 fn apply_money_event(balance: i64, event: &BankingEvent) -> i64 {

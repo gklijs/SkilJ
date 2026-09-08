@@ -996,12 +996,12 @@ pub async fn update_private_field_grant(
 /// rather than being re-decided - see `submit_command`'s own doc
 /// comment for the full design.
 ///
-/// `client_id`-scoped since docs/architecture.md §37 - originally
+/// `client_id`-scoped since [docs/architecture.md §37](../../../docs/architecture.md#idempotency-keys-client-id-scoping) - originally
 /// `(command_type_name, idempotency_key)` only (issue #12's own
 /// deliberate call: "not also per-caller"), which held up fine under
 /// that decision's own assumption - a well-randomized caller-chosen key
 /// (a UUID, say) never collides with another caller's by accident. Owner-
-/// tag multi-tenancy (§23/§25/§30), built after issue #12, broke that
+/// tag multi-tenancy ([§23](../../../docs/architecture.md#cross-tenant-projection-read-fix-owner-tag)/[§25](../../../docs/architecture.md#cross-tenant-read-fix-command-query)/[§30](../../../docs/architecture.md#cross-tenant-write-fix-owner-tag-scoping)), built after issue #12, broke that
 /// assumption: many distinct tenants (distinct `CommandToken`s/
 /// `RoleAccessMapping`s, disambiguated only by their own `scope`,
 /// invisible to this table) routinely submit the *same* `CommandType`,
@@ -1012,7 +1012,7 @@ pub async fn update_private_field_grant(
 /// tenant's real submission as a `Deduplicated` hit against the first
 /// tenant's own stored sequences - a live bug since issue #12 shipped in
 /// 0.0.2, not merely `CrossContextRoute`'s narrower predictable-key
-/// variant (§36) of the same root cause. `client_id` (`token.id` for
+/// variant ([§36](../../../docs/architecture.md#cross-context-route)) of the same root cause. `client_id` (`token.id` for
 /// REST, `access_mapping.role.id` for GraphQL, `"cross-context-route"`
 /// for that internal caller - `authorise_command_trigger`/
 /// `authorise_command_submission`'s own `CommandAuthorised.client_id`)
@@ -1078,7 +1078,7 @@ pub async fn ensure_idempotency_keys_table<'e>(
 /// Backfilled `''` (never a real `client_id` - always a server-derived
 /// token/role id or `"cross-context-route"`, never empty) rather than
 /// deleted, matching this codebase's own explicit "no retention/TTL,
-/// nothing is ever deleted" precedent (§21) - but, on the user's own
+/// nothing is ever deleted" precedent ([§21](../../../docs/architecture.md#optional-idempotency-key-submission)) - but, on the user's own
 /// explicit call, deliberately left permanently *unmatchable* by
 /// `lookup_idempotency_key` rather than kept as a fallback for whichever
 /// caller retries that same string first. Two ways to fail were on the
@@ -1222,7 +1222,7 @@ pub async fn ensure_cross_context_route_cursors_table<'e>(
 /// `external_message_cursors` - the durable state behind
 /// `highest_dedupe_sequence(adapter, dedupe_partition_key)` in
 /// specs/skilj.allium's own `rule CreateExternalEvent`
-/// (docs/architecture.md §39). One row per `(adapter_id, partition_key)`
+/// ([docs/architecture.md §39](../../../docs/architecture.md#external-message-dedup-create-external-event)). One row per `(adapter_id, partition_key)`
 /// pair that has ever had an event written under it, storing only the
 /// highest `dedupe_sequence` seen so far - a compact watermark, not a row
 /// per message the way `idempotency_keys` is: sound only because the
@@ -1242,7 +1242,7 @@ pub async fn ensure_cross_context_route_cursors_table<'e>(
 /// existed). `CREATE TABLE IF NOT EXISTS`, called unconditionally on
 /// every `build()`, is the whole migration story - a fresh table with no
 /// existing rows needs no `ALTER TABLE` dance the way `idempotency_keys`'
-/// own `client_id` retrofit did (docs/architecture.md §37).
+/// own `client_id` retrofit did ([docs/architecture.md §37](../../../docs/architecture.md#idempotency-keys-client-id-scoping)).
 #[tracing::instrument(skip_all)]
 pub async fn ensure_external_message_cursors_table<'e>(
     executor: impl sqlx::PgExecutor<'e>,
@@ -2890,7 +2890,7 @@ pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::e
 /// insert-or-update `insert_event_and_update_sync_projections`/
 /// `catch_up_bounded_context` both need now that instances are created
 /// lazily, on first touch, rather than pre-seeded at registration
-/// (§9's "keyed / multi-row Projections" pass). `ON CONFLICT ... DO
+/// ([§9](../../../docs/architecture.md#next-steps)'s "keyed / multi-row Projections" pass). `ON CONFLICT ... DO
 /// UPDATE SET state = {schema}.projection_state.state` is a no-op write
 /// on the already-exists path - it exists purely so Postgres still
 /// acquires the row lock there too (the identical guarantee a plain
@@ -3018,7 +3018,7 @@ async fn apply_projection_fold_update(
     Ok(())
 }
 
-/// docs/architecture.md §19's "Problem 2" - get-or-create-with-lock for
+/// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2" - get-or-create-with-lock for
 /// one snapshot's own `(snapshot_name, tag_key, tag_value)` row, the
 /// `Snapshot` counterpart to `get_or_create_projection_state_for_update`
 /// above. `version` is the currently-registered `Snapshot::VERSION` -
@@ -3147,7 +3147,7 @@ pub struct ResolvedSnapshot {
 }
 
 /// Shared by `skilj-graphql`'s `submitCommand` resolver and `skilj-rest`'s
-/// `post_commands_trigger` route (docs/architecture.md §19), so the "does
+/// `post_commands_trigger` route ([docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)), so the "does
 /// this command take the snapshot-accelerated path" decision lives once,
 /// not duplicated per surface the way plenty of resolver-local logic
 /// legitimately is elsewhere - this one has real, non-trivial rules
@@ -4280,7 +4280,7 @@ pub async fn list_events_for_bounded_context_from(
 }
 
 /// Tag-indexed sibling of `list_events_for_bounded_context`/`_from` -
-/// docs/architecture.md §19's "Problem 1" fix. Those two always fetch
+/// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 1" fix. Those two always fetch
 /// the *whole* bounded context and leave tag-matching to the caller's
 /// own in-memory filter (`consistency_boundary_and_matching_events`'s
 /// own union semantics) - fine while a bounded context is small, but a
@@ -4581,7 +4581,7 @@ pub async fn list_events_cached(
 /// case respectively. `ProcessCommand`'s own DCB pre-check, and
 /// `QueryEvents`/`CountEvents` when a `tags` filter *is* given, use
 /// `list_events_for_bounded_context_matching_tags_cached` below instead -
-/// docs/architecture.md §19's "Problem 1" fix, avoiding exactly the
+/// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 1" fix, avoiding exactly the
 /// full-bounded-context fetch this function's own fallback still does.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_for_bounded_context_cached(
@@ -4718,7 +4718,7 @@ pub async fn insert_event<'e>(
     Ok(())
 }
 
-/// The real, transactional half of §8 item 6: inserts `event` and, in
+/// The real, transactional half of [§8](../../../docs/architecture.md#open-for-a-future-pass) item 6: inserts `event` and, in
 /// the *same* transaction, folds it into every `sync = true` `Projection`
 /// in its bounded context via `dispatcher` - "commits or fails with the
 /// write" (the note above the rules), the whole reason sync projections
@@ -4904,7 +4904,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
 
 /// The `dedupe_partition_key`/`dedupe_sequence` pair from
 /// specs/skilj.allium's own `SubmitExternalEvent` trigger
-/// (`rule CreateExternalEvent`, docs/architecture.md §39) - always
+/// (`rule CreateExternalEvent`, [docs/architecture.md §39](../../../docs/architecture.md#external-message-dedup-create-external-event)) - always
 /// supplied together or not at all. That "both or neither" `requires`
 /// guard in the spec is satisfied structurally here, not by a separate
 /// runtime check: there is no way to construct one of these fields
@@ -5035,7 +5035,7 @@ async fn advance_dedupe_watermark<'e>(
 /// is the only crate that owns the database driver, so no other crate
 /// ever opens a `Transaction` itself.
 ///
-/// **`dedupe`** (docs/architecture.md §39, specs/skilj.allium's own
+/// **`dedupe`** ([docs/architecture.md §39](../../../docs/architecture.md#external-message-dedup-create-external-event), specs/skilj.allium's own
 /// `rule CreateExternalEvent`): `None` reproduces every existing
 /// caller's own behaviour exactly, byte for byte - no lookup, no write
 /// to `external_message_cursors`, an event created every single time,
@@ -5247,7 +5247,7 @@ pub enum SubmitCommandOutcome {
 }
 
 /// A `submit_command` call's own snapshot-acceleration context
-/// (docs/architecture.md §19) - `Some` when the caller took the
+/// ([docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)) - `Some` when the caller took the
 /// snapshot-accelerated path (`CommandDispatcher::dispatch_from_snapshot`)
 /// instead of the ordinary one (`dispatch`) for its own `initial_decision`.
 /// `state_json` is handed to `dispatch_from_snapshot` again on a
@@ -5290,7 +5290,7 @@ pub struct SnapshotContext<'a> {
 /// until the decision that finally governs it is. If that peek shows
 /// more has been committed than `bounded_context_events` (the caller's
 /// own optimistic read - already tag-scoped to `consistency_tags` by
-/// every real call site, docs/architecture.md §19's "Problem 1" fix)
+/// every real call site, [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 1" fix)
 /// already reflected, and at least one of those new arrivals matches
 /// `consistency_tags`, that is the DCB conflict this lock exists to
 /// catch (see `DynamicConsistencyBoundaryHonoured`):
@@ -5625,7 +5625,7 @@ pub async fn submit_command(
 /// a resolved `CommandType` and a JSON payload in hand: derive
 /// consistency tags, resolve a snapshot context if one applies
 /// (`resolve_snapshot_context`), fetch matching events (tag-indexed -
-/// docs/architecture.md §19's own "Problem 1" fix), `dispatch()` once
+/// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s own "Problem 1" fix), `dispatch()` once
 /// optimistically, then hand off to [`submit_command`] for the real,
 /// locked recheck-and-retry.
 ///
@@ -6103,7 +6103,7 @@ async fn list_building_projection_rebuilds_for_bounded_context(
     Ok(rebuilds)
 }
 
-/// The background half of §8 item 6: one poll tick, for one bounded
+/// The background half of [§8](../../../docs/architecture.md#open-for-a-future-pass) item 6: one poll tick, for one bounded
 /// context - folds every committed event not yet reflected in that
 /// context's `sync = false` `Projection`s, and separately walks any
 /// `building` `ProjectionRebuild`s toward completion, promoting each one
@@ -6346,7 +6346,7 @@ pub async fn catch_up_bounded_context(
     Ok(())
 }
 
-/// docs/architecture.md §19's "Problem 2" - the background half of
+/// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2" - the background half of
 /// `Snapshot`: one poll tick, for one bounded context, folding every
 /// committed event not yet reflected in any registered snapshot.
 /// Deliberately its own function, not folded into `catch_up_bounded_context`

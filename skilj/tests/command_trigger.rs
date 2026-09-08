@@ -1,5 +1,5 @@
 //! End-to-end tests for `POST /v1/commands/trigger` (docs/architecture.md
-//! §8 item 4) - a real HTTP request, through `Skilj::rest_router()`,
+//! [§8](../../docs/architecture.md#open-for-a-future-pass) item 4) - a real HTTP request, through `Skilj::rest_router()`,
 //! through the `Arc<dyn CommandDispatcher>` bridge, into a real
 //! `decide()`, and back out through `process_command`'s persistence.
 //! Same `DATABASE_URL`-then-embedded-Postgres-then-skip harness as
@@ -425,7 +425,7 @@ fn command_trigger_deduplicates_a_repeated_idempotency_key() {
 }
 
 /// Security-review finding on `CrossContextRoute` (docs/architecture.md
-/// §36): a caller-supplied `Idempotency-Key` using the reserved
+/// [§36](../../docs/architecture.md#cross-context-route)): a caller-supplied `Idempotency-Key` using the reserved
 /// `skilj-cross-context-route:` prefix must be rejected outright, not
 /// silently accepted into the same shared `idempotency_keys` table
 /// `CrossContextRoute`'s own background task writes into - see
@@ -705,7 +705,7 @@ fn command_trigger_rejects_a_malformed_credential() {
 /// pass - not exercised over HTTP, since REST triggering never consults
 /// it (`CommandToken` is its own, separate grant); this is what
 /// `skilj-graphql`'s eventual mutation resolver will call before
-/// dispatching (§8 item 5).
+/// dispatching ([§8](../../docs/architecture.md#open-for-a-future-pass) item 5).
 #[test]
 fn command_dispatcher_required_role_reflects_the_requires_role_attribute() {
     runtime().block_on(async {

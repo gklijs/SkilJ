@@ -1,5 +1,5 @@
 //! Renders `skilj_core::error::SkiljRejection` (both error tiers - see
-//! docs/architecture.md §4) into `async_graphql`'s own `Error`, carrying
+//! [docs/architecture.md §4](../../docs/architecture.md#error-handling)) into `async_graphql`'s own `Error`, carrying
 //! `code()` as the `code` extension - §5.4's shared error shape, the
 //! same `code()`/`message()` trait `skilj-rest::error` renders through
 //! for REST (§4.2, §7.5). `CommandRejected` isn't specially handled here

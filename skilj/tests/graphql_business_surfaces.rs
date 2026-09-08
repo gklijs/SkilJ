@@ -918,7 +918,7 @@ fn submit_command_deduplicates_a_repeated_idempotency_key_over_graphql() {
 }
 
 /// Security-review finding on `CrossContextRoute` (docs/architecture.md
-/// §36): a caller-supplied `idempotencyKey` using the reserved
+/// [§36](../../docs/architecture.md#cross-context-route)): a caller-supplied `idempotencyKey` using the reserved
 /// `skilj-cross-context-route:` prefix must be rejected outright, not
 /// silently accepted into the same shared `idempotency_keys` table
 /// `CrossContextRoute`'s own background task writes into - see
@@ -1055,7 +1055,7 @@ fn matching_events_is_only_returned_to_an_admin_level_caller() {
     });
 }
 
-/// `inspectSnapshot` (docs/architecture.md §19) - Admin-gated, `null`
+/// `inspectSnapshot` ([docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)) - Admin-gated, `null`
 /// for a real, registered snapshot that's simply never had a row
 /// written yet (cold, not an error), and a real error for a
 /// `snapshotName` that isn't registered at all.

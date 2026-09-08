@@ -1,5 +1,5 @@
 //! Tests for `db::list_events_for_bounded_context_matching_tags` -
-//! docs/architecture.md §19's "Problem 1" fix: a GIN-indexed,
+//! [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 1" fix: a GIN-indexed,
 //! `tags @> ...`-based query replacing the "fetch the whole bounded
 //! context, filter in memory" shape `list_events_for_bounded_context`/
 //! `consistency_boundary_and_matching_events` used to be the only way to

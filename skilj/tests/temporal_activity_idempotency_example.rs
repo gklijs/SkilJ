@@ -1,6 +1,6 @@
-//! Phase 1 of docs/architecture.md §34's `skilj-temporal` plan: proof
+//! Phase 1 of [docs/architecture.md §34](../../docs/architecture.md#skilj-temporal-plan)'s `skilj-temporal` plan: proof
 //! that skilj's existing `Idempotency-Key` mechanism (Codeberg issue
-//! #12, §21) is a drop-in fit for a Temporal Activity that calls
+//! #12, [§21](../../docs/architecture.md#optional-idempotency-key-submission)) is a drop-in fit for a Temporal Activity that calls
 //! `POST /v1/commands/trigger`, using Temporal's own documented
 //! idempotency-key derivation - a Workflow Run ID plus an Activity ID,
 //! "guaranteed to be consistent across retry attempts but unique among
@@ -244,7 +244,7 @@ async fn setup() -> (Router, String, Pool, String) {
     (skilj.rest_router(), credential, pool, bc_name)
 }
 
-/// The one piece of client-side glue docs/architecture.md §34's phase 1
+/// The one piece of client-side glue [docs/architecture.md §34](../../docs/architecture.md#skilj-temporal-plan)'s phase 1
 /// names - not shipped by skilj (it has no Temporal dependency to build
 /// against, and there is no logic here beyond the format string), but
 /// this is exactly what a Temporal Activity implementation composes
@@ -288,7 +288,7 @@ async fn submit_withdraw_money_activity(
     serde_json::from_slice(&body).unwrap()
 }
 
-/// The scenario docs/architecture.md §34 phase 1 exists to prove: a
+/// The scenario [docs/architecture.md §34](../../docs/architecture.md#skilj-temporal-plan) phase 1 exists to prove: a
 /// Temporal Activity executes successfully, but the Worker crashes
 /// before Temporal's own server records that outcome - from the
 /// Workflow's point of view this is indistinguishable from the Activity

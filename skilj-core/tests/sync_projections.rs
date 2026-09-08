@@ -1,6 +1,6 @@
 //! Tests for `db::insert_event_and_update_sync_projections` and
-//! `db::get_projection_state` - the real, transactional half of §8 item 6
-//! (`project()`, sync case only), now also covering §9's "keyed /
+//! `db::get_projection_state` - the real, transactional half of [§8](../../docs/architecture.md#open-for-a-future-pass) item 6
+//! (`project()`, sync case only), now also covering [§9](../../docs/architecture.md#next-steps)'s "keyed /
 //! multi-row Projections" pass - see `docs/architecture.md`'s own
 //! write-up and the plan at
 //! `/home/gklijs/.claude/plans/serene-puzzling-pinwheel.md`. No
@@ -30,7 +30,7 @@ use skilj_core::shared::{generate_token_id, Metadata};
 /// unchanged, `caught_up_to` still advances" in the same harness; and
 /// `"TransferBalances"` (keyed by account id - a `"Transferred"` event's
 /// own `from`/`to` fields, crediting one and debiting the other from a
-/// single fold) exercising §9's "keyed / multi-row Projections" pass -
+/// single fold) exercising [§9](../../docs/architecture.md#next-steps)'s "keyed / multi-row Projections" pass -
 /// one event updating two independent rows.
 struct TestDispatcher;
 
@@ -264,7 +264,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str) -> EventT
 }
 
 /// Registers a `sync = true` `Projection` consuming `consumed` - no
-/// `projection_state` seeding anymore (§9's "keyed / multi-row
+/// `projection_state` seeding anymore ([§9](../../docs/architecture.md#next-steps)'s "keyed / multi-row
 /// Projections" pass): each instance's own row is created lazily, on
 /// first touch, starting from `TestDispatcher::default_state`'s own
 /// `"0"`, the same shape `SkiljBuilder::projection::<T>()`'s own
@@ -347,7 +347,7 @@ fn a_consumed_event_updates_both_state_and_caught_up_to() {
 /// projection's own caught_up_to to the event's sequence either way"
 /// (the note above the rules) - but touches no instance at all: `keys()`
 /// itself returns none for an event type it doesn't consume, so no row
-/// is even lazily created (§9's "keyed / multi-row Projections" pass -
+/// is even lazily created ([§9](../../docs/architecture.md#next-steps)'s "keyed / multi-row Projections" pass -
 /// unlike the old always-pre-seeded schema, `get_projection_state` for a
 /// key nothing has ever touched is genuinely `None`, not a default-valued
 /// row; `resolvers::projection_query`'s own `default_state` fallback is
@@ -392,7 +392,7 @@ fn an_unconsumed_event_advances_caught_up_to_but_touches_no_instance() {
 
 /// One event, two rows: a transfer event credits the receiver's own row
 /// and debits the giver's, each independently, from a single fold -
-/// §9's own worked example ("keyed / multi-row Projections").
+/// [§9](../../docs/architecture.md#next-steps)'s own worked example ("keyed / multi-row Projections").
 #[test]
 fn a_transfer_event_updates_both_accounts_own_row_from_one_fold() {
     runtime().block_on(async {

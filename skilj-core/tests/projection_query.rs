@@ -1,5 +1,5 @@
 //! Tests for the `ProjectionQuery` surface (`specs/skilj.allium`) -
-//! propagated after `command_query.rs` (docs/architecture.md §9): rule
+//! propagated after `command_query.rs` ([docs/architecture.md §9](../../docs/architecture.md#next-steps)): rule
 //! `QueryProjection`. This is the last of the three admin/read-facing
 //! query surfaces (alongside `EventQuery`/`CommandQuery`) - unlike the
 //! other two, `read_projection`/`await_projection_caught_up` are both

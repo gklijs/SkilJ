@@ -306,7 +306,7 @@ fn get_bounded_context_is_none_for_an_unknown_name() {
 
 /// `list_bounded_contexts` - added propagating `skilj-graphql`'s Phase 1
 /// admin console (`BoundedContextDirectory`'s `boundedContexts` query,
-/// docs/architecture.md §8 item 5's own plan). Every context this engine
+/// [docs/architecture.md §8](../../docs/architecture.md#open-for-a-future-pass) item 5's own plan). Every context this engine
 /// knows of, unfiltered - so two freshly-seeded contexts are both in the
 /// returned set, not just the one most recently inserted.
 #[test]

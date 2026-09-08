@@ -22,7 +22,7 @@ pub struct Args {
 
     /// The bounded context to operate on. Superadmin-only operations
     /// (the cross-context directory, admin console) aren't in v1 - see
-    /// docs/architecture.md §11.
+    /// [docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console).
     #[arg(long, env = "SKILJ_BOUNDED_CONTEXT")]
     pub bounded_context: String,
 }
