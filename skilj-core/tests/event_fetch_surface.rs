@@ -82,6 +82,8 @@ fn token(status: TokenStatus, event_type: EventType) -> EventReadToken {
         event_type,
         scope: None,
         start_from: EventReadStartPosition::Beginning,
+        start_at_sequence: None,
+        start_at_time: None,
     }
 }
 
@@ -105,6 +107,19 @@ fn event(event_type: EventType, sequence: i64) -> Event {
 
 fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(secs, 0).unwrap()
+}
+
+/// `event()` above with a caller-chosen `metadata.created_at`, for
+/// `at_time` fixtures that need to distinguish events by when they
+/// happened rather than only by their own sequence.
+fn event_at(event_type: EventType, sequence: i64, created_at: chrono::DateTime<Utc>) -> Event {
+    Event {
+        metadata: skilj_core::shared::Metadata {
+            created_at,
+            ..event(event_type.clone(), sequence).metadata
+        },
+        ..event(event_type, sequence)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -253,6 +268,112 @@ fn consume_events_provisions_a_cursor_on_first_use() {
         }
         other => panic!("expected ReadCursor.created, got {other:?}"),
     }
+}
+
+/// `at_sequence`'s whole point over `latest`: the token's first call can
+/// replay *some* history from a caller-chosen cutoff, not just none at
+/// all - here sequence 0 stays unserved (at or before the cutoff) while
+/// 1 and 2, already historical relative to this call, are served
+/// alongside nothing-new-yet.
+#[test]
+fn consume_events_at_sequence_starts_strictly_after_the_given_sequence() {
+    let et = event_type(true);
+    let t = EventReadToken {
+        start_from: EventReadStartPosition::AtSequence,
+        start_at_sequence: Some(0),
+        ..token(TokenStatus::Active, et.clone())
+    };
+    let events = vec![event(et.clone(), 0), event(et.clone(), 1), event(et, 2)];
+
+    let ConsumeEventsResult {
+        served,
+        cursor_update,
+    } = event_store::consume_events(
+        &t,
+        None,
+        Some(AckMode::AutoAdvance),
+        &events,
+        &[],
+        timestamp(100),
+    )
+    .unwrap();
+
+    assert_eq!(
+        served.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    match cursor_update {
+        CursorUpdate::Created(cursor) => assert_eq!(cursor.sequence, 2),
+        other => panic!("expected ReadCursor.created, got {other:?}"),
+    }
+}
+
+/// `at_time`'s own version of the same proof: the cutoff sits strictly
+/// between two events' own `created_at`, so the earlier one is excluded
+/// and the later one - already historical relative to this call - is
+/// served, exactly the "replay from a chosen point in time" behaviour
+/// `at_sequence` gives by number instead.
+#[test]
+fn consume_events_at_time_starts_strictly_after_events_at_or_before_that_cutoff() {
+    let et = event_type(true);
+    let cutoff = timestamp(50);
+    let t = EventReadToken {
+        start_from: EventReadStartPosition::AtTime,
+        start_at_time: Some(cutoff),
+        ..token(TokenStatus::Active, et.clone())
+    };
+    let events = vec![
+        event_at(et.clone(), 0, timestamp(10)), // before the cutoff - excluded
+        event_at(et.clone(), 1, timestamp(50)), // exactly at the cutoff - excluded
+        event_at(et.clone(), 2, timestamp(90)), // after the cutoff - served
+    ];
+
+    let ConsumeEventsResult { served, .. } = event_store::consume_events(
+        &t,
+        None,
+        Some(AckMode::AutoAdvance),
+        &events,
+        &[],
+        timestamp(100),
+    )
+    .unwrap();
+
+    assert_eq!(
+        served.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+/// A `start_at_time` with nothing committed at or before it behaves
+/// exactly as `beginning` would - the spec's own "empty means the token
+/// gets the whole stream" note on `at_time_position`.
+#[test]
+fn consume_events_at_time_with_no_events_before_the_cutoff_serves_everything() {
+    let et = event_type(true);
+    let t = EventReadToken {
+        start_from: EventReadStartPosition::AtTime,
+        start_at_time: Some(timestamp(5)),
+        ..token(TokenStatus::Active, et.clone())
+    };
+    let events = vec![
+        event_at(et.clone(), 0, timestamp(50)),
+        event_at(et, 1, timestamp(60)),
+    ];
+
+    let ConsumeEventsResult { served, .. } = event_store::consume_events(
+        &t,
+        None,
+        Some(AckMode::AutoAdvance),
+        &events,
+        &[],
+        timestamp(100),
+    )
+    .unwrap();
+
+    assert_eq!(
+        served.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
 }
 
 #[test]

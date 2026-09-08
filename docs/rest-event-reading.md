@@ -27,6 +27,15 @@ A few things that trip people up:
   straight past everything already committed and only ever sees what happens from there on.
   This is a one-time choice made at minting, like the ack mode above: it can't be changed on an
   existing token, only chosen for a new one.
+- **Want to replay from a specific point instead of "nothing" or "everything"?** `startFrom:
+  AT_SEQUENCE` with `startAtSequence: <n>` starts the token's first call strictly after sequence
+  `n` — useful when you know exactly where you want to pick up, even mid-history (`n` can be
+  older than the token's own minting time; unlike `LATEST`, this can replay some history on
+  purpose). `startFrom: AT_TIME` with `startAtTime: "<RFC3339 timestamp>"` does the same by time
+  instead of sequence number — it looks only at what's already committed the moment the token's
+  first call actually happens, not a schedule: a future timestamp just behaves like `LATEST` did
+  at that moment. Naming one of these without its own value (or with the other one's) is
+  refused, not silently defaulted.
 - **Manual-ack can redeliver duplicates, on purpose.** If you fetch a batch and crash before
   acknowledging it, the next fetch serves the same batch again. This library doesn't de-duplicate
   for you — your handler needs to be safe to run twice on the same event (e.g. keyed by the

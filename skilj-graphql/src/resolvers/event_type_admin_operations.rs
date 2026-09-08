@@ -2,7 +2,7 @@
 //! `createDirectCreationToken`, `createEventReadToken`. `AdminAccess`-
 //! gated on the target `EventType`'s own bounded context.
 
-use super::{create_type_token_field, not_found, parse_event_read_start_position};
+use super::{create_type_token_field, not_found, parse_event_read_start_position, parse_rfc3339};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -29,15 +29,24 @@ pub fn create_direct_creation_token_field() -> Field {
         skilj_core::db::insert_direct_creation_token
     )
 }
-/// `createEventReadToken(boundedContext: String!, eventTypeName: String!, scope: String, startFrom: EventReadStartPosition): EventReadToken!` -
+/// `createEventReadToken(boundedContext: String!, eventTypeName: String!, scope: String, startFrom: EventReadStartPosition, startAtSequence: Int, startAtTime: String): EventReadToken!` -
 /// hand-written again rather than the `create_type_token_field!` macro
 /// invocation this used to be (docs/architecture.md's own write-up of
 /// this pass): `start_from` is the one parameter `create_event_read_token`
 /// doesn't share with its three siblings, so it no longer fits that
 /// macro's "every `create_*_token` function takes an identical parameter
 /// list" premise. Same body the macro would have generated, plus the
-/// one extra argument - see `create_type_token_field!`'s own doc comment
+/// extra arguments - see `create_type_token_field!`'s own doc comment
 /// for the parts that didn't change.
+///
+/// `startAtSequence`/`startAtTime` (docs/architecture.md's own write-up
+/// of this later pass) - `Int`/`String` the same way `queryEvents`'s own
+/// `afterSequence`/`fetchCommands`'s own `after`/`before` already are
+/// (`.i64()`/`parse_rfc3339` - no custom scalar exists in this schema
+/// for either). Passed straight through to `create_event_read_token`
+/// unvalidated at this layer; the three-way exclusivity with `startFrom`
+/// is `create_event_read_token`'s own guard, rendered here through the
+/// same `to_graphql_error` every other rejection already goes through.
 pub fn create_event_read_token_field() -> Field {
     Field::new(
         "createEventReadToken",
@@ -60,6 +69,20 @@ pub fn create_event_read_token_field() -> Field {
                     Some(v) => Some(parse_event_read_start_position(v.enum_name()?)),
                     None => None,
                 };
+                let start_at_sequence = ctx
+                    .args
+                    .get("startAtSequence")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.i64())
+                    .transpose()?;
+                let start_at_time = ctx
+                    .args
+                    .get("startAtTime")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?
+                    .map(|s| parse_rfc3339(&s))
+                    .transpose()?;
 
                 let target_type =
                     skilj_core::db::get_event_type(&state.pool, &bounded_context_name, &type_name)
@@ -74,6 +97,8 @@ pub fn create_event_read_token_field() -> Field {
                     skilj_core::shared::generate_token_secret(),
                     scope,
                     start_from,
+                    start_at_sequence,
+                    start_at_time,
                     chrono::Utc::now(),
                 )
                 .map_err(to_graphql_error)?;
@@ -97,5 +122,13 @@ pub fn create_event_read_token_field() -> Field {
     .argument(InputValue::new(
         "startFrom",
         TypeRef::named("EventReadStartPosition"),
+    ))
+    .argument(InputValue::new(
+        "startAtSequence",
+        TypeRef::named(TypeRef::INT),
+    ))
+    .argument(InputValue::new(
+        "startAtTime",
+        TypeRef::named(TypeRef::STRING),
     ))
 }

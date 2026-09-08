@@ -10,16 +10,10 @@
 //! naturally fit this surface the way `EventQuery`'s genuine sequence
 //! cursor does (confirmed with the user - see the Phase 3 plan).
 
-use super::{not_found, require_admin_mapping, resolve_read_data_keys};
+use super::{not_found, parse_rfc3339, require_admin_mapping, resolve_read_data_keys};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, InputValue, TypeRef};
-
-fn parse_rfc3339(value: &str) -> async_graphql::Result<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .map_err(|e| async_graphql::Error::new(format!("not a valid RFC3339 timestamp: {e}")))
-}
 
 /// `fetchCommands(boundedContext: String!, commandTypes: [String!]!, after: String, before: String, triggeredEvent: Int): [String!]!`
 pub fn fetch_commands_field() -> Field {

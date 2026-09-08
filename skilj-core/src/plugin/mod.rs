@@ -912,10 +912,29 @@ pub trait CrossContextRoute {
 /// start_from`) rather than leaned on implicitly, so a reader never has
 /// to check whether "the default" here means this type's `Default` impl
 /// or the trait const's - there is only ever one to check.
+///
+/// `AtSequence`/`AtTime` are this trait's own counterpart to
+/// `EventReadStartPosition`'s identically-named extension
+/// (docs/architecture.md's own write-up of this pass) - a route's first
+/// tick seeds its cursor at a caller-chosen sequence, or at the highest
+/// sequence already committed at or before a given point in time,
+/// exactly like an `EventReadToken` minted the same way would. `AtTime`
+/// carries a plain Unix timestamp (seconds, UTC) rather than
+/// `chrono::DateTime<Utc>` for one structural reason: `START_FROM` is a
+/// trait *associated const*, so every value it can ever hold has to be
+/// const-evaluable at the implementing type's own definition site, and
+/// `DateTime<Utc>` has no `const fn` constructor to build one from - an
+/// `i64` literal is. Converted to a real `DateTime<Utc>` only where it's
+/// actually compared against event timestamps
+/// (`db::catch_up_cross_context_route`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossContextRouteStartFrom {
     Beginning,
     Latest,
+    AtSequence(i64),
+    /// Unix timestamp, seconds, UTC - see this enum's own doc comment
+    /// for why not `DateTime<Utc>`.
+    AtTime(i64),
 }
 
 /// One registered route's own static identity - `CrossContextRouteDispatcher::routes()`'s

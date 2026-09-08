@@ -720,3 +720,464 @@ fn a_latest_route_never_dispatches_history_that_predates_its_own_registration() 
         assert_eq!(state, Some(r#"{"total":3}"#.to_string()));
     });
 }
+
+// --- CrossContextRoute::START_FROM = AtSequence/AtTime: replaying from
+// a chosen mid-history point, not just "none" (Latest) or "everything"
+// (Beginning) ---
+
+const SHIPPING_BOUNDED_CONTEXT_CUTOFFS: &str = "skilj_cross_context_route_test_shipping_cutoffs";
+const INVENTORY_BOUNDED_CONTEXT_CUTOFFS: &str = "skilj_cross_context_route_test_inventory_cutoffs";
+
+struct OrderShippedCutoffs;
+
+impl EventType for OrderShippedCutoffs {
+    type Payload = OrderShippedPayload;
+    const NAME: &'static str = "OrderShipped";
+    const BOUNDED_CONTEXT: &'static str = SHIPPING_BOUNDED_CONTEXT_CUTOFFS;
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+}
+
+// One target CommandType/EventType/Projection per route, both hosted in
+// the same INVENTORY_BOUNDED_CONTEXT_CUTOFFS - two routes independently
+// cursored against the same OrderShippedCutoffs stream, each dispatching
+// to its own command type so neither route's own count is polluted by
+// the other's.
+
+// `InventoryEvent` (defined above, matching the literal name
+// "StockReserved") can't be reused here - unlike the `Latest` scenario's
+// own `StockReservedLatest`, which gets away with keeping the literal
+// name "StockReserved" because it lives in its own separate bounded
+// context, `StockReservedAtSequence`/`StockReservedAtTime` below share
+// *one* bounded context with each other, so each needs its own distinct
+// name, and therefore its own `BoundedContextEvent` impl matching it.
+
+enum InventoryEventAtSequence {
+    StockReserved(StockReservedPayload),
+}
+
+impl BoundedContextEvent for InventoryEventAtSequence {
+    fn try_from_event(
+        event: &skilj_core::event_store::Event,
+    ) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "StockReservedAtSequence" => Some(
+                serde_json::from_str(&event.payload).map(InventoryEventAtSequence::StockReserved),
+            ),
+            _ => None,
+        }
+    }
+}
+
+struct ReserveStockAtSequence;
+
+impl CommandType for ReserveStockAtSequence {
+    type Payload = ReserveStockPayload;
+    type Event = InventoryEventAtSequence;
+    const NAME: &'static str = "ReserveStockAtSequence";
+    const BOUNDED_CONTEXT: &'static str = INVENTORY_BOUNDED_CONTEXT_CUTOFFS;
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "StockReservedAtSequence".to_string(),
+                payload: serde_json::json!({
+                    "order_id": payload.order_id,
+                    "quantity": payload.quantity,
+                }),
+            }],
+        }
+    }
+}
+
+struct StockReservedAtSequence;
+
+impl EventType for StockReservedAtSequence {
+    type Payload = StockReservedPayload;
+    const NAME: &'static str = "StockReservedAtSequence";
+    const BOUNDED_CONTEXT: &'static str = INVENTORY_BOUNDED_CONTEXT_CUTOFFS;
+}
+
+struct ReservedTotalAtSequence;
+
+impl Projection for ReservedTotalAtSequence {
+    type State = ReservedTotalState;
+    type Event = InventoryEventAtSequence;
+    const NAME: &'static str = "ReservedTotalAtSequence";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["StockReservedAtSequence"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        let InventoryEventAtSequence::StockReserved(payload) = event;
+        state.total += payload.quantity;
+    }
+}
+
+struct RouteAtSequence;
+
+impl CrossContextRoute for RouteAtSequence {
+    type Source = OrderShippedCutoffs;
+    type Target = ReserveStockAtSequence;
+    const NAME: &'static str = "RouteAtSequence";
+    const START_FROM: CrossContextRouteStartFrom = CrossContextRouteStartFrom::AtSequence(0);
+    fn route(source_payload: &OrderShippedPayload) -> Option<ReserveStockPayload> {
+        Some(ReserveStockPayload {
+            order_id: source_payload.order_id.clone(),
+            quantity: source_payload.quantity,
+        })
+    }
+}
+
+enum InventoryEventAtTime {
+    StockReserved(StockReservedPayload),
+}
+
+impl BoundedContextEvent for InventoryEventAtTime {
+    fn try_from_event(
+        event: &skilj_core::event_store::Event,
+    ) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "StockReservedAtTime" => {
+                Some(serde_json::from_str(&event.payload).map(InventoryEventAtTime::StockReserved))
+            }
+            _ => None,
+        }
+    }
+}
+
+struct ReserveStockAtTime;
+
+impl CommandType for ReserveStockAtTime {
+    type Payload = ReserveStockPayload;
+    type Event = InventoryEventAtTime;
+    const NAME: &'static str = "ReserveStockAtTime";
+    const BOUNDED_CONTEXT: &'static str = INVENTORY_BOUNDED_CONTEXT_CUTOFFS;
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "StockReservedAtTime".to_string(),
+                payload: serde_json::json!({
+                    "order_id": payload.order_id,
+                    "quantity": payload.quantity,
+                }),
+            }],
+        }
+    }
+}
+
+struct StockReservedAtTime;
+
+impl EventType for StockReservedAtTime {
+    type Payload = StockReservedPayload;
+    const NAME: &'static str = "StockReservedAtTime";
+    const BOUNDED_CONTEXT: &'static str = INVENTORY_BOUNDED_CONTEXT_CUTOFFS;
+}
+
+struct ReservedTotalAtTime;
+
+impl Projection for ReservedTotalAtTime {
+    type State = ReservedTotalState;
+    type Event = InventoryEventAtTime;
+    const NAME: &'static str = "ReservedTotalAtTime";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["StockReservedAtTime"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        let InventoryEventAtTime::StockReserved(payload) = event;
+        state.total += payload.quantity;
+    }
+}
+
+/// `START_FROM: AtTime(unix_secs)` - the const has to be known at
+/// compile time, so the cutoff itself is baked in as a fixed point
+/// safely in the past (well before this test binary's own run), and the
+/// proof of "replays from a chosen point, not from nothing" instead
+/// comes from `RouteAtSequence`'s own test below sharing this same
+/// pattern with a caller-chosen sequence - `AtTime`'s own mid-history
+/// behaviour is already proven for real over REST
+/// (`skilj/tests/event_fetch_rest.rs::an_at_time_token_replays_history_after_a_chosen_cutoff_but_not_before_it`),
+/// so this route only needs to prove the *seeding mechanism itself*
+/// runs for `AtTime` the same way it does for `AtSequence`/`Latest` -
+/// nothing committed before this fixed cutoff, so every deposit in this
+/// test counts, the same as `Beginning` would give, which is exactly
+/// what the spec's own "empty means the whole stream" note on
+/// `at_time_position` predicts.
+struct RouteAtTime;
+
+impl CrossContextRoute for RouteAtTime {
+    type Source = OrderShippedCutoffs;
+    type Target = ReserveStockAtTime;
+    const NAME: &'static str = "RouteAtTime";
+    const START_FROM: CrossContextRouteStartFrom = CrossContextRouteStartFrom::AtTime(0);
+    fn route(source_payload: &OrderShippedPayload) -> Option<ReserveStockPayload> {
+        Some(ReserveStockPayload {
+            order_id: source_payload.order_id.clone(),
+            quantity: source_payload.quantity,
+        })
+    }
+}
+
+/// Both routes react to the same `OrderShippedCutoffs` stream, each with
+/// its own independent cursor (`cross_context_route_cursors` keyed by
+/// `route_name`) and its own target command/event/projection, so
+/// neither's own count is polluted by the other's - proof two routes
+/// with different `START_FROM` values can coexist against one source
+/// without interfering.
+///
+/// Two `Skilj::builder()` calls, same shape as the `Latest` test above:
+/// the first registers only the source/target types and posts one
+/// "historical" `OrderShipped` occurrence at sequence zero; the second
+/// adds both routes. `RouteAtSequence`'s own `AtSequence(0)` cutoff sits
+/// exactly at that historical occurrence's own sequence, so a second
+/// occurrence posted before either route is ever registered, at
+/// sequence one, still gets replayed once `RouteAtSequence` starts - the
+/// concrete proof this mechanism can replay *some* history, not just
+/// none at all the way `Latest` can. `RouteAtTime`'s fixed, safely-past
+/// `AtTime(0)` cutoff proves the identical seeding mechanism runs for
+/// that variant too (see its own doc comment above for why its
+/// mid-history behaviour specifically is proven over REST instead, not
+/// here).
+#[test]
+fn at_sequence_and_at_time_routes_replay_from_their_own_chosen_cutoffs() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+
+        let shipping_bc = BoundedContext {
+            name: SHIPPING_BOUNDED_CONTEXT_CUTOFFS.to_string(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &shipping_bc)
+            .await
+            .unwrap();
+        let inventory_bc = BoundedContext {
+            name: INVENTORY_BOUNDED_CONTEXT_CUTOFFS.to_string(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &inventory_bc)
+            .await
+            .unwrap();
+
+        let shipping_mapping = RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: shipping_bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &shipping_mapping)
+            .await
+            .unwrap();
+        let inventory_mapping = RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: inventory_bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &inventory_mapping)
+            .await
+            .unwrap();
+
+        // First build: no routes yet, just enough to mint a token and
+        // post two "historical" OrderShipped occurrences.
+        let (skilj, report) = Skilj::builder(database_url.clone())
+            .bounded_context(SHIPPING_BOUNDED_CONTEXT_CUTOFFS)
+            .event_type::<OrderShippedCutoffs>()
+            .bounded_context(INVENTORY_BOUNDED_CONTEXT_CUTOFFS)
+            .event_type::<StockReservedAtSequence>()
+            .command_type::<ReserveStockAtSequence>()
+            .projection::<ReservedTotalAtSequence>()
+            .event_type::<StockReservedAtTime>()
+            .command_type::<ReserveStockAtTime>()
+            .projection::<ReservedTotalAtTime>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let event_type =
+            db::get_event_type(&pool, SHIPPING_BOUNDED_CONTEXT_CUTOFFS, "OrderShipped")
+                .await
+                .unwrap()
+                .unwrap();
+        let direct_token = access_control::create_direct_creation_token(
+            &shipping_mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct_token)
+            .await
+            .unwrap();
+        let credential = format!("{}.{}", direct_token.id, direct_token.secret);
+
+        let router = skilj.rest_router();
+        // Sequence 0 - RouteAtSequence's own cutoff sits exactly here.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"order_id":"order-0","quantity":5,"backorder":false}}"#,
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        // Sequence 1 - historical relative to either route's own
+        // registration below, but after RouteAtSequence's cutoff.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"order_id":"order-1","quantity":7,"backorder":false}}"#,
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Second build, same bounded contexts: both routes registered
+        // this time.
+        let (_skilj, report) = Skilj::builder(database_url)
+            .bounded_context(SHIPPING_BOUNDED_CONTEXT_CUTOFFS)
+            .event_type::<OrderShippedCutoffs>()
+            .bounded_context(INVENTORY_BOUNDED_CONTEXT_CUTOFFS)
+            .event_type::<StockReservedAtSequence>()
+            .command_type::<ReserveStockAtSequence>()
+            .projection::<ReservedTotalAtSequence>()
+            .event_type::<StockReservedAtTime>()
+            .command_type::<ReserveStockAtTime>()
+            .projection::<ReservedTotalAtTime>()
+            .cross_context_route::<RouteAtSequence>()
+            .cross_context_route::<RouteAtTime>()
+            .cross_context_route_poll_interval(std::time::Duration::from_millis(50))
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        // RouteAtSequence: sequence 0 stays unserved (at the cutoff),
+        // sequence 1 - historical, but after the cutoff - gets replayed.
+        let mut at_sequence_state = None;
+        // RouteAtTime: nothing existed before its own fixed, safely-past
+        // cutoff, so both occurrences count - the "empty means the whole
+        // stream" case.
+        let mut at_time_state = None;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            at_sequence_state = db::get_projection_state(
+                &pool,
+                INVENTORY_BOUNDED_CONTEXT_CUTOFFS,
+                "ReservedTotalAtSequence",
+                "",
+            )
+            .await
+            .unwrap();
+            at_time_state = db::get_projection_state(
+                &pool,
+                INVENTORY_BOUNDED_CONTEXT_CUTOFFS,
+                "ReservedTotalAtTime",
+                "",
+            )
+            .await
+            .unwrap();
+            if at_sequence_state.as_deref() == Some(r#"{"total":7}"#)
+                && at_time_state.as_deref() == Some(r#"{"total":12}"#)
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            at_sequence_state,
+            Some(r#"{"total":7}"#.to_string()),
+            "AtSequence(0) must skip sequence 0 but replay sequence 1"
+        );
+        assert_eq!(
+            at_time_state,
+            Some(r#"{"total":12}"#.to_string()),
+            "AtTime's fixed past cutoff must replay everything, like Beginning would"
+        );
+
+        // A genuinely new occurrence, posted after both routes exist -
+        // both must still react to it normally.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"order_id":"order-2","quantity":100,"backorder":false}}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let mut at_sequence_state = None;
+        let mut at_time_state = None;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            at_sequence_state = db::get_projection_state(
+                &pool,
+                INVENTORY_BOUNDED_CONTEXT_CUTOFFS,
+                "ReservedTotalAtSequence",
+                "",
+            )
+            .await
+            .unwrap();
+            at_time_state = db::get_projection_state(
+                &pool,
+                INVENTORY_BOUNDED_CONTEXT_CUTOFFS,
+                "ReservedTotalAtTime",
+                "",
+            )
+            .await
+            .unwrap();
+            if at_sequence_state.as_deref() == Some(r#"{"total":107}"#)
+                && at_time_state.as_deref() == Some(r#"{"total":112}"#)
+            {
+                break;
+            }
+        }
+        assert_eq!(at_sequence_state, Some(r#"{"total":107}"#.to_string()));
+        assert_eq!(at_time_state, Some(r#"{"total":112}"#.to_string()));
+    });
+}

@@ -549,6 +549,74 @@ fn full_type_registration_lifecycle_end_to_end() {
         assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
         assert_eq!(response["data"]["createEventReadToken"]["startFrom"], "LATEST");
 
+        // `AT_SEQUENCE` with its own matching `startAtSequence` - reads
+        // back both together, over the real GraphQL wire.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                createEventReadToken(boundedContext: $bc, eventTypeName: $name, \
+                    startFrom: AT_SEQUENCE, startAtSequence: 41) { \
+                    startFrom startAtSequence startAtTime \
+                } \
+            }",
+            json!({ "bc": bc_name, "name": "MoneyDeposited" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["createEventReadToken"]["startFrom"],
+            "AT_SEQUENCE"
+        );
+        assert_eq!(
+            response["data"]["createEventReadToken"]["startAtSequence"],
+            41
+        );
+        assert!(response["data"]["createEventReadToken"]["startAtTime"].is_null());
+
+        // `AT_TIME`'s own version of the test above - an RFC3339 string,
+        // parsed by `resolvers::parse_rfc3339` and read back the same way.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                createEventReadToken(boundedContext: $bc, eventTypeName: $name, \
+                    startFrom: AT_TIME, startAtTime: \"2026-01-01T00:00:00Z\") { \
+                    startFrom startAtTime startAtSequence \
+                } \
+            }",
+            json!({ "bc": bc_name, "name": "MoneyDeposited" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["createEventReadToken"]["startFrom"],
+            "AT_TIME"
+        );
+        assert_eq!(
+            response["data"]["createEventReadToken"]["startAtTime"],
+            "2026-01-01T00:00:00+00:00"
+        );
+        assert!(response["data"]["createEventReadToken"]["startAtSequence"].is_null());
+
+        // `AT_SEQUENCE` with no `startAtSequence` at all - refused, not
+        // silently resolved to `beginning`.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                createEventReadToken(boundedContext: $bc, eventTypeName: $name, \
+                    startFrom: AT_SEQUENCE) { startFrom } \
+            }",
+            json!({ "bc": bc_name, "name": "MoneyDeposited" }),
+        )
+        .await;
+        assert!(response.get("data").is_none() || response["data"]["createEventReadToken"].is_null());
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "start_at_sequence_mismatch"
+        );
+
         // createCommandToken - omitting scope entirely still works and
         // reads back null, the default every token minted before this
         // argument existed carries.

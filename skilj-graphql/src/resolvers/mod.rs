@@ -344,8 +344,22 @@ pub fn parse_missed_occurrence_policy(name: &str) -> MissedOccurrencePolicy {
 pub fn parse_event_read_start_position(name: &str) -> EventReadStartPosition {
     match name {
         "LATEST" => EventReadStartPosition::Latest,
+        "AT_SEQUENCE" => EventReadStartPosition::AtSequence,
+        "AT_TIME" => EventReadStartPosition::AtTime,
         _ => EventReadStartPosition::Beginning,
     }
+}
+
+/// An RFC3339 timestamp `String` argument - `command_query::fetch_commands_field`'s
+/// own `after`/`before` and `event_type_admin_operations::create_event_read_token_field`'s
+/// own `startAtTime` all take a timestamp this same way (a plain string,
+/// not a custom GraphQL scalar - this schema has none), so this moved
+/// here once a second call site needed it rather than staying a private
+/// helper local to the first.
+pub(crate) fn parse_rfc3339(value: &str) -> async_graphql::Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| async_graphql::Error::new(format!("not a valid RFC3339 timestamp: {e}")))
 }
 
 /// A `String` argument this crate treats as an entity name/id lookup key

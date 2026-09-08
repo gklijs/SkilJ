@@ -322,6 +322,8 @@ fn create_event_read_token_succeeds_and_stamps_the_full_entity_shape() {
         "s3cr3t".into(),
         None,
         None,
+        None,
+        None,
         timestamp(1000),
     )
     .unwrap();
@@ -351,11 +353,194 @@ fn create_event_read_token_honours_an_explicit_start_from() {
         "s3cr3t".into(),
         None,
         Some(EventReadStartPosition::Latest),
+        None,
+        None,
         timestamp(1000),
     )
     .unwrap();
 
     assert_eq!(token.start_from, EventReadStartPosition::Latest);
+}
+
+/// `at_sequence` with its own matching value succeeds and stamps it
+/// through unvalidated - `EventReadToken.start_at_sequence`'s own "no
+/// check that it names a real event" treatment.
+#[test]
+fn create_event_read_token_succeeds_with_at_sequence_and_its_value() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+
+    let token = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-5".into(),
+        "s3cr3t".into(),
+        None,
+        Some(EventReadStartPosition::AtSequence),
+        Some(41),
+        None,
+        timestamp(1000),
+    )
+    .unwrap();
+
+    assert_eq!(token.start_from, EventReadStartPosition::AtSequence);
+    assert_eq!(token.start_at_sequence, Some(41));
+    assert_eq!(token.start_at_time, None);
+}
+
+/// `at_time`'s own version of the test above.
+#[test]
+fn create_event_read_token_succeeds_with_at_time_and_its_value() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let cutoff = timestamp(500);
+
+    let token = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-6".into(),
+        "s3cr3t".into(),
+        None,
+        Some(EventReadStartPosition::AtTime),
+        None,
+        Some(cutoff),
+        timestamp(1000),
+    )
+    .unwrap();
+
+    assert_eq!(token.start_from, EventReadStartPosition::AtTime);
+    assert_eq!(token.start_at_time, Some(cutoff));
+    assert_eq!(token.start_at_sequence, None);
+}
+
+/// rule-failure: `at_sequence` with no `start_at_sequence` at all.
+#[test]
+fn create_event_read_token_rejects_at_sequence_with_no_value() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+
+    let err = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-7".into(),
+        "s3cr3t".into(),
+        None,
+        Some(EventReadStartPosition::AtSequence),
+        None,
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        access_control::Error::StartAtSequenceMismatch.code()
+    );
+}
+
+/// rule-failure: `at_sequence` with `start_at_time` given instead of
+/// (or alongside) `start_at_sequence`.
+#[test]
+fn create_event_read_token_rejects_at_sequence_with_the_wrong_value() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+
+    let err = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-8".into(),
+        "s3cr3t".into(),
+        None,
+        Some(EventReadStartPosition::AtSequence),
+        None,
+        Some(timestamp(0)),
+        timestamp(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        access_control::Error::StartAtSequenceMismatch.code()
+    );
+}
+
+/// rule-failure: `at_time`'s own version of the two guards above,
+/// exercised together (missing its own value, given the other one's).
+#[test]
+fn create_event_read_token_rejects_at_time_with_no_value_or_the_wrong_one() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+
+    let missing = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-9".into(),
+        "s3cr3t".into(),
+        None,
+        Some(EventReadStartPosition::AtTime),
+        None,
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        missing.code(),
+        access_control::Error::StartAtTimeMismatch.code()
+    );
+
+    let wrong = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-10".into(),
+        "s3cr3t".into(),
+        None,
+        Some(EventReadStartPosition::AtTime),
+        Some(41),
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        wrong.code(),
+        access_control::Error::StartAtTimeMismatch.code()
+    );
+}
+
+/// rule-failure: `beginning`/`latest` (including the omitted-`start_from`
+/// default) forbid both values - naming one anyway is refused, not
+/// silently dropped.
+#[test]
+fn create_event_read_token_rejects_a_value_with_beginning_or_latest() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+
+    let with_beginning = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-11".into(),
+        "s3cr3t".into(),
+        None,
+        None,
+        Some(41),
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        with_beginning.code(),
+        access_control::Error::StartAtValueNotAllowed.code()
+    );
+
+    let with_latest = access_control::create_event_read_token(
+        &mapping,
+        &event_type(),
+        "token-12".into(),
+        "s3cr3t".into(),
+        None,
+        Some(EventReadStartPosition::Latest),
+        None,
+        Some(timestamp(0)),
+        timestamp(0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        with_latest.code(),
+        access_control::Error::StartAtValueNotAllowed.code()
+    );
 }
 
 #[test]
@@ -367,6 +552,8 @@ fn create_event_read_token_rejects_a_revoked_mapping() {
         &event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
+        None,
         None,
         None,
         timestamp(0),
@@ -385,6 +572,8 @@ fn create_event_read_token_rejects_a_write_level_mapping() {
         &event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
+        None,
         None,
         None,
         timestamp(0),
@@ -406,6 +595,8 @@ fn create_event_read_token_rejects_an_event_type_from_another_bounded_context() 
         &other_bounded_context_event_type(),
         "token-3".into(),
         "s3cr3t".into(),
+        None,
+        None,
         None,
         None,
         timestamp(0),
@@ -434,6 +625,8 @@ fn event_read_token_carries_its_variant_specific_field_through_the_access_token_
         event_type: et.clone(),
         scope: None,
         start_from: EventReadStartPosition::Beginning,
+        start_at_sequence: None,
+        start_at_time: None,
     };
 
     match AccessToken::EventReadToken(token) {
@@ -574,6 +767,8 @@ fn revoke_token_succeeds_for_every_variant_and_stamps_revoked_at() {
             event_type: event_type(),
             scope: None,
             start_from: EventReadStartPosition::Beginning,
+            start_at_sequence: None,
+            start_at_time: None,
         }),
     ];
 
@@ -625,6 +820,8 @@ fn revoke_token_rejects_a_revoked_mapping() {
         event_type: event_type(),
         scope: None,
         start_from: EventReadStartPosition::Beginning,
+        start_at_sequence: None,
+        start_at_time: None,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -645,6 +842,8 @@ fn revoke_token_rejects_a_write_level_mapping() {
         event_type: event_type(),
         scope: None,
         start_from: EventReadStartPosition::Beginning,
+        start_at_sequence: None,
+        start_at_time: None,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -668,6 +867,8 @@ fn revoke_token_rejects_a_token_scoped_to_another_bounded_context() {
         event_type: other_bounded_context_event_type(),
         scope: None,
         start_from: EventReadStartPosition::Beginning,
+        start_at_sequence: None,
+        start_at_time: None,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -693,6 +894,8 @@ fn revoke_token_rejects_an_already_revoked_token() {
         event_type: event_type(),
         scope: None,
         start_from: EventReadStartPosition::Beginning,
+        start_at_sequence: None,
+        start_at_time: None,
     });
 
     let err = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap_err();
@@ -719,6 +922,8 @@ fn revoke_token_only_ever_produces_the_revoked_status() {
         event_type: event_type(),
         scope: None,
         start_from: EventReadStartPosition::Beginning,
+        start_at_sequence: None,
+        start_at_time: None,
     });
 
     let revoked = access_control::revoke_token(&mapping, &token, timestamp(0)).unwrap();

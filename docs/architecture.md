@@ -6682,3 +6682,91 @@ clean; `allium check` unchanged from baseline bar one checker-limitation
 warning on the new enum (an enum referenced only from a `variant` field,
 not an `entity` one, per allium 3.5.3 - confirmed on a minimal scratch
 spec, not a real defect); `allium analyse` byte-identical to baseline.
+
+**Extension, same session: offset- and time-based starting positions.**
+A follow-up question - "is it possible to subscribe from a specific
+offset or time?" - closed the same gap `beginning`/`latest` leave open:
+neither can replay *some* history from a caller-chosen point, only none
+of it or all of it. `EventReadStartPosition` gained `at_sequence`/
+`at_time`, `EventReadToken` two new nullable fields
+(`start_at_sequence: Integer?`/`start_at_time: Timestamp?`), and
+`CreateEventReadToken` two new optional parameters plus three `requires`
+guards (spec delegated to `allium:tend` again, independently
+re-verified): `at_sequence` demands `start_at_sequence` and forbids
+`start_at_time`, `at_time` demands the reverse, and `beginning`/`latest`
+forbid both - naming one without its value, or with the other one's, is
+refused outright (`Error::StartAtSequenceMismatch`/`StartAtTimeMismatch`/
+`StartAtValueNotAllowed`) rather than silently resolved to some default.
+`rule ConsumeEvents` gained a sibling `at_time_position` binding next to
+`latest_position` (identical `history`/scope treatment, plus `e.metadata.
+created_at <= token.start_at_time`); `at_sequence`'s own position is the
+caller's value directly, unvalidated, the same opaque-value treatment
+`scope` already gets. An empty `at_time_position` (nothing committed at
+or before the cutoff) resolves to `-1` - exactly `beginning`'s own
+behaviour, not a special case.
+
+The real distinguishing value over `latest`, proved by both new pure and
+end-to-end tests: `at_sequence`/`at_time` can replay history from a
+chosen *mid-history* point - including occurrences that already existed
+before the token/route was ever minted/registered - which `latest`
+structurally cannot (it only ever starts at "whatever's already there
+right now") and `beginning` over-serves (everything). `CrossContextRoute`'s
+own `CrossContextRouteStartFrom` grew matching `AtSequence(i64)`/
+`AtTime(i64)` variants - `i64` (Unix seconds), not `chrono::DateTime<Utc>`,
+because `START_FROM` is a trait associated const and `DateTime` has no
+`const fn` constructor to build one from at the implementing type's own
+definition site; converted to a real `DateTime<Utc>` only where compared
+against event timestamps. `db::catch_up_cross_context_route`'s seeding
+branch (previously `Latest`-only) now covers all three non-`Beginning`
+variants uniformly: `AtSequence(n)` seeds the cursor at `n` directly (no
+event load needed, though one happens anyway for one shared code path
+rather than a fourth special case - a one-time cost, same reasoning as
+above); `AtTime`'s own seed mirrors `at_time_position`, minus the scope
+filter `CrossContextRoute` has no concept of.
+
+**GraphQL**: `createEventReadToken` gained `startAtSequence: Int`/
+`startAtTime: String` arguments and matching output fields on
+`EventReadToken` - `Int`/`String` (an RFC3339 timestamp), the same shape
+`queryEvents`'s own `afterSequence`/`fetchCommands`'s own `after`/
+`before` already use, no custom scalar existing in this schema for
+either. `parse_rfc3339` moved from `command_query.rs` (its only prior
+caller) to `resolvers/mod.rs` once this became its second - the same
+"promoted once a second call site needs it" move `parse_missed_occurrence_policy`/
+`create_type_token_field!` already went through in earlier passes.
+
+**Verified**: `skilj-core/tests/event_fetch_surface.rs`
+(`consume_events_at_sequence_starts_strictly_after_the_given_sequence`,
+`consume_events_at_time_starts_strictly_after_events_at_or_before_that_cutoff`,
+`consume_events_at_time_with_no_events_before_the_cutoff_serves_everything`),
+`skilj-core/tests/token_lifecycle.rs` (six new tests: both success
+shapes, all three `requires` guards' own failure shapes),
+`skilj/tests/event_fetch_rest.rs`
+(`an_at_sequence_token_replays_history_after_a_chosen_cutoff_but_not_before_it`/
+`an_at_time_token_replays_history_after_a_chosen_cutoff_but_not_before_it` -
+real REST, real wall-clock gaps around the `at_time` cutoff to rule out
+same-second flakiness, both proving mid-history replay: a deposit at or
+before the cutoff excluded, one already historical but after it
+replayed, a genuinely new one afterward served normally),
+`skilj/tests/graphql_type_registration.rs` (`AT_SEQUENCE`/`AT_TIME` over
+real GraphQL, plus the mismatch-rejection wire path), `skilj/tests/
+cross_context_route.rs`
+(`at_sequence_and_at_time_routes_replay_from_their_own_chosen_cutoffs` -
+two routes against one shared source, independently cursored, each
+proving its own seeding branch for real). One real bug caught by
+actually running this last test, not just compiling it: the two new
+target command/projection types were first written reusing the earlier
+`Latest` scenario's own shared `InventoryEvent`/`BoundedContextEvent`
+impl (which matches the literal event-type name `"StockReserved"`) -
+harmless there because that scenario's own event type kept that exact
+literal name in its own separate bounded context, but silently wrong
+here, where `StockReservedAtSequence`/`StockReservedAtTime` need their
+own distinct names to coexist in one bounded context and therefore their
+own matching `BoundedContextEvent` impls; every event still got created
+correctly, but silently never folded into either projection, since
+`try_from_event` never matched either name - a projection-state lookup
+returning `None` where a real fold had already committed, not a panic
+or a compile error, so it only surfaced once the test's own assertions
+ran for real, not from `cargo build` alone. `cargo build/clippy -D
+warnings/test --workspace` and `cargo fmt --check` clean; `allium check`
+unchanged from baseline (0 errors, same warning/info set as §43's own
+first pass); `allium analyse` byte-identical to baseline.

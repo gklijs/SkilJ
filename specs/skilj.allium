@@ -417,8 +417,11 @@ enum AckMode { auto_advance | manual_ack }
 -- rule takes it as an argument and records it (CreateEventReadToken) and
 -- another compares against it much later (ConsumeEvents), so it reads as
 -- a type rather than as two coincidentally matching literal lists. The
--- two values are defined in full on variant EventReadToken.start_from.
-enum EventReadStartPosition { beginning | latest }
+-- four values are defined in full on variant EventReadToken.start_from,
+-- and the two that need a value to go with them - at_sequence and
+-- at_time - take it from EventReadToken.start_at_sequence and
+-- EventReadToken.start_at_time beside it.
+enum EventReadStartPosition { beginning | latest | at_sequence | at_time }
 
 -- Which visibility rule a PrivateField follows. Named rather than inline
 -- because three separate things read it: valid_private_fields at
@@ -995,25 +998,58 @@ variant EventReadToken : AccessToken {
 
     -- Where this token's very first ConsumeEvents call begins, and the
     -- only thing this field ever decides. beginning - which is what every
-    -- token holds unless the minting admin named the other one (see rule
+    -- token holds unless the minting admin named another one (see rule
     -- CreateEventReadToken) - starts that first call at position = -1,
     -- before the first sequence of the bounded context, which is exactly
     -- where every token minted before this field existed already starts.
     -- latest starts it past everything already committed instead, so the
     -- token's first call skips straight to what is committed from that
     -- call onwards; see rule ConsumeEvents' own latest_position binding
-    -- for the precise position that resolves to.
+    -- for the precise position that resolves to. at_sequence and at_time
+    -- start it at a place the minting admin named rather than at either
+    -- end of history, and each reads that place from one of the two
+    -- fields below.
     --
     -- It says where in history a token starts, never what it may read.
     -- event_type and scope above are untouched by it, and so is every
     -- filter, redaction and opt-in either read applies: a latest token
     -- reaches nothing a beginning one could not, it simply does not go
-    -- back for what it was minted after. Consulted on that first call
-    -- alone and never again - from the second call on the two kinds of
-    -- token are indistinguishable. FetchEvents never consults it at all,
-    -- since that read carries the caller's own cursor rather than a
-    -- server-side one.
+    -- back for what it was minted after, and the same holds of the other
+    -- two. Consulted on that first call alone and never again - from the
+    -- second call on all four kinds of token are indistinguishable.
+    -- FetchEvents never consults it at all, since that read carries the
+    -- caller's own cursor rather than a server-side one.
     start_from: EventReadStartPosition
+
+    -- The starting position an at_sequence token reads directly, and the
+    -- whole of what at_sequence means: the token's first call continues
+    -- strictly after this number, exactly as any later call continues
+    -- strictly after the position its cursor already holds.
+    --
+    -- Opaque and unvalidated, the same treatment scope above gets: it is
+    -- a caller-chosen number this library records and later compares
+    -- against, with no check that it names a real event, an event of this
+    -- token's own type, or an event this token is scoped to. A number
+    -- past everything committed simply serves nothing until the stream
+    -- reaches it, and a negative one behaves as beginning does.
+    start_at_sequence: Integer?
+
+    -- The point in time an at_time token derives its starting position
+    -- from - not a position itself, but the cutoff one is computed from:
+    -- the highest sequence among this token's own event type whose
+    -- metadata.created_at is at or before this value, scoped exactly as
+    -- latest's own seed is. See rule ConsumeEvents' at_time_position
+    -- binding for that computation in full.
+    start_at_time: Timestamp?
+
+    -- Exactly one of the two fields above is populated, and only when
+    -- start_from names the value that reads it: beginning and latest
+    -- leave both null, at_sequence populates start_at_sequence alone and
+    -- at_time populates start_at_time alone. Rule CreateEventReadToken is
+    -- what holds that true - a token in any other shape is one this
+    -- library never mints - on the same terms the kind-specific fields of
+    -- the other AccessToken variants are held true, by what construction
+    -- is allowed to produce rather than by an invariant restating it.
 }
 
 -- The bootstrap secret: the only credential SkilJ ever generates for
@@ -2620,9 +2656,34 @@ rule ConsumeEvents {
         highest_sequence(filter(history, e =>
             event_owner_scope_satisfied(e, token.scope))) ?? -1
 
+    -- The at_time counterpart of the seed above, and the same computation
+    -- with one extra condition: the highest sequence this token could
+    -- have read of its own type as of token.start_at_time, scoped the
+    -- same way and blind to this call's filters for the same reason.
+    -- Empty means nothing of this type was committed by then, so the
+    -- token starts at -1 and gets the whole stream, which is what
+    -- beginning would have given it.
+    let at_time_position =
+        highest_sequence(filter(history, e =>
+            event_owner_scope_satisfied(e, token.scope)
+                and e.metadata.created_at <= token.start_at_time)) ?? -1
+
+    -- at_sequence and at_time are the same idea as latest with a cutoff
+    -- the minting admin chose rather than "now": at_sequence gives that
+    -- cutoff directly as a sequence number and is used as it stands,
+    -- at_time gives a point in time and has the cutoff derived from it
+    -- above.
+    --
+    -- at_time reads only what is already committed at the moment this
+    -- first call actually happens, and is not a scheduling mechanism. A
+    -- start_at_time in the future is not an instruction to wait for it -
+    -- it behaves exactly as latest would at that moment, since nothing
+    -- committed by then has a later created_at to be excluded by it.
     let position =
         if not is_new: cursor.sequence
         else if token.start_from = latest: latest_position
+        else if token.start_from = at_sequence: token.start_at_sequence
+        else if token.start_from = at_time: at_time_position
         else: -1
 
     let candidates =
@@ -5320,10 +5381,15 @@ rule CreateCommandToken {
 }
 
 rule CreateEventReadToken {
-    when: CreateEventReadToken(access_mapping, event_type, scope?, start_from?)
+    when: CreateEventReadToken(access_mapping, event_type, scope?, start_from?, start_at_sequence?, start_at_time?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = event_type.bounded_context
+
+    -- Omitted, start_from is beginning; the binding is what both the
+    -- guards below and the ensures at the bottom then read, so the
+    -- default is written once rather than three times.
+    let resolved_start_from = start_from ?? beginning
 
     -- scope is carried through unvalidated, the same treatment
     -- GrantRoleAccessMapping gives the scope it records: an opaque
@@ -5360,13 +5426,35 @@ rule CreateEventReadToken {
     -- it is beginning, which is where every token minted before this
     -- argument existed starts. See variant EventReadToken.start_from and
     -- rule ConsumeEvents.
+    --
+    -- Two of the four values need a second argument to go with them, and
+    -- the three guards below are the whole of what that costs: at_sequence
+    -- demands start_at_sequence and forbids start_at_time, at_time demands
+    -- start_at_time and forbids start_at_sequence, and beginning and
+    -- latest forbid both. Naming one without its value, or with the other
+    -- one's, is a malformed request and is refused as such rather than
+    -- quietly resolved to some default - a caller that asked to start
+    -- somewhere in particular and did not say where has not asked for
+    -- beginning, it has asked for something incoherent.
+    requires:
+        resolved_start_from = at_sequence
+            implies (start_at_sequence != null and start_at_time = null)
+    requires:
+        resolved_start_from = at_time
+            implies (start_at_time != null and start_at_sequence = null)
+    requires:
+        (resolved_start_from = beginning or resolved_start_from = latest)
+            implies (start_at_sequence = null and start_at_time = null)
+
     ensures:
         EventReadToken.created(
             id: generate_token_id(),
             event_type: event_type,
             secret: generate_token_secret(),
             scope: scope,
-            start_from: start_from ?? beginning,
+            start_from: resolved_start_from,
+            start_at_sequence: start_at_sequence,
+            start_at_time: start_at_time,
             status: active,
             created_at: now
         )
@@ -7487,7 +7575,7 @@ surface EventTypeAdminOperations {
     provides:
         CreateExternalEventToken(access_mapping, event_type, scope?)
         CreateDirectCreationToken(access_mapping, event_type, scope?)
-        CreateEventReadToken(access_mapping, event_type, scope?, start_from?)
+        CreateEventReadToken(access_mapping, event_type, scope?, start_from?, start_at_sequence?, start_at_time?)
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises minting tokens for

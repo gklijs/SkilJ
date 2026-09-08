@@ -176,12 +176,16 @@ pub fn event_read_start_position_enum() -> Enum {
     Enum::new("EventReadStartPosition")
         .item("BEGINNING")
         .item("LATEST")
+        .item("AT_SEQUENCE")
+        .item("AT_TIME")
 }
 
 pub fn event_read_start_position_name(position: EventReadStartPosition) -> &'static str {
     match position {
         EventReadStartPosition::Beginning => "BEGINNING",
         EventReadStartPosition::Latest => "LATEST",
+        EventReadStartPosition::AtSequence => "AT_SEQUENCE",
+        EventReadStartPosition::AtTime => "AT_TIME",
     }
 }
 
@@ -615,6 +619,19 @@ pub fn event_read_token_object() -> Object {
         "startFrom",
         TypeRef::named_nn("EventReadStartPosition"),
         |t: &EventReadToken| Value::from(event_read_start_position_name(t.start_from)),
+    ))
+    .field(scalar_field(
+        "startAtSequence",
+        TypeRef::named(TypeRef::INT),
+        |t: &EventReadToken| match t.start_at_sequence {
+            Some(seq) => Value::from(seq),
+            None => Value::Null,
+        },
+    ))
+    .field(scalar_field(
+        "startAtTime",
+        TypeRef::named(TypeRef::STRING),
+        |t: &EventReadToken| optional_timestamp(t.start_at_time),
     ))
 }
 

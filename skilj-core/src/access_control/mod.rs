@@ -189,6 +189,16 @@ pub struct EventReadToken {
     /// absence" treatment `consume_events`' own resolved `mode` binding
     /// already gives `AckMode`.
     pub start_from: EventReadStartPosition,
+    /// See `EventReadToken.start_at_sequence` in the spec. Populated iff
+    /// `start_from = AtSequence` - `create_event_read_token`'s own
+    /// `requires` guards are what hold that true, not a type-level
+    /// enforcement here (the same "construction, not a restating
+    /// invariant" register the spec's own doc comment on this exact
+    /// point uses).
+    pub start_at_sequence: Option<i64>,
+    /// See `EventReadToken.start_at_time` in the spec - `start_at_sequence`'s
+    /// own sibling, populated iff `start_from = AtTime`.
+    pub start_at_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// See `variant EventReadToken.start_from`. `Beginning` unless a minting
@@ -202,6 +212,12 @@ pub struct EventReadToken {
 pub enum EventReadStartPosition {
     Beginning,
     Latest,
+    /// See `EventReadToken.start_at_sequence` - the value this variant
+    /// reads is carried on the token itself, not on this tag.
+    AtSequence,
+    /// See `EventReadToken.start_at_time` - same treatment as
+    /// `AtSequence` above.
+    AtTime,
 }
 
 /// See `variant ExternalEventToken`.
@@ -405,6 +421,24 @@ pub enum Error {
 
     #[error("fetching the trusted IdP's JWKS failed: {0}")]
     JwksFetchFailed(String),
+
+    /// `rule CreateEventReadToken`'s first `start_at_sequence`/
+    /// `start_at_time` guard: `start_from` (after its own `?? beginning`
+    /// default) resolves to `at_sequence`, but `start_at_sequence` is
+    /// absent, or `start_at_time` is present alongside it.
+    #[error("start_from = at_sequence requires start_at_sequence and forbids start_at_time")]
+    StartAtSequenceMismatch,
+
+    /// Same guard's `at_time` counterpart.
+    #[error("start_from = at_time requires start_at_time and forbids start_at_sequence")]
+    StartAtTimeMismatch,
+
+    /// Same guard's `beginning`/`latest` counterpart - neither of these
+    /// two takes a value, so naming one anyway is refused rather than
+    /// silently ignored (see `create_event_read_token`'s own doc
+    /// comment).
+    #[error("start_from = beginning or latest forbids both start_at_sequence and start_at_time")]
+    StartAtValueNotAllowed,
 }
 
 impl SkiljRejection for Error {
@@ -433,6 +467,9 @@ impl SkiljRejection for Error {
             Error::JwtVerificationFailed(_) => "jwt_verification_failed",
             Error::MissingSubjectClaim(_) => "missing_subject_claim",
             Error::JwksFetchFailed(_) => "jwks_fetch_failed",
+            Error::StartAtSequenceMismatch => "start_at_sequence_mismatch",
+            Error::StartAtTimeMismatch => "start_at_time_mismatch",
+            Error::StartAtValueNotAllowed => "start_at_value_not_allowed",
         }
     }
 
@@ -1172,6 +1209,18 @@ pub fn create_direct_creation_token(
 /// own `start_from?`) resolves to `Beginning` here, the rule's own
 /// `start_from ?? beginning` default substitution - the entity itself
 /// never stores the absence, only the resolved value.
+///
+/// `start_at_sequence`/`start_at_time` are `AtSequence`/`AtTime`'s own
+/// values (`EventReadToken.start_at_sequence`/`.start_at_time`'s own doc
+/// comments) - the rule's three guards, checked here in the same order
+/// the spec states them: `AtSequence` demands `start_at_sequence` and
+/// forbids `start_at_time`, `AtTime` demands the reverse, and
+/// `Beginning`/`Latest` forbid both. A caller that names one without its
+/// value, or with the other one's, is refused outright
+/// (`StartAtSequenceMismatch`/`StartAtTimeMismatch`/`StartAtValueNotAllowed`)
+/// rather than silently resolved to some default - see those guards' own
+/// doc comment in the spec for why.
+#[allow(clippy::too_many_arguments)]
 pub fn create_event_read_token(
     access_mapping: &RoleAccessMapping,
     event_type: &crate::event_store::EventType,
@@ -1179,11 +1228,32 @@ pub fn create_event_read_token(
     secret: String,
     scope: Option<String>,
     start_from: Option<EventReadStartPosition>,
+    start_at_sequence: Option<i64>,
+    start_at_time: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<EventReadToken> {
     require_active_admin(access_mapping)?;
     if access_mapping.bounded_context != event_type.bounded_context {
         return Err(Error::GrantBoundedContextMismatch.into());
+    }
+
+    let resolved_start_from = start_from.unwrap_or(EventReadStartPosition::Beginning);
+    match resolved_start_from {
+        EventReadStartPosition::AtSequence => {
+            if start_at_sequence.is_none() || start_at_time.is_some() {
+                return Err(Error::StartAtSequenceMismatch.into());
+            }
+        }
+        EventReadStartPosition::AtTime => {
+            if start_at_time.is_none() || start_at_sequence.is_some() {
+                return Err(Error::StartAtTimeMismatch.into());
+            }
+        }
+        EventReadStartPosition::Beginning | EventReadStartPosition::Latest => {
+            if start_at_sequence.is_some() || start_at_time.is_some() {
+                return Err(Error::StartAtValueNotAllowed.into());
+            }
+        }
     }
 
     Ok(EventReadToken {
@@ -1194,7 +1264,9 @@ pub fn create_event_read_token(
         revoked_at: None,
         event_type: event_type.clone(),
         scope,
-        start_from: start_from.unwrap_or(EventReadStartPosition::Beginning),
+        start_from: resolved_start_from,
+        start_at_sequence,
+        start_at_time,
     })
 }
 

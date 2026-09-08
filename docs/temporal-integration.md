@@ -112,6 +112,11 @@ history would start one `OrderFulfillment` workflow execution per historical ord
 this mapping's first poll runs, not just for orders placed from then on. Pass `startFrom: LATEST`
 to the `createEventReadToken` GraphQL mutation when minting `order_placed_read_token`/
 `payment_confirmed_read_token` so the mapping only reacts to what happens after it goes live.
+If you need to backfill deliberately - starting workflows for orders already placed since a known
+point rather than none of them - `startFrom: AT_SEQUENCE`/`startAtSequence` or `startFrom:
+AT_TIME`/`startAtTime` pick a specific cutoff instead of "now", including one earlier than the
+token's own minting time (see [`docs/rest-event-reading.md`](rest-event-reading.md) for the full
+set of options).
 
 `correlation_tag_key` names which of the event's own DCB tags supplies the workflow id - both
 mappings above name `"order"`, so `OrderPlaced` and `PaymentConfirmed` events carrying the same

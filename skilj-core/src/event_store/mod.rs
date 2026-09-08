@@ -2896,23 +2896,47 @@ pub fn consume_events(
         .expect("is_new implies ack_mode.is_some(), checked above");
 
     // See `EventReadToken.start_from`'s own doc comment and rule
-    // `ConsumeEvents`' `latest_position` binding. Scoped exactly as a
-    // served event is (an event outside this token's own scope was
-    // never visible to it, so it can't count as "already seen" either),
-    // but deliberately blind to this call's own `filters` argument,
-    // which varies call to call and must never change where a `Latest`
-    // token's one-time seed lands.
+    // `ConsumeEvents`' `latest_position`/`at_time_position` bindings.
+    // `Latest`/`AtTime` are both scoped exactly as a served event is (an
+    // event outside this token's own scope was never visible to it, so
+    // it can't count as "already seen" either), but deliberately blind
+    // to this call's own `filters` argument, which varies call to call
+    // and must never change where a one-time seed lands. `AtSequence`
+    // needs no computation at all - the caller-chosen value is the
+    // position, unvalidated, the same "opaque value" treatment `scope`
+    // gets.
     let position = match existing_cursor {
         Some(cursor) => cursor.sequence,
-        None if token.start_from == EventReadStartPosition::Latest => events
-            .iter()
-            .filter(|e| e.bounded_context == read_type.bounded_context)
-            .filter(|e| &e.event_type == read_type)
-            .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
-            .map(|e| e.sequence)
-            .max()
-            .unwrap_or(-1),
-        None => -1,
+        None => match token.start_from {
+            EventReadStartPosition::Beginning => -1,
+            EventReadStartPosition::Latest => events
+                .iter()
+                .filter(|e| e.bounded_context == read_type.bounded_context)
+                .filter(|e| &e.event_type == read_type)
+                .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
+                .map(|e| e.sequence)
+                .max()
+                .unwrap_or(-1),
+            EventReadStartPosition::AtSequence => token.start_at_sequence.expect(
+                "create_event_read_token guarantees start_at_sequence is Some when \
+                 start_from = AtSequence",
+            ),
+            EventReadStartPosition::AtTime => {
+                let threshold = token.start_at_time.expect(
+                    "create_event_read_token guarantees start_at_time is Some when \
+                     start_from = AtTime",
+                );
+                events
+                    .iter()
+                    .filter(|e| e.bounded_context == read_type.bounded_context)
+                    .filter(|e| &e.event_type == read_type)
+                    .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
+                    .filter(|e| e.metadata.created_at <= threshold)
+                    .map(|e| e.sequence)
+                    .max()
+                    .unwrap_or(-1)
+            }
+        },
     };
 
     let served: Vec<Event> = events

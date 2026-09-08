@@ -207,6 +207,8 @@ async fn setup() -> (Skilj, String, String) {
         generate_token_secret(),
         None,
         None,
+        None,
+        None,
         test_now(),
     )
     .unwrap();
@@ -524,6 +526,8 @@ fn a_latest_token_never_serves_history_that_predates_its_own_minting() {
             generate_token_secret(),
             None,
             Some(EventReadStartPosition::Latest),
+            None,
+            None,
             test_now(),
         )
         .unwrap();
@@ -559,6 +563,270 @@ fn a_latest_token_never_serves_history_that_predates_its_own_minting() {
             .method("GET")
             .uri("/v1/events/consume?mode=auto")
             .header("authorization", format!("Bearer {latest_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert_eq!(events[0]["payload"]["amount"], 99);
+    });
+}
+
+/// `at_sequence`'s own distinguishing value over `latest`, over the real
+/// wire: an admin can mint a token that replays *some* history from a
+/// chosen cutoff, even history that already existed before the token
+/// itself was minted - impossible with `latest` (nothing before minting
+/// time) or `beginning` (everything). Deposit 0 stays unserved (at the
+/// cutoff), deposit 1 - already historical relative to minting - is
+/// served anyway, and a genuinely new deposit afterward is served too.
+#[test]
+fn an_at_sequence_token_replays_history_after_a_chosen_cutoff_but_not_before_it() {
+    runtime().block_on(async {
+        let Some(database_url) = test_db().await else {
+            return;
+        };
+        let pool = db::connect(&database_url).await.unwrap();
+
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+
+        let mapping = RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &mapping)
+            .await
+            .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url)
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+        let router = skilj.rest_router();
+
+        let event_type = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        let direct_token = access_control::create_direct_creation_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct_token)
+            .await
+            .unwrap();
+        let direct_credential = format!("{}.{}", direct_token.id, direct_token.secret);
+
+        deposit(&router, &direct_credential, 5).await; // sequence 0 - the cutoff itself
+        deposit(&router, &direct_credential, 7).await; // sequence 1 - historical, but after the cutoff
+
+        let at_sequence_token = access_control::create_event_read_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            Some(EventReadStartPosition::AtSequence),
+            Some(0),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_event_read_token(&pool, &at_sequence_token)
+            .await
+            .unwrap();
+        let at_sequence_credential =
+            format!("{}.{}", at_sequence_token.id, at_sequence_token.secret);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events/consume?mode=auto")
+            .header("authorization", format!("Bearer {at_sequence_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert_eq!(events[0]["payload"]["amount"], 7);
+
+        deposit(&router, &direct_credential, 99).await; // sequence 2 - genuinely new
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events/consume?mode=auto")
+            .header("authorization", format!("Bearer {at_sequence_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert_eq!(events[0]["payload"]["amount"], 99);
+    });
+}
+
+/// `at_time`'s own version of the test above - real wall-clock gaps
+/// (`sleep`) around the cutoff rather than a chosen sequence number, so
+/// the cutoff sits provably strictly between the two deposits'
+/// `metadata.created_at` and no same-second ambiguity can make the test
+/// flaky either way.
+#[test]
+fn an_at_time_token_replays_history_after_a_chosen_cutoff_but_not_before_it() {
+    runtime().block_on(async {
+        let Some(database_url) = test_db().await else {
+            return;
+        };
+        let pool = db::connect(&database_url).await.unwrap();
+
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+
+        let mapping = RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &mapping)
+            .await
+            .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url)
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+        let router = skilj.rest_router();
+
+        let event_type = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        let direct_token = access_control::create_direct_creation_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct_token)
+            .await
+            .unwrap();
+        let direct_credential = format!("{}.{}", direct_token.id, direct_token.secret);
+
+        deposit(&router, &direct_credential, 5).await; // before the cutoff - excluded
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let cutoff = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        deposit(&router, &direct_credential, 7).await; // after the cutoff, but before minting - still served
+
+        let at_time_token = access_control::create_event_read_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            Some(EventReadStartPosition::AtTime),
+            None,
+            Some(cutoff),
+            test_now(),
+        )
+        .unwrap();
+        db::insert_event_read_token(&pool, &at_time_token)
+            .await
+            .unwrap();
+        let at_time_credential = format!("{}.{}", at_time_token.id, at_time_token.secret);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events/consume?mode=auto")
+            .header("authorization", format!("Bearer {at_time_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "events: {events:?}");
+        assert_eq!(events[0]["payload"]["amount"], 7);
+
+        deposit(&router, &direct_credential, 99).await; // genuinely new
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events/consume?mode=auto")
+            .header("authorization", format!("Bearer {at_time_credential}"))
             .body(Body::empty())
             .unwrap();
         let response = router.oneshot(request).await.unwrap();

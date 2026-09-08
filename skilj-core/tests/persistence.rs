@@ -632,6 +632,8 @@ fn round_trips_a_revoked_event_read_token() {
             event_type: et,
             scope: None,
             start_from: EventReadStartPosition::Beginning,
+            start_at_sequence: None,
+            start_at_time: None,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -730,6 +732,8 @@ fn read_cursor_is_none_before_the_first_consume() {
             event_type: et,
             scope: None,
             start_from: EventReadStartPosition::Beginning,
+            start_at_sequence: None,
+            start_at_time: None,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -754,6 +758,8 @@ fn apply_cursor_update_created_then_advanced_round_trips() {
             event_type: et,
             scope: None,
             start_from: EventReadStartPosition::Beginning,
+            start_at_sequence: None,
+            start_at_time: None,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
 
@@ -804,6 +810,8 @@ fn record_acknowledgement_moves_the_cursor() {
             event_type: et,
             scope: None,
             start_from: EventReadStartPosition::Beginning,
+            start_at_sequence: None,
+            start_at_time: None,
         };
         db::insert_event_read_token(&pool, &token).await.unwrap();
         db::apply_cursor_update(

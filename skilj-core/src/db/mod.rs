@@ -302,12 +302,16 @@ fn event_read_start_position_to_str(position: EventReadStartPosition) -> &'stati
     match position {
         EventReadStartPosition::Beginning => "beginning",
         EventReadStartPosition::Latest => "latest",
+        EventReadStartPosition::AtSequence => "at_sequence",
+        EventReadStartPosition::AtTime => "at_time",
     }
 }
 
 fn event_read_start_position_from_str(s: &str) -> EventReadStartPosition {
     match s {
         "latest" => EventReadStartPosition::Latest,
+        "at_sequence" => EventReadStartPosition::AtSequence,
+        "at_time" => EventReadStartPosition::AtTime,
         _ => EventReadStartPosition::Beginning,
     }
 }
@@ -726,11 +730,15 @@ async fn provision_bounded_context_schema(
             -- the default for a token minted with none) means
             -- unrestricted, for every kind alike.
             scope TEXT,
-            -- EventReadToken.start_from - meaningful only for the
-            -- 'event_read' kind (see ensure_event_read_token_start_from_column's
-            -- own doc comment for why a fresh table still declares this
-            -- with the identical default a retrofitted one gets).
-            start_from TEXT NOT NULL DEFAULT 'beginning' CHECK (start_from IN ('beginning', 'latest')),
+            -- EventReadToken.start_from/.start_at_sequence/.start_at_time -
+            -- meaningful only for the 'event_read' kind (see
+            -- ensure_event_read_token_start_from_column's own doc comment
+            -- for why a fresh table still declares these with the
+            -- identical defaults a retrofitted one gets).
+            start_from TEXT NOT NULL DEFAULT 'beginning'
+                CHECK (start_from IN ('beginning', 'latest', 'at_sequence', 'at_time')),
+            start_at_sequence BIGINT,
+            start_at_time TIMESTAMPTZ,
             CHECK (
                 (kind = 'command' AND command_type_name IS NOT NULL AND event_type_name IS NULL)
                 OR (kind != 'command' AND event_type_name IS NOT NULL AND command_type_name IS NULL)
@@ -1375,20 +1383,30 @@ pub async fn ensure_private_field_columns(
     Ok(())
 }
 
-/// `access_tokens.start_from` - `EventReadToken.start_from`
-/// (docs/architecture.md's own write-up of this pass), meaningful only
-/// for the `event_read` kind but a column on the shared `access_tokens`
-/// table exactly as `scope` already is (`EventReadToken.scope`'s own
-/// doc comment on why one column serves all four kinds). Following
-/// `ensure_event_scoping_columns`'s own pattern exactly: a targeted,
-/// idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, called
-/// unconditionally on every `build()`, for a bounded context provisioned
-/// before this column existed. `NOT NULL DEFAULT 'beginning'` rather
-/// than nullable - every row this backfills is a token minted before
-/// `start_from` existed, and `EventReadStartPosition::Beginning` is
-/// exactly what such a token already behaves as (`consume_events`' own
-/// `-1` fallback), so the column's own default and the domain default
-/// agree; `get_event_read_token` never has to handle an absent value.
+/// `access_tokens.start_from`/`.start_at_sequence`/`.start_at_time` -
+/// `EventReadToken.start_from`/`.start_at_sequence`/`.start_at_time`
+/// (docs/architecture.md's own write-up of these two passes), meaningful
+/// only for the `event_read` kind but columns on the shared
+/// `access_tokens` table exactly as `scope` already is
+/// (`EventReadToken.scope`'s own doc comment on why one column serves
+/// all four kinds). Following `ensure_event_scoping_columns`'s own
+/// pattern exactly: targeted, idempotent `ALTER TABLE ... ADD COLUMN IF
+/// NOT EXISTS`, called unconditionally on every `build()`, for a bounded
+/// context provisioned before these columns existed - `start_at_sequence`/
+/// `start_at_time` folded into this same function rather than a fourth
+/// one, since they were added in the identical follow-up pass that
+/// needs nothing about `start_from`'s own retrofit changed.
+///
+/// `start_from` is `NOT NULL DEFAULT 'beginning'` rather than nullable -
+/// every row this backfills is a token minted before `start_from`
+/// existed, and `EventReadStartPosition::Beginning` is exactly what such
+/// a token already behaves as (`consume_events`' own `-1` fallback), so
+/// the column's own default and the domain default agree;
+/// `get_event_read_token` never has to handle an absent value. No such
+/// domain default exists for `start_at_sequence`/`start_at_time` - a
+/// `beginning` token never had one to fall back to - so both stay
+/// nullable, exactly the shape `EventReadToken`'s own fields already
+/// have.
 pub async fn ensure_event_read_token_start_from_column(
     pool: &Pool,
     bounded_context: &str,
@@ -1397,6 +1415,16 @@ pub async fn ensure_event_read_token_start_from_column(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.access_tokens \
          ADD COLUMN IF NOT EXISTS start_from TEXT NOT NULL DEFAULT 'beginning'"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS start_at_sequence BIGINT"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS start_at_time TIMESTAMPTZ"
     )))
     .execute(pool)
     .await?;
@@ -5850,22 +5878,36 @@ async fn update_cross_context_route_cursor(
 /// tick without losing anything (the next tick re-fetches from the same
 /// cursor).
 ///
-/// **First-ever tick, `CrossContextRoute::START_FROM = Latest`**: when
-/// `get_cross_context_route_cursor` comes back `None` (no row - this
-/// route has never ticked before) and the route asks to start from
-/// `Latest`, this tick does no dispatching at all. It instead loads
-/// `Source`'s own occurrences once (the identical `list_events_cached`
-/// call the normal path below makes, from `-1`) purely to find the
-/// highest sequence among them, seeds the cursor row at that sequence
-/// (or `-1`, unchanged, if `Source` has no occurrences at all yet), and
-/// returns - so every occurrence that already existed at registration
-/// time is treated as "already seen" without a single `route()` call or
-/// `Target` submission for any of them. This is the mechanism that stops
-/// a brand-new route like `UserRegistered -> SendWelcomeEmail` from
-/// emailing every user who has ever registered: exactly one full history
-/// load, exactly once, ever, for this route - every later tick reads the
-/// real cursor row this seeded and only ever sees genuinely new
-/// occurrences, the same as a `Beginning` route always has.
+/// **First-ever tick, `CrossContextRoute::START_FROM != Beginning`**:
+/// when `get_cross_context_route_cursor` comes back `None` (no row -
+/// this route has never ticked before) and the route asks to start
+/// anywhere other than `Beginning`, this tick does no dispatching at
+/// all. It instead loads `Source`'s own occurrences once (the identical
+/// `list_events_cached` call the normal path below makes, from `-1`) -
+/// needed to compute `Latest`'s/`AtTime`'s own seed, paid unconditionally
+/// even for `AtSequence` (which doesn't need it) for one shared code
+/// path rather than a fourth special case - purely to find the seed
+/// sequence, writes the cursor row there (or leaves it at `-1`,
+/// unchanged, if there's nothing to seed past), and returns - so every
+/// occurrence that already existed at registration time is treated as
+/// "already seen" without a single `route()` call or `Target` submission
+/// for any of them:
+/// - `Latest`: the highest sequence among every loaded occurrence.
+/// - `AtSequence(n)`: `n` directly - no need to look at `events` at all,
+///   the same "opaque, unvalidated value" treatment
+///   `EventReadToken.start_at_sequence` gets.
+/// - `AtTime(unix_secs)`: the highest sequence among occurrences whose
+///   own `metadata.created_at` is at or before that moment - the
+///   identical `at_time_position` computation `event_store::consume_events`
+///   makes, minus the scope filter (`CrossContextRoute` has no scope
+///   concept to filter by).
+///
+/// This is the mechanism that stops a brand-new route like
+/// `UserRegistered -> SendWelcomeEmail` from emailing every user who has
+/// ever registered: exactly one full history load, exactly once, ever,
+/// for this route - every later tick reads the real cursor row this
+/// seeded and only ever sees genuinely new occurrences, the same as a
+/// `Beginning` route always has.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(route = %route.name))]
 pub async fn catch_up_cross_context_route(
@@ -5892,12 +5934,29 @@ pub async fn catch_up_cross_context_route(
     .await?;
 
     if existing_cursor.is_none()
-        && route.start_from == crate::plugin::CrossContextRouteStartFrom::Latest
+        && route.start_from != crate::plugin::CrossContextRouteStartFrom::Beginning
     {
         // See this function's own doc comment's "First-ever tick" note -
         // `events` above already is the full history from `-1`, loaded
         // for exactly this purpose; nothing in it gets dispatched.
-        let seed = events.iter().map(|e| e.sequence).max().unwrap_or(-1);
+        let seed = match route.start_from {
+            crate::plugin::CrossContextRouteStartFrom::Beginning => {
+                unreachable!("excluded by this branch's own condition above")
+            }
+            crate::plugin::CrossContextRouteStartFrom::Latest => {
+                events.iter().map(|e| e.sequence).max().unwrap_or(-1)
+            }
+            crate::plugin::CrossContextRouteStartFrom::AtSequence(n) => n,
+            crate::plugin::CrossContextRouteStartFrom::AtTime(unix_secs) => {
+                let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
+                events
+                    .iter()
+                    .filter(|e| e.metadata.created_at <= threshold)
+                    .map(|e| e.sequence)
+                    .max()
+                    .unwrap_or(-1)
+            }
+        };
         update_cross_context_route_cursor(
             pool,
             route.source_bounded_context,
@@ -6952,6 +7011,11 @@ struct AccessTokenColumns {
     /// whatever the column's own `DEFAULT` gave it, read here but never
     /// interpreted.
     start_from: String,
+    /// `EventReadToken.start_at_sequence`/`.start_at_time` - two more
+    /// columns, all four kinds, meaningful only for `event_read` on the
+    /// identical terms `start_from` above already is.
+    start_at_sequence: Option<i64>,
+    start_at_time: Option<DateTime<Utc>>,
 }
 
 struct AccessTokenRow {
@@ -6974,7 +7038,8 @@ async fn fetch_access_token_row(
     let schema = schema_ident(&bounded_context);
     let columns: Option<AccessTokenColumns> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, kind, secret, status, created_at, revoked_at, event_type_name, \
-         command_type_name, scope, start_from FROM {schema}.access_tokens WHERE id = $1"
+         command_type_name, scope, start_from, start_at_sequence, start_at_time \
+         FROM {schema}.access_tokens WHERE id = $1"
     )))
     .bind(id)
     .fetch_optional(pool)
@@ -7124,7 +7189,8 @@ pub async fn insert_event_read_token(
     let schema = schema_ident(&token.event_type.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.access_tokens (id, kind, secret, status, created_at, revoked_at, \
-         event_type_name, scope, start_from) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"
+         event_type_name, scope, start_from, start_at_sequence, start_at_time) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"
     )))
     .bind(&token.id)
     .bind(AccessTokenKind::EventRead.as_str())
@@ -7135,6 +7201,8 @@ pub async fn insert_event_read_token(
     .bind(&token.event_type.name)
     .bind(token.scope.as_deref())
     .bind(event_read_start_position_to_str(token.start_from))
+    .bind(token.start_at_sequence)
+    .bind(token.start_at_time)
     .execute(pool)
     .await?;
     insert_token_index(pool, &token.id, &token.event_type.bounded_context.name).await
@@ -7250,6 +7318,8 @@ pub async fn get_event_read_token(
         event_type,
         scope: row.columns.scope,
         start_from: event_read_start_position_from_str(&row.columns.start_from),
+        start_at_sequence: row.columns.start_at_sequence,
+        start_at_time: row.columns.start_at_time,
     }))
 }
 
