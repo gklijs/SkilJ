@@ -46,4 +46,4 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken.workspace = true
-tokio-tungstenite = "0.29"
+tokio-tungstenite.workspace = true

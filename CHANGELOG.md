@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `EventReadToken` and `CrossContextRoute` no longer unconditionally start
+  at the very beginning of history. `createEventReadToken` gains an
+  optional `startFrom` (`BEGINNING` default, unchanged; `LATEST` skips
+  straight past current history so only events from then on are delivered),
+  plus `startAtSequence`/`startAtTime` for replaying from a chosen
+  mid-history point - exactly one of the four may be given. The Rust-only
+  `plugin::CrossContextRouteStartFrom` trait const gives a route the same
+  four choices (`Beginning`/`Latest`/`AtSequence`/`AtTime`), seeded on its
+  first-ever catch-up tick. Wiring a new side effect (e.g.
+  `UserRegistered` -> send a welcome email, or a new `EventTypeMapping`
+  onto a Temporal workflow) against an event type with existing history no
+  longer replays every historical occurrence through it by default. See
+  [docs/architecture.md §43](docs/architecture.md#43-stopping-a-new-subscriber-from-replaying-all-of-history).
+
+### Changed
+
+- `docs/architecture.md`'s top-level sections now carry stable,
+  number-independent anchors instead of GitHub's auto-generated
+  number-dependent slugs, so a `§NN` citation elsewhere in the repo no
+  longer breaks the next time a section is added, removed, or
+  renumbered. Every existing `§N`/`§N.M` citation - in `docs/architecture.md`
+  itself, other `.md` files, and Rust `///`/`//!` doc comments - now links
+  against the new anchors. New `scripts/check-section-refs.sh`, wired
+  into CI, scans every tracked file for `§N` citations and fails the
+  build if a top-level number no longer resolves to a current heading.
+  No behavior change.
+
 ## [0.0.5] - 2026-09-08
 
 ### Added

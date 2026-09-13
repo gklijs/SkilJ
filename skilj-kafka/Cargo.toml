@@ -19,7 +19,7 @@ thiserror.workspace = true
 # CONTRIBUTING.md's own note on the one real build-time snag this hits
 # (an unconditional `#include <curl/curl.h>` in this librdkafka version,
 # regardless of WITH_CURL).
-rdkafka = { version = "0.38", features = ["cmake-build", "tokio"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
 
 [lib]
 name = "skilj_kafka"
