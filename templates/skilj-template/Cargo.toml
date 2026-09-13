@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-skilj = "0.0.5"
-skilj-core = "0.0.5"
+skilj = "0.0.6"
+skilj-core = "0.0.6"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }

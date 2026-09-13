@@ -75,7 +75,7 @@ members = [
 #                 group-id/group-sequence).
 
 [workspace.package]
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://codeberg.org/gklijs/SklilJ"
@@ -167,9 +167,9 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 opentelemetry-appender-tracing = "0.32"
 
 # Path dependencies between skilj's own crates
-skilj-core = { path = "skilj-core", version = "0.0.5" }
-skilj-graphql = { path = "skilj-graphql", version = "0.0.5" }
-skilj-macros = { path = "skilj-macros", version = "0.0.5" }
-skilj-rest = { path = "skilj-rest", version = "0.0.5" }
-skilj = { path = "skilj", version = "0.0.5" }
-skilj-codegen = { path = "skilj-codegen", version = "0.0.5" }
+skilj-core = { path = "skilj-core", version = "0.0.6" }
+skilj-graphql = { path = "skilj-graphql", version = "0.0.6" }
+skilj-macros = { path = "skilj-macros", version = "0.0.6" }
+skilj-rest = { path = "skilj-rest", version = "0.0.6" }
+skilj = { path = "skilj", version = "0.0.6" }
+skilj-codegen = { path = "skilj-codegen", version = "0.0.6" }
