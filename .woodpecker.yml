@@ -1,0 +1,57 @@
+## Codeberg-hosted CI - see docs/architecture.md and CONTRIBUTING.md for
+## the checks themselves. `.forgejo/workflows/ci.yml` is the identical
+## pipeline written for Forgejo Actions; that path needs a self-hosted
+## runner Codeberg doesn't provide out of the box, so this Woodpecker
+## config (Codeberg's own first-class hosted CI - see
+## https://docs.codeberg.org/ci/) is what actually runs without any
+## infrastructure of our own. Keep both in sync if the check list ever
+## changes; this file is the one that runs automatically today.
+##
+## Must be enabled once per repo at https://ci.codeberg.org/repos/add
+## before it starts building - adding this file alone doesn't register
+## a webhook.
+##
+## Each step below runs in its own fresh container - only the workspace
+## (the checked-out repo, including `target/`) is shared across steps,
+## never anything installed into a container's own system dirs. That's
+## why `apt-get install libcurl4-openssl-dev`/`rustup component add`
+## live inside the one step that needs them rather than as their own
+## separate steps the way `.forgejo/workflows/ci.yml` has them (that
+## file's steps all share one long-lived container instead, so the
+## same split works there but would silently break here).
+
+when:
+  - event: push
+    branch: main
+  - event: pull_request
+
+steps:
+  - name: check-section-refs
+    image: rust:1-bookworm
+    commands:
+      # Validates every "§N" citation of docs/architecture.md's own
+      # section headings - see that script's own doc comment for why
+      # this exists (a past renumbering silently broke ~600 of them).
+      - scripts/check-section-refs.sh
+
+  - name: fmt
+    image: rust:1-bookworm
+    commands:
+      - rustup component add rustfmt
+      - cargo fmt --all -- --check
+
+  - name: build-clippy-test
+    image: rust:1-bookworm
+    commands:
+      # skilj-kafka's rdkafka dependency vendors librdkafka from source
+      # (cmake-build), which #includes curl/curl.h unconditionally even
+      # with CURL support compiled out - a real upstream quirk, not
+      # something this crate's own Cargo features avoid. See
+      # CONTRIBUTING.md's own note. (skilj-temporal no longer needs a
+      # system protoc as of 0.0.5 - it builds via temporalio-client's
+      # own vendored-protox feature instead.)
+      - apt-get update && apt-get install -y --no-install-recommends libcurl4-openssl-dev
+      - rustup component add clippy
+      - cargo build --workspace --all-targets
+      - cargo clippy --workspace --all-targets -- -D warnings
+      - cargo test --workspace
