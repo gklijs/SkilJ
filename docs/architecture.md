@@ -37,6 +37,7 @@ listed separately here; see that section itself for its own structure.
   - [2.2.2 Schema-per-bounded-context storage](#222-schema-per-bounded-context-storage)
   - [2.3 Property-based testing: `proptest`](#23-property-based-testing-proptest)
   - [2.4 Configuration: a plain builder, not a config-loading crate](#24-configuration-a-plain-builder-not-a-config-loading-crate)
+  - [2.5 Payload serialization: JSON only, not pluggable, permanently](#25-payload-serialization-json-only-not-pluggable-permanently)
 - [3. Crate and module structure](#crate-module-structure)
   - [3.1 Four crates, not one](#31-four-crates-not-one)
   - [3.2 `skilj-core`: grouped by domain concern](#32-skilj-core-grouped-by-domain-concern)
@@ -774,6 +775,39 @@ never SkilJ's. Consistent with the "library, not a framework" positioning
 the Allium spec keeps to throughout (see the scope header's exclusion of
 IdP trust configuration values as "runtime/library configuration...
 rather than modelled as domain state").
+
+### 2.5 Payload serialization: JSON only, not pluggable, permanently
+
+Raised while comparing SkilJ against Axon Framework and other DCB
+implementations, several of which (Axon's `Serializer` SPI, XStream/
+Jackson choice included) let a consuming application swap the wire/
+storage format for event and command payloads. SkilJ deliberately does
+not offer this, and the user confirmed this is not a "not yet" - it's a
+permanent, considered rejection, not tracked as an open item anywhere.
+
+The reason isn't inertia - a pluggable serializer would cut against
+several load-bearing decisions already made elsewhere in this document:
+`#[derive(Serialize, Deserialize, JsonSchema)]` ([§1.2](#12-json-schema-is-derived-from-the-rust-type-not-hand-written))
+derives the wire-visible JSON Schema *from* the same Rust type that
+(de)serializes the payload - a second serializer would need its own
+schema-derivation story, or the two would drift. `valid_tag_mappings`/
+`valid_sensitive_fields`/`private_fields` ([§2.2](#22-database-layer-sqlx), [§31](#private-fields-third-protection))
+all walk a `serde_json::Value` payload by field path (dot-separated JSON
+Pointer-ish keys) to find what to redact or index - a different
+serialization format has no equivalent structural walk for free.
+Payload upcasting ([§33](#payload-upcasting)) is implemented as an
+old-JSON-to-new-JSON transform chain; a second format multiplies that by
+however many formats are live at once. And every message-broker bridge
+([§40](#skilj-kafka-bridge)-[§42](#skilj-nats-bridge)) already assumes
+the payload on the wire is JSON, with no format negotiation.
+
+None of this is impossible to generalize - it's that doing so would
+mean re-deriving JSON Schema generation, sensitive-field/owner-tag field
+walking, upcasting, and every bridge against an abstract serializer
+trait instead of against `serde_json::Value` directly, for a capability
+this project has never had a concrete use case for. If that changes,
+it's a new design pass from scratch, not a resumption of a deferred
+item.
 
 ---
 
