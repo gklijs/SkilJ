@@ -24,6 +24,11 @@ when:
   - event: push
     branch: main
   - event: pull_request
+  # Without this, Woodpecker's own "Run pipeline" UI button creates a
+  # pipeline with event: manual, which matches neither entry above -
+  # surfaced as a bare "no matching workflows found", not an error tied
+  # to this file at all.
+  - event: manual
 
 steps:
   - name: check-section-refs
