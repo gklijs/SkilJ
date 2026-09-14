@@ -104,6 +104,7 @@ banking and courses) if you want to see more before committing.
 | [`skilj-kafka`](skilj-kafka) | Optional: a bridge between skilj's own event stream and Kafka, both directions - produce mapped events to a topic, consume a topic into `ExternalEventIngestion`/`CommandTrigger`. See [`docs/architecture.md` §40](docs/architecture.md#skilj-kafka-bridge). |
 | [`skilj-amqp`](skilj-amqp) | Optional: `skilj-kafka`'s own sibling for any AMQP 1.0 broker - Solace PubSub+, Azure Service Bus, ActiveMQ Artemis. See [`docs/architecture.md` §41](docs/architecture.md#skilj-amqp-bridge). |
 | [`skilj-nats`](skilj-nats) | Optional: a third bridge sibling, for NATS JetStream. See [`docs/architecture.md` §42](docs/architecture.md#skilj-nats-bridge). |
+| [`skilj-test-fixture`](skilj-test-fixture) | Optional dev-dependency: a given/when/then test harness for your own `CommandType::decide()`/`Projection::project()` - no database, no HTTP. See [`docs/architecture.md` §45](docs/architecture.md#given-when-then-test-fixture). |
 | [`skilj-macros`](skilj-macros) | Internal proc-macros, re-exported through `skilj-core`/`skilj` (not uniformly - each macro picks whichever crate it applies to) - you won't normally add this directly. |
 
 ## Documentation

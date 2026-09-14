@@ -6974,3 +6974,107 @@ parallelism, compounded by leftover orphaned `postgres` processes
 accumulating across a long session), not a regression this pass
 introduced - every test that hit it passes cleanly in isolation
 (`--test-threads=1` or run alone), including the newly-added ones.
+
+---
+
+<a id="given-when-then-test-fixture"></a>
+## 45. A given/when/then test fixture for decide()/project() (Codeberg issue #19)
+
+Raised comparing skilj against Axon Framework (`AggregateTestFixture`),
+Occurrent's Decider testing DSL, and Disintegrate's `Decision` testing
+support - every one of these ships an in-memory harness for a plugin
+author's own business logic. skilj had none: `skilj-demo`'s own tests
+exercised `decide()`/`project()` only indirectly, through a real
+Postgres-backed `Skilj` instance and, for commands, a full HTTP/GraphQL
+round trip - the right level for testing skilj's own engine
+(persistence, DCB conflict handling, access control), but heavy and slow
+for a plugin author who just wants to know whether their own
+`decide()`/`project()` produces the right answer.
+
+### Scope: deliberately narrower than it first sounds
+
+The issue's own proposal sketch mentions reusing
+`consistency_boundary_and_matching_events` to build the `matching_events`
+slice from raw, tagged events. Looked at closely, that machinery belongs
+to a different layer than this issue is actually about: `CommandType::
+decide()`/`Projection::project()` already take `&[Self::Event]` - the
+bounded context's own generated, *already-filtered, already-typed* event
+enum, never a raw `Event` with tags. Deriving a command's consistency
+tags from its payload and filtering a bounded context's full history
+down to that slice is real work, but it's `skilj`'s own engine's job
+(`db::process_command_transaction`'s real caller of
+`consistency_boundary_and_matching_events`, §19's own redispatch path),
+already covered end to end by `skilj-core/tests/submit_command.rs` and
+`skilj-demo`'s real-Postgres integration suite. Rebuilding that here,
+from a plugin author's own test file, would just be a second, slower
+copy of coverage that already exists - not what a plugin author testing
+their *own* logic in isolation needs.
+
+So `skilj-test-fixture`'s `GivenEvents` takes the "given" events exactly
+as `decide()`/`project()` would see them - `T::Event` values, given
+directly - and calls straight through to `T::decide()`/`T::project()`.
+No raw `Event`, no tags, no DCB boundary computation, no database, no
+HTTP. The events a test gives *are* the matching events, by construction
+- an honest, narrower promise than "replicates skilj's own filtering",
+stated as such in the crate's own doc comment rather than glossed over.
+
+### A new crate, not a feature-gated module in `skilj-core`
+
+The issue floated both. A separate crate (`skilj-test-fixture`, the same
+"depends on `skilj-core` directly" posture `skilj-inspector` already has,
+§14) won out: it publishes to crates.io on its own cadence alongside the
+other 12 (RELEASING.md), and a consumer adds it as an ordinary dev
+dependency with no Cargo feature to remember to enable - simpler for the
+actual audience (a plugin author's own `[dev-dependencies]`) than
+threading a `test-fixture` feature through `skilj-core` and hoping every
+downstream `Cargo.toml` opts in consistently.
+
+### API shape
+
+Two builders, one per plugin trait, both `.event(T::Event)`/`.events(...)`
+then a terminal call:
+
+- `command::GivenEvents<T: CommandType>` - `.when(payload: T::Payload)`
+  returns a `CommandOutcome` wrapping `T::decide()`'s own
+  `CommandDecision`. `.then_accepted(expected: Vec<EventSpec>)` asserts
+  `Accepted` and that every event's `event_type`/`payload` matches, in
+  order; `.then_rejected(expected_kind: &str)` asserts `Rejected` and
+  checks `kind` only - `reason` is human-facing prose, not something a
+  test should pin to exact wording. `.then(FnOnce(&CommandDecision))` is
+  an escape hatch for anything else.
+- `projection::GivenEvents<T: Projection>` - folds every given event into
+  `T::State::default()` via `T::project()`, under the single default key
+  (`Projection::keys`'s own default `""`) - a projection whose `keys()`
+  fans one event across several instances isn't covered by this pass,
+  same "real, unbuilt, out of scope" register as the tag-derivation gap
+  above. `.then_state(expected: T::State)` asserts the folded state
+  matches; `.then(FnOnce(&T::State))` is the same escape hatch.
+
+Both assertion paths compare via `serde_json::Value` (`serde_json::
+to_value` on both sides) rather than requiring `PartialEq`/`Debug` on
+`T::Payload`/`T::State` beyond what `CommandType`/`Projection` already
+demand - `AccountBalanceState` in `skilj-demo` needed no changes at all
+to work with `then_state`. A mismatch panics with both sides
+pretty-printed, so a failing test reads like a diff.
+
+### Tests and adopter proof
+
+`skilj-test-fixture`'s own `tests/fixture.rs` (9 tests) proves the
+builder/assertion logic itself against a tiny hand-rolled bounded
+context, including `#[should_panic]` cases for every mismatch path.
+`skilj-demo/tests/banking_fixture.rs` (5 tests) is the real adopter: the
+same `DepositMoney`/`WithdrawMoney`/`AccountBalance` scenarios `tests/
+banking.rs`'s real-Postgres suite already covers, run purely in-process
+here - no `Skilj::builder().build()`, no embedded Postgres, no HTTP.
+
+`cargo build/clippy -D warnings --workspace --all-targets` and `cargo
+fmt --check --all` clean.
+
+### Left for later
+
+The issue's own closing note - pairing this with the `skilj` Claude Code
+skill (Codeberg #3) as the natural next thing it points a plugin author
+at once they've added a `CommandType`/`Projection` - is a real, wanted
+follow-up (the skill package now mentions `skilj-test-fixture` as a
+pointer), not fully built out into a worked example inside the skill
+itself yet.

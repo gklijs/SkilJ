@@ -14,6 +14,7 @@ members = [
     "skilj-kafka",
     "skilj-amqp",
     "skilj-nats",
+    "skilj-test-fixture",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.
@@ -73,6 +74,14 @@ members = [
 #                 partitions; broker-assigned (stream, stream-sequence)
 #                 on every message, unlike AMQP's sender-optional
 #                 group-id/group-sequence).
+# skilj-test-fixture - a given/when/then test harness for a plugin
+#                 author's own CommandType::decide()/Projection::project()
+#                 (§45, Codeberg issue #19): no database, no HTTP, just the
+#                 typed events/payload decide()/project() already take.
+#                 Deliberately doesn't rederive DCB consistency tags or
+#                 matching_events - that's skilj's own engine, exercised
+#                 by skilj-core's integration tests instead. Depends on
+#                 skilj-core directly, same posture as skilj-inspector.
 
 [workspace.package]
 version = "0.0.6"
@@ -173,3 +182,4 @@ skilj-macros = { path = "skilj-macros", version = "0.0.6" }
 skilj-rest = { path = "skilj-rest", version = "0.0.6" }
 skilj = { path = "skilj", version = "0.0.6" }
 skilj-codegen = { path = "skilj-codegen", version = "0.0.6" }
+skilj-test-fixture = { path = "skilj-test-fixture", version = "0.0.6" }

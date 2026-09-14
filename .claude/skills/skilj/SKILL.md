@@ -104,6 +104,28 @@ const you define per type. Full detail, including manual (non-macro)
 registration and what happens with no bounded-context module at all:
 [references/registration.md](references/registration.md).
 
+## Testing your `decide()`/`project()`
+
+Once a `CommandType`/`Projection` is written, test its own logic with
+`skilj-test-fixture` - given/when/then against `decide()`/`project()`
+directly, no database, no HTTP:
+
+```rust
+use skilj_test_fixture::command::GivenEvents;
+
+GivenEvents::<WithdrawMoney>::new()
+    .event(BankingEvent::MoneyDeposited(MoneyDepositedPayload { account_id: "a".into(), amount: 100 }))
+    .when(WithdrawMoneyPayload { account_id: "a".into(), amount: 150 })
+    .then_rejected("insufficient_funds");
+```
+
+`skilj_test_fixture::projection::GivenEvents` is the `Projection`
+counterpart (`.then_state(expected)`). See `skilj-demo/tests/
+banking_fixture.rs` for a complete worked example, and
+docs/architecture.md §45 for what this deliberately does and doesn't
+replace - it's a complement to a real Postgres-backed integration test
+(`skilj-demo/tests/banking.rs`), not a substitute for one.
+
 ## If a registration or a submission gets rejected
 
 Don't guess at the cause - [references/common-mistakes.md](references/common-mistakes.md)

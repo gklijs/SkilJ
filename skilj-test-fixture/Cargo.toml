@@ -1,0 +1,16 @@
+[package]
+name = "skilj-test-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "A given/when/then test harness for a skilj plugin author's own CommandType::decide()/Projection::project() - no database, no HTTP. See docs/architecture.md §45 (Codeberg issue #19)."
+
+[dependencies]
+skilj-core.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+schemars.workspace = true

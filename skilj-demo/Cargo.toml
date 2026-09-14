@@ -39,6 +39,7 @@ skilj-codegen.workspace = true
 postgresql_embedded = "0.21.0"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+skilj-test-fixture.workspace = true
 # tests/snapshot.rs's own tampered-row proof needs a raw UPDATE against
 # {schema}.snapshots directly - not otherwise a dependency this crate's
 # own code needs.
