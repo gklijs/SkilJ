@@ -49,13 +49,18 @@ steps:
     image: rust:1-bookworm
     commands:
       # skilj-kafka's rdkafka dependency vendors librdkafka from source
-      # (cmake-build), which #includes curl/curl.h unconditionally even
-      # with CURL support compiled out - a real upstream quirk, not
-      # something this crate's own Cargo features avoid. See
-      # CONTRIBUTING.md's own note. (skilj-temporal no longer needs a
-      # system protoc as of 0.0.5 - it builds via temporalio-client's
-      # own vendored-protox feature instead.)
-      - apt-get update && apt-get install -y --no-install-recommends libcurl4-openssl-dev
+      # via the cmake-build feature - `rust:1-bookworm` has a C compiler
+      # but no `cmake` itself, unlike a typical dev machine where it's
+      # already present for other reasons (CONTRIBUTING.md's own note
+      # only had to call out the libcurl one below, since cmake was
+      # never the missing piece there). Separately, that vendored
+      # librdkafka #includes curl/curl.h unconditionally even with CURL
+      # support compiled out - a real upstream quirk, not something this
+      # crate's own Cargo features avoid - hence libcurl4-openssl-dev
+      # too. (skilj-temporal no longer needs a system protoc as of
+      # 0.0.5 - it builds via temporalio-client's own vendored-protox
+      # feature instead.)
+      - apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
       - rustup component add clippy
       - cargo build --workspace --all-targets
       - cargo clippy --workspace --all-targets -- -D warnings
