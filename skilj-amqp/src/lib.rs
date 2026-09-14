@@ -65,10 +65,20 @@
 //! lands) calls skilj again rather than silently skipping the message.
 
 use fe2o3_amqp::link::{RecvError, SendError};
-use fe2o3_amqp::types::messaging::{Data, Message, MessageId, Properties};
+use fe2o3_amqp::types::messaging::{ApplicationProperties, Data, Message, MessageId, Properties};
+use fe2o3_amqp::types::primitives::SimpleValue;
 use fe2o3_amqp::{Receiver as AmqpReceiver, Sender as AmqpSender};
 use serde::Deserialize;
 use std::collections::HashMap;
+
+/// The `application-properties` key this bridge uses for causation_id
+/// (Codeberg issue #18) - AMQP 1.0's standard `Properties` has a real
+/// `correlation-id` field (used directly, see [`produce_once`]/
+/// [`InboundMessageMeta::correlation_id`]) but no causation equivalent,
+/// so this rides in the message's own free-form application properties
+/// instead, the same register `skilj-kafka`/`skilj-nats` use a custom
+/// header for the identical reason.
+const CAUSATION_ID_PROPERTY: &str = "Skilj-Causation-Id";
 
 // --- outbound: skilj event -> AMQP ---
 
@@ -100,6 +110,17 @@ pub struct ConsumedEvent {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub tags: Vec<Tag>,
+    pub metadata: ConsumedEventMetadata,
+}
+
+/// The subset of `MetadataDto`'s wire shape (`skilj-rest/src/routes/mod.rs`)
+/// this bridge actually needs - the identical shape
+/// `skilj_kafka::ConsumedEventMetadata` already has.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumedEventMetadata {
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,13 +236,27 @@ pub async fn produce_once(
             }
         };
         let payload = event.payload.to_string().into_bytes();
+        // Codeberg issue #18 - `correlation-id` is a real AMQP 1.0
+        // standard property (`Properties::correlation_id`), set directly;
+        // `causation_id` has no standard equivalent, so it rides in
+        // `application-properties` instead (see `CAUSATION_ID_PROPERTY`'s
+        // own doc comment). correlation_id is always present by this
+        // point (the spec's own CorrelationIdIsAlwaysRecorded invariant);
+        // causation_id is absent for a root event.
+        let mut properties_builder = Properties::builder()
+            .group_id(group_id)
+            .group_sequence(group_sequence);
+        if let Some(id) = event.metadata.correlation_id.clone() {
+            properties_builder = properties_builder.correlation_id(MessageId::String(id));
+        }
+        let application_properties = event.metadata.causation_id.as_deref().map(|id| {
+            ApplicationProperties::builder()
+                .insert(CAUSATION_ID_PROPERTY, id)
+                .build()
+        });
         let message = Message::builder()
-            .properties(
-                Properties::builder()
-                    .group_id(group_id)
-                    .group_sequence(group_sequence)
-                    .build(),
-            )
+            .properties(properties_builder.build())
+            .application_properties(application_properties)
             .data(payload)
             .build();
         sender
@@ -328,6 +363,15 @@ pub struct InboundMessageMeta {
     pub group_id: Option<String>,
     pub group_sequence: Option<u32>,
     pub message_id: Option<MessageId>,
+    /// AMQP 1.0's own standard `correlation-id` property (Codeberg issue
+    /// #18) - rendered via [`message_id_to_string`], same treatment
+    /// `message_id` above already gets. Forwarded as `correlationId` on
+    /// whichever skilj call `dispatch_inbound_message` makes; `None`
+    /// leaves it absent on the wire, letting skilj generate one itself.
+    pub correlation_id: Option<MessageId>,
+    /// [`CAUSATION_ID_PROPERTY`]'s own value, read back from
+    /// `application-properties` - no standard AMQP property for this.
+    pub causation_id: Option<String>,
 }
 
 /// `MessageId` has no single canonical string form in the AMQP 1.0 spec
@@ -364,6 +408,7 @@ pub async fn dispatch_inbound_message(
     payload: &[u8],
 ) -> Result<(), BridgeError> {
     let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
+    let correlation_id = meta.correlation_id.as_ref().map(message_id_to_string);
 
     let response = match &mapping.action {
         InboundAction::Record { .. } => {
@@ -377,6 +422,8 @@ pub async fn dispatch_inbound_message(
             let mut body = serde_json::json!({
                 "payload": payload_json,
                 "sourceContent": "amqp",
+                "correlationId": correlation_id,
+                "causationId": meta.causation_id,
             });
             if let Some(dedupe) = dedupe {
                 body["dedupe"] = dedupe;
@@ -391,7 +438,11 @@ pub async fn dispatch_inbound_message(
             let mut request = http
                 .post(format!("{skilj_base_url}/v1/commands/trigger"))
                 .bearer_auth(&mapping.credential)
-                .json(&serde_json::json!({ "payload": payload_json }));
+                .json(&serde_json::json!({
+                    "payload": payload_json,
+                    "correlationId": correlation_id,
+                    "causationId": meta.causation_id,
+                }));
             if let Some(id) = &meta.message_id {
                 request = request.header("Idempotency-Key", message_id_to_string(id));
             }
@@ -455,10 +506,21 @@ pub async fn run_inbound(
             continue;
         };
         let properties = delivery.message().properties.as_ref();
+        let causation_id = delivery
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|props| props.get(CAUSATION_ID_PROPERTY))
+            .and_then(|v| match v {
+                SimpleValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
         let meta = InboundMessageMeta {
             group_id: properties.and_then(|p| p.group_id.clone()),
             group_sequence: properties.and_then(|p| p.group_sequence),
             message_id: properties.and_then(|p| p.message_id.clone()),
+            correlation_id: properties.and_then(|p| p.correlation_id.clone()),
+            causation_id,
         };
         let payload = delivery.body().0.as_ref();
         match dispatch_inbound_message(http, skilj_base_url, mapping, &meta, payload).await {

@@ -829,6 +829,66 @@ fn full_business_surfaces_lifecycle_end_to_end() {
         let commands = response["data"]["fetchCommands"].as_array().unwrap();
         assert_eq!(commands.len(), 2);
 
+        // Codeberg issue #18 - submitCommand echoes back the correlationId
+        // it actually stored (the caller's own, verbatim), and both
+        // queryEvents and fetchCommands can be scoped to exactly that one
+        // transaction via their own new correlationId argument.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!, $payload: String!, $corr: String) { \
+                submitCommand(boundedContext: $bc, commandTypeName: $name, payload: $payload, \
+                    correlationId: $corr) { \
+                    accepted triggeredEventSequences correlationId \
+                } \
+            }",
+            json!({
+                "bc": bc_name,
+                "name": "WithdrawMoney",
+                "payload": r#"{"amount":1}"#,
+                "corr": "test-correlation-42",
+            }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true);
+        assert_eq!(
+            response["data"]["submitCommand"]["correlationId"],
+            "test-correlation-42"
+        );
+        let correlated_sequence = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!, $corr: String) { \
+                queryEvents(boundedContext: $bc, eventTypes: [], correlationId: $corr) { \
+                    sequence \
+                } \
+            }",
+            json!({ "bc": bc_name, "corr": "test-correlation-42" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let correlated_events = response["data"]["queryEvents"].as_array().unwrap();
+        assert_eq!(correlated_events.len(), 1);
+        assert_eq!(correlated_events[0]["sequence"], correlated_sequence);
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!, $corr: String) { \
+                fetchCommands(boundedContext: $bc, commandTypes: [], correlationId: $corr) \
+            }",
+            json!({ "bc": bc_name, "corr": "test-correlation-42" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let correlated_commands = response["data"]["fetchCommands"].as_array().unwrap();
+        assert_eq!(correlated_commands, &vec![json!(r#"{"amount":1}"#)]);
+
         // Gating: no caller at all is rejected for submitCommand, before
         // anything runs.
         let response = graphql_request(

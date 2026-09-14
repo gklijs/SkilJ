@@ -94,6 +94,8 @@ fn event(event_type: EventType, sequence: i64, payload: &str, tags: Vec<Tag>) ->
             version: 1,
             client_id: "someone".into(),
             created_at: timestamp(0),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence,
         tags,
@@ -136,6 +138,7 @@ fn query_events_returns_only_matching_later_events_rendered() {
         &[],
         None,
         Some(0),
+        None,
         &events,
         |_, _| unreachable!(),
         &[],
@@ -162,6 +165,7 @@ fn query_events_with_no_after_sequence_starts_from_the_beginning() {
         &[],
         None,
         None,
+        None,
         &events,
         |_, _| unreachable!(),
         &[],
@@ -184,6 +188,7 @@ fn query_events_with_empty_event_types_matches_every_type() {
     let rendered = event_store::query_events(
         &mapping,
         &[],
+        None,
         None,
         None,
         &events,
@@ -210,6 +215,7 @@ fn query_events_filters_by_named_event_type() {
         &[placed],
         None,
         None,
+        None,
         &events,
         |_, _| unreachable!(),
         &[],
@@ -234,6 +240,7 @@ fn query_events_filters_by_any_matching_tag() {
         &mapping,
         &[],
         Some(&[tag("account", "A")]),
+        None,
         None,
         &events,
         |_, _| unreachable!(),
@@ -263,6 +270,7 @@ fn query_events_never_returns_events_from_another_bounded_context() {
         &[],
         None,
         None,
+        None,
         &[foreign_event],
         |_, _| unreachable!(),
         &[],
@@ -277,8 +285,17 @@ fn query_events_never_returns_events_from_another_bounded_context() {
 fn query_events_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Admin);
 
-    let err = event_store::query_events(&mapping, &[], None, None, &[], |_, _| unreachable!(), &[])
-        .unwrap_err();
+    let err = event_store::query_events(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &[],
+        |_, _| unreachable!(),
+        &[],
+    )
+    .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -288,8 +305,17 @@ fn query_events_rejects_a_revoked_mapping() {
 fn query_events_rejects_a_write_level_mapping() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write);
 
-    let err = event_store::query_events(&mapping, &[], None, None, &[], |_, _| unreachable!(), &[])
-        .unwrap_err();
+    let err = event_store::query_events(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &[],
+        |_, _| unreachable!(),
+        &[],
+    )
+    .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -313,6 +339,7 @@ fn query_events_rejects_a_named_event_type_from_another_bounded_context() {
     let err = event_store::query_events(
         &mapping,
         &[foreign_type],
+        None,
         None,
         None,
         &[],
@@ -340,7 +367,7 @@ fn count_events_counts_every_matching_event_regardless_of_sequence() {
         event(et, 1, "b", Vec::new()),
     ];
 
-    let count = event_store::count_events(&mapping, &[], None, &events).unwrap();
+    let count = event_store::count_events(&mapping, &[], None, None, &events).unwrap();
 
     assert_eq!(count, 2);
 }
@@ -353,7 +380,7 @@ fn count_events_with_empty_event_types_matches_every_type() {
         event(event_type("OrderCancelled"), 1, "b", Vec::new()),
     ];
 
-    let count = event_store::count_events(&mapping, &[], None, &events).unwrap();
+    let count = event_store::count_events(&mapping, &[], None, None, &events).unwrap();
 
     assert_eq!(count, 2);
 }
@@ -374,7 +401,8 @@ fn count_events_filters_by_named_event_type_and_tag() {
     ];
 
     let count =
-        event_store::count_events(&mapping, &[et], Some(&[tag("account", "A")]), &events).unwrap();
+        event_store::count_events(&mapping, &[et], Some(&[tag("account", "A")]), None, &events)
+            .unwrap();
 
     assert_eq!(count, 1);
 }
@@ -384,7 +412,7 @@ fn count_events_filters_by_named_event_type_and_tag() {
 fn count_events_rejects_a_revoked_mapping() {
     let mapping = access_mapping(RoleStatus::Revoked, AccessLevel::Admin);
 
-    let err = event_store::count_events(&mapping, &[], None, &[]).unwrap_err();
+    let err = event_store::count_events(&mapping, &[], None, None, &[]).unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -394,7 +422,7 @@ fn count_events_rejects_a_revoked_mapping() {
 fn count_events_rejects_a_write_level_mapping() {
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write);
 
-    let err = event_store::count_events(&mapping, &[], None, &[]).unwrap_err();
+    let err = event_store::count_events(&mapping, &[], None, None, &[]).unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -414,7 +442,7 @@ fn count_events_rejects_a_named_event_type_from_another_bounded_context() {
         ..event_type("InvoiceIssued")
     };
 
-    let err = event_store::count_events(&mapping, &[foreign_type], None, &[]).unwrap_err();
+    let err = event_store::count_events(&mapping, &[foreign_type], None, None, &[]).unwrap_err();
 
     assert_eq!(
         err.code(),

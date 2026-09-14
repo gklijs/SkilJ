@@ -396,6 +396,8 @@ fn sample_event(bc: &BoundedContext, et: &EventType, sequence: i64, client_id: &
             version: et.schema_version,
             client_id: client_id.to_string(),
             created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence,
         tags: vec![Tag {

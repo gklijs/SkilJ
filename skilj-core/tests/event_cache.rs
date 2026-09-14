@@ -157,6 +157,8 @@ async fn insert_event_bypassing_cache(pool: &Pool, bc: &BoundedContext, et: &Eve
             version: et.schema_version,
             client_id: "bypassing-writer".to_string(),
             created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence: seq,
         tags: Vec::new(),

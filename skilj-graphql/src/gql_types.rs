@@ -754,6 +754,10 @@ pub fn event_meta_object() -> Object {
 
     gql_object!(Event => "EventMeta" {
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.metadata.created_at.to_rfc3339()),
+        // Codeberg issue #18. `correlationId` is null only for a record
+        // written before this field existed.
+        scalar "correlationId": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.metadata.correlation_id.clone()),
+        scalar "causationId": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.metadata.causation_id.clone()),
         object "origin": TypeRef::named_nn("EventOrigin") => |e| Some(e.origin.clone()),
     })
 }
@@ -820,6 +824,12 @@ pub struct SubmitCommandResult {
     // is that prior outcome's, not a fresh decision. Always `false` when
     // no key was given, matching today's behaviour exactly.
     pub deduplicated: bool,
+    // Codeberg issue #18: the resulting Command's own correlation_id -
+    // the caller's, if it supplied one, or generated server-side
+    // otherwise. `None` for a rejection (nothing was stored) and for a
+    // deduplicated outcome (the cached prior answer doesn't carry it -
+    // see the resolver's own construction of this struct).
+    pub correlation_id: Option<String>,
 }
 
 pub fn submit_command_payload_object() -> Object {
@@ -835,6 +845,7 @@ pub fn submit_command_payload_object() -> Object {
         scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_reason.clone()),
         scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
         scalar "deduplicated": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.deduplicated),
+        scalar "correlationId": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.correlation_id.clone()),
     })
     .field(Field::new(
         "triggeredEventSequences",

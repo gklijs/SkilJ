@@ -269,6 +269,8 @@ async fn insert_deposit(
             version: et.schema_version,
             client_id: "test".to_string(),
             created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence: seq,
         tags,

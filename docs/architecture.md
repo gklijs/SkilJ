@@ -95,6 +95,7 @@ listed separately here; see that section itself for its own structure.
 - [41. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)](#skilj-amqp-bridge)
 - [42. `skilj-nats`: a bridge to NATS JetStream](#skilj-nats-bridge)
 - [43. Stopping a new subscriber from replaying all of history](#new-subscriber-replay-fix)
+- [44. Correlation/causation ids on commands and events (Codeberg issue #18)](#correlation-causation-ids)
 
 ---
 
@@ -6804,3 +6805,172 @@ ran for real, not from `cargo build` alone. `cargo build/clippy -D
 warnings/test --workspace` and `cargo fmt --check` clean; `allium check`
 unchanged from baseline (0 errors, same warning/info set as §43's own
 first pass); `allium analyse` byte-identical to baseline.
+
+---
+
+<a id="correlation-causation-ids"></a>
+## 44. Correlation/causation ids on commands and events (Codeberg issue #18)
+
+Raised comparing skilj against Axon Framework and other event-sourcing
+frameworks for gaps: nothing recorded "which command caused this event"
+or "which business transaction this belongs to" as a durable, queryable
+field. `Event.origin`'s `CommandTriggered` variant already links an
+event back to the `Command` that produced it, but that's a single hop -
+nothing threaded an id across a longer chain (a submitted command → the
+events it triggers → a `CrossContextRoute`-triggered command in another
+bounded context → more events). Deliberately distinct from the OTel
+trace id already threaded on REST/GraphQL error responses (§10b) - a
+trace id is ephemeral and exporter-dependent; these are durable, written
+into the row, and queryable from the store itself years later.
+
+### Spec (`specs/skilj.allium`)
+
+`value Metadata` gained `correlation_id: String?`/`causation_id: String?`,
+with a note distinguishing both from OTel tracing explicitly. A new
+shared black box, `valid_correlation_id(id) -> Boolean` (`None`/empty
+vacuously valid, otherwise ≤ 200 characters, no charset restriction -
+deliberately looser than `valid_bounded_context_name`, since this is
+arbitrary caller/bridge-supplied trace data, never embedded as an
+identifier anywhere), gates both fields wherever they're set.
+`CommandSubmission`/`CommandTrigger`/`ExternalEventIngestion`/
+`DirectEventCreation` all gained the pair on their own `provides:` facts
+(the last two needed it too - a message-broker bridge attaches an
+upstream trace id exactly there), each with its own `@guarantee`.
+`ProcessCommand`'s `ensures:` stamps `Command.created(...)` with
+`correlation_id ?? generate_id()` (every stored command ends up with
+one) and `causation_id` passed through as-is (`None` for a plain
+submission); every `CommandTriggered.created(...)` in the same rule
+inherits the command's own `correlation_id` and gets
+`causation_id: command.id`. `CreateExternalEvent`/`CreateDirectEvent`
+generate when absent identically; `CreateSystemEvent` always generates
+(a scheduler tick has no caller to inherit from). A new invariant,
+`CorrelationIdIsAlwaysRecorded`, checks `correlation_id != null` across
+every stored `Command`/`Event` - deliberately *not* extended to
+`causation_id`, whose whole point is that `null` is a true, common
+statement ("this is a root"). `allium check`/`allium analyse` both
+unchanged from baseline after the full spec pass.
+
+### Core types and engine (`skilj-core`)
+
+`shared::Metadata` gained the two `Option<String>` fields (honest at the
+type level regardless of the "always generated" guarantee, since a row
+written before this existed genuinely has neither).
+`event_store::valid_correlation_id`/`CORRELATION_ID_MAX_LEN` (200) and a
+new `Error::CorrelationIdTooLong` variant implement the spec's black
+box. A new `event_causation_id(event: &Event) -> String` (
+`"{bounded_context}:{sequence}"`) is the stable string a causing `Event`
+is named by, since `Event` deliberately has no synthetic id of its own
+the way `Command.id` does. `process_command`, `create_external_event`,
+`create_direct_event`, `authorise_command_submission`/
+`authorise_command_trigger` (whose `CommandAuthorised` fan-in struct now
+carries both fields through to `process_command`), `submit_command`, and
+`decide_and_submit_command` all gained `correlation_id: Option<&str>`/
+`causation_id: Option<&str>` parameters, threaded end to end.
+
+**`CrossContextRoute`'s own attachment point** (`db::catch_up_cross_context_route`,
+§36): the routed command's `correlation_id` is forward-carried from the
+source event's own (always-present) one, and its `causation_id` is
+`Some(event_causation_id(source_event))` - replacing the previous
+`client_id: "cross-context-route"` with no upstream link at all with a
+real, traceable answer to "what caused this."
+
+### Persistence
+
+`events`/`commands` each gained `metadata_correlation_id`/
+`metadata_causation_id TEXT` columns (both in the fresh-provision
+`CREATE TABLE` and via a new `ensure_correlation_causation_columns`
+patch for an already-provisioned bounded context, the same
+`ensure_event_scoping_columns`-style idiom every prior additive column
+in this schema uses - no advisory-lock/PK-swap machinery needed, this is
+purely additive and nullable). A partial index on each
+(`WHERE metadata_correlation_id IS NOT NULL`) backs the new query
+surface below.
+
+### Wire contracts
+
+GraphQL: `submitCommand` gained optional `correlationId`/`causationId`
+arguments and echoes the resolved `correlationId` back on
+`SubmitCommandPayload` (`None` for a rejection or a deduplicated
+outcome - the latter has no fresh `Command` to read one off of).
+`EventMeta` gained `correlationId`/`causationId` fields, falling out
+"for free" wherever `Metadata` is already surfaced. The deliberately
+narrow `MatchingEvent`/raw `EventSubscription` tuple stay unchanged, per
+their own already-documented "narrow on purpose" reasoning.
+
+REST: `ExternalEventRequest`/`DirectEventRequest`/`CommandTriggerRequest`
+each gained optional `correlationId`/`causationId` body fields;
+`CommandTriggerResponse` echoes `correlationId` back identically to
+GraphQL's `SubmitCommandResult`; `MetadataDto`/`EventDto` expose both on
+every existing read path.
+
+### Query-by-correlation-id
+
+Checked first: the existing generic `Filter`/`filters=` mechanism only
+ever matches against `event.payload` (`matches_filters` parses it as
+JSON) - it has no access to `Metadata` at all, so it couldn't be reused
+as-is. Instead, `query_events`/`count_events`/`fetch_commands`/
+`fetch_events` each gained a `correlation_id: Option<&str>` parameter,
+the same "typed filter parameter" shape `fetch_commands` already used
+for `metadata.created_at` - wired through GraphQL's `queryEvents`/
+`countEvents`/`fetchCommands` and REST's `GET /v1/events?correlationId=`.
+
+### Message-broker bridges
+
+All three (`skilj-kafka`/`skilj-amqp`/`skilj-nats`) gained symmetric
+inbound/outbound plumbing. Causation has no standard protocol concept in
+any of them, so all three use a custom `Skilj-Causation-Id`
+header/application-property. Correlation prefers each protocol's own
+native concept where one exists:
+
+- **`skilj-amqp`**: AMQP 1.0's standard `correlation-id` message
+  property (never read or set before this pass) is used directly;
+  causation rides in `application-properties` (no standard field for
+  it).
+- **`skilj-kafka`**: no native correlation concept in the protocol
+  (headers are fully custom either way) - `Skilj-Correlation-Id`/
+  `Skilj-Causation-Id` headers, symmetric with AMQP's naming. Not to be
+  confused with the pre-existing `correlation_key` (an unrelated
+  DCB-tag-derived Kafka *message key* for partition routing).
+- **`skilj-nats`**: a real naming collision to resolve - `Skilj-Correlation-Key`
+  already existed (a DCB-tag-derived header for consumer-side
+  filtering/grouping, unrelated to a business-transaction id). Resolved
+  by using `Skilj-Correlation-Id` (`-Id`, not `-Key`) for the new
+  concept, with cross-referencing doc comments at both header constants
+  so the two are never conflated again.
+
+All three: an inbound message with no correlation header simply omits
+the field on the `ExternalEventRequest`/`CommandTriggerRequest` the
+bridge posts - skilj-core's own generate-if-absent behaviour takes over
+from there, no bridge-side generation logic needed.
+
+### Tests and verification
+
+A new `skilj-core/tests/correlation_causation.rs` (12 tests, pure/no-DB)
+covers generation-when-absent, verbatim preservation, inheritance across
+every `CommandTriggered` event, the length-cap rejection on both fields,
+and `event_causation_id`'s composed string. `skilj/tests/
+cross_context_route.rs`'s own end-to-end test gained real-Postgres
+assertions that a routed command's `correlation_id`/`causation_id`
+actually match the source event's, not just that the pure functions
+agree. `skilj/tests/graphql_business_surfaces.rs` and `skilj/tests/
+event_fetch_rest.rs` each gained a real end-to-end round trip
+(submit/create with an explicit id, read it back via `queryEvents`/
+`fetchCommands`/`GET /v1/events?correlationId=`). All three bridge
+crates' own real-broker integration tests gained one new case each
+(outbound header propagation via the existing round-trip test, plus a
+new dedicated inbound-forwarding test).
+
+`cargo build/clippy -D warnings --workspace --all-targets` and `cargo
+fmt --check` clean. `cargo test -p skilj-core` (real embedded Postgres,
+~710 tests across every test binary) fully green. Running `-p skilj`'s
+own real-Postgres integration suite under this sandbox's default test
+parallelism intermittently hits `Database(PoolTimedOut)` inside
+`Skilj::builder().build()` - confirmed, by `git stash`-ing this entire
+change and rerunning the identical failing test against the unmodified
+baseline, to be a **pre-existing environmental resource-contention
+artifact** (many concurrent embedded-Postgres instances exhausting this
+sandbox's connection/FD budget under `cargo test`'s default
+parallelism, compounded by leftover orphaned `postgres` processes
+accumulating across a long session), not a regression this pass
+introduced - every test that hit it passes cleanly in isolation
+(`--test-threads=1` or run alone), including the newly-added ones.

@@ -295,6 +295,8 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             &EventCache::new(16),
             &token,
             serde_json::json!({"email": plaintext_email, "user_id": "u1"}).to_string(),
+            None,
+            None,
             test_now(),
             Some(&master_key),
         )

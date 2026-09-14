@@ -98,6 +98,8 @@ fn event(et: &EventType, sequence: i64, company: Option<&str>) -> Event {
             version: et.schema_version,
             client_id: "someone".into(),
             created_at: timestamp(0),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence,
         tags: match company {
@@ -222,9 +224,17 @@ fn query_events_filters_out_events_owned_by_a_different_scope() {
     ];
     let mapping = access_mapping(AccessLevel::Admin, Some("company-a"));
 
-    let result =
-        event_store::query_events(&mapping, &[], None, None, &events, resolve_data_key, &[])
-            .unwrap();
+    let result = event_store::query_events(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &events,
+        resolve_data_key,
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].0, 0);
@@ -239,9 +249,17 @@ fn query_events_returns_everything_for_an_unscoped_grant() {
     ];
     let mapping = access_mapping(AccessLevel::Admin, None);
 
-    let result =
-        event_store::query_events(&mapping, &[], None, None, &events, resolve_data_key, &[])
-            .unwrap();
+    let result = event_store::query_events(
+        &mapping,
+        &[],
+        None,
+        None,
+        None,
+        &events,
+        resolve_data_key,
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(result.len(), 2);
 }
@@ -256,7 +274,7 @@ fn count_events_reflects_the_same_owner_filtering_as_query_events() {
     ];
     let mapping = access_mapping(AccessLevel::Admin, Some("company-a"));
 
-    let count = event_store::count_events(&mapping, &[], None, &events).unwrap();
+    let count = event_store::count_events(&mapping, &[], None, None, &events).unwrap();
 
     assert_eq!(count, 2);
 }
@@ -298,7 +316,7 @@ fn fetch_events_filters_by_the_tokens_own_scope() {
     ];
     let token = read_token(&et, Some("company-a"));
 
-    let result = event_store::fetch_events(&token, &events, &[], None).unwrap();
+    let result = event_store::fetch_events(&token, &events, &[], None, None).unwrap();
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].sequence, 0);
@@ -313,7 +331,7 @@ fn fetch_events_returns_everything_for_an_unscoped_token() {
     ];
     let token = read_token(&et, None);
 
-    let result = event_store::fetch_events(&token, &events, &[], None).unwrap();
+    let result = event_store::fetch_events(&token, &events, &[], None, None).unwrap();
 
     assert_eq!(result.len(), 2);
 }

@@ -77,6 +77,16 @@ pub type PullConsumer = Consumer<PullConfig>;
 use futures_util::TryStreamExt;
 use serde::Deserialize;
 
+/// Header names for the two Codeberg-issue-#18 ids this bridge carries,
+/// both directions. **Deliberately not `Skilj-Correlation-Key`** -
+/// that's a pre-existing, unrelated header (a DCB-tag-derived value for
+/// a downstream consumer's own filtering/grouping, see
+/// [`OutboundMapping::correlation_tag_key`]/[`correlation_key`]), not a
+/// business-transaction id - the two must not be conflated, hence `-Id`
+/// rather than `-Key` here.
+const CORRELATION_ID_HEADER: &str = "Skilj-Correlation-Id";
+const CAUSATION_ID_HEADER: &str = "Skilj-Causation-Id";
+
 // --- outbound: skilj event -> NATS JetStream ---
 
 /// One skilj `EventType`'s own mapping to a NATS subject - the outbound
@@ -107,6 +117,18 @@ pub struct ConsumedEvent {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub tags: Vec<Tag>,
+    pub metadata: ConsumedEventMetadata,
+}
+
+/// The subset of `MetadataDto`'s wire shape (`skilj-rest/src/routes/mod.rs`)
+/// this bridge actually needs - the identical shape
+/// `skilj_kafka::ConsumedEventMetadata`/`skilj_amqp::ConsumedEventMetadata`
+/// already have.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumedEventMetadata {
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +239,17 @@ pub async fn produce_once(
         if let Some(key) = correlation_key(mapping.correlation_tag_key.as_deref(), &event.tags) {
             publish = publish.header("Skilj-Correlation-Key", key.as_str());
         }
+        // Codeberg issue #18 - always present on correlation_id (the
+        // spec's own CorrelationIdIsAlwaysRecorded invariant), absent for
+        // a root event's causation_id. Distinct headers from
+        // `Skilj-Correlation-Key` above - see this module's own doc
+        // comment on `CORRELATION_ID_HEADER`.
+        if let Some(id) = &event.metadata.correlation_id {
+            publish = publish.header(CORRELATION_ID_HEADER, id.as_str());
+        }
+        if let Some(id) = &event.metadata.causation_id {
+            publish = publish.header(CAUSATION_ID_HEADER, id.as_str());
+        }
         jetstream
             .send_publish(mapping.subject.clone(), publish)
             .await?
@@ -316,6 +349,12 @@ pub struct InboundMessageMeta {
     pub stream: String,
     pub stream_sequence: u64,
     pub message_id: Option<String>,
+    /// [`CORRELATION_ID_HEADER`]/[`CAUSATION_ID_HEADER`]'s own values
+    /// (Codeberg issue #18) - both sender-optional, the same
+    /// "may or may not be populated" story `message_id` above already
+    /// has.
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
 }
 
 impl InboundMessageMeta {
@@ -336,10 +375,22 @@ impl InboundMessageMeta {
             .as_ref()
             .and_then(|h| h.get("Nats-Msg-Id"))
             .map(|v| v.to_string());
+        let correlation_id = message
+            .headers
+            .as_ref()
+            .and_then(|h| h.get(CORRELATION_ID_HEADER))
+            .map(|v| v.to_string());
+        let causation_id = message
+            .headers
+            .as_ref()
+            .and_then(|h| h.get(CAUSATION_ID_HEADER))
+            .map(|v| v.to_string());
         Ok(InboundMessageMeta {
             stream: info.stream.to_string(),
             stream_sequence: info.stream_sequence,
             message_id,
+            correlation_id,
+            causation_id,
         })
     }
 }
@@ -371,6 +422,8 @@ pub async fn dispatch_inbound_message(
             let mut body = serde_json::json!({
                 "payload": payload_json,
                 "sourceContent": "nats-jetstream",
+                "correlationId": meta.correlation_id,
+                "causationId": meta.causation_id,
             });
             match i64::try_from(meta.stream_sequence) {
                 Ok(sequence) => {
@@ -398,7 +451,11 @@ pub async fn dispatch_inbound_message(
             let mut request = http
                 .post(format!("{skilj_base_url}/v1/commands/trigger"))
                 .bearer_auth(&mapping.credential)
-                .json(&serde_json::json!({ "payload": payload_json }));
+                .json(&serde_json::json!({
+                    "payload": payload_json,
+                    "correlationId": meta.correlation_id,
+                    "causationId": meta.causation_id,
+                }));
             if let Some(id) = &meta.message_id {
                 request = request.header("Idempotency-Key", id.as_str());
             }

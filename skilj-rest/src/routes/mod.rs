@@ -321,6 +321,16 @@ struct ExternalEventRequest {
     // before this handler ever sees it - see db::DedupeCursor's own doc
     // comment for the full reasoning.
     dedupe: Option<DedupeRequest>,
+    // Codeberg issue #18 - an adapter's own attachment point for an
+    // upstream trace id (a message-broker bridge forwarding the id its
+    // own broker already carried). `correlation_id` omitted means
+    // generated server-side, never that the mechanism is skipped -
+    // unlike `dedupe`/`idempotency_key`, every stored record ends up
+    // with one regardless. Neither field takes any part in the dedupe
+    // mechanism above - a redelivery with a fresh correlation_id is
+    // still the same redelivery.
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -341,8 +351,12 @@ struct ExternalEventResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DirectEventRequest {
     payload: serde_json::Value,
+    // See `ExternalEventRequest`'s own identical pair (Codeberg issue #18).
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -358,6 +372,13 @@ struct MetadataDto {
     version: i64,
     client_id: String,
     created_at: chrono::DateTime<Utc>,
+    // Codeberg issue #18. `correlation_id` is `None` only for a record
+    // written before this field existed - see `Metadata`'s own doc
+    // comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    causation_id: Option<String>,
 }
 
 /// `payload` is re-parsed as native JSON (not left as the stored string)
@@ -395,6 +416,8 @@ impl From<&Event> for EventDto {
                 version: e.metadata.version,
                 client_id: e.metadata.client_id.clone(),
                 created_at: e.metadata.created_at,
+                correlation_id: e.metadata.correlation_id.clone(),
+                causation_id: e.metadata.causation_id.clone(),
             },
         }
     }
@@ -429,10 +452,15 @@ struct ConsumeResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EventsQuery {
     #[serde(default)]
     filter: Vec<String>,
     after: Option<i64>,
+    // Codeberg issue #18 - "show me everything in this transaction",
+    // the REST-side counterpart to `queryEvents`'s own `correlationId`
+    // GraphQL argument.
+    correlation_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -497,8 +525,17 @@ struct AckRequest {
 struct EmptyResponse {}
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CommandTriggerRequest {
     payload: serde_json::Value,
+    // See `ExternalEventRequest`'s own identical pair (Codeberg issue
+    // #18) - unlike that surface, a plain command trigger has no
+    // upstream event of its own to attach a `causation_id` from, but a
+    // bridge fronting this route may still know one (an upstream
+    // broker's own message id), so it's accepted here too rather than
+    // special-cased away.
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 }
 
 /// §7.3's `-> 200 { accepted: true, triggeredEventSequences: [...] }` /
@@ -522,6 +559,15 @@ struct CommandTriggerResponse {
     // decision. Always `false` when no header was given, matching
     // today's behaviour exactly.
     deduplicated: bool,
+    // Codeberg issue #18: echoes back the correlation_id the resulting
+    // Command actually ended up with - the caller's own, if it supplied
+    // one, or the one skilj generated on its behalf otherwise. `None`
+    // for a rejection (`process_command` never runs, so nothing was ever
+    // stored to have one) and for a deduplicated outcome (a cached prior
+    // answer carries only `triggered_event_sequences` - the original
+    // Command itself isn't re-fetched to answer this).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<String>,
 }
 
 // --- handlers ---
@@ -549,6 +595,8 @@ async fn post_events_external(
         payload,
         body.source_content,
         body.source_context,
+        body.correlation_id,
+        body.causation_id,
         body.dedupe.as_ref().map(|d| db::DedupeCursor {
             partition_key: &d.partition_key,
             sequence: d.sequence,
@@ -595,6 +643,8 @@ async fn post_events_direct(
         &state.event_cache,
         &token,
         payload,
+        body.correlation_id,
+        body.causation_id,
         Utc::now(),
         state.encryption_master_key.as_ref(),
     )
@@ -624,7 +674,13 @@ async fn get_events(
     )
     .await?;
 
-    let matched = event_store::fetch_events(&token, &events, &filters, query.after)?;
+    let matched = event_store::fetch_events(
+        &token,
+        &events,
+        &filters,
+        query.after,
+        query.correlation_id.as_deref(),
+    )?;
     let next_cursor = matched
         .last()
         .map(|e| e.sequence.to_string())
@@ -747,7 +803,12 @@ async fn post_commands_trigger(
     // delivery. See `reject_reserved_idempotency_key`'s own doc comment.
     event_store::reject_reserved_idempotency_key(idempotency_key)?;
 
-    let authorised = event_store::authorise_command_trigger(&token, payload)?;
+    let authorised = event_store::authorise_command_trigger(
+        &token,
+        payload,
+        body.correlation_id,
+        body.causation_id,
+    )?;
     let bounded_context_name = authorised.command_type.bounded_context.name.clone();
     let span = tracing::Span::current();
     span.record("bounded_context", bounded_context_name.as_str());
@@ -769,6 +830,8 @@ async fn post_commands_trigger(
         &authorised.command_type,
         &authorised.payload,
         &authorised.client_id,
+        authorised.correlation_id.as_deref(),
+        authorised.causation_id.as_deref(),
         state.encryption_master_key.as_ref(),
         Utc::now(),
         idempotency_key,
@@ -790,13 +853,15 @@ async fn post_commands_trigger(
             rejection_reason: Some(reason),
             rejection_kind: Some(kind),
             deduplicated: false,
+            correlation_id: None,
         },
-        db::SubmitCommandOutcome::Accepted { events, .. } => CommandTriggerResponse {
+        db::SubmitCommandOutcome::Accepted { command, events } => CommandTriggerResponse {
             accepted: true,
             triggered_event_sequences: Some(events.iter().map(|e| e.sequence).collect()),
             rejection_reason: None,
             rejection_kind: None,
             deduplicated: false,
+            correlation_id: command.metadata.correlation_id,
         },
         // Codeberg issue #12: a cached prior answer, not a fresh
         // decision.
@@ -808,6 +873,7 @@ async fn post_commands_trigger(
             rejection_reason: None,
             rejection_kind: None,
             deduplicated: true,
+            correlation_id: None,
         },
     }))
 }

@@ -29,7 +29,8 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{ClientConfig, Message};
 use serde_json::{json, Value};
 use skilj_kafka::{
-    dispatch_inbound_message, produce_once, InboundAction, InboundMapping, OutboundMapping,
+    dispatch_inbound_message, header_str, produce_once, InboundAction, InboundMapping,
+    OutboundMapping,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -327,6 +328,7 @@ fn an_order_placed_event_is_produced_to_kafka_with_its_own_tag_as_the_key() {
                 "eventType": "OrderPlaced",
                 "payload": { "orderId": "o-42" },
                 "tags": [{ "key": "order", "value": "o-42" }],
+                "metadata": { "correlationId": "corr-42", "causationId": null },
             })],
         );
 
@@ -362,6 +364,16 @@ fn an_order_placed_event_is_produced_to_kafka_with_its_own_tag_as_the_key() {
         let payload: Value =
             serde_json::from_slice(msg.payload().expect("message must have a payload")).unwrap();
         assert_eq!(payload, json!({ "orderId": "o-42" }));
+        // Codeberg issue #18 - the event's own correlation_id round-trips
+        // as a real Kafka header, distinct from `key` above (which is
+        // derived from the unrelated `order` DCB tag). No causation_id
+        // header at all - `causationId: null` on the consumed event
+        // means nothing is sent, not an empty-string header.
+        assert_eq!(
+            header_str(msg.headers(), "Skilj-Correlation-Id"),
+            Some("corr-42")
+        );
+        assert_eq!(header_str(msg.headers(), "Skilj-Causation-Id"), None);
 
         assert_eq!(
             mock_state.acked.lock().unwrap().as_slice(),
@@ -432,6 +444,8 @@ fn an_inbound_record_message_carries_its_own_real_partition_and_offset_as_dedupe
             msg.partition(),
             msg.offset(),
             msg.payload().unwrap(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -444,6 +458,93 @@ fn an_inbound_record_message_carries_its_own_real_partition_and_offset_as_dedupe
             json!(format!("{topic}:{}", msg.partition()))
         );
         assert_eq!(requests[0]["dedupe"]["sequence"], json!(msg.offset()));
+    });
+}
+
+/// Codeberg issue #18 - the inbound half of the same round trip the
+/// outbound test above already proves: a real Kafka message carrying
+/// `Skilj-Correlation-Id`/`Skilj-Causation-Id` headers gets them
+/// extracted (`header_str`) and forwarded as `correlationId`/`causationId`
+/// on the `POST /v1/events/external` body `dispatch_inbound_message`
+/// sends - not left for skilj to generate a fresh one, which is what
+/// would happen if this bridge silently dropped them.
+#[test]
+fn an_inbound_record_message_forwards_its_own_correlation_and_causation_headers() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-in-correlated");
+        create_topic(bootstrap_servers, &topic).await;
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-inbound-correlated")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+
+        let headers = rdkafka::message::OwnedHeaders::new()
+            .insert(rdkafka::message::Header {
+                key: "Skilj-Correlation-Id",
+                value: Some("upstream-corr-1"),
+            })
+            .insert(rdkafka::message::Header {
+                key: "Skilj-Causation-Id",
+                value: Some("upstream-cause-1"),
+            });
+        producer
+            .send(
+                FutureRecord::to(&topic)
+                    .payload(r#"{"orderId":"o-2"}"#)
+                    .key("k")
+                    .headers(headers),
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        let msg = recv_within(&consumer, Duration::from_secs(15)).await;
+        let correlation_id = header_str(msg.headers(), "Skilj-Correlation-Id");
+        let causation_id = header_str(msg.headers(), "Skilj-Causation-Id");
+
+        let mapping = InboundMapping {
+            credential: "external-token".to_string(),
+            action: InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        };
+        let http = reqwest::Client::new();
+        dispatch_inbound_message(
+            &http,
+            &skilj_base_url,
+            &mapping,
+            msg.topic(),
+            msg.partition(),
+            msg.offset(),
+            msg.payload().unwrap(),
+            correlation_id,
+            causation_id,
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_state.external_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["correlationId"], json!("upstream-corr-1"));
+        assert_eq!(requests[0]["causationId"], json!("upstream-cause-1"));
     });
 }
 
@@ -508,6 +609,8 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_offs
             msg.partition(),
             msg.offset(),
             msg.payload().unwrap(),
+            None,
+            None,
         )
         .await
         .unwrap();

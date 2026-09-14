@@ -309,6 +309,8 @@ async fn insert_ticket_opened(
             version: et.schema_version,
             client_id: "test".to_string(),
             created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence: seq,
         tags: vec![Tag {
@@ -347,6 +349,8 @@ async fn insert_ticket_commented(
             version: et.schema_version,
             client_id: "test".to_string(),
             created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence: seq,
         tags: Vec::new(), // untagged - TagMapping-derived, and this type declares none

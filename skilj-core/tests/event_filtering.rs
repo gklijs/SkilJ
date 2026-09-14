@@ -376,6 +376,8 @@ fn event(payload: &str) -> Event {
             version: 1,
             client_id: "test-client".into(),
             created_at: timestamp(0),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence: 0,
         tags: Vec::new(),

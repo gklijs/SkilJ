@@ -217,6 +217,8 @@ async fn create(
         format!(r#"{{"order_id":"{order_id}"}}"#),
         "kafka".to_string(),
         None,
+        None,
+        None,
         dedupe,
         test_now(),
         None,

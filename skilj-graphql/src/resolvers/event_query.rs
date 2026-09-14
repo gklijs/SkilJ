@@ -30,7 +30,7 @@ fn parse_tags(
     Ok(Some(tags))
 }
 
-/// `queryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [TagInput!], afterSequence: Int): [QueriedEvent!]!`
+/// `queryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [TagInput!], afterSequence: Int, correlationId: String): [QueriedEvent!]!`
 pub fn query_events_field() -> Field {
     Field::new(
         "queryEvents",
@@ -60,6 +60,14 @@ pub fn query_events_field() -> Field {
                     .filter(|v| !v.is_null())
                     .map(|v| v.i64())
                     .transpose()?;
+                // Codeberg issue #18 - "show me everything in this
+                // transaction".
+                let correlation_id = ctx
+                    .args
+                    .get("correlationId")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| v.string().ok())
+                    .map(|s| s.to_string());
 
                 // docs/architecture.md §19's "Problem 1" fix: a non-empty
                 // `tags` filter can go straight to the tag-indexed query
@@ -124,6 +132,7 @@ pub fn query_events_field() -> Field {
                     &event_types,
                     tags.as_deref(),
                     after_sequence,
+                    correlation_id.as_deref(),
                     &bounded_context_events,
                     |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
                     &private_field_grants,
@@ -149,9 +158,13 @@ pub fn query_events_field() -> Field {
         "afterSequence",
         TypeRef::named(TypeRef::INT),
     ))
+    .argument(InputValue::new(
+        "correlationId",
+        TypeRef::named(TypeRef::STRING),
+    ))
 }
 
-/// `countEvents(boundedContext: String!, eventTypes: [String!]!, tags: [TagInput!]): Int!`
+/// `countEvents(boundedContext: String!, eventTypes: [String!]!, tags: [TagInput!], correlationId: String): Int!`
 pub fn count_events_field() -> Field {
     Field::new("countEvents", TypeRef::named_nn(TypeRef::INT), |ctx| {
         FieldFuture::new(async move {
@@ -170,6 +183,12 @@ pub fn count_events_field() -> Field {
                 event_types.push(et);
             }
             let tags = parse_tags(ctx.args.get("tags"))?;
+            let correlation_id = ctx
+                .args
+                .get("correlationId")
+                .filter(|v| !v.is_null())
+                .and_then(|v| v.string().ok())
+                .map(|s| s.to_string());
 
             // See `query_events_field`'s own identical comment - same
             // §19 "Problem 1" fix, same tags-supplied-or-not branch.
@@ -199,6 +218,7 @@ pub fn count_events_field() -> Field {
                 &access_mapping,
                 &event_types,
                 tags.as_deref(),
+                correlation_id.as_deref(),
                 &bounded_context_events,
             )
             .map_err(to_graphql_error)?;
@@ -215,6 +235,10 @@ pub fn count_events_field() -> Field {
         TypeRef::named_nn_list_nn(TypeRef::STRING),
     ))
     .argument(InputValue::new("tags", TypeRef::named_nn_list("TagInput")))
+    .argument(InputValue::new(
+        "correlationId",
+        TypeRef::named(TypeRef::STRING),
+    ))
 }
 
 /// `inspectEvent(boundedContext: String!, sequence: Int!): InspectedEvent!`

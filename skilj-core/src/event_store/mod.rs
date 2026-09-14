@@ -332,6 +332,19 @@ pub struct Event {
     pub origin: EventOrigin,
 }
 
+/// The stable, composed string identifying an `Event` as a *cause*
+/// (Codeberg issue #18) - `Event` deliberately has no synthetic id of
+/// its own the way `Command.id` does (see the doc comment on `Command`'s
+/// own `id` field for why only that entity needed one), only `sequence`,
+/// which is unique per bounded context but not globally. Prefixing it
+/// with the bounded context name is enough to make it globally stable
+/// without adding a new column anywhere: used wherever an `Event` needs
+/// to be named as a `Metadata.causation_id` value - today, exactly
+/// `db::catch_up_cross_context_route`'s own routed-command construction.
+pub fn event_causation_id(event: &Event) -> String {
+    format!("{}:{}", event.bounded_context.name, event.sequence)
+}
+
 /// See `variant AllEventsSubscription`. `bounded_context`/`access_mapping`/
 /// `created_at`/`from_sequence` are `entity Subscription`'s own base
 /// fields, carried on each variant directly - the same "no wrapper
@@ -588,6 +601,16 @@ pub enum Error {
     /// this is raised (the `skilj` facade's decide()-dispatch bridge).
     #[error("stored payload did not decode into its expected type: {0}")]
     PayloadDecodeFailed(String),
+
+    /// Codeberg issue #18 - `valid_correlation_id`'s own rejection,
+    /// shared by `correlation_id` and `causation_id` alike (see that
+    /// function's own doc comment for why the two get identical, looser-
+    /// than-`valid_bounded_context_name` treatment: no charset
+    /// restriction, only a length cap, since either is arbitrary
+    /// caller/bridge-supplied trace data, not an identifier this
+    /// codebase itself embeds anywhere).
+    #[error("correlation_id/causation_id must be at most {CORRELATION_ID_MAX_LEN} characters")]
+    CorrelationIdTooLong,
 }
 
 impl SkiljRejection for Error {
@@ -621,6 +644,7 @@ impl SkiljRejection for Error {
             Error::ReservedIdempotencyKeyPrefix => "reserved_idempotency_key_prefix",
             Error::UnregisteredEventType(_) => "unregistered_event_type",
             Error::PayloadDecodeFailed(_) => "payload_decode_failed",
+            Error::CorrelationIdTooLong => "correlation_id_too_long",
         }
     }
 
@@ -975,6 +999,34 @@ pub fn valid_owner_tag_key(tag_mappings: &[TagMapping], owner_tag_key: Option<&s
     match owner_tag_key {
         None => true,
         Some(key) => tag_mappings.iter().any(|m| m.key == key),
+    }
+}
+
+/// The one gate `Metadata.correlation_id`/`causation_id` (Codeberg issue
+/// #18) each pass through, independently (`rule ProcessCommand`/
+/// `CreateExternalEvent`/`CreateDirectEvent` all call this twice, once
+/// per field). `None` or empty is vacuously valid - deliberately, the
+/// same "absent input needs no further check" shape `valid_tag_mappings`/
+/// `valid_sensitive_fields`/`valid_private_fields` above already share -
+/// otherwise valid iff at most `CORRELATION_ID_MAX_LEN` characters.
+///
+/// A black box for the same reason `valid_bounded_context_name`
+/// (`skilj-core/src/bootstrap/mod.rs`) is, but a deliberately looser
+/// one, and the difference matters: a bounded context name is carried
+/// through verbatim as a Postgres schema-name fragment by the layers
+/// underneath this spec, which is why *that* black box also restricts
+/// charset. A correlation/causation id is arbitrary caller- or
+/// bridge-supplied trace data - a UUID, a W3C traceparent-shaped string,
+/// an upstream broker's own message id - stored and compared for
+/// equality only, never embedded as an identifier anywhere. So no
+/// charset restriction here, only a length cap, purely as an abuse
+/// guard - no real downstream constraint drives the exact number.
+pub const CORRELATION_ID_MAX_LEN: usize = 200;
+
+pub fn valid_correlation_id(id: Option<&str>) -> bool {
+    match id {
+        None => true,
+        Some(id) => id.is_empty() || id.chars().count() <= CORRELATION_ID_MAX_LEN,
     }
 }
 
@@ -2379,6 +2431,7 @@ pub fn query_events(
     event_types: &[EventType],
     tags: Option<&[Tag]>,
     after_sequence: Option<i64>,
+    correlation_id: Option<&str>,
     bounded_context_events: &[Event],
     resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
     private_field_grants: &[PrivateFieldGrant],
@@ -2403,6 +2456,14 @@ pub fn query_events(
         .filter(|e| event_types.is_empty() || event_types.contains(&e.event_type))
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
         .filter(|e| e.sequence > after)
+        // Codeberg issue #18 - "show me everything in this transaction",
+        // the same `Option`-filter shape every other criterion here
+        // already has: `None` matches everything, `Some(id)` requires an
+        // exact match against this event's own (always-present, per the
+        // spec's own invariant) correlation_id.
+        .filter(|e| {
+            correlation_id.is_none_or(|id| e.metadata.correlation_id.as_deref() == Some(id))
+        })
         .filter(|e| event_owner_scope_satisfied(e, access_mapping.scope.as_deref()))
         .map(|e| {
             (
@@ -2421,6 +2482,7 @@ pub fn count_events(
     access_mapping: &RoleAccessMapping,
     event_types: &[EventType],
     tags: Option<&[Tag]>,
+    correlation_id: Option<&str>,
     bounded_context_events: &[Event],
 ) -> crate::error::Result<i64> {
     if access_mapping.status != RoleStatus::Active {
@@ -2441,6 +2503,9 @@ pub fn count_events(
         .filter(|e| e.bounded_context == access_mapping.bounded_context)
         .filter(|e| event_types.is_empty() || event_types.contains(&e.event_type))
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
+        .filter(|e| {
+            correlation_id.is_none_or(|id| e.metadata.correlation_id.as_deref() == Some(id))
+        })
         .filter(|e| event_owner_scope_satisfied(e, access_mapping.scope.as_deref()))
         .count() as i64)
 }
@@ -2517,6 +2582,7 @@ pub fn fetch_commands(
     after: Option<chrono::DateTime<chrono::Utc>>,
     before: Option<chrono::DateTime<chrono::Utc>>,
     triggered_event: Option<&Event>,
+    correlation_id: Option<&str>,
     bounded_context_commands: &[Command],
     resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
     private_field_grants: &[PrivateFieldGrant],
@@ -2548,6 +2614,11 @@ pub fn fetch_commands(
                 EventOrigin::CommandTriggered { command } => command.id == c.id,
                 _ => false,
             })
+        })
+        // Codeberg issue #18 - same "show me everything in this
+        // transaction" filter `query_events`/`count_events` gained.
+        .filter(|c| {
+            correlation_id.is_none_or(|id| c.metadata.correlation_id.as_deref() == Some(id))
         })
         .filter(|c| command_owner_scope_satisfied(c, access_mapping.scope.as_deref()))
         .map(|c| render_command(c, access_mapping, &resolve_data_key, private_field_grants))
@@ -2798,6 +2869,7 @@ pub fn fetch_events(
     events: &[Event],
     filters: &[Filter],
     after_sequence: Option<i64>,
+    correlation_id: Option<&str>,
 ) -> crate::error::Result<Vec<Event>> {
     if token.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
@@ -2817,6 +2889,11 @@ pub fn fetch_events(
         .filter(|e| &e.event_type == read_type)
         .filter(|e| e.sequence > after)
         .filter(|e| matches_filters(e, filters))
+        // Codeberg issue #18 - the REST-side counterpart to
+        // `query_events`/`count_events`'s own identical filter.
+        .filter(|e| {
+            correlation_id.is_none_or(|id| e.metadata.correlation_id.as_deref() == Some(id))
+        })
         .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
         .cloned()
         .collect())
@@ -3007,11 +3084,14 @@ pub fn acknowledge_events(
 /// this module uses. Same "derived, not a separate parameter" treatment
 /// as `fetch_events`' `read_type` for `adapter.event_type = event_type`:
 /// there's no `event_type` argument to disagree with `adapter.event_type`.
+#[allow(clippy::too_many_arguments)]
 pub fn create_external_event(
     adapter: &ExternalEventToken,
     payload: String,
     source_content: String,
     source_context: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
     next_sequence: i64,
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
@@ -3028,6 +3108,16 @@ pub fn create_external_event(
     }
     if !valid_payload(&event_type.schema, &payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
+    }
+    // Codeberg issue #18 - see `valid_correlation_id`'s own doc comment.
+    // Neither field takes any part in the adjacent dedup mechanism
+    // (`dedupe_partition_key`/`dedupe_sequence`, docs/architecture.md
+    // §39): a redelivery with a fresh correlation_id is still the same
+    // redelivery, caught upstream of this function entirely.
+    if !valid_correlation_id(correlation_id.as_deref())
+        || !valid_correlation_id(causation_id.as_deref())
+    {
+        return Err(Error::CorrelationIdTooLong.into());
     }
     // Cross-tenant write fix (docs/architecture.md's own write-up of
     // these passes) - the write-side counterpart to EventFetch's own
@@ -3056,6 +3146,12 @@ pub fn create_external_event(
             version: event_type.schema_version,
             client_id: adapter.id.clone(),
             created_at: now,
+            correlation_id: Some(
+                correlation_id
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(crate::shared::generate_token_id),
+            ),
+            causation_id: causation_id.filter(|id| !id.is_empty()),
         },
         sequence: next_sequence,
         tags,
@@ -3075,6 +3171,8 @@ pub fn create_external_event(
 pub fn create_direct_event(
     adapter: &DirectCreationToken,
     payload: String,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
     next_sequence: i64,
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
@@ -3091,6 +3189,12 @@ pub fn create_direct_event(
     }
     if !valid_payload(&event_type.schema, &payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
+    }
+    // See create_external_event's own identical note above.
+    if !valid_correlation_id(correlation_id.as_deref())
+        || !valid_correlation_id(causation_id.as_deref())
+    {
+        return Err(Error::CorrelationIdTooLong.into());
     }
     // See create_external_event's own identical note above.
     let tags = derive_tags(&event_type.tag_mappings, &payload);
@@ -3112,6 +3216,12 @@ pub fn create_direct_event(
             version: event_type.schema_version,
             client_id: adapter.id.clone(),
             created_at: now,
+            correlation_id: Some(
+                correlation_id
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(crate::shared::generate_token_id),
+            ),
+            causation_id: causation_id.filter(|id| !id.is_empty()),
         },
         sequence: next_sequence,
         tags,
@@ -3229,6 +3339,10 @@ pub fn create_system_event(
             version: event_type.schema_version,
             client_id: "system".to_string(),
             created_at: now,
+            // Always a root - a scheduler tick has no caller and no
+            // upstream cause to inherit (Codeberg issue #18).
+            correlation_id: Some(crate::shared::generate_token_id()),
+            causation_id: None,
         },
         sequence: next_sequence,
         tags: derive_tags(&event_type.tag_mappings, &payload),
@@ -3290,6 +3404,13 @@ pub struct CommandAuthorised {
     pub payload: String,
     pub client_id: String,
     pub consistency_tags: Vec<Tag>,
+    /// The caller's own opaque value, threaded through unvalidated here -
+    /// same footing `idempotency_key` already has at this layer.
+    /// `process_command` (Codeberg issue #18) is where
+    /// `valid_correlation_id` actually gates it and where an absent
+    /// `correlation_id` gets generated.
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
 }
 
 /// See `rule AuthoriseCommandTrigger`. Same "derived, not a separate
@@ -3300,6 +3421,8 @@ pub struct CommandAuthorised {
 pub fn authorise_command_trigger(
     token: &CommandToken,
     payload: String,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 ) -> crate::error::Result<CommandAuthorised> {
     if token.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
@@ -3336,6 +3459,8 @@ pub fn authorise_command_trigger(
         payload,
         client_id: token.id.clone(),
         consistency_tags,
+        correlation_id,
+        causation_id,
     })
 }
 
@@ -3354,6 +3479,8 @@ pub fn authorise_command_submission(
     access_mapping: &RoleAccessMapping,
     command_type: &CommandType,
     payload: String,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
 ) -> crate::error::Result<CommandAuthorised> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
@@ -3399,6 +3526,8 @@ pub fn authorise_command_submission(
         payload,
         client_id: access_mapping.role.id.clone(),
         consistency_tags,
+        correlation_id,
+        causation_id,
     })
 }
 
@@ -3480,10 +3609,11 @@ pub struct ProcessCommandResult {
 /// per accepted event, in order - the same Postgres-lock-backed,
 /// caller-supplied value as `create_external_event`/`create_direct_event`'s.
 ///
-/// Ten parameters because this function's own scope is genuinely that
-/// wide - it's `ProcessCommand`'s entire `let`/`ensures` body, not
-/// something a smaller grouping would simplify without inventing a
-/// struct that exists only to satisfy the lint. `resolve_key` is
+/// A dozen parameters (`correlation_id`/`causation_id`, Codeberg issue
+/// #18, are the newest two) because this function's own scope is
+/// genuinely that wide - it's `ProcessCommand`'s entire `let`/`ensures`
+/// body, not something a smaller grouping would simplify without
+/// inventing a struct that exists only to satisfy the lint. `resolve_key` is
 /// `protect_sensitive_fields`'s own pre-resolution parameter, threaded
 /// through unchanged to both of this function's own call sites below (the
 /// command's payload, and each accepted event spec's) - a command and an
@@ -3507,6 +3637,8 @@ pub fn process_command(
     command_type: &CommandType,
     payload: &str,
     client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
     bounded_context_events: &[Event],
     decision: CommandDecision,
     resolve_event_type: impl Fn(&str) -> Option<EventType>,
@@ -3514,12 +3646,33 @@ pub fn process_command(
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> crate::error::Result<ProcessCommandResult> {
+    // Codeberg issue #18 - see `valid_correlation_id`'s own doc comment.
+    // Checked here rather than only at the authorisation layer above
+    // this function (docs/architecture.md §8 item 4's own "resolving the
+    // wiring isn't this pure function's job" split notwithstanding):
+    // `ProcessCommand`'s own `requires` names this guard directly, so it
+    // belongs on the function that is this rule's actual implementation.
+    if !valid_correlation_id(correlation_id) || !valid_correlation_id(causation_id) {
+        return Err(Error::CorrelationIdTooLong.into());
+    }
+
     let event_specs = match decision {
         CommandDecision::Accepted { events } => events,
         CommandDecision::Rejected { reason, kind } => {
             return Err(crate::error::Error::CommandRejected { reason, kind });
         }
     };
+
+    // Every stored Command ends up with a correlation_id - generated
+    // here when the caller didn't supply one - per the spec's own
+    // `CorrelationIdIsAlwaysRecorded` invariant. causation_id is never
+    // generated: absent means "this is a root", a true statement for a
+    // plain submission.
+    let correlation_id = correlation_id
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::shared::generate_token_id);
+    let causation_id = causation_id.filter(|id| !id.is_empty()).map(str::to_string);
 
     let consistency_tags = derive_tags(&command_type.tag_mappings, payload);
     let (consistency_boundary, _matching_events) =
@@ -3536,6 +3689,8 @@ pub fn process_command(
             version: command_type.schema_version,
             client_id: client_id.to_string(),
             created_at: now,
+            correlation_id: Some(correlation_id),
+            causation_id,
         },
         encryption_keys: protected.encryption_keys,
         consistency_tags,
@@ -3558,6 +3713,11 @@ pub fn process_command(
                 version: event_type.schema_version,
                 client_id: client_id.to_string(),
                 created_at: now,
+                // Every event a command triggers inherits that command's
+                // correlation_id (always present by this point) and is
+                // caused by it directly - Codeberg issue #18.
+                correlation_id: command.metadata.correlation_id.clone(),
+                causation_id: Some(command.id.clone()),
             },
             sequence: next_sequence(),
             tags: derive_tags(&event_type.tag_mappings, &spec_payload),

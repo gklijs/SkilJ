@@ -46,7 +46,7 @@ fn no_decider_registered_error() -> async_graphql::Error {
         .extend_with(|_, ext| ext.set("code", "no_decider_registered"))
 }
 
-/// `submitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String): SubmitCommandPayload!`
+/// `submitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): SubmitCommandPayload!`
 pub fn submit_command_field() -> Field {
     Field::new(
         "submitCommand",
@@ -84,6 +84,22 @@ pub fn submit_command_field() -> Field {
                     idempotency_key.as_deref(),
                 )
                 .map_err(to_graphql_error)?;
+                // Codeberg issue #18 - both optional, same "absent" shape
+                // as idempotencyKey above, but a different meaning: an
+                // absent correlationId is generated server-side, never
+                // skipped (see valid_correlation_id's own doc comment).
+                let correlation_id = ctx
+                    .args
+                    .get("correlationId")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| v.string().ok())
+                    .map(|s| s.to_string());
+                let causation_id = ctx
+                    .args
+                    .get("causationId")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| v.string().ok())
+                    .map(|s| s.to_string());
 
                 // WriteAccess: any active mapping, any level -
                 // authorise_command_submission itself enforces
@@ -113,6 +129,8 @@ pub fn submit_command_field() -> Field {
                     &access_mapping,
                     &command_type,
                     payload,
+                    correlation_id,
+                    causation_id,
                 )
                 .map_err(to_graphql_error)?;
 
@@ -148,6 +166,8 @@ pub fn submit_command_field() -> Field {
                     &authorised.command_type,
                     &authorised.payload,
                     &authorised.client_id,
+                    authorised.correlation_id.as_deref(),
+                    authorised.causation_id.as_deref(),
                     state.encryption_master_key.as_ref(),
                     Utc::now(),
                     idempotency_key.as_deref(),
@@ -192,9 +212,10 @@ pub fn submit_command_field() -> Field {
                                 == skilj_core::access_control::AccessLevel::Admin)
                                 .then_some(matching_events),
                             deduplicated: false,
+                            correlation_id: None,
                         }
                     }
-                    skilj_core::db::SubmitCommandOutcome::Accepted { events, .. } => {
+                    skilj_core::db::SubmitCommandOutcome::Accepted { command, events } => {
                         SubmitCommandResult {
                             accepted: true,
                             triggered_event_sequences: Some(
@@ -204,12 +225,14 @@ pub fn submit_command_field() -> Field {
                             rejection_kind: None,
                             matching_events: None,
                             deduplicated: false,
+                            correlation_id: command.metadata.correlation_id,
                         }
                     }
                     // Codeberg issue #12: a cached prior answer, not a
                     // fresh decision - no live matchingEvents to show
                     // (nothing was redispatched), same as a normal
-                    // Accepted response otherwise.
+                    // Accepted response otherwise. No correlationId
+                    // either, for the same reason (Codeberg issue #18).
                     skilj_core::db::SubmitCommandOutcome::Deduplicated {
                         triggered_event_sequences,
                     } => SubmitCommandResult {
@@ -219,6 +242,7 @@ pub fn submit_command_field() -> Field {
                         rejection_kind: None,
                         matching_events: None,
                         deduplicated: true,
+                        correlation_id: None,
                     },
                 })))
             })
@@ -238,6 +262,14 @@ pub fn submit_command_field() -> Field {
     ))
     .argument(InputValue::new(
         "idempotencyKey",
+        TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "correlationId",
+        TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "causationId",
         TypeRef::named(TypeRef::STRING),
     ))
 }

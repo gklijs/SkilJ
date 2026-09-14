@@ -116,6 +116,8 @@ fn create_external_event_succeeds_and_stamps_source_fields_and_metadata() {
         r#"{"amount":10}"#.into(),
         r#"{"raw":"kafka blob"}"#.into(),
         Some("orders-topic/0/144".into()),
+        None,
+        None,
         7,
         timestamp(500),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -157,6 +159,8 @@ fn create_external_event_allows_an_absent_source_context() {
         "{}".into(),
         "raw".into(),
         None,
+        None,
+        None,
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -178,6 +182,8 @@ fn create_external_event_rejects_an_event_type_not_opted_into_external_creation(
         &adapter,
         "{}".into(),
         "raw".into(),
+        None,
+        None,
         None,
         0,
         timestamp(0),
@@ -205,6 +211,8 @@ fn create_external_event_event_type_is_always_the_adapters_event_type_by_constru
         "{}".into(),
         "raw".into(),
         None,
+        None,
+        None,
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -221,6 +229,8 @@ fn create_external_event_rejects_a_revoked_token() {
         &adapter,
         "{}".into(),
         "raw".into(),
+        None,
+        None,
         None,
         0,
         timestamp(0),
@@ -242,6 +252,8 @@ fn create_external_event_rejects_an_archived_bounded_context() {
         &adapter,
         "{}".into(),
         "raw".into(),
+        None,
+        None,
         None,
         0,
         timestamp(0),
@@ -268,6 +280,8 @@ fn create_external_event_rejects_a_payload_that_does_not_match_the_schema() {
         &adapter,
         "{}".into(), // missing the required "amount" field
         "raw".into(),
+        None,
+        None,
         None,
         0,
         timestamp(0),
@@ -296,6 +310,8 @@ fn create_external_event_derives_real_tags_from_a_real_tag_mapping() {
         &adapter,
         r#"{"order_id":"O-1"}"#.into(),
         "raw".into(),
+        None,
+        None,
         None,
         0,
         timestamp(0),
@@ -337,6 +353,8 @@ fn create_external_event_rejects_an_event_whose_owner_does_not_match_the_tokens_
         r#"{"company_id":"globex"}"#.into(),
         "raw".into(),
         None,
+        None,
+        None,
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -368,6 +386,8 @@ fn create_external_event_succeeds_when_the_owner_matches_the_tokens_scope() {
         r#"{"company_id":"acme"}"#.into(),
         "raw".into(),
         None,
+        None,
+        None,
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -396,6 +416,8 @@ fn create_direct_event_succeeds_and_stamps_metadata() {
     let event = event_store::create_direct_event(
         &adapter,
         r#"{"amount":10}"#.into(),
+        None,
+        None,
         3,
         timestamp(200),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -427,6 +449,8 @@ fn create_direct_event_derives_real_tags_from_a_real_tag_mapping() {
     let event = event_store::create_direct_event(
         &adapter,
         r#"{"order_id":"O-2"}"#.into(),
+        None,
+        None,
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -447,9 +471,15 @@ fn create_direct_event_derives_real_tags_from_a_real_tag_mapping() {
 fn create_direct_event_rejects_an_event_type_not_opted_into_direct_creation() {
     let adapter = direct_token(TokenStatus::Active, event_type(false, false));
 
-    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
-        unreachable!("no sensitive fields in this test")
-    })
+    let err = event_store::create_direct_event(
+        &adapter,
+        "{}".into(),
+        None,
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
     .unwrap_err();
 
     assert_eq!(
@@ -465,9 +495,15 @@ fn create_direct_event_rejects_an_event_type_not_opted_into_direct_creation() {
 fn create_direct_event_event_type_is_always_the_adapters_event_type_by_construction() {
     let et = event_type(false, true);
     let adapter = direct_token(TokenStatus::Active, et.clone());
-    let _ = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
-        unreachable!("no sensitive fields in this test")
-    });
+    let _ = event_store::create_direct_event(
+        &adapter,
+        "{}".into(),
+        None,
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    );
     assert_eq!(adapter.event_type, et);
 }
 
@@ -476,9 +512,15 @@ fn create_direct_event_event_type_is_always_the_adapters_event_type_by_construct
 fn create_direct_event_rejects_a_revoked_token() {
     let adapter = direct_token(TokenStatus::Revoked, event_type(false, true));
 
-    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
-        unreachable!("no sensitive fields in this test")
-    })
+    let err = event_store::create_direct_event(
+        &adapter,
+        "{}".into(),
+        None,
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
     .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
@@ -491,9 +533,15 @@ fn create_direct_event_rejects_an_archived_bounded_context() {
     et.bounded_context.status = BoundedContextStatus::Archived;
     let adapter = direct_token(TokenStatus::Active, et);
 
-    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
-        unreachable!("no sensitive fields in this test")
-    })
+    let err = event_store::create_direct_event(
+        &adapter,
+        "{}".into(),
+        None,
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
     .unwrap_err();
 
     assert_eq!(
@@ -514,6 +562,8 @@ fn create_direct_event_rejects_a_payload_that_does_not_match_the_schema() {
     let err = event_store::create_direct_event(
         &adapter,
         r#"{"amount":"not a number"}"#.into(),
+        None,
+        None,
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -548,6 +598,8 @@ fn create_direct_event_rejects_an_event_whose_owner_does_not_match_the_tokens_sc
     let err = event_store::create_direct_event(
         &adapter,
         r#"{"company_id":"globex"}"#.into(),
+        None,
+        None,
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -578,6 +630,8 @@ fn create_direct_event_succeeds_when_the_owner_matches_the_tokens_scope() {
     let event = event_store::create_direct_event(
         &adapter,
         r#"{"company_id":"acme"}"#.into(),
+        None,
+        None,
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
@@ -608,9 +662,15 @@ fn create_direct_event_rejects_a_payload_naming_no_owner_at_all_when_scoped() {
         ..direct_token(TokenStatus::Active, et)
     };
 
-    let err = event_store::create_direct_event(&adapter, "{}".into(), 0, timestamp(0), |_, _| {
-        unreachable!("no sensitive fields in this test")
-    })
+    let err = event_store::create_direct_event(
+        &adapter,
+        "{}".into(),
+        None,
+        None,
+        0,
+        timestamp(0),
+        |_, _| unreachable!("no sensitive fields in this test"),
+    )
     .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());

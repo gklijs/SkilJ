@@ -98,6 +98,8 @@ fn event(event_type: EventType) -> Event {
             version: 1,
             client_id: "someone".into(),
             created_at: timestamp(0),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence: 0,
         tags: Vec::new(),

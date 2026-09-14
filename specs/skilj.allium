@@ -159,6 +159,26 @@ value Filter {
     value: String               -- comparison value, serialised to match the field's declared type
 }
 
+-- correlation_id and causation_id below are durable domain state, and are
+-- deliberately not distributed tracing. Tracing - OpenTelemetry or
+-- anything else wearing its shape - is out of scope for this file
+-- entirely, in the same register as the external IdP's trust
+-- configuration and the event cache's warm-up count: runtime/library
+-- configuration a deploying team wires up around this library, never
+-- something this spec models (see the scope header's exclusions). A trace
+-- id is ephemeral, sampled, and gone once the span it belongs to has been
+-- exported or dropped; these two are written into the stored record
+-- alongside its payload, kept for as long as the event or command is kept,
+-- and queryable as themselves. A reader asking "what else happened as part
+-- of this business transaction" is asking a question about the domain's
+-- own history, and must get its answer from the event store rather than
+-- from whatever observability backend happened to be running at the time.
+--
+-- Nothing stops a caller putting a W3C traceparent-style value in
+-- correlation_id if that is the id its own upstream chain is keyed by -
+-- see valid_correlation_id in the correlation note above the rules, which
+-- imposes no shape on either field beyond a length bound. That is a caller's choice
+-- about what to correlate by, not this library adopting a tracing model.
 value Metadata {
     type: String                -- denormalised name of the event/command type this message conforms to
     version: Integer             -- schema_version of the type at the time this message was created.
@@ -171,6 +191,22 @@ value Metadata {
                                  -- RegisterEventType.
     client_id: String          -- identifies the client/caller that produced this message in some cases it might refer to the original call, for an event it might be the client that issues the command
     created_at: Timestamp
+    correlation_id: String?     -- identifies the whole business transaction this message belongs
+                                 -- to: every command and event in one causal chain carries the same
+                                 -- value, so the chain can be reassembled from the store afterwards.
+                                 -- Supplied by the caller when it already has one - an adapter
+                                 -- forwarding an upstream broker's own id, a UI tying several
+                                 -- submissions to one user action - and generated here when it does
+                                 -- not, so a stored Command always has one (see rule ProcessCommand).
+                                 -- Never interpreted: an opaque caller-chosen string, compared for
+                                 -- equality and nothing else, the same treatment an idempotency key
+                                 -- and a RoleAccessMapping.scope already get.
+    causation_id: String?       -- identifies the immediate cause of this message: the id of the
+                                 -- command or event that directly produced it, one link back rather
+                                 -- than the whole chain correlation_id names. Null when there is no
+                                 -- upstream - a plain submission a caller originated itself, a
+                                 -- scheduler occurrence - which is the root of a chain, not a gap in
+                                 -- one. Opaque and uninterpreted, exactly as correlation_id is.
 }
 
 value Tag {
@@ -1959,12 +1995,71 @@ default SystemCreator skilj = { }
 -- value baked into the library (an operator can tune how long a caller
 -- waits without a code change). A sync projection satisfies it
 -- immediately and always, by construction.
+--
+-- Correlation and causation, stamped by all four of the rules below and
+-- specified once here rather than four times. Metadata.correlation_id
+-- names the whole business transaction a command or event belongs to;
+-- Metadata.causation_id names the one thing that directly produced it (see
+-- value Metadata, which also says why neither is distributed tracing).
+-- Both are durable, stored and queryable, and neither is ever interpreted
+-- by this library - opaque caller-chosen strings compared for equality,
+-- the same treatment an idempotency key and a RoleAccessMapping.scope
+-- already get.
+--
+-- valid_correlation_id(id) is the one gate either value passes, applied
+-- separately to each: it holds when id is null or empty, and otherwise
+-- when id is at most 200 characters long. It is a black box for the same
+-- reason valid_bounded_context_name is - a character-level check is below
+-- the level this file works at - but a deliberately looser one, and the
+-- difference matters. A bounded context name is carried through verbatim
+-- as an identifier by the layers underneath this spec, which is why that
+-- check restricts the character set at all. These two are nothing of the
+-- kind: they are arbitrary trace data a caller or a message-broker bridge
+-- hands over, and a bridge has to be able to forward what its upstream
+-- actually gave it - a UUID, a W3C traceparent-style string, a broker's
+-- own message id, none of which would survive a Postgres-identifier
+-- charset. So no charset is imposed, and the only thing refused is a value
+-- long enough to be a payload rather than an id. A caller supplying
+-- neither value passes vacuously and is never rejected on this ground.
+--
+-- Who supplies what, and what is generated:
+--   - correlation_id is used verbatim when the caller names one, and
+--     generated by generate_id() when it does not, so every stored Command
+--     and every stored Event carries one. generate_id() is a black box in
+--     the same register as generate_token_id and generate_token_secret:
+--     the spec owns that it yields a fresh, unique value, not which
+--     primitive produces it.
+--   - causation_id is never generated. It is stored exactly as supplied
+--     and left null when nothing upstream was named, which is a root of a
+--     chain rather than a gap in one. A plain submission a caller
+--     originated itself, a direct creation and a scheduler occurrence are
+--     all roots.
+--   - An event a command triggers inherits the command's own
+--     correlation_id and takes the command's id as its causation_id (see
+--     rule ProcessCommand). That is the one place this library establishes
+--     a causal link itself rather than recording one it was told about,
+--     and it is what makes a chain reassemblable from the store: every
+--     event a command produced shares the command's correlation_id, and
+--     points back at the command by id.
+--
+-- What is deliberately not here is any enforcement that a chain is
+-- well-formed. Nothing checks that a supplied causation_id names a record
+-- that exists, that a correlation_id a caller reuses belongs to a chain it
+-- has any part in, or that the two agree with each other. All three would
+-- require this library to have an opinion about causality it does not have
+-- - a caller's chain routinely starts outside SkilJ entirely, in a broker
+-- or a service this spec knows nothing about - and a dangling reference is
+-- exactly what a chain crossing a system boundary looks like from inside
+-- one of the systems. These are provenance a caller asserts, not a claim
+-- this library verifies, which is the same register client_id already sits
+-- in.
 
 rule CreateExternalEvent {
     when:
         SubmitExternalEvent(
             adapter, event_type, payload, source_content, source_context?,
-            dedupe_partition_key?, dedupe_sequence?)
+            dedupe_partition_key?, dedupe_sequence?,
+            correlation_id?, causation_id?)
     requires: event_type.external_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
@@ -1984,6 +2079,19 @@ rule CreateExternalEvent {
     -- that names no scope, which is every token unless the minting admin
     -- named one, and for an event type that declares no owner dimension.
     requires: tag_owner_scope_satisfied(tags, event_type.owner_tag_key, adapter.scope)
+
+    -- This is the submission that most often has a chain to join already:
+    -- an adapter sitting in front of a broker is forwarding a message that
+    -- was itself caused by something upstream, and correlation_id and
+    -- causation_id are where it says so. Both are the adapter's own opaque
+    -- values, checked separately by the one predicate that governs them -
+    -- see the correlation note above the rules, including why the check
+    -- imposes no charset on either, which is what lets a bridge forward an
+    -- upstream id verbatim rather than reshaping it. Supplying neither is
+    -- the ordinary case for an adapter whose source carries no such id, and
+    -- passes vacuously.
+    requires: valid_correlation_id(correlation_id)
+    requires: valid_correlation_id(causation_id)
 
     -- Redelivery. dedupe_partition_key and dedupe_sequence are the caller's
     -- own values, carried here untouched from surface
@@ -2097,7 +2205,9 @@ rule CreateExternalEvent {
                     type: event_type.name,
                     version: event_type.schema_version,
                     client_id: adapter.id,
-                    created_at: now
+                    created_at: now,
+                    correlation_id: correlation_id ?? generate_id(),
+                    causation_id: causation_id
                 },
                 sequence: next_sequence(event_type.bounded_context),
                 tags: tags,
@@ -2108,7 +2218,7 @@ rule CreateExternalEvent {
 }
 
 rule CreateDirectEvent {
-    when: SubmitDirectEvent(adapter, event_type, payload)
+    when: SubmitDirectEvent(adapter, event_type, payload, correlation_id?, causation_id?)
     requires: event_type.direct_creation_allowed = true
     requires: adapter.event_type = event_type
     requires: adapter.status = active
@@ -2124,6 +2234,14 @@ rule CreateDirectEvent {
     -- DirectCreationToken.scope. Its note above is not restated here.
     requires: tag_owner_scope_satisfied(tags, event_type.owner_tag_key, adapter.scope)
 
+    -- The same two values CreateExternalEvent takes, on the same terms and
+    -- checked by the same predicate - see the correlation note above the
+    -- rules. A direct creation more often has nothing upstream to name than
+    -- an ingested message does, which is why causation_id stays null here
+    -- in the ordinary case rather than being invented.
+    requires: valid_correlation_id(correlation_id)
+    requires: valid_correlation_id(causation_id)
+
     -- Sync projection updates happen inline here too - see the project()
     -- note above the rules.
     ensures:
@@ -2135,7 +2253,9 @@ rule CreateDirectEvent {
                 type: event_type.name,
                 version: event_type.schema_version,
                 client_id: adapter.id,
-                created_at: now
+                created_at: now,
+                correlation_id: correlation_id ?? generate_id(),
+                causation_id: causation_id
             },
             sequence: next_sequence(event_type.bounded_context),
             tags: tags,
@@ -2327,6 +2447,16 @@ rule CreateSystemEvent {
     -- token or Role behind this event to name - see invariant
     -- SystemTriggeredClientIdIsSystem.
     --
+    -- This origin is always a root of its chain, and unlike the other three
+    -- it cannot be anything else: no caller reaches this rule at all, so
+    -- there is nobody to hand it a correlation_id to join or a causation_id
+    -- to point back at. It therefore always generates a fresh
+    -- correlation_id and always leaves causation_id null - the same "no
+    -- identity to borrow" reasoning that makes client_id the literal
+    -- "system" here. An occurrence of a schedule is something that
+    -- happened because the clock reached it, not because anything caused
+    -- it. See the correlation note above the rules.
+    --
     -- Both positions move in the same transaction as the event itself, and
     -- both to the occurrence's instant rather than to now: what this event
     -- stands for is the occurrence, and the wall clock of the write is
@@ -2342,7 +2472,9 @@ rule CreateSystemEvent {
                 type: event_type.name,
                 version: event_type.schema_version,
                 client_id: "system",
-                created_at: now
+                created_at: now,
+                correlation_id: generate_id(),
+                causation_id: null
             },
             sequence: next_sequence(event_type.bounded_context),
             tags: derive_tags(event_type, payload),
@@ -3151,7 +3283,10 @@ rule DeliverToSubscriptions {
 -- decision to reject is still reported to the original caller.
 
 rule AuthoriseCommandSubmission {
-    when: SubmitCommand(access_mapping, command_type, payload, idempotency_key?)
+    when:
+        SubmitCommand(
+            access_mapping, command_type, payload, idempotency_key?,
+            correlation_id?, causation_id?)
     requires: access_mapping.status = active
     requires: access_mapping.level in {write, admin}
     requires: access_mapping.bounded_context = command_type.bounded_context
@@ -3188,12 +3323,22 @@ rule AuthoriseCommandSubmission {
     -- so no business of valid_payload's, and null whenever the caller
     -- supplied none. What it means is ProcessCommand's, since both tracks
     -- mean the same thing by it.
+    --
+    -- correlation_id and causation_id are carried through on exactly the
+    -- same footing, and for the same reason: both are the caller's own
+    -- opaque values, outside the payload and so outside valid_payload's
+    -- reach, and null whenever the caller supplied neither. Their meaning,
+    -- their one validity check and the generation of a correlation_id when
+    -- none was named are all ProcessCommand's, since both tracks mean the
+    -- same thing by them too.
     ensures:
         CommandAuthorised(
             command_type: command_type,
             payload: payload,
             client_id: access_mapping.role.id,
-            idempotency_key: idempotency_key
+            idempotency_key: idempotency_key,
+            correlation_id: correlation_id,
+            causation_id: causation_id
         )
 
     @guidance
@@ -3257,7 +3402,10 @@ rule AuthoriseCommandSubmission {
 }
 
 rule AuthoriseCommandTrigger {
-    when: TriggerCommand(token, command_type, payload, idempotency_key?)
+    when:
+        TriggerCommand(
+            token, command_type, payload, idempotency_key?,
+            correlation_id?, causation_id?)
     requires: token.status = active
     requires: token.command_type = command_type
     requires: command_type.rest_trigger_allowed = true
@@ -3283,17 +3431,26 @@ rule AuthoriseCommandTrigger {
         tag_owner_scope_satisfied(
             consistency_tags, command_type.owner_tag_key, token.scope)
 
+    -- idempotency_key, correlation_id and causation_id are all carried
+    -- through untouched and unvalidated here, exactly as
+    -- AuthoriseCommandSubmission's own note above says of them; the meaning
+    -- and the checks are ProcessCommand's on both tracks alike.
     ensures:
         CommandAuthorised(
             command_type: command_type,
             payload: payload,
             client_id: token.id,
-            idempotency_key: idempotency_key
+            idempotency_key: idempotency_key,
+            correlation_id: correlation_id,
+            causation_id: causation_id
         )
 }
 
 rule ProcessCommand {
-    when: CommandAuthorised(command_type, payload, client_id, idempotency_key?)
+    when:
+        CommandAuthorised(
+            command_type, payload, client_id, idempotency_key?,
+            correlation_id?, causation_id?)
 
     -- Idempotency. idempotency_key is a value the caller chooses and
     -- supplies itself, carried here untouched from whichever surface
@@ -3369,6 +3526,13 @@ rule ProcessCommand {
     let prior_outcome = recorded_acceptance(command_type, idempotency_key)
     requires: prior_outcome = null
 
+    -- Both carried here untouched from whichever surface authorised the
+    -- command, and both checked separately by the same predicate - see the
+    -- correlation note above the rules for what each means, why the check
+    -- imposes no charset, and why a caller supplying neither passes.
+    requires: valid_correlation_id(correlation_id)
+    requires: valid_correlation_id(causation_id)
+
     let consistency_tags = derive_tags(command_type, payload)
     let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
     let matching_events =
@@ -3403,7 +3567,7 @@ rule ProcessCommand {
     -- read_projection, render_event, render_command, derive_tags, valid_filters,
     -- valid_tag_mappings, valid_sensitive_fields, valid_payload, next_sequence,
     -- scheduled_payload, next_occurrence_after, generate_token_secret,
-    -- tag_owner_scope_satisfied) is
+    -- tag_owner_scope_satisfied, valid_correlation_id, generate_id) is
     -- documented exactly this way; decide() is not special enough to earn a different treatment.
     --
     -- decide() always observes matching_events exactly as computed above -
@@ -3437,6 +3601,14 @@ rule ProcessCommand {
     -- Every sync projection consuming one of the event types created
     -- below is updated in this same transaction, alongside the command
     -- and its events - see the project() note above the rules.
+    --
+    -- This is also where a chain is established rather than merely
+    -- recorded, and the two halves of that are visible below: the command
+    -- itself gets the caller's correlation_id or a generated one, and its
+    -- causation_id exactly as supplied; every event it triggers then
+    -- inherits that correlation_id - never null by this point, whatever the
+    -- caller sent - and names the command as its own immediate cause. See
+    -- the correlation note above the rules.
     ensures:
         let command = Command.created(
             id: generate_token_id(),
@@ -3447,7 +3619,9 @@ rule ProcessCommand {
                 type: command_type.name,
                 version: command_type.schema_version,
                 client_id: client_id,
-                created_at: now
+                created_at: now,
+                correlation_id: correlation_id ?? generate_id(),
+                causation_id: causation_id
             },
             encryption_keys: protected.encryption_keys,
             consistency_tags: consistency_tags,
@@ -3462,7 +3636,9 @@ rule ProcessCommand {
                     type: spec.event_type.name,
                     version: spec.event_type.schema_version,
                     client_id: client_id,
-                    created_at: now
+                    created_at: now,
+                    correlation_id: command.metadata.correlation_id,
+                    causation_id: command.id
                 },
                 sequence: next_sequence(command_type.bounded_context),
                 tags: derive_tags(spec.event_type, spec.payload),
@@ -6063,6 +6239,32 @@ invariant SystemTriggeredClientIdIsSystem {
         e.origin = SystemTriggered implies e.metadata.client_id = "system"
 }
 
+invariant CorrelationIdIsAlwaysRecorded {
+    -- "Every stored record belongs to some chain" as a property of stored
+    -- state rather than as four rules happening to agree with each other.
+    -- ProcessCommand, CreateExternalEvent, CreateDirectEvent and
+    -- CreateSystemEvent are between them the only ways a Command or an
+    -- Event comes into being, and each either uses the correlation_id its
+    -- caller named or generates one - but that is four separate ensures
+    -- clauses, and nothing about their agreement is checkable from any one
+    -- of them. Stating it here is the same move AdminContextIsPermanent and
+    -- ScheduledTypeIsFullyConfigured make: a later rule that also writes a
+    -- Command or an Event cannot quietly reintroduce a record belonging to
+    -- no chain at all.
+    --
+    -- causation_id is deliberately not asserted alongside it, and the
+    -- asymmetry is the whole point of having two fields. A null
+    -- causation_id is a root - a submission its caller originated, a direct
+    -- creation, a scheduler occurrence - which is a real and common state,
+    -- not a missing value. A null correlation_id would be a record that
+    -- cannot be reassembled into any chain, including its own, which is
+    -- what this rules out. See the correlation note above the rules.
+    for c in Commands:
+        c.metadata.correlation_id != null
+    for e in Events:
+        e.metadata.correlation_id != null
+}
+
 invariant ScheduledTypeIsFullyConfigured {
     -- "No default, ever" as a property of stored state rather than as a
     -- guard on one rule. A type that fires on a schedule knows when it
@@ -6268,7 +6470,8 @@ surface ExternalEventIngestion {
     provides:
         SubmitExternalEvent(
             adapter, event_type, payload, source_content, source_context?,
-            dedupe_partition_key?, dedupe_sequence?)
+            dedupe_partition_key?, dedupe_sequence?,
+            correlation_id?, causation_id?)
 
     @guarantee TokenScopedToEventType
         -- A token only authorises submitting events for the EventType it
@@ -6295,6 +6498,29 @@ surface ExternalEventIngestion {
         -- A token naming no scope, which is every token unless the minting
         -- admin named one, submits exactly as it always has; so does any
         -- submission for an event type that declares no owner dimension.
+
+    @guarantee EveryEventGetsACorrelationId
+        -- correlation_id and causation_id are both optional, and this is the
+        -- surface most likely to supply them: an adapter in front of a
+        -- broker is forwarding a message something upstream already caused,
+        -- and these are where it passes that chain on. Whatever it sends is
+        -- stored verbatim, never reshaped and never interpreted - an
+        -- upstream UUID, a traceparent-style string or a broker's own
+        -- message id all survive the trip intact, since nothing here
+        -- constrains their form beyond a length bound.
+        --
+        -- An adapter supplying neither is not left out: the event is given a
+        -- freshly generated correlation_id all the same, and causation_id
+        -- stays null, which says truthfully that this library was told of no
+        -- cause rather than that there was none. See the correlation note
+        -- above the rules.
+        --
+        -- Neither value takes any part in deduplication. A redelivery is
+        -- recognised by dedupe_partition_key and dedupe_sequence and by
+        -- nothing else, so two submissions differing only in correlation_id
+        -- are the same message, and a resubmission bearing a fresh
+        -- correlation_id creates no event if its sequence is at or below the
+        -- watermark.
 
     @guarantee OmittingTheDedupePairChangesNothing
         -- dedupe_partition_key and dedupe_sequence are optional, and
@@ -6347,7 +6573,7 @@ surface DirectEventCreation {
         where this = adapter.event_type and direct_creation_allowed = true and adapter.status = active
 
     provides:
-        SubmitDirectEvent(adapter, event_type, payload)
+        SubmitDirectEvent(adapter, event_type, payload, correlation_id?, causation_id?)
 
     @guarantee TokenScopedToEventType
         -- A token only authorises creating events for the EventType it
@@ -6368,6 +6594,14 @@ surface DirectEventCreation {
         -- every token unless the minting admin named one, creates exactly as
         -- it always has; so does any creation for an event type that
         -- declares no owner dimension.
+
+    @guarantee EveryEventGetsACorrelationId
+        -- ExternalEventIngestion's guarantee of this name applied unchanged
+        -- to direct creation, and not restated: supplied values stored
+        -- verbatim, a correlation_id generated when none is named, and
+        -- causation_id left null when nothing upstream is. The only
+        -- difference is how often a caller has either to give - a direct
+        -- creation is more often the start of a chain than a link in one.
 
     @guidance
         -- REST only, the same as external event ingestion, including the
@@ -7093,7 +7327,9 @@ surface CommandSubmission {
         where bounded_context = access_mapping.bounded_context and bounded_context.status = active
 
     provides:
-        SubmitCommand(access_mapping, command_type, payload, idempotency_key?)
+        SubmitCommand(
+            access_mapping, command_type, payload, idempotency_key?,
+            correlation_id?, causation_id?)
 
     @guarantee GrantScopedToBoundedContext
         -- A write-level grant only authorises submitting commands for
@@ -7126,6 +7362,25 @@ surface CommandSubmission {
         -- named one, submits exactly as it always has; so does any
         -- submission for a command type that declares no owner dimension,
         -- whatever the grant's scope holds.
+
+    @guarantee EveryCommandGetsACorrelationId
+        -- correlation_id and causation_id are both optional, and a caller
+        -- supplying neither is not thereby left out of the chain: the stored
+        -- Command is given a freshly generated correlation_id, and every
+        -- event that command triggers inherits it, so a submission is always
+        -- reassemblable as a chain afterwards whether or not the caller named
+        -- one. A caller that does supply one - a UI tying several submissions
+        -- to one user action, an adapter forwarding an upstream id - has that
+        -- value used verbatim and never replaced.
+        --
+        -- causation_id is different in kind and is never generated: it names
+        -- the one thing that directly caused this submission, and a caller
+        -- that names none had no such thing, which is a root rather than a
+        -- gap. It is stored as supplied and left null otherwise. Neither
+        -- value is interpreted, and neither affects whether the command is
+        -- accepted - only that it is at most 200 characters, which is a
+        -- malformed-request rejection and nothing to do with the domain (see
+        -- valid_correlation_id in the correlation note above the rules).
 
     @guarantee OmittingTheKeyChangesNothing
         -- idempotency_key is optional, and omitting it is a supported,
@@ -7193,7 +7448,9 @@ surface CommandTrigger {
         where this = token.command_type and rest_trigger_allowed = true and token.status = active
 
     provides:
-        TriggerCommand(token, command_type, payload, idempotency_key?)
+        TriggerCommand(
+            token, command_type, payload, idempotency_key?,
+            correlation_id?, causation_id?)
 
     @guarantee TokenScopedToCommandType
         -- A token only authorises triggering the one CommandType it was
@@ -7217,6 +7474,16 @@ surface CommandTrigger {
         -- A token naming no scope, which is every token unless the minting
         -- admin named one, triggers exactly as it always has; so does any
         -- trigger of a command type that declares no owner dimension.
+
+    @guarantee EveryCommandGetsACorrelationId
+        -- The same guarantee CommandSubmission carries, on the same terms
+        -- and for the same reasons, and not restated here: a correlation_id
+        -- is generated when the caller names none, used verbatim when it
+        -- does, and inherited by every event the command triggers, while
+        -- causation_id is never generated and is null for a trigger with
+        -- nothing upstream. This is the track where a caller most often does
+        -- have something to name - an automated caller acting on a message
+        -- it consumed elsewhere forwards that chain's own id here.
 
     @guarantee OmittingTheKeyChangesNothing
         -- idempotency_key is optional here too, with exactly the force it

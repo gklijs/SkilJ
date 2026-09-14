@@ -269,6 +269,58 @@ fn get_events_filter_param_narrows_results_for_real_over_rest() {
     });
 }
 
+/// Codeberg issue #18 - `GET /v1/events?correlationId=...` narrows to
+/// exactly the one transaction named, over a real REST round trip: a
+/// direct event posted with an explicit `correlationId` body field comes
+/// back with that same id on `metadata.correlationId`, and is the only
+/// one `?correlationId=` finds among several unrelated events.
+#[test]
+fn get_events_correlation_id_param_narrows_results_for_real_over_rest() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+
+        deposit(&router, &direct_credential, 5).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header("authorization", format!("Bearer {direct_credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"payload":{"amount":99},"correlationId":"rest-corr-1"}"#,
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events?correlationId=rest-corr-1")
+            .header("authorization", format!("Bearer {read_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["payload"]["amount"], 99);
+        assert_eq!(events[0]["metadata"]["correlationId"], "rest-corr-1");
+    });
+}
+
 /// Drift audit finding #8 (2026-08-20, see project memory
 /// `skilj-drift-audit-2026-08-20`): `surface EventFetch`'s own `exposes:
 /// event_type.name/schema/schema_version` had no REST route returning

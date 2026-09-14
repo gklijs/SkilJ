@@ -55,12 +55,29 @@ pub enum FilterOperator {
 /// See `value Metadata` in the spec. `version` and every other
 /// sequence-adjacent integer in this codebase is `i64` - see
 /// docs/architecture.md §2.2.1.
+///
+/// `correlation_id`/`causation_id` (Codeberg issue #18) are `Option`
+/// here regardless of the "every stored `Command`/`Event` ends up with a
+/// `correlation_id`" guarantee the spec's `CorrelationIdIsAlwaysRecorded`
+/// invariant makes - that guarantee is a property of the write path
+/// (`event_store::process_command`/`create_external_event`/
+/// `create_direct_event`/`create_system_event` all generate one when the
+/// caller didn't supply one), not of this type. A row written before
+/// this field existed genuinely has neither, and decoding it as
+/// `Option::None` rather than inventing a value is the honest read.
+/// Deliberately not the OTel trace id (`skilj-rest`/`skilj-graphql`'s own
+/// `current_trace_id()`, docs/architecture.md §10b) - see the spec's own
+/// note above `value Metadata` for why the two are unrelated: a trace id
+/// is ephemeral and exporter-dependent, these are durable and queryable
+/// from the store itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Metadata {
     pub r#type: String,
     pub version: i64,
     pub client_id: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
 }
 
 /// `value` is `None` (absent) rather than the tag being omitted entirely

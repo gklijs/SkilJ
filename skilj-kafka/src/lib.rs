@@ -47,11 +47,23 @@
 //! duplicate.
 
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::message::{Header, Headers, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::Message;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
+
+/// Header names for the two Codeberg-issue-#18 ids this bridge carries
+/// across the Kafka boundary, both directions. Kafka's own message
+/// headers are fully custom (no native correlation/causation concept the
+/// way AMQP has `correlation-id`), so both get a `Skilj-`-prefixed
+/// header rather than reusing [`correlation_key`]'s own Kafka message
+/// *key* - that's an unrelated, pre-existing concept (a DCB-tag-derived
+/// partition-routing key), not a business-transaction id, and the two
+/// must not be conflated.
+const CORRELATION_ID_HEADER: &str = "Skilj-Correlation-Id";
+const CAUSATION_ID_HEADER: &str = "Skilj-Causation-Id";
 
 // --- outbound: skilj event -> Kafka ---
 
@@ -84,6 +96,17 @@ pub struct ConsumedEvent {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub tags: Vec<Tag>,
+    pub metadata: ConsumedEventMetadata,
+}
+
+/// The subset of `MetadataDto`'s wire shape (`skilj-rest/src/routes/mod.rs`)
+/// this bridge actually needs - just the two Codeberg-issue-#18 ids,
+/// forwarded onto the outbound Kafka message as headers by [`produce_once`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumedEventMetadata {
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +207,26 @@ pub async fn produce_once(
         if let Some(k) = key.as_deref() {
             record = record.key(k);
         }
+        // Codeberg issue #18 - forwards the event's own correlation_id/
+        // causation_id (always present on correlation_id, per the
+        // spec's own CorrelationIdIsAlwaysRecorded invariant; causation_id
+        // absent for a root event) as headers, distinct from `key` above.
+        let mut headers = OwnedHeaders::new();
+        if let Some(id) = &event.metadata.correlation_id {
+            headers = headers.insert(Header {
+                key: CORRELATION_ID_HEADER,
+                value: Some(id),
+            });
+        }
+        if let Some(id) = &event.metadata.causation_id {
+            headers = headers.insert(Header {
+                key: CAUSATION_ID_HEADER,
+                value: Some(id),
+            });
+        }
+        if headers.count() > 0 {
+            record = record.headers(headers);
+        }
         producer
             .send(record, Duration::from_secs(10))
             .await
@@ -271,12 +314,33 @@ pub enum InboundAction {
     Trigger { command_type: String },
 }
 
+/// Reads a header's value as UTF-8 text - `None` for a missing header, a
+/// header present with no value (Kafka allows this), or one whose bytes
+/// aren't valid UTF-8. [`run_inbound`]'s own extraction step for
+/// [`CORRELATION_ID_HEADER`]/[`CAUSATION_ID_HEADER`], kept as a free
+/// function rather than inlined so [`dispatch_inbound_message`] itself
+/// stays header-type-agnostic (see its own doc comment on why it takes
+/// plain `Option<&str>` rather than a whole headers object). Public so
+/// integration tests can assert on a real produced message's own headers
+/// without reimplementing this lookup.
+pub fn header_str<'a, H: Headers>(headers: Option<&'a H>, key: &str) -> Option<&'a str> {
+    let headers = headers?;
+    headers
+        .iter()
+        .find(|h| h.key == key)
+        .and_then(|h| h.value)
+        .and_then(|v| std::str::from_utf8(v).ok())
+}
+
 /// Dispatches one Kafka message to skilj - the one place [`InboundAction`]
 /// is interpreted. Exposed separately from [`run_inbound`] so it can be
 /// tested directly against raw `(topic, partition, offset, payload)`
 /// values, without needing a real `rdkafka` message object at all - the
 /// same "pure fields in, one HTTP call out" shape [`produce_once`]'s own
-/// per-event body has.
+/// per-event body has. `correlation_id`/`causation_id` (Codeberg issue
+/// #18) are plain `Option<&str>` for the identical reason - `run_inbound`
+/// extracts them from the real message's own headers via [`header_str`]
+/// before calling.
 ///
 /// `"{topic}:{partition}"` is this message's own redelivery-safety
 /// partition key, `offset` its own sequence - Kafka's guarantee of
@@ -285,6 +349,7 @@ pub enum InboundAction {
 /// `submitCommand`'s own idempotency key rely on, the same property
 /// `skilj_temporal`'s own `"{run_id}:{activity_id}"` convention ([§34](../../docs/architecture.md#skilj-temporal-plan)
 /// phase 1) already leans on one level further out.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_inbound_message(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -293,6 +358,8 @@ pub async fn dispatch_inbound_message(
     partition: i32,
     offset: i64,
     payload: &[u8],
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
 ) -> Result<(), BridgeError> {
     let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
     let partition_key = format!("{topic}:{partition}");
@@ -305,6 +372,8 @@ pub async fn dispatch_inbound_message(
                     "payload": payload_json,
                     "sourceContent": format!("kafka:{partition_key}:{offset}"),
                     "dedupe": { "partitionKey": partition_key, "sequence": offset },
+                    "correlationId": correlation_id,
+                    "causationId": causation_id,
                 }))
                 .send()
                 .await?
@@ -313,7 +382,11 @@ pub async fn dispatch_inbound_message(
             http.post(format!("{skilj_base_url}/v1/commands/trigger"))
                 .bearer_auth(&mapping.credential)
                 .header("Idempotency-Key", format!("{partition_key}:{offset}"))
-                .json(&serde_json::json!({ "payload": payload_json }))
+                .json(&serde_json::json!({
+                    "payload": payload_json,
+                    "correlationId": correlation_id,
+                    "causationId": causation_id,
+                }))
                 .send()
                 .await?
         }
@@ -371,6 +444,9 @@ pub async fn run_inbound(
                     );
                     continue;
                 };
+                let headers = msg.headers();
+                let correlation_id = header_str(headers, CORRELATION_ID_HEADER);
+                let causation_id = header_str(headers, CAUSATION_ID_HEADER);
                 match dispatch_inbound_message(
                     http,
                     skilj_base_url,
@@ -379,6 +455,8 @@ pub async fn run_inbound(
                     msg.partition(),
                     msg.offset(),
                     payload,
+                    correlation_id,
+                    causation_id,
                 )
                 .await
                 {

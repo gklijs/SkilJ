@@ -275,6 +275,8 @@ fn a_dcb_conflict_outside_the_cache_window_is_still_caught_via_the_postgres_fall
                     version: 1,
                     client_id: "pre-existing".to_string(),
                     created_at: test_now(),
+                    correlation_id: None,
+                    causation_id: None,
                 },
                 sequence: seq,
                 tags: vec![Tag {

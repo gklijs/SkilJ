@@ -37,7 +37,7 @@ use skilj::{CommandType, CrossContextRoute, EventType, Projection, Skilj};
 use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
-use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
+use skilj_core::event_store::{event_causation_id, BoundedContext, BoundedContextStatus};
 use skilj_core::plugin::{BoundedContextEvent, CrossContextRouteStartFrom};
 use skilj_core::shared::{generate_token_id, generate_token_secret, CommandDecision, EventSpec};
 use tower::ServiceExt;
@@ -392,6 +392,34 @@ fn an_event_in_one_bounded_context_eventually_submits_a_command_in_another() {
             }
         }
         assert_eq!(state, Some(r#"{"total":7}"#.to_string()));
+
+        // Codeberg issue #18 - the routed `ReserveStock` command finally
+        // has a real answer to "what caused this": its correlation_id is
+        // forward-carried from the source `OrderShipped` event (itself
+        // generated, since the direct-event submission above supplied
+        // none), and its causation_id names that exact source event via
+        // `event_causation_id`'s composed `{bounded_context}:{sequence}`
+        // string.
+        let source_event = db::get_event_by_sequence(&pool, SHIPPING_BOUNDED_CONTEXT, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(source_event.metadata.correlation_id.is_some());
+        let routed_command =
+            db::list_commands_for_bounded_context(&pool, INVENTORY_BOUNDED_CONTEXT)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|c| c.command_type.name == "ReserveStock")
+                .expect("the route must have submitted a real ReserveStock command by now");
+        assert_eq!(
+            routed_command.metadata.correlation_id,
+            source_event.metadata.correlation_id
+        );
+        assert_eq!(
+            routed_command.metadata.causation_id,
+            Some(event_causation_id(&source_event))
+        );
 
         // A second `OrderShipped` occurrence with `backorder: true` -
         // `route()` returns `None` for it (this fixture's own stand-in

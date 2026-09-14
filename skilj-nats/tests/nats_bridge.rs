@@ -293,6 +293,7 @@ fn an_order_placed_event_is_published_with_its_own_tag_as_correlation_header() {
                 "eventType": "OrderPlaced",
                 "payload": { "orderId": "o-42" },
                 "tags": [{ "key": "order", "value": "o-42" }],
+                "metadata": { "correlationId": "corr-42", "causationId": null },
             })],
         );
 
@@ -325,6 +326,17 @@ fn an_order_placed_event_is_published_with_its_own_tag_as_correlation_header() {
             headers.get("Nats-Msg-Id").map(|v| v.to_string()),
             Some("banking:7".to_string())
         );
+        // Codeberg issue #18 - the event's own correlation_id round-trips
+        // as a distinct `Skilj-Correlation-Id` header, not to be confused
+        // with `Skilj-Correlation-Key` above (an unrelated, pre-existing
+        // DCB-tag-derived header). No `Skilj-Causation-Id` header at all -
+        // `causationId: null` on the consumed event means nothing is
+        // sent, not an empty-string header.
+        assert_eq!(
+            headers.get("Skilj-Correlation-Id").map(|v| v.to_string()),
+            Some("corr-42".to_string())
+        );
+        assert!(headers.get("Skilj-Causation-Id").is_none());
         let payload: Value = serde_json::from_slice(&message.payload).unwrap();
         assert_eq!(payload, json!({ "orderId": "o-42" }));
 
@@ -389,6 +401,69 @@ fn an_inbound_record_message_carries_its_own_real_stream_and_sequence_as_dedupe(
         assert_eq!(requests[0]["payload"], json!({ "orderId": "o-1" }));
         assert_eq!(requests[0]["dedupe"]["partitionKey"], json!(stream_name));
         assert_eq!(requests[0]["dedupe"]["sequence"], json!(1));
+    });
+}
+
+/// Codeberg issue #18 - the inbound half of the same round trip the
+/// outbound test above already proves: a real JetStream message carrying
+/// `Skilj-Correlation-Id`/`Skilj-Causation-Id` headers gets them read
+/// back (`InboundMessageMeta::from_message`) and forwarded as
+/// `correlationId`/`causationId` on the `POST /v1/events/external` body
+/// `dispatch_inbound_message` sends - not left for skilj to generate a
+/// fresh one, which is what would happen if this bridge silently dropped
+/// them.
+#[test]
+fn an_inbound_record_message_forwards_its_own_correlation_and_causation_headers() {
+    runtime().block_on(async {
+        let Some(url) = test_nats().await else {
+            return;
+        };
+        let stream_name = unique_name("ORDERSINCORR");
+        let jetstream = jetstream_with_stream(url, &stream_name).await;
+        let consumer = pull_consumer(&jetstream, &stream_name).await;
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("Skilj-Correlation-Id", "upstream-corr-1");
+        headers.insert("Skilj-Causation-Id", "upstream-cause-1");
+        jetstream
+            .publish_with_headers(
+                format!("{stream_name}.in"),
+                headers,
+                r#"{"orderId":"o-2"}"#.into(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mut messages = consumer.messages().await.unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(15), messages.try_next())
+            .await
+            .expect("must receive the published message within 15s")
+            .unwrap()
+            .expect("stream must not have ended");
+
+        let meta = InboundMessageMeta::from_message(&message).unwrap();
+
+        let mapping = InboundMapping {
+            credential: "external-token".to_string(),
+            action: InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        };
+        let http = reqwest::Client::new();
+        dispatch_inbound_message(&http, &skilj_base_url, &mapping, &meta, &message.payload)
+            .await
+            .unwrap();
+        message.ack().await.unwrap();
+
+        let requests = mock_state.external_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["correlationId"], json!("upstream-corr-1"));
+        assert_eq!(requests[0]["causationId"], json!("upstream-cause-1"));
     });
 }
 

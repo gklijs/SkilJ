@@ -266,6 +266,8 @@ fn event(bc: &BoundedContext, et: &EventType, sequence: i64, amount: i64) -> Eve
             version: et.schema_version,
             client_id: "someone".to_string(),
             created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence,
         tags: Vec::new(),

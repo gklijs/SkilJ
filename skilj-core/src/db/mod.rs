@@ -443,6 +443,8 @@ async fn provision_bounded_context_schema(
             metadata_version BIGINT NOT NULL,
             metadata_client_id TEXT NOT NULL,
             metadata_created_at TIMESTAMPTZ NOT NULL,
+            metadata_correlation_id TEXT,
+            metadata_causation_id TEXT,
             consistency_tags JSONB NOT NULL DEFAULT '[]',
             consistency_boundary BIGINT
         )"
@@ -451,6 +453,17 @@ async fn provision_bounded_context_schema(
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX commands_by_created_at ON {schema}.commands (metadata_created_at)"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    // Codeberg issue #18 - backs `event_store::fetch_commands`' own new
+    // correlation_id filter, same "cold-start/large-history nicety, not
+    // a correctness requirement" register the `events` table's own
+    // sibling index below has, since that function already filters an
+    // in-memory slice like every other criterion it supports.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX commands_by_correlation_id ON {schema}.commands (metadata_correlation_id) \
+         WHERE metadata_correlation_id IS NOT NULL"
     )))
     .execute(&mut **tx)
     .await?;
@@ -621,6 +634,8 @@ async fn provision_bounded_context_schema(
             metadata_version BIGINT NOT NULL,
             metadata_client_id TEXT NOT NULL,
             metadata_created_at TIMESTAMPTZ NOT NULL,
+            metadata_correlation_id TEXT,
+            metadata_causation_id TEXT,
             tags JSONB NOT NULL DEFAULT '[]',
             origin_kind TEXT NOT NULL CHECK (
                 origin_kind IN ('external_triggered', 'directly_created', 'command_triggered', 'system_triggered')
@@ -634,6 +649,16 @@ async fn provision_bounded_context_schema(
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX events_by_type ON {schema}.events (event_type_name, sequence)"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    // Codeberg issue #18 - backs `event_store::query_events`/`count_events`'
+    // own new correlation_id filter. Same "cold-start/large-history
+    // nicety, not a correctness requirement" register as `events_by_tags`
+    // below: both functions already operate on an in-memory slice.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX events_by_correlation_id ON {schema}.events (metadata_correlation_id) \
+         WHERE metadata_correlation_id IS NOT NULL"
     )))
     .execute(&mut **tx)
     .await?;
@@ -1377,6 +1402,57 @@ pub async fn ensure_private_field_columns(
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `commands.metadata_correlation_id`/`metadata_causation_id`,
+/// `events.metadata_correlation_id`/`metadata_causation_id` (Codeberg
+/// issue #18), following `ensure_event_scoping_columns`'s own pattern
+/// and reasoning exactly for a bounded context provisioned before these
+/// columns existed. The two partial indexes mirror
+/// `provision_bounded_context_schema`'s own fresh-provision ones
+/// (`events_by_correlation_id`/`commands_by_correlation_id`) - `CREATE
+/// INDEX IF NOT EXISTS` rather than plain `CREATE INDEX`, since unlike
+/// the columns themselves this runs unconditionally on every `build()`,
+/// not only once.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_correlation_causation_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.events ADD COLUMN IF NOT EXISTS metadata_correlation_id TEXT"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.events ADD COLUMN IF NOT EXISTS metadata_causation_id TEXT"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS metadata_correlation_id TEXT"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS metadata_causation_id TEXT"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX IF NOT EXISTS events_by_correlation_id ON {schema}.events \
+         (metadata_correlation_id) WHERE metadata_correlation_id IS NOT NULL"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX IF NOT EXISTS commands_by_correlation_id ON {schema}.commands \
+         (metadata_correlation_id) WHERE metadata_correlation_id IS NOT NULL"
     )))
     .execute(pool)
     .await?;
@@ -2675,6 +2751,10 @@ struct CommandRow {
     metadata_version: i64,
     metadata_client_id: String,
     metadata_created_at: DateTime<Utc>,
+    // Codeberg issue #18 - `None` only for a row written before these
+    // columns existed.
+    metadata_correlation_id: Option<String>,
+    metadata_causation_id: Option<String>,
     consistency_tags: Json<Vec<Tag>>,
     consistency_boundary: Option<i64>,
 }
@@ -2698,6 +2778,8 @@ impl CommandRow {
                 version: self.metadata_version,
                 client_id: self.metadata_client_id,
                 created_at: self.metadata_created_at,
+                correlation_id: self.metadata_correlation_id,
+                causation_id: self.metadata_causation_id,
             },
             encryption_keys: Vec::new(),
             consistency_tags: self.consistency_tags.0,
@@ -2713,8 +2795,8 @@ impl CommandRow {
 // `fetch_commands`'s own `triggered_event` lookup can match a specific
 // command precisely rather than by whole-struct content equality.
 const COMMAND_COLUMNS: &str = "external_id, command_type_name, payload, metadata_type, \
-    metadata_version, metadata_client_id, metadata_created_at, consistency_tags, \
-    consistency_boundary";
+    metadata_version, metadata_client_id, metadata_created_at, metadata_correlation_id, \
+    metadata_causation_id, consistency_tags, consistency_boundary";
 
 /// Insert-only, unlike every `upsert_*` above - re-registration/promotion
 /// don't apply to a `Command`, so every call is a new row, even though it
@@ -2745,7 +2827,7 @@ pub async fn insert_command(
     let schema = schema_ident(&command.bounded_context.name);
     let (id,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id"
     )))
     .bind(&command.id)
     .bind(&command.command_type.name)
@@ -2754,6 +2836,8 @@ pub async fn insert_command(
     .bind(command.metadata.version)
     .bind(&command.metadata.client_id)
     .bind(command.metadata.created_at)
+    .bind(&command.metadata.correlation_id)
+    .bind(&command.metadata.causation_id)
     .bind(Json(&command.consistency_tags))
     .bind(command.consistency_boundary)
     .fetch_one(&mut **tx)
@@ -4093,6 +4177,10 @@ struct EventRow {
     metadata_version: i64,
     metadata_client_id: String,
     metadata_created_at: DateTime<Utc>,
+    // Codeberg issue #18 - `None` only for a row written before these
+    // columns existed.
+    metadata_correlation_id: Option<String>,
+    metadata_causation_id: Option<String>,
     tags: Json<Vec<Tag>>,
     origin_kind: String,
     origin_source_content: Option<String>,
@@ -4163,6 +4251,8 @@ impl EventRow {
                 version: self.metadata_version,
                 client_id: self.metadata_client_id,
                 created_at: self.metadata_created_at,
+                correlation_id: self.metadata_correlation_id,
+                causation_id: self.metadata_causation_id,
             },
             sequence: self.sequence,
             tags: self.tags.0,
@@ -4196,7 +4286,8 @@ pub async fn list_events(
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
-         metadata_created_at, tags, origin_kind, origin_source_content, origin_source_context, \
+         metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \
+         origin_kind, origin_source_content, origin_source_context, \
          origin_command_id FROM {schema}.events WHERE event_type_name = $1 ORDER BY sequence"
     )))
     .bind(event_type_name)
@@ -4219,6 +4310,10 @@ struct EventRowAnyType {
     metadata_version: i64,
     metadata_client_id: String,
     metadata_created_at: DateTime<Utc>,
+    // Codeberg issue #18 - `None` only for a row written before these
+    // columns existed.
+    metadata_correlation_id: Option<String>,
+    metadata_causation_id: Option<String>,
     tags: Json<Vec<Tag>>,
     origin_kind: String,
     origin_source_content: Option<String>,
@@ -4246,7 +4341,8 @@ pub async fn list_events_for_bounded_context(
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
-         metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
+         metadata_client_id, metadata_created_at, metadata_correlation_id, \
+         metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events ORDER BY sequence"
     )))
     .fetch_all(pool)
@@ -4280,6 +4376,8 @@ pub async fn list_events_for_bounded_context(
                 version: row.metadata_version,
                 client_id: row.metadata_client_id,
                 created_at: row.metadata_created_at,
+                correlation_id: row.metadata_correlation_id,
+                causation_id: row.metadata_causation_id,
             },
             sequence: row.sequence,
             tags: row.tags.0,
@@ -4308,7 +4406,8 @@ pub async fn list_events_for_bounded_context_from(
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
-         metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
+         metadata_client_id, metadata_created_at, metadata_correlation_id, \
+         metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
          WHERE sequence > $1 ORDER BY sequence"
     )))
@@ -4344,6 +4443,8 @@ pub async fn list_events_for_bounded_context_from(
                 version: row.metadata_version,
                 client_id: row.metadata_client_id,
                 created_at: row.metadata_created_at,
+                correlation_id: row.metadata_correlation_id,
+                causation_id: row.metadata_causation_id,
             },
             sequence: row.sequence,
             tags: row.tags.0,
@@ -4411,7 +4512,8 @@ pub async fn list_events_for_bounded_context_matching_tags(
 
     let sql = format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
-         metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
+         metadata_client_id, metadata_created_at, metadata_correlation_id, \
+         metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
          WHERE {where_clause} ORDER BY sequence"
     );
@@ -4452,6 +4554,8 @@ pub async fn list_events_for_bounded_context_matching_tags(
                 version: row.metadata_version,
                 client_id: row.metadata_client_id,
                 created_at: row.metadata_created_at,
+                correlation_id: row.metadata_correlation_id,
+                causation_id: row.metadata_causation_id,
             },
             sequence: row.sequence,
             tags: row.tags.0,
@@ -4479,7 +4583,8 @@ pub async fn get_event_by_sequence(
     let schema = schema_ident(bounded_context);
     let Some(row): Option<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
-         metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
+         metadata_client_id, metadata_created_at, metadata_correlation_id, \
+         metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events WHERE sequence = $1"
     )))
     .bind(sequence)
@@ -4510,6 +4615,8 @@ pub async fn get_event_by_sequence(
             version: row.metadata_version,
             client_id: row.metadata_client_id,
             created_at: row.metadata_created_at,
+            correlation_id: row.metadata_correlation_id,
+            causation_id: row.metadata_causation_id,
         },
         sequence: row.sequence,
         tags: row.tags.0,
@@ -4536,7 +4643,8 @@ pub async fn list_recent_events_for_bounded_context(
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
-         metadata_client_id, metadata_created_at, tags, origin_kind, origin_source_content, \
+         metadata_client_id, metadata_created_at, metadata_correlation_id, \
+         metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
          ORDER BY sequence DESC LIMIT $1"
     )))
@@ -4572,6 +4680,8 @@ pub async fn list_recent_events_for_bounded_context(
                 version: row.metadata_version,
                 client_id: row.metadata_client_id,
                 created_at: row.metadata_created_at,
+                correlation_id: row.metadata_correlation_id,
+                causation_id: row.metadata_causation_id,
             },
             sequence: row.sequence,
             tags: row.tags.0,
@@ -4606,7 +4716,8 @@ pub async fn list_events_from(
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
-         metadata_created_at, tags, origin_kind, origin_source_content, origin_source_context, \
+         metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \
+         origin_kind, origin_source_content, origin_source_context, \
          origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \
          ORDER BY sequence"
     )))
@@ -4772,9 +4883,10 @@ pub async fn insert_event<'e>(
     let schema = schema_ident(&event.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.events (sequence, event_type_name, payload, metadata_type, \
-         metadata_version, metadata_client_id, metadata_created_at, tags, \
+         metadata_version, metadata_client_id, metadata_created_at, metadata_correlation_id, \
+         metadata_causation_id, tags, \
          origin_kind, origin_source_content, origin_source_context, origin_command_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
     )))
     .bind(event.sequence)
     .bind(&event.event_type.name)
@@ -4783,6 +4895,8 @@ pub async fn insert_event<'e>(
     .bind(event.metadata.version)
     .bind(&event.metadata.client_id)
     .bind(event.metadata.created_at)
+    .bind(&event.metadata.correlation_id)
+    .bind(&event.metadata.causation_id)
     .bind(Json(&event.tags))
     .bind(origin_kind)
     .bind(source_content)
@@ -5137,6 +5251,8 @@ pub async fn create_and_insert_external_event(
     payload: String,
     source_content: String,
     source_context: Option<String>,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
     dedupe: Option<DedupeCursor<'_>>,
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
@@ -5175,6 +5291,8 @@ pub async fn create_and_insert_external_event(
         payload,
         source_content,
         source_context,
+        correlation_id,
+        causation_id,
         next_seq,
         now,
         |subject_key, subject_value| {
@@ -5229,6 +5347,8 @@ pub async fn create_and_insert_direct_event(
     event_cache: &crate::event_cache::EventCache,
     adapter: &DirectCreationToken,
     payload: String,
+    correlation_id: Option<String>,
+    causation_id: Option<String>,
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
 ) -> crate::error::Result<Event> {
@@ -5250,6 +5370,8 @@ pub async fn create_and_insert_direct_event(
     let event = crate::event_store::create_direct_event(
         adapter,
         payload,
+        correlation_id,
+        causation_id,
         next_seq,
         now,
         |subject_key, subject_value| {
@@ -5406,6 +5528,8 @@ pub async fn submit_command(
     command_type: &CommandType,
     payload: &str,
     client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
     bounded_context_events: &[Event],
     consistency_tags: &[Tag],
     matching_events: &[Event],
@@ -5610,6 +5734,8 @@ pub async fn submit_command(
         command_type,
         payload,
         client_id,
+        correlation_id,
+        causation_id,
         &final_bounded_context_events,
         crate::shared::CommandDecision::Accepted {
             events: event_specs,
@@ -5728,6 +5854,8 @@ pub async fn decide_and_submit_command(
     command_type: &CommandType,
     payload: &str,
     client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
     idempotency_key: Option<&str>,
@@ -5792,6 +5920,8 @@ pub async fn decide_and_submit_command(
         command_type,
         payload,
         client_id,
+        correlation_id,
+        causation_id,
         &bounded_context_events,
         &consistency_tags,
         &matching_events,
@@ -6039,6 +6169,14 @@ pub async fn catch_up_cross_context_route(
                     route.name,
                     event.sequence
                 );
+                // Codeberg issue #18: the routed command finally gets a
+                // real answer to "what caused this" - forward-carrying
+                // the source event's own correlation_id (always present
+                // by this point) and naming the source event itself as
+                // the direct cause, via `event_causation_id`'s composed
+                // `{bounded_context}:{sequence}` string (`Event` has no
+                // synthetic id of its own to use instead - see that
+                // helper's own doc comment).
                 let outcome = decide_and_submit_command(
                     pool,
                     command_dispatcher,
@@ -6049,6 +6187,8 @@ pub async fn catch_up_cross_context_route(
                     &target_command_type,
                     &target_payload,
                     "cross-context-route",
+                    event.metadata.correlation_id.as_deref(),
+                    Some(&crate::event_store::event_causation_id(event)),
                     encryption_master_key,
                     Utc::now(),
                     Some(&idempotency_key),

@@ -15,7 +15,7 @@ use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, InputValue, TypeRef};
 
-/// `fetchCommands(boundedContext: String!, commandTypes: [String!]!, after: String, before: String, triggeredEvent: Int): [String!]!`
+/// `fetchCommands(boundedContext: String!, commandTypes: [String!]!, after: String, before: String, triggeredEvent: Int, correlationId: String): [String!]!`
 pub fn fetch_commands_field() -> Field {
     Field::new(
         "fetchCommands",
@@ -73,6 +73,14 @@ pub fn fetch_commands_field() -> Field {
                     ),
                     None => None,
                 };
+                // Codeberg issue #18 - "show me everything in this
+                // transaction".
+                let correlation_id = ctx
+                    .args
+                    .get("correlationId")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| v.string().ok())
+                    .map(|s| s.to_string());
 
                 let bounded_context_commands = skilj_core::db::list_commands_for_bounded_context(
                     &state.pool,
@@ -109,6 +117,7 @@ pub fn fetch_commands_field() -> Field {
                     after,
                     before,
                     triggered_event.as_ref(),
+                    correlation_id.as_deref(),
                     &bounded_context_commands,
                     |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
                     &private_field_grants,
@@ -137,5 +146,9 @@ pub fn fetch_commands_field() -> Field {
     .argument(InputValue::new(
         "triggeredEvent",
         TypeRef::named(TypeRef::INT),
+    ))
+    .argument(InputValue::new(
+        "correlationId",
+        TypeRef::named(TypeRef::STRING),
     ))
 }

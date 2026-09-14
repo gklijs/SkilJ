@@ -286,6 +286,7 @@ fn an_order_placed_event_is_sent_with_its_own_tag_as_the_group_id() {
                 "eventType": "OrderPlaced",
                 "payload": { "orderId": "o-42" },
                 "tags": [{ "key": "order", "value": "o-42" }],
+                "metadata": { "correlationId": "corr-42", "causationId": null },
             })],
         );
 
@@ -321,6 +322,17 @@ fn an_order_placed_event_is_sent_with_its_own_tag_as_the_group_id() {
         assert_eq!(properties.group_sequence, Some(7));
         let payload: Value = serde_json::from_slice(delivery.body().0.as_ref()).unwrap();
         assert_eq!(payload, json!({ "orderId": "o-42" }));
+        // Codeberg issue #18 - the event's own correlation_id round-trips
+        // as AMQP 1.0's real standard correlation-id property, distinct
+        // from group_id above (derived from the unrelated `order` DCB
+        // tag). No causation_id application-property at all -
+        // `causationId: null` on the consumed event means nothing is
+        // sent, not an empty-string property.
+        assert_eq!(
+            properties.correlation_id,
+            Some(MessageId::String("corr-42".to_string()))
+        );
+        assert!(delivery.message().application_properties.is_none());
 
         assert_eq!(
             mock_state.acked.lock().unwrap().as_slice(),
@@ -384,6 +396,8 @@ fn an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_dedup
             group_id: properties.and_then(|p| p.group_id.clone()),
             group_sequence: properties.and_then(|p| p.group_sequence),
             message_id: properties.and_then(|p| p.message_id.clone()),
+            correlation_id: None,
+            causation_id: None,
         };
 
         let mapping = InboundMapping {
@@ -408,6 +422,102 @@ fn an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_dedup
         assert_eq!(requests[0]["payload"], json!({ "orderId": "o-1" }));
         assert_eq!(requests[0]["dedupe"]["partitionKey"], json!("partition-a"));
         assert_eq!(requests[0]["dedupe"]["sequence"], json!(42));
+    });
+}
+
+/// Codeberg issue #18 - the inbound half of the same round trip the
+/// outbound test above already proves: a real AMQP message carrying a
+/// real `correlation-id` property and a `Skilj-Causation-Id`
+/// application-property gets both read back (`InboundMessageMeta`) and
+/// forwarded as `correlationId`/`causationId` on the `POST
+/// /v1/events/external` body `dispatch_inbound_message` sends - not left
+/// for skilj to generate a fresh one, which is what would happen if this
+/// bridge silently dropped them.
+#[test]
+fn an_inbound_record_message_forwards_its_own_correlation_and_causation_properties() {
+    runtime().block_on(async {
+        let Some(url) = test_broker().await else {
+            return;
+        };
+        let address = unique_address("orders-in-correlated");
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let (_send_conn, mut send_session) = connect(url, "sender-conn").await;
+        let mut sender = Sender::attach(&mut send_session, "sender-link", address.as_str())
+            .await
+            .unwrap();
+        let (_recv_conn, mut recv_session) = connect(url, "receiver-conn").await;
+        let mut receiver = Receiver::attach(&mut recv_session, "receiver-link", address.as_str())
+            .await
+            .unwrap();
+
+        let message = Message::builder()
+            .properties(
+                Properties::builder()
+                    .correlation_id(MessageId::String("upstream-corr-1".to_string()))
+                    .build(),
+            )
+            .application_properties(
+                fe2o3_amqp_types::messaging::ApplicationProperties::builder()
+                    .insert("Skilj-Causation-Id", "upstream-cause-1")
+                    .build(),
+            )
+            .data(br#"{"orderId":"o-2"}"#.to_vec())
+            .build();
+        sender
+            .send(message)
+            .await
+            .unwrap()
+            .accepted_or_else(|o| format!("{o:?}"))
+            .unwrap();
+
+        let delivery = tokio::time::timeout(Duration::from_secs(15), receiver.recv::<Data>())
+            .await
+            .expect("must receive the sent message within 15s")
+            .unwrap();
+        receiver.accept(&delivery).await.unwrap();
+
+        let properties = delivery.message().properties.as_ref();
+        let causation_id = delivery
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|props| props.get("Skilj-Causation-Id"))
+            .and_then(|v| match v {
+                fe2o3_amqp_types::primitives::SimpleValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+        let meta = InboundMessageMeta {
+            group_id: properties.and_then(|p| p.group_id.clone()),
+            group_sequence: properties.and_then(|p| p.group_sequence),
+            message_id: properties.and_then(|p| p.message_id.clone()),
+            correlation_id: properties.and_then(|p| p.correlation_id.clone()),
+            causation_id,
+        };
+
+        let mapping = InboundMapping {
+            credential: "external-token".to_string(),
+            action: InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        };
+        let http = reqwest::Client::new();
+        dispatch_inbound_message(
+            &http,
+            &skilj_base_url,
+            &mapping,
+            &meta,
+            delivery.body().0.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_state.external_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["correlationId"], json!("upstream-corr-1"));
+        assert_eq!(requests[0]["causationId"], json!("upstream-cause-1"));
     });
 }
 
@@ -462,6 +572,8 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_mess
             group_id: properties.and_then(|p| p.group_id.clone()),
             group_sequence: properties.and_then(|p| p.group_sequence),
             message_id: properties.and_then(|p| p.message_id.clone()),
+            correlation_id: None,
+            causation_id: None,
         };
 
         let mapping = InboundMapping {

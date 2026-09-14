@@ -122,6 +122,8 @@ fn event_with_tags(sequence: i64, tags: Vec<Tag>) -> Event {
             version: 1,
             client_id: "someone".into(),
             created_at: timestamp(0),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence,
         tags,
@@ -194,7 +196,8 @@ fn authorise_command_trigger_succeeds_and_stamps_client_id_from_the_token() {
     let token = command_token(TokenStatus::Active, ct.clone());
 
     let authorised =
-        event_store::authorise_command_trigger(&token, r#"{"amount":10}"#.into()).unwrap();
+        event_store::authorise_command_trigger(&token, r#"{"amount":10}"#.into(), None, None)
+            .unwrap();
 
     assert_eq!(authorised.command_type, ct);
     assert_eq!(authorised.payload, r#"{"amount":10}"#);
@@ -206,7 +209,7 @@ fn authorise_command_trigger_succeeds_and_stamps_client_id_from_the_token() {
 fn authorise_command_trigger_rejects_a_revoked_token() {
     let token = command_token(TokenStatus::Revoked, command_type(true, Vec::new()));
 
-    let err = event_store::authorise_command_trigger(&token, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_trigger(&token, "{}".into(), None, None).unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
 }
@@ -219,7 +222,7 @@ fn authorise_command_trigger_rejects_a_revoked_token() {
 fn authorise_command_trigger_command_type_is_always_the_tokens_command_type_by_construction() {
     let ct = command_type(true, Vec::new());
     let token = command_token(TokenStatus::Active, ct.clone());
-    let _ = event_store::authorise_command_trigger(&token, "{}".into());
+    let _ = event_store::authorise_command_trigger(&token, "{}".into(), None, None);
     assert_eq!(token.command_type, ct);
 }
 
@@ -228,7 +231,7 @@ fn authorise_command_trigger_command_type_is_always_the_tokens_command_type_by_c
 fn authorise_command_trigger_rejects_a_command_type_not_opted_into_rest_triggering() {
     let token = command_token(TokenStatus::Active, command_type(false, Vec::new()));
 
-    let err = event_store::authorise_command_trigger(&token, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_trigger(&token, "{}".into(), None, None).unwrap_err();
 
     assert_eq!(err.code(), event_store::Error::RestTriggerNotAllowed.code());
 }
@@ -240,7 +243,7 @@ fn authorise_command_trigger_rejects_an_archived_bounded_context() {
     ct.bounded_context = bounded_context(BoundedContextStatus::Archived);
     let token = command_token(TokenStatus::Active, ct);
 
-    let err = event_store::authorise_command_trigger(&token, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_trigger(&token, "{}".into(), None, None).unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -257,8 +260,13 @@ fn authorise_command_trigger_rejects_a_payload_that_does_not_match_the_schema() 
     };
     let token = command_token(TokenStatus::Active, ct);
 
-    let err = event_store::authorise_command_trigger(&token, r#"{"amount":"not a number"}"#.into())
-        .unwrap_err();
+    let err = event_store::authorise_command_trigger(
+        &token,
+        r#"{"amount":"not a number"}"#.into(),
+        None,
+        None,
+    )
+    .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -288,8 +296,13 @@ fn authorise_command_trigger_rejects_a_command_whose_owner_does_not_match_the_to
         ..command_token(TokenStatus::Active, ct)
     };
 
-    let err = event_store::authorise_command_trigger(&token, r#"{"company_id":"globex"}"#.into())
-        .unwrap_err();
+    let err = event_store::authorise_command_trigger(
+        &token,
+        r#"{"company_id":"globex"}"#.into(),
+        None,
+        None,
+    )
+    .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
 }
@@ -315,8 +328,13 @@ fn authorise_command_trigger_succeeds_when_the_owner_matches_the_tokens_scope() 
         ..command_token(TokenStatus::Active, ct)
     };
 
-    let authorised =
-        event_store::authorise_command_trigger(&token, r#"{"company_id":"acme"}"#.into()).unwrap();
+    let authorised = event_store::authorise_command_trigger(
+        &token,
+        r#"{"company_id":"acme"}"#.into(),
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         authorised.consistency_tags,
@@ -347,7 +365,7 @@ fn authorise_command_trigger_rejects_a_payload_naming_no_owner_at_all_when_scope
     // No company_id field at all in the payload - derive_tags produces no
     // "company" tag, so there is nothing to affirmatively match "acme"
     // against. Fails closed, the same as a real mismatch.
-    let err = event_store::authorise_command_trigger(&token, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_trigger(&token, "{}".into(), None, None).unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
 }
@@ -365,9 +383,14 @@ fn authorise_command_submission_succeeds_and_stamps_client_id_from_the_roles_id(
         ct.bounded_context.clone(),
     );
 
-    let authorised =
-        event_store::authorise_command_submission(&mapping, &ct, r#"{"amount":10}"#.into())
-            .unwrap();
+    let authorised = event_store::authorise_command_submission(
+        &mapping,
+        &ct,
+        r#"{"amount":10}"#.into(),
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(authorised.command_type, ct);
     assert_eq!(authorised.payload, r#"{"amount":10}"#);
@@ -385,7 +408,8 @@ fn authorise_command_submission_succeeds_for_an_admin_level_grant() {
         ct.bounded_context.clone(),
     );
 
-    let authorised = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap();
+    let authorised =
+        event_store::authorise_command_submission(&mapping, &ct, "{}".into(), None, None).unwrap();
 
     assert_eq!(authorised.command_type, ct);
 }
@@ -400,7 +424,8 @@ fn authorise_command_submission_rejects_a_revoked_mapping() {
         ct.bounded_context.clone(),
     );
 
-    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into(), None, None)
+        .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::GrantNotActive.code());
 }
@@ -415,7 +440,8 @@ fn authorise_command_submission_rejects_a_read_level_mapping() {
         ct.bounded_context.clone(),
     );
 
-    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into(), None, None)
+        .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -436,7 +462,8 @@ fn authorise_command_submission_rejects_a_mapping_scoped_to_a_different_bounded_
     };
     let mapping = access_mapping(RoleStatus::Active, AccessLevel::Write, other_context);
 
-    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into(), None, None)
+        .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -455,7 +482,8 @@ fn authorise_command_submission_rejects_an_archived_bounded_context() {
         ct.bounded_context.clone(),
     );
 
-    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into(), None, None)
+        .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -476,7 +504,8 @@ fn authorise_command_submission_rejects_a_payload_that_does_not_match_the_schema
         ct.bounded_context.clone(),
     );
 
-    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into()).unwrap_err();
+    let err = event_store::authorise_command_submission(&mapping, &ct, "{}".into(), None, None)
+        .unwrap_err();
 
     assert_eq!(
         err.code(),
@@ -518,6 +547,8 @@ fn authorise_command_submission_rejects_a_command_whose_owner_does_not_match_the
         &mapping,
         &ct,
         r#"{"company_id":"globex"}"#.into(),
+        None,
+        None,
     )
     .unwrap_err();
 
@@ -549,9 +580,14 @@ fn authorise_command_submission_succeeds_when_the_owner_matches_the_grants_scope
         )
     };
 
-    let authorised =
-        event_store::authorise_command_submission(&mapping, &ct, r#"{"company_id":"acme"}"#.into())
-            .unwrap();
+    let authorised = event_store::authorise_command_submission(
+        &mapping,
+        &ct,
+        r#"{"company_id":"acme"}"#.into(),
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         authorised.consistency_tags,
@@ -588,6 +624,8 @@ fn authorise_command_submission_is_unrestricted_for_a_grant_naming_no_scope() {
         &mapping,
         &ct,
         r#"{"company_id":"globex"}"#.into(),
+        None,
+        None,
     )
     .unwrap();
 
@@ -610,6 +648,8 @@ fn process_command_accepts_and_creates_the_command_and_its_triggered_events() {
         &ct,
         r#"{"amount":10}"#,
         "trigger-adapter",
+        None,
+        None,
         &[], // no prior events in this bounded context
         accepted(vec![EventSpec {
             event_type: "FundsWithdrawn".into(),
@@ -661,6 +701,8 @@ fn process_command_calls_next_sequence_once_per_triggered_event_in_order() {
         &ct,
         "{}",
         "trigger-adapter",
+        None,
+        None,
         &[],
         accepted(vec![
             EventSpec {
@@ -703,6 +745,8 @@ fn process_command_surfaces_a_rejected_decision_verbatim() {
         &ct,
         "{}",
         "trigger-adapter",
+        None,
+        None,
         &[],
         rejected("insufficient balance", "insufficient_balance"),
         |_| None,
@@ -732,6 +776,8 @@ fn process_command_rejects_an_event_spec_naming_an_unregistered_event_type() {
         &ct,
         "{}",
         "trigger-adapter",
+        None,
+        None,
         &[],
         accepted(vec![EventSpec {
             event_type: "NoSuchType".into(),
@@ -842,6 +888,8 @@ fn command_consistency_tags_are_empty_when_the_command_type_declares_no_tag_mapp
         &ct,
         "{}",
         "trigger-adapter",
+        None,
+        None,
         &[],
         accepted(Vec::new()),
         |_| None,
@@ -869,6 +917,8 @@ fn command_consistency_tags_are_derived_for_real_from_a_real_tag_mapping() {
         &ct,
         r#"{"account_id":"A"}"#,
         "trigger-adapter",
+        None,
+        None,
         &[],
         accepted(Vec::new()),
         |_| None,
@@ -900,6 +950,8 @@ fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
         &ct,
         r#"{"account_id":"A"}"#,
         "trigger-adapter",
+        None,
+        None,
         &[],
         accepted(Vec::new()),
         |_| None,
@@ -923,6 +975,8 @@ fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
             version: 1,
             client_id: "trigger-adapter".into(),
             created_at: timestamp(1),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence: 1,
         tags: first.command.consistency_tags.clone(),

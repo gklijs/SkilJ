@@ -97,6 +97,8 @@ fn event(event_type: EventType, sequence: i64) -> Event {
             version: 1,
             client_id: "test-client".into(),
             created_at: timestamp(0),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence,
         tags: Vec::new(),
@@ -157,7 +159,7 @@ fn fetch_events_succeeds_and_returns_only_matching_later_events() {
         event(et.clone(), 4),
     ];
 
-    let result = event_store::fetch_events(&t, &events, &[], Some(1)).unwrap();
+    let result = event_store::fetch_events(&t, &events, &[], Some(1), None).unwrap();
 
     assert_eq!(
         result.iter().map(|e| e.sequence).collect::<Vec<_>>(),
@@ -171,7 +173,7 @@ fn fetch_events_with_no_after_sequence_starts_from_the_beginning() {
     let t = token(TokenStatus::Active, et.clone());
     let events = vec![event(et.clone(), 0), event(et.clone(), 1)];
 
-    let result = event_store::fetch_events(&t, &events, &[], None).unwrap();
+    let result = event_store::fetch_events(&t, &events, &[], None, None).unwrap();
 
     assert_eq!(
         result.iter().map(|e| e.sequence).collect::<Vec<_>>(),
@@ -184,7 +186,7 @@ fn fetch_events_with_no_after_sequence_starts_from_the_beginning() {
 fn fetch_events_rejects_a_revoked_token() {
     let t = token(TokenStatus::Revoked, event_type(true));
 
-    let err = event_store::fetch_events(&t, &[], &[], None).unwrap_err();
+    let err = event_store::fetch_events(&t, &[], &[], None, None).unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
 }
@@ -202,7 +204,7 @@ fn fetch_events_read_type_is_always_the_tokens_event_type_by_construction() {
     let t = token(TokenStatus::Active, et.clone());
     // No `read_type` argument exists to disagree with `t.event_type` -
     // this test exists to document the obligation, not exercise a branch.
-    let _ = event_store::fetch_events(&t, &[], &[], None);
+    let _ = event_store::fetch_events(&t, &[], &[], None, None);
     assert_eq!(t.event_type, et);
 }
 
@@ -211,7 +213,7 @@ fn fetch_events_read_type_is_always_the_tokens_event_type_by_construction() {
 fn fetch_events_rejects_an_event_type_not_opted_into_reads() {
     let t = token(TokenStatus::Active, event_type(false));
 
-    let err = event_store::fetch_events(&t, &[], &[], None).unwrap_err();
+    let err = event_store::fetch_events(&t, &[], &[], None, None).unwrap_err();
 
     assert_eq!(err.code(), event_store::Error::EventReadNotAllowed.code());
 }
@@ -227,7 +229,7 @@ fn fetch_events_rejects_an_invalid_filter() {
         value: "10".into(),
     }];
 
-    let err = event_store::fetch_events(&t, &[], &bogus_filter, None).unwrap_err();
+    let err = event_store::fetch_events(&t, &[], &bogus_filter, None, None).unwrap_err();
 
     assert_eq!(err.code(), event_store::Error::InvalidFilter.code());
 }

@@ -138,6 +138,8 @@ async fn appending_an_event_records_the_events_appended_counter() {
             version: 1,
             client_id: "test".into(),
             created_at: Utc::now(),
+            correlation_id: None,
+            causation_id: None,
         },
         sequence: 1,
         tags: Vec::new(),

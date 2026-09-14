@@ -110,6 +110,8 @@ fn process_command_emits_a_span_with_bounded_context_and_command_type_fields() {
             &ct,
             "{}",
             "trigger-adapter",
+            None,
+            None,
             &[],
             CommandDecision::Accepted {
                 events: Vec::<EventSpec>::new(),

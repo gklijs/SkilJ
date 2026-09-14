@@ -1506,6 +1506,12 @@ impl SkiljBuilder {
                     // doc comment.
                     skilj_core::db::ensure_event_read_token_start_from_column(pool, &bc.name)
                         .await?;
+                    // Correlation/causation ids (Codeberg issue #18) -
+                    // same "patched into every bounded context, every
+                    // startup" treatment. See
+                    // `ensure_correlation_causation_columns`'s own doc
+                    // comment.
+                    skilj_core::db::ensure_correlation_causation_columns(pool, &bc.name).await?;
                     Ok::<(), skilj_core::Error>(())
                 }
             })
