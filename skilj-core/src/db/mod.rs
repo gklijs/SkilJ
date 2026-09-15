@@ -471,6 +471,12 @@ async fn provision_bounded_context_schema(
     ensure_cross_context_route_cursors_table(&mut **tx, bounded_context).await?;
     ensure_external_message_cursors_table(&mut **tx, bounded_context).await?;
     ensure_deadline_cursors_table(&mut **tx, bounded_context).await?;
+    // Codeberg issue #21 - `parked_deliveries`, a brand-new table, so no
+    // `ALTER TABLE` patch is needed here the way `cross_context_route_cursors`'
+    // own new retry columns need `ensure_cross_context_route_retry_columns`
+    // (build()'s own startup loop only, not here - see that function's
+    // own doc comment).
+    ensure_parked_deliveries_table(&mut **tx, bounded_context).await?;
     // Codeberg issue #20 - `ensure_deadlines_table`'s own two-index shape
     // run directly against this transaction rather than calling that
     // function (it takes `&Pool`, not a transaction - see its own doc
@@ -1273,6 +1279,22 @@ pub async fn migrate_idempotency_keys_client_id_scoping(
 /// per-bounded-context schema migration mechanism" applies identically
 /// here - `CREATE TABLE IF NOT EXISTS`, patched into every bounded
 /// context on every `build()`, is the whole migration story.
+///
+/// `retry_attempt_count`/`retry_first_failed_at`/`retry_next_attempt_at`
+/// (Codeberg issue #21) - the durable backoff state one route's own
+/// blocked head-of-line occurrence carries between ticks, applying
+/// `skilj_retry::RetryPolicy` to what used to be an unbounded, un-
+/// throttled "retry every single tick forever" - see
+/// `catch_up_cross_context_route`'s own doc comment for the full
+/// mechanism. A single row's worth of state suffices (rather than, say,
+/// a row per failing occurrence): only the cursor's own next occurrence
+/// can ever be the one currently failing, since the cursor never
+/// advances past it - the same invariant that already lets
+/// `last_dispatched_sequence` be a single column rather than a set. An
+/// already-provisioned bounded context gets these columns patched in
+/// separately by `ensure_cross_context_route_retry_columns` (this
+/// `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so
+/// it can't add columns to one - see that function's own doc comment).
 #[tracing::instrument(skip_all)]
 pub async fn ensure_cross_context_route_cursors_table<'e>(
     executor: impl sqlx::PgExecutor<'e>,
@@ -1283,10 +1305,51 @@ pub async fn ensure_cross_context_route_cursors_table<'e>(
         "CREATE TABLE IF NOT EXISTS {schema}.cross_context_route_cursors (
             route_name TEXT PRIMARY KEY,
             last_dispatched_sequence BIGINT NOT NULL DEFAULT -1,
-            updated_at TIMESTAMPTZ NOT NULL
+            updated_at TIMESTAMPTZ NOT NULL,
+            retry_attempt_count INT NOT NULL DEFAULT 0,
+            retry_first_failed_at TIMESTAMPTZ,
+            retry_next_attempt_at TIMESTAMPTZ
         )"
     )))
     .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Patches an already-provisioned bounded context's
+/// `cross_context_route_cursors` (a real table since the cross-context
+/// router itself shipped) onto the retry-columns shape a brand-new one
+/// gets directly from `ensure_cross_context_route_cursors_table` above.
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, the same idempotent-patch
+/// idiom `ensure_projection_state_owner_columns`/`ensure_event_scoping_columns`
+/// already use - simpler than that pair's own PK-migration sibling
+/// (`migrate_idempotency_keys_client_id_scoping`) needs, since none of
+/// these three columns join a primary key. Called unconditionally on
+/// every `build()`, alongside `ensure_cross_context_route_cursors_table`
+/// itself - a no-op once a bounded context already has them, migrated or
+/// fresh.
+pub async fn ensure_cross_context_route_retry_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.cross_context_route_cursors \
+         ADD COLUMN IF NOT EXISTS retry_attempt_count INT NOT NULL DEFAULT 0"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.cross_context_route_cursors \
+         ADD COLUMN IF NOT EXISTS retry_first_failed_at TIMESTAMPTZ"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.cross_context_route_cursors \
+         ADD COLUMN IF NOT EXISTS retry_next_attempt_at TIMESTAMPTZ"
+    )))
+    .execute(pool)
     .await?;
     Ok(())
 }
@@ -6084,6 +6147,13 @@ async fn get_cross_context_route_cursor(
     Ok(row.map(|(seq,)| seq))
 }
 
+/// Also unconditionally clears any retry backoff state (Codeberg issue
+/// #21) - every call site advances the cursor past an occurrence that is
+/// now *done* one way or another (skipped, rejected, accepted, or
+/// parked after retries were exhausted), so whatever retry state applied
+/// to it is stale for the next occurrence regardless of which of those
+/// outcomes this one was. See `catch_up_cross_context_route`'s own doc
+/// comment.
 async fn update_cross_context_route_cursor(
     pool: &Pool,
     source_bounded_context: &str,
@@ -6097,7 +6167,10 @@ async fn update_cross_context_route_cursor(
          (route_name, last_dispatched_sequence, updated_at) VALUES ($1, $2, $3) \
          ON CONFLICT (route_name) DO UPDATE SET \
          last_dispatched_sequence = EXCLUDED.last_dispatched_sequence, \
-         updated_at = EXCLUDED.updated_at"
+         updated_at = EXCLUDED.updated_at, \
+         retry_attempt_count = 0, \
+         retry_first_failed_at = NULL, \
+         retry_next_attempt_at = NULL"
     )))
     .bind(route_name)
     .bind(sequence)
@@ -6105,6 +6178,361 @@ async fn update_cross_context_route_cursor(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// `(retry_attempt_count, retry_first_failed_at, retry_next_attempt_at)` -
+/// `get_cross_context_route_retry_state`'s own return shape, named only
+/// to keep that signature (and clippy) happy, not used anywhere else.
+type CrossContextRouteRetryState = (i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// `catch_up_cross_context_route`'s own read of the retry backoff state
+/// `record_cross_context_route_retry_failure` writes - `(0, None, None)`
+/// when no row exists yet (this route has never ticked, or every prior
+/// occurrence succeeded outright), the same "no row = nothing recorded"
+/// convention `get_cross_context_route_cursor` already uses one level up.
+async fn get_cross_context_route_retry_state(
+    pool: &Pool,
+    source_bounded_context: &str,
+    route_name: &str,
+) -> crate::error::Result<CrossContextRouteRetryState> {
+    let schema = schema_ident(source_bounded_context);
+    let row: Option<CrossContextRouteRetryState> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT retry_attempt_count, retry_first_failed_at, retry_next_attempt_at \
+             FROM {schema}.cross_context_route_cursors WHERE route_name = $1"
+    )))
+    .bind(route_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or((0, None, None)))
+}
+
+/// Persists one more failed attempt at the route's own blocked
+/// head-of-line occurrence - `current_cursor` is `last_dispatched_sequence`'s
+/// own current value (unchanged by this call; only present so the
+/// `INSERT` branch of `ON CONFLICT` has a value to write for a route
+/// whose very first-ever tick is already failing, before
+/// `update_cross_context_route_cursor` has ever run for it). Doesn't
+/// touch `updated_at` on conflict - that column tracks the cursor's own
+/// last *advance*, not the last retry attempt.
+#[allow(clippy::too_many_arguments)]
+async fn record_cross_context_route_retry_failure(
+    pool: &Pool,
+    source_bounded_context: &str,
+    route_name: &str,
+    current_cursor: i64,
+    attempt_count: i32,
+    first_failed_at: DateTime<Utc>,
+    next_attempt_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(source_bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.cross_context_route_cursors \
+         (route_name, last_dispatched_sequence, updated_at, retry_attempt_count, \
+          retry_first_failed_at, retry_next_attempt_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (route_name) DO UPDATE SET \
+         retry_attempt_count = EXCLUDED.retry_attempt_count, \
+         retry_first_failed_at = EXCLUDED.retry_first_failed_at, \
+         retry_next_attempt_at = EXCLUDED.retry_next_attempt_at"
+    )))
+    .bind(route_name)
+    .bind(current_cursor)
+    .bind(now)
+    .bind(attempt_count)
+    .bind(first_failed_at)
+    .bind(next_attempt_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Codeberg issue #21 - which family of thing a [`ParkedDelivery`]
+/// originally was, and therefore how `retryParkedDelivery` redrives it.
+/// `CrossContextRoute`'s own `target_bounded_context`/`target_command_type`
+/// columns are populated only for this variant; `ExternalEvent`/
+/// `CommandTrigger` populate `access_token_id` instead (see
+/// `ParkedDelivery`'s own doc comment for the full column-by-kind story).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkedDeliveryKind {
+    CrossContextRoute,
+    ExternalEvent,
+    CommandTrigger,
+}
+
+impl ParkedDeliveryKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ParkedDeliveryKind::CrossContextRoute => "cross_context_route",
+            ParkedDeliveryKind::ExternalEvent => "external_event",
+            ParkedDeliveryKind::CommandTrigger => "command_trigger",
+        }
+    }
+}
+
+fn parked_delivery_kind_from_str(s: &str) -> ParkedDeliveryKind {
+    match s {
+        "external_event" => ParkedDeliveryKind::ExternalEvent,
+        "command_trigger" => ParkedDeliveryKind::CommandTrigger,
+        _ => ParkedDeliveryKind::CrossContextRoute,
+    }
+}
+
+/// Codeberg issue #21's own generic "parked delivery" record - see
+/// `docs/architecture.md`'s parked-deliveries section for the full
+/// design. `request_json` always carries enough to redrive a retry on
+/// its own:
+/// - `CrossContextRoute`: the `Target` command's own already-translated
+///   JSON payload (`target_bounded_context`/`target_command_type` name
+///   where to submit it - `access_token_id` is `None`).
+/// - `ExternalEvent`/`CommandTrigger`: the bridge's own original
+///   `ExternalEventRequest`/`CommandTriggerRequest` body, verbatim
+///   (`target_bounded_context`/`target_command_type` are `None`;
+///   `access_token_id` names which `ExternalEventToken`/`CommandToken`
+///   to re-resolve and redrive through - the bridge's own credential,
+///   never the token's secret, which is never stored here).
+///
+/// Lives in the same bounded-context schema the failing delivery itself
+/// targeted - for `ExternalEvent`/`CommandTrigger`, that's
+/// `access_token_id`'s own token's bounded context, resolved once at
+/// ingestion time by `skilj-rest`'s `POST /v1/parked-deliveries` handler
+/// (the same capability-based resolution every other REST route already
+/// does), not a caller-supplied path/argument.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParkedDelivery {
+    pub id: String,
+    pub source: String,
+    pub kind: ParkedDeliveryKind,
+    pub identifier: String,
+    pub access_token_id: Option<String>,
+    pub target_bounded_context: Option<String>,
+    pub target_command_type: Option<String>,
+    pub request_json: serde_json::Value,
+    pub error: String,
+    pub attempt_count: i32,
+    pub first_failed_at: DateTime<Utc>,
+    pub last_failed_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ParkedDeliveryRow {
+    id: String,
+    source: String,
+    kind: String,
+    identifier: String,
+    access_token_id: Option<String>,
+    target_bounded_context: Option<String>,
+    target_command_type: Option<String>,
+    request_json: Json<serde_json::Value>,
+    error: String,
+    attempt_count: i32,
+    first_failed_at: DateTime<Utc>,
+    last_failed_at: DateTime<Utc>,
+}
+
+impl From<ParkedDeliveryRow> for ParkedDelivery {
+    fn from(row: ParkedDeliveryRow) -> Self {
+        ParkedDelivery {
+            id: row.id,
+            source: row.source,
+            kind: parked_delivery_kind_from_str(&row.kind),
+            identifier: row.identifier,
+            access_token_id: row.access_token_id,
+            target_bounded_context: row.target_bounded_context,
+            target_command_type: row.target_command_type,
+            request_json: row.request_json.0,
+            error: row.error,
+            attempt_count: row.attempt_count,
+            first_failed_at: row.first_failed_at,
+            last_failed_at: row.last_failed_at,
+        }
+    }
+}
+
+const PARKED_DELIVERY_COLUMNS: &str = "id, source, kind, identifier, access_token_id, \
+    target_bounded_context, target_command_type, request_json, error, attempt_count, \
+    first_failed_at, last_failed_at";
+
+/// Codeberg issue #21 - `parked_deliveries`, one row per persistently-
+/// failed delivery. A brand-new table, so (unlike
+/// `cross_context_route_cursors`'s own retry columns above) no
+/// already-provisioned bounded context needs a separate `ALTER TABLE`
+/// patch - `CREATE TABLE IF NOT EXISTS`, called from both
+/// `provision_bounded_context_schema` and every `build()`'s startup
+/// loop, is the whole story, the same "brand-new table needs no
+/// migration dance" register `ensure_external_message_cursors_table`'s
+/// own doc comment already uses.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_parked_deliveries_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.parked_deliveries (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            identifier TEXT NOT NULL,
+            access_token_id TEXT,
+            target_bounded_context TEXT,
+            target_command_type TEXT,
+            request_json JSONB NOT NULL,
+            error TEXT NOT NULL,
+            attempt_count INT NOT NULL,
+            first_failed_at TIMESTAMPTZ NOT NULL,
+            last_failed_at TIMESTAMPTZ NOT NULL
+        )"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `id` is generated here (`shared::generate_token_id`, the same opaque-
+/// id generator every other synthetic identifier in this codebase
+/// already uses - see its own doc comment) rather than left to the
+/// caller, since nothing about a parked delivery's own identity needs to
+/// be caller-chosen or caller-visible before this call returns it.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_parked_delivery(
+    pool: &Pool,
+    bounded_context: &str,
+    source: &str,
+    kind: ParkedDeliveryKind,
+    identifier: &str,
+    access_token_id: Option<&str>,
+    target_bounded_context: Option<&str>,
+    target_command_type: Option<&str>,
+    request_json: &serde_json::Value,
+    error: &str,
+    attempt_count: i32,
+    first_failed_at: DateTime<Utc>,
+    last_failed_at: DateTime<Utc>,
+) -> crate::error::Result<ParkedDelivery> {
+    let schema = schema_ident(bounded_context);
+    let id = crate::shared::generate_token_id();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.parked_deliveries \
+         (id, source, kind, identifier, access_token_id, target_bounded_context, \
+          target_command_type, request_json, error, attempt_count, first_failed_at, \
+          last_failed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
+    )))
+    .bind(&id)
+    .bind(source)
+    .bind(kind.as_str())
+    .bind(identifier)
+    .bind(access_token_id)
+    .bind(target_bounded_context)
+    .bind(target_command_type)
+    .bind(Json(request_json))
+    .bind(error)
+    .bind(attempt_count)
+    .bind(first_failed_at)
+    .bind(last_failed_at)
+    .execute(pool)
+    .await?;
+    Ok(ParkedDelivery {
+        id,
+        source: source.to_string(),
+        kind,
+        identifier: identifier.to_string(),
+        access_token_id: access_token_id.map(str::to_string),
+        target_bounded_context: target_bounded_context.map(str::to_string),
+        target_command_type: target_command_type.map(str::to_string),
+        request_json: request_json.clone(),
+        error: error.to_string(),
+        attempt_count,
+        first_failed_at,
+        last_failed_at,
+    })
+}
+
+/// `AdminAccess`-gated `parkedDeliveries(boundedContext:)`'s own read -
+/// newest failure first, the order an operator triaging a growing list
+/// actually wants.
+pub async fn list_parked_deliveries(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<ParkedDelivery>> {
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<ParkedDeliveryRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {PARKED_DELIVERY_COLUMNS} FROM {schema}.parked_deliveries \
+         ORDER BY last_failed_at DESC"
+    )))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(ParkedDelivery::from).collect())
+}
+
+pub async fn get_parked_delivery(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+) -> crate::error::Result<Option<ParkedDelivery>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<ParkedDeliveryRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {PARKED_DELIVERY_COLUMNS} FROM {schema}.parked_deliveries WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(ParkedDelivery::from))
+}
+
+/// `retryParkedDelivery`'s own failed-again path - the row stays parked,
+/// but its own `error`/`attempt_count`/`last_failed_at` reflect this
+/// latest attempt rather than only the original one, so an operator
+/// looking at the list sees it was actually retried, not just left
+/// alone.
+pub async fn record_parked_delivery_retry_failure(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+    error: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.parked_deliveries \
+         SET error = $1, attempt_count = attempt_count + 1, last_failed_at = $2 \
+         WHERE id = $3"
+    )))
+    .bind(error)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `discardParkedDelivery`'s own write, and `retryParkedDelivery`'s own
+/// success path (a delivery that finally landed is no longer "stuck",
+/// so it leaves this table the same way a resolved
+/// `discardProjectionRebuild` row does - no separate `resolved`/
+/// `discarded` status to track, `delete_projection_rebuild`'s own
+/// register). Returns the row as it was immediately before deletion, the
+/// same "hand back what's gone" treatment `discard_projection_rebuild`'s
+/// own doc comment gives for the identical reason: the caller (a GraphQL
+/// mutation) still needs to render it in its response.
+pub async fn delete_parked_delivery(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+) -> crate::error::Result<Option<ParkedDelivery>> {
+    let existing = get_parked_delivery(pool, bounded_context, id).await?;
+    if existing.is_none() {
+        return Ok(None);
+    }
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {schema}.parked_deliveries WHERE id = $1"
+    )))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(existing)
 }
 
 /// One catch-up tick for one registered [`crate::plugin::CrossContextRoute`] -
@@ -6158,6 +6586,23 @@ async fn update_cross_context_route_cursor(
 /// for this route - every later tick reads the real cursor row this
 /// seeded and only ever sees genuinely new occurrences, the same as a
 /// `Beginning` route always has.
+///
+/// **Codeberg issue #21**: `decide_and_submit_command`'s own `Err` used
+/// to propagate straight out of this function via a bare `?`, which
+/// stopped this tick immediately without advancing the cursor - correct
+/// as far as it went (a crash-safe "the next tick retries the identical
+/// occurrence"), but with no cap: a persistently-failing occurrence
+/// blocked this route's cursor forever, retried on every single poll
+/// tick, unthrottled. Replaced with `retry_policy` (`skilj_retry::
+/// RetryPolicy`): each failure grows the backoff before this route's
+/// blocked head-of-line occurrence is attempted again (the "not yet
+/// time" early return below, backed by `cross_context_route_cursors`'
+/// own new `retry_*` columns), and once the policy is exhausted, the
+/// occurrence is recorded as a [`ParkedDelivery`] (`source:
+/// "cross-context-route:{route.name}"`, `kind: CrossContextRoute`) and
+/// the cursor finally advances past it - the route un-blocks, and an
+/// operator gets a visible, retryable/discardable record instead of a
+/// route silently stuck forever.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(route = %route.name))]
 pub async fn catch_up_cross_context_route(
@@ -6170,6 +6615,7 @@ pub async fn catch_up_cross_context_route(
     broadcaster: &crate::event_store::EventBroadcaster,
     event_cache: &crate::event_cache::EventCache,
     encryption_master_key: Option<&EncryptionMasterKey>,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) -> crate::error::Result<()> {
     let existing_cursor =
         get_cross_context_route_cursor(pool, route.source_bounded_context, route.name).await?;
@@ -6216,6 +6662,26 @@ pub async fn catch_up_cross_context_route(
         )
         .await?;
         return Ok(());
+    }
+
+    // Codeberg issue #21 - see this function's own doc comment. Read
+    // once per tick, ahead of the loop: only the loop's own first
+    // occurrence can ever be a retry of a previously-failed one, since
+    // the cursor never advances past a blocked occurrence - the same
+    // invariant `cross_context_route_cursors` needing only one row's
+    // worth of retry state (not one per occurrence) already relies on.
+    let (mut retry_attempt, mut retry_first_failed_at, retry_next_attempt_at) =
+        get_cross_context_route_retry_state(pool, route.source_bounded_context, route.name).await?;
+    if retry_attempt > 0 {
+        if let Some(next_attempt_at) = retry_next_attempt_at {
+            if Utc::now() < next_attempt_at {
+                // Not yet time - this route's own blocked occurrence is
+                // still in backoff. Skip this tick entirely rather than
+                // re-attempting the identical failing submission on
+                // every single poll.
+                return Ok(());
+            }
+        }
     }
 
     for event in &events {
@@ -6269,6 +6735,8 @@ pub async fn catch_up_cross_context_route(
                         Utc::now(),
                     )
                     .await?;
+                    retry_attempt = 0;
+                    retry_first_failed_at = None;
                     continue;
                 };
                 // Prefixed with `RESERVED_IDEMPOTENCY_KEY_PREFIX` - a
@@ -6313,7 +6781,93 @@ pub async fn catch_up_cross_context_route(
                     Utc::now(),
                     Some(&idempotency_key),
                 )
-                .await?;
+                .await;
+                // Codeberg issue #21 - see this function's own doc
+                // comment. `Err` no longer propagates straight out via
+                // `?`; it's retried with backoff, up to `retry_policy`,
+                // before this occurrence is parked.
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        retry_attempt += 1;
+                        // Every path out of this `Err` arm either
+                        // `continue`s (after resetting `retry_attempt`/
+                        // `retry_first_failed_at` to their defaults - the
+                        // occurrence is done, parked) or `return`s (the
+                        // function exits before the outer
+                        // `retry_first_failed_at` would ever be read
+                        // again) - so unlike `retry_attempt`, there's no
+                        // corresponding outer reassignment needed for
+                        // `first_failed_at` here, only this local,
+                        // already-resolved value.
+                        let first_failed_at = retry_first_failed_at.unwrap_or_else(Utc::now);
+                        let now = Utc::now();
+                        let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
+                        if retry_policy.is_exhausted(retry_attempt as u32, elapsed) {
+                            tracing::error!(
+                                sequence = event.sequence,
+                                error = %e,
+                                attempt = retry_attempt,
+                                "cross-context route: target command submission failed \
+                                 repeatedly - parking and skipping this occurrence"
+                            );
+                            let request_json = serde_json::from_str(&target_payload)
+                                .unwrap_or(serde_json::Value::String(target_payload));
+                            insert_parked_delivery(
+                                pool,
+                                route.target_bounded_context,
+                                &format!("cross-context-route:{}", route.name),
+                                ParkedDeliveryKind::CrossContextRoute,
+                                &event.sequence.to_string(),
+                                None,
+                                Some(route.target_bounded_context),
+                                Some(route.target_command_type),
+                                &request_json,
+                                &e.to_string(),
+                                retry_attempt,
+                                first_failed_at,
+                                now,
+                            )
+                            .await?;
+                            update_cross_context_route_cursor(
+                                pool,
+                                route.source_bounded_context,
+                                route.name,
+                                event.sequence,
+                                now,
+                            )
+                            .await?;
+                            retry_attempt = 0;
+                            retry_first_failed_at = None;
+                            continue;
+                        }
+                        let next_attempt_at = now
+                            + chrono::Duration::from_std(
+                                retry_policy.next_backoff(retry_attempt as u32),
+                            )
+                            .unwrap_or(chrono::Duration::zero());
+                        tracing::warn!(
+                            sequence = event.sequence,
+                            error = %e,
+                            attempt = retry_attempt,
+                            next_attempt_at = %next_attempt_at,
+                            "cross-context route: target command submission failed - will \
+                             retry with backoff; route blocked until then"
+                        );
+                        record_cross_context_route_retry_failure(
+                            pool,
+                            route.source_bounded_context,
+                            route.name,
+                            cursor,
+                            retry_attempt,
+                            first_failed_at,
+                            next_attempt_at,
+                            now,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
                 // Defence in depth, not solely a bypass signal: with the
                 // prefix reserved, nothing *else* can write into this
                 // namespace, but this route's own past attempt at this
@@ -6343,6 +6897,8 @@ pub async fn catch_up_cross_context_route(
             Utc::now(),
         )
         .await?;
+        retry_attempt = 0;
+        retry_first_failed_at = None;
     }
     Ok(())
 }

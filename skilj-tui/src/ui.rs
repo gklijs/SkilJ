@@ -9,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use serde_json::Value;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -26,6 +27,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tab::QueryEvents => draw_query_events(frame, app, chunks[1]),
         Tab::Commands => draw_commands(frame, app, chunks[1]),
         Tab::Projections => draw_projections(frame, app, chunks[1]),
+        Tab::ParkedDeliveries => draw_parked_deliveries(frame, app, chunks[1]),
     }
     draw_status_line(frame, app, chunks[2]);
 }
@@ -375,6 +377,67 @@ fn draw_projections(frame: &mut Frame, app: &App, area: Rect) {
         body.wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("State")),
         chunks[3],
+    );
+}
+
+/// Codeberg issue #21 - `parkedDeliveries`/`retryParkedDelivery`/
+/// `discardParkedDelivery`: a list of parked deliveries (Enter retries
+/// the selected row, `d` discards it, `r` refreshes), with the selected
+/// row's own full JSON (including `requestJson` - what a retry actually
+/// redrives - too wide to fit the list row itself) shown below.
+fn draw_parked_deliveries(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Min(0)])
+        .split(area);
+
+    let title = if let Some(err) = &app.parked_deliveries.error {
+        format!("Parked deliveries - {err}")
+    } else if app.parked_deliveries.loading {
+        "Parked deliveries - loading...".to_string()
+    } else {
+        "Parked deliveries - Enter to retry, d to discard, r to refresh".to_string()
+    };
+    let items: Vec<ListItem> = app
+        .parked_deliveries
+        .items
+        .iter()
+        .map(|item| {
+            let source = item.get("source").and_then(Value::as_str).unwrap_or("");
+            let identifier = item.get("identifier").and_then(Value::as_str).unwrap_or("");
+            let attempts = item
+                .get("attemptCount")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let error = item.get("error").and_then(Value::as_str).unwrap_or("");
+            ListItem::new(format!(
+                "{source} {identifier} (attempts: {attempts}) - {error}"
+            ))
+        })
+        .collect();
+    let is_empty = items.is_empty();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    if !is_empty {
+        state.select(Some(app.parked_deliveries.list_selected));
+    }
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+
+    let body = app
+        .parked_deliveries
+        .items
+        .get(app.parked_deliveries.list_selected)
+        .map(json_style::pretty)
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Selected delivery"),
+        ),
+        chunks[1],
     );
 }
 

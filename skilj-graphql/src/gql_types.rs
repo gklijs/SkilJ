@@ -529,6 +529,53 @@ pub fn projection_registration_result_object() -> Object {
     })
 }
 
+/// Codeberg issue #21 - see `skilj_core::db::ParkedDeliveryKind`'s own
+/// doc comment for what each variant means and which other
+/// `ParkedDelivery` fields it implies are populated.
+pub fn parked_delivery_kind_name(kind: skilj_core::db::ParkedDeliveryKind) -> &'static str {
+    match kind {
+        skilj_core::db::ParkedDeliveryKind::CrossContextRoute => "CROSS_CONTEXT_ROUTE",
+        skilj_core::db::ParkedDeliveryKind::ExternalEvent => "EXTERNAL_EVENT",
+        skilj_core::db::ParkedDeliveryKind::CommandTrigger => "COMMAND_TRIGGER",
+    }
+}
+
+pub fn parked_delivery_kind_enum() -> Enum {
+    Enum::new("ParkedDeliveryKind")
+        .item("CROSS_CONTEXT_ROUTE")
+        .item("EXTERNAL_EVENT")
+        .item("COMMAND_TRIGGER")
+}
+
+/// `entity ParkedDelivery` (no spec entity backs this - see
+/// `skilj_core::db::ParkedDelivery`'s own doc comment). `requestJson` is
+/// `Value::from(serde_json::to_string(...))`, the same "deliberately
+/// coarse on the wire contract" `String`-carrying-JSON treatment
+/// `EventDto.payload`/`CommandDto.payload` already use, rather than a
+/// native GraphQL JSON scalar this schema has never needed elsewhere.
+/// `targetBoundedContext`/`targetCommandType` are populated only for
+/// `kind: CROSS_CONTEXT_ROUTE`; `accessTokenId` only for `EXTERNAL_EVENT`/
+/// `COMMAND_TRIGGER` - see `ParkedDeliveryKind`'s own doc comment for the
+/// full split.
+pub fn parked_delivery_object() -> Object {
+    gql_object!(skilj_core::db::ParkedDelivery => "ParkedDelivery" {
+        scalar "id": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.id.clone()),
+        scalar "source": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.source.clone()),
+        scalar "kind": TypeRef::named_nn("ParkedDeliveryKind") => |d| Value::from(parked_delivery_kind_name(d.kind)),
+        scalar "identifier": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.identifier.clone()),
+        scalar "accessTokenId": TypeRef::named(TypeRef::STRING) => |d| optional_string(d.access_token_id.clone()),
+        scalar "targetBoundedContext": TypeRef::named(TypeRef::STRING) => |d| optional_string(d.target_bounded_context.clone()),
+        scalar "targetCommandType": TypeRef::named(TypeRef::STRING) => |d| optional_string(d.target_command_type.clone()),
+        scalar "requestJson": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(
+            serde_json::to_string(&d.request_json).unwrap_or_default()
+        ),
+        scalar "error": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.error.clone()),
+        scalar "attemptCount": TypeRef::named_nn(TypeRef::INT) => |d| Value::from(d.attempt_count),
+        scalar "firstFailedAt": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.first_failed_at.to_rfc3339()),
+        scalar "lastFailedAt": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.last_failed_at.to_rfc3339()),
+    })
+}
+
 /// One `Object` per `AccessToken` variant, sharing the same base fields
 /// (`id`/`secret`/`status`/`createdAt`/`revokedAt`/`scope`) plus one
 /// type-specific nested field - the same "the enum variant tag is the

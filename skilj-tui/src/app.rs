@@ -10,23 +10,27 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// The four v1 tabs - see [docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console) for what's
+/// The five v1 tabs - see [docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console) for what's
 /// deliberately not here yet (schema-driven forms, the superadmin
-/// directory, admin-console operations).
+/// directory, admin-console operations). `ParkedDeliveries` (Codeberg
+/// issue #21) is the exception to "not here yet": a real admin
+/// list+retry+discard view, the first of its kind in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     LiveEvents,
     QueryEvents,
     Commands,
     Projections,
+    ParkedDeliveries,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [
+    pub const ALL: [Tab; 5] = [
         Tab::LiveEvents,
         Tab::QueryEvents,
         Tab::Commands,
         Tab::Projections,
+        Tab::ParkedDeliveries,
     ];
 
     pub fn title(self) -> &'static str {
@@ -35,6 +39,7 @@ impl Tab {
             Tab::QueryEvents => "Query Events",
             Tab::Commands => "Commands",
             Tab::Projections => "Projections",
+            Tab::ParkedDeliveries => "Parked Deliveries",
         }
     }
 }
@@ -71,6 +76,12 @@ pub enum AppEvent {
     CommandResult(Result<Value, ClientError>),
     CommandTypesResult(Result<Value, ClientError>),
     ProjectionResult(Result<Value, ClientError>),
+    /// Codeberg issue #21.
+    ParkedDeliveriesResult(Result<Value, ClientError>),
+    /// The outcome of whichever `retryParkedDelivery`/`discardParkedDelivery`
+    /// call `ParkedDeliveriesTab::action_pending` names - see its own doc
+    /// comment for why this one variant covers both mutations.
+    ParkedDeliveryActionResult(Result<Value, ClientError>),
 }
 
 const MAX_LIVE_EVENTS: usize = 200;
@@ -175,6 +186,26 @@ pub struct ProjectionsTab {
     pub loading: bool,
 }
 
+/// Codeberg issue #21 - `parkedDeliveries(boundedContext)`/
+/// `retryParkedDelivery`/`discardParkedDelivery`. Shaped like
+/// `QueryEventsTab` (a list, no picker/form sub-stage), not
+/// `CommandsTab`'s two-stage enum - there's no second view to switch
+/// into, only actions on the one list.
+pub struct ParkedDeliveriesTab {
+    pub items: Vec<Value>,
+    pub list_selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// The `id` of whichever `retryParkedDelivery`/`discardParkedDelivery`
+    /// call is currently in flight, if any. Both mutations return the
+    /// same `{ id }` shape, so `handle`'s own `ParkedDeliveryActionResult`
+    /// arm can't tell *which* action a response belongs to from the
+    /// response alone - it doesn't need to: either one succeeding means
+    /// this row is gone, so this field is all it needs to know which row
+    /// to remove from `items`.
+    pub action_pending: Option<String>,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub tab: Tab,
@@ -189,6 +220,7 @@ pub struct App {
     pub query_events: QueryEventsTab,
     pub commands: CommandsTab,
     pub projections: ProjectionsTab,
+    pub parked_deliveries: ParkedDeliveriesTab,
 
     client: Arc<Client>,
     events_tx: mpsc::UnboundedSender<AppEvent>,
@@ -235,6 +267,13 @@ impl App {
                 result: None,
                 error: None,
                 loading: false,
+            },
+            parked_deliveries: ParkedDeliveriesTab {
+                items: Vec::new(),
+                list_selected: 0,
+                loading: false,
+                error: None,
+                action_pending: None,
             },
             client,
             events_tx,
@@ -331,6 +370,42 @@ impl App {
                     Err(e) => self.projections.error = Some(e.to_string()),
                 }
             }
+            AppEvent::ParkedDeliveriesResult(result) => {
+                self.parked_deliveries.loading = false;
+                match result {
+                    Ok(data) => {
+                        self.parked_deliveries.items = data
+                            .get("parkedDeliveries")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let len = self.parked_deliveries.items.len();
+                        if self.parked_deliveries.list_selected >= len {
+                            self.parked_deliveries.list_selected = len.saturating_sub(1);
+                        }
+                        self.parked_deliveries.error = None;
+                    }
+                    Err(e) => self.parked_deliveries.error = Some(e.to_string()),
+                }
+            }
+            AppEvent::ParkedDeliveryActionResult(result) => {
+                let acted_id = self.parked_deliveries.action_pending.take();
+                match result {
+                    Ok(_) => {
+                        if let Some(id) = acted_id {
+                            self.parked_deliveries.items.retain(|item| {
+                                item.get("id").and_then(Value::as_str) != Some(id.as_str())
+                            });
+                            let len = self.parked_deliveries.items.len();
+                            if self.parked_deliveries.list_selected >= len {
+                                self.parked_deliveries.list_selected = len.saturating_sub(1);
+                            }
+                            self.status = Some(format!("parked delivery {id} handled"));
+                        }
+                    }
+                    Err(e) => self.status = Some(format!("parked delivery action failed: {e}")),
+                }
+            }
         }
     }
 
@@ -362,7 +437,7 @@ impl App {
                 self.live_events_filter_active = false;
                 return;
             }
-            if self.tab == Tab::Projections {
+            if self.tab == Tab::Projections || self.tab == Tab::ParkedDeliveries {
                 self.tab = Tab::LiveEvents;
                 return;
             }
@@ -412,6 +487,13 @@ impl App {
                     return;
                 }
                 KeyCode::Char('4') => return self.tab = Tab::Projections,
+                KeyCode::Char('5') => {
+                    self.tab = Tab::ParkedDeliveries;
+                    if self.parked_deliveries.items.is_empty() && !self.parked_deliveries.loading {
+                        self.fetch_parked_deliveries();
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -421,6 +503,7 @@ impl App {
             Tab::QueryEvents => self.handle_query_events_key(key),
             Tab::Commands => self.handle_commands_key(key),
             Tab::Projections => self.handle_projections_key(key),
+            Tab::ParkedDeliveries => self.handle_parked_deliveries_key(key),
         }
     }
 
@@ -784,6 +867,100 @@ impl App {
             )
             .await;
             let _ = tx.send(AppEvent::ProjectionResult(result));
+        });
+    }
+
+    // --- Parked Deliveries: list + retry + discard (Codeberg issue #21) ---
+
+    fn handle_parked_deliveries_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => {
+                self.parked_deliveries.list_selected =
+                    self.parked_deliveries.list_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let len = self.parked_deliveries.items.len();
+                if len > 0 && self.parked_deliveries.list_selected + 1 < len {
+                    self.parked_deliveries.list_selected += 1;
+                }
+            }
+            KeyCode::Char('r') => self.fetch_parked_deliveries(),
+            KeyCode::Enter => self.retry_selected_parked_delivery(),
+            KeyCode::Char('d') => self.discard_selected_parked_delivery(),
+            _ => {}
+        }
+    }
+
+    fn fetch_parked_deliveries(&mut self) {
+        self.parked_deliveries.loading = true;
+        self.parked_deliveries.error = None;
+        let client = self.client.clone();
+        let tx = self.events_tx.clone();
+        let bounded_context = self.bounded_context.clone();
+        tokio::spawn(async move {
+            let result = client
+                .request(
+                    "query($bc: String!) { parkedDeliveries(boundedContext: $bc) { \
+                        id source kind identifier error attemptCount firstFailedAt lastFailedAt \
+                    } }",
+                    serde_json::json!({ "bc": bounded_context }),
+                )
+                .await;
+            let _ = tx.send(AppEvent::ParkedDeliveriesResult(result));
+        });
+    }
+
+    fn selected_parked_delivery_id(&self) -> Option<String> {
+        self.parked_deliveries
+            .items
+            .get(self.parked_deliveries.list_selected)
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn retry_selected_parked_delivery(&mut self) {
+        let Some(id) = self.selected_parked_delivery_id() else {
+            return;
+        };
+        self.run_parked_delivery_action(
+            id,
+            "mutation($bc: String!, $id: String!) { \
+                retryParkedDelivery(boundedContext: $bc, id: $id) { id } \
+            }",
+        );
+    }
+
+    fn discard_selected_parked_delivery(&mut self) {
+        let Some(id) = self.selected_parked_delivery_id() else {
+            return;
+        };
+        self.run_parked_delivery_action(
+            id,
+            "mutation($bc: String!, $id: String!) { \
+                discardParkedDelivery(boundedContext: $bc, id: $id) { id } \
+            }",
+        );
+    }
+
+    /// Shared by [`retry_selected_parked_delivery`](Self::retry_selected_parked_delivery)/
+    /// [`discard_selected_parked_delivery`](Self::discard_selected_parked_delivery) -
+    /// both mutations take identical `(boundedContext, id)` arguments and
+    /// return the identical `{ id }` shape, differing only in which
+    /// mutation name `query` spells out.
+    fn run_parked_delivery_action(&mut self, id: String, query: &'static str) {
+        self.parked_deliveries.action_pending = Some(id.clone());
+        let client = self.client.clone();
+        let tx = self.events_tx.clone();
+        let bounded_context = self.bounded_context.clone();
+        tokio::spawn(async move {
+            let result = client
+                .request(
+                    query,
+                    serde_json::json!({ "bc": bounded_context, "id": id }),
+                )
+                .await;
+            let _ = tx.send(AppEvent::ParkedDeliveryActionResult(result));
         });
     }
 }

@@ -28,8 +28,8 @@ use axum::{Json, Router};
 use futures_util::TryStreamExt;
 use serde_json::{json, Value};
 use skilj_nats::{
-    dispatch_inbound_message, produce_once, InboundAction, InboundMapping, InboundMessageMeta,
-    OutboundMapping, PullConsumer,
+    dispatch_inbound_message, produce_once, run_inbound, InboundAction, InboundMapping,
+    InboundMessageMeta, OutboundMapping, PullConsumer,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -151,6 +151,18 @@ struct MockSkiljState {
     acked: Arc<Mutex<Vec<i64>>>,
     external_requests: Arc<Mutex<Vec<Value>>>,
     trigger_requests: Arc<Mutex<Vec<TriggerRequest>>>,
+    /// Codeberg issue #21 - `POST /v1/events/external` returns a 500
+    /// while this is `> 0`, decrementing it each time - the deterministic
+    /// "the target keeps failing" trigger
+    /// `an_inbound_message_parks_and_reports_after_exhausting_retries`
+    /// needs.
+    fail_external_requests: Arc<Mutex<usize>>,
+    /// Same idea, for `POST /v1/events/consume/ack` -
+    /// `an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap`'s
+    /// own deterministic trigger.
+    fail_acks: Arc<Mutex<usize>>,
+    /// Every `POST /v1/parked-deliveries` body this mock ever received.
+    parked_deliveries: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn get_events_consume(
@@ -158,12 +170,18 @@ async fn get_events_consume(
     headers: HeaderMap,
 ) -> Json<Value> {
     let token = bearer_token(&headers);
+    // Codeberg issue #21 - peeks rather than drains, so a manual-ack
+    // caller that fails to ack (`produce_once`'s own retry tests) gets
+    // the identical still-unacked event(s) back on its next GET, the
+    // real semantics `GET /v1/events/consume?mode=manual` has. Removal
+    // happens only in `post_events_consume_ack` below, once an ack
+    // actually succeeds.
     let events: Vec<Value> = state
         .queues
         .lock()
         .unwrap()
-        .get_mut(&token)
-        .map(|q| q.drain(..).collect())
+        .get(&token)
+        .map(|q| q.iter().cloned().collect())
         .unwrap_or_default();
     let event_type_name = state
         .event_types
@@ -177,13 +195,22 @@ async fn get_events_consume(
 
 async fn post_events_consume_ack(
     State(state): State<MockSkiljState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> StatusCode {
-    state
-        .acked
-        .lock()
-        .unwrap()
-        .push(body["sequence"].as_i64().unwrap());
+    {
+        let mut remaining = state.fail_acks.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    }
+    let sequence = body["sequence"].as_i64().unwrap();
+    state.acked.lock().unwrap().push(sequence);
+    let token = bearer_token(&headers);
+    if let Some(q) = state.queues.lock().unwrap().get_mut(&token) {
+        q.retain(|e| e["sequence"].as_i64().unwrap_or(i64::MIN) > sequence);
+    }
     StatusCode::OK
 }
 
@@ -191,11 +218,26 @@ async fn post_events_external(
     State(state): State<MockSkiljState>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    {
+        let mut remaining = state.fail_external_requests.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(Value::Null));
+        }
+    }
     state.external_requests.lock().unwrap().push(body);
     (
         StatusCode::CREATED,
         Json(json!({ "sequence": 1, "redelivered": false })),
     )
+}
+
+async fn post_parked_deliveries(
+    State(state): State<MockSkiljState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    state.parked_deliveries.lock().unwrap().push(body);
+    (StatusCode::CREATED, Json(json!({ "id": "parked-1" })))
 }
 
 async fn post_commands_trigger(
@@ -253,6 +295,7 @@ async fn serve_mock_skilj(state: MockSkiljState) -> String {
         .route("/v1/events/consume/ack", post(post_events_consume_ack))
         .route("/v1/events/external", post(post_events_external))
         .route("/v1/commands/trigger", post(post_commands_trigger))
+        .route("/v1/parked-deliveries", post(post_parked_deliveries))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -304,9 +347,19 @@ fn an_order_placed_event_is_published_with_its_own_tag_as_correlation_header() {
             correlation_tag_key: Some("order".to_string()),
         };
         let http = reqwest::Client::new();
-        let served = produce_once(&http, &skilj_base_url, &jetstream, "banking", &mapping)
-            .await
-            .unwrap();
+        let retry_policy = skilj_retry::RetryPolicy::default();
+        let mut retry_state = None;
+        let served = produce_once(
+            &http,
+            &skilj_base_url,
+            &jetstream,
+            "banking",
+            &mapping,
+            &retry_policy,
+            &mut retry_state,
+        )
+        .await
+        .unwrap();
         assert_eq!(served, 1);
 
         let mut messages = consumer.messages().await.unwrap();
@@ -522,5 +575,185 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_msg_
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0["payload"], json!({ "amount": 20 }));
         assert_eq!(requests[0].1.as_deref(), Some("real-msg-id-456"));
+    });
+}
+
+/// Codeberg issue #21 - a message that keeps failing to dispatch is
+/// retried with backoff (the mock's own `fail_external_requests` toggle
+/// makes `POST /v1/events/external` fail exactly twice), then reported
+/// to skilj's own `POST /v1/parked-deliveries` and the message acked
+/// anyway once `retry_policy` (`max_attempts: 2`) exhausts -
+/// `run_inbound` itself, not `dispatch_inbound_message` directly, since
+/// the retry loop lives there.
+#[test]
+fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
+    runtime().block_on(async {
+        let Some(url) = test_nats().await else {
+            return;
+        };
+        let stream_name = unique_name("ORDERSPARK");
+        let jetstream = jetstream_with_stream(url, &stream_name).await;
+        let consumer = pull_consumer(&jetstream, &stream_name).await;
+
+        let mock_state = MockSkiljState::default();
+        *mock_state.fail_external_requests.lock().unwrap() = 2;
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        jetstream
+            .publish(
+                format!("{stream_name}.in"),
+                r#"{"orderId":"o-parked"}"#.into(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mapping = InboundMapping {
+            credential: "external-token".to_string(),
+            action: InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        };
+        let http = reqwest::Client::new();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            2,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mapping, &retry_policy).await;
+        });
+
+        // 20s budget, not 5s - see skilj-kafka's own identical test for
+        // why real broker connection/session setup needs more slack than
+        // this test's own retry-policy math alone.
+        let mut parked = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let reports = mock_state.parked_deliveries.lock().unwrap();
+            if let Some(p) = reports.first() {
+                parked = Some(p.clone());
+                break;
+            }
+        }
+        let parked =
+            parked.expect("run_inbound must have reported a parked delivery within the timeout");
+        assert_eq!(parked["source"], json!("nats-inbound"));
+        assert_eq!(parked["kind"], json!("external_event"));
+        assert_eq!(parked["attemptCount"], json!(2));
+        assert_eq!(
+            parked["request"]["payload"],
+            json!({ "orderId": "o-parked" })
+        );
+        assert_eq!(parked["identifier"], json!(format!("{stream_name}:1")));
+        assert_eq!(
+            mock_state.external_requests.lock().unwrap().len(),
+            0,
+            "every attempt failed, so a real event must never have been created"
+        );
+    });
+}
+
+/// Codeberg issue #21 - the outbound direction's own shape: unlike
+/// inbound, exhausting a *configured* `retry_policy` (default is
+/// `RetryPolicy::unbounded` - this test opts into a bounded one
+/// specifically to exercise the cap) skips the event instead of parking
+/// it - acknowledged to skilj without ever successfully publishing it,
+/// no `POST /v1/parked-deliveries` call at all. `fail_acks` (not a
+/// publish failure) is this test's own deterministic trigger - see
+/// `skilj_kafka`'s own identical test for why that still exercises the
+/// real skip path even though the event *is* re-published to JetStream
+/// on each retry (an existing, pre-issue-#21 property of retrying a
+/// combined publish+ack step as one unit, not something this pass
+/// changes) - JetStream's own server-side dedup on the repeated
+/// `Nats-Msg-Id` means those retried publishes don't even create
+/// duplicate messages here, unlike Kafka's own equivalent test.
+#[test]
+fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
+    runtime().block_on(async {
+        let Some(url) = test_nats().await else {
+            return;
+        };
+        let stream_name = unique_name("ORDERSSKIP");
+        let jetstream = jetstream_with_stream(url, &stream_name).await;
+
+        let mock_state = MockSkiljState::default();
+        *mock_state.fail_acks.lock().unwrap() = 2;
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let token = "read-token-skip".to_string();
+        enqueue(
+            &mock_state,
+            &token,
+            "OrderPlaced",
+            [json!({
+                "sequence": 7,
+                "eventType": "OrderPlaced",
+                "payload": { "orderId": "o-skip" },
+                "tags": [{ "key": "order", "value": "o-skip" }],
+                "metadata": { "correlationId": null, "causationId": null },
+            })],
+        );
+
+        let mapping = OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: token,
+            subject: format!("{stream_name}.skip"),
+            correlation_tag_key: Some("order".to_string()),
+        };
+        let http = reqwest::Client::new();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            2,
+        );
+        let mut retry_state = None;
+
+        // Cycle 1: publish succeeds, ack fails (1/2 of the fail budget) -
+        // not yet exhausted, so this cycle stops here without skipping.
+        let served = produce_once(
+            &http,
+            &skilj_base_url,
+            &jetstream,
+            "banking",
+            &mapping,
+            &retry_policy,
+            &mut retry_state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(served, 0);
+        assert!(retry_state.is_some());
+        assert!(mock_state.acked.lock().unwrap().is_empty());
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Cycle 2: backoff has elapsed - publish succeeds again, ack
+        // fails again (2/2), which exhausts `max_attempts: 2`. The event
+        // is skipped: acknowledged directly, without a 3rd publish.
+        let served = produce_once(
+            &http,
+            &skilj_base_url,
+            &jetstream,
+            "banking",
+            &mapping,
+            &retry_policy,
+            &mut retry_state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            served, 0,
+            "a skipped event is not counted as served - it was never actually delivered"
+        );
+        assert!(retry_state.is_none());
+        assert_eq!(mock_state.acked.lock().unwrap().as_slice(), &[7]);
+        assert!(
+            mock_state.parked_deliveries.lock().unwrap().is_empty(),
+            "outbound gives up by skipping, never by parking"
+        );
     });
 }

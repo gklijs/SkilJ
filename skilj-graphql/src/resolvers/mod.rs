@@ -65,6 +65,7 @@ pub mod command_type_admin_operations;
 pub mod event_query;
 pub mod event_subscription;
 pub mod event_type_admin_operations;
+pub mod parked_deliveries;
 pub mod private_field_grant_management;
 pub mod projection_query;
 pub mod snapshot_query;

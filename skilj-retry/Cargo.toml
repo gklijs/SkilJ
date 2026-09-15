@@ -1,0 +1,12 @@
+[package]
+name = "skilj-retry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "A small, dependency-free backoff/attempt-cap policy shared by CrossContextRoute's catch-up loop and the three message-broker bridges (skilj-kafka/skilj-amqp/skilj-nats) - see docs/architecture.md's parked-deliveries section. No I/O, no async, no dependency on any other skilj crate."
+
+[lib]
+name = "skilj_retry"
+path = "src/lib.rs"

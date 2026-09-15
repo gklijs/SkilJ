@@ -98,6 +98,7 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
         .field(resolvers::snapshot_query::inspect_snapshot_field())
         .field(resolvers::command_query::fetch_commands_field())
         .field(resolvers::private_field_grant_management::list_private_field_grants_field())
+        .field(resolvers::parked_deliveries::parked_deliveries_field())
         .field(resolvers::projection_query::schema_field());
     if projection_types.is_some() {
         query = query.field(resolvers::projection_query::field());
@@ -118,6 +119,8 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
         .field(resolvers::type_registration::register_projection_field())
         .field(resolvers::type_registration::rebuild_projection_field())
         .field(resolvers::type_registration::discard_projection_rebuild_field())
+        .field(resolvers::parked_deliveries::retry_parked_delivery_field())
+        .field(resolvers::parked_deliveries::discard_parked_delivery_field())
         .field(resolvers::event_type_admin_operations::create_external_event_token_field())
         .field(resolvers::event_type_admin_operations::create_direct_creation_token_field())
         .field(resolvers::event_type_admin_operations::create_event_read_token_field())
@@ -186,7 +189,9 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
     .register(gql_types::inspected_snapshot_object())
     .register(gql_types::submit_command_payload_object())
     .register(gql_types::encryption_key_object())
-    .register(gql_types::encryption_key_status_enum());
+    .register(gql_types::encryption_key_status_enum())
+    .register(gql_types::parked_delivery_object())
+    .register(gql_types::parked_delivery_kind_enum());
 
     // ProjectionQuery's own per-projection types (§5.1) - data-dependent,
     // unlike everything registered above, which is why this is the one

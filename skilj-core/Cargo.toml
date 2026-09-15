@@ -42,6 +42,11 @@ ipnet.workspace = true
 # the `skilj` facade crate, where it first lived) so both `skilj` and
 # `skilj-graphql` can share one instance through `GraphqlState`.
 arc-swap.workspace = true
+# Codeberg issue #21 - the shared backoff/attempt-cap policy
+# `db::catch_up_cross_context_route` applies before parking a
+# persistently-failing occurrence. See docs/architecture.md's
+# parked-deliveries section.
+skilj-retry.workspace = true
 
 [dev-dependencies]
 postgresql_embedded = "0.21.0"

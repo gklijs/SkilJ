@@ -14,6 +14,12 @@ serde_json.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+chrono.workspace = true
+# Codeberg issue #21 - the shared backoff/attempt-cap policy both
+# directions now apply: bounded (park-on-exhaustion) inbound, unbounded
+# (skip-on-exhaustion, if a cap is configured at all) outbound. See
+# docs/architecture.md's parked-deliveries section.
+skilj-retry.workspace = true
 # rustls, not native-tls: the same TLS backend choice this workspace's
 # own `reqwest`/`jsonwebtoken` dependencies already make - Solace/Azure
 # Service Bus both require TLS (`amqps://`) in any real deployment.

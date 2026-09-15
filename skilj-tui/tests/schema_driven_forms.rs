@@ -232,3 +232,59 @@ async fn query_events_checklist_toggles_and_runs_with_only_checked_types() {
     );
     assert!(app.query_events.query_error.is_none());
 }
+
+/// Codeberg issue #21 - `App`'s Parked Deliveries tab: entering it fetches
+/// the list, navigating and discarding/retrying update `action_pending`
+/// correctly, and a successful action removes the row while a failed one
+/// leaves it in place - driven purely through `App::handle`, the same
+/// synthetic-result shape every other test in this file already uses.
+#[tokio::test]
+async fn parked_deliveries_lists_navigates_and_acts_on_the_selected_row() {
+    let mut app = new_app();
+
+    app.handle(key(KeyCode::Char('5')));
+    assert!(
+        app.parked_deliveries.loading,
+        "entering the tab should start a fetch"
+    );
+
+    app.handle(AppEvent::ParkedDeliveriesResult(Ok(json!({
+        "parkedDeliveries": [
+            { "id": "p1", "source": "kafka-inbound", "kind": "EXTERNAL_EVENT", "identifier": "a", "error": "boom", "attemptCount": 3 },
+            { "id": "p2", "source": "kafka-inbound", "kind": "EXTERNAL_EVENT", "identifier": "b", "error": "boom", "attemptCount": 5 }
+        ]
+    }))));
+    assert!(!app.parked_deliveries.loading);
+    assert_eq!(app.parked_deliveries.items.len(), 2);
+    assert_eq!(app.parked_deliveries.list_selected, 0);
+
+    app.handle(key(KeyCode::Down));
+    assert_eq!(app.parked_deliveries.list_selected, 1);
+
+    // Discard the selected (2nd) row.
+    app.handle(key(KeyCode::Char('d')));
+    assert_eq!(app.parked_deliveries.action_pending.as_deref(), Some("p2"));
+
+    app.handle(AppEvent::ParkedDeliveryActionResult(Ok(
+        json!({ "discardParkedDelivery": { "id": "p2" } }),
+    )));
+    assert!(app.parked_deliveries.action_pending.is_none());
+    assert_eq!(app.parked_deliveries.items.len(), 1);
+    assert_eq!(app.parked_deliveries.items[0]["id"], "p1");
+    assert!(app.status.as_deref().unwrap().contains("p2"));
+
+    // Retry the one remaining row - a failure must leave it in place.
+    app.handle(key(KeyCode::Enter));
+    assert_eq!(app.parked_deliveries.action_pending.as_deref(), Some("p1"));
+
+    app.handle(AppEvent::ParkedDeliveryActionResult(Err(
+        skilj_tui::graphql::ClientError::MalformedResponse("down".to_string()),
+    )));
+    assert!(app.parked_deliveries.action_pending.is_none());
+    assert_eq!(
+        app.parked_deliveries.items.len(),
+        1,
+        "a failed action must not remove the row"
+    );
+    assert!(app.status.as_deref().unwrap().contains("failed"));
+}

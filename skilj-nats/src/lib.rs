@@ -62,12 +62,41 @@
 //! sender populated one) as `Idempotency-Key` - omitted, never
 //! fabricated, when absent, the same "omitting it is always fine"
 //! register every other bridge in this workspace already has.
+//!
+//! # Dead-letter/parking (Codeberg issue #21)
+//!
+//! Both directions apply a [`skilj_retry::RetryPolicy`], but to different
+//! ends - see docs/architecture.md's parked-deliveries section for the
+//! full design, only summarised here (identical shape to
+//! `skilj_kafka`/`skilj_amqp`'s own "Dead-letter/parking" sections):
+//!
+//! - **Inbound**: a message that keeps failing to dispatch is retried
+//!   with backoff, *for that one message*, before this consumer ever
+//!   pulls its next message ([`run_inbound`]) - not tracked via
+//!   JetStream's own redelivery, which only replays after this
+//!   consumer's own ack-wait timeout elapses, not on the very next pull
+//!   in the same session. Once the policy exhausts, the message is
+//!   reported to skilj's own `POST /v1/parked-deliveries`
+//!   ([`report_parked_delivery`]) and acked anyway - without that, a
+//!   poison message would keep being redelivered by JetStream forever,
+//!   on every ack-wait timeout.
+//! - **Outbound**: an event that keeps failing to publish is retried with
+//!   backoff across [`produce_once`] calls (state threaded through
+//!   [`OutboundRetryState`]), same as inbound - but the default policy is
+//!   [`skilj_retry::RetryPolicy::unbounded`], not bounded: a JetStream
+//!   outage should self-heal once the broker is back, not give up. If a
+//!   caller configures a bounded policy anyway, exhausting it skips that
+//!   one event (acknowledges it to skilj without ever publishing it) and
+//!   moves on, logged loudly - no parked-delivery record, since there is
+//!   nothing wrong with the *message*, only (temporarily) with reaching
+//!   the broker.
 
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
 use async_nats::jetstream::consumer::Consumer;
 use async_nats::jetstream::context::Context as Jetstream;
 use async_nats::jetstream::message::PublishMessage;
 use async_nats::jetstream::Message as JetstreamMessage;
+use chrono::{DateTime, Utc};
 
 /// A pull consumer, already bound to its own stream and subject filter
 /// at creation - see [`InboundMapping`]'s own doc comment for why
@@ -193,25 +222,118 @@ pub enum BridgeError {
     MessageInfo(#[source] async_nats::Error),
 }
 
+/// Codeberg issue #21 - the backoff state one [`OutboundMapping`]'s own
+/// blocked head-of-line event carries across [`produce_once`] calls,
+/// threaded in by [`run_outbound`] (one instance per mapping) - the
+/// identical shape `skilj_kafka::OutboundRetryState`/
+/// `skilj_amqp::OutboundRetryState` already have.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboundRetryState {
+    /// Which event this state belongs to - `produce_once` clears the
+    /// state whenever a different sequence succeeds, so a stale state
+    /// left over from an old, now-skipped event is never mistaken for
+    /// the current head's.
+    sequence: i64,
+    attempt: u32,
+    first_failed_at: DateTime<Utc>,
+    next_attempt_at: DateTime<Utc>,
+}
+
+async fn ack_event(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &OutboundMapping,
+    sequence: i64,
+) -> Result<(), BridgeError> {
+    let ack = http
+        .post(format!("{skilj_base_url}/v1/events/consume/ack"))
+        .bearer_auth(&mapping.credential)
+        .json(&serde_json::json!({ "sequence": sequence }))
+        .send()
+        .await?;
+    if !ack.status().is_success() {
+        let status = ack.status();
+        let body = ack.text().await.unwrap_or_default();
+        return Err(BridgeError::SkiljStatus { status, body });
+    }
+    Ok(())
+}
+
+/// Publishes one event to JetStream, then acknowledges it to skilj -
+/// never the other order, so a crash between the two redelivers the
+/// same event next cycle rather than silently dropping it; the
+/// `Nats-Msg-Id` this sets (see this module's own "Redelivery safety"
+/// doc section) is what keeps that redelivered publish from landing
+/// twice on the JetStream side, for free, via JetStream's own
+/// server-side dedup window.
+async fn publish_and_ack_one(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    jetstream: &Jetstream,
+    bounded_context: &str,
+    mapping: &OutboundMapping,
+    event: &ConsumedEvent,
+) -> Result<(), BridgeError> {
+    let payload = event.payload.to_string().into_bytes();
+    let message_id = format!("{bounded_context}:{}", event.sequence);
+    let mut publish = PublishMessage::build()
+        .payload(payload.into())
+        .message_id(message_id);
+    if let Some(key) = correlation_key(mapping.correlation_tag_key.as_deref(), &event.tags) {
+        publish = publish.header("Skilj-Correlation-Key", key.as_str());
+    }
+    // Codeberg issue #18 - always present on correlation_id (the spec's
+    // own CorrelationIdIsAlwaysRecorded invariant), absent for a root
+    // event's causation_id. Distinct headers from `Skilj-Correlation-Key`
+    // above - see this module's own doc comment on `CORRELATION_ID_HEADER`.
+    if let Some(id) = &event.metadata.correlation_id {
+        publish = publish.header(CORRELATION_ID_HEADER, id.as_str());
+    }
+    if let Some(id) = &event.metadata.causation_id {
+        publish = publish.header(CAUSATION_ID_HEADER, id.as_str());
+    }
+    jetstream
+        .send_publish(mapping.subject.clone(), publish)
+        .await?
+        .await?;
+    ack_event(http, skilj_base_url, mapping, event.sequence).await
+}
+
 /// One fetch-publish-ack cycle for a single [`OutboundMapping`] -
 /// [`run_outbound`] is just this in a loop. Exposed separately so it can
 /// be driven directly in tests, the identical shape
 /// `skilj_kafka::produce_once`/`skilj_amqp::produce_once` already have.
-/// Returns how many events were served this cycle.
+/// Returns how many events this cycle actually published (0 when the
+/// mapping's own read cursor is already caught up, or when its own head
+/// event is still in backoff - see [`OutboundRetryState`]'s own doc
+/// comment). A skipped event (Codeberg issue #21 - `retry_policy`
+/// exhausted) is acknowledged but not counted here, so a caller checking
+/// "did this cycle make real progress" isn't misled into thinking
+/// JetStream actually received it.
 ///
-/// Publishes to JetStream *before* acknowledging to skilj - never the
-/// other order - so a crash between the two redelivers the same event
-/// next cycle rather than silently dropping it; the `Nats-Msg-Id` this
-/// sets (see this module's own "Redelivery safety" doc section) is what
-/// keeps that redelivered publish from landing twice on the JetStream
-/// side, for free, via JetStream's own server-side dedup window.
+/// A failure publishing *or* acknowledging one event stops this cycle
+/// right there - `retry_state` records it, and no event behind it is
+/// even attempted this cycle (the identical "the head blocks everything
+/// behind it" behaviour `skilj_kafka::produce_once`/
+/// `catch_up_cross_context_route` already have, and for the same reason:
+/// skipping ahead would silently drop the blocked event from ever being
+/// retried, since nothing would ever revisit it once a later one's own
+/// ack passes it).
 pub async fn produce_once(
     http: &reqwest::Client,
     skilj_base_url: &str,
     jetstream: &Jetstream,
     bounded_context: &str,
     mapping: &OutboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
+    retry_state: &mut Option<OutboundRetryState>,
 ) -> Result<usize, BridgeError> {
+    if let Some(state) = retry_state {
+        if Utc::now() < state.next_attempt_at {
+            return Ok(0);
+        }
+    }
+
     let response = http
         .get(format!("{skilj_base_url}/v1/events/consume?mode=manual"))
         .bearer_auth(&mapping.credential)
@@ -230,62 +352,105 @@ pub async fn produce_once(
         });
     }
 
+    let mut served = 0;
     for event in &consumed.events {
-        let payload = event.payload.to_string().into_bytes();
-        let message_id = format!("{bounded_context}:{}", event.sequence);
-        let mut publish = PublishMessage::build()
-            .payload(payload.into())
-            .message_id(message_id);
-        if let Some(key) = correlation_key(mapping.correlation_tag_key.as_deref(), &event.tags) {
-            publish = publish.header("Skilj-Correlation-Key", key.as_str());
-        }
-        // Codeberg issue #18 - always present on correlation_id (the
-        // spec's own CorrelationIdIsAlwaysRecorded invariant), absent for
-        // a root event's causation_id. Distinct headers from
-        // `Skilj-Correlation-Key` above - see this module's own doc
-        // comment on `CORRELATION_ID_HEADER`.
-        if let Some(id) = &event.metadata.correlation_id {
-            publish = publish.header(CORRELATION_ID_HEADER, id.as_str());
-        }
-        if let Some(id) = &event.metadata.causation_id {
-            publish = publish.header(CAUSATION_ID_HEADER, id.as_str());
-        }
-        jetstream
-            .send_publish(mapping.subject.clone(), publish)
-            .await?
-            .await?;
-
-        let ack = http
-            .post(format!("{skilj_base_url}/v1/events/consume/ack"))
-            .bearer_auth(&mapping.credential)
-            .json(&serde_json::json!({ "sequence": event.sequence }))
-            .send()
-            .await?;
-        if !ack.status().is_success() {
-            let status = ack.status();
-            let body = ack.text().await.unwrap_or_default();
-            return Err(BridgeError::SkiljStatus { status, body });
+        match publish_and_ack_one(
+            http,
+            skilj_base_url,
+            jetstream,
+            bounded_context,
+            mapping,
+            event,
+        )
+        .await
+        {
+            Ok(()) => {
+                served += 1;
+                if retry_state.is_some_and(|s| s.sequence == event.sequence) {
+                    *retry_state = None;
+                }
+            }
+            Err(e) => {
+                let now = Utc::now();
+                let (attempt, first_failed_at) = match retry_state {
+                    Some(state) if state.sequence == event.sequence => {
+                        state.attempt += 1;
+                        (state.attempt, state.first_failed_at)
+                    }
+                    _ => {
+                        *retry_state = Some(OutboundRetryState {
+                            sequence: event.sequence,
+                            attempt: 1,
+                            first_failed_at: now,
+                            next_attempt_at: now,
+                        });
+                        (1, now)
+                    }
+                };
+                let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
+                if retry_policy.is_exhausted(attempt, elapsed) {
+                    tracing::error!(
+                        event_type = %mapping.event_type,
+                        sequence = event.sequence,
+                        attempt,
+                        error = %e,
+                        "giving up on this event after repeated failures - skipping it \
+                         (acknowledging without ever publishing it to JetStream) so the \
+                         stream isn't blocked forever"
+                    );
+                    ack_event(http, skilj_base_url, mapping, event.sequence).await?;
+                    *retry_state = None;
+                    continue;
+                }
+                let backoff = retry_policy.next_backoff(attempt);
+                tracing::warn!(
+                    event_type = %mapping.event_type,
+                    sequence = event.sequence,
+                    attempt,
+                    error = %e,
+                    "publishing/acknowledging this event failed - will retry with backoff"
+                );
+                if let Some(state) = retry_state {
+                    state.next_attempt_at = now
+                        + chrono::Duration::from_std(backoff).unwrap_or(chrono::Duration::zero());
+                }
+                return Ok(served);
+            }
         }
     }
-    Ok(consumed.events.len())
+    Ok(served)
 }
 
 /// Runs [`produce_once`] forever, one mapping at a time in the order
 /// given, sleeping `poll_interval` between cycles that served nothing -
 /// the identical shape `skilj_kafka::run_outbound`/`skilj_amqp::run_outbound`
-/// already have.
+/// already have. `retry_policy` applies to every mapping alike - see
+/// [`produce_once`]'s own doc comment and this module's own "Dead-letter/
+/// parking" section for what it governs.
 pub async fn run_outbound(
     skilj_base_url: &str,
     jetstream: &Jetstream,
     bounded_context: &str,
     mappings: &[OutboundMapping],
     poll_interval: std::time::Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
     let http = reqwest::Client::new();
+    let mut retry_states: Vec<Option<OutboundRetryState>> = vec![None; mappings.len()];
     loop {
         let mut served_any = false;
-        for mapping in mappings {
-            match produce_once(&http, skilj_base_url, jetstream, bounded_context, mapping).await {
+        for (mapping, retry_state) in mappings.iter().zip(retry_states.iter_mut()) {
+            match produce_once(
+                &http,
+                skilj_base_url,
+                jetstream,
+                bounded_context,
+                mapping,
+                retry_policy,
+                retry_state,
+            )
+            .await
+            {
                 Ok(served) => served_any |= served > 0,
                 Err(e) => {
                     tracing::error!(
@@ -335,6 +500,19 @@ pub enum InboundAction {
     /// `client_id`-scoped since [§37](../../docs/architecture.md#idempotency-keys-client-id-scoping)) *only when* the message carries a
     /// `Nats-Msg-Id` - see [`InboundMessageMeta`]'s own doc comment.
     Trigger { command_type: String },
+}
+
+impl InboundAction {
+    /// The `kind` `POST /v1/parked-deliveries` expects - see
+    /// `skilj-rest::routes::ParkedDeliveryKindRequest`'s own identical
+    /// two variants, and `skilj_kafka::InboundAction::parked_delivery_kind`/
+    /// `skilj_amqp::InboundAction::parked_delivery_kind`.
+    fn parked_delivery_kind(&self) -> &'static str {
+        match self {
+            InboundAction::Record { .. } => "external_event",
+            InboundAction::Trigger { .. } => "command_trigger",
+        }
+    }
 }
 
 /// The subset of a consumed JetStream message's own metadata this
@@ -408,16 +586,19 @@ impl InboundMessageMeta {
 /// `dedupe` rather than sending a negative, meaningless value, the same
 /// "omit rather than wrap" register `skilj_amqp::produce_once` already
 /// uses for AMQP 1.0's own narrower 32-bit `group-sequence`.
-pub async fn dispatch_inbound_message(
-    http: &reqwest::Client,
-    skilj_base_url: &str,
+/// The exact `ExternalEventRequest`/`CommandTriggerRequest` body
+/// [`dispatch_inbound_message`] sends for `mapping`/`payload_json`/`meta` -
+/// factored out so [`report_parked_delivery`] can store the identical
+/// body a `retryParkedDelivery` redrive later needs, without either
+/// duplicating this shape or sending a live HTTP request just to build
+/// it - the identical role `skilj_kafka::inbound_request_body`/
+/// `skilj_amqp::inbound_request_body` already play.
+fn inbound_request_body(
     mapping: &InboundMapping,
     meta: &InboundMessageMeta,
-    payload: &[u8],
-) -> Result<(), BridgeError> {
-    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
-
-    let response = match &mapping.action {
+    payload_json: &serde_json::Value,
+) -> serde_json::Value {
+    match &mapping.action {
         InboundAction::Record { .. } => {
             let mut body = serde_json::json!({
                 "payload": payload_json,
@@ -441,6 +622,28 @@ pub async fn dispatch_inbound_message(
                     );
                 }
             }
+            body
+        }
+        InboundAction::Trigger { .. } => serde_json::json!({
+            "payload": payload_json,
+            "correlationId": meta.correlation_id,
+            "causationId": meta.causation_id,
+        }),
+    }
+}
+
+pub async fn dispatch_inbound_message(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    meta: &InboundMessageMeta,
+    payload: &[u8],
+) -> Result<(), BridgeError> {
+    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
+    let body = inbound_request_body(mapping, meta, &payload_json);
+
+    let response = match &mapping.action {
+        InboundAction::Record { .. } => {
             http.post(format!("{skilj_base_url}/v1/events/external"))
                 .bearer_auth(&mapping.credential)
                 .json(&body)
@@ -451,11 +654,7 @@ pub async fn dispatch_inbound_message(
             let mut request = http
                 .post(format!("{skilj_base_url}/v1/commands/trigger"))
                 .bearer_auth(&mapping.credential)
-                .json(&serde_json::json!({
-                    "payload": payload_json,
-                    "correlationId": meta.correlation_id,
-                    "causationId": meta.causation_id,
-                }));
+                .json(&body);
             if let Some(id) = &meta.message_id {
                 request = request.header("Idempotency-Key", id.as_str());
             }
@@ -475,18 +674,75 @@ pub async fn dispatch_inbound_message(
     Ok(())
 }
 
-/// Runs forever: for every message this `consumer` pulls, calls
-/// [`dispatch_inbound_message`], acking (`Message::ack`) only once that
-/// call succeeds - the identical "commit/ack only after skilj confirms"
-/// shape `skilj_kafka::run_inbound`/`skilj_amqp::run_inbound` already
-/// have. A dispatch failure is logged, not acked - JetStream redelivers
-/// the identical message once its own ack-wait timeout elapses, safe
-/// because of [`dispatch_inbound_message`]'s own redelivery-safety keys.
+/// Codeberg issue #21 - reports a message [`run_inbound`] gave up
+/// retrying to skilj's own `POST /v1/parked-deliveries`, using the same
+/// credential `mapping` already carries (that route resolves the
+/// bounded context from the presented token itself, the identical
+/// capability-based design this bridge's every other call already
+/// relies on) - the identical role `skilj_kafka::report_parked_delivery`/
+/// `skilj_amqp::report_parked_delivery` already play. `identifier` is
+/// `"{stream}:{stream_sequence}"` - always available (unlike
+/// `Nats-Msg-Id`, sender-optional), the same pair [`inbound_request_body`]
+/// already sends as `dedupe` for a `Record` action. `request` is
+/// [`inbound_request_body`]'s own output, the exact body that kept
+/// failing, stored verbatim so a later `retryParkedDelivery` redrives
+/// the identical request.
+#[allow(clippy::too_many_arguments)]
+async fn report_parked_delivery(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    identifier: &str,
+    request: &serde_json::Value,
+    error: &str,
+    attempt_count: u32,
+    first_failed_at: DateTime<Utc>,
+) -> Result<(), BridgeError> {
+    let response = http
+        .post(format!("{skilj_base_url}/v1/parked-deliveries"))
+        .bearer_auth(&mapping.credential)
+        .json(&serde_json::json!({
+            "source": "nats-inbound",
+            "kind": mapping.action.parked_delivery_kind(),
+            "identifier": identifier,
+            "error": error,
+            "attemptCount": attempt_count,
+            "firstFailedAt": first_failed_at.to_rfc3339(),
+            "request": request,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(BridgeError::SkiljStatus { status, body });
+    }
+    Ok(())
+}
+
+/// Runs forever: for every message this `consumer` pulls, dispatches it
+/// via [`dispatch_inbound_message`], acking (`Message::ack`) only once
+/// that call succeeds - the identical "commit/ack only after skilj
+/// confirms" shape `skilj_kafka::run_inbound`/`skilj_amqp::run_inbound`
+/// already have.
+///
+/// Codeberg issue #21: a dispatch failure is retried, *for this one
+/// message*, with backoff up to `retry_policy` - not by relying on
+/// JetStream's own redelivery, which only replays after this consumer's
+/// own ack-wait timeout elapses, not on the very next pulled message in
+/// the same session. Once `retry_policy` exhausts, the message is
+/// reported to skilj via [`report_parked_delivery`] and acked anyway -
+/// without that, a poison message would keep being redelivered by
+/// JetStream forever, on every ack-wait timeout. If the *report* itself
+/// fails, the message is deliberately left unacked (a real gap - better
+/// a loud, visible redelivery loop than a silently unreported poison
+/// message).
 pub async fn run_inbound(
     consumer: &PullConsumer,
     http: &reqwest::Client,
     skilj_base_url: &str,
     mapping: &InboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
     loop {
         let mut messages = match consumer.messages().await {
@@ -505,20 +761,78 @@ pub async fn run_inbound(
                     continue;
                 }
             };
-            match dispatch_inbound_message(http, skilj_base_url, mapping, &meta, &message.payload)
+
+            let mut attempt: u32 = 0;
+            let mut first_failed_at: Option<DateTime<Utc>> = None;
+            loop {
+                match dispatch_inbound_message(
+                    http,
+                    skilj_base_url,
+                    mapping,
+                    &meta,
+                    &message.payload,
+                )
                 .await
-            {
-                Ok(()) => {
-                    if let Err(e) = message.ack().await {
-                        tracing::error!("acking a JetStream message failed: {e}");
+                {
+                    Ok(()) => {
+                        if let Err(e) = message.ack().await {
+                            tracing::error!("acking a JetStream message failed: {e}");
+                        }
+                        break;
                     }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        stream = meta.stream,
-                        stream_sequence = meta.stream_sequence,
-                        "dispatch failed, not acking - will redeliver: {e}"
-                    );
+                    Err(e) => {
+                        attempt += 1;
+                        let failed_at = *first_failed_at.get_or_insert_with(Utc::now);
+                        let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
+                        if retry_policy.is_exhausted(attempt, elapsed) {
+                            tracing::error!(
+                                stream = meta.stream,
+                                stream_sequence = meta.stream_sequence,
+                                attempt,
+                                error = %e,
+                                "dispatch failed repeatedly - parking and acking so this \
+                                 message doesn't get redelivered forever"
+                            );
+                            let payload_json: serde_json::Value =
+                                serde_json::from_slice(&message.payload)
+                                    .unwrap_or(serde_json::Value::Null);
+                            let body = inbound_request_body(mapping, &meta, &payload_json);
+                            let identifier = format!("{}:{}", meta.stream, meta.stream_sequence);
+                            if let Err(report_err) = report_parked_delivery(
+                                http,
+                                skilj_base_url,
+                                mapping,
+                                &identifier,
+                                &body,
+                                &e.to_string(),
+                                attempt,
+                                failed_at,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    stream = meta.stream,
+                                    stream_sequence = meta.stream_sequence,
+                                    "reporting this parked delivery failed - not acking, \
+                                     will redeliver: {report_err}"
+                                );
+                                break;
+                            }
+                            if let Err(ack_err) = message.ack().await {
+                                tracing::error!("acking a JetStream message failed: {ack_err}");
+                            }
+                            break;
+                        }
+                        let backoff = retry_policy.next_backoff(attempt);
+                        tracing::warn!(
+                            stream = meta.stream,
+                            stream_sequence = meta.stream_sequence,
+                            attempt,
+                            error = %e,
+                            "dispatch failed - retrying after backoff"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
                 }
             }
         }

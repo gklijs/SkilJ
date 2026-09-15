@@ -63,7 +63,37 @@
 //! (`Receiver::accept`, [`run_inbound`]) after skilj confirms the call
 //! succeeded, so a redelivery (a consumer crash before its own accept
 //! lands) calls skilj again rather than silently skipping the message.
+//!
+//! # Dead-letter/parking (Codeberg issue #21)
+//!
+//! Both directions apply a [`skilj_retry::RetryPolicy`], the identical
+//! shape `skilj-kafka` uses - see that crate's own "Dead-letter/parking"
+//! doc section and docs/architecture.md's parked-deliveries section for
+//! the full design, only summarised here:
+//!
+//! - **Inbound**: a message that keeps failing to dispatch is retried
+//!   with backoff, *for that one message*, before this receiver ever
+//!   calls `recv()` again ([`run_inbound`]) - a purely local, in-process
+//!   retry loop, not tracked via any broker-reported delivery/redelivery
+//!   count (AMQP 1.0 has no such standard property this bridge already
+//!   reads - see [`InboundMessageMeta`]'s own doc comment on how sparse
+//!   its own metadata already is). Once the policy exhausts, the message
+//!   is reported to skilj's own `POST /v1/parked-deliveries`
+//!   ([`report_parked_delivery`]) and the delivery is accepted anyway -
+//!   without that, a poison message would block redelivery forever on
+//!   whichever broker-side redelivery/ack-timeout mechanism applies.
+//! - **Outbound**: an event that keeps failing to send is retried with
+//!   backoff across [`produce_once`] calls (state threaded through
+//!   [`OutboundRetryState`]) - but the default policy is
+//!   [`skilj_retry::RetryPolicy::unbounded`], not bounded: a broker
+//!   outage should self-heal once it's back, not give up. If a caller
+//!   configures a bounded policy anyway, exhausting it skips that one
+//!   event (acknowledges it to skilj without ever sending it) and moves
+//!   on, logged loudly - no parked-delivery record, since there is
+//!   nothing wrong with the *message*, only (temporarily) with reaching
+//!   the broker.
 
+use chrono::{DateTime, Utc};
 use fe2o3_amqp::link::{RecvError, SendError};
 use fe2o3_amqp::types::messaging::{ApplicationProperties, Data, Message, MessageId, Properties};
 use fe2o3_amqp::types::primitives::SimpleValue;
@@ -184,26 +214,127 @@ pub enum BridgeError {
     MalformedPayload(#[from] serde_json::Error),
 }
 
-/// One fetch-produce-ack cycle for a single [`OutboundMapping`] -
+/// Codeberg issue #21 - the backoff state one [`OutboundMapping`]'s own
+/// blocked head-of-line event carries across [`produce_once`] calls,
+/// threaded in by [`run_outbound`] (one instance per mapping). Only the
+/// head can ever be blocked - see `skilj_kafka::OutboundRetryState`'s own
+/// doc comment for the identical invariant and why.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboundRetryState {
+    sequence: i64,
+    attempt: u32,
+    first_failed_at: DateTime<Utc>,
+    next_attempt_at: DateTime<Utc>,
+}
+
+async fn ack_event(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &OutboundMapping,
+    sequence: i64,
+) -> Result<(), BridgeError> {
+    let ack = http
+        .post(format!("{skilj_base_url}/v1/events/consume/ack"))
+        .bearer_auth(&mapping.credential)
+        .json(&serde_json::json!({ "sequence": sequence }))
+        .send()
+        .await?;
+    if !ack.status().is_success() {
+        let status = ack.status();
+        let body = ack.text().await.unwrap_or_default();
+        return Err(BridgeError::SkiljStatus { status, body });
+    }
+    Ok(())
+}
+
+/// Sends one event to AMQP, then acknowledges it to skilj - never the
+/// other order, so a crash between the two redelivers the same event
+/// next cycle rather than silently dropping it. `group-sequence` is this
+/// event's own skilj sequence number, cast to AMQP 1.0's own 32-bit
+/// field - `None` (omitted, not wrapped) if it doesn't fit, logged as a
+/// real, if distant, protocol-level limit rather than silently producing
+/// a meaningless wrapped value a downstream consumer might mistake for a
+/// genuine ordering.
+async fn send_and_ack_one(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    sender: &mut AmqpSender,
+    mapping: &OutboundMapping,
+    event: &ConsumedEvent,
+) -> Result<(), BridgeError> {
+    let group_id = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
+    let group_sequence = match u32::try_from(event.sequence) {
+        Ok(seq) => Some(seq),
+        Err(_) => {
+            tracing::warn!(
+                sequence = event.sequence,
+                "event sequence exceeds AMQP 1.0's own 32-bit group-sequence field - \
+                 omitting it rather than wrapping into a meaningless value"
+            );
+            None
+        }
+    };
+    let payload = event.payload.to_string().into_bytes();
+    // Codeberg issue #18 - `correlation-id` is a real AMQP 1.0 standard
+    // property (`Properties::correlation_id`), set directly;
+    // `causation_id` has no standard equivalent, so it rides in
+    // `application-properties` instead (see `CAUSATION_ID_PROPERTY`'s own
+    // doc comment). correlation_id is always present by this point (the
+    // spec's own CorrelationIdIsAlwaysRecorded invariant); causation_id is
+    // absent for a root event.
+    let mut properties_builder = Properties::builder()
+        .group_id(group_id)
+        .group_sequence(group_sequence);
+    if let Some(id) = event.metadata.correlation_id.clone() {
+        properties_builder = properties_builder.correlation_id(MessageId::String(id));
+    }
+    let application_properties = event.metadata.causation_id.as_deref().map(|id| {
+        ApplicationProperties::builder()
+            .insert(CAUSATION_ID_PROPERTY, id)
+            .build()
+    });
+    let message = Message::builder()
+        .properties(properties_builder.build())
+        .application_properties(application_properties)
+        .data(payload)
+        .build();
+    sender
+        .send(message)
+        .await?
+        .accepted_or_else(BridgeError::NotAccepted)?;
+    ack_event(http, skilj_base_url, mapping, event.sequence).await
+}
+
+/// One fetch-send-ack cycle for a single [`OutboundMapping`] -
 /// [`run_outbound`] is just this in a loop. Exposed separately so it can
 /// be driven directly in tests, the identical shape
 /// `skilj_kafka::produce_once`/`skilj_temporal::poll_once` already have.
-/// Returns how many events were served this cycle.
+/// Returns how many events this cycle actually sent (0 when the
+/// mapping's own read cursor is already caught up, or when its own head
+/// event is still in backoff - see [`OutboundRetryState`]'s own doc
+/// comment). A skipped event (Codeberg issue #21 - `retry_policy`
+/// exhausted) is acknowledged but not counted here, the identical
+/// "don't misrepresent a skip as real delivery" reasoning
+/// `skilj_kafka::produce_once` already documents.
 ///
-/// Sends to AMQP *before* acknowledging to skilj - never the other
-/// order - so a crash between the two redelivers the same event next
-/// cycle rather than silently dropping it. `group-sequence` is this
-/// event's own skilj sequence number, cast to AMQP 1.0's own 32-bit
-/// field - `None` (omitted, not wrapped) if it doesn't fit, logged as a
-/// real, if distant, protocol-level limit rather than silently
-/// producing a meaningless wrapped value a downstream consumer might
-/// mistake for a genuine ordering.
+/// A failure sending *or* acknowledging one event stops this cycle right
+/// there - `retry_state` records it, and no event behind it is even
+/// attempted this cycle, the identical "the head blocks everything
+/// behind it" behaviour `skilj_kafka::produce_once` already has.
 pub async fn produce_once(
     http: &reqwest::Client,
     skilj_base_url: &str,
     sender: &mut AmqpSender,
     mapping: &OutboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
+    retry_state: &mut Option<OutboundRetryState>,
 ) -> Result<usize, BridgeError> {
+    if let Some(state) = retry_state {
+        if Utc::now() < state.next_attempt_at {
+            return Ok(0);
+        }
+    }
+
     let response = http
         .get(format!("{skilj_base_url}/v1/events/consume?mode=manual"))
         .bearer_auth(&mapping.credential)
@@ -222,79 +353,94 @@ pub async fn produce_once(
         });
     }
 
+    let mut served = 0;
     for event in &consumed.events {
-        let group_id = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
-        let group_sequence = match u32::try_from(event.sequence) {
-            Ok(seq) => Some(seq),
-            Err(_) => {
-                tracing::warn!(
-                    sequence = event.sequence,
-                    "event sequence exceeds AMQP 1.0's own 32-bit group-sequence field - \
-                     omitting it rather than wrapping into a meaningless value"
-                );
-                None
+        match send_and_ack_one(http, skilj_base_url, sender, mapping, event).await {
+            Ok(()) => {
+                served += 1;
+                if retry_state.is_some_and(|s| s.sequence == event.sequence) {
+                    *retry_state = None;
+                }
             }
-        };
-        let payload = event.payload.to_string().into_bytes();
-        // Codeberg issue #18 - `correlation-id` is a real AMQP 1.0
-        // standard property (`Properties::correlation_id`), set directly;
-        // `causation_id` has no standard equivalent, so it rides in
-        // `application-properties` instead (see `CAUSATION_ID_PROPERTY`'s
-        // own doc comment). correlation_id is always present by this
-        // point (the spec's own CorrelationIdIsAlwaysRecorded invariant);
-        // causation_id is absent for a root event.
-        let mut properties_builder = Properties::builder()
-            .group_id(group_id)
-            .group_sequence(group_sequence);
-        if let Some(id) = event.metadata.correlation_id.clone() {
-            properties_builder = properties_builder.correlation_id(MessageId::String(id));
-        }
-        let application_properties = event.metadata.causation_id.as_deref().map(|id| {
-            ApplicationProperties::builder()
-                .insert(CAUSATION_ID_PROPERTY, id)
-                .build()
-        });
-        let message = Message::builder()
-            .properties(properties_builder.build())
-            .application_properties(application_properties)
-            .data(payload)
-            .build();
-        sender
-            .send(message)
-            .await?
-            .accepted_or_else(BridgeError::NotAccepted)?;
-
-        let ack = http
-            .post(format!("{skilj_base_url}/v1/events/consume/ack"))
-            .bearer_auth(&mapping.credential)
-            .json(&serde_json::json!({ "sequence": event.sequence }))
-            .send()
-            .await?;
-        if !ack.status().is_success() {
-            let status = ack.status();
-            let body = ack.text().await.unwrap_or_default();
-            return Err(BridgeError::SkiljStatus { status, body });
+            Err(e) => {
+                let now = Utc::now();
+                let (attempt, first_failed_at) = match retry_state {
+                    Some(state) if state.sequence == event.sequence => {
+                        state.attempt += 1;
+                        (state.attempt, state.first_failed_at)
+                    }
+                    _ => {
+                        *retry_state = Some(OutboundRetryState {
+                            sequence: event.sequence,
+                            attempt: 1,
+                            first_failed_at: now,
+                            next_attempt_at: now,
+                        });
+                        (1, now)
+                    }
+                };
+                let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
+                if retry_policy.is_exhausted(attempt, elapsed) {
+                    tracing::error!(
+                        event_type = %mapping.event_type,
+                        sequence = event.sequence,
+                        attempt,
+                        error = %e,
+                        "giving up on this event after repeated failures - skipping it \
+                         (acknowledging without ever sending it to AMQP) so the stream \
+                         isn't blocked forever"
+                    );
+                    ack_event(http, skilj_base_url, mapping, event.sequence).await?;
+                    *retry_state = None;
+                    continue;
+                }
+                let backoff = retry_policy.next_backoff(attempt);
+                tracing::warn!(
+                    event_type = %mapping.event_type,
+                    sequence = event.sequence,
+                    attempt,
+                    error = %e,
+                    "sending/acknowledging this event failed - will retry with backoff"
+                );
+                if let Some(state) = retry_state {
+                    state.next_attempt_at = now
+                        + chrono::Duration::from_std(backoff).unwrap_or(chrono::Duration::zero());
+                }
+                return Ok(served);
+            }
         }
     }
-    Ok(consumed.events.len())
+    Ok(served)
 }
 
 /// Runs [`produce_once`] forever, one mapping at a time in the order
 /// given, sleeping `poll_interval` between cycles that served nothing -
 /// the identical shape `skilj_kafka::run_outbound`/`skilj_temporal::run`
-/// already have, including why a transient failure is logged and
-/// retried rather than ending the loop.
+/// already have. `retry_policy` applies to every mapping alike - see
+/// [`produce_once`]'s own doc comment and this crate's own "Dead-letter/
+/// parking" section for what it governs.
 pub async fn run_outbound(
     skilj_base_url: &str,
     sender: &mut AmqpSender,
     mappings: &[OutboundMapping],
     poll_interval: std::time::Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
     let http = reqwest::Client::new();
+    let mut retry_states: Vec<Option<OutboundRetryState>> = vec![None; mappings.len()];
     loop {
         let mut served_any = false;
-        for mapping in mappings {
-            match produce_once(&http, skilj_base_url, sender, mapping).await {
+        for (mapping, retry_state) in mappings.iter().zip(retry_states.iter_mut()) {
+            match produce_once(
+                &http,
+                skilj_base_url,
+                sender,
+                mapping,
+                retry_policy,
+                retry_state,
+            )
+            .await
+            {
                 Ok(served) => served_any |= served > 0,
                 Err(e) => {
                     tracing::error!(
@@ -338,6 +484,18 @@ pub enum InboundAction {
     /// `client_id`-scoped since [§37](../../docs/architecture.md#idempotency-keys-client-id-scoping)) *only when* the message carries a
     /// `message-id` - see [`InboundMessageMeta`]'s own doc comment.
     Trigger { command_type: String },
+}
+
+impl InboundAction {
+    /// The `kind` `POST /v1/parked-deliveries` expects - see
+    /// `skilj_kafka::InboundAction::parked_delivery_kind`'s own identical
+    /// two variants.
+    fn parked_delivery_kind(&self) -> &'static str {
+        match self {
+            InboundAction::Record { .. } => "external_event",
+            InboundAction::Trigger { .. } => "command_trigger",
+        }
+    }
 }
 
 /// The subset of an inbound AMQP message's own `Properties` this bridge
@@ -395,22 +553,18 @@ fn message_id_to_string(id: &MessageId) -> String {
     }
 }
 
-/// Dispatches one AMQP message to skilj - the one place [`InboundAction`]
-/// is interpreted, the identical shape `skilj_kafka::dispatch_inbound_message`
-/// already has. Exposed separately from [`run_inbound`] so it can be
-/// tested directly against a plain [`InboundMessageMeta`] and raw
-/// payload bytes, without needing a real `fe2o3_amqp` delivery object.
-pub async fn dispatch_inbound_message(
-    http: &reqwest::Client,
-    skilj_base_url: &str,
+/// The exact `ExternalEventRequest`/`CommandTriggerRequest` body
+/// [`dispatch_inbound_message`] sends for `mapping`/`meta`/`payload_json` -
+/// factored out so [`report_parked_delivery`] can store the identical
+/// body a `retryParkedDelivery` redrive later needs, the identical
+/// `skilj_kafka::inbound_request_body` reasoning.
+fn inbound_request_body(
     mapping: &InboundMapping,
     meta: &InboundMessageMeta,
-    payload: &[u8],
-) -> Result<(), BridgeError> {
-    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
+    payload_json: &serde_json::Value,
+) -> serde_json::Value {
     let correlation_id = meta.correlation_id.as_ref().map(message_id_to_string);
-
-    let response = match &mapping.action {
+    match &mapping.action {
         InboundAction::Record { .. } => {
             let dedupe = match (&meta.group_id, meta.group_sequence) {
                 (Some(partition_key), Some(sequence)) => Some(serde_json::json!({
@@ -428,6 +582,55 @@ pub async fn dispatch_inbound_message(
             if let Some(dedupe) = dedupe {
                 body["dedupe"] = dedupe;
             }
+            body
+        }
+        InboundAction::Trigger { .. } => serde_json::json!({
+            "payload": payload_json,
+            "correlationId": correlation_id,
+            "causationId": meta.causation_id,
+        }),
+    }
+}
+
+/// A stable-enough string identifying one inbound message for
+/// `POST /v1/parked-deliveries`' own `identifier` field - purely
+/// informational (an operator's own way of finding the original message
+/// in the broker's own tooling), never used for redelivery-safety
+/// itself (that's [`inbound_request_body`]'s own `dedupe`/
+/// `Idempotency-Key`, sent separately). Prefers `group-id`/`group-sequence`
+/// (when both present), falls back to `message-id`, falls back to a
+/// fixed placeholder when the sender populated neither - the identical
+/// "never an error, just less identifiable" register every other use of
+/// this message's own sparse metadata already has (see
+/// [`InboundMessageMeta`]'s own doc comment).
+fn message_identifier(meta: &InboundMessageMeta) -> String {
+    match (&meta.group_id, meta.group_sequence) {
+        (Some(group_id), Some(group_sequence)) => format!("{group_id}:{group_sequence}"),
+        _ => meta
+            .message_id
+            .as_ref()
+            .map(message_id_to_string)
+            .unwrap_or_else(|| "unidentified-amqp-message".to_string()),
+    }
+}
+
+/// Dispatches one AMQP message to skilj - the one place [`InboundAction`]
+/// is interpreted, the identical shape `skilj_kafka::dispatch_inbound_message`
+/// already has. Exposed separately from [`run_inbound`] so it can be
+/// tested directly against a plain [`InboundMessageMeta`] and raw
+/// payload bytes, without needing a real `fe2o3_amqp` delivery object.
+pub async fn dispatch_inbound_message(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    meta: &InboundMessageMeta,
+    payload: &[u8],
+) -> Result<(), BridgeError> {
+    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
+    let body = inbound_request_body(mapping, meta, &payload_json);
+
+    let response = match &mapping.action {
+        InboundAction::Record { .. } => {
             http.post(format!("{skilj_base_url}/v1/events/external"))
                 .bearer_auth(&mapping.credential)
                 .json(&body)
@@ -438,11 +641,7 @@ pub async fn dispatch_inbound_message(
             let mut request = http
                 .post(format!("{skilj_base_url}/v1/commands/trigger"))
                 .bearer_auth(&mapping.credential)
-                .json(&serde_json::json!({
-                    "payload": payload_json,
-                    "correlationId": correlation_id,
-                    "causationId": meta.causation_id,
-                }));
+                .json(&body);
             if let Some(id) = &meta.message_id {
                 request = request.header("Idempotency-Key", message_id_to_string(id));
             }
@@ -459,6 +658,44 @@ pub async fn dispatch_inbound_message(
     // identical reasoning `skilj_kafka::dispatch_inbound_message`
     // already documents: the message was successfully delivered and
     // decided upon, which is all this bridge ever promises.
+    Ok(())
+}
+
+/// Codeberg issue #21 - reports a message [`run_inbound`] gave up
+/// retrying to skilj's own `POST /v1/parked-deliveries`, the identical
+/// `skilj_kafka::report_parked_delivery` shape. `request` is
+/// [`inbound_request_body`]'s own output, stored verbatim so a later
+/// `retryParkedDelivery` redrives the identical request.
+#[allow(clippy::too_many_arguments)]
+async fn report_parked_delivery(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    identifier: &str,
+    request: &serde_json::Value,
+    error: &str,
+    attempt_count: u32,
+    first_failed_at: DateTime<Utc>,
+) -> Result<(), BridgeError> {
+    let response = http
+        .post(format!("{skilj_base_url}/v1/parked-deliveries"))
+        .bearer_auth(&mapping.credential)
+        .json(&serde_json::json!({
+            "source": "amqp-inbound",
+            "kind": mapping.action.parked_delivery_kind(),
+            "identifier": identifier,
+            "error": error,
+            "attemptCount": attempt_count,
+            "firstFailedAt": first_failed_at.to_rfc3339(),
+            "request": request,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(BridgeError::SkiljStatus { status, body });
+    }
     Ok(())
 }
 
@@ -483,12 +720,24 @@ pub async fn dispatch_inbound_message(
 /// configured mapping (unusual, but not prevented by AMQP itself) has a
 /// defined lookup, not because this function itself multiplexes several
 /// receivers.
+/// Codeberg issue #21: a dispatch failure is retried, *for this one
+/// message*, with backoff up to `retry_policy` - a purely local,
+/// in-process loop, since (unlike `skilj-kafka`'s broker-assigned
+/// offsets) AMQP 1.0 gives this bridge no delivery/redelivery count to
+/// track instead - see this crate's own "Dead-letter/parking" doc
+/// section. Once `retry_policy` exhausts, the message is reported to
+/// skilj via [`report_parked_delivery`] and the delivery is accepted
+/// anyway - without that, a poison message would block redelivery
+/// forever. If the *report* itself fails, the delivery is deliberately
+/// left un-accepted (a real gap - better a loud, visible redelivery loop
+/// than a silently unreported poison message).
 pub async fn run_inbound(
     receiver: &mut AmqpReceiver,
     http: &reqwest::Client,
     skilj_base_url: &str,
     address: &str,
     mappings: &HashMap<String, InboundMapping>,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
     loop {
         let delivery = match receiver.recv::<Data>().await {
@@ -523,17 +772,66 @@ pub async fn run_inbound(
             causation_id,
         };
         let payload = delivery.body().0.as_ref();
-        match dispatch_inbound_message(http, skilj_base_url, mapping, &meta, payload).await {
-            Ok(()) => {
-                if let Err(e) = receiver.accept(&delivery).await {
-                    tracing::error!("accepting an AMQP delivery failed: {e}");
+
+        let mut attempt: u32 = 0;
+        let mut first_failed_at: Option<DateTime<Utc>> = None;
+        loop {
+            match dispatch_inbound_message(http, skilj_base_url, mapping, &meta, payload).await {
+                Ok(()) => {
+                    if let Err(e) = receiver.accept(&delivery).await {
+                        tracing::error!("accepting an AMQP delivery failed: {e}");
+                    }
+                    break;
                 }
-            }
-            Err(e) => {
-                tracing::error!(
-                    address,
-                    "dispatch failed, not accepting - will redeliver: {e}"
-                );
+                Err(e) => {
+                    attempt += 1;
+                    let failed_at = *first_failed_at.get_or_insert_with(Utc::now);
+                    let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
+                    if retry_policy.is_exhausted(attempt, elapsed) {
+                        tracing::error!(
+                            address,
+                            attempt,
+                            error = %e,
+                            "dispatch failed repeatedly - parking and accepting so this \
+                             message doesn't block redelivery forever"
+                        );
+                        let payload_json: serde_json::Value =
+                            serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+                        let body = inbound_request_body(mapping, &meta, &payload_json);
+                        let identifier = message_identifier(&meta);
+                        if let Err(report_err) = report_parked_delivery(
+                            http,
+                            skilj_base_url,
+                            mapping,
+                            &identifier,
+                            &body,
+                            &e.to_string(),
+                            attempt,
+                            failed_at,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                address,
+                                "reporting this parked delivery failed - not accepting, \
+                                 will redeliver: {report_err}"
+                            );
+                            break;
+                        }
+                        if let Err(accept_err) = receiver.accept(&delivery).await {
+                            tracing::error!("accepting an AMQP delivery failed: {accept_err}");
+                        }
+                        break;
+                    }
+                    let backoff = retry_policy.next_backoff(attempt);
+                    tracing::warn!(
+                        address,
+                        attempt,
+                        error = %e,
+                        "dispatch failed - retrying after backoff"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
             }
         }
     }

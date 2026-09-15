@@ -96,6 +96,9 @@ listed separately here; see that section itself for its own structure.
 - [42. `skilj-nats`: a bridge to NATS JetStream](#skilj-nats-bridge)
 - [43. Stopping a new subscriber from replaying all of history](#new-subscriber-replay-fix)
 - [44. Correlation/causation ids on commands and events (Codeberg issue #18)](#correlation-causation-ids)
+- [45. A given/when/then test fixture for decide()/project() (Codeberg issue #19)](#given-when-then-test-fixture)
+- [46. A native one-shot, per-entity deadline/timer (Codeberg issue #20)](#native-deadlines)
+- [47. Dead-letter/parking for failed event/message handler delivery (Codeberg issue #21)](#parked-deliveries)
 
 ---
 
@@ -7282,3 +7285,289 @@ crash-simulation test for it either, for the same reason this pass
 doesn't: the black-box, full-`Skilj` harness every test file here uses
 has no fault-injection hook to force a real redelivery, only ever
 exercising the ordinary, non-redelivered path.
+
+<a id="parked-deliveries"></a>
+## 47. Dead-letter/parking for failed event/message handler delivery (Codeberg issue #21)
+
+The gap the issue named: a persistently-failing delivery had no
+operator-visible surface anywhere in this codebase. `CrossContextRoute`'s
+own catch-up loop ([§36](#cross-context-route)) retried a failing target
+command forever, on every single poll tick, blocking that route's cursor
+- and therefore every occurrence behind it - indefinitely. Each of
+`skilj-kafka`/`skilj-amqp`/`skilj-nats` ([§40](#skilj-kafka-bridge)/[§41](#skilj-amqp-bridge)/[§42](#skilj-nats-bridge))
+had the mirror-image problem on their own outbound side (an unthrottled
+sleep-and-retry-the-whole-cycle loop) and, on inbound, a real correctness
+gap: a poison message never advanced that mapping's own durable commit/
+ack point, so a bridge restart replayed an ever-growing backlog forever.
+
+### `skilj-retry`: one shared backoff/attempt-cap policy
+
+A new, dependency-free crate - `RetryPolicy { initial_backoff,
+multiplier, max_backoff, max_attempts: Option<u32>, max_elapsed:
+Option<Duration> }`, pure data and pure functions only (`next_backoff`,
+`is_exhausted`), no clock read, no `sleep`. `RetryPolicy::bounded(...)`
+gives up after `max_attempts`; `RetryPolicy::unbounded(...)` never does
+by attempt count alone, `.with_max_elapsed(...)` layering an optional
+elapsed-time cap on top of either. Every caller (`skilj-core`'s
+`CrossContextRoute` catch-up loop, and each bridge's inbound *and*
+outbound loop) already has its own notion of "now" and its own way of
+sleeping/rescheduling, so this crate only ever answers "how long before
+the next attempt" and "have I tried enough (or for long enough) to give
+up" - the one piece of real code-sharing this pass needed, replacing
+four independently hand-rolled poll-sleep-retry shapes with one.
+
+### The inbound/outbound asymmetry, by design
+
+Confirmed with the user before building, not assumed: the two directions
+warrant genuinely different default behaviour, not the same mechanism
+applied twice.
+
+- **Inbound** (a route's own target command, or a bridge's own `POST
+  /v1/events/external`/`POST /v1/commands/trigger` call) defaults to
+  `RetryPolicy::bounded` - a real submission that keeps failing (a
+  schema mismatch, a rejected precondition, a downstream bug) won't ever
+  start succeeding just by waiting longer, so this direction gives up and
+  **parks** the occurrence: a durable, operator-visible record (see
+  below), the delivery marked done from the route/bridge's own point of
+  view so it stops blocking everything behind it.
+- **Outbound** (a bridge publishing an event *to* a broker) defaults to
+  `RetryPolicy::unbounded` - a publish failure is almost always the
+  target broker being unreachable, which should self-heal once it's back
+  rather than being given up on. If a caller configures a bounded policy
+  anyway, exhausting it **skips** that one event (acknowledged to skilj
+  without ever having been produced) and moves on, logged loudly - no
+  parked-delivery record, since there is nothing wrong with the message
+  itself, only (temporarily) with reaching the broker. Accepted,
+  deliberate data loss on the caller's own explicit opt-in, not a
+  default.
+
+### `parked_deliveries` - one row per persistently-failed delivery
+
+A new per-bounded-context table (`skilj_core::db::ParkedDelivery`/
+`ensure_parked_deliveries_table`, the identical `CREATE TABLE IF NOT
+EXISTS` "brand-new table needs no migration dance" register
+`ensure_external_message_cursors_table` ([§39](#external-message-dedup-create-external-event)) already established):
+`id, source, kind, identifier, access_token_id, target_bounded_context,
+target_command_type, request_json, error, attempt_count,
+first_failed_at, last_failed_at`. `kind` is `CrossContextRoute`/
+`ExternalEvent`/`CommandTrigger` - which other columns are populated and
+how a later retry redrives the row both follow from it:
+
+- `CrossContextRoute`: `request_json` is the `Target` command's own
+  already-translated JSON payload; `target_bounded_context`/
+  `target_command_type` name where to resubmit it; `access_token_id` is
+  `None`.
+- `ExternalEvent`/`CommandTrigger`: `request_json` is the bridge's own
+  original `ExternalEventRequest`/`CommandTriggerRequest` body,
+  verbatim; `access_token_id` names which `ExternalEventToken`/
+  `CommandToken` to re-resolve and redrive through (never the token's
+  own secret, which is never stored here); `target_bounded_context`/
+  `target_command_type` are `None`.
+
+**Lives in the target's own schema, not the source's** - a real bug this
+pass's own new end-to-end test caught (see "Verified" below): the first
+`CrossContextRoute` integration wrote a parked row into the *source*
+bounded context's schema (the same schema `cross_context_route_cursors`
+already lives in, "cursor lives with whoever's reading" -
+[§36](#cross-context-route)'s own register), not the target's. Fixed
+before merge - an operator managing the *target* bounded context is who
+actually wants to see "deliveries into my bounded context that failed",
+matching where `ExternalEvent`/`CommandTrigger` kinds already land
+naturally (the resolved token's own bounded context, from the REST
+ingestion endpoint below).
+
+### `CrossContextRoute`: retry-then-park replaces retry-forever
+
+`catch_up_cross_context_route` ([§36](#cross-context-route)) used to
+propagate a target-submission `Err` straight out via a bare `?`, stopping
+that tick without advancing the cursor - correct as a crash-safe "the
+next tick retries the identical occurrence", but unthrottled and
+unbounded. Now takes a `retry_policy: &skilj_retry::RetryPolicy`
+(`SkiljBuilder::cross_context_route_retry_policy`, defaulting to
+`RetryPolicy::default()` - 1s initial backoff, x2, capped at 5 minutes,
+5 attempts) and three new `cross_context_route_cursors` columns
+(`retry_attempt_count`/`retry_first_failed_at`/`retry_next_attempt_at`) -
+a single row's worth of state suffices, the same invariant
+`last_dispatched_sequence` itself already relies on: only the cursor's
+own next occurrence can ever be the one currently failing, since the
+cursor never advances past it. A tick reads this state once, up front -
+if still within backoff, the whole tick is skipped (no dispatch, no
+re-fetch cost) rather than re-attempting the identical failing
+submission on every single poll. Once exhausted, the occurrence is
+recorded as a `ParkedDelivery` (`source: "cross-context-route:{name}"`)
+and the cursor finally advances past it, un-blocking the route for
+everything behind it. An already-provisioned bounded context gets the
+three new columns patched in by `ensure_cross_context_route_retry_columns`
+(the `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` idiom
+`ensure_projection_state_owner_columns` already established) -
+`ensure_cross_context_route_cursors_table`'s own `CREATE TABLE IF NOT
+EXISTS` already gives a brand-new one the full shape directly.
+
+### REST ingestion: `POST /v1/parked-deliveries`
+
+A bridge reports a message it gave up retrying using the *same*
+`ExternalEventToken`/`CommandToken` credential it already presents for
+the delivery itself (`kind` in the body says which) - the identical
+capability-based design ("the credential says what's being written and
+where, not a caller-supplied argument") every other `skilj-rest` route
+already follows ([§7.2](#rest-wire-contract)). The bounded context a delivery is
+parked under, and which `access_token_id` a later `retryParkedDelivery`
+re-resolves, both come from that same token - no bounded-context
+argument on the wire at all.
+
+### GraphQL admin surface
+
+`parkedDeliveries(boundedContext:)`/`retryParkedDelivery`/
+`discardParkedDelivery`, `AdminAccess`-gated (`require_admin_mapping`),
+following `rebuildProjection`/`discardProjectionRebuild`'s own list+
+retry+discard shape exactly ([§8](#open-for-a-future-pass) item 5's own
+Phase 2 precedent). `retryParkedDelivery` redrives a delivery's own
+stored `request_json` straight through the same `skilj_core::db`/
+`skilj_core::event_store` functions the original REST route (or
+`catch_up_cross_context_route`) would have called - `db::
+decide_and_submit_command` for `CrossContextRoute`/`CommandTrigger`
+kinds (the latter re-running `event_store::authorise_command_trigger`
+first, so a schema/status change since parking is still caught), `db::
+create_and_insert_external_event` for `ExternalEvent` - bypassing the
+REST/token-secret layer entirely (this mutation is already admin-gated,
+so re-presenting the original bridge's own secret would add nothing).
+Any outcome that isn't a real `Err` - accepted, rejected, redelivered,
+deduplicated - means the delivery is no longer stuck, so the row is
+deleted; only a genuine `Err` (the identical failure class that parked
+it) leaves it parked, with `attempt_count`/`error`/`last_failed_at`
+updated to reflect the fresh attempt. A `CrossContextRoute` redrive
+deliberately doesn't reconstruct the original source event's own
+`correlation_id`/`causation_id` (not stored on the parked row) - the
+retried command gets a fresh, server-generated `correlation_id` instead,
+the same "omitted means generated server-side" register Codeberg issue
+#18 ([§44](#correlation-causation-ids)) already established for every
+other caller with none to hand.
+
+### The three bridges
+
+Each of `skilj-kafka`/`skilj-amqp`/`skilj-nats` ([§40](#skilj-kafka-bridge)/[§41](#skilj-amqp-bridge)/[§42](#skilj-nats-bridge))
+gets the identical shape:
+
+- **Inbound**: a dispatch failure is retried, *for that one message*,
+  entirely locally (a `sleep`-backoff loop around the same dispatch
+  call) before the consumer ever reads its next message - not tracked
+  via any broker-reported redelivery/attempt count. None of the three
+  brokers gives this bridge a redelivery count worth trusting anyway:
+  Kafka has no such concept at all reachable from here; AMQP 1.0's own
+  `delivery-count` header isn't one this crate already reads; NATS/
+  JetStream's own redelivery only replays after this consumer's own
+  ack-wait timeout, not on the very next pulled message in the same
+  session. A purely local, in-process counter sidesteps needing any of
+  that - and sidesteps the "does it survive a bridge restart" question
+  entirely, since every fresh delivery (first time or post-restart
+  redelivery alike) gets its own full retry budget. Once exhausted, the
+  message is reported to `POST /v1/parked-deliveries` and then
+  committed/accepted/acked anyway - without that last step, a poison
+  message would block that mapping's own durable commit point forever,
+  each future restart redelivering a growing backlog. If the *report*
+  itself fails, the message is deliberately left uncommitted (a real
+  gap - better a loud, visible redelivery loop than a silently
+  unreported poison message).
+- **Outbound**: a produce/ack failure is retried across `produce_once`
+  calls via a new `OutboundRetryState` (one instance per mapping,
+  threaded by `run_outbound`) - the identical "only the head can be
+  blocked" invariant the route's own cursor retry state relies on, so a
+  plain `Option<OutboundRetryState>` suffices. A failure producing *or*
+  acknowledging one event stops that cycle right there; no event behind
+  it is even attempted, since skipping ahead would silently drop the
+  blocked event from ever being retried (nothing would ever revisit it
+  once a later one's own ack passes it). Default `RetryPolicy::unbounded`
+  per the asymmetry above; exhausting a caller-configured bounded one
+  skips the event (direct ack, no produce) and moves on.
+
+### `skilj-tui`: a fifth tab
+
+`skilj-tui` ([§11](#skilj-tui-console)) gets its first real admin
+list+action view - `Tab::ParkedDeliveries`, digit `5`: a list (`r` to
+refresh) with the selected row's own full JSON shown below it (including
+`request_json` - what a retry actually redrives, too wide to fit the
+list row itself), `Enter` to retry the selected row,
+`d` to discard it. Shaped like `QueryEventsTab` (a flat list, no picker/
+form sub-stage) rather than `CommandsTab`'s two-stage enum - there's no
+second view to switch into here, only actions on the one list. Both
+mutations return the identical `{ id }` shape, so `ParkedDeliveriesTab::
+action_pending` (the `id` of whichever call is currently in flight) is
+what tells `App::handle`'s own result arm which row to remove on
+success, not the response itself.
+
+### No spec entity
+
+Like `Snapshot`/`CrossContextRoute`/the deadline mechanism ([§46](#native-deadlines)),
+`ParkedDelivery` is a Rust-only construct layered on top of DCB, not a
+change to DCB's own model or the Allium spec.
+
+### Verified
+
+- `skilj-retry`'s own unit tests: geometric backoff growth and capping,
+  attempt-count exhaustion, elapsed-time exhaustion, and that either cap
+  alone is enough (both independent).
+- `skilj-core/tests/cross_context_route_parking.rs`, a real end-to-end
+  test against Postgres, deliberately at the `skilj-core` layer (a
+  hand-rolled `CommandDispatcher`/`CrossContextRouteDispatcher` pair, not
+  the full `skilj` builder facade `skilj/tests/cross_context_route.rs`
+  exercises) - the legitimate typed `CrossContextRoute` API gives no way
+  to make a *real* registration fail deterministically, `route()`'s own
+  return type being tied to `Target::Payload` at compile time. Proves,
+  with a target dispatcher that fails a controlled number of times: the
+  occurrence parks (not blocks) once `retry_policy` exhausts; the
+  backoff genuinely throttles (a tick within the backoff window makes no
+  dispatch call at all); the cursor actually unblocks (a second
+  occurrence posted afterward is picked up and parked independently,
+  proof the route kept running rather than staying stuck on the first);
+  a manual failed retry bumps `attempt_count`/`error` rather than
+  deleting the row; a manual successful retry (the exact redrive
+  `retryParkedDelivery`'s own resolver makes) both creates the real
+  command and deletes the row; and a discard without ever retrying
+  removes the row with no command created. This test is what caught the
+  wrong-schema bug described above - it failed on the very first run,
+  for exactly that reason.
+- `skilj/tests/parked_deliveries_graphql.rs`, a real end-to-end test
+  through `Skilj::graphql_router()` with real JWT/JWKS auth (mirroring
+  `skilj/tests/graphql_type_registration.rs`'s own harness) - narrower
+  and complementary to the `skilj-core` test above: given a parked
+  delivery already exists (seeded directly via `db::insert_parked_delivery`,
+  not reproduced through a real failure), proves `parkedDeliveries`
+  renders every field correctly, `retryParkedDelivery` redrives the
+  stored `ExternalEvent`-kind request for real (a genuine event lands)
+  and deletes the row, and a second row discarded without ever being
+  retried is removed with no event created.
+- Each bridge's own `tests/*_bridge.rs` gained two new tests -
+  `an_inbound_message_parks_and_reports_after_exhausting_retries` and
+  `an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap` -
+  against the identical real-broker-plus-mock-skilj harness those files
+  already use, the mock's own `GET /v1/events/consume` changed from
+  drain- to peek-based (and `POST /v1/events/consume/ack` to remove only
+  the acked entry) to correctly simulate real manual-ack semantics across
+  the multiple retry cycles these new tests need. Run against real
+  brokers once Docker became reachable in this sandbox (KRaft-mode Kafka,
+  Artemis for AMQP 1.0, ephemeral NATS+JetStream) - all 18 tests across
+  the three crates pass. Two real bugs this run caught, neither in the
+  library code itself:
+  - All three new inbound-parking tests initially timed out (a 5s
+    polling budget) - real consumer-group/session/broker setup latency
+    on a first subscription needs the identical ~15-20s tolerance
+    `recv_within`'s own established pattern elsewhere in these files
+    already budgets for; tightened to 20s across all three.
+  - `skilj-amqp`'s own inbound-parking test attached its receiver *after*
+    sending the test message - unlike JetStream's durable log (NATS) or
+    a queue a message survives regardless of consumer presence, this
+    broker/address combination has no durable subscription for a message
+    published before any receiver exists to be held for, so it was
+    simply never delivered. Fixed by attaching before sending, the same
+    ordering every other inbound test in that file already uses.
+- `skilj-tui/tests/schema_driven_forms.rs` gained
+  `parked_deliveries_lists_navigates_and_acts_on_the_selected_row`,
+  driven purely through `App::handle` the same synthetic-result shape
+  every other test in that file already uses (no real server needed) -
+  proves entering the tab fetches, Up/Down navigates, discard/retry both
+  set `action_pending` correctly, a successful action removes the row
+  and updates the status line, and a failed one leaves the row in place.
+- `cargo build/clippy -D warnings/test --workspace` and `cargo fmt
+  --check` clean across every crate this pass touched
+  (`skilj-retry`/`skilj-core`/`skilj-rest`/`skilj-graphql`/`skilj`/
+  `skilj-kafka`/`skilj-amqp`/`skilj-nats`/`skilj-tui`).

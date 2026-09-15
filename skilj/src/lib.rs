@@ -540,6 +540,7 @@ impl Skilj {
             async_projection_poll_interval: std::time::Duration::from_millis(500),
             snapshot_poll_interval: std::time::Duration::from_millis(500),
             cross_context_route_poll_interval: std::time::Duration::from_millis(500),
+            cross_context_route_retry_policy: skilj_retry::RetryPolicy::default(),
             deadline_poll_interval: std::time::Duration::from_millis(500),
             scheduler_poll_interval: std::time::Duration::from_secs(1),
             projection_query_wait_timeout: std::time::Duration::from_secs(5),
@@ -1156,6 +1157,11 @@ pub struct SkiljBuilder {
     async_projection_poll_interval: std::time::Duration,
     snapshot_poll_interval: std::time::Duration,
     cross_context_route_poll_interval: std::time::Duration,
+    /// Codeberg issue #21 - the backoff/attempt-cap policy
+    /// `db::catch_up_cross_context_route` applies to a route's own
+    /// blocked head-of-line occurrence before parking it. See
+    /// `cross_context_route_retry_policy`'s own builder doc comment.
+    cross_context_route_retry_policy: skilj_retry::RetryPolicy,
     deadline_poll_interval: std::time::Duration,
     scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
@@ -1326,6 +1332,20 @@ impl SkiljBuilder {
     /// reason.
     pub fn cross_context_route_poll_interval(mut self, interval: std::time::Duration) -> Self {
         self.cross_context_route_poll_interval = interval;
+        self
+    }
+
+    /// Codeberg issue #21 - the backoff/attempt-cap policy
+    /// `db::catch_up_cross_context_route` applies to a route's own
+    /// blocked head-of-line occurrence: how long to wait before
+    /// re-attempting a failed target-command submission, and how many
+    /// attempts (or how much elapsed time) to allow before giving up and
+    /// recording it as a `ParkedDelivery` instead of blocking the route
+    /// forever. Defaults to `skilj_retry::RetryPolicy::default()` - 1s
+    /// initial backoff, doubling, capped at 5 minutes, 5 attempts. See
+    /// docs/architecture.md's parked-deliveries section.
+    pub fn cross_context_route_retry_policy(mut self, policy: skilj_retry::RetryPolicy) -> Self {
+        self.cross_context_route_retry_policy = policy;
         self
     }
 
@@ -1661,6 +1681,24 @@ impl SkiljBuilder {
                     // `ensure_correlation_causation_columns`'s own doc
                     // comment.
                     skilj_core::db::ensure_correlation_causation_columns(pool, &bc.name).await?;
+                    // Codeberg issue #21 (dead-letter/parking for failed
+                    // event/message handler delivery) - `cross_context_route_cursors`'
+                    // own three new retry-backoff columns, same "patched
+                    // into every bounded context, every startup"
+                    // treatment. See
+                    // `ensure_cross_context_route_retry_columns`'s own
+                    // doc comment for why this is a separate `ALTER
+                    // TABLE` patch rather than folded into
+                    // `ensure_cross_context_route_cursors_table` above.
+                    skilj_core::db::ensure_cross_context_route_retry_columns(pool, &bc.name)
+                        .await?;
+                    // Same pass's own `parked_deliveries` table - a
+                    // brand-new table, so (unlike the retry columns just
+                    // above) this needs no `ALTER TABLE` patch, only the
+                    // identical `CREATE TABLE IF NOT EXISTS` every other
+                    // brand-new per-bounded-context table already gets
+                    // here.
+                    skilj_core::db::ensure_parked_deliveries_table(pool, &bc.name).await?;
                     Ok::<(), skilj_core::Error>(())
                 }
             })
@@ -1904,6 +1942,7 @@ impl SkiljBuilder {
             });
         let routes = route_dispatcher.routes();
         let route_interval = self.cross_context_route_poll_interval;
+        let route_retry_policy = self.cross_context_route_retry_policy;
         tokio::spawn(async move {
             loop {
                 let start = std::time::Instant::now();
@@ -1929,6 +1968,7 @@ impl SkiljBuilder {
                                     &route_broadcaster,
                                     &route_event_cache,
                                     route_encryption_master_key.as_ref(),
+                                    &route_retry_policy,
                                 )
                                 .await
                                 {

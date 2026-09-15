@@ -10,6 +10,7 @@ members = [
     "skilj-tui",
     "skilj-inspector",
     "skilj-codegen",
+    "skilj-retry",
     "skilj-temporal",
     "skilj-kafka",
     "skilj-amqp",
@@ -74,6 +75,14 @@ members = [
 #                 partitions; broker-assigned (stream, stream-sequence)
 #                 on every message, unlike AMQP's sender-optional
 #                 group-id/group-sequence).
+# skilj-retry   - a small, dependency-free backoff/attempt-cap policy
+#                 (Codeberg issue #21) shared by `CrossContextRoute`'s own
+#                 catch-up loop and the three bridge crates' inbound and
+#                 outbound loops - the one piece of real code-sharing the
+#                 parked-deliveries mechanism needed, replacing four
+#                 independently hand-rolled poll-sleep-retry shapes with
+#                 one. Zero dependency on any other skilj crate, no
+#                 async, no I/O.
 # skilj-test-fixture - a given/when/then test harness for a plugin
 #                 author's own CommandType::decide()/Projection::project()
 #                 (§45, Codeberg issue #19): no database, no HTTP, just the
@@ -183,3 +192,4 @@ skilj-rest = { path = "skilj-rest", version = "0.0.6" }
 skilj = { path = "skilj", version = "0.0.6" }
 skilj-codegen = { path = "skilj-codegen", version = "0.0.6" }
 skilj-test-fixture = { path = "skilj-test-fixture", version = "0.0.6" }
+skilj-retry = { path = "skilj-retry", version = "0.0.6" }

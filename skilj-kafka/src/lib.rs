@@ -45,7 +45,36 @@
 //! skipping the message - safe specifically *because* the skilj-side
 //! mechanisms above make that redelivered call a no-op, not a
 //! duplicate.
+//!
+//! # Dead-letter/parking (Codeberg issue #21)
+//!
+//! Both directions apply a [`skilj_retry::RetryPolicy`], but to different
+//! ends - see docs/architecture.md's parked-deliveries section for the
+//! full design, only summarised here:
+//!
+//! - **Inbound**: a message that keeps failing to dispatch is retried
+//!   with backoff, *for that one message*, before this consumer ever
+//!   calls `recv()` again ([`run_inbound`]) - not tracked via Kafka's own
+//!   redelivery, which doesn't apply within one running session anyway
+//!   (an uncommitted offset only replays after a restart/rebalance, not
+//!   on the next `recv()` in the same session). Once the policy exhausts,
+//!   the message is reported to skilj's own `POST /v1/parked-deliveries`
+//!   ([`report_parked_delivery`]) and the offset is committed anyway -
+//!   without that, a poison message would block this mapping's own
+//!   durable commit point forever, redelivering an ever-growing backlog
+//!   on every future restart.
+//! - **Outbound**: an event that keeps failing to produce is retried with
+//!   backoff across [`produce_once`] calls (state threaded through
+//!   [`OutboundRetryState`]), same as inbound - but the default policy is
+//!   [`skilj_retry::RetryPolicy::unbounded`], not bounded: a Kafka outage
+//!   should self-heal once the broker is back, not give up. If a caller
+//!   configures a bounded policy anyway, exhausting it skips that one
+//!   event (acknowledges it to skilj without ever producing it) and moves
+//!   on, logged loudly - no parked-delivery record, since there is
+//!   nothing wrong with the *message*, only (temporarily) with reaching
+//!   the broker.
 
+use chrono::{DateTime, Utc};
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Header, Headers, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -163,25 +192,125 @@ pub enum BridgeError {
     MalformedPayload(#[from] serde_json::Error),
 }
 
+/// Codeberg issue #21 - the backoff state one [`OutboundMapping`]'s own
+/// blocked head-of-line event carries across [`produce_once`] calls,
+/// threaded in by [`run_outbound`] (one instance per mapping - see its
+/// own doc comment). Only the head can ever be blocked: [`produce_once`]
+/// never attempts an event *behind* one still in backoff (see its own
+/// doc comment), the identical invariant `skilj_core::db`'s own
+/// `cross_context_route_cursors` retry columns rely on for the same
+/// reason.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboundRetryState {
+    /// Which event this state belongs to - `produce_once` clears the
+    /// state whenever a different sequence succeeds, so a stale state
+    /// left over from an old, now-skipped event is never mistaken for
+    /// the current head's.
+    sequence: i64,
+    attempt: u32,
+    first_failed_at: DateTime<Utc>,
+    next_attempt_at: DateTime<Utc>,
+}
+
+async fn ack_event(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &OutboundMapping,
+    sequence: i64,
+) -> Result<(), BridgeError> {
+    let ack = http
+        .post(format!("{skilj_base_url}/v1/events/consume/ack"))
+        .bearer_auth(&mapping.credential)
+        .json(&serde_json::json!({ "sequence": sequence }))
+        .send()
+        .await?;
+    if !ack.status().is_success() {
+        let status = ack.status();
+        let body = ack.text().await.unwrap_or_default();
+        return Err(BridgeError::SkiljStatus { status, body });
+    }
+    Ok(())
+}
+
+/// Produces one event to Kafka, then acknowledges it to skilj - never
+/// the other order, so a crash between the two redelivers the same event
+/// next cycle rather than silently dropping it; `rdkafka`'s own producer
+/// idempotence (`enable.idempotence`, set on `producer`'s own
+/// `ClientConfig` by the caller, not this function) is what keeps that
+/// redelivered produce from landing twice on the Kafka side.
+async fn produce_and_ack_one(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    producer: &FutureProducer,
+    mapping: &OutboundMapping,
+    event: &ConsumedEvent,
+) -> Result<(), BridgeError> {
+    let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
+    let payload = event.payload.to_string();
+    let mut record = FutureRecord::to(&mapping.topic).payload(&payload);
+    if let Some(k) = key.as_deref() {
+        record = record.key(k);
+    }
+    // Codeberg issue #18 - forwards the event's own correlation_id/
+    // causation_id (always present on correlation_id, per the spec's own
+    // CorrelationIdIsAlwaysRecorded invariant; causation_id absent for a
+    // root event) as headers, distinct from `key` above.
+    let mut headers = OwnedHeaders::new();
+    if let Some(id) = &event.metadata.correlation_id {
+        headers = headers.insert(Header {
+            key: CORRELATION_ID_HEADER,
+            value: Some(id),
+        });
+    }
+    if let Some(id) = &event.metadata.causation_id {
+        headers = headers.insert(Header {
+            key: CAUSATION_ID_HEADER,
+            value: Some(id),
+        });
+    }
+    if headers.count() > 0 {
+        record = record.headers(headers);
+    }
+    producer
+        .send(record, Duration::from_secs(10))
+        .await
+        .map_err(|(e, _)| e)?;
+    ack_event(http, skilj_base_url, mapping, event.sequence).await
+}
+
 /// One fetch-produce-ack cycle for a single [`OutboundMapping`] -
 /// [`run_outbound`] is just this in a loop. Exposed separately so it can
 /// be driven directly in tests without needing to interrupt a running
 /// loop, the same shape `skilj_temporal::poll_once` already has. Returns
-/// how many events were served this cycle (0 when the mapping's own read
-/// cursor is already caught up).
+/// how many events this cycle actually produced (0 when the mapping's
+/// own read cursor is already caught up, or when its own head event is
+/// still in backoff - see [`OutboundRetryState`]'s own doc comment). A
+/// skipped event (Codeberg issue #21 - `retry_policy` exhausted) is
+/// acknowledged but not counted here, so a caller checking "did this
+/// cycle make real progress" isn't misled into thinking Kafka actually
+/// received it.
 ///
-/// Produces to Kafka *before* acknowledging to skilj - never the other
-/// order - so a crash between the two redelivers the same event next
-/// cycle rather than silently dropping it; `rdkafka`'s own producer
-/// idempotence (`enable.idempotence`, set on `producer`'s own
-/// `ClientConfig` by the caller, not this function) is what keeps that
-/// redelivered produce from landing twice on the Kafka side.
+/// A failure produces *or* acknowledging one event stops this cycle
+/// right there - `retry_state` records it, and no event behind it is
+/// even attempted this cycle (the identical "the head blocks everything
+/// behind it" behaviour `catch_up_cross_context_route` has, and for the
+/// same reason: skipping ahead would silently drop the blocked event
+/// from ever being retried, since nothing would ever revisit it once a
+/// later one's own ack passes it).
 pub async fn produce_once(
     http: &reqwest::Client,
     skilj_base_url: &str,
     producer: &FutureProducer,
     mapping: &OutboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
+    retry_state: &mut Option<OutboundRetryState>,
 ) -> Result<usize, BridgeError> {
+    if let Some(state) = retry_state {
+        if Utc::now() < state.next_attempt_at {
+            return Ok(0);
+        }
+    }
+
     let response = http
         .get(format!("{skilj_base_url}/v1/events/consume?mode=manual"))
         .bearer_auth(&mapping.credential)
@@ -200,71 +329,96 @@ pub async fn produce_once(
         });
     }
 
+    let mut served = 0;
     for event in &consumed.events {
-        let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
-        let payload = event.payload.to_string();
-        let mut record = FutureRecord::to(&mapping.topic).payload(&payload);
-        if let Some(k) = key.as_deref() {
-            record = record.key(k);
-        }
-        // Codeberg issue #18 - forwards the event's own correlation_id/
-        // causation_id (always present on correlation_id, per the
-        // spec's own CorrelationIdIsAlwaysRecorded invariant; causation_id
-        // absent for a root event) as headers, distinct from `key` above.
-        let mut headers = OwnedHeaders::new();
-        if let Some(id) = &event.metadata.correlation_id {
-            headers = headers.insert(Header {
-                key: CORRELATION_ID_HEADER,
-                value: Some(id),
-            });
-        }
-        if let Some(id) = &event.metadata.causation_id {
-            headers = headers.insert(Header {
-                key: CAUSATION_ID_HEADER,
-                value: Some(id),
-            });
-        }
-        if headers.count() > 0 {
-            record = record.headers(headers);
-        }
-        producer
-            .send(record, Duration::from_secs(10))
-            .await
-            .map_err(|(e, _)| e)?;
-
-        let ack = http
-            .post(format!("{skilj_base_url}/v1/events/consume/ack"))
-            .bearer_auth(&mapping.credential)
-            .json(&serde_json::json!({ "sequence": event.sequence }))
-            .send()
-            .await?;
-        if !ack.status().is_success() {
-            let status = ack.status();
-            let body = ack.text().await.unwrap_or_default();
-            return Err(BridgeError::SkiljStatus { status, body });
+        match produce_and_ack_one(http, skilj_base_url, producer, mapping, event).await {
+            Ok(()) => {
+                served += 1;
+                if retry_state.is_some_and(|s| s.sequence == event.sequence) {
+                    *retry_state = None;
+                }
+            }
+            Err(e) => {
+                let now = Utc::now();
+                let (attempt, first_failed_at) = match retry_state {
+                    Some(state) if state.sequence == event.sequence => {
+                        state.attempt += 1;
+                        (state.attempt, state.first_failed_at)
+                    }
+                    _ => {
+                        *retry_state = Some(OutboundRetryState {
+                            sequence: event.sequence,
+                            attempt: 1,
+                            first_failed_at: now,
+                            next_attempt_at: now,
+                        });
+                        (1, now)
+                    }
+                };
+                let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
+                if retry_policy.is_exhausted(attempt, elapsed) {
+                    tracing::error!(
+                        event_type = %mapping.event_type,
+                        sequence = event.sequence,
+                        attempt,
+                        error = %e,
+                        "giving up on this event after repeated failures - skipping it \
+                         (acknowledging without ever producing it to Kafka) so the stream \
+                         isn't blocked forever"
+                    );
+                    ack_event(http, skilj_base_url, mapping, event.sequence).await?;
+                    *retry_state = None;
+                    continue;
+                }
+                let backoff = retry_policy.next_backoff(attempt);
+                tracing::warn!(
+                    event_type = %mapping.event_type,
+                    sequence = event.sequence,
+                    attempt,
+                    error = %e,
+                    "producing/acknowledging this event failed - will retry with backoff"
+                );
+                if let Some(state) = retry_state {
+                    state.next_attempt_at = now
+                        + chrono::Duration::from_std(backoff).unwrap_or(chrono::Duration::zero());
+                }
+                return Ok(served);
+            }
         }
     }
-    Ok(consumed.events.len())
+    Ok(served)
 }
 
 /// Runs [`produce_once`] forever, one mapping at a time in the order
 /// given, sleeping `poll_interval` between cycles that served nothing -
 /// the identical shape `skilj_temporal::run` already has, including why
-/// a transient failure is logged and retried rather than ending the
-/// loop, and why a real deployment runs one [`OutboundMapping`] per task
+/// a real deployment runs one [`OutboundMapping`] per task
 /// (`tokio::spawn`) rather than calling this with more than one mapping
-/// serially.
+/// serially. `retry_policy` applies to every mapping alike - see
+/// [`produce_once`]'s own doc comment and this crate's own "Dead-letter/
+/// parking" section for what it governs.
 pub async fn run_outbound(
     skilj_base_url: &str,
     producer: &FutureProducer,
     mappings: &[OutboundMapping],
     poll_interval: Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
     let http = reqwest::Client::new();
+    let mut retry_states: Vec<Option<OutboundRetryState>> = vec![None; mappings.len()];
     loop {
         let mut served_any = false;
-        for mapping in mappings {
-            match produce_once(&http, skilj_base_url, producer, mapping).await {
+        for (mapping, retry_state) in mappings.iter().zip(retry_states.iter_mut()) {
+            match produce_once(
+                &http,
+                skilj_base_url,
+                producer,
+                mapping,
+                retry_policy,
+                retry_state,
+            )
+            .await
+            {
                 Ok(served) => served_any |= served > 0,
                 Err(e) => {
                     tracing::error!(
@@ -314,6 +468,18 @@ pub enum InboundAction {
     Trigger { command_type: String },
 }
 
+impl InboundAction {
+    /// The `kind` `POST /v1/parked-deliveries` expects - see
+    /// `skilj-rest::routes::ParkedDeliveryKindRequest`'s own identical
+    /// two variants.
+    fn parked_delivery_kind(&self) -> &'static str {
+        match self {
+            InboundAction::Record { .. } => "external_event",
+            InboundAction::Trigger { .. } => "command_trigger",
+        }
+    }
+}
+
 /// Reads a header's value as UTF-8 text - `None` for a missing header, a
 /// header present with no value (Kafka allows this), or one whose bytes
 /// aren't valid UTF-8. [`run_inbound`]'s own extraction step for
@@ -349,6 +515,36 @@ pub fn header_str<'a, H: Headers>(headers: Option<&'a H>, key: &str) -> Option<&
 /// `submitCommand`'s own idempotency key rely on, the same property
 /// `skilj_temporal`'s own `"{run_id}:{activity_id}"` convention ([§34](../../docs/architecture.md#skilj-temporal-plan)
 /// phase 1) already leans on one level further out.
+/// The exact `ExternalEventRequest`/`CommandTriggerRequest` body
+/// [`dispatch_inbound_message`] sends for `mapping`/`payload_json` -
+/// factored out so [`report_parked_delivery`] can store the identical
+/// body a `retryParkedDelivery` redrive later needs, without either
+/// duplicating this shape or sending a live HTTP request just to build
+/// it.
+fn inbound_request_body(
+    mapping: &InboundMapping,
+    payload_json: &serde_json::Value,
+    partition_key: &str,
+    offset: i64,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+) -> serde_json::Value {
+    match &mapping.action {
+        InboundAction::Record { .. } => serde_json::json!({
+            "payload": payload_json,
+            "sourceContent": format!("kafka:{partition_key}:{offset}"),
+            "dedupe": { "partitionKey": partition_key, "sequence": offset },
+            "correlationId": correlation_id,
+            "causationId": causation_id,
+        }),
+        InboundAction::Trigger { .. } => serde_json::json!({
+            "payload": payload_json,
+            "correlationId": correlation_id,
+            "causationId": causation_id,
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_inbound_message(
     http: &reqwest::Client,
@@ -363,18 +559,20 @@ pub async fn dispatch_inbound_message(
 ) -> Result<(), BridgeError> {
     let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
     let partition_key = format!("{topic}:{partition}");
+    let body = inbound_request_body(
+        mapping,
+        &payload_json,
+        &partition_key,
+        offset,
+        correlation_id,
+        causation_id,
+    );
 
     let response = match &mapping.action {
         InboundAction::Record { .. } => {
             http.post(format!("{skilj_base_url}/v1/events/external"))
                 .bearer_auth(&mapping.credential)
-                .json(&serde_json::json!({
-                    "payload": payload_json,
-                    "sourceContent": format!("kafka:{partition_key}:{offset}"),
-                    "dedupe": { "partitionKey": partition_key, "sequence": offset },
-                    "correlationId": correlation_id,
-                    "causationId": causation_id,
-                }))
+                .json(&body)
                 .send()
                 .await?
         }
@@ -382,11 +580,7 @@ pub async fn dispatch_inbound_message(
             http.post(format!("{skilj_base_url}/v1/commands/trigger"))
                 .bearer_auth(&mapping.credential)
                 .header("Idempotency-Key", format!("{partition_key}:{offset}"))
-                .json(&serde_json::json!({
-                    "payload": payload_json,
-                    "correlationId": correlation_id,
-                    "causationId": causation_id,
-                }))
+                .json(&body)
                 .send()
                 .await?
         }
@@ -405,24 +599,77 @@ pub async fn dispatch_inbound_message(
     Ok(())
 }
 
+/// Codeberg issue #21 - reports a message [`run_inbound`] gave up
+/// retrying to skilj's own `POST /v1/parked-deliveries`, using the same
+/// credential `mapping` already carries (that route resolves the
+/// bounded context from the presented token itself, the identical
+/// capability-based design this bridge's every other call already
+/// relies on). `identifier` is `"{topic}:{partition}:{offset}"` -
+/// `request` is [`inbound_request_body`]'s own output, the exact body
+/// that kept failing, stored verbatim so a later `retryParkedDelivery`
+/// redrives the identical request.
+#[allow(clippy::too_many_arguments)]
+async fn report_parked_delivery(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    identifier: &str,
+    request: &serde_json::Value,
+    error: &str,
+    attempt_count: u32,
+    first_failed_at: DateTime<Utc>,
+) -> Result<(), BridgeError> {
+    let response = http
+        .post(format!("{skilj_base_url}/v1/parked-deliveries"))
+        .bearer_auth(&mapping.credential)
+        .json(&serde_json::json!({
+            "source": "kafka-inbound",
+            "kind": mapping.action.parked_delivery_kind(),
+            "identifier": identifier,
+            "error": error,
+            "attemptCount": attempt_count,
+            "firstFailedAt": first_failed_at.to_rfc3339(),
+            "request": request,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(BridgeError::SkiljStatus { status, body });
+    }
+    Ok(())
+}
+
 /// Runs forever: for every message this `consumer` receives (already
 /// subscribed to whatever topics its own caller configured), looks up
-/// the [`InboundMapping`] for that message's own topic and calls
-/// [`dispatch_inbound_message`], committing the offset (`CommitMode::Async`,
-/// via `commit_message` - the caller's own `ClientConfig` must set
-/// `enable.auto.commit = false` for this to be the only thing that ever
-/// advances it) only once that call succeeds. A dispatch failure is
-/// logged, not committed - the identical message is redelivered on the
-/// next `recv()` (or after this consumer's own restart), safe because
-/// of [`dispatch_inbound_message`]'s own redelivery-safety keys, not
-/// because this loop does anything clever. An unmapped topic or an
-/// empty payload is logged and skipped, also uncommitted - not silently
-/// swallowed, but also not something retrying could ever fix.
+/// the [`InboundMapping`] for that message's own topic and dispatches it
+/// via [`dispatch_inbound_message`], committing the offset
+/// (`CommitMode::Async`, via `commit_message` - the caller's own
+/// `ClientConfig` must set `enable.auto.commit = false` for this to be
+/// the only thing that ever advances it) once that call succeeds.
+///
+/// Codeberg issue #21: a dispatch failure is retried, *for this one
+/// message*, with backoff up to `retry_policy` - not by relying on
+/// Kafka's own redelivery, which doesn't apply within one running
+/// session (an uncommitted offset only replays after a restart/
+/// rebalance; the next plain `recv()` here would just move on to the
+/// next message). Once `retry_policy` exhausts, the message is reported
+/// to skilj via [`report_parked_delivery`] and the offset is committed
+/// anyway - without that, a poison message would block this mapping's
+/// own durable commit point forever, redelivering an ever-growing
+/// backlog on every future restart. If the *report* itself fails, the
+/// offset is deliberately left uncommitted (a real gap - better a loud,
+/// visible redelivery loop than a silently unreported poison message).
+/// An unmapped topic or an empty payload is logged and skipped, also
+/// uncommitted - not silently swallowed, but also not something
+/// retrying could ever fix.
 pub async fn run_inbound(
     consumer: &StreamConsumer,
     http: &reqwest::Client,
     skilj_base_url: &str,
     mappings: &HashMap<String, InboundMapping>,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
     loop {
         match consumer.recv().await {
@@ -447,31 +694,99 @@ pub async fn run_inbound(
                 let headers = msg.headers();
                 let correlation_id = header_str(headers, CORRELATION_ID_HEADER);
                 let causation_id = header_str(headers, CAUSATION_ID_HEADER);
-                match dispatch_inbound_message(
-                    http,
-                    skilj_base_url,
-                    mapping,
-                    topic,
-                    msg.partition(),
-                    msg.offset(),
-                    payload,
-                    correlation_id,
-                    causation_id,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
-                            tracing::error!("committing a Kafka offset failed: {e}");
+                let partition = msg.partition();
+                let offset = msg.offset();
+
+                let mut attempt: u32 = 0;
+                let mut first_failed_at: Option<DateTime<Utc>> = None;
+                loop {
+                    match dispatch_inbound_message(
+                        http,
+                        skilj_base_url,
+                        mapping,
+                        topic,
+                        partition,
+                        offset,
+                        payload,
+                        correlation_id,
+                        causation_id,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
+                                tracing::error!("committing a Kafka offset failed: {e}");
+                            }
+                            break;
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            topic,
-                            partition = msg.partition(),
-                            offset = msg.offset(),
-                            "dispatch failed, not committing - will redeliver: {e}"
-                        );
+                        Err(e) => {
+                            attempt += 1;
+                            let failed_at = *first_failed_at.get_or_insert_with(Utc::now);
+                            let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
+                            if retry_policy.is_exhausted(attempt, elapsed) {
+                                tracing::error!(
+                                    topic,
+                                    partition,
+                                    offset,
+                                    attempt,
+                                    error = %e,
+                                    "dispatch failed repeatedly - parking and committing so \
+                                     this message doesn't block progress forever"
+                                );
+                                let payload_json: serde_json::Value =
+                                    serde_json::from_slice(payload)
+                                        .unwrap_or(serde_json::Value::Null);
+                                let partition_key = format!("{topic}:{partition}");
+                                let body = inbound_request_body(
+                                    mapping,
+                                    &payload_json,
+                                    &partition_key,
+                                    offset,
+                                    correlation_id,
+                                    causation_id,
+                                );
+                                let identifier = format!("{partition_key}:{offset}");
+                                if let Err(report_err) = report_parked_delivery(
+                                    http,
+                                    skilj_base_url,
+                                    mapping,
+                                    &identifier,
+                                    &body,
+                                    &e.to_string(),
+                                    attempt,
+                                    failed_at,
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        topic,
+                                        partition,
+                                        offset,
+                                        "reporting this parked delivery failed - not \
+                                         committing, will redeliver: {report_err}"
+                                    );
+                                    break;
+                                }
+                                if let Err(commit_err) =
+                                    consumer.commit_message(&msg, CommitMode::Async)
+                                {
+                                    tracing::error!(
+                                        "committing a Kafka offset failed: {commit_err}"
+                                    );
+                                }
+                                break;
+                            }
+                            let backoff = retry_policy.next_backoff(attempt);
+                            tracing::warn!(
+                                topic,
+                                partition,
+                                offset,
+                                attempt,
+                                error = %e,
+                                "dispatch failed - retrying after backoff"
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
                     }
                 }
             }

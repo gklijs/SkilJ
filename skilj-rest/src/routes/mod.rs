@@ -9,6 +9,12 @@
 //! - `GET  /v1/events/consume`     - EventFetch::ConsumeEvents (server-tracked)
 //! - `POST /v1/events/consume/ack` - EventFetch::AcknowledgeEvents (manual_ack only)
 //! - `POST /v1/commands/trigger`   - CommandTrigger
+//! - `POST /v1/parked-deliveries`  - ParkedDeliveryReport (Codeberg issue
+//!   #21) - a message-broker bridge's own "I gave up retrying this
+//!   inbound delivery" report, authenticated with the same
+//!   `ExternalEventToken`/`CommandToken` credential the bridge already
+//!   uses for the delivery itself (`kind` in the body says which),
+//!   rather than a new credential kind of its own.
 //!
 //! `CommandTrigger` needs an `Arc<dyn CommandDispatcher>` - `router()`'s
 //! second parameter - to actually reach a bounded context's typed
@@ -186,6 +192,7 @@ pub fn router(
         .route("/v1/events/consume", get(get_events_consume))
         .route("/v1/events/consume/ack", post(post_events_consume_ack))
         .route("/v1/commands/trigger", post(post_commands_trigger))
+        .route("/v1/parked-deliveries", post(post_parked_deliveries))
         .layer(middleware::from_fn(trace_request))
         .with_state(AppState {
             pool,
@@ -570,6 +577,51 @@ struct CommandTriggerResponse {
     correlation_id: Option<String>,
 }
 
+/// Codeberg issue #21 - which credential kind (and therefore which
+/// original REST route) this parked delivery came from. Deliberately
+/// not `CrossContextRoute` here - that kind is only ever written by
+/// `db::catch_up_cross_context_route` directly (same process, real DB
+/// access, no REST hop needed), never reported over the wire by an
+/// external bridge.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ParkedDeliveryKindRequest {
+    ExternalEvent,
+    CommandTrigger,
+}
+
+/// A message-broker bridge's own "I gave up retrying this inbound
+/// delivery" report - see docs/architecture.md's parked-deliveries
+/// section. `request` is the exact original `ExternalEventRequest`/
+/// `CommandTriggerRequest` body the bridge already tried to submit
+/// (verbatim, whichever shape `kind` says), stored as-is so
+/// `retryParkedDelivery` can redrive it later without the bridge's own
+/// involvement.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParkedDeliveryRequest {
+    /// The bridge's own name for itself (e.g. `"kafka-inbound"`,
+    /// `"amqp-inbound"`, `"nats-inbound"`) - purely informational, not
+    /// validated against any fixed set, since this crate has no notion
+    /// of which bridges exist.
+    source: String,
+    kind: ParkedDeliveryKindRequest,
+    /// The broker-native identifier for this message (e.g.
+    /// `"{topic}:{partition}:{offset}"` for Kafka) - an operator's own
+    /// way of finding the original message in the broker's own tooling,
+    /// not used by skilj itself for anything.
+    identifier: String,
+    error: String,
+    attempt_count: i32,
+    first_failed_at: chrono::DateTime<Utc>,
+    request: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct ParkedDeliveryResponse {
+    id: String,
+}
+
 // --- handlers ---
 
 async fn post_events_external(
@@ -876,4 +928,62 @@ async fn post_commands_trigger(
             correlation_id: None,
         },
     }))
+}
+
+/// `ParkedDeliveryReport` (Codeberg issue #21) - authenticated with the
+/// same `ExternalEventToken`/`CommandToken` credential the bridge
+/// already presents for the delivery itself, `kind` saying which -
+/// resolving it here (rather than accepting a bare `boundedContext`
+/// argument) is this route's own instance of the capability-based
+/// design this whole crate already follows (see this module's own
+/// top-of-file doc comment): the *credential* says what's being
+/// written and where, not a caller-supplied path/argument. The bounded
+/// context a delivery is parked under, and which `access_token_id` a
+/// later `retryParkedDelivery` re-resolves, both come from that same
+/// token.
+async fn post_parked_deliveries(
+    State(state): State<AppState>,
+    credential: BearerCredential,
+    Json(body): Json<ParkedDeliveryRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let (bounded_context_name, access_token_id, kind) = match body.kind {
+        ParkedDeliveryKindRequest::ExternalEvent => {
+            let token = resolve_token::<ExternalEventToken>(&state, &credential).await?;
+            (
+                token.event_type.bounded_context.name,
+                token.id,
+                db::ParkedDeliveryKind::ExternalEvent,
+            )
+        }
+        ParkedDeliveryKindRequest::CommandTrigger => {
+            let token = resolve_token::<CommandToken>(&state, &credential).await?;
+            (
+                token.command_type.bounded_context.name,
+                token.id,
+                db::ParkedDeliveryKind::CommandTrigger,
+            )
+        }
+    };
+
+    let delivery = db::insert_parked_delivery(
+        &state.pool,
+        &bounded_context_name,
+        &body.source,
+        kind,
+        &body.identifier,
+        Some(&access_token_id),
+        None,
+        None,
+        &body.request,
+        &body.error,
+        body.attempt_count,
+        body.first_failed_at,
+        Utc::now(),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ParkedDeliveryResponse { id: delivery.id }),
+    ))
 }

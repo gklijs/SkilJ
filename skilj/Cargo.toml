@@ -12,6 +12,9 @@ skilj-core.workspace = true
 skilj-graphql.workspace = true
 skilj-rest.workspace = true
 skilj-macros.workspace = true
+# Codeberg issue #21 - `SkiljBuilder::cross_context_route_retry_policy`'s
+# own type.
+skilj-retry.workspace = true
 tokio.workspace = true
 axum.workspace = true
 chrono.workspace = true
