@@ -13,6 +13,7 @@ use crate::gql_types::ProjectionWithRebuild;
 use crate::projection_types::graphql_type_name;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
+use skilj_core::access_control::RoleAccessMapping;
 use skilj_core::db::Pool;
 
 /// `await_projection_caught_up(projection, wait_for_sequence)`'s real
@@ -26,7 +27,7 @@ use skilj_core::db::Pool;
 /// poll already succeeds; for an async one it may need to wait out one
 /// or more of the background consumer's own poll ticks
 /// (`db::catch_up_bounded_context`).
-async fn wait_until_caught_up(
+pub(crate) async fn wait_until_caught_up(
     pool: &Pool,
     bounded_context: &str,
     projection_name: &str,
@@ -78,6 +79,133 @@ async fn wait_until_caught_up(
 /// is exactly the "unestablished owner" case a `scope`-restricted grant
 /// fails closed on (cross-tenant projection read fix,
 /// docs/architecture.md's own write-up of this pass).
+/// `field()`/`resolvers::projection_subscription`'s shared read path -
+/// `team_only` gate, `get_projection`, `wait_until_caught_up`,
+/// `get_projection_state_and_owner`, decrypt-on-read, and
+/// `projections::query_projection`, all as `field()` used to have them
+/// inlined. Pulled out so the new `projectionUpdates` subscription
+/// (Codeberg issue #23) can push through the *identical* authorization/
+/// decrypt path the plain query already has coverage for, instead of a
+/// second hand-rolled copy that could silently drift from it - both the
+/// subscription's initial snapshot and every one of its per-event
+/// refetches call this, never anything else.
+///
+/// `access_mapping` is the caller's: `field()` fetches it once via
+/// `require_read_mapping`, while the subscription re-fetches a fresh one
+/// on every push (never trusting the mapping captured at subscribe time,
+/// the same rule `event_subscription.rs`'s own per-delivery re-check
+/// already follows) - so this function takes it as a parameter rather
+/// than fetching it itself.
+pub(crate) async fn fetch_projection_result(
+    state: &GraphqlState,
+    access_mapping: &RoleAccessMapping,
+    bounded_context_name: &str,
+    name: &str,
+    key: &str,
+    wait_for_sequence: Option<i64>,
+) -> async_graphql::Result<(serde_json::Value, String)> {
+    // `team_only` is a plain in-memory `ProjectionDispatcher` lookup, no
+    // DB round trip - checked first and rejected outright before any of
+    // the DB work below runs, rather than waiting for `query_projection`'s
+    // own copy of this same check at the very end. A caller who was never
+    // going to be authorized shouldn't pay for `get_projection`, the
+    // `waitForSequence` poll loop (up to `state.
+    // projection_query_wait_timeout`), the state fetch, or a
+    // sensitive-field decrypt just to be told no.
+    let team_only = state
+        .projection_dispatcher
+        .team_only(bounded_context_name, name)
+        .flatten();
+    if !skilj_core::access_control::role_matches_required_team(&access_mapping.role, team_only) {
+        return Err(to_graphql_error(
+            skilj_core::access_control::Error::NotOnRequiredTeam,
+        ));
+    }
+
+    let projection = skilj_core::db::get_projection(&state.pool, bounded_context_name, name)
+        .await
+        .map_err(to_graphql_error)?
+        .ok_or_else(|| not_found("Projection", name))?;
+
+    let caught_up = match wait_for_sequence {
+        None => true,
+        Some(seq) => wait_until_caught_up(
+            &state.pool,
+            bounded_context_name,
+            name,
+            seq,
+            state.projection_query_wait_timeout,
+        )
+        .await
+        .map_err(to_graphql_error)?,
+    };
+
+    let stored = skilj_core::db::get_projection_state_and_owner(
+        &state.pool,
+        bounded_context_name,
+        name,
+        key,
+    )
+    .await
+    .map_err(to_graphql_error)?;
+    // Cross-tenant projection read fix (docs/architecture.md's own
+    // write-up of this pass): `instance_owner` is this row's own `owner`
+    // column, `None` for a row that doesn't exist yet - the same "no
+    // proven owner" treatment either way, decided by `query_projection`
+    // below, not here.
+    let instance_owner = stored.as_ref().and_then(|(_, owner)| owner.clone());
+    let state_json = stored
+        .map(|(state_json, _)| state_json)
+        .or_else(|| {
+            state
+                .projection_dispatcher
+                .default_state(bounded_context_name, name)
+        })
+        .unwrap_or_else(|| "{}".to_string());
+    let owner_tag_key = state
+        .projection_dispatcher
+        .owner_tag_key(bounded_context_name, name)
+        .flatten();
+
+    // Real decrypt-on-read - automatic, no `Projection.sensitive_fields`
+    // declaration anywhere (see `field()`'s own doc comment). Grant
+    // checked once, up front: an ungranted caller's query never needs a
+    // master key, or even a DB round trip for one, at all.
+    let data_keys = if skilj_core::event_store::sensitive_field_is_granted(access_mapping, key) {
+        skilj_core::db::list_active_data_keys_for_subject_value(
+            &state.pool,
+            bounded_context_name,
+            key,
+            state.encryption_master_key.as_ref(),
+        )
+        .await
+        .map_err(to_graphql_error)?
+    } else {
+        Vec::new()
+    };
+    let state_json = skilj_core::projections::read_projection(&state_json, &data_keys);
+
+    let result = skilj_core::projections::query_projection(
+        access_mapping,
+        &projection,
+        key,
+        wait_for_sequence,
+        caught_up,
+        skilj_core::projections::ProjectionAccessScope {
+            declares_owner: owner_tag_key.is_some(),
+            instance_owner: instance_owner.as_deref(),
+            team_only,
+        },
+        state_json,
+    )
+    .map_err(to_graphql_error)?;
+
+    let value: serde_json::Value = serde_json::from_str(&result)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+
+    Ok((value, graphql_type_name(bounded_context_name, name)))
+}
+
 pub fn field() -> Field {
     Field::new("projection", TypeRef::named_nn("ProjectionResult"), |ctx| {
         FieldFuture::new(async move {
@@ -100,115 +228,17 @@ pub fn field() -> Field {
                 .map(|v| v.i64())
                 .transpose()?;
 
-            // `team_only` is a plain in-memory `ProjectionDispatcher`
-            // lookup, no DB round trip - checked first and rejected
-            // outright before any of the DB work below runs, rather than
-            // waiting for `query_projection`'s own copy of this same
-            // check at the very end. A caller who was never going to be
-            // authorized shouldn't pay for `get_projection`, the
-            // `waitForSequence` poll loop (up to `state.
-            // projection_query_wait_timeout`), the state fetch, or a
-            // sensitive-field decrypt just to be told no.
-            let team_only = state
-                .projection_dispatcher
-                .team_only(&bounded_context_name, &name)
-                .flatten();
-            if !skilj_core::access_control::role_matches_required_team(
-                &access_mapping.role,
-                team_only,
-            ) {
-                return Err(to_graphql_error(
-                    skilj_core::access_control::Error::NotOnRequiredTeam,
-                ));
-            }
-
-            let projection =
-                skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)
-                    .await
-                    .map_err(to_graphql_error)?
-                    .ok_or_else(|| not_found("Projection", &name))?;
-
-            let caught_up = match wait_for_sequence {
-                None => true,
-                Some(seq) => wait_until_caught_up(
-                    &state.pool,
-                    &bounded_context_name,
-                    &name,
-                    seq,
-                    state.projection_query_wait_timeout,
-                )
-                .await
-                .map_err(to_graphql_error)?,
-            };
-
-            let stored = skilj_core::db::get_projection_state_and_owner(
-                &state.pool,
+            let (value, type_name) = fetch_projection_result(
+                state,
+                &access_mapping,
                 &bounded_context_name,
                 &name,
                 &key,
-            )
-            .await
-            .map_err(to_graphql_error)?;
-            // Cross-tenant projection read fix (docs/architecture.md's
-            // own write-up of this pass): `instance_owner` is this row's
-            // own `owner` column, `None` for a row that doesn't exist yet
-            // - the same "no proven owner" treatment either way, decided
-            // by `query_projection` below, not here.
-            let instance_owner = stored.as_ref().and_then(|(_, owner)| owner.clone());
-            let state_json = stored
-                .map(|(state_json, _)| state_json)
-                .or_else(|| {
-                    state
-                        .projection_dispatcher
-                        .default_state(&bounded_context_name, &name)
-                })
-                .unwrap_or_else(|| "{}".to_string());
-            let owner_tag_key = state
-                .projection_dispatcher
-                .owner_tag_key(&bounded_context_name, &name)
-                .flatten();
-
-            // Real decrypt-on-read - automatic, no `Projection.sensitive_fields`
-            // declaration anywhere (see this field's own doc comment).
-            // Grant checked once, up front: an ungranted caller's query
-            // never needs a master key, or even a DB round trip for one,
-            // at all.
-            let data_keys =
-                if skilj_core::event_store::sensitive_field_is_granted(&access_mapping, &key) {
-                    skilj_core::db::list_active_data_keys_for_subject_value(
-                        &state.pool,
-                        &bounded_context_name,
-                        &key,
-                        state.encryption_master_key.as_ref(),
-                    )
-                    .await
-                    .map_err(to_graphql_error)?
-                } else {
-                    Vec::new()
-                };
-            let state_json = skilj_core::projections::read_projection(&state_json, &data_keys);
-
-            let result = skilj_core::projections::query_projection(
-                &access_mapping,
-                &projection,
-                &key,
                 wait_for_sequence,
-                caught_up,
-                skilj_core::projections::ProjectionAccessScope {
-                    declares_owner: owner_tag_key.is_some(),
-                    instance_owner: instance_owner.as_deref(),
-                    team_only,
-                },
-                state_json,
             )
-            .map_err(to_graphql_error)?;
+            .await?;
 
-            let value: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-
-            Ok(Some(FieldValue::owned_any(value).with_type(
-                graphql_type_name(&bounded_context_name, &name),
-            )))
+            Ok(Some(FieldValue::owned_any(value).with_type(type_name)))
         })
     })
     .argument(InputValue::new(

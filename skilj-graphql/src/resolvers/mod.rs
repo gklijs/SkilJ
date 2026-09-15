@@ -68,6 +68,7 @@ pub mod event_type_admin_operations;
 pub mod parked_deliveries;
 pub mod private_field_grant_management;
 pub mod projection_query;
+pub mod projection_subscription;
 pub mod snapshot_query;
 pub mod subject_erasure;
 pub mod superadmin_bootstrap;

@@ -7639,3 +7639,122 @@ what would traditionally be separate aggregates - at the tag/decision-
 model level, which is the level DCB itself operates at. No feature
 gap identified; issue closed as already-solved, pointing at
 `EnrollStudentInCourse` as the existing proof.
+
+## 49. A GraphQL subscription for Projections: `projectionUpdates` (Codeberg issue #23)
+
+`EventSubscription` ([§9](#next-steps)'s "last surface out of the
+backlog") already gave clients a live push of raw events, but a client
+wanting "push me the current balance whenever it changes" had to
+subscribe to raw events and re-implement the projection's own `project()`
+fold client-side. This adds `projectionUpdates` - `ProjectionQuery`'s own
+subscription counterpart, pushing the already-computed `Projection`
+state itself.
+
+### The refactor this needed first
+
+`ProjectionQuery.projection`'s resolver (`skilj-graphql/src/resolvers/projection_query.rs`)
+already had the entire read path this needed: `team_only` gate →
+`get_projection` → `wait_until_caught_up` → `get_projection_state_and_owner`
+→ decrypt-on-read → `projections::query_projection`. Rather than a second,
+hand-rolled copy for the subscription to drift from, that path was
+pulled out into `fetch_projection_result` (same file, now `pub(crate)`,
+along with `wait_until_caught_up`) - `field()` becomes a thin wrapper
+around it, and `projectionUpdates`'s initial snapshot and every one of
+its per-event refetches call the identical function. Any future fix to
+that read path (an owner-scope bug, a decrypt gap) now fixes both
+surfaces by construction, the same reasoning `event_subscription.rs`'s
+own re-fetch-fresh-`access_mapping` pattern already established for
+`EventSubscription`.
+
+### Shape: mirrors `EventSubscription`, two deliberate divergences
+
+New module `skilj-graphql/src/resolvers/projection_subscription.rs`,
+one field: `projectionUpdates(boundedContext: String!, name: String!,
+key: String): ProjectionResult!` (`key` defaults to `""`, identical
+convention to `projection`; no `waitForSequence` - a subscription starts
+from current state and lives indefinitely, nothing to wait for up
+front). Registered into the schema's `Subscription` root under the same
+`projection_types.is_some()` guard `projection_query::field()` already
+uses (`skilj-graphql/src/schema.rs`) - nothing to register when no
+projection exists anywhere to reference.
+
+The resolver shape mirrors `event_subscription.rs`'s two fields exactly:
+`require_read_mapping` → `team_only` gate (fail fast, before any DB work
+or subscribing - a caller who was never going to be authorized never
+even reaches `state.event_broadcaster.subscribe()`) → confirm the
+projection exists → subscribe *before* the initial snapshot read (the
+identical drift-audit-finding-#7 ordering `event_subscription.rs`
+already documents: an event landing in the gap must be either already
+reflected in the snapshot or delivered live, never neither) → yield the
+initial state → loop on `tokio::select!` between the event receiver and
+`state.revocation_broadcaster`, reusing `revocation_closes_connection`
+(now `pub(crate)`) unchanged for the push-revocation path.
+
+Two places this genuinely, deliberately differs from `EventSubscription`:
+
+- **What triggers a push.** Not every event - only one whose
+  `ProjectionDispatcher::keys(bounded_context, name, event)` names this
+  subscription's own `key`. Every other event is a cheap in-memory
+  `continue`, no DB round trip at all - the same "position always
+  advances, state only changes when consumed" distinction `keys()`'s own
+  doc comment already draws, now load-bearing for cost rather than just
+  correctness.
+- **What gets pushed, and `RecvError::Lagged` handling.** Never the
+  triggering event itself - always a fresh `fetch_projection_result`
+  refetch, passed the triggering event's own `sequence` as
+  `wait_for_sequence`. That one argument is what makes this correct for
+  an *async* (`sync() == false`) projection too, with no sync/async
+  branch anywhere in the subscription's own code: `wait_until_caught_up`
+  (inside the shared function) resolves on its very first poll for a
+  sync projection (already current by commit time) and waits out a real
+  `catch_up_bounded_context` poll tick for an async one. Because of that,
+  `RecvError::Lagged` doesn't need to be fatal here the way it is for
+  `EventSubscription`: that surface promises every individual event
+  (`DeliveryIsAtMostOnce`), so falling behind is real, unrecoverable data
+  loss. `projectionUpdates` promises "current state whenever it changes",
+  not "every event that changed it" - a lagged receiver loses nothing a
+  plain refetch can't recover, so it self-heals (refetch this key's
+  current state with `wait_for_sequence: None`, keep the connection
+  open) instead of closing.
+
+### Tests
+
+`skilj/tests/projection_subscription.rs`, the same real-Postgres/real-
+JWKS-server/real-websocket harness `skilj/tests/event_subscription.rs`
+already established (duplicated rather than extracted into shared
+test-support, this project's own established call):
+
+- Initial push on subscribe, a push per matching event afterward
+  (cumulative, not one-shot), and revocation mid-stream closing the
+  connection distinguishably (`grant_not_active`) - one consolidated
+  end-to-end test, the same consolidation style
+  `event_subscription_end_to_end` already uses.
+- Key-filtering: a keyed `CustomerPurchaseHistory` projection proves an
+  event for a *different* key never pushes anything, while one for the
+  subscribed key does.
+- `TEAM_ONLY` (Codeberg issue #17's gate, reached through this new
+  surface): a Role missing the required team name is rejected as the
+  subscription's own first and only message, before any event could
+  possibly be involved - proving the check runs before
+  `event_broadcaster.subscribe()`, not just before a push. A Role
+  carrying the team name subscribes normally.
+- An async (`sync() == false`) projection: proves the push genuinely
+  waits for `catch_up_bounded_context`'s own poll tick rather than
+  racing it - a naive immediate refetch would risk pushing the still-
+  default state with no second event ever arriving to correct it, since
+  `keys()` already matched on the first one.
+
+Owner-tag cross-tenant scoping and sensitive-field decrypt-on-read are
+deliberately not re-tested here - both run through the identical
+`fetch_projection_result` `projection_query.rs`'s own suite already
+covers end to end; duplicating them through a second transport would
+test the shared function twice, not the new wiring.
+
+### Verified
+
+`cargo build/clippy -D warnings/test --workspace` and `cargo fmt --check`
+clean; the new `projection_subscription.rs` suite (4 tests) and the
+pre-existing `projection_query.rs`/`event_subscription.rs` suites (5 + 4
+tests) all pass unchanged against real embedded Postgres, confirming the
+`fetch_projection_result` refactor didn't alter `projection`'s own
+behaviour.

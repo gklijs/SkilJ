@@ -82,7 +82,7 @@ fn subscription_lagged_error(skipped: u64) -> async_graphql::Error {
 /// `(role_id, bounded_context)`. `Ok(false)`: not ours, or nothing to act
 /// on yet - keep looping. `Err`: a real I/O failure while re-checking a
 /// lagged receiver, ready to `yield_error` as-is.
-async fn revocation_closes_connection(
+pub(crate) async fn revocation_closes_connection(
     pool: &skilj_core::db::Pool,
     role_id: &str,
     bounded_context_name: &str,

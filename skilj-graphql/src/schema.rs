@@ -136,9 +136,13 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
             ),
         )
         .field(resolvers::private_field_grant_management::revoke_private_field_access_field());
-    let subscription = Subscription::new("Subscription")
+    let mut subscription = Subscription::new("Subscription")
         .field(resolvers::event_subscription::all_events_field())
         .field(resolvers::event_subscription::events_by_type_field());
+    if projection_types.is_some() {
+        subscription =
+            subscription.field(resolvers::projection_subscription::projection_updates_field());
+    }
 
     let mut builder = Schema::build(
         query.type_name(),
