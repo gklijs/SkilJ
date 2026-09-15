@@ -3,7 +3,7 @@
 //! reasoning behind this shape.
 
 use crate::event_store::{Event, MissedOccurrencePolicy};
-use crate::shared::{CommandDecision, PrivateField, SensitiveField, TagMapping};
+use crate::shared::{CommandDecision, PrivateField, SensitiveField, Tag, TagMapping};
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -982,4 +982,216 @@ pub trait CrossContextRouteDispatcher: Send + Sync {
         route_name: &str,
         source_payload_json: &str,
     ) -> Option<Result<Option<String>, serde_json::Error>>;
+}
+
+/// Codeberg issue #20's own "where does this cursor start" const, one per
+/// `ScheduleDeadline`/`CancelDeadline` implementor - identical in shape to
+/// `CrossContextRouteStartFrom` but its own type rather than a reuse of
+/// it: a deadline reactor isn't a route, and giving it a name that says
+/// what it's actually for beats leaning on a type whose own doc comment
+/// is written entirely in terms of routes. See `CrossContextRouteStartFrom`'s
+/// own doc comment for why `AtTime` carries a plain Unix timestamp rather
+/// than `DateTime<Utc>` - the identical reasoning (a trait associated
+/// const has to be const-evaluable) applies here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlinePollStartFrom {
+    Beginning,
+    Latest,
+    AtSequence(i64),
+    /// Unix timestamp, seconds, UTC.
+    AtTime(i64),
+}
+
+/// `ScheduleDeadline::schedule`'s own `Some` output - everything a
+/// one-shot, per-entity timer needs: when it fires (`fire_at`), what it's
+/// scoped to for a later `CancelDeadline` lookup (`tags`), and what to
+/// submit when it does (`payload`, `Self::Target`'s own payload type).
+#[derive(Debug, Clone)]
+pub struct DeadlineSpec<P> {
+    pub fire_at: chrono::DateTime<chrono::Utc>,
+    pub tags: Vec<Tag>,
+    pub payload: P,
+}
+
+/// Codeberg issue #20: a native one-shot, per-entity deadline/timer -
+/// "cancel this order if not paid within 30 minutes," without reaching
+/// for `skilj-temporal` (docs/architecture.md §34) or hand-building it on
+/// top of the recurring, `EventType`-wide scheduler (`rule
+/// CreateSystemEvent`). Deliberately the same shape as `CrossContextRoute`
+/// just above, for the same reason: `decide()`'s only output is
+/// `CommandDecision` (`Accepted { events }` / `Rejected`) - it has no
+/// side-effect channel to schedule a timer through, and none should be
+/// added there. So scheduling one is itself modelled as a pure reaction
+/// to a committed event, with a background poller doing the actual
+/// durable write, exactly like a route reacting to one.
+///
+/// Fires `Target` as a real command, not a raw event - the same reasoning
+/// `CrossContextRoute::Target` already gives: whether a deadline is still
+/// relevant is a decision `Target::decide()` gets to make against
+/// *current* state at fire time, not one baked in back when the timer was
+/// scheduled.
+pub trait ScheduleDeadline {
+    /// The event that, on commit, may schedule a new deadline.
+    type Source: EventType;
+    /// The command submitted when the deadline fires.
+    type Target: CommandType;
+
+    /// This schedule's own stable identity - names its durable cursor row
+    /// and, combined with the triggering `Source` event's own sequence,
+    /// the deterministic id of every row it inserts
+    /// (`"{NAME}:{source_event_sequence}"`) - so a redelivered/retried
+    /// catch-up tick re-inserts the identical row rather than a duplicate
+    /// (`ON CONFLICT (id) DO NOTHING`), the same property a route's own
+    /// idempotency key gives its command submissions, applied here to the
+    /// row insert itself.
+    const NAME: &'static str;
+
+    /// See `DeadlinePollStartFrom`. `Beginning` (the default) replays
+    /// every `Source` occurrence ever committed - the same default
+    /// `CrossContextRoute::START_FROM` has, and for the same reason: it's
+    /// what every schedule registered before this const existed already
+    /// does.
+    const START_FROM: DeadlinePollStartFrom = DeadlinePollStartFrom::Beginning;
+
+    /// `None` skips this occurrence of `Source` entirely - no deadline
+    /// scheduled, cursor still advances. `Some(spec)` inserts a `pending`
+    /// row, fired the next time `spec.fire_at` comes due (or immediately,
+    /// if it's already in the past by the time this runs - a deadline is
+    /// a one-shot, so there's no missed-occurrence policy to choose
+    /// between the way the recurring scheduler needs one).
+    fn schedule(
+        source_payload: &<Self::Source as EventType>::Payload,
+    ) -> Option<DeadlineSpec<<Self::Target as CommandType>::Payload>>;
+}
+
+/// Codeberg issue #20's own cancellation half - "cancellable if the
+/// awaited thing happens first." Bound to a specific `ScheduleDeadline`
+/// via `Deadline` (not just any deadline sharing a tag) so two unrelated
+/// schedules that happen to reuse a tag key never cross-cancel each
+/// other's rows.
+///
+/// Cancels **by tag**, not by id: the cancelling event (say, `OrderPaid`)
+/// only ever carries its own payload/tags, never the opaque id a
+/// `ScheduleDeadline` implementor generated deep inside its own row
+/// insert - tag-based lookup is what actually lets "whichever happens
+/// first" work without threading an id back out through some side
+/// channel. Reuses the same tag-containment query
+/// `list_events_for_bounded_context_matching_tags` already uses for
+/// events (docs/architecture.md §19 Problem 1), applied to the
+/// `deadlines` table's own `tags` column.
+pub trait CancelDeadline {
+    /// The event that, on commit, may cancel one or more pending
+    /// deadlines.
+    type Source: EventType;
+    /// Which `ScheduleDeadline`'s own pending rows this targets.
+    type Deadline: ScheduleDeadline;
+
+    /// This cancel reactor's own stable identity - names its durable
+    /// cursor row, independent of `Self::Deadline::NAME`'s own cursor (a
+    /// schedule and its cancel counterpart advance independently, each
+    /// walking its own `Source` event stream).
+    const NAME: &'static str;
+
+    /// See `DeadlinePollStartFrom`; same default and reasoning as
+    /// `ScheduleDeadline::START_FROM`.
+    const START_FROM: DeadlinePollStartFrom = DeadlinePollStartFrom::Beginning;
+
+    /// `None` skips this occurrence entirely - nothing cancelled, cursor
+    /// still advances. `Some(tags)` cancels every still-`pending` row
+    /// `Self::Deadline::NAME` owns whose own `tags` contain these -
+    /// cancelling zero, one, or several rows is all a legitimate outcome
+    /// here (a deadline that already fired, was already cancelled, or was
+    /// never scheduled in the first place is not an error), the same
+    /// register `CrossContextRoute::route` returning `None` already is.
+    fn cancel_tags(source_payload: &<Self::Source as EventType>::Payload) -> Option<Vec<Tag>>;
+}
+
+/// One registered `ScheduleDeadline`'s own static identity -
+/// `ScheduleDeadlineDispatcher::schedules()`'s own element type, the
+/// `ScheduleDeadline`/`CancelDeadline` pair's counterpart to
+/// `CrossContextRouteInfo`.
+#[derive(Debug, Clone, Copy)]
+pub struct ScheduleDeadlineInfo {
+    pub name: &'static str,
+    pub source_bounded_context: &'static str,
+    pub source_event_type: &'static str,
+    pub target_bounded_context: &'static str,
+    pub target_command_type: &'static str,
+    pub start_from: DeadlinePollStartFrom,
+}
+
+/// One registered `CancelDeadline`'s own static identity.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelDeadlineInfo {
+    pub name: &'static str,
+    pub source_bounded_context: &'static str,
+    pub source_event_type: &'static str,
+    pub deadline_schedule_name: &'static str,
+    /// `Self::Deadline::Source::BOUNDED_CONTEXT` - where the paired
+    /// `ScheduleDeadline`'s own `deadlines`/`deadline_cursors` rows
+    /// physically live (mirroring `CrossContextRoute`'s own
+    /// `source_bounded_context` placement choice for its cursor table),
+    /// which can differ from this cancel reactor's own
+    /// `source_bounded_context` above - the cancelling event and the
+    /// deadline it cancels aren't required to live in the same bounded
+    /// context, the same generality `CrossContextRoute::Source`/`Target`
+    /// already has.
+    pub deadline_schedule_bounded_context: &'static str,
+    pub start_from: DeadlinePollStartFrom,
+}
+
+/// Type-erased dispatch to a bounded context's own typed
+/// `ScheduleDeadline::schedule` - `CrossContextRouteDispatcher`'s own
+/// counterpart for this trait.
+pub trait ScheduleDeadlineDispatcher: Send + Sync {
+    /// Every registered schedule, across every bounded context - not
+    /// scoped to one bounded context, the same reasoning
+    /// `CrossContextRouteDispatcher::routes` already gives.
+    fn schedules(&self) -> Vec<ScheduleDeadlineInfo>;
+
+    /// `schedule_name` names one of `schedules()`'s own entries;
+    /// `source_payload_json` is the triggering `Source` event's own
+    /// stored payload. Outer `None` - not registered at all. `Some(Err(e))` -
+    /// the stored payload didn't deserialize into `Source::Payload`.
+    /// `Some(Ok(None))` - `schedule()` itself decided this occurrence
+    /// doesn't apply. `Some(Ok(Some(spec)))` - ready to insert as a
+    /// `pending` row, `Target`'s own JSON payload already resolved.
+    fn schedule(
+        &self,
+        schedule_name: &str,
+        source_payload_json: &str,
+    ) -> Option<Result<Option<ErasedDeadlineSpec>, serde_json::Error>>;
+}
+
+/// `ScheduleDeadlineDispatcher::schedule`'s own type-erased output -
+/// `DeadlineSpec<P>` with `P` resolved to its already-serialised JSON,
+/// the same "erase the payload's own concrete type at the dispatcher
+/// boundary" treatment every other dispatcher trait in this module
+/// already gives its own typed payloads.
+#[derive(Debug, Clone)]
+pub struct ErasedDeadlineSpec {
+    pub fire_at: chrono::DateTime<chrono::Utc>,
+    pub tags: Vec<Tag>,
+    pub payload_json: String,
+}
+
+/// Type-erased dispatch to a bounded context's own typed
+/// `CancelDeadline::cancel_tags`.
+pub trait CancelDeadlineDispatcher: Send + Sync {
+    /// Every registered cancel reactor, across every bounded context.
+    fn cancels(&self) -> Vec<CancelDeadlineInfo>;
+
+    /// `cancel_name` names one of `cancels()`'s own entries;
+    /// `source_payload_json` is the triggering `Source` event's own
+    /// stored payload. Outer `None` - not registered at all. `Some(Err(e))` -
+    /// the stored payload didn't deserialize into `Source::Payload`.
+    /// `Some(Ok(None))` - `cancel_tags()` itself decided this occurrence
+    /// doesn't apply. `Some(Ok(Some(tags)))` - cancel every still-`pending`
+    /// row the paired `ScheduleDeadline` owns whose own tags contain
+    /// these.
+    fn cancel_tags(
+        &self,
+        cancel_name: &str,
+        source_payload_json: &str,
+    ) -> Option<Result<Option<Vec<Tag>>, serde_json::Error>>;
 }

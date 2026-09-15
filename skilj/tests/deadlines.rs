@@ -1,0 +1,606 @@
+//! End-to-end proof of Codeberg issue #20's native one-shot, per-entity
+//! deadline mechanism (`skilj_core::plugin::ScheduleDeadline`/
+//! `CancelDeadline`): a real `OrderPlaced` event, directly created,
+//! schedules a deadline via the background poll task
+//! `SkiljBuilder::build()` spawns for it; that deadline either fires a
+//! real `CancelOrder` command once due, or never does when a same-tagged
+//! `OrderPaid` event cancels it first - proof the wiring from
+//! `skilj_core::db::catch_up_schedule_deadline`/`catch_up_cancel_deadline`/
+//! `fire_due_deadlines` all the way through `SkiljBuilder::schedule_deadline::<S>()`/
+//! `.cancel_deadline::<C>()` is real and running, not just the
+//! persistence layer in isolation. Same `DATABASE_URL`-then-embedded-
+//! Postgres-then-skip harness as `skilj/tests/cross_context_route.rs` -
+//! see its own doc comment for the details, not repeated a third time
+//! here.
+//!
+//! One bounded context, one test function, three orders as sub-scenarios,
+//! the same "several sub-scenarios in one shared harness" shape
+//! `cross_context_route.rs`'s own main test already uses. Chosen here to
+//! keep this file's own share of the pre-existing embedded-Postgres
+//! connection-pool pressure (see `CONTRIBUTING.md`) as small as
+//! reasonably possible: every additional `#[test]` fn builds its own
+//! `Skilj` instance, and this feature alone adds three more perpetual
+//! background poll tasks per instance on top of the five every other
+//! test file's instance already carries.
+//!
+//! **Not covered here**: a dedicated crash/redelivery simulation proving
+//! `ON CONFLICT (id) DO NOTHING` makes a redelivered schedule-catch-up
+//! tick a safe no-op. That property is structural, not incidental - the
+//! identical mechanism (a deterministic id/idempotency key,
+//! `Deduplicated` handled as a warning not an error) `CrossContextRoute`
+//! already relies on and which docs/architecture.md §36/§37 reasoned
+//! about at length - and `cross_context_route.rs`'s own three tests don't
+//! carry a dedicated crash-simulation test for it either, for the same
+//! reason this file doesn't: the black-box, full-`Skilj` harness every
+//! test file here uses has no fault-injection hook to force a real
+//! redelivery, only ever exercising the ordinary, non-redelivered path.
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use chrono::{SubsecRound, Utc};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use skilj::{CancelDeadline, CommandType, EventType, Projection, ScheduleDeadline, Skilj};
+use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
+use skilj_core::bootstrap::ContextCreator;
+use skilj_core::db::{self, Pool};
+use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
+use skilj_core::plugin::{BoundedContextEvent, DeadlineSpec};
+use skilj_core::shared::{
+    generate_token_id, generate_token_secret, CommandDecision, EventSpec, Tag,
+};
+use tower::ServiceExt;
+
+const ORDERS_BOUNDED_CONTEXT: &str = "skilj_deadlines_test_orders";
+
+// --- source events ---
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct OrderPlacedPayload {
+    order_id: String,
+    deadline_at: chrono::DateTime<chrono::Utc>,
+    /// Exercises `ScheduleOrderCancelDeadline::schedule` returning
+    /// `None` (the occurrence this schedule itself decided doesn't
+    /// apply) when `false` - `ScheduleReminderDeadline` below ignores
+    /// this field entirely and always schedules its own reminder
+    /// regardless, proving one schedule's own skip has no bearing on a
+    /// sibling schedule reacting to the identical event.
+    schedule_cancel_deadline: bool,
+}
+
+struct OrderPlaced;
+
+impl EventType for OrderPlaced {
+    type Payload = OrderPlacedPayload;
+    const NAME: &'static str = "OrderPlaced";
+    const BOUNDED_CONTEXT: &'static str = ORDERS_BOUNDED_CONTEXT;
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct OrderPaidPayload {
+    order_id: String,
+}
+
+struct OrderPaid;
+
+impl EventType for OrderPaid {
+    type Payload = OrderPaidPayload;
+    const NAME: &'static str = "OrderPaid";
+    const BOUNDED_CONTEXT: &'static str = ORDERS_BOUNDED_CONTEXT;
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+}
+
+// --- fired commands + the events they produce ---
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct CancelOrderPayload {
+    order_id: String,
+}
+
+struct CancelOrder;
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct OrderCancelledPayload {
+    order_id: String,
+}
+
+struct OrderCancelled;
+
+impl EventType for OrderCancelled {
+    type Payload = OrderCancelledPayload;
+    const NAME: &'static str = "OrderCancelled";
+    const BOUNDED_CONTEXT: &'static str = ORDERS_BOUNDED_CONTEXT;
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct SendReminderPayload {
+    order_id: String,
+}
+
+struct SendReminder;
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct ReminderSentPayload {
+    order_id: String,
+}
+
+struct ReminderSent;
+
+impl EventType for ReminderSent {
+    type Payload = ReminderSentPayload;
+    const NAME: &'static str = "ReminderSent";
+    const BOUNDED_CONTEXT: &'static str = ORDERS_BOUNDED_CONTEXT;
+}
+
+enum OrdersEvent {
+    OrderCancelled(OrderCancelledPayload),
+    ReminderSent(ReminderSentPayload),
+}
+
+impl BoundedContextEvent for OrdersEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "OrderCancelled" => {
+                Some(serde_json::from_str(&event.payload).map(OrdersEvent::OrderCancelled))
+            }
+            "ReminderSent" => {
+                Some(serde_json::from_str(&event.payload).map(OrdersEvent::ReminderSent))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl CommandType for CancelOrder {
+    type Payload = CancelOrderPayload;
+    type Event = OrdersEvent;
+    const NAME: &'static str = "CancelOrder";
+    const BOUNDED_CONTEXT: &'static str = ORDERS_BOUNDED_CONTEXT;
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "OrderCancelled".to_string(),
+                payload: serde_json::json!({ "order_id": payload.order_id }),
+            }],
+        }
+    }
+}
+
+impl CommandType for SendReminder {
+    type Payload = SendReminderPayload;
+    type Event = OrdersEvent;
+    const NAME: &'static str = "SendReminder";
+    const BOUNDED_CONTEXT: &'static str = ORDERS_BOUNDED_CONTEXT;
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "ReminderSent".to_string(),
+                payload: serde_json::json!({ "order_id": payload.order_id }),
+            }],
+        }
+    }
+}
+
+// --- projections ---
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct OrderCancellationsState {
+    cancelled_order_ids: Vec<String>,
+}
+
+/// `sync: true` - the assertions below are already only waiting on the
+/// deadline background tasks' own poll cycles; no reason to also make
+/// them wait on a second, independent projection poll task on top (same
+/// reasoning `cross_context_route.rs`'s own `ReservedTotal` gives).
+struct OrderCancellations;
+
+impl Projection for OrderCancellations {
+    type State = OrderCancellationsState;
+    type Event = OrdersEvent;
+    const NAME: &'static str = "OrderCancellations";
+    const BOUNDED_CONTEXT: &'static str = ORDERS_BOUNDED_CONTEXT;
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["OrderCancelled"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        if let OrdersEvent::OrderCancelled(payload) = event {
+            state.cancelled_order_ids.push(payload.order_id.clone());
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct RemindersSentState {
+    reminded_order_ids: Vec<String>,
+}
+
+struct RemindersSent;
+
+impl Projection for RemindersSent {
+    type State = RemindersSentState;
+    type Event = OrdersEvent;
+    const NAME: &'static str = "RemindersSent";
+    const BOUNDED_CONTEXT: &'static str = ORDERS_BOUNDED_CONTEXT;
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["ReminderSent"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        if let OrdersEvent::ReminderSent(payload) = event {
+            state.reminded_order_ids.push(payload.order_id.clone());
+        }
+    }
+}
+
+// --- the deadline reactors themselves ---
+
+fn order_tag(order_id: &str) -> Tag {
+    Tag {
+        key: "order".to_string(),
+        value: Some(order_id.to_string()),
+    }
+}
+
+struct ScheduleOrderCancelDeadline;
+
+impl ScheduleDeadline for ScheduleOrderCancelDeadline {
+    type Source = OrderPlaced;
+    type Target = CancelOrder;
+    const NAME: &'static str = "ScheduleOrderCancelDeadline";
+    fn schedule(source_payload: &OrderPlacedPayload) -> Option<DeadlineSpec<CancelOrderPayload>> {
+        if !source_payload.schedule_cancel_deadline {
+            return None;
+        }
+        Some(DeadlineSpec {
+            fire_at: source_payload.deadline_at,
+            tags: vec![order_tag(&source_payload.order_id)],
+            payload: CancelOrderPayload {
+                order_id: source_payload.order_id.clone(),
+            },
+        })
+    }
+}
+
+/// Shares `order_tag(...)` with `ScheduleOrderCancelDeadline` above -
+/// deliberately, to prove `CancelDeadline::Deadline`'s own
+/// `schedule_name` scoping: cancelling one schedule's rows for a given
+/// tag must never touch a different schedule's own rows for that
+/// identical tag.
+struct ScheduleReminderDeadline;
+
+impl ScheduleDeadline for ScheduleReminderDeadline {
+    type Source = OrderPlaced;
+    type Target = SendReminder;
+    const NAME: &'static str = "ScheduleReminderDeadline";
+    fn schedule(source_payload: &OrderPlacedPayload) -> Option<DeadlineSpec<SendReminderPayload>> {
+        Some(DeadlineSpec {
+            fire_at: source_payload.deadline_at,
+            tags: vec![order_tag(&source_payload.order_id)],
+            payload: SendReminderPayload {
+                order_id: source_payload.order_id.clone(),
+            },
+        })
+    }
+}
+
+struct CancelOrderDeadlineOnPaid;
+
+impl CancelDeadline for CancelOrderDeadlineOnPaid {
+    type Source = OrderPaid;
+    type Deadline = ScheduleOrderCancelDeadline;
+    const NAME: &'static str = "CancelOrderDeadlineOnPaid";
+    fn cancel_tags(source_payload: &OrderPaidPayload) -> Option<Vec<Tag>> {
+        Some(vec![order_tag(&source_payload.order_id)])
+    }
+}
+
+// --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
+// (identical shape to `cross_context_route.rs`'s own harness - see that
+// file's doc comment)
+
+struct TestDb {
+    database_url: String,
+    pool: Pool,
+    _embedded: Option<postgresql_embedded::PostgreSQL>,
+}
+
+static TEST_DB: tokio::sync::OnceCell<Option<TestDb>> = tokio::sync::OnceCell::const_new();
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new().expect("failed to build a tokio runtime for deadline tests")
+    })
+}
+
+async fn test_db() -> Option<(String, Pool)> {
+    TEST_DB
+        .get_or_init(provision)
+        .await
+        .as_ref()
+        .map(|db| (db.database_url.clone(), db.pool.clone()))
+}
+
+async fn connect_and_migrate(database_url: &str, label: &str) -> Option<Pool> {
+    let pool = match db::connect(database_url).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("skipping: connecting to {label} failed: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = db::migrate(&pool).await {
+        eprintln!("skipping: migrating {label} failed: {e}");
+        return None;
+    }
+    Some(pool)
+}
+
+async fn provision() -> Option<TestDb> {
+    let database_url = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+        database_url
+    } else {
+        let mut server = postgresql_embedded::PostgreSQL::default();
+        if let Err(e) = server.setup().await {
+            eprintln!(
+                "skipping: DATABASE_URL not set and embedded PostgreSQL setup failed \
+                 (no network egress to fetch the binary, or a missing system library \
+                 like libxml2 it links against): {e}"
+            );
+            return None;
+        }
+        if let Err(e) = server.start().await {
+            eprintln!("skipping: embedded PostgreSQL failed to start: {e}");
+            return None;
+        }
+        let database_name = "skilj_deadlines_e2e_test";
+        if let Err(e) = server.create_database(database_name).await {
+            eprintln!("skipping: embedded PostgreSQL create_database failed: {e}");
+            return None;
+        }
+        let url = server.settings().url(database_name);
+        let pool = connect_and_migrate(&url, "embedded PostgreSQL").await?;
+        return Some(TestDb {
+            database_url: url,
+            pool,
+            _embedded: Some(server),
+        });
+    };
+
+    let pool = connect_and_migrate(&database_url, "DATABASE_URL").await?;
+    Some(TestDb {
+        database_url,
+        pool,
+        _embedded: None,
+    })
+}
+
+fn unique_name(prefix: &str) -> String {
+    format!("{prefix}_{}", generate_token_id())
+}
+
+fn test_now() -> chrono::DateTime<Utc> {
+    Utc::now().trunc_subsecs(6)
+}
+
+async fn create_direct_event(
+    router: &axum::Router,
+    credential: &str,
+    payload: serde_json::Value,
+) -> StatusCode {
+    let body = serde_json::to_vec(&serde_json::json!({ "payload": payload })).unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/events/direct")
+        .header("authorization", format!("Bearer {credential}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    response.status()
+}
+
+#[test]
+fn a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+
+        let orders_bc = BoundedContext {
+            name: ORDERS_BOUNDED_CONTEXT.to_string(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &orders_bc).await.unwrap();
+
+        let orders_mapping = RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: orders_bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &orders_mapping)
+            .await
+            .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url)
+            .bounded_context(ORDERS_BOUNDED_CONTEXT)
+            .event_type::<OrderPlaced>()
+            .event_type::<OrderPaid>()
+            .event_type::<OrderCancelled>()
+            .event_type::<ReminderSent>()
+            .command_type::<CancelOrder>()
+            .command_type::<SendReminder>()
+            .projection::<OrderCancellations>()
+            .projection::<RemindersSent>()
+            .schedule_deadline::<ScheduleOrderCancelDeadline>()
+            .cancel_deadline::<CancelOrderDeadlineOnPaid>()
+            .schedule_deadline::<ScheduleReminderDeadline>()
+            .deadline_poll_interval(std::time::Duration::from_millis(30))
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let order_placed_type = db::get_event_type(&pool, ORDERS_BOUNDED_CONTEXT, "OrderPlaced")
+            .await
+            .unwrap()
+            .unwrap();
+        let order_placed_token = access_control::create_direct_creation_token(
+            &orders_mapping,
+            &order_placed_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &order_placed_token)
+            .await
+            .unwrap();
+        let order_placed_credential =
+            format!("{}.{}", order_placed_token.id, order_placed_token.secret);
+
+        let order_paid_type = db::get_event_type(&pool, ORDERS_BOUNDED_CONTEXT, "OrderPaid")
+            .await
+            .unwrap()
+            .unwrap();
+        let order_paid_token = access_control::create_direct_creation_token(
+            &orders_mapping,
+            &order_paid_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &order_paid_token)
+            .await
+            .unwrap();
+        let order_paid_credential = format!("{}.{}", order_paid_token.id, order_paid_token.secret);
+
+        let router = skilj.rest_router();
+
+        // Three orders, one shared deadline window (`deadline_at`, 300ms
+        // out - several multiples of the 30ms poll interval above, so
+        // every background task gets several ticks' worth of margin on
+        // both sides of it):
+        //
+        //   order-A: paid immediately, before its own deadline - the
+        //     `CancelOrder` deadline must be cancelled and must never
+        //     fire, but the *reminder* deadline (a different schedule,
+        //     sharing the identical `order` tag) must still fire -
+        //     `CancelDeadline::Deadline`'s own scoping at work.
+        //   order-B: never paid - its `CancelOrder` deadline fires
+        //     normally, same as its reminder.
+        //   order-C: `schedule_cancel_deadline: false` - `ScheduleOrderCancelDeadline::schedule`
+        //     itself decides this occurrence doesn't apply, so no
+        //     `CancelOrder` deadline is ever scheduled at all; its
+        //     reminder still fires, unaffected by the sibling schedule's
+        //     own skip.
+        let deadline_at = test_now() + chrono::Duration::milliseconds(300);
+
+        for (order_id, schedule_cancel_deadline) in
+            [("order-A", true), ("order-B", true), ("order-C", false)]
+        {
+            let status = create_direct_event(
+                &router,
+                &order_placed_credential,
+                serde_json::json!({
+                    "order_id": order_id,
+                    "deadline_at": deadline_at,
+                    "schedule_cancel_deadline": schedule_cancel_deadline,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let status = create_direct_event(
+            &router,
+            &order_paid_credential,
+            serde_json::json!({ "order_id": "order-A" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Wait for every reminder to have fired - the longest-running
+        // path here (it never gets cancelled for any of the three
+        // orders), so once it's settled, `deadline_at` plus many poll
+        // intervals' worth of margin has also long since passed for the
+        // `CancelOrder` deadlines, making the negative assertions below
+        // (order-A and order-C must never appear as cancelled)
+        // meaningful rather than merely "didn't wait long enough."
+        let mut reminders: Vec<String> = Vec::new();
+        for _ in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let state =
+                db::get_projection_state(&pool, ORDERS_BOUNDED_CONTEXT, "RemindersSent", "")
+                    .await
+                    .unwrap();
+            if let Some(state) = state {
+                let parsed: RemindersSentState = serde_json::from_str(&state).unwrap();
+                reminders = parsed.reminded_order_ids;
+                if reminders.len() >= 3 {
+                    break;
+                }
+            }
+        }
+        reminders.sort();
+        assert_eq!(
+            reminders,
+            vec![
+                "order-A".to_string(),
+                "order-B".to_string(),
+                "order-C".to_string()
+            ],
+            "every order's own reminder deadline must fire, regardless of what happened to its \
+             (differently-scheduled) CancelOrder deadline"
+        );
+
+        let cancellations_state =
+            db::get_projection_state(&pool, ORDERS_BOUNDED_CONTEXT, "OrderCancellations", "")
+                .await
+                .unwrap()
+                .unwrap();
+        let cancellations: OrderCancellationsState =
+            serde_json::from_str(&cancellations_state).unwrap();
+        assert_eq!(
+            cancellations.cancelled_order_ids,
+            vec!["order-B".to_string()],
+            "order-A must have been cancelled by its own OrderPaid event before it came due, \
+             and order-C must never have been scheduled at all - only order-B's CancelOrder \
+             deadline should ever have fired"
+        );
+    });
+}

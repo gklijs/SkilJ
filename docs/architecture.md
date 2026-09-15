@@ -5744,6 +5744,16 @@ integration tests) passes clean with no `protoc` on `PATH` and no
 was a welcome upstream fix landing four days before this release, not a
 signal the API has stopped evolving.
 
+**Relationship to native deadlines ([§46](#native-deadlines), Codeberg issue #20)**: `skilj-temporal` stays the
+right answer for a genuine multi-step process - retries, compensation,
+state that outlives any one command, real waits on an external system.
+[§46](#native-deadlines)'s `ScheduleDeadline`/`CancelDeadline` is the lightweight native option for
+the much more common case this pairing was always overkill for: "fire
+one command if nothing else happens by a given time." The two live side
+by side, not one superseding the other - the same "no multi-step state,
+no compensation, one hop" scoping decision [§36](#cross-context-route)'s `CrossContextRoute` already
+made for its own, narrower slice of what would otherwise need Temporal.
+
 <a id="connection-pool-sizing"></a>
 ## 35. Configurable connection pool sizing
 
@@ -7078,3 +7088,197 @@ at once they've added a `CommandType`/`Projection` - is a real, wanted
 follow-up (the skill package now mentions `skilj-test-fixture` as a
 pointer), not fully built out into a worked example inside the skill
 itself yet.
+
+<a id="native-deadlines"></a>
+## 46. A native one-shot, per-entity deadline/timer (Codeberg issue #20)
+
+Raised comparing skilj against Axon Framework's `DeadlineManager` -
+schedule a one-off timer tied to a *specific* entity/tag ("cancel this
+order if not paid within 30 minutes"), cancellable if the awaited thing
+happens first. The existing scheduler (`rule CreateSystemEvent`/`rule
+SkipMissedOccurrences`, [§22](#background-polling-and-startup-scaling)) is cron-based and global: it fires the
+same system event on a recurring schedule for a whole `EventType`, not a
+one-shot timer scoped to one entity's tags. Today, "cancel this if
+nothing happens within N minutes" either had to be hand-built on top of
+that recurring scheduler, or meant reaching for `skilj-temporal` ([§34](#skilj-temporal-plan)) -
+a much heavier dependency for what's usually a single deferred command.
+
+**The trigger-model question, resolved with the user before building**:
+Axon's `DeadlineManager` is called imperatively from inside a command
+handler. skilj's `decide()` is a pure function whose only output is
+`CommandDecision` (`Accepted { events }`/`Rejected`) - no side-effect
+channel exists there or should be added. Two shapes were on the table:
+an event-reactive Rust-only plugin trait (mirroring [§36](#cross-context-route)'s
+`CrossContextRoute`: `decide()` stays pure, a background poller does the
+actual write, no new wire surface) versus a wire-exposed `scheduleDeadline`/
+`cancelDeadline` GraphQL mutation/REST endpoint any authenticated caller
+invokes directly (closer to the issue's own literal `ScheduleDeadline {
+fire_at, tags, ... }` notation, but a materially bigger lift: a new spec
+entity, its own access-control/owner-tag design, a new way for a caller
+to flood the `deadlines` table). The user picked the event-reactive trait
+- no new spec entity, reuses every piece of already-proven `CrossContextRoute`
+machinery, and keeps "what happens next" answerable purely from committed
+history, the same register [§36](#cross-context-route) already settled for cross-context
+routing.
+
+**Cancellation, also resolved with the user**: by tag, not by id. The
+cancelling event (`OrderPaid`, say) only ever carries its own payload and
+tags - never an opaque id a separate `ScheduleDeadline` reactor generated
+deep inside its own row insert - so cancel-by-tag is what actually lets
+"whichever happens first" work without threading an id back out through
+some side channel the domain model has no natural place for.
+
+### Design
+
+Two new plugin traits alongside `CrossContextRoute` in
+`skilj_core::plugin`:
+
+```rust
+pub struct DeadlineSpec<P> {
+    pub fire_at: DateTime<Utc>,
+    pub tags: Vec<Tag>,   // scopes this deadline for a later cancel-by-tag lookup
+    pub payload: P,       // Target command payload, submitted when it fires
+}
+
+pub trait ScheduleDeadline {
+    type Source: EventType;
+    type Target: CommandType;
+    const NAME: &'static str;
+    const START_FROM: DeadlinePollStartFrom = DeadlinePollStartFrom::Beginning;
+    fn schedule(source_payload: &<Self::Source as EventType>::Payload)
+        -> Option<DeadlineSpec<<Self::Target as CommandType>::Payload>>;
+}
+
+pub trait CancelDeadline {
+    type Source: EventType;
+    type Deadline: ScheduleDeadline;   // which schedule's own pending rows this targets
+    const NAME: &'static str;
+    const START_FROM: DeadlinePollStartFrom = DeadlinePollStartFrom::Beginning;
+    fn cancel_tags(source_payload: &<Self::Source as EventType>::Payload) -> Option<Vec<Tag>>;
+}
+```
+
+`DeadlinePollStartFrom` is a small new enum, identical in shape to
+`CrossContextRouteStartFrom` (`Beginning`/`Latest`/`AtSequence(i64)`/
+`AtTime(i64)`) but its own type rather than a reuse - the same reasoning
+`CrossContextRoute` itself already gives for not reusing
+`EventReadStartPosition`: no spec entity to hang a shared type off, and a
+name that says what it's actually for rather than one whose own doc
+comment is written entirely in terms of routes. `CancelDeadline::Deadline`
+is what stops two unrelated schedules that happen to reuse a tag key
+(e.g. two different features both tagging `order:123`) from
+cross-cancelling each other's rows - cancellation is always scoped to one
+named schedule's own pending rows, never "every pending row with this
+tag."
+
+Type-erased dispatchers (`ScheduleDeadlineDispatcher`/`CancelDeadlineDispatcher`,
+each with an `*Info` struct carrying the registration's static shape)
+mirror `CrossContextRouteDispatcher`/`CrossContextRouteInfo` exactly -
+`skilj/src/lib.rs`'s `ScheduleDeadlineDispatcherImpl`/`CancelDeadlineDispatcherImpl`
+are thin registry wrappers, the same shape `CrossContextRouteDispatcherImpl`
+already is.
+
+**Storage** - one new per-bounded-context table, `deadlines`, provisioned
+via `db::ensure_deadlines_table` (the `CREATE TABLE IF NOT EXISTS` idiom
+`ensure_idempotency_keys_table`/`ensure_cross_context_route_cursors_table`
+already use - called from both `provision_bounded_context_schema`, a
+brand-new bounded context, and the startup warm-up loop in
+`skilj/src/lib.rs`, an already-provisioned one). `id` is **deterministic**
+- `"{schedule_name}:{source_event_sequence}"` - inserted with `ON
+CONFLICT (id) DO NOTHING`, the same "redelivery of the same occurrence is
+a safe no-op" property `CrossContextRoute`'s idempotency key already
+gives its own command submissions, applied here to the row insert
+itself. A second, shared `deadline_cursors` table (one row per registered
+`ScheduleDeadline::NAME`/`CancelDeadline::NAME`) holds the durable
+per-reactor read position - kept separate from `cross_context_route_cursors`
+rather than piggybacked on it, since these are a genuinely different
+reactor family even though the cursor shape (`{owner} -> last_dispatched_sequence`)
+is identical. `tags` is GIN-indexed the same way [§19](#optional-snapshotting-matching-events) Problem 1 already
+indexes the `events` table's own `tags` column, backing `catch_up_cancel_deadline`'s
+tag-containment lookup.
+
+**Three background pollers**, spawned from `SkiljBuilder::build()` the
+same `tokio::spawn` + `for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, ...)`
+shape every other background task here already uses, all three sharing
+one `deadline_poll_interval` builder knob (default 500ms, matching every
+sibling default):
+
+1. `db::catch_up_schedule_deadline` - per registered `ScheduleDeadline`,
+   walks `Source` events after its own cursor; `schedule()` returning
+   `Some(spec)` inserts a `pending` row, `None` just advances the cursor
+   - identical control flow to `catch_up_cross_context_route`.
+2. `db::catch_up_cancel_deadline` - per registered `CancelDeadline`,
+   walks its own `Source` events after its own cursor; `cancel_tags()`
+   returning `Some(tags)` runs a tag-containment `UPDATE ... SET status =
+   'cancelled'` scoped to `Self::Deadline`'s own `schedule_name` -
+   cancelling zero, one, or several matching pending rows is all a
+   legitimate outcome, the same register `route() -> None` already is.
+3. `db::fire_due_deadlines` - **not** tied to any one registered type,
+   unlike the two above: it scans every bounded context's own `deadlines`
+   table directly (`WHERE status = 'pending' AND fire_at <= now()`), so a
+   row fires regardless of whether the `ScheduleDeadline` that created it
+   is still registered in this process - the same "every instance does
+   the same redundant, idempotent work" register [§22](#background-polling-and-startup-scaling) already
+   established. Deliberately no `FOR UPDATE SKIP LOCKED` row-claiming
+   here either: two instances racing to fire the same row both submit
+   under the identical idempotency key (below), so the second is a
+   harmless `Deduplicated`, and both marking the row `fired` afterward is
+   a harmless no-op the second time (`WHERE status = 'pending'` guards
+   the update). A due row whose `target_command_type` isn't registered at
+   all is marked `fired` without ever submitting - logged, not retried
+   forever, the identical stance `catch_up_cross_context_route` already
+   takes for its own "target `CommandType` isn't registered" case. A
+   `Target` command that *is* submitted but gets rejected by its own
+   `decide()` is marked `fired` too - a legitimate business outcome
+   (deciding whether a deadline is still relevant happens at fire time,
+   against current state, exactly the reasoning `CrossContextRoute::Target`
+   already gives for firing a command rather than a raw event), not a
+   reason to retry.
+
+Firing goes through the existing `db::decide_and_submit_command` ([§36](#cross-context-route)),
+idempotency-keyed with a new sibling reserved prefix,
+`RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX` (`"skilj-deadline:"`,
+`event_store::reject_reserved_idempotency_key` extended to check both
+prefixes) - the exact §36/§37 pre-plant-vulnerability fix, applied
+proactively here rather than found after the fact. Not load-bearing
+either, for the identical reason `RESERVED_IDEMPOTENCY_KEY_PREFIX`'s own
+doc comment gives: this call's own `client_id` (`"deadline"`) is
+server-derived, never caller-suppliable, so `idempotency_keys`'
+`client_id`-scoping ([§37](#idempotency-keys-client-id-scoping)) already puts every key it writes in a partition
+no external caller's own submission ever lands in. Kept anyway as the
+same harmless defense-in-depth register every other internal caller here
+now gets.
+
+**No spec entity** - like `Snapshot`/`CrossContextRoute`, this is a
+Rust-only construct layered on top of DCB, not a change to DCB's own
+model or the Allium spec.
+
+### Verified
+
+`skilj/tests/deadlines.rs`, a real end-to-end test against Postgres: one
+bounded context, three orders sharing one `ScheduleOrderCancelDeadline`
+(`OrderPlaced -> CancelOrder`) and a second, independent
+`ScheduleReminderDeadline` (`OrderPlaced -> SendReminder`) tagged
+identically by order id. Order A is paid before its own deadline - its
+`CancelOrder` deadline is cancelled by `CancelOrderDeadlineOnPaid` and
+never fires, while its *reminder* deadline (a different schedule sharing
+the same tag) still fires, proving `CancelDeadline::Deadline`'s own
+scoping. Order B is never paid - its `CancelOrder` deadline fires
+normally. Order C has `schedule_cancel_deadline: false` - `ScheduleOrderCancelDeadline::schedule`
+itself decides the occurrence doesn't apply, so no `CancelOrder` deadline
+is ever scheduled at all, while its own reminder still fires unaffected.
+Final projection state proves all three combinations at once: reminders
+fired for A/B/C, cancellations only for B. `cargo build/clippy -D
+warnings/test --workspace` and `cargo fmt --check` clean.
+
+**Not covered by a dedicated test**: a real crash/redelivery simulation
+proving `ON CONFLICT (id) DO NOTHING` makes a redelivered schedule
+catch-up tick a safe no-op. That property is structural, not incidental
+- the identical mechanism (a deterministic id/idempotency key,
+`Deduplicated` handled as a warning, not an error) `CrossContextRoute`
+already relies on and which [§36](#cross-context-route)/[§37](#idempotency-keys-client-id-scoping) reasoned about at length - and
+`cross_context_route.rs`'s own three tests don't carry a dedicated
+crash-simulation test for it either, for the same reason this pass
+doesn't: the black-box, full-`Skilj` harness every test file here uses
+has no fault-injection hook to force a real redelivery, only ever
+exercising the ordinary, non-redelivered path.

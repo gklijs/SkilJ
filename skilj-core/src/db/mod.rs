@@ -470,6 +470,26 @@ async fn provision_bounded_context_schema(
     ensure_idempotency_keys_table(&mut **tx, bounded_context).await?;
     ensure_cross_context_route_cursors_table(&mut **tx, bounded_context).await?;
     ensure_external_message_cursors_table(&mut **tx, bounded_context).await?;
+    ensure_deadline_cursors_table(&mut **tx, bounded_context).await?;
+    // Codeberg issue #20 - `ensure_deadlines_table`'s own two-index shape
+    // run directly against this transaction rather than calling that
+    // function (it takes `&Pool`, not a transaction - see its own doc
+    // comment), the identical split `private_field_grants_table_ddl`'s
+    // own two call sites already use.
+    sqlx::query(sqlx::AssertSqlSafe(deadlines_table_ddl(&schema)))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \
+         WHERE status = 'pending'"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX IF NOT EXISTS deadlines_tags_gin ON {schema}.deadlines USING GIN (tags)"
+    )))
+    .execute(&mut **tx)
+    .await?;
     // `EncryptionKey` is a real, independently-lived entity (its own
     // status/lifecycle - see `entity EncryptionKey`), so it's referenced
     // here, not JSONB-embedded like `tag_mappings`/`sensitive_fields` -
@@ -1267,6 +1287,106 @@ pub async fn ensure_cross_context_route_cursors_table<'e>(
         )"
     )))
     .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Codeberg issue #20 - the durable cursor table `catch_up_schedule_deadline`/
+/// `catch_up_cancel_deadline` share, one row per registered
+/// `ScheduleDeadline::NAME`/`CancelDeadline::NAME` (a schedule and its own
+/// cancel counterpart advance independently, even though they're paired -
+/// see `plugin::CancelDeadline::Deadline`'s own doc comment). Deliberately
+/// its own table rather than piggybacked on `cross_context_route_cursors`
+/// above - a genuinely different reactor family, even though the cursor
+/// shape (`{owner} -> last_dispatched_sequence`) is identical. Same
+/// `impl PgExecutor`/`CREATE TABLE IF NOT EXISTS` treatment as every
+/// sibling `ensure_*_table` function here - see
+/// `ensure_idempotency_keys_table`'s own doc comment for the full
+/// "brand-new bounded context vs. patching an already-provisioned one"
+/// story.
+pub async fn ensure_deadline_cursors_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.deadline_cursors (
+            cursor_owner TEXT PRIMARY KEY,
+            last_dispatched_sequence BIGINT NOT NULL DEFAULT -1,
+            updated_at TIMESTAMPTZ NOT NULL
+        )"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Codeberg issue #20's own row store - one row per deadline a
+/// `ScheduleDeadline` has ever scheduled, living in
+/// `ScheduleDeadline::Source::BOUNDED_CONTEXT`'s own schema (mirroring
+/// `cross_context_route_cursors`' placement choice: the reactor's own
+/// *source* side owns the durable state, regardless of where its
+/// *target* eventually lands). `id` is deterministic
+/// (`"{schedule_name}:{source_event_sequence}"`, see `ScheduleDeadline::NAME`'s
+/// own doc comment) so a redelivered catch-up tick's `INSERT ... ON
+/// CONFLICT (id) DO NOTHING` is always a safe no-op, never a duplicate
+/// row. `tags` backs `catch_up_cancel_deadline`'s own tag-containment
+/// lookup, indexed the same GIN way `docs/architecture.md §19 Problem 1`
+/// already indexes the `events` table's own `tags` column. `status`
+/// starts `'pending'`, and only ever moves to `'fired'` (`db::fire_due_deadlines`)
+/// or `'cancelled'` (`catch_up_cancel_deadline`) - terminal either way,
+/// never reset.
+///
+/// The DDL itself is shared between `provision_bounded_context_schema`
+/// (a brand-new context, run against its own open transaction) and
+/// `ensure_deadlines_table` below (an existing one, run against `&Pool`) -
+/// one DDL string, not two copies to keep in sync, the identical split
+/// `private_field_grants_table_ddl` already uses for the same reason.
+fn deadlines_table_ddl(schema: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.deadlines (
+            id TEXT PRIMARY KEY,
+            schedule_name TEXT NOT NULL,
+            fire_at TIMESTAMPTZ NOT NULL,
+            tags JSONB NOT NULL,
+            correlation_id TEXT,
+            target_bounded_context TEXT NOT NULL,
+            target_command_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            resolved_at TIMESTAMPTZ
+        )"
+    )
+}
+
+/// `pool: &Pool`, not a generic `impl PgExecutor` - this needs three
+/// statements (the table plus two indexes), and unlike every
+/// single-statement sibling `ensure_*_table` function here, a generic
+/// executor can't be reused across more than one `.execute()` call
+/// without already being `Copy` the way `&Pool` is. Same split
+/// `ensure_private_field_grants_table` already uses for the identical
+/// reason: `provision_bounded_context_schema` below runs the equivalent
+/// statements directly against its own `&mut **tx` instead of calling
+/// this.
+pub async fn ensure_deadlines_table(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(deadlines_table_ddl(&schema)))
+        .execute(pool)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \
+         WHERE status = 'pending'"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX IF NOT EXISTS deadlines_tags_gin ON {schema}.deadlines USING GIN (tags)"
+    )))
+    .execute(pool)
     .await?;
     Ok(())
 }
@@ -6224,6 +6344,441 @@ pub async fn catch_up_cross_context_route(
         )
         .await?;
     }
+    Ok(())
+}
+
+// --- Codeberg issue #20: native one-shot, per-entity deadlines ---
+//
+// `catch_up_schedule_deadline`/`catch_up_cancel_deadline` are
+// `catch_up_cross_context_route`'s own shape, applied to
+// `ScheduleDeadline`/`CancelDeadline` instead of `CrossContextRoute` -
+// walk one registered reactor's own `Source` event stream after its
+// cursor, react to every occurrence, advance the cursor past it either
+// way. `fire_due_deadlines` has no `CrossContextRoute` analogue: it
+// isn't tied to any one registered type, it scans the `deadlines` table
+// itself by `fire_at`, the same register `scheduler_tick_for_bounded_context`'s
+// own due-occurrence scan already is.
+
+/// `deadline_cursors`' own read - `get_cross_context_route_cursor`'s
+/// analogue, `cursor_owner` a `ScheduleDeadline::NAME`/`CancelDeadline::NAME`.
+async fn get_deadline_cursor(
+    pool: &Pool,
+    bounded_context: &str,
+    cursor_owner: &str,
+) -> crate::error::Result<Option<i64>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT last_dispatched_sequence FROM {schema}.deadline_cursors WHERE cursor_owner = $1"
+    )))
+    .bind(cursor_owner)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(seq,)| seq))
+}
+
+async fn update_deadline_cursor(
+    pool: &Pool,
+    bounded_context: &str,
+    cursor_owner: &str,
+    sequence: i64,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.deadline_cursors \
+         (cursor_owner, last_dispatched_sequence, updated_at) VALUES ($1, $2, $3) \
+         ON CONFLICT (cursor_owner) DO UPDATE SET \
+         last_dispatched_sequence = EXCLUDED.last_dispatched_sequence, \
+         updated_at = EXCLUDED.updated_at"
+    )))
+    .bind(cursor_owner)
+    .bind(sequence)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One registered `ScheduleDeadline`'s own catch-up tick - see this
+/// section's own header comment, and `catch_up_cross_context_route`'s
+/// doc comment for the full "first-ever tick seeding" reasoning
+/// `start_from != Beginning` shares with it verbatim.
+pub async fn catch_up_schedule_deadline(
+    pool: &Pool,
+    schedule: &crate::plugin::ScheduleDeadlineInfo,
+    dispatcher: &dyn crate::plugin::ScheduleDeadlineDispatcher,
+    event_cache: &crate::event_cache::EventCache,
+) -> crate::error::Result<()> {
+    let existing_cursor =
+        get_deadline_cursor(pool, schedule.source_bounded_context, schedule.name).await?;
+    let cursor = existing_cursor.unwrap_or(-1);
+    let events = list_events_cached(
+        pool,
+        event_cache,
+        schedule.source_bounded_context,
+        schedule.source_event_type,
+        cursor,
+    )
+    .await?;
+
+    if existing_cursor.is_none()
+        && schedule.start_from != crate::plugin::DeadlinePollStartFrom::Beginning
+    {
+        let seed = match schedule.start_from {
+            crate::plugin::DeadlinePollStartFrom::Beginning => {
+                unreachable!("excluded by this branch's own condition above")
+            }
+            crate::plugin::DeadlinePollStartFrom::Latest => {
+                events.iter().map(|e| e.sequence).max().unwrap_or(-1)
+            }
+            crate::plugin::DeadlinePollStartFrom::AtSequence(n) => n,
+            crate::plugin::DeadlinePollStartFrom::AtTime(unix_secs) => {
+                let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
+                events
+                    .iter()
+                    .filter(|e| e.metadata.created_at <= threshold)
+                    .map(|e| e.sequence)
+                    .max()
+                    .unwrap_or(-1)
+            }
+        };
+        update_deadline_cursor(
+            pool,
+            schedule.source_bounded_context,
+            schedule.name,
+            seed,
+            Utc::now(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let schema = schema_ident(schedule.source_bounded_context);
+    for event in &events {
+        match dispatcher.schedule(schedule.name, &event.payload) {
+            None => {
+                // Defensive only - `schedule.name` came from this same
+                // dispatcher's own `schedules()` list.
+                tracing::warn!(
+                    sequence = event.sequence,
+                    "schedule deadline not found in its own dispatcher - skipping"
+                );
+            }
+            Some(Err(e)) => {
+                tracing::warn!(
+                    sequence = event.sequence,
+                    error = %e,
+                    "schedule deadline: source payload did not deserialize - skipping"
+                );
+            }
+            Some(Ok(None)) => {
+                // `schedule()` itself decided this occurrence doesn't
+                // apply - a real, expected outcome, not an error.
+            }
+            Some(Ok(Some(spec))) => {
+                // Deterministic id - see `ensure_deadlines_table`'s own
+                // doc comment for why `ON CONFLICT (id) DO NOTHING` makes
+                // a redelivered tick a safe no-op.
+                let id = format!("{}:{}", schedule.name, event.sequence);
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO {schema}.deadlines \
+                     (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+                      target_command_type, payload, status, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9) \
+                     ON CONFLICT (id) DO NOTHING"
+                )))
+                .bind(&id)
+                .bind(schedule.name)
+                .bind(spec.fire_at)
+                .bind(Json(&spec.tags))
+                .bind(event.metadata.correlation_id.as_deref())
+                .bind(schedule.target_bounded_context)
+                .bind(schedule.target_command_type)
+                .bind(&spec.payload_json)
+                .bind(Utc::now())
+                .execute(pool)
+                .await?;
+            }
+        }
+        update_deadline_cursor(
+            pool,
+            schedule.source_bounded_context,
+            schedule.name,
+            event.sequence,
+            Utc::now(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// One registered `CancelDeadline`'s own catch-up tick - same shape as
+/// `catch_up_schedule_deadline` just above, reacting by cancelling
+/// pending rows instead of inserting one. Writes into
+/// `cancel.deadline_schedule_bounded_context`'s own `deadlines` table,
+/// which can differ from `cancel.source_bounded_context` - see
+/// `CancelDeadlineInfo::deadline_schedule_bounded_context`'s own doc
+/// comment.
+pub async fn catch_up_cancel_deadline(
+    pool: &Pool,
+    cancel: &crate::plugin::CancelDeadlineInfo,
+    dispatcher: &dyn crate::plugin::CancelDeadlineDispatcher,
+    event_cache: &crate::event_cache::EventCache,
+) -> crate::error::Result<()> {
+    let existing_cursor =
+        get_deadline_cursor(pool, cancel.source_bounded_context, cancel.name).await?;
+    let cursor = existing_cursor.unwrap_or(-1);
+    let events = list_events_cached(
+        pool,
+        event_cache,
+        cancel.source_bounded_context,
+        cancel.source_event_type,
+        cursor,
+    )
+    .await?;
+
+    if existing_cursor.is_none()
+        && cancel.start_from != crate::plugin::DeadlinePollStartFrom::Beginning
+    {
+        let seed = match cancel.start_from {
+            crate::plugin::DeadlinePollStartFrom::Beginning => {
+                unreachable!("excluded by this branch's own condition above")
+            }
+            crate::plugin::DeadlinePollStartFrom::Latest => {
+                events.iter().map(|e| e.sequence).max().unwrap_or(-1)
+            }
+            crate::plugin::DeadlinePollStartFrom::AtSequence(n) => n,
+            crate::plugin::DeadlinePollStartFrom::AtTime(unix_secs) => {
+                let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
+                events
+                    .iter()
+                    .filter(|e| e.metadata.created_at <= threshold)
+                    .map(|e| e.sequence)
+                    .max()
+                    .unwrap_or(-1)
+            }
+        };
+        update_deadline_cursor(
+            pool,
+            cancel.source_bounded_context,
+            cancel.name,
+            seed,
+            Utc::now(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let target_schema = schema_ident(cancel.deadline_schedule_bounded_context);
+    for event in &events {
+        match dispatcher.cancel_tags(cancel.name, &event.payload) {
+            None => {
+                tracing::warn!(
+                    sequence = event.sequence,
+                    "cancel deadline not found in its own dispatcher - skipping"
+                );
+            }
+            Some(Err(e)) => {
+                tracing::warn!(
+                    sequence = event.sequence,
+                    error = %e,
+                    "cancel deadline: source payload did not deserialize - skipping"
+                );
+            }
+            Some(Ok(None)) => {
+                // `cancel_tags()` itself decided this occurrence doesn't
+                // apply.
+            }
+            Some(Ok(Some(tags))) if tags.is_empty() => {
+                // An empty tag list matches nothing - the identical
+                // treatment `list_events_for_bounded_context_matching_tags`'s
+                // own early return already gives, applied here rather
+                // than running a `WHERE` clause with no tag condition at
+                // all (which would match every still-pending row this
+                // schedule owns, not none).
+            }
+            Some(Ok(Some(tags))) => {
+                // Tag-containment, one `tags @> $n::jsonb` clause per
+                // wanted tag, ORed together - the identical shape
+                // `list_events_for_bounded_context_matching_tags` already
+                // uses against the `events` table's own `tags` column
+                // (docs/architecture.md §19 Problem 1), applied here to
+                // `deadlines.tags` instead. Cancels every still-`pending`
+                // row this schedule owns that shares at least one of
+                // these tags - zero, one, or several rows, all a
+                // legitimate outcome (see `CancelDeadline::cancel_tags`'s
+                // own doc comment).
+                let tag_literals: Vec<String> = tags
+                    .iter()
+                    .map(|t| {
+                        serde_json::to_string(std::slice::from_ref(t))
+                            .expect("Tag serialisation is infallible")
+                    })
+                    .collect();
+                let tag_clause = (0..tag_literals.len())
+                    .map(|i| format!("tags @> ${}::jsonb", i + 3))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {target_schema}.deadlines SET status = 'cancelled', resolved_at = $1 \
+                     WHERE schedule_name = $2 AND status = 'pending' AND ({tag_clause})"
+                )))
+                .bind(Utc::now())
+                .bind(cancel.deadline_schedule_name);
+                for literal in tag_literals {
+                    query = query.bind(literal);
+                }
+                query.execute(pool).await?;
+            }
+        }
+        update_deadline_cursor(
+            pool,
+            cancel.source_bounded_context,
+            cancel.name,
+            event.sequence,
+            Utc::now(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// `fire_due_deadlines`'s own per-tick cap - the identical "recent
+/// window, not a hard limit on correctness" register
+/// `scheduler_tick`'s own `MAX_OCCURRENCES_PER_TICK` already is: a
+/// backlog bigger than this just takes more ticks to drain, each one
+/// picking up wherever the last left off (`fire_at` order, never
+/// re-offering an already-`fired`/`cancelled` row).
+const MAX_DUE_DEADLINES_PER_TICK: i64 = 1000;
+
+#[derive(sqlx::FromRow)]
+struct DueDeadlineRow {
+    id: String,
+    correlation_id: Option<String>,
+    target_bounded_context: String,
+    target_command_type: String,
+    payload: String,
+}
+
+/// One bounded context's own share of the firing scan - **not** tied to
+/// any one registered `ScheduleDeadline`, unlike the two catch-up
+/// functions above: it scans `{schema}.deadlines` itself, so a row fires
+/// regardless of whether the `ScheduleDeadline` that created it is still
+/// registered in this process (the same "every instance does the same
+/// redundant, idempotent work" register [docs/architecture.md §22](../../../docs/architecture.md#background-polling-and-startup-scaling)
+/// already established - deliberately no `FOR UPDATE SKIP LOCKED` row
+/// claiming here either, for the identical reason: two instances racing
+/// to fire the same row both submit under the identical idempotency key,
+/// so the second is a harmless `Deduplicated`, and both marking the row
+/// `fired` afterward is a harmless no-op the second time
+/// (`mark_deadline_resolved`'s own `WHERE status = 'pending'` guard).
+///
+/// A due row whose own `target_command_type` isn't registered at all is
+/// marked `fired` without ever calling `decide_and_submit_command` -
+/// logged as a warning, not retried forever, the identical stance
+/// `catch_up_cross_context_route` already takes for its own "target
+/// `CommandType` isn't registered" case. A `Target` command that *is*
+/// submitted but gets rejected by its own `decide()` is marked `fired`
+/// too - a legitimate business outcome (`ScheduleDeadline`'s own doc
+/// comment), not a reason to retry.
+#[allow(clippy::too_many_arguments)]
+pub async fn fire_due_deadlines(
+    pool: &Pool,
+    command_dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    now: DateTime<Utc>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, correlation_id, target_bounded_context, target_command_type, payload \
+         FROM {schema}.deadlines WHERE status = 'pending' AND fire_at <= $1 \
+         ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}"
+    )))
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let Some(target_command_type) =
+            get_command_type(pool, &row.target_bounded_context, &row.target_command_type).await?
+        else {
+            tracing::warn!(
+                deadline_id = %row.id,
+                target_bounded_context = %row.target_bounded_context,
+                target_command_type = %row.target_command_type,
+                "deadline's own target CommandType isn't registered - marking fired without submitting"
+            );
+            mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
+            continue;
+        };
+        // Prefixed with `RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX` - see
+        // that constant's own doc comment for why this is
+        // defense-in-depth, not load-bearing, now that `idempotency_keys`
+        // is `client_id`-scoped and this call's own `client_id` below
+        // ("deadline") is never externally suppliable.
+        let idempotency_key = format!(
+            "{}{}",
+            crate::event_store::RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX,
+            row.id
+        );
+        // Codeberg issue #18: carries the scheduling event's own
+        // correlation_id forward (stored on the row at schedule time) -
+        // no `causation_id` of its own, since there's no `Event` this
+        // firing directly descends from the way a `CrossContextRoute`'s
+        // own submission descends from the `Source` event that triggered
+        // it (`event_causation_id`); a fired deadline's real cause is a
+        // clock, not a prior commit.
+        let outcome = decide_and_submit_command(
+            pool,
+            command_dispatcher,
+            projection_dispatcher,
+            snapshot_dispatcher,
+            broadcaster,
+            event_cache,
+            &target_command_type,
+            &row.payload,
+            "deadline",
+            row.correlation_id.as_deref(),
+            None,
+            encryption_master_key,
+            now,
+            Some(&idempotency_key),
+        )
+        .await?;
+        if matches!(outcome, SubmitCommandOutcome::Deduplicated { .. }) {
+            tracing::warn!(
+                deadline_id = %row.id,
+                "deadline's own idempotency key was already present - expected after a \
+                 crash/restart between a prior fire attempt and marking it resolved; \
+                 unexpected otherwise, since the key space is reserved"
+            );
+        }
+        mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
+    }
+    Ok(())
+}
+
+async fn mark_deadline_resolved(
+    pool: &Pool,
+    schema: &str,
+    id: &str,
+    status: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.deadlines SET status = $1, resolved_at = $2 \
+         WHERE id = $3 AND status = 'pending'"
+    )))
+    .bind(status)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

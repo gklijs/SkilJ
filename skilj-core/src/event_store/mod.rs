@@ -1155,6 +1155,24 @@ pub fn valid_payload(schema: &str, payload: &str) -> bool {
 /// scenario the reservation itself is meant to make unreachable).
 pub const RESERVED_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-cross-context-route:";
 
+/// Codeberg issue #20's own sibling reservation - the identical
+/// defense-in-depth `RESERVED_IDEMPOTENCY_KEY_PREFIX` gives
+/// `CrossContextRoute`, extended proactively to `db::fire_due_deadlines`'s
+/// own internally-derived keys (`"{RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX}{deadline_id}"`,
+/// `deadline_id` itself already `"{ScheduleDeadline::NAME}:{source_event_sequence}"`)
+/// rather than after the fact the way [§36](../../../docs/architecture.md#cross-context-route)'s own version was. Not
+/// load-bearing either, for the identical reason `RESERVED_IDEMPOTENCY_KEY_PREFIX`'s
+/// own doc comment gives: `fire_due_deadlines`'s `client_id` ("deadline")
+/// is server-derived, never caller-suppliable, so `idempotency_keys`'
+/// own `client_id`-scoping ([§37](../../../docs/architecture.md#idempotency-keys-client-id-scoping)) already puts every key it writes in a
+/// partition no external caller's own submission ever lands in. A
+/// separate literal from `RESERVED_IDEMPOTENCY_KEY_PREFIX` rather than
+/// sharing one, so each internal caller's own reserved namespace stays
+/// legible on its own (an unexpected `Deduplicated` outcome logs which
+/// namespace it collided with) rather than folding two unrelated
+/// mechanisms under one name.
+pub const RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-deadline:";
+
 /// Checked by `authorise_command_trigger`/`authorise_command_submission`'s
 /// own two REST/GraphQL callers, immediately after either reads a
 /// caller-supplied `idempotencyKey`/`Idempotency-Key` value - never
@@ -1172,7 +1190,10 @@ pub const RESERVED_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-cross-context-route:";
 /// real defense, just a harmless second layer on top of it.
 pub fn reject_reserved_idempotency_key(idempotency_key: Option<&str>) -> crate::error::Result<()> {
     match idempotency_key {
-        Some(key) if key.starts_with(RESERVED_IDEMPOTENCY_KEY_PREFIX) => {
+        Some(key)
+            if key.starts_with(RESERVED_IDEMPOTENCY_KEY_PREFIX)
+                || key.starts_with(RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX) =>
+        {
             Err(Error::ReservedIdempotencyKeyPrefix.into())
         }
         _ => Ok(()),

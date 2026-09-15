@@ -73,8 +73,8 @@ pub use inventory;
 pub use skilj_core::access_control::{IdpConfig, SigningAlgorithm};
 pub use skilj_core::encryption::EncryptionMasterKey;
 pub use skilj_core::plugin::{
-    requires_role, CommandType, CrossContextRoute, EventType, Projection, Snapshot,
-    DEFAULT_BOUNDED_CONTEXT,
+    requires_role, CancelDeadline, CommandType, CrossContextRoute, EventType, Projection,
+    ScheduleDeadline, Snapshot, DEFAULT_BOUNDED_CONTEXT,
 };
 /// See `skilj_macros::auto_register`'s own doc comment - unlike
 /// `requires_role` above, this one is facade-specific (its expansion
@@ -482,6 +482,47 @@ impl skilj_core::plugin::CrossContextRouteDispatcher for CrossContextRouteDispat
     }
 }
 
+/// Codeberg issue #20 - `ScheduleDeadlineDispatcher`'s own implementer,
+/// `CrossContextRouteDispatcherImpl`'s identical shape.
+struct ScheduleDeadlineDispatcherImpl {
+    schedules: Arc<HashMap<String, RegisteredScheduleDeadline>>,
+}
+
+impl skilj_core::plugin::ScheduleDeadlineDispatcher for ScheduleDeadlineDispatcherImpl {
+    fn schedules(&self) -> Vec<skilj_core::plugin::ScheduleDeadlineInfo> {
+        self.schedules.values().map(|s| s.info).collect()
+    }
+
+    fn schedule(
+        &self,
+        schedule_name: &str,
+        source_payload_json: &str,
+    ) -> Option<Result<Option<skilj_core::plugin::ErasedDeadlineSpec>, serde_json::Error>> {
+        let registered = self.schedules.get(schedule_name)?;
+        Some((registered.schedule)(source_payload_json))
+    }
+}
+
+/// Codeberg issue #20 - `CancelDeadlineDispatcher`'s own implementer.
+struct CancelDeadlineDispatcherImpl {
+    cancels: Arc<HashMap<String, RegisteredCancelDeadline>>,
+}
+
+impl skilj_core::plugin::CancelDeadlineDispatcher for CancelDeadlineDispatcherImpl {
+    fn cancels(&self) -> Vec<skilj_core::plugin::CancelDeadlineInfo> {
+        self.cancels.values().map(|c| c.info).collect()
+    }
+
+    fn cancel_tags(
+        &self,
+        cancel_name: &str,
+        source_payload_json: &str,
+    ) -> Option<Result<Option<Vec<skilj_core::shared::Tag>>, serde_json::Error>> {
+        let registered = self.cancels.get(cancel_name)?;
+        Some((registered.cancel_tags)(source_payload_json))
+    }
+}
+
 impl Skilj {
     pub fn builder(database_url: impl Into<String>) -> SkiljBuilder {
         SkiljBuilder {
@@ -494,9 +535,12 @@ impl Skilj {
             projections: HashMap::new(),
             snapshots: HashMap::new(),
             cross_context_routes: HashMap::new(),
+            schedule_deadlines: HashMap::new(),
+            cancel_deadlines: HashMap::new(),
             async_projection_poll_interval: std::time::Duration::from_millis(500),
             snapshot_poll_interval: std::time::Duration::from_millis(500),
             cross_context_route_poll_interval: std::time::Duration::from_millis(500),
+            deadline_poll_interval: std::time::Duration::from_millis(500),
             scheduler_poll_interval: std::time::Duration::from_secs(1),
             projection_query_wait_timeout: std::time::Duration::from_secs(5),
             encryption_master_key: None,
@@ -1003,6 +1047,65 @@ fn registered_cross_context_route<R: CrossContextRoute + 'static>() -> Registere
     }
 }
 
+/// Codeberg issue #20 - one registered `ScheduleDeadline`, the identical
+/// type-erased-closure shape `RegisteredCrossContextRoute` already uses
+/// for the same reason.
+struct RegisteredScheduleDeadline {
+    info: skilj_core::plugin::ScheduleDeadlineInfo,
+    schedule: fn(&str) -> Result<Option<skilj_core::plugin::ErasedDeadlineSpec>, serde_json::Error>,
+}
+
+fn registered_schedule_deadline<S: ScheduleDeadline + 'static>() -> RegisteredScheduleDeadline {
+    RegisteredScheduleDeadline {
+        info: skilj_core::plugin::ScheduleDeadlineInfo {
+            name: S::NAME,
+            source_bounded_context: S::Source::BOUNDED_CONTEXT,
+            source_event_type: S::Source::NAME,
+            target_bounded_context: S::Target::BOUNDED_CONTEXT,
+            target_command_type: S::Target::NAME,
+            start_from: S::START_FROM,
+        },
+        schedule: |payload_json| {
+            let source_payload: <S::Source as EventType>::Payload =
+                serde_json::from_str(payload_json)?;
+            match S::schedule(&source_payload) {
+                None => Ok(None),
+                Some(spec) => Ok(Some(skilj_core::plugin::ErasedDeadlineSpec {
+                    fire_at: spec.fire_at,
+                    tags: spec.tags,
+                    payload_json: serde_json::to_string(&spec.payload)?,
+                })),
+            }
+        },
+    }
+}
+
+/// Codeberg issue #20 - one registered `CancelDeadline`, `RegisteredScheduleDeadline`'s
+/// own counterpart.
+struct RegisteredCancelDeadline {
+    info: skilj_core::plugin::CancelDeadlineInfo,
+    cancel_tags: fn(&str) -> Result<Option<Vec<skilj_core::shared::Tag>>, serde_json::Error>,
+}
+
+fn registered_cancel_deadline<C: CancelDeadline + 'static>() -> RegisteredCancelDeadline {
+    RegisteredCancelDeadline {
+        info: skilj_core::plugin::CancelDeadlineInfo {
+            name: C::NAME,
+            source_bounded_context: C::Source::BOUNDED_CONTEXT,
+            source_event_type: C::Source::NAME,
+            deadline_schedule_name: C::Deadline::NAME,
+            deadline_schedule_bounded_context:
+                <<C::Deadline as ScheduleDeadline>::Source as EventType>::BOUNDED_CONTEXT,
+            start_from: C::START_FROM,
+        },
+        cancel_tags: |payload_json| {
+            let source_payload: <C::Source as EventType>::Payload =
+                serde_json::from_str(payload_json)?;
+            Ok(C::cancel_tags(&source_payload))
+        },
+    }
+}
+
 /// One `#[auto_register]`-tagged `EventType` impl's own contribution -
 /// the type-erased equivalent of one
 /// `.bounded_context(T::BOUNDED_CONTEXT).event_type::<T>()` call, as a
@@ -1044,9 +1147,16 @@ pub struct SkiljBuilder {
     /// contexts, so there is no single one to key it against the way
     /// `.bounded_context(...)` scopes every other registration.
     cross_context_routes: HashMap<String, RegisteredCrossContextRoute>,
+    /// Codeberg issue #20 - keyed by `ScheduleDeadline::NAME`/
+    /// `CancelDeadline::NAME` respectively, the identical "spans two
+    /// bounded contexts, no single one to key against" reasoning
+    /// `cross_context_routes` above already has.
+    schedule_deadlines: HashMap<String, RegisteredScheduleDeadline>,
+    cancel_deadlines: HashMap<String, RegisteredCancelDeadline>,
     async_projection_poll_interval: std::time::Duration,
     snapshot_poll_interval: std::time::Duration,
     cross_context_route_poll_interval: std::time::Duration,
+    deadline_poll_interval: std::time::Duration,
     scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
     encryption_master_key: Option<EncryptionMasterKey>,
@@ -1141,6 +1251,24 @@ impl SkiljBuilder {
         self
     }
 
+    /// Codeberg issue #20 - registers a [`ScheduleDeadline`], the same
+    /// "never scoped by `.bounded_context(...)`, keyed by its own
+    /// `NAME`, last registration wins" treatment `cross_context_route`
+    /// just above already gives its own trait.
+    pub fn schedule_deadline<S: ScheduleDeadline + 'static>(mut self) -> Self {
+        self.schedule_deadlines
+            .insert(S::NAME.to_string(), registered_schedule_deadline::<S>());
+        self
+    }
+
+    /// Codeberg issue #20 - registers a [`CancelDeadline`],
+    /// `schedule_deadline`'s own counterpart.
+    pub fn cancel_deadline<C: CancelDeadline + 'static>(mut self) -> Self {
+        self.cancel_deadlines
+            .insert(C::NAME.to_string(), registered_cancel_deadline::<C>());
+        self
+    }
+
     /// The Role the startup reconciliation loop authenticates as - named
     /// by `external_subject`, the same identifier every other identity
     /// resolution in the spec keys on. Optional: omitting it skips
@@ -1198,6 +1326,19 @@ impl SkiljBuilder {
     /// reason.
     pub fn cross_context_route_poll_interval(mut self, interval: std::time::Duration) -> Self {
         self.cross_context_route_poll_interval = interval;
+        self
+    }
+
+    /// Codeberg issue #20 - how often each of the three background tasks
+    /// backing [`ScheduleDeadline`]/[`CancelDeadline`] runs its own tick
+    /// (catching up every registered schedule, catching up every
+    /// registered cancel reactor, and scanning every bounded context's
+    /// own `deadlines` table for due rows to fire) - one shared knob
+    /// rather than three, the same "one interval per feature, not one per
+    /// internal task" register every other `*_poll_interval` here already
+    /// keeps. Defaults to 500ms, matching every sibling default.
+    pub fn deadline_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.deadline_poll_interval = interval;
         self
     }
 
@@ -1490,6 +1631,14 @@ impl SkiljBuilder {
                     // own doc comment.
                     skilj_core::db::ensure_cross_context_route_cursors_table(pool, &bc.name)
                         .await?;
+                    // Codeberg issue #20: native one-shot, per-entity
+                    // deadlines - same "patched into every bounded
+                    // context, every startup" treatment, for the new
+                    // `deadline_cursors`/`deadlines` tables. See
+                    // `ensure_deadline_cursors_table`/`ensure_deadlines_table`'s
+                    // own doc comments.
+                    skilj_core::db::ensure_deadline_cursors_table(pool, &bc.name).await?;
+                    skilj_core::db::ensure_deadlines_table(pool, &bc.name).await?;
                     // External-message dedup (docs/architecture.md §39,
                     // specs/skilj.allium's own rule CreateExternalEvent) -
                     // same "patched into every bounded context, every
@@ -1810,6 +1959,158 @@ impl SkiljBuilder {
             }
         });
 
+        // Codeberg issue #20: native one-shot, per-entity deadlines -
+        // three more shared background tasks, the same "one task, not
+        // one per registration, detached, runs for the process's
+        // lifetime" treatment the `CrossContextRoute` task just above
+        // already gets. `schedule_deadlines`/`cancel_deadlines` are each
+        // read once here too, for the identical "no runtime registration
+        // surface" reason `routes` is above. All three share one
+        // `deadline_poll_interval` - see that builder method's own doc
+        // comment for why.
+        let deadline_interval = self.deadline_poll_interval;
+
+        let schedule_deadline_pool = skilj.pool.clone();
+        let schedule_deadline_event_cache = skilj.event_cache.clone();
+        let schedule_deadline_dispatcher: Arc<dyn skilj_core::plugin::ScheduleDeadlineDispatcher> =
+            Arc::new(ScheduleDeadlineDispatcherImpl {
+                schedules: Arc::new(self.schedule_deadlines),
+            });
+        let schedules = schedule_deadline_dispatcher.schedules();
+        tokio::spawn(async move {
+            loop {
+                let start = std::time::Instant::now();
+                async {
+                    stream::iter(schedules.clone())
+                        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |schedule| {
+                            let schedule_deadline_pool = schedule_deadline_pool.clone();
+                            let schedule_deadline_dispatcher = schedule_deadline_dispatcher.clone();
+                            let schedule_deadline_event_cache =
+                                schedule_deadline_event_cache.clone();
+                            async move {
+                                if let Err(e) = skilj_core::db::catch_up_schedule_deadline(
+                                    &schedule_deadline_pool,
+                                    &schedule,
+                                    schedule_deadline_dispatcher.as_ref(),
+                                    &schedule_deadline_event_cache,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        schedule = %schedule.name,
+                                        error = %e,
+                                        "schedule deadline catch-up failed"
+                                    );
+                                    BACKGROUND_TASK_ERRORS.add(
+                                        1,
+                                        &[
+                                            KeyValue::new("task", "schedule_deadline"),
+                                            KeyValue::new("reason", "catch_up_failed"),
+                                        ],
+                                    );
+                                }
+                            }
+                        })
+                        .await;
+                }
+                .instrument(tracing::info_span!("schedule_deadline_tick"))
+                .await;
+                BACKGROUND_TASK_TICK_DURATION.record(
+                    start.elapsed().as_secs_f64(),
+                    &[KeyValue::new("task", "schedule_deadline")],
+                );
+                tokio::time::sleep(deadline_interval).await;
+            }
+        });
+
+        let cancel_deadline_pool = skilj.pool.clone();
+        let cancel_deadline_event_cache = skilj.event_cache.clone();
+        let cancel_deadline_dispatcher: Arc<dyn skilj_core::plugin::CancelDeadlineDispatcher> =
+            Arc::new(CancelDeadlineDispatcherImpl {
+                cancels: Arc::new(self.cancel_deadlines),
+            });
+        let cancels = cancel_deadline_dispatcher.cancels();
+        tokio::spawn(async move {
+            loop {
+                let start = std::time::Instant::now();
+                async {
+                    stream::iter(cancels.clone())
+                        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |cancel| {
+                            let cancel_deadline_pool = cancel_deadline_pool.clone();
+                            let cancel_deadline_dispatcher = cancel_deadline_dispatcher.clone();
+                            let cancel_deadline_event_cache = cancel_deadline_event_cache.clone();
+                            async move {
+                                if let Err(e) = skilj_core::db::catch_up_cancel_deadline(
+                                    &cancel_deadline_pool,
+                                    &cancel,
+                                    cancel_deadline_dispatcher.as_ref(),
+                                    &cancel_deadline_event_cache,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        cancel = %cancel.name,
+                                        error = %e,
+                                        "cancel deadline catch-up failed"
+                                    );
+                                    BACKGROUND_TASK_ERRORS.add(
+                                        1,
+                                        &[
+                                            KeyValue::new("task", "cancel_deadline"),
+                                            KeyValue::new("reason", "catch_up_failed"),
+                                        ],
+                                    );
+                                }
+                            }
+                        })
+                        .await;
+                }
+                .instrument(tracing::info_span!("cancel_deadline_tick"))
+                .await;
+                BACKGROUND_TASK_TICK_DURATION.record(
+                    start.elapsed().as_secs_f64(),
+                    &[KeyValue::new("task", "cancel_deadline")],
+                );
+                tokio::time::sleep(deadline_interval).await;
+            }
+        });
+
+        // Unlike the two tasks just above, not tied to a fixed,
+        // read-once-at-startup list - `deadline_fire_tick` fans out over
+        // every *currently active* bounded context each tick instead,
+        // the same register `scheduler_tick` below already uses for its
+        // own due-occurrence scan (`db::fire_due_deadlines`'s own doc
+        // comment explains why).
+        let deadline_fire_pool = skilj.pool.clone();
+        let deadline_fire_command_dispatcher = skilj.command_dispatcher();
+        let deadline_fire_projection_dispatcher = skilj.projection_dispatcher();
+        let deadline_fire_snapshot_dispatcher = skilj.snapshot_dispatcher();
+        let deadline_fire_broadcaster = skilj.event_broadcaster.clone();
+        let deadline_fire_event_cache = skilj.event_cache.clone();
+        let deadline_fire_encryption_master_key = skilj.encryption_master_key.clone();
+        tokio::spawn(async move {
+            loop {
+                let start = std::time::Instant::now();
+                deadline_fire_tick(
+                    &deadline_fire_pool,
+                    deadline_fire_command_dispatcher.as_ref(),
+                    deadline_fire_projection_dispatcher.as_ref(),
+                    deadline_fire_snapshot_dispatcher.as_ref(),
+                    &deadline_fire_broadcaster,
+                    &deadline_fire_event_cache,
+                    deadline_fire_encryption_master_key.as_ref(),
+                    chrono::Utc::now(),
+                )
+                .instrument(tracing::info_span!("deadline_fire_tick"))
+                .await;
+                BACKGROUND_TASK_TICK_DURATION.record(
+                    start.elapsed().as_secs_f64(),
+                    &[KeyValue::new("task", "deadline_fire")],
+                );
+                tokio::time::sleep(deadline_interval).await;
+            }
+        });
+
         // The background scheduler backing `rule CreateSystemEvent`/
         // `rule SkipMissedOccurrences` - one shared task, not one per
         // bounded context or event type, for the same reasons the async
@@ -2019,6 +2320,73 @@ impl SkiljBuilder {
 
         Ok((skilj, report))
     }
+}
+
+/// Codeberg issue #20's own firing half - not tied to any one
+/// registered `ScheduleDeadline` the way `catch_up_schedule_deadline`/
+/// `catch_up_cancel_deadline` each are (see `db::fire_due_deadlines`'s
+/// own doc comment for why), so this fans out over every *currently
+/// active* bounded context each tick instead - the identical shape
+/// `scheduler_tick` below already uses for its own per-bc due-occurrence
+/// scan.
+#[allow(clippy::too_many_arguments)]
+async fn deadline_fire_tick(
+    pool: &Pool,
+    command_dispatcher: &dyn CommandDispatcher,
+    projection_dispatcher: &dyn skilj_core::plugin::ProjectionDispatcher,
+    snapshot_dispatcher: &dyn skilj_core::plugin::SnapshotDispatcher,
+    broadcaster: &EventBroadcaster,
+    event_cache: &EventCache,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
+        Ok(bcs) => bcs,
+        Err(e) => {
+            tracing::warn!(error = %e, "deadline fire tick failed to list bounded contexts");
+            BACKGROUND_TASK_ERRORS.add(
+                1,
+                &[
+                    KeyValue::new("task", "deadline_fire"),
+                    KeyValue::new("reason", "list_bounded_contexts_failed"),
+                ],
+            );
+            return;
+        }
+    };
+    stream::iter(&bounded_contexts)
+        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| async move {
+            if bc.status != skilj_core::event_store::BoundedContextStatus::Active {
+                return;
+            }
+            if let Err(e) = skilj_core::db::fire_due_deadlines(
+                pool,
+                command_dispatcher,
+                projection_dispatcher,
+                snapshot_dispatcher,
+                broadcaster,
+                event_cache,
+                &bc.name,
+                now,
+                encryption_master_key,
+            )
+            .await
+            {
+                tracing::warn!(
+                    bounded_context = %bc.name,
+                    error = %e,
+                    "deadline fire tick failed"
+                );
+                BACKGROUND_TASK_ERRORS.add(
+                    1,
+                    &[
+                        KeyValue::new("task", "deadline_fire"),
+                        KeyValue::new("reason", "fire_due_deadlines_failed"),
+                    ],
+                );
+            }
+        })
+        .await;
 }
 
 /// A generous bound on how many occurrences one event type's own backlog
