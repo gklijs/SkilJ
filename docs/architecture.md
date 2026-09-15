@@ -7571,3 +7571,71 @@ change to DCB's own model or the Allium spec.
   --check` clean across every crate this pass touched
   (`skilj-retry`/`skilj-core`/`skilj-rest`/`skilj-graphql`/`skilj`/
   `skilj-kafka`/`skilj-amqp`/`skilj-nats`/`skilj-tui`).
+
+## 48. Investigation: atomic transactions spanning multiple command types (Codeberg issue #22)
+
+Issue #22 asked whether `skilj` needs a way to atomically process
+multiple independently-registered `CommandType`s in one transaction,
+citing DCB's headline claim (via AxonIQ's Axon Framework 5 framing)
+that "a single transaction can span decision models that would
+traditionally be separate aggregates". `CommandDispatcher::dispatch()`
+does take exactly one command type per call, so the premise is
+accurate as a description of the code - the question was whether that's
+a real gap.
+
+### What "spans decision models that would traditionally be separate
+aggregates" actually means
+
+Checked against the primary sources (dcb.events, AxonIQ's own Framework
+5 writeup), not just the issue's paraphrase: the DCB consistency
+boundary is defined **per command**, by that command's own query/tag
+selection - not by atomically batching multiple independently-submitted
+commands together. dcb.events' own canonical motivating example is a
+student enrolling in a course, needing both a `Course` capacity
+invariant and a `Student` enrollment-limit invariant - "classic
+one-stream-per-aggregate" territory that would otherwise need a saga.
+Axon 5 doesn't offer cross-command atomic batching either; its
+"decision model" is likewise assembled per command handler invocation.
+
+### skilj already has this - it's the flagship demo, not a gap
+
+`skilj-demo/src/courses.rs`'s `EnrollStudentInCourse` **is** that exact
+canonical example, already built and tested:
+
+- `tag_mappings()` names both `student` and `course` tags at once
+  (`student_and_course_tags()`), so `decide()` receives the *union* of
+  both entities' histories as a single `matching_events` slice and
+  checks both invariants (course capacity, per-student course limit) in
+  one synchronous call - no second round trip, no separate aggregate
+  transaction.
+- `CommandDecision::Accepted { events: Vec<EventSpec> }`
+  (`skilj-core/src/shared/mod.rs`) already allows one `decide()` call to
+  emit multiple events of different types atomically.
+- `db::submit_command`'s row-locked optimistic-then-locked commit (the
+  DCB-conflict-retry machinery this doc already covers) makes this
+  atomic under real concurrency, not just logically consistent in a
+  single-threaded read - `skilj-demo/tests/courses.rs` races two
+  enrollments for a course's last seat to prove it.
+
+The module's own doc comment on `courses.rs` already names the result:
+"no saga, no reservation, no compensation" - precisely what issue #22
+asked whether skilj could do.
+
+### What's genuinely not supported, and why that's fine
+
+Dynamically gluing two already-registered, independent `CommandType`s
+together into one call without writing new code isn't supported. But
+DCB itself doesn't provide that either - the idiomatic answer to a new
+cross-entity use case is a new `CommandType` whose `tag_mappings()`
+names every tag the new invariant needs (exactly what
+`EnrollStudentInCourse` is), not command-composition plumbing bolted
+onto the dispatcher.
+
+### Recommendation (issue #22's own third listed outcome)
+
+Document the single-command-per-transaction model as deliberate: it
+already delivers DCB's actual capability - atomic decisions spanning
+what would traditionally be separate aggregates - at the tag/decision-
+model level, which is the level DCB itself operates at. No feature
+gap identified; issue closed as already-solved, pointing at
+`EnrollStudentInCourse` as the existing proof.
