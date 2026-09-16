@@ -782,3 +782,93 @@ fn a_real_concurrent_event_and_promotion_never_strand_the_event() {
         assert_eq!(final_projection.caught_up_to, Some(second_seq));
     });
 }
+
+/// Codeberg issue #25's investigation: while checking whether the
+/// existing "every instance redundantly redoes the same idempotent work"
+/// design (docs/architecture.md §22) actually holds for async
+/// `Projection` catch-up (unlike the scheduler/deadline paths, which are
+/// idempotent by construction - `WHERE status = 'pending'`/idempotency-
+/// key dedup), a real `tokio::join!` race between two independent
+/// `catch_up_bounded_context` calls (the same real-concurrency pattern
+/// `a_real_concurrent_event_and_promotion_never_strand_the_event` above
+/// uses) proved it didn't: without a per-row position check, the second
+/// instance re-reads the first instance's already-folded state and folds
+/// the same event into it a second time. Fixed by `projection_state.as_of_sequence`,
+/// mirroring `snapshots.as_of_sequence`'s own already-correct design
+/// (docs/architecture.md §19's "Problem 2"). Before the fix this failed
+/// nondeterministically (whichever instance's row lock lost the race
+/// double-folded) - `AccountBalance` landing on 40 instead of 20 in most
+/// runs; after the fix it's deterministic every run.
+#[test]
+fn two_concurrent_instances_never_double_fold_the_same_event() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        insert_plain_event(&pool, &bc, &et, 20).await;
+
+        let (r1, r2) = tokio::join!(
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher),
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher),
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+            .await
+            .unwrap();
+        assert_eq!(state, Some("20".to_string()));
+    });
+}
+
+/// The same finding's other real reachable path: `register_projection`'s
+/// own `existing = get_projection(...)` in `skilj/src/lib.rs`'s
+/// reconciliation loop is a plain read-then-decide with no claim
+/// mechanism, so two instances both starting up at once and both
+/// registering the identical brand-new sync projection for the first
+/// time would both independently decide `needs_history_fold: true` and
+/// both call `fold_history_into_new_sync_projection` - a second, distinct
+/// call site racing the exact same `projection_state` rows, closed by
+/// the identical `as_of_sequence` check.
+#[test]
+fn two_concurrent_first_time_registrations_never_double_fold_history() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        insert_plain_event(&pool, &bc, &et, 20).await;
+
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: "AccountBalance".to_string(),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: vec![et.clone()],
+            sync: true,
+            caught_up_to: None,
+        };
+
+        // `projection_state.projection_name` is a foreign key into
+        // `projections` - the real caller (`skilj/src/lib.rs`'s
+        // reconciliation loop) always `upsert_projection`s before ever
+        // calling `fold_history_into_new_sync_projection`.
+        db::upsert_projection(&pool, &projection).await.unwrap();
+
+        let (r1, r2) = tokio::join!(
+            db::fold_history_into_new_sync_projection(&pool, &projection, &TestDispatcher),
+            db::fold_history_into_new_sync_projection(&pool, &projection, &TestDispatcher),
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+            .await
+            .unwrap();
+        assert_eq!(state, Some("20".to_string()));
+    });
+}

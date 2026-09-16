@@ -7807,3 +7807,107 @@ pre-existing `projection_query.rs`/`event_subscription.rs` suites (5 + 4
 tests) all pass unchanged against real embedded Postgres, confirming the
 `fetch_projection_result` refactor didn't alter `projection`'s own
 behaviour.
+
+## 50. Investigation: segmented/parallel event processing for horizontal scale-out (Codeberg issue #25)
+
+Speculative, not a commitment - the issue asked whether skilj should
+adopt Axon Framework's Tracking Event Processor model (parallel
+segments claimed via leased tokens), replacing the current "every
+instance redundantly redoes the same idempotent work" design, and named
+three possible outcomes: a targeted narrow fix, a fuller segment-based
+redesign, or documentation that the current model already suits skilj's
+scale. It also asked, as an open question, whether that "redundant work
+is idempotent" premise actually holds.
+
+### The premise didn't hold - a real bug, not a hypothetical
+
+Checking that premise directly (not just re-reading the existing design
+notes) found it's true for the scheduler and deadline-firing paths -
+both genuinely idempotent by construction (`fire_due_deadlines`'s own
+doc comment: "two instances racing to fire the same row both submit
+under the identical idempotency key, so the second is a harmless
+`Deduplicated`") - but **false** for async `Projection` catch-up.
+`Snapshot` catch-up (`catch_up_snapshots`) already re-reads its own
+per-row `as_of_sequence` under the row lock and skips a event already
+folded into that specific row; `Projection` catch-up
+(`catch_up_bounded_context`, `insert_event_and_update_sync_projections_in_tx`,
+`fold_history_into_new_sync_projection`) had no equivalent per-row
+check - only a projection-level `caught_up_to` snapshotted once at
+function entry and never rechecked mid-walk.
+
+Proven with a real `tokio::join!` race (not reasoned about from the code
+shape): two concurrent `catch_up_bounded_context` calls against the same
+bounded context, simulating two instances' own background pollers both
+firing at once, folded one `MoneyDeposited(20)` event into
+`AccountBalance` twice - state landing on `40` instead of `20` in most
+runs. A second, independently-reachable path to the identical bug: two
+instances starting up at once and both reconciling the same brand-new
+sync projection registration would both see `existing: None` (a plain
+read-then-decide in `skilj/src/lib.rs`'s reconciliation loop, no claim
+mechanism) and both call `fold_history_into_new_sync_projection`
+concurrently.
+
+### The fix: `projection_state`/`projection_rebuild_state` get their own `as_of_sequence`
+
+Mirrors `snapshots.as_of_sequence` exactly, rather than introducing a
+new mechanism (an advisory lock serializing an entire bc's catch-up
+tick was considered and rejected - coarser than necessary, and would
+have worked against, not for, any future parallelism): a new
+`as_of_sequence BIGINT NOT NULL DEFAULT -1` column on both tables,
+returned by `get_or_create_projection_state_for_update`/
+`..._rebuild_state_for_update` alongside `state`, checked by every fold
+call site immediately after (`if as_of_sequence >= event.sequence {
+continue; }`) - *before* `dispatcher.project()` ever runs, so a losing
+instance's own read of the winner's already-updated state is never
+folded a second time. `apply_projection_fold_update` advances it to
+`event.sequence` in the same `UPDATE` that persists the new `state`.
+`promote_projection_rebuild`'s existing `INSERT ... SELECT` from
+`projection_rebuild_state` into `projection_state` carries the column
+across too - left out, every promoted row's `as_of_sequence` would reset
+to `-1` while `state` already reflected a full replay, reintroducing the
+exact bug on the very next tick.
+
+`insert_event_and_update_sync_projections_in_tx`'s own sync-projection
+fold is provably unreachable concurrently already (it shares the one
+transaction that holds the bounded context's `sequence` row lock for its
+entire duration, per `insert_event_via_the_locked_path`'s own doc
+comment) - the check is added there too anyway, for structural
+consistency across all four fold call sites rather than leaving it as
+the one unexplained exception.
+
+An already-provisioned bounded context gets the column patched in by
+`ensure_projection_state_as_of_sequence_columns`, following
+`ensure_projection_state_owner_columns`'s own established pattern (a
+plain `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, called unconditionally
+on every `build()` - see that function's own doc comment for why a
+blanket `-1` backfill is safe even against a row with real pre-existing
+`state`: the coarser, untouched `projections.caught_up_to` already
+decides which events a tick ever re-fetches, so a freshly-`-1` row is
+only ever compared against events it genuinely never folded).
+
+### Recommendation (issue #25's own first listed outcome)
+
+A targeted narrow fix, not a segment-based redesign: no evidence
+throughput has actually hit a real limit (the issue's own first
+question), and the redundant-work model's real cost is bounded per tick
+already (§22). Building Axon-style leased-segment claiming now would
+add real coordination machinery (a token store, claim/renew/release,
+segment-count configuration) to solve a problem that isn't yet
+demonstrated, and would have been built on top of a design that was
+*actively incorrect* for one of its own components - fixing the
+correctness gap first was the prerequisite either way. Revisit
+segmentation if a real throughput ceiling shows up in practice, not
+speculatively.
+
+### Verified
+
+A real concurrent-race regression test for each of the two reachable
+paths (`two_concurrent_instances_never_double_fold_the_same_event`,
+`two_concurrent_first_time_registrations_never_double_fold_history`,
+both in `skilj-core/tests/async_projections.rs`) - both reproduced the
+double-fold reliably before the fix (10/10 runs clean after; the
+pre-fix version failed in the majority of runs, confirming it wasn't a
+one-off timing fluke) and pass deterministically after it.
+`cargo build/test --workspace` clean, including the full pre-existing
+`async_projections.rs`/`sync_projections.rs`/`projection_registration.rs`
+suites unchanged.

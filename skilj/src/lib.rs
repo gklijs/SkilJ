@@ -1630,6 +1630,14 @@ impl SkiljBuilder {
                     // `ensure_projection_state_owner_columns`'s own doc
                     // comment.
                     skilj_core::db::ensure_projection_state_owner_columns(pool, &bc.name).await?;
+                    // Codeberg issue #25: `projection_state.as_of_sequence`/
+                    // `projection_rebuild_state.as_of_sequence`, the real
+                    // fix for a genuine cross-instance double-fold race
+                    // found while investigating that issue - see
+                    // `ensure_projection_state_as_of_sequence_columns`'s
+                    // own doc comment.
+                    skilj_core::db::ensure_projection_state_as_of_sequence_columns(pool, &bc.name)
+                        .await?;
                     // Same pass's own raw-event half - `event_types.owner_tag_key`/
                     // `access_tokens.scope` - see
                     // `ensure_event_scoping_columns`'s own doc comment.

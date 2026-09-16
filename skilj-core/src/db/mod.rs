@@ -584,6 +584,13 @@ async fn provision_bounded_context_schema(
     // `catch_up_bounded_context` reaches this key first - there is no
     // single call site that knows every instance a projection will ever
     // have ahead of time.
+    // `as_of_sequence` (Codeberg issue #25's investigation - see
+    // `apply_projection_fold_update`'s own doc comment for the full
+    // story): the highest event sequence actually folded into *this row*,
+    // mirroring `snapshots.as_of_sequence` exactly. Without it, two
+    // instances racing the same key's row lock both re-read the
+    // already-folded state and fold the same event into it a second time
+    // - proven by a real concurrent test, not just reasoned about.
     // `owner`, like `projection_state.owner` below, is the derived
     // owner-tag value this instance's own folded events carry - see
     // `plugin::Projection::OWNER_TAG_KEY`'s own doc comment. Nullable:
@@ -595,6 +602,7 @@ async fn provision_bounded_context_schema(
             key TEXT NOT NULL,
             state TEXT NOT NULL,
             owner TEXT,
+            as_of_sequence BIGINT NOT NULL DEFAULT -1,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (projection_name, status, key),
             FOREIGN KEY (projection_name, status)
@@ -628,6 +636,7 @@ async fn provision_bounded_context_schema(
             key TEXT NOT NULL,
             state TEXT NOT NULL,
             owner TEXT,
+            as_of_sequence BIGINT NOT NULL DEFAULT -1,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (projection_name, key)
         )"
@@ -1524,6 +1533,46 @@ pub async fn ensure_projection_state_owner_columns(
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.projection_rebuild_state ADD COLUMN IF NOT EXISTS owner TEXT"
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `projection_state.as_of_sequence`/`projection_rebuild_state.as_of_sequence`
+/// - the real fix behind Codeberg issue #25's investigation, following
+/// `ensure_projection_state_owner_columns`'s own pattern exactly (see its
+/// own doc comment): a bounded context provisioned before this column
+/// existed gets it patched in here, `DEFAULT -1` matching a brand-new
+/// row's own starting value.
+///
+/// A blanket `-1` backfill is safe even for a row with real accumulated
+/// `state` from before this migration, and deliberately doesn't try to
+/// derive each row's true historical position: `catch_up_bounded_context`/
+/// `insert_event_and_update_sync_projections_in_tx` never re-fetch an
+/// event once the *projection-level* `projections.caught_up_to` (an
+/// existing column, untouched by this migration) has passed it - that
+/// coarser gate is what actually decides which events a tick ever looks
+/// at again, not this row's own `as_of_sequence`. So every event this
+/// row's freshly-`-1` `as_of_sequence` will ever be compared against is
+/// one `caught_up_to` hadn't reached yet at migration time, i.e. one this
+/// row genuinely has never folded - the exact case `-1` is supposed to
+/// mean.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_projection_state_as_of_sequence_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.projection_state \
+         ADD COLUMN IF NOT EXISTS as_of_sequence BIGINT NOT NULL DEFAULT -1"
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.projection_rebuild_state \
+         ADD COLUMN IF NOT EXISTS as_of_sequence BIGINT NOT NULL DEFAULT -1"
     )))
     .execute(pool)
     .await?;
@@ -3241,54 +3290,62 @@ pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::e
 /// `default_state_json`. Generic over `impl sqlx::PgExecutor<'_>` (the
 /// same generalisation `insert_event` itself already has) so both
 /// callers can run this inside their own already-open transaction.
+///
+/// Also returns the row's own `as_of_sequence` (Codeberg issue #25's
+/// investigation finding - see `apply_projection_fold_update`'s own doc
+/// comment) - every caller needs it immediately after to decide whether
+/// this specific row has already folded the event it's about to fold,
+/// the same shape `get_or_create_snapshot_state_for_update` already
+/// returns for `Snapshot`.
 async fn get_or_create_projection_state_for_update(
     executor: impl sqlx::PgExecutor<'_>,
     schema: &str,
     projection_name: &str,
     key: &str,
     default_state_json: &str,
-) -> crate::error::Result<String> {
-    let (state,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+) -> crate::error::Result<(i64, String)> {
+    let (as_of_sequence, state): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
          VALUES ($1, $2, $3, now()) \
          ON CONFLICT (projection_name, key) DO UPDATE SET state = {schema}.projection_state.state \
-         RETURNING state"
+         RETURNING as_of_sequence, state"
     )))
     .bind(projection_name)
     .bind(key)
     .bind(default_state_json)
     .fetch_one(executor)
     .await?;
-    Ok(state)
+    Ok((as_of_sequence, state))
 }
 
 /// `get_or_create_projection_state_for_update`'s own twin for
 /// `projection_rebuild_state` - see that function's own doc comment for
-/// the "no-op write, purely to acquire the lock" reasoning, identical
-/// here. `status` is always `'building'` inline, not a parameter - a
-/// pending row is never folded (only `catch_up_bounded_context`'s own
-/// `building_rebuilds` walk reaches this function at all), so there is no
-/// other status any real caller could mean.
+/// the "no-op write, purely to acquire the lock" reasoning and the
+/// returned `as_of_sequence`, both identical here. `status` is always
+/// `'building'` inline, not a parameter - a pending row is never folded
+/// (only `catch_up_bounded_context`'s own `building_rebuilds` walk
+/// reaches this function at all), so there is no other status any real
+/// caller could mean.
 async fn get_or_create_projection_rebuild_state_for_update(
     executor: impl sqlx::PgExecutor<'_>,
     schema: &str,
     projection_name: &str,
     key: &str,
     default_state_json: &str,
-) -> crate::error::Result<String> {
-    let (state,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+) -> crate::error::Result<(i64, String)> {
+    let (as_of_sequence, state): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projection_rebuild_state (projection_name, status, key, state, \
          updated_at) VALUES ($1, 'building', $2, $3, now()) \
          ON CONFLICT (projection_name, status, key) DO UPDATE SET \
          state = {schema}.projection_rebuild_state.state \
-         RETURNING state"
+         RETURNING as_of_sequence, state"
     )))
     .bind(projection_name)
     .bind(key)
     .bind(default_state_json)
     .fetch_one(executor)
     .await?;
-    Ok(state)
+    Ok((as_of_sequence, state))
 }
 
 /// Applies one projection fold's `UPDATE ... SET state = ...` - shared by
@@ -3313,6 +3370,17 @@ async fn get_or_create_projection_rebuild_state_for_update(
 /// field was absent" case - see `Tag.value` in the spec) never clears an
 /// already-established owner. See `plugin::Projection::OWNER_TAG_KEY`'s
 /// own doc comment for the full contract.
+///
+/// Also advances `as_of_sequence` to `event.sequence` (Codeberg issue
+/// #25's investigation finding) - every call site's own `event.sequence`
+/// only ever increases within its own walk, so a plain unconditional
+/// `SET` is correct here without needing a `GREATEST(...)` guard; what
+/// actually makes this safe under two instances racing the same row is
+/// each call site's own new pre-fold check against the value
+/// `get_or_create_projection_state_for_update`/`..._rebuild_state_for_update`
+/// just returned, *before* `dispatcher.project()` is ever called - by the
+/// time this function runs, the caller has already decided this event
+/// genuinely hasn't been folded into this row yet.
 #[allow(clippy::too_many_arguments)]
 async fn apply_projection_fold_update(
     executor: impl sqlx::PgExecutor<'_>,
@@ -3335,11 +3403,12 @@ async fn apply_projection_fold_update(
     match owner {
         Some(owner) => {
             sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {schema}.{table} SET state = $1, owner = $2, updated_at = now() \
-                 WHERE projection_name = $3 AND key = $4{extra_where}"
+                "UPDATE {schema}.{table} SET state = $1, owner = $2, as_of_sequence = $3, \
+                 updated_at = now() WHERE projection_name = $4 AND key = $5{extra_where}"
             )))
             .bind(new_state)
             .bind(owner)
+            .bind(event.sequence)
             .bind(projection_name)
             .bind(key)
             .execute(executor)
@@ -3347,10 +3416,11 @@ async fn apply_projection_fold_update(
         }
         None => {
             sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {schema}.{table} SET state = $1, updated_at = now() \
-                 WHERE projection_name = $2 AND key = $3{extra_where}"
+                "UPDATE {schema}.{table} SET state = $1, as_of_sequence = $2, updated_at = now() \
+                 WHERE projection_name = $3 AND key = $4{extra_where}"
             )))
             .bind(new_state)
+            .bind(event.sequence)
             .bind(projection_name)
             .bind(key)
             .execute(executor)
@@ -5228,7 +5298,16 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
             .flatten();
 
         for key in &keys {
-            let current_state = get_or_create_projection_state_for_update(
+            // `as_of_sequence` guard (Codeberg issue #25's investigation
+            // finding) - unreachable in practice on this particular path
+            // (every call here shares the one transaction that also
+            // holds `insert_event`'s own bounded-context `sequence` row
+            // lock, already fully serializing concurrent instances for
+            // the whole bc, per `insert_event_via_the_locked_path`'s own
+            // doc comment), kept anyway so this call site stays
+            // structurally identical to the two genuinely-concurrent
+            // ones below rather than being the one exception mid-fix.
+            let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
                 &mut **tx,
                 &schema,
                 &projection.name,
@@ -5236,6 +5315,9 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
                 &default_state_json,
             )
             .await?;
+            if as_of_sequence >= event.sequence {
+                continue;
+            }
 
             let new_state = match dispatcher.project(
                 bounded_context,
@@ -7607,7 +7689,19 @@ pub async fn catch_up_bounded_context(
                 .flatten();
 
             for key in &keys {
-                let current_state = get_or_create_projection_state_for_update(
+                // `as_of_sequence` guard (Codeberg issue #25's
+                // investigation finding) - this row's own real, current
+                // position, re-read fresh under this row's lock rather
+                // than trusted from `async_projections`' own function-
+                // entry snapshot above (which two concurrent instances'
+                // calls would each load independently, stale relative to
+                // each other). Proven necessary by a real concurrent
+                // test, not just reasoned about: without this check, two
+                // instances racing this same row both fold the same
+                // event, the second reading the first's already-updated
+                // `state` back as `current_state` and folding again on
+                // top of it.
+                let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
                     &mut *tx,
                     &schema,
                     &projection.name,
@@ -7615,6 +7709,9 @@ pub async fn catch_up_bounded_context(
                     &default_state_json,
                 )
                 .await?;
+                if as_of_sequence >= event.sequence {
+                    continue;
+                }
 
                 let new_state = match dispatcher.project(
                     bounded_context,
@@ -7666,14 +7763,21 @@ pub async fn catch_up_bounded_context(
                 .flatten();
 
             for key in &keys {
-                let current_state = get_or_create_projection_rebuild_state_for_update(
-                    &mut *tx,
-                    &schema,
-                    &rebuild.projection.name,
-                    key,
-                    &default_state_json,
-                )
-                .await?;
+                // `as_of_sequence` guard - see the identical comment on
+                // the live-projection loop above; the same cross-instance
+                // race applies here for a `ProjectionRebuild`'s own state.
+                let (as_of_sequence, current_state) =
+                    get_or_create_projection_rebuild_state_for_update(
+                        &mut *tx,
+                        &schema,
+                        &rebuild.projection.name,
+                        key,
+                        &default_state_json,
+                    )
+                    .await?;
+                if as_of_sequence >= event.sequence {
+                    continue;
+                }
 
                 let new_state = match dispatcher.project(
                     bounded_context,
@@ -7957,7 +8061,17 @@ pub async fn fold_history_into_new_sync_projection(
             .keys(bounded_context, &projection.name, event)
             .unwrap_or_default();
         for key in &keys {
-            let current_state = get_or_create_projection_state_for_update(
+            // `as_of_sequence` guard - see `catch_up_bounded_context`'s
+            // identical comment. This function's own race is different in
+            // shape (two instances both reconciling the *same brand-new*
+            // registration concurrently - `register_projection`'s own
+            // `existing = None` read-then-decide has no claim mechanism,
+            // so both would call this function at once) but the same
+            // per-row fix closes it: whichever instance's transaction
+            // commits a key's row first, the other's own `RETURNING`
+            // here sees `as_of_sequence` already at `event.sequence` and
+            // skips instead of folding again.
+            let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
                 &mut *tx,
                 &schema,
                 &projection.name,
@@ -7965,6 +8079,9 @@ pub async fn fold_history_into_new_sync_projection(
                 &default_state_json,
             )
             .await?;
+            if as_of_sequence >= event.sequence {
+                continue;
+            }
 
             let new_state = match dispatcher.project(
                 bounded_context,
@@ -8136,10 +8253,19 @@ pub async fn promote_projection_rebuild(
     // `owner` carried across too - a promoted rebuild keeps whatever
     // ownership it derived while building, exactly as `state` does
     // (cross-tenant projection read fix, docs/architecture.md's own
-    // write-up of this pass).
+    // write-up of this pass). `as_of_sequence` carried across for the
+    // identical reason (Codeberg issue #25's investigation finding) -
+    // and load-bearing here, not just consistency: leaving it out would
+    // have every promoted row's `as_of_sequence` default back to `-1`
+    // while `state` already reflects the rebuild's full replay, so the
+    // very next `catch_up_bounded_context` tick would see "never folded"
+    // and replay every historical event into already-folded state a
+    // second time - the exact bug this whole pass fixes, reintroduced
+    // right here if this column were dropped from the copy.
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO {schema}.projection_state (projection_name, key, state, owner, updated_at) \
-         SELECT projection_name, key, state, owner, updated_at \
+        "INSERT INTO {schema}.projection_state \
+         (projection_name, key, state, owner, as_of_sequence, updated_at) \
+         SELECT projection_name, key, state, owner, as_of_sequence, updated_at \
          FROM {schema}.projection_rebuild_state WHERE projection_name = $1 AND status = $2"
     )))
     .bind(projection_name)
