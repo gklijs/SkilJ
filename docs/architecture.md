@@ -60,6 +60,7 @@ listed separately here; see that section itself for its own structure.
 - [8. Open for a future pass](#open-for-a-future-pass)
 - [9. Next steps](#next-steps)
 - [10. Dynamic Consistency Boundary (DCB) alignment](#dcb-alignment)
+  - [10.1 The query algebra is narrower than the spec's, deliberately](#101-the-query-algebra-is-narrower-than-the-specs-deliberately)
 - [10b. OpenTelemetry tracing, logging, and metrics](#otel-tracing-logging-metrics)
   - [10b.1 Four smaller follow-ups](#10b1-four-smaller-follow-ups)
 - [11. `skilj-tui` - a Ratatui operator console](#skilj-tui-console)
@@ -2345,7 +2346,7 @@ so what follows is a mapping, not a migration:
 | DCB term (from the [spec](https://dcb.events/specification/)) | skilj's own term | Note |
 |---|---|---|
 | `Event { type, data, tags }` | `Event { event_type, payload, tags: Vec<Tag> }` | DCB's `tags` are opaque strings (conventionally `"key:value"`); skilj's `Tag { key, value: Option<String> }` (`skilj-core/src/shared/mod.rs`) is structured, not opaque - same purpose, different representation |
-| `Query { items: [{ types?, tags? }] }` | `consistency_tags` (derived per command/event via `TagMapping`/`derive_tags`) | skilj never builds an explicit `Query` object; the equivalent selection is computed directly from the payload's own tag mappings |
+| `Query { items: [{ types?, tags? }] }` | `consistency_tags` (derived per command/event via `TagMapping`/`derive_tags`) | skilj never builds an explicit `Query` object; the equivalent selection is computed directly from the payload's own tag mappings - narrower than the spec's `Query`, see §10.1 |
 | `read(query) -> SequencedEvents` | `consistency_boundary_and_matching_events(bounded_context_events, consistency_tags) -> (Option<i64>, Vec<Event>)` (`skilj-core/src/event_store/mod.rs`) | Same "read the relevant slice before deciding" ordering DCB requires; skilj computes the boundary (highest matching sequence) in the same pass |
 | `append(events, condition?)`, `AppendCondition { failIfEventsMatch, after }` | the DCB-conflict recheck inside `db::submit_command` (re-run the read under `next_sequence`'s own row lock, redispatch `decide()` on change) | Mechanistically different: DCB's own model is one declarative condition passed to a single atomic append; skilj gets the identical guarantee via a Postgres row lock plus optimistic-read-then-locked-recheck-and-retry instead of a condition object |
 | the "decision model" (an app-level concept the spec deliberately leaves out of scope) | `CommandType::decide()` | Named independently in skilj's own Allium spec, not borrowed from DCB - same role the DCB examples describe |
@@ -2356,6 +2357,54 @@ in DCB's own [implementation list](https://dcb.events/resources/libraries/)
 Whether to list skilj there too is tracked separately in
 `docs/open-source-todo.md`, gated on this repository actually being
 public - a link to a private repo serves no one who'd read that list.
+
+### 10.1 The query algebra is narrower than the spec's, deliberately
+
+Raised as Codeberg issue #24. The DCB [specification](https://dcb.events/specification/)'s
+own `Query` is a list of independently-scoped items, each `{types?,
+tags?}`, OR'd together (with AND between one item's own types and tags).
+That lets a single query express something like "conflict if there's a
+`SeatReserved` event tagged `seat:12A` *or* a `SeatBlocked` event tagged
+`zone:premium`" - two alternatives with different type/tag pairings, not
+sharing a type set.
+
+skilj's actual match is flatter, and narrower than even the flat framing
+above suggests. `matching_events` isn't a per-command type set at all -
+it's the *entire bounded context's* own registered `EventType` universe
+([§1.4](#14-matching_events-is-a-generated-per-bounded-context-enum)),
+the same enum shared by every `CommandType` in that context. Within that
+one fixed universe, `consistency_boundary_and_matching_events`
+(`skilj-core/src/event_store/mod.rs:3584`) filters by a single OR of
+`consistency_tags` - an event matches if *any* of its tags is in the set,
+regardless of its own type. There is no way to pair a type restriction
+with only one of several OR'd tags: every candidate event, whatever its
+type, is checked against the same flat tag set.
+
+What this gets you for free: any number of tags OR'd together, checked
+against every event type the bounded context has, with `decide()` itself
+narrowing by payload afterward. `skilj-demo`'s `courses.rs` is the real
+example - `EnrollStudentInCourse` names both the `student` and `course`
+tags in one `tag_mappings()`, and `decide()` receives the union of that
+student's history and that course's history in a single call, checking
+both the course-capacity and per-student-course-limit invariants
+atomically with no saga ([module doc comment](../skilj-demo/src/courses.rs)).
+That's the flat OR-of-tags shape doing real work.
+
+What it can't do: the independently-typed-and-tagged-alternative case
+above, where different OR branches need different type/tag pairings, not
+just different tags against the same shared universe. No bounded context
+built so far - in `skilj-demo` or otherwise - has needed that; every
+multi-invariant case so far (`courses.rs` included) has resolved fully
+within the flat model, because the invariants involved were about "does
+some event carry this tag", not "does an event of type X carry this tag
+while a completely different type needs a different one". Per the same
+reasoning as [§2.5](#25-payload-serialization-json-only-not-pluggable-permanently)'s
+pluggable-serializer rejection: this is a deliberate scope narrowing, not
+an oversight, and not tracked as an open item anywhere. If a concrete
+bounded context ever needs the fuller per-item algebra, that's a new
+design pass against `consistency_boundary_and_matching_events` and the
+tag-indexed Postgres query it mirrors ([§19](#optional-snapshotting-matching-events)),
+not a resumption of a deferred item.
 
 <a id="otel-tracing-logging-metrics"></a>
 ## 10b. OpenTelemetry tracing, logging, and metrics
