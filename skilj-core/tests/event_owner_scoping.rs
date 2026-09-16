@@ -352,6 +352,7 @@ fn consume_events_serves_only_the_tokens_own_scope() {
         &events,
         &[],
         timestamp(0),
+        chrono::Duration::minutes(5),
     )
     .unwrap();
 

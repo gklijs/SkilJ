@@ -134,6 +134,43 @@ pub struct OutboundMapping {
     /// this is a header, not a NATS-native routing concept the way a
     /// Kafka key or an AMQP `group-id` is.
     pub correlation_tag_key: Option<String>,
+    /// `Some((partition_index, partition_count))` splits this
+    /// `EventType`'s own outbound work across `partition_count`
+    /// independent bridge instances (Codeberg issue #25's investigation,
+    /// docs/architecture.md §54) - the identical mechanism
+    /// `skilj_kafka::OutboundMapping::partition` establishes; see that
+    /// field's own doc comment for the full design. Reuses
+    /// `correlation_key`'s own output as the partitioning input here
+    /// too: NATS has no native partition concept to align with (unlike
+    /// Kafka's message key or AMQP's `group-id`), so this is purely
+    /// skilj-side bookkeeping, with no broker-side echo. `None` (the
+    /// default) means unpartitioned.
+    pub partition: Option<(u32, u32)>,
+}
+
+/// `skilj_kafka::partition_for_key`'s own identical vendored copy - see
+/// that function's own doc comment for why it's vendored rather than
+/// shared via a dependency, and why not `DefaultHasher`.
+fn partition_for_key(key: &str, partition_count: u32) -> u32 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash % u64::from(partition_count.max(1))) as u32
+}
+
+/// `skilj_kafka::owns_partition_for`'s own identical twin, for
+/// `OutboundMapping::partition` here.
+fn owns_partition_for(mapping: &OutboundMapping, key: Option<&str>) -> bool {
+    match mapping.partition {
+        None => true,
+        Some((partition_index, partition_count)) => {
+            partition_for_key(key.unwrap_or(""), partition_count) == partition_index
+        }
+    }
 }
 
 /// One event served by skilj's own `GET /v1/events/consume` - the
@@ -354,18 +391,31 @@ pub async fn produce_once(
 
     let mut served = 0;
     for event in &consumed.events {
-        match publish_and_ack_one(
-            http,
-            skilj_base_url,
-            jetstream,
-            bounded_context,
-            mapping,
-            event,
-        )
-        .await
-        {
+        let key = correlation_key(mapping.correlation_tag_key.as_deref(), &event.tags);
+        let owned = owns_partition_for(mapping, key.as_deref());
+        let outcome = if owned {
+            publish_and_ack_one(
+                http,
+                skilj_base_url,
+                jetstream,
+                bounded_context,
+                mapping,
+                event,
+            )
+            .await
+        } else {
+            // Codeberg issue #25's investigation (docs/architecture.md
+            // §54) - not this instance's own partition: acknowledged
+            // (advancing this instance's own cursor) without ever being
+            // published to JetStream - see `OutboundMapping::partition`'s
+            // own doc comment.
+            ack_event(http, skilj_base_url, mapping, event.sequence).await
+        };
+        match outcome {
             Ok(()) => {
-                served += 1;
+                if owned {
+                    served += 1;
+                }
                 if retry_state.is_some_and(|s| s.sequence == event.sequence) {
                     *retry_state = None;
                 }
@@ -869,5 +919,63 @@ mod tests {
     fn correlation_key_is_none_when_the_tag_key_is_entirely_absent() {
         let tags = vec![tag("company", "acme")];
         assert_eq!(correlation_key(Some("order"), &tags), None);
+    }
+
+    // --- Codeberg issue #25's investigation (docs/architecture.md §54) ---
+
+    #[test]
+    fn owns_partition_for_is_always_true_when_unpartitioned() {
+        let mapping = OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: "irrelevant".to_string(),
+            subject: "irrelevant".to_string(),
+            correlation_tag_key: None,
+            partition: None,
+        };
+        for key in [None, Some("o-1"), Some("o-2"), Some("")] {
+            assert!(owns_partition_for(&mapping, key));
+        }
+    }
+
+    /// Every key must be owned by exactly one partition index - not zero
+    /// (a key silently dropped by every instance) and not more than one
+    /// (a key double-published by two instances), for a real spread of
+    /// keys, not just one.
+    #[test]
+    fn owns_partition_for_assigns_every_key_to_exactly_one_partition() {
+        let partition_count = 4;
+        let keys: Vec<Option<&str>> = vec![
+            Some("o-1"),
+            Some("o-2"),
+            Some("o-3"),
+            Some("o-4"),
+            Some("o-5"),
+            Some("o-6"),
+            Some("o-7"),
+            Some("o-8"),
+            None,
+        ];
+        for key in keys {
+            let owners: Vec<u32> = (0..partition_count)
+                .filter(|&partition_index| {
+                    owns_partition_for(
+                        &OutboundMapping {
+                            event_type: "OrderPlaced".to_string(),
+                            credential: "irrelevant".to_string(),
+                            subject: "irrelevant".to_string(),
+                            correlation_tag_key: None,
+                            partition: Some((partition_index, partition_count)),
+                        },
+                        key,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                owners.len(),
+                1,
+                "key {key:?} must be owned by exactly one of {partition_count} partitions, \
+                 got {owners:?}"
+            );
+        }
     }
 }

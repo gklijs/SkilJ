@@ -520,6 +520,30 @@ pub trait Projection {
     /// open as before).
     const TEAM_ONLY: Option<&'static str> = None;
 
+    /// How many partitions this projection's own `keys()` values hash
+    /// into for async catch-up (Codeberg issue #25,
+    /// docs/architecture.md §51) - `1` (the default, and every
+    /// projection that predates this) means every key hashes to the
+    /// same partition, so `catch_up_bounded_context` takes its original,
+    /// unpartitioned code path unchanged and order is exactly as it
+    /// already was. A value greater than `1` lets multiple skilj
+    /// instances each independently claim and fold a different slice of
+    /// this projection's own keys concurrently, instead of every
+    /// instance redundantly redoing all of it - see
+    /// `catch_up_partitioned_projection`'s own doc comment for the
+    /// mechanism. Deliberately Rust-only, no spec entity field and no
+    /// registration/admin-visible surface, the identical treatment
+    /// `OWNER_TAG_KEY`/`TEAM_ONLY` above already get: it's a pure
+    /// work-distribution detail, invisible to what `project()` actually
+    /// folds, so changing it between deploys needs no rebuild (unlike
+    /// `schema`/`consumed_event_types`/`sync`, which change what gets
+    /// folded - see `register_projection`'s own rebuild-trigger logic).
+    /// Meaningful only for `sync() == false`; inert (never validated
+    /// against, never rejected) for a sync one, the same stance
+    /// `OWNER_TAG_KEY`/`TEAM_ONLY` already take toward combinations that
+    /// don't make sense rather than erroring on them.
+    const PARTITION_COUNT: u32 = 1;
+
     /// `key` is which instance is currently being folded - one of
     /// `Self::keys(event)`'s own return values, handed back so `project()`
     /// can tell them apart when an event touches more than one (compare
@@ -609,6 +633,16 @@ pub trait Snapshot {
     /// comment), never trusted. Not inferred: Rust has no way to detect
     /// a fold's own semantic change, only a decider declaring one can.
     const VERSION: u64;
+
+    /// How many partitions this snapshot's own tag values hash into for
+    /// catch-up (Codeberg issue #25, docs/architecture.md §52 - the
+    /// `Snapshot` twin of `Projection::PARTITION_COUNT`, see that
+    /// const's own doc comment for the full reasoning, identical here
+    /// with the derived tag *value* playing the role `Projection`'s own
+    /// `keys()` return values play). `1` (the default) means every tag
+    /// value hashes to the same partition, so `catch_up_snapshots` takes
+    /// its original, unpartitioned code path unchanged.
+    const PARTITION_COUNT: u32 = 1;
 
     /// Folds one event into `state`, in place - the identical shape
     /// `Projection::project` already has, minus the `key` parameter
@@ -775,6 +809,18 @@ pub trait ProjectionDispatcher: Send + Sync {
     ) -> Option<Option<&'static str>> {
         None
     }
+
+    /// The registered projection's own `Projection::PARTITION_COUNT`
+    /// (Codeberg issue #25, docs/architecture.md §51) - `None` for the
+    /// same "pair isn't registered at all" case every method here
+    /// already has, treated by every real caller (`db::
+    /// catch_up_bounded_context`) identically to `Some(1)`: unpartitioned.
+    /// Defaulted (unlike `owner_tag_key`, which has no default) for the
+    /// same reason `team_only` is - a dispatcher with nothing partitioned
+    /// needs no explicit override at all.
+    fn partition_count(&self, _bounded_context: &str, _projection_name: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// Type-erased dispatch to a bounded context's own typed `Snapshot::fold` -
@@ -832,6 +878,16 @@ pub trait SnapshotDispatcher: Send + Sync {
     /// `snapshot_version` no longer matches. `None` for the identical
     /// "pair isn't registered at all" case.
     fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String>;
+
+    /// The registered snapshot's own `Snapshot::PARTITION_COUNT`
+    /// (Codeberg issue #25, docs/architecture.md §52) -
+    /// `ProjectionDispatcher::partition_count`'s identical shape and
+    /// defaulting: `None` for the same "pair isn't registered at all"
+    /// case every method here already has, treated by every real caller
+    /// (`db::catch_up_snapshots`) identically to `Some(1)`: unpartitioned.
+    fn partition_count(&self, _bounded_context: &str, _snapshot_name: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// A single-hop, stateless reaction: when `Source` commits in its own

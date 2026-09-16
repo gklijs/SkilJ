@@ -7911,3 +7911,501 @@ one-off timing fluke) and pass deterministically after it.
 `cargo build/test --workspace` clean, including the full pre-existing
 `async_projections.rs`/`sync_projections.rs`/`projection_registration.rs`
 suites unchanged.
+
+## 51. Segmented/parallel event processing, built (Codeberg issue #25, part two)
+
+§50 above recommended a narrow fix over segmentation - no evidence of a
+real throughput ceiling, and the redundant-work model's real cost was
+already bounded per tick. The user asked for the fuller feature anyway,
+despite that. This section is that feature: real horizontal parallelism
+for async `Projection` catch-up, built on top of §50's `as_of_sequence`
+fix rather than instead of it.
+
+### The key thing that de-risks the whole design
+
+`as_of_sequence` (§50) already makes every fold safe under *arbitrary*
+concurrent races, regardless of which partition or instance performs
+it. Everything below - the advisory-lock claiming in particular - is a
+pure work-avoidance optimization, not a correctness mechanism. Even a
+hash disagreement between instances (a theoretical `hashtext` collision,
+or a rolling deploy briefly running two different `PARTITION_COUNT`
+values for the same projection) could only ever cause wasted duplicate
+work, never a double-fold. That guarantee is what makes it safe to build
+this without any lease/heartbeat/claim-table machinery at all.
+
+### Two confirmed design forks
+
+- **Partition assignment reuses `Projection::keys()`** rather than
+  introducing a separate "partition key" concept. A projection keyed by
+  a tag value is already partitioned by that tag; one keyed by an id is
+  already partitioned by that id - `keys()` already is each projection's
+  own notion of "which instance does this event touch," partitioning
+  just hashes that same string into one of `PARTITION_COUNT` buckets.
+  Zero new trait surface beyond the one new constant itself.
+- **Claiming is a non-blocking, per-tick `pg_try_advisory_xact_lock`
+  race**, not a lease/claim table with heartbeat/expiry (the fuller,
+  Axon-style alternative). Each tick, each instance tries the lock for
+  each partition with pending work; whichever instance wins folds that
+  partition's own pending keys inside the one transaction holding the
+  lock, and commits (releasing it). A losing instance just skips that
+  partition this tick. Self-healing for free - a dead instance simply
+  stops winning locks, no reclaim/rebalance logic needed anywhere.
+
+### New table: `projection_partition_progress`
+
+One row per `(projection_name, partition_index)`, `caught_up_to BIGINT
+NOT NULL DEFAULT -1` - `ensure_projection_partition_progress_table`
+(`skilj-core/src/db/mod.rs`), following the established `CREATE TABLE IF
+NOT EXISTS`/`impl PgExecutor` idiom every sibling `ensure_*_table`
+function here already uses, called from both
+`provision_bounded_context_schema` and the startup loop in
+`skilj/src/lib.rs`.
+
+No columns were added to `projections`/`projection_state`/
+`projection_rebuild_state`. `projections.caught_up_to` - the single
+external source of truth `Projection.caughtUpTo` (GraphQL) and
+`wait_until_caught_up`/`fetch_projection_result` (`skilj-graphql`,
+backing both the `projection` query and the `projectionUpdates`
+subscription) depend on - stays exactly what it always meant: every key
+of this projection reflects every event up to this sequence. It's now
+computed, for a partitioned projection, as a monotonic-only rollup
+(`MIN(caught_up_to) WHERE partition_index < PARTITION_COUNT`, guarded
+by `WHERE caught_up_to IS NULL OR caught_up_to < $1` so it can never
+regress) rather than being advanced directly - GraphQL/the subscription
+needed zero changes.
+
+### `catch_up_bounded_context`: branch, don't rewrite
+
+Async projections are split by their own `dispatcher.partition_count(...)`
+(defaulted to `None` ≡ unpartitioned) into `unpartitioned_async_projections`
+(`<= 1`, the default, and every projection that predates this feature)
+and `partitioned_async_projections` (`> 1`). Everything for the
+unpartitioned set - the per-event transaction loop, `min_caught_up`, the
+early-return guard - is **byte-identical** to before this pass, just
+renamed; every pre-existing test in `async_projections.rs`/
+`sync_projections.rs` passes unchanged, proving it. Order stays kept by
+default simply because the new code path is never entered.
+
+Partitioned projections are handled afterward by a new
+`catch_up_partitioned_projection`, one per projection, sequentially (not
+`for_each_concurrent` - see below).
+
+### `catch_up_partitioned_projection`
+
+Per partitioned projection, per tick: seed missing `0..PARTITION_COUNT`
+progress rows (`ON CONFLICT DO NOTHING`); load current progress; fetch a
+**capped** batch of new events (`MAX_EVENTS_PER_PARTITION_TICK = 1000`,
+via the new `list_events_for_bounded_context_from_limited` - a separate
+function from `list_events_for_bounded_context_from` so that function's
+other caller, `catch_up_snapshots`, stays untouched); skip any partition
+already caught up through this batch's tail; for each remaining
+partition, open one transaction, `pg_try_advisory_xact_lock` (keyed by
+`partition_lock_key`, `hashtext(...)::bigint`, the identical primitive
+`migrate_idempotency_keys_client_id_scoping` already established), and
+on success fold every key in this batch that hashes into that partition
+through the **unmodified** `get_or_create_projection_state_for_update` →
+`as_of_sequence` guard → `dispatcher.project()` →
+`apply_projection_fold_update` sequence the unpartitioned loop already
+uses, then upsert this partition's own progress and commit. Regardless
+of which partitions this instance won, it rolls up the projection-level
+`caught_up_to` (above) every tick - harmless, idempotent, whichever
+instance happens to do it.
+
+**One transaction per `(partition, tick)`, not per-event** - a
+deliberate, evaluated tradeoff, not an oversight. A non-blocking lock
+re-acquired per event would force stopping at the first lost race
+anyway, since a partition's own progress can only advance contiguously
+in sequence order - far more lock round trips for comparatively little
+benefit. The real cost traded away, relative to the unpartitioned loop's
+own per-event transaction granularity: a poison event anywhere in a
+partition's own batch this tick rolls back that whole partition's tick,
+not just the offending event. `MAX_EVENTS_PER_PARTITION_TICK` bounds the
+blast radius; the next tick's fresh, non-blocking race is self-healing
+regardless of which instance (if any) previously held that partition.
+
+**Intra-tick partition processing stays sequential in v1** (not further
+fanned out within one instance) - the real scale-out value comes from
+separate *instances* racing for partitions, not from one instance's own
+intra-tick concurrency, and stacking more concurrency here on top of
+this function's own already-concurrent per-bounded-context caller
+(`BACKGROUND_TASK_CONCURRENCY` in `skilj/src/lib.rs`) against a pool
+with a modest default connection cap (§35) was judged a poor trade for
+what little it would buy.
+
+**A finding worth contrasting, not fixing here**: the existing
+unpartitioned loop's own `caught_up_to` update
+(`UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2`)
+has no monotonic guard - in principle, two concurrent redundant
+`catch_up_bounded_context` calls could commit their own ascending
+per-event transactions in a different real order, letting a slower
+instance's earlier-event commit land after a faster instance's
+later-event commit and regress it. A pre-existing, latent, self-
+correcting risk (the next tick just re-advances past it) in code this
+pass leaves untouched, since it's out of scope for a partitioning
+feature - but the new partitioned rollup deliberately does add the
+monotonic guard, which is why it's worth naming the asymmetry here.
+
+### Key → partition hash
+
+Hand-written 64-bit FNV-1a (`partition_for_key`), not
+`std::collections::hash_map::DefaultHasher` (explicitly not guaranteed
+stable across Rust versions/std/build flags - unsuitable for a scheme
+that must agree across every instance in a fleet, possibly running
+slightly different builds mid rolling-deploy) and not a new crate
+dependency (not judged worth it for a few lines of well-known, public-
+domain algorithm). Computed in Rust, not pushed into Postgres via
+`hashtext()`, since partition membership must be known before deciding
+which partitions are even worth a lock attempt that tick - `hashtext()`
+is still used, unrelated, for the advisory lock key itself.
+
+### Trait/dispatcher surface
+
+`Projection::PARTITION_COUNT: u32 = 1` (`skilj-core/src/plugin/mod.rs`,
+next to `OWNER_TAG_KEY`/`TEAM_ONLY`) - the identical "deliberately
+Rust-only, no spec entity field, no registration/admin-visible surface"
+treatment those two already get, and for the same underlying reason:
+it's a pure work-distribution detail, invisible to what `project()`
+actually folds, so `register_projection`'s rebuild-trigger logic
+(`schema_changed`/`consumed_change_has_history`/`becoming_sync`) never
+needs to know about it - changing `PARTITION_COUNT` between deploys
+needs no rebuild.
+
+`ProjectionDispatcher::partition_count(...)`, defaulted to `None`
+(≡ unpartitioned) rather than required, the same treatment `team_only`
+already gets - every hand-rolled test-double `ProjectionDispatcher`
+impl across the test suite kept compiling unchanged. Wiring the real
+implementation (`skilj/src/lib.rs`) turned out to need no macro
+changes: one new field on `RegisteredProjection`, set from
+`T::PARTITION_COUNT` in `registered_projection::<T>()`, and one new
+accessor on `ProjectionDispatcherImpl`, mirroring `owner_tag_key`/
+`team_only` exactly.
+
+### Deliberate v1 scope cuts
+
+- The `building_rebuilds` loop (same function) and
+  `fold_history_into_new_sync_projection` stay single-instance,
+  unpartitioned, regardless of a live projection's own
+  `PARTITION_COUNT`. Rebuilds are one-time, bounded events (only
+  `schema_changed`/`consumed_change_has_history`/`becoming_sync` ever
+  stage one), not the sustained-throughput concern this issue is
+  actually about.
+- **Known accepted limitation**: after a rebuild promotes
+  (`promote_projection_rebuild`), a partitioned live projection's
+  `projection_partition_progress` rows can be stale relative to the
+  freshly-jumped `projections.caught_up_to` the rebuild just set. The
+  next tick(s) re-scan that gap - capped and self-healing over a few
+  ticks by `MAX_EVENTS_PER_PARTITION_TICK` - purely as wasted work,
+  never a correctness risk, since `as_of_sequence` still skips every
+  already-folded key/event pair encountered along the way. Not worth
+  promotion-side bookkeeping to close for a rare, self-correcting cost.
+
+### Verified
+
+New tests in `skilj-core/tests/async_projections.rs` -
+`partitioned_projection_concurrent_instances_fold_every_key_exactly_once`
+(a real `tokio::join!` race across three concurrent instances and a
+four-partition, three-key projection), `partitioned_projection_caught_up_to_never_regresses_and_reaches_latest`,
+`partitioned_projection_uneven_key_distribution_converges` (mostly-idle
+partitions still advance), and
+`catching_up_a_bounded_context_with_both_partitioned_and_unpartitioned_projections_keeps_both_correct`
+(the two loops don't cross-contaminate) - all pass deterministically
+across 10 repeated runs. The full pre-existing `async_projections.rs`
+suite (12 tests total now) and `sync_projections.rs`/
+`projection_query.rs`/`skilj-graphql`'s own suites pass unchanged,
+confirming the unpartitioned path is genuinely untouched and GraphQL's
+`caughtUpTo`/`wait_for_sequence` contract needed no changes. `cargo
+build/clippy --workspace --all-targets -- -D warnings` and `cargo fmt
+--check` clean.
+
+## 52. Scoping parallelism beyond Projection catch-up, and building the Snapshot half
+
+After §51, the question came up: does the same design apply anywhere
+else events get processed? Three candidates were investigated directly
+against the code: `Snapshot` catch-up, `CrossContextRoute` catch-up, and
+the Kafka/AMQP/NATS outbound bridge crates. They needed genuinely
+different answers.
+
+### `CrossContextRoute`: no fit, no action
+
+`CrossContextRoute::route()` takes one event payload and returns one
+optional command payload - no key, no instance concept, no fan-out.
+`cross_context_route_cursors` has exactly one row per `route_name`, a
+single linear stream by construction. Every real registered example in
+the codebase (only in `skilj/tests/cross_context_route.rs` - none in
+skilj-demo) is a single coarse mapping like `OrderShipped → ReserveStock`,
+matching §36's own explicit scoping. Unlike `Projection` before §50's
+fix, this mechanism is already correctness-safe under redundant
+concurrent execution today - not via a row-level guard, but because
+target-side command submission uses a deterministic idempotency key
+(`"{route_name}:{event.sequence}"}`); a losing concurrent instance's
+submission comes back `Deduplicated`, handled and logged, not an error.
+There is no independent, divisible unit of work here the way a
+`Projection`'s many keys or a `Snapshot`'s many tag values are - a
+route's own cost is O(events since cursor), not O(events × keys).
+**No action taken.** If a specific route's own redundant-work cost ever
+becomes a real, demonstrated concern, the applicable fix would be a
+single non-blocking lock per *route* (not per partition within one) to
+cut wasted redundant scans - a work-avoidance optimization, not a
+throughput increase, since one route's own processing stays inherently
+serial regardless. Not built speculatively, for the same reason §50
+gave for not building segmentation before a real need was shown.
+
+### `Snapshot`: built, mirroring §51 almost exactly
+
+`Snapshot` has no `Projection::keys()`-equivalent, but doesn't need one:
+it's already strictly one row per `(snapshot_name, tag_key, tag_value)`,
+with exactly one tag value derived per event (`catch_up_snapshots`).
+That derived tag value plays the identical structural role a
+`Projection`'s per-event key string does. `snapshots.as_of_sequence`
+already existed per row, already checked before folding - the same
+guard §50 had to *add* for `Projection`, `Snapshot` already had it.
+
+**Before building anything on top of that guard**, it was proven
+directly rather than assumed: no test anywhere in the repo had run
+`catch_up_snapshots` under a real concurrent race before this pass
+(`grep -rln "tokio::join!" skilj-core/tests/` matched only
+`async_projections.rs`). A new
+`two_concurrent_instances_never_double_fold_the_same_snapshot_row`
+(`skilj-core/tests/snapshot_context.rs`) - two simultaneous
+`catch_up_snapshots` calls against one account's single deposit event -
+passed clean across 10 repeated runs. Unlike `Projection`'s own
+investigation, this one found no bug: `Snapshot`'s guard was already
+correct.
+
+**The build itself**, mechanically identical to §51:
+- `Snapshot::PARTITION_COUNT: u32 = 1` (`skilj-core/src/plugin/mod.rs`,
+  next to `Snapshot::OWNER_TAG_KEY`) - the same Rust-only, no-spec-
+  surface treatment, and for the identical reason: a pure work-
+  distribution detail, invisible to what `fold()` actually folds.
+- `SnapshotDispatcher::partition_count(&self, bc, name) -> Option<u32>`,
+  defaulted to `None` (≡ unpartitioned) - every existing hand-rolled
+  `SnapshotDispatcher` test double (and the real
+  `SnapshotDispatcherImpl` in `skilj/src/lib.rs`, which needed one new
+  field on `RegisteredSnapshot` plus one new accessor, mirroring
+  `ProjectionDispatcherImpl`'s own `partition_count` wiring) kept
+  compiling unchanged.
+- New `snapshot_partition_progress` table (`snapshot_name,
+  partition_index, caught_up_to, updated_at`) - **no `REFERENCES`
+  clause**, unlike `projection_partition_progress`: `snapshots`/
+  `snapshot_progress` have no backing registration table either, so
+  there's nothing to foreign-key against and no table-creation-ordering
+  constraint to get wrong (§51's own placement bug - caught and fixed
+  during that pass - doesn't recur here for that reason).
+  `ensure_snapshot_partition_progress_table` follows the established
+  `CREATE TABLE IF NOT EXISTS` idiom, called from both
+  `provision_bounded_context_schema` and the `skilj/src/lib.rs` startup
+  loop.
+- `catch_up_snapshots` splits `snapshot_names` into
+  `unpartitioned_snapshot_names`/`partitioned_snapshot_names` by
+  `dispatcher.partition_count(...)`, identical branch shape to
+  `catch_up_bounded_context`. The unpartitioned path is byte-identical
+  to before this pass - every pre-existing test in
+  `snapshot_context.rs`/`snapshot_owner_scoping.rs`/
+  `skilj-demo/tests/snapshot.rs` passes unchanged, proving it. A new
+  `catch_up_partitioned_snapshot` per partitioned name reuses
+  `partition_for_key` (the identical FNV-1a §51 established),
+  `list_events_for_bounded_context_from_limited`/
+  `MAX_EVENTS_PER_PARTITION_TICK` (both already generic, untouched), and
+  the identical non-blocking `pg_try_advisory_xact_lock`-per-`(name,
+  partition)`-per-tick race, folding through the **unmodified**
+  `get_or_create_snapshot_state_for_update` → `as_of_sequence` guard →
+  `dispatcher.fold()` → the existing owner/no-owner `UPDATE snapshots`
+  branches. `snapshot_progress.caught_up_to` (the existing rollup) gets
+  the same monotonic-only `MIN()` update `projections.caught_up_to`
+  does in §51.
+- Four new tests in `snapshot_context.rs`, the `Snapshot` twins of §51's
+  four:
+  `partitioned_snapshot_concurrent_instances_fold_every_tag_value_exactly_once`
+  (a real 3-instance race, four partitions, three accounts),
+  `partitioned_snapshot_as_of_sequence_reaches_latest_across_ticks`,
+  `partitioned_snapshot_uneven_tag_distribution_converges` (mostly-idle
+  partitions still advance) - via a small `PartitionedTestSnapshotDispatcher`
+  that delegates everything to the existing `TestSnapshotDispatcher`
+  except `partition_count`, so none of the file's existing construction
+  sites needed touching. All pass deterministically across 10 repeated
+  runs.
+
+### Kafka/AMQP/NATS outbound bridges: scoped, not yet built
+
+A different design (§53 covers this once built): the bridge crates are
+pure REST clients (`produce_once` polls `GET /v1/events/consume` over
+HTTP; none of the three has a `sqlx`/Postgres dependency at all), so
+`Projection`/`Snapshot`'s advisory-lock racing can't apply there
+directly - there is no database connection in that crate to hold a lock
+on. The investigation also found a real, previously-unverified gap
+worth closing independent of any parallelism work: `read_cursors`
+(the server-side cursor `mode=manual` polling advances) has no claiming
+mechanism at all today - two concurrent instances of the same
+`OutboundMapping` would both fetch the same unacked batch and both
+double-publish. See docs/architecture.md's next section for the fix and
+the partitioning design built on top of it.
+
+### Verified
+
+`cargo build/clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --check` clean. `two_concurrent_instances_never_double_fold_the_same_snapshot_row`
+and the three partitioned-snapshot tests pass deterministically across
+10 repeated runs each. Full `snapshot_context.rs` (9 tests),
+`snapshot_owner_scoping.rs` (8 tests), and `skilj-demo/tests/snapshot.rs`
+(2 tests) all pass.
+
+## 53. Closing the Kafka/AMQP/NATS bridges' double-publish gap: `ReadCursor.checked_out_at`
+
+§52 found a real, previously-unverified gap in the bridge crates
+(`skilj-kafka`/`skilj-amqp`/`skilj-nats`): they're pure REST clients
+(`produce_once` polls `GET /v1/events/consume` over HTTP; none of the
+three has a `sqlx`/Postgres dependency), and `read_cursors`' `manual_ack`
+mode had no claiming mechanism at all - two concurrent callers presenting
+the same `EventReadToken` would both be served the identical unacknowledged
+batch, both act on it externally (publish to a broker), and only
+afterward both acknowledge. This section closes that gap, spec-first.
+
+### Spec change
+
+`ReadCursor`/`ConsumeEvents`/`AcknowledgeEvents` are Allium spec
+constructs (`specs/skilj.allium`), not just an implementation detail -
+this project treats the spec as the source of truth for behaviour, so
+the fix went through `allium:tend` before any Rust was written, verified
+clean with `allium check`/`allium analyse` (zero new diagnostics or
+findings beyond what already existed).
+
+- New `Config` section (the spec had none before this):
+  `read_cursor_checkout_lease: Duration = 5.minutes`.
+- `ReadCursor` gains `checked_out_at: Timestamp?` - `manual_ack` only,
+  always `null` for `auto_advance` (which has no equivalent gap: serving
+  already advances its own cursor in the same moment).
+- `rule ConsumeEvents`: a new `is_leased` binding (`manual_ack`, not
+  `is_new`, `checked_out_at` set and not yet past the lease) forces
+  `served = []` when true; a new `ensures` branch claims the cursor
+  (`checked_out_at = now`) whenever it serves a `manual_ack` batch not
+  already claimed by a live lease.
+- `rule AcknowledgeEvents`: unconditionally clears `checked_out_at`.
+- `DeliveryFollowsAckMode` and the "Server-side read cursors" note both
+  updated to state precisely that this narrows the existing at-least-once
+  guarantee rather than weakening it - a served-but-unacknowledged batch
+  is still always eventually redelivered, just never to two callers
+  racing each other at once.
+
+### The mechanism, and a bug caught by testing it for real
+
+`event_store::consume_events` gained a `checkout_lease: chrono::Duration`
+parameter and the `is_leased` logic verbatim from the spec;
+`CursorUpdate` gained a `Claimed { checked_out_at }` variant alongside
+the existing `Created`/`Advanced`/`Unchanged`. `ReadCursor.checked_out_at`
+threads through `skilj-core`'s persistence layer
+(`get_read_cursor`/`upsert_read_cursor`/`apply_cursor_update`/
+`record_acknowledgement`), and `SkiljBuilder::read_cursor_checkout_lease`
+(default 5 minutes, matching the spec) threads it down to
+`skilj-rest`'s `GET /v1/events/consume` handler.
+
+**The first implementation was wrong, and a real concurrent test caught
+it, not review.** The obvious persistence-layer design - wrap the read
+and the write in one transaction, holding a `SELECT ... FOR UPDATE` row
+lock across both - works for an *existing* cursor but protects nothing
+for a token's *very first* call: there's no row yet to lock, so two
+concurrent first-time callers both see `existing_cursor = None` and both
+get served. A new end-to-end test,
+`two_concurrent_manual_consumes_never_both_serve_the_same_batch`
+(`skilj/tests/event_fetch_rest.rs`, real HTTP through `Skilj::rest_router()`,
+`tokio::join!` on two simultaneous requests for a brand-new token),
+failed reliably (`a=1 b=1` - both served) with the row-lock design,
+exposing exactly this gap.
+
+**The fix**: `pg_advisory_xact_lock`, the identical primitive
+`migrate_idempotency_keys_client_id_scoping` already establishes, keyed
+by `(bounded_context, token_id)` - acquired first thing inside the same
+transaction (`db::lock_read_cursor_for_consume`), blocking (not
+`pg_try_advisory_xact_lock`: two callers racing the same token should
+serialize for the few milliseconds a request takes, not have one
+immediately give up), released automatically on commit. Unlike a row
+lock, an advisory lock doesn't care whether the row exists yet, so it
+protects the first-call case identically to every later one.
+`get_read_cursor`/`apply_cursor_update` both became generic over `impl
+sqlx::PgExecutor` (the same generalisation `insert_event` already has)
+so the REST handler can call them inside the same locked transaction -
+critical, not cosmetic: a lock taken on one pooled connection while the
+protected read/write happen on a different one would be meaningless, the
+identical failure mode that migration guard's own doc comment already
+warns about. After the fix, the same end-to-end test passed clean across
+15 repeated runs.
+
+### Verified
+
+New tests at every layer: `event_fetch_surface.rs` (5 new pure-function
+tests - live claim serves nothing, stale claim reclaims, `manual_ack`'s
+first call claims where `auto_advance` never does, plus updated
+assertions on the two pre-existing tests whose own `Unchanged` outcome
+this pass narrowed to `Claimed`), `persistence.rs` (2 new/extended DB
+round-trip tests - `Claimed` persists without moving `sequence`,
+`AcknowledgeEvents` clears a live claim), and the real end-to-end
+`event_fetch_rest.rs` test described above. `cargo build/clippy
+--workspace --all-targets -- -D warnings` and `cargo fmt --check` clean.
+Full `skilj-core`/`skilj-rest` suites pass unchanged elsewhere, confirming
+`auto_advance` and every other cursor path stayed untouched.
+
+## 54. Bridge partitioning: skilj-kafka/skilj-amqp/skilj-nats, on top of §53
+
+The design from §52's scoping: per-partition `EventReadToken`s, not
+advisory-lock racing (these bridges are already one dedicated task per
+mapping by design, unlike `Projection`/`Snapshot` catch-up's
+interchangeable-fleet model) - each partition gets its own dedicated
+`credential`, so each partition's own `read_cursors` row is already
+independently checkout-protected by §53, with no new coordination needed
+in `skilj-core` at all.
+
+### The change, identical across all three crates
+
+- `OutboundMapping` gains `partition: Option<(u32, u32)>` -
+  `(partition_index, partition_count)`. `None` (the default) is
+  unpartitioned, byte-identical to before this pass.
+- A vendored copy of the same hand-written 64-bit FNV-1a
+  `partition_for_key` §51 established (not `DefaultHasher` - see that
+  section's own reasoning), plus `owns_partition_for(mapping, key)`.
+  Vendored, not pulled in via a `skilj-core` dependency: all three
+  bridge crates are deliberately skilj-core-free, pure REST/broker
+  clients (confirmed by §52's own investigation - none has a `sqlx`
+  dependency).
+- Reuses each crate's own existing [`correlation_key`] output (already
+  computed for Kafka's native partition assignment / AMQP's `group-id`)
+  as the partitioning input - the same tag that decides broker-side
+  placement now also decides which bridge instance is responsible for
+  an event. NATS has no native partition concept to align with (its
+  `correlation_tag_key` is header-only, per §38's own finding) - there,
+  partitioning is purely skilj-side bookkeeping, no broker-side echo.
+- `produce_once`'s own per-event loop: an event not owned by this
+  mapping's own partition is acknowledged (advancing this instance's own
+  cursor past it) but never produced/sent/published - the identical
+  "position always advances even when nothing happens for this
+  particular item" treatment `catch_up_cross_context_route` already
+  gives an unregistered target command type. Not counted toward
+  `served`, the same treatment a retry-exhausted skip already gets.
+
+### Verified against real brokers, not just compiled
+
+Each crate gained a real end-to-end test
+(`two_partitioned_mappings_together_{produce,send,publish}_every_key_exactly_once`):
+two `OutboundMapping`s, different dedicated credentials, same
+`partition_count`, different `partition_index`, each given a single
+`produce_once` call over an identical six-key queue - asserting the
+union of what actually lands on the real broker (Kafka/Artemis/JetStream,
+via each crate's own existing `testcontainers`-backed harness) is
+exactly those six keys with no duplicates and no gaps, and that every
+sequence was acknowledged on both tokens regardless of which one
+produced it. All three passed clean against real ephemeral brokers
+(Docker reachable partway through this work - initially unavailable in
+this session, confirmed reachable and used for real verification once
+it was), repeated multiple times each with no flakes. Each crate also
+gained fast, Docker-free unit tests for `owns_partition_for`/
+`partition_for_key` directly (unpartitioned is always owned; every key
+is owned by exactly one of N partitions, never zero, never more than
+one). Full pre-existing suites in all three crates (7 tests each,
+including the pre-existing single-mapping outbound/inbound/retry/parking
+tests) pass unchanged. `cargo build/clippy --workspace --all-targets --
+-D warnings` and `cargo fmt --check` clean across the whole workspace.
+
+### What this completes
+
+Codeberg issue #25, in full: §51 (Projection partitioning), §52
+(scoping - Snapshot partitioning built, CrossContextRoute found not to
+fit, the bridge gap found), §53 (the `read_cursors` checkout mechanism
+that gap needed), and this section (partitioning built on top of it).

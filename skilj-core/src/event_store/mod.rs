@@ -417,13 +417,18 @@ pub enum AckMode {
     ManualAck,
 }
 
-/// See `entity ReadCursor`.
+/// See `entity ReadCursor`. `checked_out_at` is `manual_ack` only - always
+/// `None` for an `auto_advance` cursor, which has no equivalent gap to
+/// close (see the field's own doc comment in the spec). Codeberg issue
+/// #25's investigation found the gap this closes: docs/architecture.md
+/// §53.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadCursor {
     pub token: EventReadToken,
     pub ack_mode: AckMode,
     pub sequence: i64,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub checked_out_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Library-level errors this module's own rules reject for.
@@ -2945,8 +2950,18 @@ pub enum CursorUpdate {
         sequence: i64,
         updated_at: chrono::DateTime<chrono::Utc>,
     },
-    /// `manual_ack` - only `AcknowledgeEvents` moves this cursor, so
-    /// serving never does, matched or not.
+    /// `manual_ack`, cursor not already claimed (or a stale claim just
+    /// reclaimed) - `ReadCursor.checked_out_at` becomes `now`, `sequence`
+    /// untouched (manual_ack never moves it here, claimed or not - only
+    /// `AcknowledgeEvents` does). Codeberg issue #25's investigation
+    /// (docs/architecture.md §53); see `ReadCursor.checked_out_at`'s own
+    /// spec doc comment for why this exists.
+    Claimed {
+        checked_out_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// `manual_ack`, cursor already claimed by a live (not stale) lease -
+    /// nothing moves, `served` is empty (see `consume_events`'s own
+    /// `is_leased` handling).
     Unchanged,
 }
 
@@ -2959,7 +2974,10 @@ pub struct ConsumeEventsResult {
 /// See `rule ConsumeEvents`. `existing_cursor` is this token's current
 /// `ReadCursor` as already looked up by the caller (`None` when this
 /// token has never consumed before) - the get-or-create lookup itself is
-/// the caller's persistence concern, not this rule's.
+/// the caller's persistence concern, not this rule's. `checkout_lease` is
+/// `config.read_cursor_checkout_lease` - the caller's own
+/// `SkiljBuilder`-configured value, not a spec-time constant (Codeberg
+/// issue #25's investigation, docs/architecture.md §53).
 pub fn consume_events(
     token: &EventReadToken,
     existing_cursor: Option<&ReadCursor>,
@@ -2967,6 +2985,7 @@ pub fn consume_events(
     events: &[Event],
     filters: &[Filter],
     now: chrono::DateTime<chrono::Utc>,
+    checkout_lease: chrono::Duration,
 ) -> crate::error::Result<ConsumeEventsResult> {
     if token.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
@@ -3037,15 +3056,35 @@ pub fn consume_events(
         },
     };
 
-    let served: Vec<Event> = events
-        .iter()
-        .filter(|e| e.bounded_context == read_type.bounded_context)
-        .filter(|e| &e.event_type == read_type)
-        .filter(|e| e.sequence > position)
-        .filter(|e| matches_filters(e, filters))
-        .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
-        .cloned()
-        .collect();
+    // `manual_ack` only, and always `false` when `is_new` (a cursor just
+    // being provisioned was never claimed by anyone) - see
+    // `ReadCursor.checked_out_at`'s own spec doc comment. A claim older
+    // than `checkout_lease` is treated as abandoned rather than live, the
+    // same "self-healing, not a hard failure" register
+    // `fire_due_deadlines`'s own missed-occurrence handling already uses.
+    let is_leased = mode == AckMode::ManualAck
+        && !is_new
+        && existing_cursor
+            .and_then(|c| c.checked_out_at)
+            .is_some_and(|checked_out_at| checked_out_at + checkout_lease > now);
+
+    // `is_leased` overrides everything else to the empty set - a second
+    // caller racing a live claim sees no candidates at all, not a
+    // filtered or scope-narrowed view of them (see `rule ConsumeEvents`'
+    // own identical comment).
+    let served: Vec<Event> = if is_leased {
+        Vec::new()
+    } else {
+        events
+            .iter()
+            .filter(|e| e.bounded_context == read_type.bounded_context)
+            .filter(|e| &e.event_type == read_type)
+            .filter(|e| e.sequence > position)
+            .filter(|e| matches_filters(e, filters))
+            .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
+            .cloned()
+            .collect()
+    };
 
     let next_position = match mode {
         AckMode::AutoAdvance => highest_sequence(&served).unwrap_or(position),
@@ -3057,12 +3096,21 @@ pub fn consume_events(
             token: token.clone(),
             ack_mode: mode,
             sequence: next_position,
+            checked_out_at: (mode == AckMode::ManualAck).then_some(now),
             updated_at: now,
         }))
     } else if mode == AckMode::AutoAdvance {
         CursorUpdate::Advanced {
             sequence: next_position,
             updated_at: now,
+        }
+    } else if !is_leased {
+        // manual_ack, and either never claimed or a stale claim just
+        // reclaimed - this call's own served batch is now this call's
+        // claim to hold until it acknowledges or its own lease lapses in
+        // turn.
+        CursorUpdate::Claimed {
+            checked_out_at: now,
         }
     } else {
         CursorUpdate::Unchanged

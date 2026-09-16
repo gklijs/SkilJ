@@ -395,6 +395,7 @@ fn an_order_placed_event_is_produced_to_kafka_with_its_own_tag_as_the_key() {
             credential: token,
             topic: topic.clone(),
             key_tag_key: Some("order".to_string()),
+            partition: None,
         };
         let http = reqwest::Client::new();
         let retry_policy = skilj_retry::RetryPolicy::default();
@@ -822,6 +823,7 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
             credential: token,
             topic: topic.clone(),
             key_tag_key: Some("order".to_string()),
+            partition: None,
         };
         let http = reqwest::Client::new();
         let retry_policy = skilj_retry::RetryPolicy::bounded(
@@ -872,6 +874,119 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
         assert!(
             mock_state.parked_deliveries.lock().unwrap().is_empty(),
             "outbound gives up by skipping, never by parking"
+        );
+    });
+}
+
+/// Codeberg issue #25's investigation (docs/architecture.md §54) - real
+/// partitioning proof against a real Kafka broker: two `OutboundMapping`s
+/// for the same `EventType`, different `credential`s (simulating two
+/// independent `EventReadToken`s, each seeing the identical stream - the
+/// mock server's own `enqueue` keys by token), same `partition_count`,
+/// different `partition_index`. Each gets a single `produce_once` call
+/// over its own full six-event queue. The union of what actually lands
+/// in Kafka across both must be exactly those six keys, no duplicates
+/// (double-publish) and no gaps (lost delivery) - and every one of the
+/// six sequences must be acknowledged on *both* tokens regardless of
+/// which one actually produced it, proving a partition-skip still
+/// advances that instance's own cursor rather than leaving it stuck.
+#[test]
+fn two_partitioned_mappings_together_produce_every_key_exactly_once() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-partitioned");
+        create_topic(bootstrap_servers, &topic).await;
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let order_ids = ["o-1", "o-2", "o-3", "o-4", "o-5", "o-6"];
+        let events: Vec<Value> = order_ids
+            .iter()
+            .enumerate()
+            .map(|(i, order_id)| {
+                json!({
+                    "sequence": i as i64,
+                    "eventType": "OrderPlaced",
+                    "payload": { "orderId": order_id },
+                    "tags": [{ "key": "order", "value": order_id }],
+                    "metadata": { "correlationId": null, "causationId": null },
+                })
+            })
+            .collect();
+
+        let token_0 = "read-token-partition-0".to_string();
+        let token_1 = "read-token-partition-1".to_string();
+        enqueue(&mock_state, &token_0, "OrderPlaced", events.clone());
+        enqueue(&mock_state, &token_1, "OrderPlaced", events);
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+
+        let http = reqwest::Client::new();
+        let retry_policy = skilj_retry::RetryPolicy::default();
+
+        for (token, partition_index) in [(token_0.clone(), 0u32), (token_1.clone(), 1u32)] {
+            let mapping = OutboundMapping {
+                event_type: "OrderPlaced".to_string(),
+                credential: token,
+                topic: topic.clone(),
+                key_tag_key: Some("order".to_string()),
+                partition: Some((partition_index, 2)),
+            };
+            let mut retry_state = None;
+            produce_once(
+                &http,
+                &skilj_base_url,
+                &producer,
+                &mapping,
+                &retry_policy,
+                &mut retry_state,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut received_keys = std::collections::HashSet::new();
+        for _ in 0..order_ids.len() {
+            let msg = recv_within(&consumer, Duration::from_secs(15)).await;
+            let key =
+                String::from_utf8(msg.key().expect("message must have a key").to_vec()).unwrap();
+            assert!(
+                received_keys.insert(key.clone()),
+                "key {key} was produced more than once - double-publish across partitions"
+            );
+        }
+        assert_eq!(
+            received_keys,
+            order_ids.iter().map(|s| s.to_string()).collect(),
+            "every key must be produced exactly once across both partitions"
+        );
+
+        // Every sequence acknowledged on *both* tokens - a partition-skip
+        // still advances this instance's own cursor, it just never
+        // produces to Kafka.
+        let expected_sequences: Vec<i64> = (0..order_ids.len() as i64).collect();
+        let mut acked = mock_state.acked.lock().unwrap().clone();
+        acked.sort_unstable();
+        acked.dedup();
+        assert_eq!(
+            acked, expected_sequences,
+            "every sequence must be acknowledged, owned by this partition or not"
         );
     });
 }

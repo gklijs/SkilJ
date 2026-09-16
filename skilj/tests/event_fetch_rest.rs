@@ -915,3 +915,62 @@ fn get_events_rejects_a_wrong_secret_for_a_known_token_id_with_401() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     });
 }
+
+/// Codeberg issue #25's investigation (docs/architecture.md §53) - the
+/// real end-to-end proof, not just the pure-function layer
+/// (`skilj-core/tests/event_fetch_surface.rs` covers that): two genuinely
+/// concurrent `GET /v1/events/consume?mode=manual` calls for the same
+/// token, real HTTP through `Skilj::rest_router()`, `tokio::join!` the
+/// same real-concurrency pattern this codebase's own catch-up races use.
+/// Before this fix both would have been served the identical batch -
+/// exactly the gap that let two Kafka/AMQP/NATS bridge instances of the
+/// same `OutboundMapping` double-publish. Now exactly one must be.
+#[test]
+fn two_concurrent_manual_consumes_never_both_serve_the_same_batch() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+
+        deposit(&router, &direct_credential, 5).await;
+
+        let request_a = Request::builder()
+            .method("GET")
+            .uri("/v1/events/consume?mode=manual")
+            .header("authorization", format!("Bearer {read_credential}"))
+            .body(Body::empty())
+            .unwrap();
+        let request_b = Request::builder()
+            .method("GET")
+            .uri("/v1/events/consume?mode=manual")
+            .header("authorization", format!("Bearer {read_credential}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let (response_a, response_b) = tokio::join!(
+            router.clone().oneshot(request_a),
+            router.clone().oneshot(request_b),
+        );
+        let response_a = response_a.unwrap();
+        let response_b = response_b.unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+        assert_eq!(response_b.status(), StatusCode::OK);
+
+        let served_a = response_a.into_body().collect().await.unwrap().to_bytes();
+        let served_b = response_b.into_body().collect().await.unwrap().to_bytes();
+        let json_a: serde_json::Value = serde_json::from_slice(&served_a).unwrap();
+        let json_b: serde_json::Value = serde_json::from_slice(&served_b).unwrap();
+        let count_a = json_a["events"].as_array().unwrap().len();
+        let count_b = json_b["events"].as_array().unwrap().len();
+
+        assert_eq!(
+            count_a + count_b,
+            1,
+            "exactly one of two concurrent manual-ack consumes must serve the one \
+             deposit, never both (double-publish) and never neither (lost delivery): \
+             a={count_a} b={count_b}"
+        );
+    });
+}

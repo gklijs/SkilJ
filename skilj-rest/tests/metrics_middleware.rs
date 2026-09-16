@@ -147,6 +147,7 @@ async fn a_request_records_the_http_server_request_duration_histogram() {
         None,
         EventBroadcaster::new(4),
         EventCache::new(4),
+        chrono::Duration::minutes(5),
     );
 
     let request = Request::builder()

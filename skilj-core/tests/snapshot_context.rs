@@ -443,3 +443,271 @@ fn a_stored_row_at_an_old_version_is_treated_as_absent() {
         assert_eq!(state_v2.balance, 0);
     });
 }
+
+/// Investigation prompted by scoping partitioned/parallel catch-up for
+/// `Snapshot` (following Codeberg issue #25/docs/architecture.md §51's
+/// `Projection` work): before building anything on top of `Snapshot`'s
+/// existing `as_of_sequence` guard (`catch_up_snapshots`'s own
+/// pre-fold check, mirroring the guard §50 had to *add* for
+/// `Projection`), prove directly that it already holds under a real
+/// concurrent race - no test in this file (or anywhere else in the
+/// repo) had done so before this one. `tokio::join!`, the same
+/// real-concurrency pattern `async_projections.rs`'s
+/// `two_concurrent_instances_never_double_fold_the_same_event` uses:
+/// two simultaneous `catch_up_snapshots` calls, simulating two
+/// instances' own background pollers, against one account's `Deposited`
+/// event. A double-fold would land the balance on `200`, not `100`.
+#[test]
+fn two_concurrent_instances_never_double_fold_the_same_snapshot_row() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let dispatcher = TestSnapshotDispatcher {
+            tag_key: "account",
+            version: 1,
+        };
+        let account = unique_name("account");
+
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 100).await;
+
+        let (r1, r2) = tokio::join!(
+            db::catch_up_snapshots(&pool, &bc.name, &dispatcher),
+            db::catch_up_snapshots(&pool, &bc.name, &dispatcher),
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        let resolved = db::resolve_snapshot_context(
+            &pool,
+            &bc.name,
+            &dispatcher,
+            "Balance",
+            &[tag("account", &account)],
+        )
+        .await
+        .unwrap()
+        .expect("a real row now exists");
+        let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+        assert_eq!(state.balance, 100, "double-fold detected!");
+    });
+}
+
+/// Codeberg issue #25 (docs/architecture.md §52) -
+/// `TestSnapshotDispatcher`'s own partitioned twin, delegating
+/// everything except `partition_count` so the tests below don't need
+/// to touch `TestSnapshotDispatcher` or any of its existing
+/// construction sites at all (the trait's own default `partition_count`,
+/// `None` i.e. unpartitioned, already covers every test above
+/// unchanged).
+struct PartitionedTestSnapshotDispatcher {
+    inner: TestSnapshotDispatcher,
+    partition_count: u32,
+}
+
+impl SnapshotDispatcher for PartitionedTestSnapshotDispatcher {
+    fn snapshot_names(&self, bounded_context: &str) -> Vec<&'static str> {
+        self.inner.snapshot_names(bounded_context)
+    }
+
+    fn tag_key(&self, bounded_context: &str, snapshot_name: &str) -> Option<&'static str> {
+        self.inner.tag_key(bounded_context, snapshot_name)
+    }
+
+    fn owner_tag_key(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+    ) -> Option<Option<&'static str>> {
+        self.inner.owner_tag_key(bounded_context, snapshot_name)
+    }
+
+    fn version(&self, bounded_context: &str, snapshot_name: &str) -> Option<u64> {
+        self.inner.version(bounded_context, snapshot_name)
+    }
+
+    fn fold(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+        state_json: &str,
+        event: &Event,
+    ) -> Option<skilj_core::error::Result<String>> {
+        self.inner
+            .fold(bounded_context, snapshot_name, state_json, event)
+    }
+
+    fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String> {
+        self.inner.default_state(bounded_context, snapshot_name)
+    }
+
+    fn partition_count(&self, _bounded_context: &str, snapshot_name: &str) -> Option<u32> {
+        (snapshot_name == "Balance").then_some(self.partition_count)
+    }
+}
+
+/// Codeberg issue #25 - the `Snapshot` twin of
+/// `partitioned_projection_concurrent_instances_fold_every_key_exactly_once`:
+/// three concurrent instances (`tokio::join!`), `PARTITION_COUNT = 4`,
+/// three distinct accounts (tag values). Every account's final balance
+/// must be exactly its own deposits/withdrawals' net - no loss, no
+/// double-fold.
+#[test]
+fn partitioned_snapshot_concurrent_instances_fold_every_tag_value_exactly_once() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let dispatcher = PartitionedTestSnapshotDispatcher {
+            inner: TestSnapshotDispatcher {
+                tag_key: "account",
+                version: 1,
+            },
+            partition_count: 4,
+        };
+        let acc_a = unique_name("account");
+        let acc_b = unique_name("account");
+        let acc_c = unique_name("account");
+
+        insert_money_event(&pool, &bc, &deposited, "account", &acc_a, 10).await;
+        insert_money_event(&pool, &bc, &deposited, "account", &acc_b, 20).await;
+        insert_money_event(&pool, &bc, &deposited, "account", &acc_a, 5).await;
+        insert_money_event(&pool, &bc, &deposited, "account", &acc_c, 7).await;
+        insert_money_event(&pool, &bc, &deposited, "account", &acc_b, 3).await;
+        insert_money_event(&pool, &bc, &deposited, "account", &acc_c, 1).await;
+
+        let (r1, r2, r3) = tokio::join!(
+            db::catch_up_snapshots(&pool, &bc.name, &dispatcher),
+            db::catch_up_snapshots(&pool, &bc.name, &dispatcher),
+            db::catch_up_snapshots(&pool, &bc.name, &dispatcher),
+        );
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+
+        // A partition a losing instance's tick never claimed simply
+        // isn't caught up yet after just one round - a second tick,
+        // standing in for the next scheduled poll, is what a real fleet
+        // would give it anyway.
+        db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+            .await
+            .unwrap();
+
+        for (account, expected) in [(&acc_a, 15), (&acc_b, 23), (&acc_c, 8)] {
+            let resolved = db::resolve_snapshot_context(
+                &pool,
+                &bc.name,
+                &dispatcher,
+                "Balance",
+                &[tag("account", account)],
+            )
+            .await
+            .unwrap()
+            .expect("a real row now exists");
+            let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+            assert_eq!(state.balance, expected, "wrong balance for {account}");
+        }
+    });
+}
+
+/// Codeberg issue #25 - proves a partitioned snapshot's own per-row
+/// `as_of_sequence` reaches the latest committed sequence across several
+/// ticks interleaved with new events, mirroring
+/// `partitioned_projection_caught_up_to_never_regresses_and_reaches_latest`.
+#[test]
+fn partitioned_snapshot_as_of_sequence_reaches_latest_across_ticks() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let dispatcher = PartitionedTestSnapshotDispatcher {
+            inner: TestSnapshotDispatcher {
+                tag_key: "account",
+                version: 1,
+            },
+            partition_count: 4,
+        };
+        let account = unique_name("account");
+
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 1).await;
+        db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+            .await
+            .unwrap();
+
+        let last_seq = insert_money_event(&pool, &bc, &deposited, "account", &account, 2).await;
+        for _ in 0..3 {
+            db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+                .await
+                .unwrap();
+        }
+
+        let resolved = db::resolve_snapshot_context(
+            &pool,
+            &bc.name,
+            &dispatcher,
+            "Balance",
+            &[tag("account", &account)],
+        )
+        .await
+        .unwrap()
+        .expect("a real row now exists");
+        assert_eq!(resolved.as_of_sequence, last_seq);
+        let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+        assert_eq!(state.balance, 3);
+    });
+}
+
+/// Codeberg issue #25 - `PARTITION_COUNT = 4` with only one real tag
+/// value touched: three of the four partitions have no matching tag
+/// value in any event, proving idle partitions still advance their own
+/// progress (so the rollup can still reach `latest`) purely from
+/// scanning the batch, mirroring
+/// `partitioned_projection_uneven_key_distribution_converges`.
+#[test]
+fn partitioned_snapshot_uneven_tag_distribution_converges() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let dispatcher = PartitionedTestSnapshotDispatcher {
+            inner: TestSnapshotDispatcher {
+                tag_key: "account",
+                version: 1,
+            },
+            partition_count: 4,
+        };
+        let account = unique_name("account");
+
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 4).await;
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 6).await;
+        let last_seq = insert_money_event(&pool, &bc, &deposited, "account", &account, 1).await;
+
+        for _ in 0..2 {
+            db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+                .await
+                .unwrap();
+        }
+
+        let resolved = db::resolve_snapshot_context(
+            &pool,
+            &bc.name,
+            &dispatcher,
+            "Balance",
+            &[tag("account", &account)],
+        )
+        .await
+        .unwrap()
+        .expect("a real row now exists");
+        assert_eq!(resolved.as_of_sequence, last_seq);
+        let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+        assert_eq!(state.balance, 11);
+    });
+}

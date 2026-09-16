@@ -165,6 +165,7 @@ async fn a_request_with_a_traceparent_header_continues_that_trace() {
         None,
         EventBroadcaster::new(4),
         EventCache::new(4),
+        chrono::Duration::minutes(5),
     );
 
     let injected_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";

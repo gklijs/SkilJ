@@ -771,6 +771,7 @@ fn apply_cursor_update_created_then_advanced_round_trips() {
             ack_mode: AckMode::AutoAdvance,
             sequence: 0,
             updated_at: created_at,
+            checked_out_at: None,
         }));
         db::apply_cursor_update(&pool, &token, &created)
             .await
@@ -778,6 +779,7 @@ fn apply_cursor_update_created_then_advanced_round_trips() {
         let loaded = db::get_read_cursor(&pool, &token).await.unwrap().unwrap();
         assert_eq!(loaded.sequence, 0);
         assert_eq!(loaded.ack_mode, AckMode::AutoAdvance);
+        assert_eq!(loaded.checked_out_at, None);
 
         let advanced_at = test_now();
         let advanced = CursorUpdate::Advanced {
@@ -792,6 +794,63 @@ fn apply_cursor_update_created_then_advanced_round_trips() {
         // ack_mode isn't part of an Advanced update - it stays whatever
         // Created it with, per ReadCursor's own 1:1-with-a-token shape.
         assert_eq!(loaded.ack_mode, AckMode::AutoAdvance);
+    });
+}
+
+/// Codeberg issue #25's investigation (docs/architecture.md §53) -
+/// `CursorUpdate::Claimed` round-trips through `apply_cursor_update`
+/// without touching `sequence`/`updated_at`, the same "a claim alone
+/// never moves the cursor's own position" guarantee
+/// `event_store::consume_events`' own doc comment describes.
+#[test]
+fn apply_cursor_update_claimed_round_trips_without_moving_sequence() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let token = EventReadToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            event_type: et,
+            scope: None,
+            start_from: EventReadStartPosition::Beginning,
+            start_at_sequence: None,
+            start_at_time: None,
+        };
+        db::insert_event_read_token(&pool, &token).await.unwrap();
+        db::apply_cursor_update(
+            &pool,
+            &token,
+            &CursorUpdate::Created(Box::new(ReadCursor {
+                token: token.clone(),
+                ack_mode: AckMode::ManualAck,
+                sequence: 3,
+                updated_at: test_now(),
+                checked_out_at: None,
+            })),
+        )
+        .await
+        .unwrap();
+
+        let claimed_at = test_now();
+        db::apply_cursor_update(
+            &pool,
+            &token,
+            &CursorUpdate::Claimed {
+                checked_out_at: claimed_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        let loaded = db::get_read_cursor(&pool, &token).await.unwrap().unwrap();
+        assert_eq!(loaded.sequence, 3, "a claim alone must not move sequence");
+        assert_eq!(loaded.checked_out_at, Some(claimed_at));
     });
 }
 
@@ -824,7 +883,21 @@ fn record_acknowledgement_moves_the_cursor() {
                 ack_mode: AckMode::ManualAck,
                 sequence: -1,
                 updated_at: test_now(),
+                checked_out_at: None,
             })),
+        )
+        .await
+        .unwrap();
+        // Codeberg issue #25's investigation (docs/architecture.md §53) -
+        // a live claim, so the assertion below actually proves
+        // `record_acknowledgement` clears it rather than it having never
+        // been set in the first place.
+        db::apply_cursor_update(
+            &pool,
+            &token,
+            &CursorUpdate::Claimed {
+                checked_out_at: test_now(),
+            },
         )
         .await
         .unwrap();
@@ -837,6 +910,10 @@ fn record_acknowledgement_moves_the_cursor() {
         let loaded = db::get_read_cursor(&pool, &token).await.unwrap().unwrap();
         assert_eq!(loaded.sequence, 3);
         assert_eq!(loaded.ack_mode, AckMode::ManualAck);
+        assert_eq!(
+            loaded.checked_out_at, None,
+            "AcknowledgeEvents must clear any live claim unconditionally"
+        );
     });
 }
 

@@ -137,6 +137,13 @@ pub struct Skilj {
     /// `ProjectionQuery`'s own `wait_for_sequence` timeout - see
     /// `SkiljBuilder::projection_query_wait_timeout`'s own doc comment.
     projection_query_wait_timeout: std::time::Duration,
+    /// `ConsumeEvents`' own `manual_ack` claim lease - see
+    /// `SkiljBuilder::read_cursor_checkout_lease`'s own doc comment.
+    /// Consulted per-request by `rest_router()`'s `GET /v1/events/consume`
+    /// route, the same "stored on `Skilj` itself, not just consumed once
+    /// in `.build()`" treatment `projection_query_wait_timeout` already
+    /// gets, for the identical reason.
+    read_cursor_checkout_lease: std::time::Duration,
     /// `protect_sensitive_fields`'s own envelope-encryption master key -
     /// see `SkiljBuilder::encryption_master_key`'s own doc comment.
     /// `None` when never configured - fine as long as no bounded context
@@ -349,6 +356,13 @@ impl skilj_core::plugin::ProjectionDispatcher for ProjectionDispatcherImpl {
     ) -> Option<Option<&'static str>> {
         Some(self.registered(bounded_context, projection_name)?.team_only)
     }
+
+    fn partition_count(&self, bounded_context: &str, projection_name: &str) -> Option<u32> {
+        Some(
+            self.registered(bounded_context, projection_name)?
+                .partition_count,
+        )
+    }
 }
 
 /// `EventDispatcher`'s own implementer - same shape and reasoning as
@@ -453,6 +467,16 @@ impl skilj_core::plugin::SnapshotDispatcher for SnapshotDispatcherImpl {
             .get(&(bounded_context, snapshot_name.to_string()))?;
         Some(registered.default_state_json.clone())
     }
+
+    fn partition_count(&self, bounded_context: &str, snapshot_name: &str) -> Option<u32> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        let registered = self
+            .snapshots
+            .get(&(bounded_context, snapshot_name.to_string()))?;
+        Some(registered.partition_count)
+    }
 }
 
 /// `CrossContextRouteDispatcher`'s own implementer - a thin wrapper
@@ -544,6 +568,10 @@ impl Skilj {
             deadline_poll_interval: std::time::Duration::from_millis(500),
             scheduler_poll_interval: std::time::Duration::from_secs(1),
             projection_query_wait_timeout: std::time::Duration::from_secs(5),
+            // Codeberg issue #25's investigation (docs/architecture.md
+            // §53) - matches `config.read_cursor_checkout_lease`'s own
+            // default in specs/skilj.allium.
+            read_cursor_checkout_lease: std::time::Duration::from_secs(5 * 60),
             encryption_master_key: None,
             event_broadcast_capacity: 1024,
             event_cache_warm_up_count: 1000,
@@ -627,6 +655,14 @@ impl Skilj {
             self.encryption_master_key.clone(),
             self.event_broadcaster.clone(),
             self.event_cache.clone(),
+            // Codeberg issue #25 (docs/architecture.md §53) -
+            // `chrono::Duration::from_std` only fails for a duration too
+            // large to fit, never a real concern for a checkout lease
+            // measured in minutes; the same fallback
+            // `skilj-kafka`/`skilj-amqp`/`skilj-nats`'s own retry-backoff
+            // conversions already use.
+            chrono::Duration::from_std(self.read_cursor_checkout_lease)
+                .unwrap_or(chrono::Duration::zero()),
         )
     }
 
@@ -894,6 +930,7 @@ struct RegisteredProjection {
     default_state_json: String,
     owner_tag_key: Option<&'static str>,
     team_only: Option<&'static str>,
+    partition_count: u32,
     keys: KeysFn,
     project: ProjectFn,
 }
@@ -912,6 +949,7 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
         default_state_json,
         owner_tag_key: T::OWNER_TAG_KEY,
         team_only: T::TEAM_ONLY,
+        partition_count: T::PARTITION_COUNT,
         keys: Box::new(move |event| {
             if !consumed_for_keys
                 .iter()
@@ -984,6 +1022,7 @@ struct RegisteredSnapshot {
     tag_key: &'static str,
     owner_tag_key: Option<&'static str>,
     version: u64,
+    partition_count: u32,
     default_state_json: String,
     fold: SnapshotFoldFn,
 }
@@ -996,6 +1035,7 @@ fn registered_snapshot<T: Snapshot + 'static>() -> RegisteredSnapshot {
         tag_key: T::TAG_KEY,
         owner_tag_key: T::OWNER_TAG_KEY,
         version: T::VERSION,
+        partition_count: T::PARTITION_COUNT,
         default_state_json,
         fold: Box::new(|state_json, event| {
             let mut state: T::State = serde_json::from_str(state_json)
@@ -1165,6 +1205,7 @@ pub struct SkiljBuilder {
     deadline_poll_interval: std::time::Duration,
     scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
+    read_cursor_checkout_lease: std::time::Duration,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
@@ -1389,6 +1430,26 @@ impl SkiljBuilder {
         self
     }
 
+    /// How long a `GET /v1/events/consume?mode=manual`'s claim on a
+    /// `manual_ack` `ReadCursor` holds before a second concurrent caller
+    /// for the same token may reclaim it - `config.read_cursor_checkout_lease`
+    /// in specs/skilj.allium, `ReadCursor.checked_out_at`'s own spec doc
+    /// comment. Codeberg issue #25's investigation (docs/architecture.md
+    /// §53): closes the gap where two bridge instances of the same
+    /// `skilj-kafka`/`skilj-amqp`/`skilj-nats` `OutboundMapping` (or any
+    /// other manual-ack REST consumer) could both be served, and both act
+    /// on, the same unacknowledged batch. Defaults to 5 minutes, matching
+    /// the spec's own default - generous enough that an ordinary caller's
+    /// poll-serve-act-acknowledge cycle never trips it, short enough that
+    /// a caller which crashes after being served does not leave the
+    /// stream stuck for long. Meaningless for `auto_advance`, which has no
+    /// equivalent gap (serving already advances its own cursor in the
+    /// same moment) - this only ever affects `manual_ack` cursors.
+    pub fn read_cursor_checkout_lease(mut self, lease: std::time::Duration) -> Self {
+        self.read_cursor_checkout_lease = lease;
+        self
+    }
+
     /// `protect_sensitive_fields`'s own envelope-encryption master key -
     /// see `skilj_core::encryption`'s own module doc comment for the full
     /// design. Optional: a bounded context with no real `sensitive_fields`
@@ -1575,6 +1636,7 @@ impl SkiljBuilder {
 
         let poll_interval = self.async_projection_poll_interval;
         let projection_query_wait_timeout = self.projection_query_wait_timeout;
+        let read_cursor_checkout_lease = self.read_cursor_checkout_lease;
         let encryption_master_key = self.encryption_master_key;
         let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
         let revocation_broadcaster = RevocationBroadcaster::new();
@@ -1667,6 +1729,27 @@ impl SkiljBuilder {
                     // own doc comments.
                     skilj_core::db::ensure_deadline_cursors_table(pool, &bc.name).await?;
                     skilj_core::db::ensure_deadlines_table(pool, &bc.name).await?;
+                    // Codeberg issue #25: partitioned async Projection
+                    // catch-up - same "patched into every bounded
+                    // context, every startup" treatment, for a brand-new
+                    // table that needs no migration dance. See
+                    // `ensure_projection_partition_progress_table`'s own
+                    // doc comment.
+                    skilj_core::db::ensure_projection_partition_progress_table(pool, &bc.name)
+                        .await?;
+                    // Codeberg issue #25 (docs/architecture.md §52):
+                    // partitioned Snapshot catch-up - same treatment,
+                    // for `Snapshot`'s own twin table. See
+                    // `ensure_snapshot_partition_progress_table`'s own
+                    // doc comment.
+                    skilj_core::db::ensure_snapshot_partition_progress_table(pool, &bc.name)
+                        .await?;
+                    // Codeberg issue #25 (docs/architecture.md §53): the
+                    // read_cursors checkout mechanism closing the
+                    // Kafka/AMQP/NATS outbound bridges' double-publish
+                    // gap. See `ensure_read_cursors_checkout_column`'s
+                    // own doc comment.
+                    skilj_core::db::ensure_read_cursors_checkout_column(pool, &bc.name).await?;
                     // External-message dedup (docs/architecture.md §39,
                     // specs/skilj.allium's own rule CreateExternalEvent) -
                     // same "patched into every bounded context, every
@@ -1761,6 +1844,7 @@ impl SkiljBuilder {
             bootstrap_secret,
             identity_provider,
             projection_query_wait_timeout,
+            read_cursor_checkout_lease,
             encryption_master_key,
             event_broadcaster,
             revocation_broadcaster,

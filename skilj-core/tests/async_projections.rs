@@ -50,6 +50,20 @@ impl ProjectionDispatcher for TestDispatcher {
                 Some(vec![String::new()])
             }
             "AccountBalance" | "AccountBalanceCopy" => Some(Vec::new()),
+            // Codeberg issue #25 - a real multi-key projection, keyed by
+            // the payload's own `account` field, for the new partitioned
+            // catch-up tests below. `PARTITION_COUNT` for this name is
+            // `4` - see `partition_count` below.
+            "PartitionedAccountBalances" if event.event_type.name == "MoneyDeposited" => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&event.payload).expect("test payload is always JSON");
+                let account = payload["account"]
+                    .as_str()
+                    .expect("keyed test events always carry an account field")
+                    .to_string();
+                Some(vec![account])
+            }
+            "PartitionedAccountBalances" => Some(Vec::new()),
             _ => None,
         }
     }
@@ -63,7 +77,7 @@ impl ProjectionDispatcher for TestDispatcher {
         _key: &str,
     ) -> Option<skilj_core::error::Result<String>> {
         match projection_name {
-            "AccountBalance" | "AccountBalanceCopy" => {
+            "AccountBalance" | "AccountBalanceCopy" | "PartitionedAccountBalances" => {
                 if event.event_type.name != "MoneyDeposited" {
                     return Some(Ok(state_json.to_string()));
                 }
@@ -81,7 +95,9 @@ impl ProjectionDispatcher for TestDispatcher {
 
     fn default_state(&self, _bounded_context: &str, projection_name: &str) -> Option<String> {
         match projection_name {
-            "AccountBalance" | "AccountBalanceCopy" => Some("0".to_string()),
+            "AccountBalance" | "AccountBalanceCopy" | "PartitionedAccountBalances" => {
+                Some("0".to_string())
+            }
             _ => None,
         }
     }
@@ -92,7 +108,7 @@ impl ProjectionDispatcher for TestDispatcher {
         projection_name: &str,
     ) -> Option<Option<&'static str>> {
         match projection_name {
-            "AccountBalance" | "AccountBalanceCopy" => Some(None),
+            "AccountBalance" | "AccountBalanceCopy" | "PartitionedAccountBalances" => Some(None),
             _ => None,
         }
     }
@@ -103,7 +119,22 @@ impl ProjectionDispatcher for TestDispatcher {
         projection_name: &str,
     ) -> Option<Option<&'static str>> {
         match projection_name {
-            "AccountBalance" | "AccountBalanceCopy" => Some(None),
+            "AccountBalance" | "AccountBalanceCopy" | "PartitionedAccountBalances" => Some(None),
+            _ => None,
+        }
+    }
+
+    /// Codeberg issue #25 - `AccountBalance`/`AccountBalanceCopy` are
+    /// deliberately left unmatched here (falling through to `None`,
+    /// `catch_up_bounded_context`'s own "not recognized" treatment,
+    /// identical in effect to `Some(1)`): the realistic default for a
+    /// dispatcher that never opts a projection into partitioning at all,
+    /// proving the pre-existing, unmodified test suite above (still
+    /// green, unchanged by this pass) already covers "`PARTITION_COUNT`
+    /// resolves to 1 behaves exactly as before."
+    fn partition_count(&self, _bounded_context: &str, projection_name: &str) -> Option<u32> {
+        match projection_name {
+            "PartitionedAccountBalances" => Some(4),
             _ => None,
         }
     }
@@ -279,6 +310,48 @@ fn event(bc: &BoundedContext, et: &EventType, sequence: i64, amount: i64) -> Eve
 async fn insert_plain_event(pool: &Pool, bc: &BoundedContext, et: &EventType, amount: i64) -> i64 {
     let seq = db::next_sequence(pool, &bc.name).await.unwrap();
     let e = event(bc, et, seq, amount);
+    db::insert_event(pool, &e, None).await.unwrap();
+    seq
+}
+
+/// `event`'s own keyed twin (Codeberg issue #25) - carries an `account`
+/// field alongside `amount` so `TestDispatcher`'s `"PartitionedAccountBalances"`
+/// arm has something real to key/partition by.
+fn keyed_event(
+    bc: &BoundedContext,
+    et: &EventType,
+    sequence: i64,
+    account: &str,
+    amount: i64,
+) -> Event {
+    Event {
+        bounded_context: bc.clone(),
+        event_type: et.clone(),
+        payload: format!(r#"{{"account":"{account}","amount":{amount}}}"#),
+        metadata: Metadata {
+            r#type: et.name.clone(),
+            version: et.schema_version,
+            client_id: "someone".to_string(),
+            created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
+        },
+        sequence,
+        tags: Vec::new(),
+        encryption_keys: Vec::new(),
+        origin: EventOrigin::DirectlyCreated,
+    }
+}
+
+async fn insert_keyed_event(
+    pool: &Pool,
+    bc: &BoundedContext,
+    et: &EventType,
+    account: &str,
+    amount: i64,
+) -> i64 {
+    let seq = db::next_sequence(pool, &bc.name).await.unwrap();
+    let e = keyed_event(bc, et, seq, account, amount);
     db::insert_event(pool, &e, None).await.unwrap();
     seq
 }
@@ -870,5 +943,207 @@ fn two_concurrent_first_time_registrations_never_double_fold_history() {
             .await
             .unwrap();
         assert_eq!(state, Some("20".to_string()));
+    });
+}
+
+/// Codeberg issue #25 (docs/architecture.md §51) - proves
+/// `catch_up_partitioned_projection`'s core correctness claim under a
+/// real race: `M` concurrent instances (`tokio::join!`, the same
+/// real-concurrency pattern `two_concurrent_instances_never_double_fold_the_same_event`
+/// above uses) both calling `catch_up_bounded_context` against the same
+/// `PARTITION_COUNT = 4` projection with three distinct keys (accounts),
+/// several deposits spread across them. Every account's final folded
+/// state must be exactly its own deposits' sum - no loss (a partition
+/// nobody ever claims), and no double-fold (two instances both winning
+/// the same partition's lock, impossible by construction, but this is
+/// the test that would catch it if the guard ever regressed).
+#[test]
+fn partitioned_projection_concurrent_instances_fold_every_key_exactly_once() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "PartitionedAccountBalances", vec![et.clone()]).await;
+
+        insert_keyed_event(&pool, &bc, &et, "acc-a", 10).await;
+        insert_keyed_event(&pool, &bc, &et, "acc-b", 20).await;
+        insert_keyed_event(&pool, &bc, &et, "acc-a", 5).await;
+        insert_keyed_event(&pool, &bc, &et, "acc-c", 7).await;
+        insert_keyed_event(&pool, &bc, &et, "acc-b", 3).await;
+        insert_keyed_event(&pool, &bc, &et, "acc-c", 1).await;
+
+        let (r1, r2, r3) = tokio::join!(
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher),
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher),
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher),
+        );
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+
+        // A partition a losing instance's tick never got to claim (or
+        // claimed but lost the lock race on) simply isn't caught up yet
+        // after just one round - a second tick, standing in for the next
+        // scheduled poll, is what a real fleet would give it anyway.
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        let state_a =
+            db::get_projection_state(&pool, &bc.name, "PartitionedAccountBalances", "acc-a")
+                .await
+                .unwrap();
+        let state_b =
+            db::get_projection_state(&pool, &bc.name, "PartitionedAccountBalances", "acc-b")
+                .await
+                .unwrap();
+        let state_c =
+            db::get_projection_state(&pool, &bc.name, "PartitionedAccountBalances", "acc-c")
+                .await
+                .unwrap();
+        assert_eq!(state_a, Some("15".to_string()));
+        assert_eq!(state_b, Some("23".to_string()));
+        assert_eq!(state_c, Some("8".to_string()));
+    });
+}
+
+/// Codeberg issue #25 - `projections.caught_up_to` (the single external
+/// source of truth GraphQL's `caughtUpTo`/`wait_until_caught_up` depend
+/// on) must stay a correct, monotonically non-decreasing rollup across
+/// several ticks interleaved with new events landing, exactly reaching
+/// `latest_sequence` once every partition has genuinely caught up - not
+/// a per-partition number leaking through, and never regressing partway.
+#[test]
+fn partitioned_projection_caught_up_to_never_regresses_and_reaches_latest() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "PartitionedAccountBalances", vec![et.clone()]).await;
+
+        insert_keyed_event(&pool, &bc, &et, "acc-a", 1).await;
+        insert_keyed_event(&pool, &bc, &et, "acc-b", 2).await;
+
+        let mut last_caught_up_to = None;
+        for _ in 0..3 {
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+                .await
+                .unwrap();
+            let projection = db::get_projection(&pool, &bc.name, "PartitionedAccountBalances")
+                .await
+                .unwrap()
+                .unwrap();
+            if let (Some(last), Some(current)) = (last_caught_up_to, projection.caught_up_to) {
+                assert!(
+                    current >= last,
+                    "caught_up_to regressed: {last} -> {current}"
+                );
+            }
+            last_caught_up_to = projection.caught_up_to;
+        }
+
+        let last_seq = insert_keyed_event(&pool, &bc, &et, "acc-c", 3).await;
+        for _ in 0..3 {
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+                .await
+                .unwrap();
+        }
+
+        let projection = db::get_projection(&pool, &bc.name, "PartitionedAccountBalances")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.caught_up_to, Some(last_seq));
+    });
+}
+
+/// Codeberg issue #25 - `PARTITION_COUNT = 4` with only one real key
+/// touched: three of the four partitions have no matching key at all in
+/// any event, proving `catch_up_partitioned_projection`'s own idle
+/// partitions still advance their own progress (so the rollup can still
+/// reach `latest`) purely from scanning the batch, not from ever
+/// actually folding anything.
+#[test]
+fn partitioned_projection_uneven_key_distribution_converges() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "PartitionedAccountBalances", vec![et.clone()]).await;
+
+        insert_keyed_event(&pool, &bc, &et, "only-account", 4).await;
+        insert_keyed_event(&pool, &bc, &et, "only-account", 6).await;
+        let last_seq = insert_keyed_event(&pool, &bc, &et, "only-account", 1).await;
+
+        for _ in 0..2 {
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+                .await
+                .unwrap();
+        }
+
+        let projection = db::get_projection(&pool, &bc.name, "PartitionedAccountBalances")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.caught_up_to, Some(last_seq));
+        let state = db::get_projection_state(
+            &pool,
+            &bc.name,
+            "PartitionedAccountBalances",
+            "only-account",
+        )
+        .await
+        .unwrap();
+        assert_eq!(state, Some("11".to_string()));
+    });
+}
+
+/// Codeberg issue #25 - one bounded context registering both an
+/// unpartitioned (`AccountBalance`) and a partitioned
+/// (`PartitionedAccountBalances`) projection at once, proving the
+/// `unpartitioned_async_projections`/`partitioned_async_projections`
+/// split inside `catch_up_bounded_context` doesn't cross-contaminate
+/// either path within one tick.
+#[test]
+fn catching_up_a_bounded_context_with_both_partitioned_and_unpartitioned_projections_keeps_both_correct(
+) {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        seed_async_projection(&pool, &bc, "PartitionedAccountBalances", vec![et.clone()]).await;
+
+        insert_keyed_event(&pool, &bc, &et, "acc-a", 10).await;
+        insert_keyed_event(&pool, &bc, &et, "acc-b", 20).await;
+
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        let unpartitioned_state = db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+            .await
+            .unwrap();
+        assert_eq!(unpartitioned_state, Some("30".to_string()));
+
+        let a = db::get_projection_state(&pool, &bc.name, "PartitionedAccountBalances", "acc-a")
+            .await
+            .unwrap();
+        let b = db::get_projection_state(&pool, &bc.name, "PartitionedAccountBalances", "acc-b")
+            .await
+            .unwrap();
+        assert_eq!(a, Some("10".to_string()));
+        assert_eq!(b, Some("20".to_string()));
     });
 }

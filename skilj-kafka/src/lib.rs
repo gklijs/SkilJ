@@ -112,6 +112,67 @@ pub struct OutboundMapping {
     /// distributes the message across partitions on its own (round-robin
     /// by default). See [`correlation_key`].
     pub key_tag_key: Option<String>,
+    /// `Some((partition_index, partition_count))` splits this
+    /// `EventType`'s own outbound work across `partition_count`
+    /// independent bridge instances (Codeberg issue #25's investigation,
+    /// docs/architecture.md §54) - each with its own dedicated
+    /// `credential` (a distinct `EventReadToken`, so each gets its own
+    /// independently-checkout-protected `read_cursors` row, §53 - no new
+    /// coordination is needed beyond that). `None` (the default) means
+    /// unpartitioned: this mapping alone handles every event, exactly as
+    /// before this feature existed.
+    ///
+    /// Reuses [`correlation_key`]'s own output as the partitioning
+    /// input: the same tag that drives Kafka's own native partition
+    /// assignment also decides which bridge instance is responsible for
+    /// an event, via the identical FNV-1a hash
+    /// (`skilj_core::db::partition_for_key`) skilj-core's own §51/§52
+    /// partitioning already established, vendored here rather than
+    /// pulled in as a dependency (this crate is deliberately
+    /// skilj-core-free - see the module doc comment). An event with no
+    /// derivable key (no `key_tag_key` configured, or the tag absent)
+    /// hashes on the empty string, which is a real, stable answer - just
+    /// one that sends every keyless event to whichever single partition
+    /// happens to own that hash, not spread across instances. A
+    /// partitioned mapping that doesn't own a given event still
+    /// acknowledges it (advancing this instance's own cursor past it)
+    /// without producing it to Kafka - the identical "position always
+    /// advances even when nothing happens for this particular item"
+    /// treatment `catch_up_cross_context_route` already gives an
+    /// unregistered target command type.
+    pub partition: Option<(u32, u32)>,
+}
+
+/// `skilj_core::db::partition_for_key`'s own hand-written 64-bit FNV-1a,
+/// vendored rather than pulled in via a `skilj-core` dependency (this
+/// crate is deliberately skilj-core-free - see the module doc comment).
+/// Not `std::collections::hash_map::DefaultHasher`, which is explicitly
+/// not guaranteed stable across Rust versions/std/build flags - unsuitable
+/// for a scheme that must agree across every bridge instance in a fleet,
+/// possibly running slightly different builds mid rolling-deploy.
+fn partition_for_key(key: &str, partition_count: u32) -> u32 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash % u64::from(partition_count.max(1))) as u32
+}
+
+/// Whether `mapping` (partitioned or not) is responsible for an event
+/// whose own [`correlation_key`] output is `key` - `true` unconditionally
+/// for an unpartitioned mapping (`partition: None`), matching
+/// [`partition_for_key`] against this mapping's own `partition_index`
+/// otherwise.
+fn owns_partition_for(mapping: &OutboundMapping, key: Option<&str>) -> bool {
+    match mapping.partition {
+        None => true,
+        Some((partition_index, partition_count)) => {
+            partition_for_key(key.unwrap_or(""), partition_count) == partition_index
+        }
+    }
 }
 
 /// One event served by skilj's own `GET /v1/events/consume` - the subset
@@ -331,9 +392,30 @@ pub async fn produce_once(
 
     let mut served = 0;
     for event in &consumed.events {
-        match produce_and_ack_one(http, skilj_base_url, producer, mapping, event).await {
+        let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
+        let owned = owns_partition_for(mapping, key.as_deref());
+        let outcome = if owned {
+            produce_and_ack_one(http, skilj_base_url, producer, mapping, event).await
+        } else {
+            // Codeberg issue #25's investigation (docs/architecture.md
+            // §54) - not this instance's own partition: acknowledged
+            // (so this instance's own cursor still advances past it)
+            // without ever being produced to Kafka. Whichever instance
+            // *does* own this event's own partition sees it too, via its
+            // own dedicated credential/cursor - see `OutboundMapping::partition`'s
+            // own doc comment.
+            ack_event(http, skilj_base_url, mapping, event.sequence).await
+        };
+        match outcome {
             Ok(()) => {
-                served += 1;
+                // A partition-skip is acknowledged but not counted here,
+                // the identical "not misleading a caller checking did
+                // this cycle make real progress" treatment this
+                // function's own doc comment already gives a
+                // retry-exhausted skip below.
+                if owned {
+                    served += 1;
+                }
                 if retry_state.is_some_and(|s| s.sequence == event.sequence) {
                     *retry_state = None;
                 }
@@ -836,5 +918,69 @@ mod tests {
             value: None,
         }];
         assert_eq!(correlation_key(Some("order"), &tags), None);
+    }
+
+    // --- Codeberg issue #25's investigation (docs/architecture.md §54) ---
+
+    #[test]
+    fn owns_partition_for_is_always_true_when_unpartitioned() {
+        let mapping = OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: "irrelevant".to_string(),
+            topic: "irrelevant".to_string(),
+            key_tag_key: None,
+            partition: None,
+        };
+        for key in [None, Some("o-1"), Some("o-2"), Some("")] {
+            assert!(owns_partition_for(&mapping, key));
+        }
+    }
+
+    /// Every key must be owned by exactly one partition index - not zero
+    /// (a key silently dropped by every instance) and not more than one
+    /// (a key double-published by two instances), for a real spread of
+    /// keys, not just one.
+    #[test]
+    fn owns_partition_for_assigns_every_key_to_exactly_one_partition() {
+        let partition_count = 4;
+        let keys: Vec<Option<&str>> = vec![
+            Some("o-1"),
+            Some("o-2"),
+            Some("o-3"),
+            Some("o-4"),
+            Some("o-5"),
+            Some("o-6"),
+            Some("o-7"),
+            Some("o-8"),
+            None,
+        ];
+        for key in keys {
+            let owners: Vec<u32> = (0..partition_count)
+                .filter(|&partition_index| {
+                    owns_partition_for(
+                        &OutboundMapping {
+                            event_type: "OrderPlaced".to_string(),
+                            credential: "irrelevant".to_string(),
+                            topic: "irrelevant".to_string(),
+                            key_tag_key: None,
+                            partition: Some((partition_index, partition_count)),
+                        },
+                        key,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                owners.len(),
+                1,
+                "key {key:?} must be owned by exactly one of {partition_count} partitions, \
+                 got {owners:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_for_key_is_deterministic_across_calls() {
+        assert_eq!(partition_for_key("o-1", 4), partition_for_key("o-1", 4));
+        assert_eq!(partition_for_key("", 4), partition_for_key("", 4));
     }
 }

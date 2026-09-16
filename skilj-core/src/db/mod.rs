@@ -643,6 +643,12 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
+    // Codeberg issue #25 - `projection_partition_progress`, a brand-new
+    // table, so `ensure_projection_partition_progress_table`'s own
+    // `CREATE TABLE IF NOT EXISTS` is the whole story here too - see its
+    // own doc comment. Must run after `projections` (just above) exists,
+    // since its own `projection_name` column references it.
+    ensure_projection_partition_progress_table(&mut **tx, bounded_context).await?;
 
     // Backs `next_sequence` - one row, seeded below, incremented under
     // the row lock its own `UPDATE ... RETURNING` acquires. `-1` is
@@ -759,6 +765,15 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
+    // Codeberg issue #25 (docs/architecture.md §52) -
+    // `snapshot_partition_progress`, a brand-new table, so
+    // `ensure_snapshot_partition_progress_table`'s own `CREATE TABLE IF
+    // NOT EXISTS` is the whole story here too - see its own doc
+    // comment. No ordering constraint to worry about (unlike
+    // `projection_partition_progress`'s own `REFERENCES {schema}.projections`):
+    // `snapshots`/`snapshot_progress` have no backing registration table
+    // either, so this one doesn't reference anything.
+    ensure_snapshot_partition_progress_table(&mut **tx, bounded_context).await?;
     // See `command_encryption_keys` above - the identical join-table
     // treatment, keyed by `sequence` instead of a synthetic id since
     // `events.sequence` is already `Event`'s own natural primary key.
@@ -813,7 +828,8 @@ async fn provision_bounded_context_schema(
             token_id TEXT PRIMARY KEY REFERENCES {schema}.access_tokens (id),
             ack_mode TEXT NOT NULL CHECK (ack_mode IN ('auto_advance', 'manual_ack')),
             sequence BIGINT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL
+            updated_at TIMESTAMPTZ NOT NULL,
+            checked_out_at TIMESTAMPTZ
         )"
     )))
     .execute(&mut **tx)
@@ -1393,6 +1409,73 @@ pub async fn ensure_deadline_cursors_table<'e>(
     Ok(())
 }
 
+/// Codeberg issue #25's investigation (docs/architecture.md §50/§51) -
+/// one row per `(projection_name, partition_index)` a partitioned async
+/// `Projection` (`Projection::PARTITION_COUNT > 1`) has ever had a
+/// `catch_up_partitioned_projection` tick seed or advance. `caught_up_to`
+/// here is this one partition's own position, distinct from
+/// `projections.caught_up_to` - the latter stays the single external
+/// source of truth (`Projection.caughtUpTo` over GraphQL,
+/// `wait_until_caught_up`), rolled up as the `MIN(caught_up_to)` across
+/// a projection's own partition rows every tick. `DEFAULT -1` matches
+/// `projection_state.as_of_sequence`'s own "nothing folded yet"
+/// convention. Same `impl PgExecutor`/`CREATE TABLE IF NOT EXISTS`
+/// treatment as every sibling `ensure_*_table` function here - see
+/// `ensure_idempotency_keys_table`'s own doc comment for the full
+/// "brand-new bounded context vs. patching an already-provisioned one"
+/// story.
+pub async fn ensure_projection_partition_progress_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.projection_partition_progress (
+            projection_name TEXT NOT NULL REFERENCES {schema}.projections (name),
+            partition_index INT NOT NULL,
+            caught_up_to BIGINT NOT NULL DEFAULT -1,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (projection_name, partition_index)
+        )"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `Snapshot`'s own twin of `ensure_projection_partition_progress_table`
+/// just above - one row per `(snapshot_name, partition_index)` a
+/// partitioned `Snapshot` (`Snapshot::PARTITION_COUNT > 1`) has ever had
+/// a `catch_up_partitioned_snapshot` tick seed or advance
+/// (docs/architecture.md §52). `caught_up_to` is this one partition's
+/// own position, distinct from `snapshot_progress.caught_up_to` - the
+/// latter stays the single external rollup (`MIN(caught_up_to)` across
+/// a snapshot's own partition rows every tick), the identical relation
+/// `projections.caught_up_to`/`projection_partition_progress` already
+/// has. `DEFAULT -1` matches `snapshots.as_of_sequence`'s own "nothing
+/// folded yet" convention. No `REFERENCES` clause, unlike the
+/// `Projection` twin - `snapshots` has no backing registration table to
+/// reference, so there's nothing to foreign-key against and no
+/// table-creation-ordering constraint here.
+pub async fn ensure_snapshot_partition_progress_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.snapshot_partition_progress (
+            snapshot_name TEXT NOT NULL,
+            partition_index INT NOT NULL,
+            caught_up_to BIGINT NOT NULL DEFAULT -1,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (snapshot_name, partition_index)
+        )"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Codeberg issue #20's own row store - one row per deadline a
 /// `ScheduleDeadline` has ever scheduled, living in
 /// `ScheduleDeadline::Source::BOUNDED_CONTEXT`'s own schema (mirroring
@@ -1573,6 +1656,27 @@ pub async fn ensure_projection_state_as_of_sequence_columns(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.projection_rebuild_state \
          ADD COLUMN IF NOT EXISTS as_of_sequence BIGINT NOT NULL DEFAULT -1"
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `read_cursors.checked_out_at` - the real fix behind Codeberg issue
+/// #25's investigation of the Kafka/AMQP/NATS outbound bridges
+/// (docs/architecture.md §53): a bounded context provisioned before this
+/// column existed gets it patched in here, following
+/// `ensure_projection_state_owner_columns`'s own established pattern -
+/// nullable, no `DEFAULT`, since `NULL` already means exactly "not
+/// checked out" (`ReadCursor.checked_out_at`'s own spec doc comment),
+/// the same value a brand-new row starts at.
+pub async fn ensure_read_cursors_checkout_column(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.read_cursors ADD COLUMN IF NOT EXISTS checked_out_at TIMESTAMPTZ"
     )))
     .execute(pool)
     .await?;
@@ -4708,6 +4812,76 @@ pub async fn list_events_for_bounded_context_from(
     Ok(events)
 }
 
+/// `list_events_for_bounded_context_from`'s own capped sibling -
+/// Codeberg issue #25's `catch_up_partitioned_projection` is the one
+/// caller (`MAX_EVENTS_PER_PARTITION_TICK`'s own doc comment explains
+/// why it needs a cap that function's other caller, `catch_up_snapshots`,
+/// doesn't). A separate function rather than an optional `limit`
+/// parameter added to `list_events_for_bounded_context_from` itself, so
+/// that function's existing, unrelated caller stays untouched.
+pub async fn list_events_for_bounded_context_from_limited(
+    pool: &Pool,
+    bounded_context: &str,
+    after_sequence: i64,
+    limit: i64,
+) -> crate::error::Result<Vec<Event>> {
+    let bc = get_bounded_context(pool, bounded_context).await?.expect(
+        "list_events_for_bounded_context_from_limited: bounded_context row must exist for any event referencing it",
+    );
+
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
+         metadata_client_id, metadata_created_at, metadata_correlation_id, \
+         metadata_causation_id, tags, origin_kind, origin_source_content, \
+         origin_source_context, origin_command_id FROM {schema}.events \
+         WHERE sequence > $1 ORDER BY sequence LIMIT $2"
+    )))
+    .bind(after_sequence)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut event_types: std::collections::HashMap<String, EventType> =
+        std::collections::HashMap::new();
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !event_types.contains_key(&row.event_type_name) {
+            let et = get_event_type(pool, bounded_context, &row.event_type_name)
+                .await?
+                .expect("events row references an event_types row that no longer exists");
+            event_types.insert(row.event_type_name.clone(), et);
+        }
+        let origin = event_origin_from_row(
+            pool,
+            bounded_context,
+            &row.origin_kind,
+            row.origin_source_content,
+            row.origin_source_context,
+            row.origin_command_id,
+        )
+        .await?;
+        events.push(Event {
+            bounded_context: bc.clone(),
+            event_type: event_types[&row.event_type_name].clone(),
+            payload: row.payload,
+            metadata: Metadata {
+                r#type: row.metadata_type,
+                version: row.metadata_version,
+                client_id: row.metadata_client_id,
+                created_at: row.metadata_created_at,
+                correlation_id: row.metadata_correlation_id,
+                causation_id: row.metadata_causation_id,
+            },
+            sequence: row.sequence,
+            tags: row.tags.0,
+            encryption_keys: Vec::new(),
+            origin,
+        });
+    }
+    Ok(events)
+}
+
 /// Tag-indexed sibling of `list_events_for_bounded_context`/`_from` -
 /// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 1" fix. Those two always fetch
 /// the *whole* bounded context and leave tag-matching to the caller's
@@ -7626,7 +7800,37 @@ pub async fn catch_up_bounded_context(
     let latest = latest_sequence(pool, bounded_context).await?.unwrap_or(-1);
 
     let all_projections = list_projections_for_bounded_context(pool, bounded_context).await?;
-    let async_projections: Vec<_> = all_projections.iter().filter(|p| !p.sync).collect();
+    // Codeberg issue #25 (docs/architecture.md §51) - every async
+    // projection is split here by its own `Projection::PARTITION_COUNT`
+    // (via the dispatcher, since that's a Rust-only config the domain
+    // `Projection` struct itself never carries). `unpartitioned_async_projections`
+    // (`<= 1`, the default, and every projection that predates this
+    // feature) feeds the exact same loop this function has always had,
+    // completely unchanged below - order is kept simply by never
+    // entering the new code path. `.max(1)` guards a misconfigured
+    // `PARTITION_COUNT = 0` against a later divide-by-zero.
+    let unpartitioned_async_projections: Vec<_> = all_projections
+        .iter()
+        .filter(|p| {
+            !p.sync
+                && dispatcher
+                    .partition_count(bounded_context, &p.name)
+                    .unwrap_or(1)
+                    .max(1)
+                    <= 1
+        })
+        .collect();
+    let partitioned_async_projections: Vec<(&Projection, u32)> = all_projections
+        .iter()
+        .filter(|p| !p.sync)
+        .filter_map(|p| {
+            let partition_count = dispatcher
+                .partition_count(bounded_context, &p.name)
+                .unwrap_or(1)
+                .max(1);
+            (partition_count > 1).then_some((p, partition_count))
+        })
+        .collect();
     let building_rebuilds = list_building_projection_rebuilds_for_bounded_context(
         pool,
         bounded_context,
@@ -7634,7 +7838,10 @@ pub async fn catch_up_bounded_context(
     )
     .await?;
 
-    if async_projections.is_empty() && building_rebuilds.is_empty() {
+    if unpartitioned_async_projections.is_empty()
+        && partitioned_async_projections.is_empty()
+        && building_rebuilds.is_empty()
+    {
         return Ok(());
     }
 
@@ -7650,7 +7857,7 @@ pub async fn catch_up_bounded_context(
         }
     }
 
-    let min_caught_up = async_projections
+    let min_caught_up = unpartitioned_async_projections
         .iter()
         .map(|p| p.caught_up_to.unwrap_or(-1))
         .chain(
@@ -7670,7 +7877,7 @@ pub async fn catch_up_bounded_context(
     for event in &events {
         let mut tx = pool.begin().await?;
 
-        for projection in &async_projections {
+        for projection in &unpartitioned_async_projections {
             if projection.caught_up_to.unwrap_or(-1) >= event.sequence {
                 continue;
             }
@@ -7845,7 +8052,352 @@ pub async fn catch_up_bounded_context(
         }
     }
 
+    // Codeberg issue #25 (docs/architecture.md §51) - sequential across
+    // partitioned projections, not `for_each_concurrent`: the real
+    // scale-out value comes from separate *instances* racing for
+    // partitions, not from one instance's own intra-tick fan-out, and
+    // stacking more concurrency here on top of this function's own
+    // already-concurrent per-bounded-context caller
+    // (`BACKGROUND_TASK_CONCURRENCY` in `skilj/src/lib.rs`) against a
+    // pool whose default cap is modest (docs/architecture.md §35) risks
+    // exhausting it for little gain.
+    for (projection, partition_count) in partitioned_async_projections {
+        catch_up_partitioned_projection(
+            pool,
+            bounded_context,
+            &schema,
+            dispatcher,
+            projection,
+            partition_count,
+            latest,
+        )
+        .await?;
+    }
+
     Ok(())
+}
+
+/// `catch_up_bounded_context`'s own per-tick body for one async
+/// `Projection` whose `Projection::PARTITION_COUNT > 1` (Codeberg issue
+/// #25's investigation, docs/architecture.md §50/§51 - see that
+/// section for the full design writeup). Reuses `keys()` itself as the
+/// partitioning input - no separate "partition key" concept - hashing
+/// each key `dispatcher.keys()` returns into one of `partition_count`
+/// buckets via `partition_for_key` (a hand-written, cross-version-stable
+/// FNV-1a, not `std::collections::hash_map::DefaultHasher`, which is
+/// explicitly not guaranteed stable across Rust versions and would risk
+/// two instances silently disagreeing on a key's own bucket).
+///
+/// Claiming is a non-blocking, per-tick race for each partition's own
+/// `pg_try_advisory_xact_lock`, the identical primitive
+/// `migrate_idempotency_keys_client_id_scoping` already establishes -
+/// whichever instance wins a given partition this tick folds every
+/// pending key in that bucket, inside the one transaction that holds
+/// the lock; a losing instance simply skips that partition this tick,
+/// with no lease/heartbeat/expiry machinery needed since a dead
+/// instance just stops winning locks. **This lock is a pure
+/// work-avoidance optimization, not a correctness mechanism**: every
+/// fold below still goes through the exact same
+/// `get_or_create_projection_state_for_update` → `as_of_sequence` guard
+/// → `dispatcher.project()` → `apply_projection_fold_update` sequence
+/// the unpartitioned loop above uses, so even a hash disagreement
+/// between instances (a theoretical `hashtext` collision, or a rolling
+/// deploy briefly running two different `PARTITION_COUNT` values) could
+/// only ever cause wasted duplicate work, never a double-fold.
+///
+/// One transaction per `(partition, tick)`, not per-event: a
+/// non-blocking lock re-acquired per event would force stopping at the
+/// first lost race anyway, since a partition's own progress can only
+/// advance contiguously in sequence order - far more lock round trips
+/// for no real benefit. The real cost this trades away, relative to the
+/// unpartitioned loop's own per-event transaction granularity, is
+/// durability: a poison event anywhere in a partition's own batch this
+/// tick rolls back that whole partition's tick, not just the offending
+/// event - `MAX_EVENTS_PER_PARTITION_TICK` bounds the blast radius, and
+/// the next tick's fresh, non-blocking race is self-healing regardless
+/// of which instance (if any) previously held that partition.
+///
+/// Deliberately excludes a `ProjectionRebuild`'s own `building` fold and
+/// `fold_history_into_new_sync_projection` - both stay single-instance,
+/// exactly as before `PARTITION_COUNT` existed. Rebuilds are one-time,
+/// bounded events (only `schema_changed`/`consumed_change_has_history`/
+/// `becoming_sync` in `register_projection` ever stage one), not the
+/// sustained-throughput concern issue #25 is actually about.
+///
+/// **Known accepted limitation**: after a rebuild promotes
+/// (`promote_projection_rebuild`), this projection's own
+/// `projection_partition_progress` rows can be stale relative to the
+/// freshly-jumped `projections.caught_up_to` the rebuild just set - the
+/// next tick(s) will re-scan the gap (capped, self-healing over a few
+/// ticks by `MAX_EVENTS_PER_PARTITION_TICK`) purely as wasted work,
+/// never a correctness risk, since `as_of_sequence` still skips every
+/// already-folded key/event pair it re-scans. Not worth promotion-side
+/// bookkeeping to close for what is a rare, self-correcting cost.
+#[allow(clippy::too_many_arguments)]
+async fn catch_up_partitioned_projection(
+    pool: &Pool,
+    bounded_context: &str,
+    schema: &str,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    projection: &Projection,
+    partition_count: u32,
+    latest: i64,
+) -> crate::error::Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.projection_partition_progress \
+         (projection_name, partition_index, caught_up_to, updated_at) \
+         SELECT $1, gs, -1, now() FROM generate_series(0, $2::int - 1) AS gs \
+         ON CONFLICT (projection_name, partition_index) DO NOTHING"
+    )))
+    .bind(&projection.name)
+    .bind(partition_count as i32)
+    .execute(pool)
+    .await?;
+
+    let mut progress = list_projection_partition_progress(pool, schema, &projection.name).await?;
+    let min_caught_up = (0..partition_count)
+        .map(|p| progress.get(&p).copied().unwrap_or(-1))
+        .min()
+        .unwrap_or(latest);
+
+    let events = if min_caught_up >= latest {
+        Vec::new()
+    } else {
+        list_events_for_bounded_context_from_limited(
+            pool,
+            bounded_context,
+            min_caught_up,
+            MAX_EVENTS_PER_PARTITION_TICK,
+        )
+        .await?
+    };
+
+    if !events.is_empty() {
+        let batch_end = events
+            .last()
+            .expect("just checked events is non-empty")
+            .sequence;
+        let default_state_json = dispatcher
+            .default_state(bounded_context, &projection.name)
+            .unwrap_or_default();
+        let owner_tag_key = dispatcher
+            .owner_tag_key(bounded_context, &projection.name)
+            .flatten();
+
+        for partition_index in 0..partition_count {
+            if progress.get(&partition_index).copied().unwrap_or(-1) >= batch_end {
+                continue;
+            }
+
+            let mut tx = pool.begin().await?;
+            let locked: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+                    .bind(partition_lock_key(
+                        bounded_context,
+                        &projection.name,
+                        partition_index,
+                    ))
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !locked {
+                // Nothing was written under this transaction - dropping
+                // it is a no-op rollback, not a partial commit to worry
+                // about. Another instance (or this one, next tick) owns
+                // this partition for now.
+                continue;
+            }
+
+            let mut this_partition_progress = progress.get(&partition_index).copied().unwrap_or(-1);
+            for event in &events {
+                if this_partition_progress >= event.sequence {
+                    continue;
+                }
+                let keys = dispatcher
+                    .keys(bounded_context, &projection.name, event)
+                    .unwrap_or_default();
+                for key in &keys {
+                    if partition_for_key(key, partition_count) != partition_index {
+                        continue;
+                    }
+
+                    // Identical guard to the unpartitioned loop above -
+                    // see its own comment. Here it also absorbs any
+                    // hash disagreement between instances (this
+                    // function's own doc comment's "pure work-avoidance
+                    // optimization" point).
+                    let (as_of_sequence, current_state) =
+                        get_or_create_projection_state_for_update(
+                            &mut *tx,
+                            schema,
+                            &projection.name,
+                            key,
+                            &default_state_json,
+                        )
+                        .await?;
+                    if as_of_sequence >= event.sequence {
+                        continue;
+                    }
+
+                    let new_state = match dispatcher.project(
+                        bounded_context,
+                        &projection.name,
+                        &current_state,
+                        event,
+                        key,
+                    ) {
+                        Some(result) => result?,
+                        None => current_state,
+                    };
+
+                    apply_projection_fold_update(
+                        &mut *tx,
+                        schema,
+                        "projection_state",
+                        "",
+                        &projection.name,
+                        key,
+                        &new_state,
+                        owner_tag_key,
+                        event,
+                    )
+                    .await?;
+                }
+                this_partition_progress = event.sequence;
+            }
+
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {schema}.projection_partition_progress \
+                 (projection_name, partition_index, caught_up_to, updated_at) \
+                 VALUES ($1, $2, $3, now()) \
+                 ON CONFLICT (projection_name, partition_index) DO UPDATE SET \
+                    caught_up_to = GREATEST(\
+                        {schema}.projection_partition_progress.caught_up_to, EXCLUDED.caught_up_to), \
+                    updated_at = now()"
+            )))
+            .bind(&projection.name)
+            .bind(partition_index as i32)
+            .bind(this_partition_progress)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            progress.insert(partition_index, this_partition_progress);
+        }
+    }
+
+    // Rolled up regardless of which partitions (if any) this instance
+    // won this tick - any instance computing this is harmless, idempotent
+    // work, and it's what keeps `projections.caught_up_to` (the single
+    // external source of truth GraphQL's `caughtUpTo`/`wait_until_caught_up`
+    // depend on) meaning exactly what it always has: every key of this
+    // projection reflects every event up to this sequence. The
+    // `partition_index < $2` filter excludes any row left over from a
+    // since-decreased `PARTITION_COUNT`, so it can never wedge the
+    // rollup on a stale high-index row nothing advances anymore.
+    let rolled_up: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT MIN(caught_up_to) FROM {schema}.projection_partition_progress \
+         WHERE projection_name = $1 AND partition_index < $2"
+    )))
+    .bind(&projection.name)
+    .bind(partition_count as i32)
+    .fetch_one(pool)
+    .await?;
+    if let Some(rolled_up) = rolled_up {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.projections SET caught_up_to = $1 \
+             WHERE name = $2 AND (caught_up_to IS NULL OR caught_up_to < $1)"
+        )))
+        .bind(rolled_up)
+        .bind(&projection.name)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// A generous bound on how many events one partitioned projection's own
+/// per-partition-per-tick transaction (`catch_up_partitioned_projection`)
+/// spans - not a correctness requirement, but for a different reason
+/// than `MAX_DUE_DEADLINES_PER_TICK`/`MAX_OCCURRENCES_PER_TICK`'s own
+/// "don't starve other work sharing this tick": a partitioned
+/// projection's own tick is a *single all-or-nothing transaction* per
+/// partition (see `catch_up_partitioned_projection`'s own doc comment
+/// for why), so without a cap, a poison event anywhere in a truly
+/// enormous post-outage backlog would roll back that entire backlog's
+/// worth of progress for that partition, not just the offending event -
+/// the unpartitioned path's own per-event transaction granularity has no
+/// such exposure. Events beyond this cap are simply left for the next
+/// tick, which resumes from wherever this partition's own progress
+/// landed - the same "recent window, not a hard limit on correctness"
+/// register those two constants are already in.
+const MAX_EVENTS_PER_PARTITION_TICK: i64 = 1000;
+
+/// `catch_up_partitioned_projection`'s own key→partition assignment -
+/// hand-written 64-bit FNV-1a rather than
+/// `std::collections::hash_map::DefaultHasher` (explicitly not
+/// guaranteed stable across Rust versions/std/build flags - unsuitable
+/// for a scheme that must agree across every instance in a fleet,
+/// possibly running slightly different builds during a rolling deploy)
+/// or a new crate dependency (not judged worth it for a few lines of
+/// well-known, public-domain algorithm). Computed in Rust, not pushed
+/// into Postgres via `hashtext()`, since partition membership must be
+/// known *before* deciding which partitions are even worth a lock
+/// attempt this tick - `hashtext()` is still used, unrelated, for the
+/// advisory lock key itself (`partition_lock_key` below).
+fn partition_for_key(key: &str, partition_count: u32) -> u32 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash % u64::from(partition_count)) as u32
+}
+
+/// The `pg_try_advisory_xact_lock` key `catch_up_partitioned_projection`
+/// races for one `(bounded_context, projection, partition)` triple -
+/// bound via `hashtext($1)::bigint`, the same pattern
+/// `migrate_idempotency_keys_client_id_scoping` already establishes. A
+/// `hashtext` collision with an unrelated lock key is theoretically
+/// possible (32-bit output) but harmless here: it would only ever cause
+/// a spurious, self-healing missed attempt this tick - exactly why this
+/// function's own caller uses the non-blocking `pg_try_advisory_xact_lock`
+/// form rather than the blocking `pg_advisory_xact_lock` the migration
+/// guard uses.
+fn partition_lock_key(
+    bounded_context: &str,
+    projection_name: &str,
+    partition_index: u32,
+) -> String {
+    format!("projection_partition:{bounded_context}:{projection_name}:{partition_index}")
+}
+
+/// `catch_up_partitioned_projection`'s own progress read - every
+/// `projection_partition_progress` row for one projection, as a
+/// `partition_index -> caught_up_to` map. A partition index with no row
+/// yet (shouldn't happen once that function's own seed step has run,
+/// but not assumed) is simply absent from the map - every caller already
+/// treats a missing entry as `-1` via `.unwrap_or(-1)`, the same
+/// "nothing folded yet" convention `projection_state.as_of_sequence`'s
+/// own default uses.
+async fn list_projection_partition_progress(
+    pool: &Pool,
+    schema: &str,
+    projection_name: &str,
+) -> crate::error::Result<std::collections::HashMap<u32, i64>> {
+    let rows: Vec<(i32, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT partition_index, caught_up_to \
+         FROM {schema}.projection_partition_progress WHERE projection_name = $1"
+    )))
+    .bind(projection_name)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(idx, seq)| (idx as u32, seq))
+        .collect())
 }
 
 /// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2" - the background half of
@@ -7876,20 +8428,48 @@ pub async fn catch_up_snapshots(
     let schema = schema_ident(bounded_context);
     let latest = latest_sequence(pool, bounded_context).await?.unwrap_or(-1);
 
-    let snapshot_names = dispatcher.snapshot_names(bounded_context);
-    if snapshot_names.is_empty() {
+    let all_snapshot_names = dispatcher.snapshot_names(bounded_context);
+    // Codeberg issue #25 (docs/architecture.md §52) - split by
+    // `Snapshot::PARTITION_COUNT` (via the dispatcher, the only place
+    // this Rust-only config lives, exactly like `Projection`'s own
+    // split in `catch_up_bounded_context`). `unpartitioned_snapshot_names`
+    // (`<= 1`, the default, and every snapshot that predates this
+    // feature) feeds the exact same loop this function has always had,
+    // completely unchanged below.
+    let unpartitioned_snapshot_names: Vec<&str> = all_snapshot_names
+        .iter()
+        .filter(|name| {
+            dispatcher
+                .partition_count(bounded_context, name)
+                .unwrap_or(1)
+                .max(1)
+                <= 1
+        })
+        .copied()
+        .collect();
+    let partitioned_snapshot_names: Vec<(&str, u32)> = all_snapshot_names
+        .iter()
+        .filter_map(|name| {
+            let partition_count = dispatcher
+                .partition_count(bounded_context, name)
+                .unwrap_or(1)
+                .max(1);
+            (partition_count > 1).then_some((*name, partition_count))
+        })
+        .collect();
+    if unpartitioned_snapshot_names.is_empty() && partitioned_snapshot_names.is_empty() {
         return Ok(());
     }
 
     let progress_from_db =
         list_snapshot_progress_for_bounded_context(pool, bounded_context).await?;
-    let mut progress: std::collections::HashMap<&str, i64> = snapshot_names
+    let mut progress: std::collections::HashMap<&str, i64> = unpartitioned_snapshot_names
         .iter()
         .map(|name| (*name, progress_from_db.get(*name).copied().unwrap_or(-1)))
         .collect();
 
     let min_caught_up = progress.values().copied().min().unwrap_or(latest);
-    let events = if min_caught_up >= latest {
+    let events = if unpartitioned_snapshot_names.is_empty() || min_caught_up >= latest {
         Vec::new()
     } else {
         list_events_for_bounded_context_from(pool, bounded_context, min_caught_up).await?
@@ -7898,7 +8478,7 @@ pub async fn catch_up_snapshots(
     for event in &events {
         let mut tx = pool.begin().await?;
 
-        for name in &snapshot_names {
+        for name in &unpartitioned_snapshot_names {
             if progress[name] >= event.sequence {
                 continue;
             }
@@ -7998,7 +8578,7 @@ pub async fn catch_up_snapshots(
             }
         }
 
-        for name in &snapshot_names {
+        for name in &unpartitioned_snapshot_names {
             if progress[name] >= event.sequence {
                 continue;
             }
@@ -8009,7 +8589,285 @@ pub async fn catch_up_snapshots(
         tx.commit().await?;
     }
 
+    // Codeberg issue #25 (docs/architecture.md §52) - sequential across
+    // partitioned snapshots, not `for_each_concurrent`, the identical
+    // reasoning `catch_up_bounded_context`'s own partitioned-projection
+    // loop already documents (§51): the real scale-out value comes from
+    // separate *instances* racing for partitions, not from one
+    // instance's own intra-tick fan-out.
+    for (name, partition_count) in partitioned_snapshot_names {
+        catch_up_partitioned_snapshot(
+            pool,
+            bounded_context,
+            &schema,
+            dispatcher,
+            name,
+            partition_count,
+            latest,
+        )
+        .await?;
+    }
+
     Ok(())
+}
+
+/// `catch_up_snapshots`'s own per-tick body for one `Snapshot` whose
+/// `Snapshot::PARTITION_COUNT > 1` (Codeberg issue #25, docs/architecture.md
+/// §52 - the `Snapshot` twin of `catch_up_partitioned_projection`, see
+/// that function's own doc comment for the full design writeup, not
+/// repeated in full here). The one structural difference: `Snapshot`
+/// derives at most *one* tag value per event (there's no `keys()`-style
+/// fan-out - see `Snapshot`'s own doc comment), so partitioning hashes
+/// that single derived tag value instead of iterating several keys per
+/// event.
+///
+/// Same primitives throughout: `partition_for_key` (the identical
+/// FNV-1a §51 established), a non-blocking
+/// `pg_try_advisory_xact_lock` per `(snapshot_name, partition)` per
+/// tick (`snapshot_partition_lock_key`), one transaction per
+/// `(partition, tick)`, `MAX_EVENTS_PER_PARTITION_TICK`-capped batches
+/// via the existing `list_events_for_bounded_context_from_limited`, and
+/// a monotonic-only rollup into `snapshot_progress.caught_up_to` (the
+/// single external source of truth, unchanged in shape - `Snapshot` has
+/// no GraphQL-exposed `caughtUpTo` field the way `Projection` does, but
+/// `resolve_snapshot_context`'s own correctness already depends on
+/// `snapshots.as_of_sequence` per row, untouched by any of this).
+#[allow(clippy::too_many_arguments)]
+async fn catch_up_partitioned_snapshot(
+    pool: &Pool,
+    bounded_context: &str,
+    schema: &str,
+    dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    name: &str,
+    partition_count: u32,
+    latest: i64,
+) -> crate::error::Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.snapshot_partition_progress \
+         (snapshot_name, partition_index, caught_up_to, updated_at) \
+         SELECT $1, gs, -1, now() FROM generate_series(0, $2::int - 1) AS gs \
+         ON CONFLICT (snapshot_name, partition_index) DO NOTHING"
+    )))
+    .bind(name)
+    .bind(partition_count as i32)
+    .execute(pool)
+    .await?;
+
+    let mut progress = list_snapshot_partition_progress(pool, schema, name).await?;
+    let min_caught_up = (0..partition_count)
+        .map(|p| progress.get(&p).copied().unwrap_or(-1))
+        .min()
+        .unwrap_or(latest);
+
+    let events = if min_caught_up >= latest {
+        Vec::new()
+    } else {
+        list_events_for_bounded_context_from_limited(
+            pool,
+            bounded_context,
+            min_caught_up,
+            MAX_EVENTS_PER_PARTITION_TICK,
+        )
+        .await?
+    };
+
+    if !events.is_empty() {
+        let batch_end = events
+            .last()
+            .expect("just checked events is non-empty")
+            .sequence;
+        let Some(tag_key) = dispatcher.tag_key(bounded_context, name) else {
+            return Ok(());
+        };
+        let version = dispatcher.version(bounded_context, name).unwrap_or(0);
+        let default_state_json = dispatcher
+            .default_state(bounded_context, name)
+            .unwrap_or_default();
+        let owner_tag_key = dispatcher.owner_tag_key(bounded_context, name).flatten();
+
+        for partition_index in 0..partition_count {
+            if progress.get(&partition_index).copied().unwrap_or(-1) >= batch_end {
+                continue;
+            }
+
+            let mut tx = pool.begin().await?;
+            let locked: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+                    .bind(snapshot_partition_lock_key(
+                        bounded_context,
+                        name,
+                        partition_index,
+                    ))
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !locked {
+                // Nothing was written under this transaction - dropping
+                // it is a no-op rollback. Another instance (or this
+                // one, next tick) owns this partition for now.
+                continue;
+            }
+
+            let mut this_partition_progress = progress.get(&partition_index).copied().unwrap_or(-1);
+            for event in &events {
+                if this_partition_progress >= event.sequence {
+                    continue;
+                }
+                let tag_value = event
+                    .tags
+                    .iter()
+                    .find(|t| t.key == tag_key)
+                    .and_then(|t| t.value.as_deref());
+                if let Some(tag_value) = tag_value {
+                    if partition_for_key(tag_value, partition_count) == partition_index {
+                        let (as_of_sequence, current_state) =
+                            get_or_create_snapshot_state_for_update(
+                                &mut *tx,
+                                schema,
+                                name,
+                                tag_key,
+                                tag_value,
+                                version,
+                                &default_state_json,
+                            )
+                            .await?;
+                        // Identical guard to the unpartitioned loop
+                        // above - see `catch_up_partitioned_projection`'s
+                        // own comment for why this is what actually
+                        // makes cross-instance racing safe, the
+                        // advisory lock being only an optimization.
+                        if as_of_sequence < event.sequence {
+                            let new_state =
+                                match dispatcher.fold(bounded_context, name, &current_state, event)
+                                {
+                                    Some(result) => result?,
+                                    None => current_state,
+                                };
+                            let owner = owner_tag_key.and_then(|owner_tag_key| {
+                                event
+                                    .tags
+                                    .iter()
+                                    .find(|t| t.key == owner_tag_key)
+                                    .and_then(|t| t.value.clone())
+                            });
+                            match owner {
+                                Some(owner) => {
+                                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                                        "UPDATE {schema}.snapshots SET snapshot_version = $1, \
+                                         as_of_sequence = $2, state = $3::jsonb, owner = $4, \
+                                         updated_at = now() \
+                                         WHERE snapshot_name = $5 AND tag_key = $6 AND tag_value = $7"
+                                    )))
+                                    .bind(version as i64)
+                                    .bind(event.sequence)
+                                    .bind(&new_state)
+                                    .bind(owner)
+                                    .bind(name)
+                                    .bind(tag_key)
+                                    .bind(tag_value)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                }
+                                None => {
+                                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                                        "UPDATE {schema}.snapshots SET snapshot_version = $1, \
+                                         as_of_sequence = $2, state = $3::jsonb, updated_at = now() \
+                                         WHERE snapshot_name = $4 AND tag_key = $5 AND tag_value = $6"
+                                    )))
+                                    .bind(version as i64)
+                                    .bind(event.sequence)
+                                    .bind(&new_state)
+                                    .bind(name)
+                                    .bind(tag_key)
+                                    .bind(tag_value)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                }
+                            }
+                        }
+                    }
+                }
+                this_partition_progress = event.sequence;
+            }
+
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {schema}.snapshot_partition_progress \
+                 (snapshot_name, partition_index, caught_up_to, updated_at) \
+                 VALUES ($1, $2, $3, now()) \
+                 ON CONFLICT (snapshot_name, partition_index) DO UPDATE SET \
+                    caught_up_to = GREATEST(\
+                        {schema}.snapshot_partition_progress.caught_up_to, EXCLUDED.caught_up_to), \
+                    updated_at = now()"
+            )))
+            .bind(name)
+            .bind(partition_index as i32)
+            .bind(this_partition_progress)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            progress.insert(partition_index, this_partition_progress);
+        }
+    }
+
+    // Rolled up regardless of which partitions (if any) this instance
+    // won this tick - see `catch_up_partitioned_projection`'s own
+    // identical comment. `partition_index < $2` excludes any row left
+    // over from a since-decreased `PARTITION_COUNT`.
+    let rolled_up: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT MIN(caught_up_to) FROM {schema}.snapshot_partition_progress \
+         WHERE snapshot_name = $1 AND partition_index < $2"
+    )))
+    .bind(name)
+    .bind(partition_count as i32)
+    .fetch_one(pool)
+    .await?;
+    if let Some(rolled_up) = rolled_up {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.snapshot_progress (snapshot_name, caught_up_to) \
+             VALUES ($1, $2) \
+             ON CONFLICT (snapshot_name) DO UPDATE SET \
+                caught_up_to = GREATEST({schema}.snapshot_progress.caught_up_to, EXCLUDED.caught_up_to)"
+        )))
+        .bind(name)
+        .bind(rolled_up)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// `catch_up_partitioned_snapshot`'s own lock key - `partition_lock_key`'s
+/// identical `hashtext(...)::bigint` pattern, namespaced by `"snapshot_partition"`
+/// rather than `"projection_partition"` so the two families can never
+/// collide with each other even if a projection and a snapshot happened
+/// to share a name.
+fn snapshot_partition_lock_key(
+    bounded_context: &str,
+    snapshot_name: &str,
+    partition_index: u32,
+) -> String {
+    format!("snapshot_partition:{bounded_context}:{snapshot_name}:{partition_index}")
+}
+
+/// `catch_up_partitioned_snapshot`'s own progress read - `list_projection_partition_progress`'s
+/// identical shape, for `snapshot_partition_progress` instead.
+async fn list_snapshot_partition_progress(
+    pool: &Pool,
+    schema: &str,
+    snapshot_name: &str,
+) -> crate::error::Result<std::collections::HashMap<u32, i64>> {
+    let rows: Vec<(i32, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT partition_index, caught_up_to \
+         FROM {schema}.snapshot_partition_progress WHERE snapshot_name = $1"
+    )))
+    .bind(snapshot_name)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(idx, seq)| (idx as u32, seq))
+        .collect())
 }
 
 /// `RegisterProjection`'s own synchronous counterpart to
@@ -8739,47 +9597,95 @@ struct ReadCursorRow {
     ack_mode: String,
     sequence: i64,
     updated_at: DateTime<Utc>,
+    checked_out_at: Option<DateTime<Utc>>,
 }
 
 /// Unlike `access_tokens`, no index/bounded-context-resolution step is
 /// needed here: every caller already holds the full `EventReadToken` (and
 /// so its own `event_type.bounded_context.name`) by the time this is
 /// called - token resolution (which does need the index) already
-/// happened first, in `get_event_read_token` above.
+/// happened first, in `get_event_read_token` above. Generic over `impl
+/// sqlx::PgExecutor` (the same generalisation `insert_event` itself
+/// already has) so `GET /v1/events/consume?mode=manual` can call this
+/// inside the same transaction `lock_read_cursor_for_consume`'s own
+/// advisory lock spans (Codeberg issue #25's investigation,
+/// docs/architecture.md §53) - see that function's own doc comment for
+/// why a plain call against `&Pool` here wouldn't actually be protected
+/// by a lock taken on a different pooled connection.
 #[tracing::instrument(skip_all)]
 pub async fn get_read_cursor(
-    pool: &Pool,
+    executor: impl sqlx::PgExecutor<'_>,
     token: &EventReadToken,
 ) -> crate::error::Result<Option<ReadCursor>> {
     let schema = schema_ident(&token.event_type.bounded_context.name);
     let row: Option<ReadCursorRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT ack_mode, sequence, updated_at FROM {schema}.read_cursors WHERE token_id = $1"
+        "SELECT ack_mode, sequence, updated_at, checked_out_at \
+         FROM {schema}.read_cursors WHERE token_id = $1"
     )))
     .bind(&token.id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row.map(|r| ReadCursor {
         token: token.clone(),
         ack_mode: ack_mode_from_str(&r.ack_mode),
         sequence: r.sequence,
         updated_at: r.updated_at,
+        checked_out_at: r.checked_out_at,
     }))
 }
 
-async fn upsert_read_cursor(pool: &Pool, cursor: &ReadCursor) -> crate::error::Result<()> {
+/// The primitive that actually closes the `manual_ack` claim race
+/// (Codeberg issue #25's investigation, docs/architecture.md §53) - not
+/// a row lock on `read_cursors` (a `SELECT ... FOR UPDATE` protects
+/// nothing for a token's very first-ever call, before any row exists to
+/// lock - proven by a real concurrent test that failed exactly there
+/// before this fix, not assumed). `pg_advisory_xact_lock`, the identical
+/// primitive `migrate_idempotency_keys_client_id_scoping` already
+/// establishes - deliberately blocking, not `pg_try_advisory_xact_lock`:
+/// two callers racing the same token should serialize (one waits a few
+/// milliseconds for the other's short transaction to commit), not have
+/// one immediately give up. Held for the rest of the caller's own
+/// transaction, released automatically on commit or rollback. Must be
+/// called on the SAME transaction whose own later `get_read_cursor`/
+/// `apply_cursor_update` calls it's meant to protect - a bare
+/// `pg_advisory_lock` against a `&Pool` would make this meaningless (the
+/// lock and the work it protects could each land on a different pooled
+/// connection entirely), the identical failure mode that function's own
+/// doc comment already warns about for the migration guard.
+#[tracing::instrument(skip_all)]
+pub async fn lock_read_cursor_for_consume(
+    tx: &mut Transaction<'_, Postgres>,
+    token: &EventReadToken,
+) -> crate::error::Result<()> {
+    let key = format!(
+        "read_cursor:{}:{}",
+        token.event_type.bounded_context.name, token.id
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn upsert_read_cursor(
+    executor: impl sqlx::PgExecutor<'_>,
+    cursor: &ReadCursor,
+) -> crate::error::Result<()> {
     let schema = schema_ident(&cursor.token.event_type.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO {schema}.read_cursors (token_id, ack_mode, sequence, updated_at) \
-         VALUES ($1,$2,$3,$4) \
+        "INSERT INTO {schema}.read_cursors (token_id, ack_mode, sequence, updated_at, checked_out_at) \
+         VALUES ($1,$2,$3,$4,$5) \
          ON CONFLICT (token_id) DO UPDATE SET \
             ack_mode = EXCLUDED.ack_mode, sequence = EXCLUDED.sequence, \
-            updated_at = EXCLUDED.updated_at"
+            updated_at = EXCLUDED.updated_at, checked_out_at = EXCLUDED.checked_out_at"
     )))
     .bind(&cursor.token.id)
     .bind(ack_mode_to_str(cursor.ack_mode))
     .bind(cursor.sequence)
     .bind(cursor.updated_at)
-    .execute(pool)
+    .bind(cursor.checked_out_at)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -8787,15 +9693,23 @@ async fn upsert_read_cursor(pool: &Pool, cursor: &ReadCursor) -> crate::error::R
 /// Persists whatever `event_store::consume_events` decided to do to a
 /// token's `ReadCursor` - see `CursorUpdate`'s own doc comment for why
 /// that decision and this persistence step are two separate functions
-/// (the pure/no-I/O split every rule in this crate keeps).
+/// (the pure/no-I/O split every rule in this crate keeps). Generic over
+/// `impl sqlx::PgExecutor` (the same generalisation `insert_event` itself
+/// already has) so `GET /v1/events/consume?mode=manual` can call this
+/// inside the same transaction `get_read_cursor_for_update`'s own row
+/// lock spans (Codeberg issue #25's investigation, docs/architecture.md
+/// §53) - without that, the read and this write would each be free to
+/// land on a different pooled connection, making the lock meaningless
+/// (the identical failure mode `migrate_idempotency_keys_client_id_scoping`'s
+/// own doc comment warns about for a bare `pg_advisory_lock`).
 #[tracing::instrument(skip_all)]
 pub async fn apply_cursor_update(
-    pool: &Pool,
+    executor: impl sqlx::PgExecutor<'_>,
     token: &EventReadToken,
     update: &CursorUpdate,
 ) -> crate::error::Result<()> {
     match update {
-        CursorUpdate::Created(cursor) => upsert_read_cursor(pool, cursor).await,
+        CursorUpdate::Created(cursor) => upsert_read_cursor(executor, cursor).await,
         CursorUpdate::Advanced {
             sequence,
             updated_at,
@@ -8807,7 +9721,22 @@ pub async fn apply_cursor_update(
             .bind(sequence)
             .bind(updated_at)
             .bind(&token.id)
-            .execute(pool)
+            .execute(executor)
+            .await?;
+            Ok(())
+        }
+        // Codeberg issue #25's investigation (docs/architecture.md §53) -
+        // `sequence`/`updated_at` deliberately untouched: a claim alone
+        // never moves the cursor's own position, only `AcknowledgeEvents`
+        // does.
+        CursorUpdate::Claimed { checked_out_at } => {
+            let schema = schema_ident(&token.event_type.bounded_context.name);
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {schema}.read_cursors SET checked_out_at = $1 WHERE token_id = $2"
+            )))
+            .bind(checked_out_at)
+            .bind(&token.id)
+            .execute(executor)
             .await?;
             Ok(())
         }
@@ -8819,6 +9748,10 @@ pub async fn apply_cursor_update(
 /// itself only returns the new `(sequence, updated_at)` pair (it has no
 /// `CursorUpdate` variant of its own; see its doc comment), so there's no
 /// enum to dispatch on the way `apply_cursor_update` above does.
+/// `checked_out_at` is cleared unconditionally alongside `sequence`/
+/// `updated_at` - `rule AcknowledgeEvents`' own `ensures` block does the
+/// same, unconditionally, regardless of whether a live claim was even
+/// held (Codeberg issue #25's investigation, docs/architecture.md §53).
 #[tracing::instrument(skip_all)]
 pub async fn record_acknowledgement(
     pool: &Pool,
@@ -8828,7 +9761,8 @@ pub async fn record_acknowledgement(
 ) -> crate::error::Result<()> {
     let schema = schema_ident(&token.event_type.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE {schema}.read_cursors SET sequence = $1, updated_at = $2 WHERE token_id = $3"
+        "UPDATE {schema}.read_cursors SET sequence = $1, updated_at = $2, checked_out_at = NULL \
+         WHERE token_id = $3"
     )))
     .bind(sequence)
     .bind(updated_at)

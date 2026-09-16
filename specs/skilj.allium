@@ -1619,6 +1619,24 @@ entity ReadCursor {
                                             -- past everything committed when it was provisioned
                                             -- (see variant EventReadToken.start_from).
     updated_at: Timestamp                  -- when this cursor last moved
+
+    -- manual_ack only - always null for an auto_advance cursor, which has
+    -- no equivalent gap to close (serving already advances it in the same
+    -- moment, so there is nothing left unacknowledged for a second caller
+    -- to race). Set by ConsumeEvents when it serves a manual_ack cursor
+    -- whose own claim was not already held (see that rule's own manual_ack
+    -- branch), and cleared by AcknowledgeEvents - so it marks exactly the
+    -- span between "served" and "acknowledged", never anything wider.
+    -- While set and not yet older than config.read_cursor_checkout_lease,
+    -- a second concurrent ConsumeEvents call for the same token is served
+    -- nothing rather than the same unacknowledged batch a first caller may
+    -- still be acting on - closing the gap where two callers each act on
+    -- one served-but-unacknowledged batch before either acknowledges (see
+    -- the note above rule ConsumeEvents and EventFetch's own
+    -- DeliveryFollowsAckMode, which this narrows but does not weaken: the
+    -- batch is still redelivered, to whichever caller next finds the
+    -- claim expired or clear, so manual_ack stays at-least-once).
+    checked_out_at: Timestamp?
 }
 
 -- One Role letting another read the private fields of a record it is
@@ -1671,6 +1689,21 @@ entity PrivateFieldGrant {
         active -> revoked
         terminal: revoked
     }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+-- How long a ConsumeEvents claim on a manual_ack ReadCursor holds before
+-- it is treated as abandoned and reclaimable - see ReadCursor.checked_out_at
+-- and rule ConsumeEvents' own manual_ack branch. Generous by default:
+-- long enough that an ordinary caller's own poll-serve-act-acknowledge
+-- cycle never trips it, short enough that a caller which crashes after
+-- being served (and so never acknowledges) does not leave the stream
+-- stuck for long.
+config {
+    read_cursor_checkout_lease: Duration = 5.minutes
 }
 
 ------------------------------------------------------------
@@ -2719,6 +2752,24 @@ rule FetchEvents {
 --     and never de-duplicated here (see EventFetch's
 --     DeliveryFollowsAckMode).
 --
+-- manual_ack alone has one more moving part: ReadCursor.checked_out_at.
+-- A caller that consumes a batch, then acts on it somewhere outside this
+-- specification (publishing it to an external system, say) before
+-- acknowledging, has a real gap between "served" and "acknowledged" - and
+-- without anything to close it, a second caller presenting the same token
+-- during that gap would be served the identical unacknowledged batch and
+-- might act on it too, doubling whatever the first caller's own action
+-- was. checked_out_at closes that specific gap, and only that gap: it is
+-- claimed by ConsumeEvents when it serves a manual_ack cursor not already
+-- claimed, cleared by AcknowledgeEvents, and treated as abandoned - so
+-- reclaimable, serving the same batch again - once older than
+-- config.read_cursor_checkout_lease. It narrows DeliveryFollowsAckMode's
+-- at-least-once guarantee, never contradicts it: a served-but-unacknowledged
+-- batch is still always eventually redelivered, to whichever caller next
+-- finds the claim expired or clear, exactly as before this existed - the
+-- only change is that "next" no longer means "possibly also, right now,
+-- to a second caller racing the first."
+--
 -- Neither rule requires the bounded context to be active, for the same
 -- reason FetchEvents does not: archiving stops writes, and reading the
 -- retained history is the point. Both are served by the same
@@ -2823,6 +2874,17 @@ rule ConsumeEvents {
             and event_type = token.event_type
             and sequence > position
 
+    -- manual_ack only, and false whenever is_new (a cursor just being
+    -- provisioned was never claimed by anyone) - see ReadCursor.checked_out_at
+    -- and the note above this rule. A claim older than
+    -- config.read_cursor_checkout_lease is treated as abandoned rather
+    -- than live, the same "self-healing, not a hard failure" register
+    -- ScheduleDeadline's own missed-occurrence handling already uses
+    -- elsewhere in this specification.
+    let is_leased =
+        mode = manual_ack and not is_new and cursor.checked_out_at != null
+            and cursor.checked_out_at + config.read_cursor_checkout_lease > now
+
     -- The same two-part filter FetchEvents applies, on the same candidate
     -- population under the same token, and deliberately identical: these
     -- are two ways to read one stream under one permission model, so what
@@ -2832,9 +2894,13 @@ rule ConsumeEvents {
     -- composition does not change is the cursor: an event excluded because
     -- of scope is treated exactly as one excluded by a filter already is,
     -- passed over without being served and without moving the position
-    -- past it.
-    let served = filter(candidates, e =>
-        matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope))
+    -- past it. is_leased overrides all of that to the empty set - a
+    -- second caller racing a live claim sees no candidates at all, not a
+    -- filtered or scope-narrowed view of them.
+    let served =
+        if is_leased: []
+        else: filter(candidates, e =>
+            matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope))
 
     -- Unchanged when nothing matched, in either mode: an auto_advance
     -- cursor has nothing new to advance past, and a manual_ack one never
@@ -2863,11 +2929,19 @@ rule ConsumeEvents {
                 token: token,
                 ack_mode: mode,
                 sequence: next_position,
+                checked_out_at: if mode = manual_ack: now else: null,
                 updated_at: now
             )
         else if mode = auto_advance:
             cursor.sequence = next_position
             cursor.updated_at = now
+        else if not is_leased:
+            -- manual_ack, and either never claimed or a stale claim just
+            -- reclaimed - either way this call's own served batch (the
+            -- same batch a stale claim's own caller was already served,
+            -- when reclaiming) is now this call's claim to hold until it
+            -- acknowledges or its own lease lapses in turn.
+            cursor.checked_out_at = now
 }
 
 rule AcknowledgeEvents {
@@ -2887,6 +2961,14 @@ rule AcknowledgeEvents {
     ensures:
         cursor.sequence = sequence
         cursor.updated_at = now
+        -- Cleared unconditionally, whether or not this call's own caller
+        -- is the one still holding a live claim - see
+        -- ReadCursor.checked_out_at and the note above rule ConsumeEvents.
+        -- An acknowledgement is exactly what a claim exists to wait for,
+        -- so once one arrives the claim has done its job; there is no
+        -- scenario where leaving it set would still be protecting
+        -- anything.
+        cursor.checked_out_at = null
 }
 
 -- The GraphQL read, and the counterpart to FetchEvents above: where a
@@ -6732,7 +6814,16 @@ surface EventFetch {
         -- without acknowledging in between is served the same events
         -- twice. Handling those duplicates is the caller's own
         -- responsibility - idempotent processing, say - and never
-        -- something this library de-duplicates on its behalf.
+        -- something this library de-duplicates on its behalf. "Consuming
+        -- twice" here means two calls that each find the claim clear or
+        -- expired (see ReadCursor.checked_out_at) - a second call while a
+        -- first caller's own claim is still live is served nothing rather
+        -- than a duplicate, so two callers racing each other never both
+        -- act on the same unacknowledged batch at once. The batch is
+        -- still redelivered, exactly as before that existed, to whichever
+        -- caller next finds the claim clear or expired - this narrows
+        -- when a duplicate can be handed out, never whether one
+        -- eventually is.
 
     @guidance
         -- REST only, with the token presented as

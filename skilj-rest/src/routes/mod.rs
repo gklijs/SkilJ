@@ -89,6 +89,10 @@ struct AppState {
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
+    /// `ConsumeEvents`' own `manual_ack` claim lease - see
+    /// `skilj::SkiljBuilder::read_cursor_checkout_lease`'s own doc
+    /// comment (Codeberg issue #25, docs/architecture.md §53).
+    read_cursor_checkout_lease: chrono::Duration,
 }
 
 /// One request-level span per REST call, its parent set from an incoming
@@ -176,6 +180,7 @@ async fn trace_request(request: Request, next: Next) -> Response {
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn router(
     pool: Pool,
     dispatcher: Arc<dyn CommandDispatcher>,
@@ -184,6 +189,7 @@ pub fn router(
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
+    read_cursor_checkout_lease: chrono::Duration,
 ) -> Router {
     Router::new()
         .route("/v1/events/external", post(post_events_external))
@@ -202,6 +208,7 @@ pub fn router(
             encryption_master_key,
             event_broadcaster,
             event_cache,
+            read_cursor_checkout_lease,
         })
 }
 
@@ -775,7 +782,22 @@ async fn get_events_consume(
         }
     };
 
-    let existing_cursor = db::get_read_cursor(&state.pool, &token).await?;
+    // Codeberg issue #25's investigation (docs/architecture.md §53) - the
+    // read and the write below share one transaction, guarded end to end
+    // by `lock_read_cursor_for_consume`'s own advisory lock, so a second
+    // concurrent request for the same token genuinely blocks here until
+    // the first commits, rather than both reading the same pre-claim
+    // snapshot the way a separate read-then-write each against a fresh
+    // pooled connection would let them - see that function's own doc
+    // comment for why a row lock alone wouldn't have closed this (a
+    // token's very first-ever call has no row yet to lock).
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(skilj_core::error::Error::from)?;
+    db::lock_read_cursor_for_consume(&mut tx, &token).await?;
+    let existing_cursor = db::get_read_cursor(&mut *tx, &token).await?;
     let events = db::list_events_cached(
         &state.pool,
         &state.event_cache,
@@ -792,8 +814,10 @@ async fn get_events_consume(
         &events,
         &filters,
         Utc::now(),
+        state.read_cursor_checkout_lease,
     )?;
-    db::apply_cursor_update(&state.pool, &token, &result.cursor_update).await?;
+    db::apply_cursor_update(&mut *tx, &token, &result.cursor_update).await?;
+    tx.commit().await.map_err(skilj_core::error::Error::from)?;
 
     // See `get_events`' own identical comment above.
     let served: Vec<_> = result

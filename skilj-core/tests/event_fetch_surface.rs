@@ -111,6 +111,15 @@ fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(secs, 0).unwrap()
 }
 
+/// `consume_events`'s own `checkout_lease` parameter (Codeberg issue #25,
+/// docs/architecture.md §53) - matches both `config.read_cursor_checkout_lease`'s
+/// own spec default and `SkiljBuilder::read_cursor_checkout_lease`'s own
+/// Rust default, so a test relying on this fixture is exercising the
+/// same real-world value a default deployment would.
+fn checkout_lease() -> chrono::Duration {
+    chrono::Duration::minutes(5)
+}
+
 /// `event()` above with a caller-chosen `metadata.created_at`, for
 /// `at_time` fixtures that need to distinguish events by when they
 /// happened rather than only by their own sequence.
@@ -136,12 +145,14 @@ fn read_cursor_carries_its_declared_fields() {
         ack_mode: AckMode::ManualAck,
         sequence: 41,
         updated_at: timestamp(1000),
+        checked_out_at: Some(timestamp(1000)),
     };
 
     assert_eq!(cursor.token, t);
     assert_eq!(cursor.ack_mode, AckMode::ManualAck);
     assert_eq!(cursor.sequence, 41);
     assert_eq!(cursor.updated_at, timestamp(1000));
+    assert_eq!(cursor.checked_out_at, Some(timestamp(1000)));
 }
 
 // ---------------------------------------------------------------------
@@ -254,6 +265,7 @@ fn consume_events_provisions_a_cursor_on_first_use() {
         &events,
         &[],
         timestamp(100),
+        checkout_lease(),
     )
     .unwrap();
 
@@ -267,6 +279,11 @@ fn consume_events_provisions_a_cursor_on_first_use() {
             assert_eq!(cursor.ack_mode, AckMode::AutoAdvance);
             assert_eq!(cursor.sequence, 1); // highest served
             assert_eq!(cursor.updated_at, timestamp(100));
+            // Codeberg issue #25 (docs/architecture.md §53) -
+            // auto_advance never claims: it has no equivalent gap to
+            // close (see `ReadCursor.checked_out_at`'s own spec doc
+            // comment).
+            assert_eq!(cursor.checked_out_at, None);
         }
         other => panic!("expected ReadCursor.created, got {other:?}"),
     }
@@ -297,6 +314,7 @@ fn consume_events_at_sequence_starts_strictly_after_the_given_sequence() {
         &events,
         &[],
         timestamp(100),
+        checkout_lease(),
     )
     .unwrap();
 
@@ -337,6 +355,7 @@ fn consume_events_at_time_starts_strictly_after_events_at_or_before_that_cutoff(
         &events,
         &[],
         timestamp(100),
+        checkout_lease(),
     )
     .unwrap();
 
@@ -369,6 +388,7 @@ fn consume_events_at_time_with_no_events_before_the_cutoff_serves_everything() {
         &events,
         &[],
         timestamp(100),
+        checkout_lease(),
     )
     .unwrap();
 
@@ -387,14 +407,23 @@ fn consume_events_auto_advance_moves_the_cursor_to_the_highest_served_sequence()
         ack_mode: AckMode::AutoAdvance,
         sequence: 5,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
     let events = vec![event(et.clone(), 6), event(et.clone(), 7)];
 
     let ConsumeEventsResult {
         served,
         cursor_update,
-    } = event_store::consume_events(&t, Some(&existing), None, &events, &[], timestamp(200))
-        .unwrap();
+    } = event_store::consume_events(
+        &t,
+        Some(&existing),
+        None,
+        &events,
+        &[],
+        timestamp(200),
+        checkout_lease(),
+    )
+    .unwrap();
 
     assert_eq!(
         served.iter().map(|e| e.sequence).collect::<Vec<_>>(),
@@ -409,6 +438,13 @@ fn consume_events_auto_advance_moves_the_cursor_to_the_highest_served_sequence()
     );
 }
 
+/// `sequence`/`position` never moves on serve, in either mode - but
+/// unlike before Codeberg issue #25's investigation (docs/architecture.md
+/// §53), a `manual_ack` cursor with no live claim now *does* get one:
+/// `Claimed`, not `Unchanged`. See
+/// `consume_events_manual_ack_with_a_live_claim_serves_nothing` below for
+/// the case this test used to conflate with "nothing happens" - a second
+/// call while a claim is still live really is `Unchanged`.
 #[test]
 fn consume_events_manual_ack_never_moves_the_cursor_on_serve() {
     let et = event_type(true);
@@ -418,20 +454,152 @@ fn consume_events_manual_ack_never_moves_the_cursor_on_serve() {
         ack_mode: AckMode::ManualAck,
         sequence: 5,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
     let events = vec![event(et.clone(), 6)];
 
     let ConsumeEventsResult {
         served,
         cursor_update,
-    } = event_store::consume_events(&t, Some(&existing), None, &events, &[], timestamp(200))
-        .unwrap();
+    } = event_store::consume_events(
+        &t,
+        Some(&existing),
+        None,
+        &events,
+        &[],
+        timestamp(200),
+        checkout_lease(),
+    )
+    .unwrap();
 
     assert_eq!(
         served.iter().map(|e| e.sequence).collect::<Vec<_>>(),
         vec![6]
     );
+    assert_eq!(
+        cursor_update,
+        CursorUpdate::Claimed {
+            checked_out_at: timestamp(200)
+        }
+    );
+}
+
+/// Codeberg issue #25's investigation (docs/architecture.md §53) - the
+/// gap this closes: a second caller racing a still-live claim on the
+/// same token must be served nothing, not the identical unacknowledged
+/// batch a first caller may still be acting on externally.
+#[test]
+fn consume_events_manual_ack_with_a_live_claim_serves_nothing() {
+    let et = event_type(true);
+    let t = token(TokenStatus::Active, et.clone());
+    let existing = ReadCursor {
+        token: t.clone(),
+        ack_mode: AckMode::ManualAck,
+        sequence: 5,
+        updated_at: timestamp(0),
+        // Claimed one minute ago - well inside the five-minute
+        // checkout_lease() fixture, so still live.
+        checked_out_at: Some(timestamp(150)),
+    };
+    let events = vec![event(et, 6)];
+
+    let ConsumeEventsResult {
+        served,
+        cursor_update,
+    } = event_store::consume_events(
+        &t,
+        Some(&existing),
+        None,
+        &events,
+        &[],
+        timestamp(200),
+        checkout_lease(),
+    )
+    .unwrap();
+
+    assert!(
+        served.is_empty(),
+        "a second caller must not be served the same unacknowledged batch"
+    );
     assert_eq!(cursor_update, CursorUpdate::Unchanged);
+}
+
+/// Codeberg issue #25's investigation - the other half of the same
+/// guarantee: a claim older than `checkout_lease` is abandoned, not
+/// live, so this call succeeds exactly as if nothing had claimed it -
+/// serving the batch and reclaiming the cursor with a fresh
+/// `checked_out_at`, the self-healing path for a caller that was served
+/// but crashed before acknowledging.
+#[test]
+fn consume_events_manual_ack_reclaims_a_stale_claim() {
+    let et = event_type(true);
+    let t = token(TokenStatus::Active, et.clone());
+    let existing = ReadCursor {
+        token: t.clone(),
+        ack_mode: AckMode::ManualAck,
+        sequence: 5,
+        updated_at: timestamp(0),
+        // Six minutes before `now` below - past the five-minute
+        // checkout_lease() fixture, so stale.
+        checked_out_at: Some(timestamp(200 - 6 * 60)),
+    };
+    let events = vec![event(et, 6)];
+
+    let ConsumeEventsResult {
+        served,
+        cursor_update,
+    } = event_store::consume_events(
+        &t,
+        Some(&existing),
+        None,
+        &events,
+        &[],
+        timestamp(200),
+        checkout_lease(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        served.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![6],
+        "a stale claim must be reclaimed, not treated as still live"
+    );
+    assert_eq!(
+        cursor_update,
+        CursorUpdate::Claimed {
+            checked_out_at: timestamp(200)
+        }
+    );
+}
+
+/// Codeberg issue #25's investigation - the `manual_ack` twin of
+/// `consume_events_provisions_a_cursor_on_first_use`: a brand new
+/// cursor's very first serve claims it too, unlike `auto_advance`, which
+/// never sets `checked_out_at` at all (that test's own assertion).
+#[test]
+fn consume_events_manual_ack_provisions_a_claimed_cursor_on_first_use() {
+    let et = event_type(true);
+    let t = token(TokenStatus::Active, et.clone());
+    let events = vec![event(et, 0)];
+
+    let ConsumeEventsResult { cursor_update, .. } = event_store::consume_events(
+        &t,
+        None,
+        Some(AckMode::ManualAck),
+        &events,
+        &[],
+        timestamp(100),
+        checkout_lease(),
+    )
+    .unwrap();
+
+    match cursor_update {
+        CursorUpdate::Created(cursor) => {
+            assert_eq!(cursor.ack_mode, AckMode::ManualAck);
+            assert_eq!(cursor.checked_out_at, Some(timestamp(100)));
+        }
+        other => panic!("expected ReadCursor.created, got {other:?}"),
+    }
 }
 
 /// Per the spec's `ensures` block, the `auto_advance` branch writes
@@ -439,7 +607,9 @@ fn consume_events_manual_ack_never_moves_the_cursor_on_serve() {
 /// new matched and `next_position` falls back to the unchanged `position`
 /// (`highest_sequence(served) ?? position`) - so this is still
 /// `Advanced`, at the same sequence, not `Unchanged`. `Unchanged` is only
-/// reachable for `manual_ack` (see the test above).
+/// reachable for `manual_ack` with a still-live claim (Codeberg issue
+/// #25's investigation narrowed this - see
+/// `consume_events_manual_ack_with_a_live_claim_serves_nothing` below).
 #[test]
 fn consume_events_auto_advance_with_nothing_new_still_reports_advanced_at_the_same_sequence() {
     let et = event_type(true);
@@ -449,12 +619,22 @@ fn consume_events_auto_advance_with_nothing_new_still_reports_advanced_at_the_sa
         ack_mode: AckMode::AutoAdvance,
         sequence: 5,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
 
     let ConsumeEventsResult {
         served,
         cursor_update,
-    } = event_store::consume_events(&t, Some(&existing), None, &[], &[], timestamp(200)).unwrap();
+    } = event_store::consume_events(
+        &t,
+        Some(&existing),
+        None,
+        &[],
+        &[],
+        timestamp(200),
+        checkout_lease(),
+    )
+    .unwrap();
 
     assert!(served.is_empty());
     assert_eq!(
@@ -471,9 +651,16 @@ fn consume_events_auto_advance_with_nothing_new_still_reports_advanced_at_the_sa
 fn consume_events_rejects_a_revoked_token() {
     let t = token(TokenStatus::Revoked, event_type(true));
 
-    let err =
-        event_store::consume_events(&t, None, Some(AckMode::AutoAdvance), &[], &[], timestamp(0))
-            .unwrap_err();
+    let err = event_store::consume_events(
+        &t,
+        None,
+        Some(AckMode::AutoAdvance),
+        &[],
+        &[],
+        timestamp(0),
+        checkout_lease(),
+    )
+    .unwrap_err();
 
     assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
 }
@@ -483,9 +670,16 @@ fn consume_events_rejects_a_revoked_token() {
 fn consume_events_rejects_an_event_type_not_opted_into_reads() {
     let t = token(TokenStatus::Active, event_type(false));
 
-    let err =
-        event_store::consume_events(&t, None, Some(AckMode::AutoAdvance), &[], &[], timestamp(0))
-            .unwrap_err();
+    let err = event_store::consume_events(
+        &t,
+        None,
+        Some(AckMode::AutoAdvance),
+        &[],
+        &[],
+        timestamp(0),
+        checkout_lease(),
+    )
+    .unwrap_err();
 
     assert_eq!(err.code(), event_store::Error::EventReadNotAllowed.code());
 }
@@ -508,6 +702,7 @@ fn consume_events_rejects_an_invalid_filter() {
         &[],
         &bogus_filter,
         timestamp(0),
+        checkout_lease(),
     )
     .unwrap_err();
 
@@ -519,7 +714,8 @@ fn consume_events_rejects_an_invalid_filter() {
 fn consume_events_rejects_a_first_call_with_no_ack_mode() {
     let t = token(TokenStatus::Active, event_type(true));
 
-    let err = event_store::consume_events(&t, None, None, &[], &[], timestamp(0)).unwrap_err();
+    let err = event_store::consume_events(&t, None, None, &[], &[], timestamp(0), checkout_lease())
+        .unwrap_err();
 
     assert_eq!(err.code(), event_store::Error::CursorAckModeMismatch.code());
 }
@@ -533,6 +729,7 @@ fn consume_events_rejects_an_ack_mode_that_disagrees_with_the_stored_one() {
         ack_mode: AckMode::ManualAck,
         sequence: 0,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
 
     let err = event_store::consume_events(
@@ -542,6 +739,7 @@ fn consume_events_rejects_an_ack_mode_that_disagrees_with_the_stored_one() {
         &[],
         &[],
         timestamp(0),
+        checkout_lease(),
     )
     .unwrap_err();
 
@@ -560,6 +758,7 @@ fn acknowledge_events_moves_the_cursor_forward() {
         ack_mode: AckMode::ManualAck,
         sequence: 5,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
 
     let (sequence, updated_at) =
@@ -577,6 +776,7 @@ fn acknowledge_events_allows_reconfirming_ground_already_covered() {
         ack_mode: AckMode::ManualAck,
         sequence: 5,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
 
     let (sequence, _) =
@@ -594,6 +794,7 @@ fn acknowledge_events_rejects_a_revoked_token() {
         ack_mode: AckMode::ManualAck,
         sequence: 0,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
 
     let err = event_store::acknowledge_events(&t, Some(&cursor), 0, timestamp(0)).unwrap_err();
@@ -620,6 +821,7 @@ fn acknowledge_events_rejects_an_auto_advance_cursor() {
         ack_mode: AckMode::AutoAdvance,
         sequence: 0,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
 
     let err = event_store::acknowledge_events(&t, Some(&cursor), 0, timestamp(0)).unwrap_err();
@@ -636,6 +838,7 @@ fn acknowledge_events_rejects_moving_the_cursor_backwards() {
         ack_mode: AckMode::ManualAck,
         sequence: 5,
         updated_at: timestamp(0),
+        checked_out_at: None,
     };
 
     let err = event_store::acknowledge_events(&t, Some(&cursor), 4, timestamp(0)).unwrap_err();
@@ -692,7 +895,16 @@ proptest! {
             let existing = cursors.get(&key);
             let ack_mode = if existing.is_none() { Some(AckMode::AutoAdvance) } else { None };
 
-            let result = event_store::consume_events(t, existing, ack_mode, &[], &[], Utc::now()).unwrap();
+            let result = event_store::consume_events(
+                t,
+                existing,
+                ack_mode,
+                &[],
+                &[],
+                Utc::now(),
+                checkout_lease(),
+            )
+            .unwrap();
             if let CursorUpdate::Created(cursor) = result.cursor_update {
                 let previous = cursors.insert(key.clone(), *cursor);
                 prop_assert!(previous.is_none(), "a second ReadCursor.created for a token that already has one");

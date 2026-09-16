@@ -339,6 +339,7 @@ fn an_order_placed_event_is_sent_with_its_own_tag_as_the_group_id() {
             credential: token,
             address: address.clone(),
             key_tag_key: Some("order".to_string()),
+            partition: None,
         };
         let http = reqwest::Client::new();
         let retry_policy = skilj_retry::RetryPolicy::default();
@@ -790,6 +791,7 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
             credential: token,
             address: address.clone(),
             key_tag_key: Some("order".to_string()),
+            partition: None,
         };
         let http = reqwest::Client::new();
         let retry_policy = skilj_retry::RetryPolicy::bounded(
@@ -835,6 +837,139 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
         assert!(
             mock_state.parked_deliveries.lock().unwrap().is_empty(),
             "outbound gives up by skipping, never by parking"
+        );
+    });
+}
+
+/// Codeberg issue #25's investigation (docs/architecture.md §54) - the
+/// AMQP twin of `skilj_kafka`'s own
+/// `two_partitioned_mappings_together_produce_every_key_exactly_once`:
+/// two `OutboundMapping`s for the same `EventType`, different
+/// `credential`s (simulating two independent `EventReadToken`s, each
+/// seeing the identical stream), same `partition_count`, different
+/// `partition_index`. Each gets a single `produce_once` call over its
+/// own full six-event queue. The union of what actually lands on the
+/// real Artemis address across both must be exactly those six group-ids,
+/// no duplicates (double-send) and no gaps (lost delivery) - and every
+/// sequence must be acknowledged regardless of which instance actually
+/// sent it, proving a partition-skip still advances that instance's own
+/// cursor.
+#[test]
+fn two_partitioned_mappings_together_send_every_key_exactly_once() {
+    runtime().block_on(async {
+        let Some(url) = test_broker().await else {
+            return;
+        };
+        let address = unique_address("orders-partitioned");
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let order_ids = ["o-1", "o-2", "o-3", "o-4", "o-5", "o-6"];
+        let events: Vec<Value> = order_ids
+            .iter()
+            .enumerate()
+            .map(|(i, order_id)| {
+                json!({
+                    "sequence": i as i64,
+                    "eventType": "OrderPlaced",
+                    "payload": { "orderId": order_id },
+                    "tags": [{ "key": "order", "value": order_id }],
+                    "metadata": { "correlationId": null, "causationId": null },
+                })
+            })
+            .collect();
+
+        let token_0 = "read-token-partition-0".to_string();
+        let token_1 = "read-token-partition-1".to_string();
+        enqueue(&mock_state, &token_0, "OrderPlaced", events.clone());
+        enqueue(&mock_state, &token_1, "OrderPlaced", events);
+
+        let (_send_conn_0, mut send_session_0) = connect(url, "sender-conn-0").await;
+        let mut sender_0 = Sender::attach(&mut send_session_0, "sender-link-0", address.as_str())
+            .await
+            .unwrap();
+        let (_send_conn_1, mut send_session_1) = connect(url, "sender-conn-1").await;
+        let mut sender_1 = Sender::attach(&mut send_session_1, "sender-link-1", address.as_str())
+            .await
+            .unwrap();
+        let (_recv_conn, mut recv_session) = connect(url, "receiver-conn").await;
+        let mut receiver = Receiver::attach(&mut recv_session, "receiver-link", address.as_str())
+            .await
+            .unwrap();
+
+        let http = reqwest::Client::new();
+        let retry_policy = skilj_retry::RetryPolicy::default();
+
+        let mapping_0 = OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: token_0,
+            address: address.clone(),
+            key_tag_key: Some("order".to_string()),
+            partition: Some((0, 2)),
+        };
+        let mut retry_state_0 = None;
+        produce_once(
+            &http,
+            &skilj_base_url,
+            &mut sender_0,
+            &mapping_0,
+            &retry_policy,
+            &mut retry_state_0,
+        )
+        .await
+        .unwrap();
+
+        let mapping_1 = OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: token_1,
+            address: address.clone(),
+            key_tag_key: Some("order".to_string()),
+            partition: Some((1, 2)),
+        };
+        let mut retry_state_1 = None;
+        produce_once(
+            &http,
+            &skilj_base_url,
+            &mut sender_1,
+            &mapping_1,
+            &retry_policy,
+            &mut retry_state_1,
+        )
+        .await
+        .unwrap();
+
+        let mut received_keys = std::collections::HashSet::new();
+        for _ in 0..order_ids.len() {
+            let delivery = tokio::time::timeout(Duration::from_secs(15), receiver.recv::<Data>())
+                .await
+                .expect("must receive every message within 15s")
+                .unwrap();
+            receiver.accept(&delivery).await.unwrap();
+            let group_id = delivery
+                .message()
+                .properties
+                .as_ref()
+                .and_then(|p| p.group_id.clone())
+                .expect("every message in this test carries a group-id");
+            assert!(
+                received_keys.insert(group_id.clone()),
+                "key {group_id} was sent more than once - double-send across partitions"
+            );
+        }
+        assert_eq!(
+            received_keys,
+            order_ids.iter().map(|s| s.to_string()).collect(),
+            "every key must be sent exactly once across both partitions"
+        );
+
+        let expected_sequences: Vec<i64> = (0..order_ids.len() as i64).collect();
+        let mut acked = mock_state.acked.lock().unwrap().clone();
+        acked.sort_unstable();
+        acked.dedup();
+        assert_eq!(
+            acked, expected_sequences,
+            "every sequence must be acknowledged, owned by this partition or not"
         );
     });
 }
