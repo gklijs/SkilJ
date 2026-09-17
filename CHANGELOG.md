@@ -6,6 +6,86 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: breaking changes may land in minor/patch versions until 1.0).
 
+## [0.0.7] - 2026-09-17
+
+### Added
+
+- `Metadata` on commands and events gains `correlation_id`/`causation_id`:
+  a durable, queryable thread from a submitted command through every
+  event and cross-context command it triggers, distinct from the
+  ephemeral OTel trace id already carried on REST/GraphQL error
+  responses. Every stored `Command` ends up with a `correlation_id`
+  (generated when the caller omits one); `causation_id` is `null` for a
+  root command and set to the causing event's own stable name otherwise.
+  See [docs/architecture.md §44](docs/architecture.md#correlation-causation-ids)
+  (Codeberg issue #18).
+- New `skilj-test-fixture` crate: a given/when/then harness for
+  exercising a plugin's own `decide()`/`project()` directly, in memory -
+  no Postgres, no license required for a full HTTP round trip just to
+  check whether a decision function returns the right event. See
+  [docs/architecture.md §45](docs/architecture.md#given-when-then-test-fixture)
+  (Codeberg issue #19).
+- Native one-shot, per-entity deadlines: `plugin::ScheduleDeadline`/
+  `CancelDeadline` schedule a deferred command tied to a specific
+  entity's own tags - "cancel this order if it has no time to die within
+  30 minutes without payment" - and cancel it if the awaited event
+  happens first, without reaching for the much heavier `skilj-temporal`
+  for a single deferred command. See
+  [docs/architecture.md §46](docs/architecture.md#native-deadlines)
+  (Codeberg issue #20).
+- Dead-letter/parking for failed event and message handler delivery:
+  `CrossContextRoute`'s catch-up loop and the `skilj-kafka`/`skilj-amqp`/
+  `skilj-nats` bridges now share one backoff/attempt-cap policy (new
+  `skilj-retry` crate) instead of retrying a poison delivery forever on
+  every poll tick, blocking every occurrence behind it. Past the attempt
+  cap, the occurrence is parked to an operator-visible surface instead
+  of looping - a failing delivery finally gets to live and let die,
+  rather than take the whole route down with it. See
+  [docs/architecture.md §47](docs/architecture.md#parked-deliveries)
+  (Codeberg issue #21).
+- New GraphQL subscription `projectionUpdates`: the subscription
+  counterpart to `ProjectionQuery`, pushing the already-computed
+  `Projection` state itself so a client wanting "push me the current
+  balance whenever it changes" no longer has to subscribe to raw events
+  and reimplement `project()`'s own fold client-side. See
+  [docs/architecture.md §49](docs/architecture.md#49-a-graphql-subscription-for-projections-projectionupdates-codeberg-issue-23)
+  (Codeberg issue #23).
+- Segmented/parallel event processing: async `Projection` and `Snapshot`
+  catch-up can now be spread across a fleet of instances, each claiming
+  and processing its own segment via `pg_advisory_xact_lock`, for
+  workloads where one instance redundantly redoing the same idempotent
+  work isn't enough - the world, as it turns out, is not always enough.
+  The `skilj-kafka`/`skilj-amqp`/`skilj-nats` bridges gain the same
+  per-partition split, on top of a newly-closed double-publish gap
+  (`ReadCursor.checked_out_at`) where two concurrent instances of the
+  same mapping could otherwise both be served, and both act on, the
+  identical unacknowledged batch. See
+  [docs/architecture.md §50](docs/architecture.md#50-investigation-segmentedparallel-event-processing-for-horizontal-scale-out-codeberg-issue-25)
+  through
+  [§54](docs/architecture.md#54-bridge-partitioning-skilj-kafkaskilj-amqpskilj-nats-on-top-of-53)
+  (Codeberg issue #25).
+
+### Fixed
+
+- A real cross-instance double-fold bug in async `Projection` catch-up,
+  found while checking issue #25's "is the redundant work actually
+  idempotent?" premise directly instead of trusting the existing design
+  notes: two instances racing the same fold could each apply an
+  overlapping batch of events, double-counting some of them. See
+  [docs/architecture.md §50](docs/architecture.md#50-investigation-segmentedparallel-event-processing-for-horizontal-scale-out-codeberg-issue-25).
+- A fire-vs-cancel race in `CancelDeadline` (§46): `fire_due_deadlines`
+  could still exercise a deadline's license to fire its command after a
+  concurrent `catch_up_cancel_deadline` tick had already revoked it,
+  because the row was only marked `'fired'` after the side effect ran.
+  See [docs/architecture.md §55](docs/architecture.md#55-closing-the-canceldeadline-fire-vs-cancel-race).
+- A duplicate parked-delivery race in `catch_up_cross_context_route`
+  (§47): two instances polling the same route concurrently could both
+  read the same near-exhausted retry state and both park a row for the
+  identical failure - not quite diamonds are forever, but two rows for
+  one real failure was one too many. Retry-state reads and writes are
+  now lock-guarded and atomic. See
+  [docs/architecture.md §56](docs/architecture.md#56-closing-the-parked-delivery-duplication-race-in-catch_up_cross_context_route).
+
 ## [0.0.6] - 2026-09-13
 
 ### Added
@@ -302,7 +382,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.6...HEAD
+[Unreleased]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.7...HEAD
+[0.0.7]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.6...v0.0.7
 [0.0.6]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.5...v0.0.6
 [0.0.5]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.4...v0.0.5
 [0.0.4]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.3...v0.0.4

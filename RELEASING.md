@@ -1,11 +1,12 @@
 # Releasing
 
-The workspace has 14 crates. 13 are published to crates.io:
+The workspace has 15 crates. 14 are published to crates.io:
 `skilj-macros`, `skilj-core`, `skilj-graphql`, `skilj-rest`, `skilj`,
 `skilj-codegen`, `skilj-tui`, `skilj-inspector`, `skilj-temporal`,
-`skilj-kafka`, `skilj-amqp`, `skilj-nats`, `skilj-test-fixture`.
-`skilj-demo` is not (`publish = false` in its `Cargo.toml` - it's a
-worked example, not a library anyone should depend on).
+`skilj-kafka`, `skilj-amqp`, `skilj-nats`, `skilj-test-fixture`,
+`skilj-retry`. `skilj-demo` is not (`publish = false` in its
+`Cargo.toml` - it's a worked example, not a library anyone should
+depend on).
 
 ## Version sync
 
@@ -14,18 +15,20 @@ Every crate uses `version.workspace = true`, pulling its version from
 therefore:
 
 1. Bump `[workspace.package] version`.
-2. Update the matching `version = "..."` in each of the 7 internal
+2. Update the matching `version = "..."` in each of the 8 internal
    `[workspace.dependencies]` path entries (`skilj-core`,
    `skilj-graphql`, `skilj-macros`, `skilj-rest`, `skilj`,
-   `skilj-codegen`, `skilj-test-fixture` - these are the only crates any
-   other workspace member depends on via a `workspace = true` reference
-   (`skilj-demo`'s own `[dev-dependencies]` is `skilj-test-fixture`'s
-   one dependent); `skilj-tui`/`skilj-inspector` have no internal
-   dependents and need no such entry).
+   `skilj-codegen`, `skilj-test-fixture`, `skilj-retry` - these are the
+   only crates any other workspace member depends on via a
+   `workspace = true` reference (`skilj-demo`'s own `[dev-dependencies]`
+   is `skilj-test-fixture`'s one dependent); `skilj-tui`/`skilj-inspector`
+   have no internal dependents and need no such entry).
 
-Not 11 separate per-crate edits - one field plus 7 matching version
-strings (`skilj-temporal` has no internal dependents either, the same
-reason `skilj-tui`/`skilj-inspector` need no entry).
+Not 12 separate per-crate edits - one field plus 8 matching version
+strings (`skilj-temporal`/`skilj-kafka`/`skilj-amqp`/`skilj-nats` have
+no internal dependents either - `skilj-retry` is a dependency of
+`skilj-core`/`skilj-kafka`/`skilj-amqp`/`skilj-nats`, not the other way
+round - the same reason `skilj-tui`/`skilj-inspector` need no entry).
 
 ### Doing this with `cargo-release`
 
@@ -48,8 +51,8 @@ see exactly what it would do.
 
 Derived from the real internal dependency graph:
 
-1. `skilj-macros` (zero internal deps)
-2. `skilj-core` (depends on `skilj-macros`)
+1. `skilj-macros`, `skilj-retry` (both zero internal deps)
+2. `skilj-core` (depends on `skilj-macros` and `skilj-retry`)
 3. `skilj-graphql`, `skilj-rest`, `skilj-codegen`, `skilj-test-fixture`
    (each depends on `skilj-core` at most; independent of each other -
    `skilj-codegen` has zero internal deps, `skilj-rest`/
@@ -59,9 +62,10 @@ Derived from the real internal dependency graph:
 5. `skilj-tui` (zero internal deps), `skilj-inspector` (depends on
    `skilj-core` only), `skilj-temporal` (zero internal deps - it speaks
    only skilj's wire protocol, the same posture as `skilj-tui`),
-   `skilj-kafka`/`skilj-amqp`/`skilj-nats` (zero internal deps, the same
-   posture as `skilj-temporal`) - independent of each other and of
-   `skilj`
+   `skilj-kafka`/`skilj-amqp`/`skilj-nats` (depend on `skilj-retry`,
+   already published in step 1, plus skilj's wire protocol - the same
+   posture as `skilj-temporal` otherwise) - independent of each other
+   and of `skilj`
 
 Wait for each crate to finish indexing on crates.io
 (`cargo search <crate>` or the crates.io page) before publishing
@@ -70,6 +74,7 @@ version to actually resolve from the registry.
 
 ```sh
 cargo publish -p skilj-macros
+cargo publish -p skilj-retry
 # wait for indexing
 cargo publish -p skilj-core
 # wait for indexing
