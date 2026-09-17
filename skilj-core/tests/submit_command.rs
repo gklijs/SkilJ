@@ -1457,3 +1457,75 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
         assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 0);
     });
 }
+
+#[test]
+fn submit_command_batches_sequence_allocation_for_a_multi_event_command() {
+    // Codeberg issue #32: `submit_command` claims every sequence number a
+    // multi-event `CommandDecision::Accepted` needs in one
+    // `next_sequence_batch` round trip rather than one `next_sequence`
+    // call per event. Same `TriggerTwoEvents` decider as the poison-pill
+    // rollback test above, but with no `Poisonable` projection
+    // registered - `PoisonEvent`'s own `project()` handler only poisons
+    // that one specific projection name, so with nothing consuming it
+    // this is an ordinary two-event success, and the real thing this
+    // test exists to prove is that the two resulting sequences are
+    // contiguous, ascending, and assigned in `event_specs` order -
+    // exactly what one batched `UPDATE ... SET next_value = next_value +
+    // 2 RETURNING next_value` derives its range from.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        seed_poison_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "TriggerTwoEvents").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+
+        let payload = "{}";
+        let initial_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+
+        let outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "client-1",
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            initial_decision,
+            None,
+            test_now(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let SubmitCommandOutcome::Accepted { events, .. } = outcome else {
+            panic!("no Poisonable projection is registered, so nothing rejects this");
+        };
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type.name, "OrderShipped");
+        assert_eq!(events[0].sequence, 0);
+        assert_eq!(events[1].event_type.name, "PoisonEvent");
+        assert_eq!(events[1].sequence, 1);
+
+        // The batch allocation's own high-water mark left the sequence
+        // row exactly where two individual `next_sequence` calls would
+        // have - the next real allocation continues right after it, no
+        // gap and no overlap.
+        assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 2);
+    });
+}

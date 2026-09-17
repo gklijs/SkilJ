@@ -2546,13 +2546,18 @@ pub async fn fire_system_event(
     };
 
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
+    // Fetched only now - after `next_sequence` above already took this
+    // bounded context's own lock - see `insert_event_and_update_sync_projections_in_tx`'s
+    // own doc comment on why that ordering, not "as early as possible", is
+    // what keeps this read race-free against `promote_projection_rebuild`.
+    let sync_projections = sync_projections_for_bounded_context(pool, bounded_context).await?;
     insert_event_and_update_sync_projections_in_tx(
-        pool,
         &mut tx,
         &event,
         None,
         projection_dispatcher,
         &encryption_key_ids,
+        &sync_projections,
     )
     .await?;
 
@@ -3949,6 +3954,30 @@ pub async fn list_projections_for_bounded_context(
     Ok(projections)
 }
 
+/// The `sync`-only slice of `list_projections_for_bounded_context` that
+/// `insert_event_and_update_sync_projections_in_tx` actually needs -
+/// pulled out so every call site fetches it once, itself, before opening
+/// (or as part of preparing) its own transaction, instead of that
+/// function re-running the full metadata read once per event it inserts.
+/// A command that decides several events used to pay for this read again
+/// for every one of them, all of it while `submit_command`'s own
+/// bounded-context lock was held (Codeberg issue #32) - hoisting it here,
+/// to one call per commit, is pure round-trip reduction, not a behaviour
+/// change: it is still the same "small, admin-managed list, not worth
+/// locking" read via `pool`, not `tx`, that function's own doc comment
+/// already describes.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn sync_projections_for_bounded_context(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<Projection>> {
+    Ok(list_projections_for_bounded_context(pool, bounded_context)
+        .await?
+        .into_iter()
+        .filter(|p| p.sync)
+        .collect())
+}
+
 #[derive(sqlx::FromRow)]
 struct ProjectionRebuildRow {
     projection_name: String,
@@ -4517,6 +4546,38 @@ pub async fn next_sequence<'e>(
     .fetch_one(executor)
     .await?;
     Ok(next)
+}
+
+/// `next_sequence`'s own batch form - one command triggering several
+/// events (`CommandDecision::Accepted { events }` with more than one
+/// `EventSpec`) used to call `next_sequence` once per event, each its own
+/// round trip to Postgres, all of them while `submit_command`'s own
+/// bounded-context lock is held (Codeberg issue #32: that lock hold
+/// duration, not pool size, is what caps real-world write throughput).
+/// This claims the whole range in one `UPDATE ... RETURNING`, exactly the
+/// same row-lock-based serialisation as the single-value form (already
+/// held by the `SELECT ... FOR UPDATE` every real caller takes first), so
+/// the semantics are identical - just one round trip for `count` sequence
+/// numbers instead of `count` of them. `count == 0` short-circuits without
+/// touching the row at all, since `next_value + 0` would still be a wasted
+/// round trip for a command whose decision produced no events.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn next_sequence_batch<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+    count: i64,
+) -> crate::error::Result<Vec<i64>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let schema = schema_ident(bounded_context);
+    let (last,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.sequence SET next_value = next_value + $1 RETURNING next_value"
+    )))
+    .bind(count)
+    .fetch_one(executor)
+    .await?;
+    Ok(((last - count + 1)..=last).collect())
 }
 
 /// The highest `sequence` currently committed in a bounded context -
@@ -5382,14 +5443,16 @@ pub async fn insert_event_and_update_sync_projections(
     broadcaster: &crate::event_store::EventBroadcaster,
     event_cache: &crate::event_cache::EventCache,
 ) -> crate::error::Result<()> {
+    let sync_projections =
+        sync_projections_for_bounded_context(pool, &event.bounded_context.name).await?;
     let mut tx = pool.begin().await?;
     insert_event_and_update_sync_projections_in_tx(
-        pool,
         &mut tx,
         event,
         command_id,
         dispatcher,
         encryption_key_ids,
+        &sync_projections,
     )
     .await?;
     tx.commit().await?;
@@ -5417,38 +5480,39 @@ pub async fn insert_event_and_update_sync_projections(
 /// and released on commit." Neither commits `tx` nor broadcasts - both
 /// stay the caller's job, exactly once, after every event in a single
 /// submission (a `ProcessCommand` call can trigger several) has been
-/// folded in. `pool` is still needed alongside `tx`, only for
-/// `list_projections_for_bounded_context`'s own metadata-only read -
-/// deliberately not run through `tx` (see that call's own comment
-/// below). This read is safe on the bare pool specifically *because*
-/// every event-insert path already holds `next_sequence`'s own lock on
-/// this bounded context's `sequence` row by the time it runs, and
-/// `promote_projection_rebuild` - the one place a projection's own
-/// `sync` flag can flip mid-flight - takes that identical lock before it
-/// can promote (drift audit finding #6, see project memory
-/// `skilj-drift-audit-2026-08-20`, and that function's own doc comment):
-/// the two can never interleave, so by the time this plain read runs
-/// there is no possible half-visible state to see.
+/// folded in.
+///
+/// `sync_projections` is the caller's job too now (Codeberg issue #32) -
+/// this function used to re-run `list_projections_for_bounded_context`'s
+/// own metadata read itself, once per event, which meant a command that
+/// decided several events paid for it again and again while
+/// `submit_command`'s own bounded-context lock was held. Every real call
+/// site now fetches it exactly once via `sync_projections_for_bounded_context`
+/// and passes the same slice into every event this one submission
+/// inserts. That fetch is still a plain `pool` read, not `tx` - deliberately,
+/// the same "small, admin-managed list, not worth locking" treatment
+/// `list_projections_for_bounded_context`'s own callers already give it
+/// elsewhere - but it is only safe to run *after* the caller's own
+/// `next_sequence`/`SELECT ... FOR UPDATE` on this bounded context's
+/// `sequence` row has already been taken (every real call site fetches it
+/// no earlier than that point): `promote_projection_rebuild` - the one
+/// place a projection's own `sync` flag can flip mid-flight - takes that
+/// identical lock before it can promote (drift audit finding #6, see
+/// project memory `skilj-drift-audit-2026-08-20`, and that function's own
+/// doc comment), so the two can never interleave once this caller's own
+/// lock is held, and there is no possible half-visible state left to see.
+/// Fetching it before that lock would reopen exactly that race.
 #[tracing::instrument(skip_all)]
 pub async fn insert_event_and_update_sync_projections_in_tx(
-    pool: &Pool,
     tx: &mut Transaction<'_, Postgres>,
     event: &Event,
     command_id: Option<i64>,
     dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     encryption_key_ids: &[i64],
+    sync_projections: &[Projection],
 ) -> crate::error::Result<()> {
     let bounded_context = &event.bounded_context.name;
     let schema = schema_ident(bounded_context);
-
-    // Metadata only - read outside `tx`, the same "small, admin-managed
-    // list, not worth locking" treatment `list_projections_for_bounded_context`'s
-    // own callers already give it elsewhere.
-    let sync_projections: Vec<_> = list_projections_for_bounded_context(pool, bounded_context)
-        .await?
-        .into_iter()
-        .filter(|p| p.sync)
-        .collect();
 
     insert_event(&mut **tx, event, command_id).await?;
 
@@ -5469,7 +5533,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
         .await?;
     }
 
-    for projection in &sync_projections {
+    for projection in sync_projections {
         // `Some(vec![])` (registered, but this event's type isn't
         // consumed) and `None` (dispatcher doesn't recognise this
         // projection at all) both fall through to an empty loop below -
@@ -5760,13 +5824,19 @@ pub async fn create_and_insert_external_event(
         },
     )?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
+    // Fetched only now - after `next_sequence` above already took this
+    // bounded context's own lock - see `insert_event_and_update_sync_projections_in_tx`'s
+    // own doc comment on why that ordering, not "as early as possible", is
+    // what keeps this read race-free against `promote_projection_rebuild`.
+    let sync_projections =
+        sync_projections_for_bounded_context(pool, &bounded_context_name).await?;
     insert_event_and_update_sync_projections_in_tx(
-        pool,
         &mut tx,
         &event,
         None,
         projection_dispatcher,
         &encryption_key_ids,
+        &sync_projections,
     )
     .await?;
     if let Some(cursor) = &dedupe {
@@ -5839,13 +5909,19 @@ pub async fn create_and_insert_direct_event(
         },
     )?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
+    // Fetched only now - after `next_sequence` above already took this
+    // bounded context's own lock - see `insert_event_and_update_sync_projections_in_tx`'s
+    // own doc comment on why that ordering, not "as early as possible", is
+    // what keeps this read race-free against `promote_projection_rebuild`.
+    let sync_projections =
+        sync_projections_for_bounded_context(pool, &bounded_context_name).await?;
     insert_event_and_update_sync_projections_in_tx(
-        pool,
         &mut tx,
         &event,
         None,
         projection_dispatcher,
         &encryption_key_ids,
+        &sync_projections,
     )
     .await?;
     tx.commit().await?;
@@ -6001,6 +6077,59 @@ pub async fn submit_command(
         .max()
         .unwrap_or_else(|| snapshot.as_ref().map(|s| s.as_of_sequence).unwrap_or(-1));
 
+    // Codeberg issue #32: a pre-lock warm-up for the common, no-DCB-conflict
+    // path - mirrors `create_and_insert_external_event`/
+    // `create_and_insert_direct_event`'s own "resolve encryption keys
+    // before opening the transaction" shape, extended here to event-type
+    // lookups too. `initial_decision`'s own event_specs are exactly what a
+    // redispatch-free commit will need; the post-lock code further down
+    // still runs unconditionally and is what actually governs correctness
+    // (its `Entry::Vacant`/`resolved.contains_key` guards already tolerate
+    // this warm-up being partial, stale - a redispatch below can still add
+    // to both maps - or skipped entirely, e.g. a Rejected initial_decision
+    // never enters this block). This exists purely to shorten the
+    // bounded-context lock's own hold span for the case that matters most:
+    // the large majority of commands that never hit a DCB conflict at all.
+    let mut event_types_by_name: std::collections::HashMap<String, EventType> =
+        std::collections::HashMap::new();
+    let mut resolved = std::collections::HashMap::new();
+    if let crate::shared::CommandDecision::Accepted { events } = &initial_decision {
+        for spec in events {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                event_types_by_name.entry(spec.event_type.clone())
+            {
+                if let Some(et) =
+                    get_event_type(pool, &bounded_context_name, &spec.event_type).await?
+                {
+                    entry.insert(et);
+                }
+            }
+        }
+        resolve_encryption_keys(
+            pool,
+            &bounded_context_name,
+            &command_type.sensitive_fields,
+            payload,
+            encryption_master_key,
+            &mut resolved,
+        )
+        .await?;
+        for spec in events {
+            if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
+                let spec_payload = spec.payload.to_string();
+                resolve_encryption_keys(
+                    pool,
+                    &bounded_context_name,
+                    &event_type.sensitive_fields,
+                    &spec_payload,
+                    encryption_master_key,
+                    &mut resolved,
+                )
+                .await?;
+            }
+        }
+    }
+
     let mut tx = pool.begin().await?;
     let (locked_highest,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT next_value FROM {schema}.sequence FOR UPDATE"
@@ -6125,10 +6254,12 @@ pub async fn submit_command(
     // process_command's own resolve_event_type/next_sequence stay plain
     // sync closures (decide() and everything downstream is I/O-free per
     // §1.1) - every EventType lookup and sequence allocation this call
-    // will need happens first, here, against the *final* event_specs
-    // (the redispatched ones, if a retry happened above).
-    let mut event_types_by_name: std::collections::HashMap<String, EventType> =
-        std::collections::HashMap::new();
+    // will need happens against the *final* event_specs (the redispatched
+    // ones, if a retry happened above). `event_types_by_name` was already
+    // warmed up before the lock for `initial_decision`'s own specs (see
+    // that block's own comment); this loop is what a redispatch's
+    // different specs still need, and its `Entry::Vacant` guard means it
+    // costs nothing extra when nothing changed.
     for spec in &event_specs {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             event_types_by_name.entry(spec.event_type.clone())
@@ -6139,15 +6270,15 @@ pub async fn submit_command(
         }
     }
 
-    // Allocated inside `tx`, after the lock above - `next_sequence`'s
-    // row lock is already held, so these UPDATEs proceed immediately,
-    // and a failure anywhere below (an unregistered event type,
-    // encryption resolution, the inserts themselves) rolls every one of
-    // them back with the rest of this transaction.
-    let mut sequences = Vec::with_capacity(event_specs.len());
-    for _ in 0..event_specs.len() {
-        sequences.push(next_sequence(&mut *tx, &bounded_context_name).await?);
-    }
+    // Allocated inside `tx`, after the lock above, in one round trip for
+    // every event this command decided - `next_sequence_batch`, not
+    // `event_specs.len()` separate `next_sequence` calls (Codeberg issue
+    // #32: each one used to be its own round trip while this lock was
+    // held). A failure anywhere below (an unregistered event type,
+    // encryption resolution, the inserts themselves) rolls the whole
+    // allocation back with the rest of this transaction.
+    let sequences =
+        next_sequence_batch(&mut *tx, &bounded_context_name, event_specs.len() as i64).await?;
     let mut sequences = sequences.into_iter();
 
     // protect_sensitive_fields' own pre-resolution step, for the
@@ -6158,7 +6289,10 @@ pub async fn submit_command(
     // sequence row lock across a master-key wrap" reasoning
     // `create_and_insert_external_event`'s own doc comment gives, doubly
     // so here since this is the lock `submit_command` itself holds.
-    let mut resolved = std::collections::HashMap::new();
+    // `resolved` was already warmed up before the lock for
+    // `initial_decision`'s own payloads; `resolve_encryption_keys`'s own
+    // `contains_key` guard makes every call below a no-op unless a
+    // redispatch actually changed what needs resolving.
     resolve_encryption_keys(
         pool,
         &bounded_context_name,
@@ -6220,15 +6354,22 @@ pub async fn submit_command(
     // events.
     let command_key_ids = encryption_key_ids(&result.command.encryption_keys, &resolved);
     let command_id = insert_command(&mut tx, &result.command, &command_key_ids).await?;
+    // Fetched once for every event this command triggers, not once per
+    // event (Codeberg issue #32) - and only now, after the lock above is
+    // already held, which is what keeps this read race-free against
+    // `promote_projection_rebuild` (see `insert_event_and_update_sync_projections_in_tx`'s
+    // own doc comment).
+    let sync_projections =
+        sync_projections_for_bounded_context(pool, &bounded_context_name).await?;
     for event in &result.events {
         let event_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
         insert_event_and_update_sync_projections_in_tx(
-            pool,
             &mut tx,
             event,
             Some(command_id),
             projection_dispatcher,
             &event_key_ids,
+            &sync_projections,
         )
         .await?;
     }

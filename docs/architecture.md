@@ -8557,3 +8557,121 @@ possible window for this race. Verified failing against the pre-fix
 code first (both the advisory lock and the unique index/upsert
 temporarily reverted, reproducing exactly two parked rows for the one
 occurrence), then verified passing again with the fix restored.
+
+## 57. Shortening `submit_command`'s own lock hold (Codeberg issue #32)
+
+A load test of `skilj-helpdesk` against this library (its own
+`docs/load-test-report-2026-09-17.md`) found that total write throughput
+for a single bounded context is capped at roughly 10-16 commands/second
+- in total, across every tenant/entity sharing that bounded context, not
+per-entity - independent of DB pool size or a consuming app's own
+concurrency limiting. The reported symptom: a single `SELECT next_value
+FROM sequence FOR UPDATE` observed taking up to 60s under concurrent
+load, with the pool nowhere near exhausted. The root cause is exactly
+what `submit_command`'s own doc comment already describes and §22
+confirmed is deliberate: one bounded context's whole commit path -
+dispatch/redispatch on conflict, `insert_command`, every triggered
+event's insert - runs inside a single transaction holding that one
+`sequence` row's lock, so no two commands against the same bounded
+context can ever commit concurrently. That serialization is what keeps
+`SequenceIsGaplessPerBoundedContext`/`DynamicConsistencyBoundaryHonoured`
+true, and this pass does not touch it - what it does instead is shrink
+how long each commit holds that lock, since every extra round trip made
+while the lock is held directly caps how many commands/second the whole
+bounded context can ever process, regardless of pool size.
+
+**Three independent round-trip reductions, all inside `submit_command`
+(`skilj-core/src/db/mod.rs`):**
+
+1. **Batched sequence allocation.** A command whose decision triggers
+   several events used to call `next_sequence` once per event, each its
+   own round trip while the lock was held. `next_sequence_batch` claims
+   the whole range in one `UPDATE {schema}.sequence SET next_value =
+   next_value + $1 RETURNING next_value` instead - the returned
+   high-water mark plus `count` derives the same contiguous, ascending
+   range `event_specs` order already expected, just in one round trip
+   instead of `count` of them. `next_sequence` itself (the single-value
+   form) is untouched - every other call site, all single-event, still
+   uses it.
+2. **One `sync_projections` fetch per commit, not one per event.**
+   `insert_event_and_update_sync_projections_in_tx` used to re-run
+   `list_projections_for_bounded_context`'s own metadata read (itself
+   several round trips: a bounded-context lookup, the `projections` row
+   scan, one `consumed_event_types` query per row) on every single call
+   - so a command triggering N events paid for it N times. The function
+   now takes `sync_projections: &[Projection]` as a parameter instead of
+   a `pool` handle, and every real call site (`submit_command`,
+   `create_and_insert_external_event`, `create_and_insert_direct_event`,
+   the scheduled-occurrence path, `insert_event_and_update_sync_projections`'s
+   own pooled wrapper) fetches it exactly once via the new
+   `sync_projections_for_bounded_context` helper and passes the same
+   slice through every event one commit inserts.
+   **This one is not free to reorder, though**: the read is still a
+   plain `pool` read, not `tx`, deliberately (the same "small,
+   admin-managed list, not worth locking" register the metadata read
+   always was) - but it is only race-free *after* the caller's own
+   bounded-context `sequence` row lock is already held, because
+   `promote_projection_rebuild` (the one place a projection's own `sync`
+   flag can flip mid-flight, drift audit finding #6) takes that
+   identical lock before it can promote. Every call site therefore
+   fetches `sync_projections` no earlier than right after its own
+   `next_sequence`/`SELECT ... FOR UPDATE` on that row - fetching it
+   before the lock, which would have shortened the lock's hold span
+   further, would silently reopen that exact race. This is why this fix
+   only removes *redundant* reads (N down to 1 per commit), not the one
+   remaining read's own position relative to the lock.
+3. **A pre-lock warm-up for the common, no-DCB-conflict path.** Every
+   event type an accepted decision needs, and every encryption key its
+   sensitive fields need, used to be resolved only after the lock was
+   already held - one query per not-yet-cached event type, plus
+   `resolve_encryption_keys`'s own `get_or_create_encryption_key` round
+   trips. `submit_command` now runs that same resolution once, before
+   `pool.begin()` is even called, against `initial_decision`'s own
+   event_specs (the ones a redispatch-free commit will actually use) -
+   mirroring `create_and_insert_external_event`/`create_and_insert_direct_event`'s
+   own pre-existing "resolve encryption keys before opening the
+   transaction" shape, extended here to event-type lookups too. Unlike
+   the `sync_projections` fetch above, this warm-up is safe to run
+   before the lock: `event_types_by_name`'s `Entry::Vacant` guard and
+   `resolve_encryption_keys`'s own `resolved.contains_key` guard were
+   already there for a different reason (letting several event specs
+   share one resolution) and happen to make both maps tolerant of being
+   pre-populated, partially stale (a DCB-conflict redispatch can still
+   add new specs the warm-up never saw), or simply empty (an
+   `initial_decision` that started out `Rejected` skips the block
+   entirely) - the post-lock code is completely unchanged and still
+   governs correctness; the warm-up only removes round trips for the
+   large majority of commands that never hit a conflict at all.
+
+**What this does not change**: the bounded-context lock itself, its
+scope, or the invariants it protects - `submit_command`'s own doc
+comment, and §22's confirmation that DCB's multi-entity atomicity is
+already solved by tag-scoped `matching_events` rather than a
+per-entity lock, both still apply exactly as before. The issue's own
+write-up lists other options not attempted here - deferring
+sync-projection folding to after commit, or batching several *different*
+commands' sequence allocation into one lock acquisition - as real but
+separately-scoped follow-ups, not something this pass rejected; picking
+between them needs its own investigation, not a rider on a round-trip
+cleanup. Per-tenant bounded contexts (the issue's own item 4, sidestepping
+the ceiling entirely for a multi-tenant app at the cost of harder
+cross-tenant querying) also stays a modelling recommendation for a
+consuming app to weigh, not something this library can decide on an
+app's behalf.
+
+**Verified**: `cargo build/clippy/test --workspace` and `cargo fmt
+--check` clean, real Postgres throughout (not skipped - the
+embedded-Postgres/libxml2 workaround `CONTRIBUTING.md` describes). A new
+test, `skilj-core/tests/submit_command.rs`'s
+`submit_command_batches_sequence_allocation_for_a_multi_event_command`,
+reuses the existing `TriggerTwoEvents` decider from the poison-pill
+rollback test just above it, but with no `Poisonable` projection
+registered (so nothing poisons the second event) - proving the two
+resulting events land at sequences 0 and 1, in `event_specs` order, with
+`next_sequence` continuing at 2 afterward: exactly the range one batched
+allocation derives, with no gap and no overlap. The pre-existing
+`submit_command_rolls_back_the_command_and_every_event_together_when_a_later_event_fails_to_insert`
+test (same decider, `Poisonable` registered) already exercised the batch
+call's own rollback path unchanged - both provisionally allocated
+sequences roll back together on the poison event's failure, same as
+before this pass.

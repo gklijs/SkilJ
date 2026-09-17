@@ -374,13 +374,16 @@ async fn insert_event_via_the_locked_path(
     let mut tx = pool.begin().await.unwrap();
     let seq = db::next_sequence(&mut *tx, &bc.name).await.unwrap();
     let e = event(bc, et, seq, amount);
+    let sync_projections = db::sync_projections_for_bounded_context(pool, &bc.name)
+        .await
+        .unwrap();
     db::insert_event_and_update_sync_projections_in_tx(
-        pool,
         &mut tx,
         &e,
         None,
         &TestDispatcher,
         &[],
+        &sync_projections,
     )
     .await
     .unwrap();
