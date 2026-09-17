@@ -1488,9 +1488,13 @@ pub async fn ensure_snapshot_partition_progress_table<'e>(
 /// row. `tags` backs `catch_up_cancel_deadline`'s own tag-containment
 /// lookup, indexed the same GIN way `docs/architecture.md §19 Problem 1`
 /// already indexes the `events` table's own `tags` column. `status`
-/// starts `'pending'`, and only ever moves to `'fired'` (`db::fire_due_deadlines`)
-/// or `'cancelled'` (`catch_up_cancel_deadline`) - terminal either way,
-/// never reset.
+/// starts `'pending'`, and moves to `'cancelled'` (`catch_up_cancel_deadline`,
+/// terminal) or `'firing'` then `'fired'` (`db::fire_due_deadlines`'s own
+/// atomic claim-then-resolve, closing the fire-vs-cancel race - see
+/// [docs/architecture.md §55](../../../docs/architecture.md#55-closing-the-canceldeadline-fire-vs-cancel-race)).
+/// `firing_at` records when a row was claimed, purely so a crashed
+/// instance's claim can be reclaimed after it goes stale - see
+/// `fire_due_deadlines`'s own doc comment for the reclaim window.
 ///
 /// The DDL itself is shared between `provision_bounded_context_schema`
 /// (a brand-new context, run against its own open transaction) and
@@ -1510,7 +1514,8 @@ fn deadlines_table_ddl(schema: &str) -> String {
             payload TEXT NOT NULL,
             status TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
-            resolved_at TIMESTAMPTZ
+            resolved_at TIMESTAMPTZ,
+            firing_at TIMESTAMPTZ
         )"
     )
 }
@@ -1532,6 +1537,16 @@ pub async fn ensure_deadlines_table(
     sqlx::query(sqlx::AssertSqlSafe(deadlines_table_ddl(&schema)))
         .execute(pool)
         .await?;
+    // A bounded context provisioned before the fire-vs-cancel race fix
+    // (docs/architecture.md §55) gets `firing_at` patched in here -
+    // nullable, no `DEFAULT`, same treatment `ensure_read_cursors_checkout_column`
+    // already gives `checked_out_at` for the identical reason: `NULL`
+    // already means exactly "not currently claimed."
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.deadlines ADD COLUMN IF NOT EXISTS firing_at TIMESTAMPTZ"
+    )))
+    .execute(pool)
+    .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \
          WHERE status = 'pending'"
@@ -6645,11 +6660,91 @@ pub async fn ensure_parked_deliveries_table<'e>(
     Ok(())
 }
 
+const PARKED_DELIVERIES_DEDUP_INDEX: &str = "parked_deliveries_source_kind_identifier_key";
+
+/// Codeberg issue #25 review (docs/architecture.md §56): belt-and-suspenders
+/// for `catch_up_cross_context_route`'s own advisory-lock fix above -
+/// a `UNIQUE` index on `(source, kind, identifier)` (the tuple that
+/// identifies one real failed occurrence, whichever `ParkedDeliveryKind`
+/// it is) so `insert_parked_delivery`'s own `ON CONFLICT` can turn any
+/// remaining duplicate-insert path, from this bug or a future one, into
+/// a harmless upsert instead of a second row.
+///
+/// A live bounded context that already hit the race this fixes can have
+/// real duplicate rows sitting in `parked_deliveries` already - creating
+/// the index directly would fail outright against those, turning a
+/// silent duplication bug into a hard startup error. So this runs as a
+/// real migration, `migrate_idempotency_keys_client_id_scoping`'s own
+/// shape: a dedicated transaction, a `pg_advisory_xact_lock` on the
+/// schema name (serializing concurrent instances migrating the same
+/// bounded context at startup), an idempotency check against
+/// `pg_indexes` so an already-migrated schema is a cheap no-op, then the
+/// actual work - here, deleting every duplicate but the newest
+/// (`(last_failed_at, id)` descending; `id` only to break an exact tie,
+/// never itself meaningful) before creating the index. A duplicate row
+/// this deletes was never independently actionable - both were always
+/// the identical occurrence records under `retryParkedDelivery`'s own
+/// terms - so discarding all but one loses no real operator-facing
+/// information, unlike `idempotency_keys`' own pre-migration rows.
+pub async fn migrate_parked_deliveries_dedup_and_unique_index(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let raw_schema = format!("bc_{bounded_context}");
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&raw_schema)
+        .execute(&mut *tx)
+        .await?;
+
+    let already_migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = $1 AND indexname = $2
+        )",
+    )
+    .bind(&raw_schema)
+    .bind(PARKED_DELIVERIES_DEDUP_INDEX)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if already_migrated {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {schema}.parked_deliveries a USING {schema}.parked_deliveries b \
+         WHERE a.source = b.source AND a.kind = b.kind AND a.identifier = b.identifier \
+         AND (a.last_failed_at, a.id) < (b.last_failed_at, b.id)"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS {PARKED_DELIVERIES_DEDUP_INDEX} \
+         ON {schema}.parked_deliveries (source, kind, identifier)"
+    )))
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// `id` is generated here (`shared::generate_token_id`, the same opaque-
 /// id generator every other synthetic identifier in this codebase
 /// already uses - see its own doc comment) rather than left to the
 /// caller, since nothing about a parked delivery's own identity needs to
 /// be caller-chosen or caller-visible before this call returns it.
+/// `ON CONFLICT (source, kind, identifier)` (docs/architecture.md §56)
+/// turns a duplicate-occurrence insert into an upsert that refreshes the
+/// failure details onto the existing row rather than a second one -
+/// `RETURNING` so the id/fields this returns always describe the row
+/// that actually exists afterward, real either way (the fresh `id` this
+/// generated, or the winning row's own from an earlier insert).
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_parked_delivery(
     pool: &Pool,
@@ -6668,12 +6763,18 @@ pub async fn insert_parked_delivery(
 ) -> crate::error::Result<ParkedDelivery> {
     let schema = schema_ident(bounded_context);
     let id = crate::shared::generate_token_id();
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    let row: ParkedDeliveryRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.parked_deliveries \
          (id, source, kind, identifier, access_token_id, target_bounded_context, \
           target_command_type, request_json, error, attempt_count, first_failed_at, \
           last_failed_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         ON CONFLICT (source, kind, identifier) DO UPDATE SET \
+         request_json = EXCLUDED.request_json, \
+         error = EXCLUDED.error, \
+         attempt_count = EXCLUDED.attempt_count, \
+         last_failed_at = EXCLUDED.last_failed_at \
+         RETURNING {PARKED_DELIVERY_COLUMNS}"
     )))
     .bind(&id)
     .bind(source)
@@ -6687,22 +6788,9 @@ pub async fn insert_parked_delivery(
     .bind(attempt_count)
     .bind(first_failed_at)
     .bind(last_failed_at)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
-    Ok(ParkedDelivery {
-        id,
-        source: source.to_string(),
-        kind,
-        identifier: identifier.to_string(),
-        access_token_id: access_token_id.map(str::to_string),
-        target_bounded_context: target_bounded_context.map(str::to_string),
-        target_command_type: target_command_type.map(str::to_string),
-        request_json: request_json.clone(),
-        error: error.to_string(),
-        attempt_count,
-        first_failed_at,
-        last_failed_at,
-    })
+    Ok(row.into())
 }
 
 /// `AdminAccess`-gated `parkedDeliveries(boundedContext:)`'s own read -
@@ -6859,9 +6947,75 @@ pub async fn delete_parked_delivery(
 /// the cursor finally advances past it - the route un-blocks, and an
 /// operator gets a visible, retryable/discardable record instead of a
 /// route silently stuck forever.
+///
+/// **Codeberg issue #25 review (docs/architecture.md §56)**: this whole
+/// tick - reading `retry_attempt_count`, deciding whether the policy is
+/// exhausted, and either recording another backoff or parking - is a
+/// plain read-then-write with no lock of its own, so two instances
+/// polling the same route concurrently could both read the same
+/// almost-exhausted retry state, both independently exhaust it, and both
+/// call `insert_parked_delivery` for the identical occurrence: two rows
+/// for one real failure. Closed by serializing the *entire* tick per
+/// `route_name` with a blocking `pg_advisory_xact_lock` - the identical
+/// primitive `lock_read_cursor_for_consume` already uses for its own
+/// claim race, just held on a dedicated lock-only transaction here
+/// rather than the transaction the protected work itself runs in: this
+/// function's own work already spans many independent pooled calls
+/// (`decide_and_submit_command` alone opens and commits its own nested
+/// transaction), so threading one shared transaction through all of it
+/// would be a far larger change than this fix calls for. A lock held on
+/// its own connection for the tick's whole duration serializes callers
+/// just as effectively, since what needs protecting is "only one
+/// instance runs this route's tick at a time," not any single row.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(route = %route.name))]
 pub async fn catch_up_cross_context_route(
+    pool: &Pool,
+    route: &crate::plugin::CrossContextRouteInfo,
+    route_dispatcher: &dyn crate::plugin::CrossContextRouteDispatcher,
+    command_dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    retry_policy: &skilj_retry::RetryPolicy,
+) -> crate::error::Result<()> {
+    // Held for this whole call's duration on a dedicated transaction
+    // that carries no application writes of its own - `pg_advisory_xact_lock`
+    // releases automatically when it commits (the success path) or rolls
+    // back (dropped on an early `?` return), so there's no separate
+    // unlock call to forget on any exit path. See this function's own
+    // doc comment above for why the lock's connection is deliberately
+    // not the same one the tick's own reads/writes use.
+    let mut lock_tx = pool.begin().await?;
+    let lock_key = format!(
+        "cross_context_route:{}:{}",
+        route.source_bounded_context, route.name
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&lock_key)
+        .execute(&mut *lock_tx)
+        .await?;
+    let result = catch_up_cross_context_route_locked(
+        pool,
+        route,
+        route_dispatcher,
+        command_dispatcher,
+        projection_dispatcher,
+        snapshot_dispatcher,
+        broadcaster,
+        event_cache,
+        encryption_master_key,
+        retry_policy,
+    )
+    .await;
+    lock_tx.commit().await?;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn catch_up_cross_context_route_locked(
     pool: &Pool,
     route: &crate::plugin::CrossContextRouteInfo,
     route_dispatcher: &dyn crate::plugin::CrossContextRouteDispatcher,
@@ -7463,6 +7617,22 @@ pub async fn catch_up_cancel_deadline(
 /// re-offering an already-`fired`/`cancelled` row).
 const MAX_DUE_DEADLINES_PER_TICK: i64 = 1000;
 
+/// How long a claimed (`'firing'`) row is left alone before a future
+/// tick is allowed to reclaim it - long enough that a live instance's
+/// own `decide_and_submit_command` call (a handful of DB round trips)
+/// never comes close, short enough that a genuinely crashed claim (the
+/// only way a row is still `'firing'` this long after `firing_at`) gets
+/// retried on a human-visible timescale rather than parked forever. The
+/// retry itself is safe even if the original attempt actually did
+/// commit its command before crashing: `RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX`
+/// makes the resubmission a harmless `Deduplicated`, the same
+/// defense-in-depth `fire_due_deadlines`'s own doc comment already
+/// describes for the fire-vs-fire case this claim mechanism otherwise
+/// closes off entirely.
+fn deadline_firing_claim_stale_after() -> chrono::Duration {
+    chrono::Duration::minutes(5)
+}
+
 #[derive(sqlx::FromRow)]
 struct DueDeadlineRow {
     id: String,
@@ -7478,21 +7648,37 @@ struct DueDeadlineRow {
 /// regardless of whether the `ScheduleDeadline` that created it is still
 /// registered in this process (the same "every instance does the same
 /// redundant, idempotent work" register [docs/architecture.md §22](../../../docs/architecture.md#background-polling-and-startup-scaling)
-/// already established - deliberately no `FOR UPDATE SKIP LOCKED` row
-/// claiming here either, for the identical reason: two instances racing
-/// to fire the same row both submit under the identical idempotency key,
-/// so the second is a harmless `Deduplicated`, and both marking the row
-/// `fired` afterward is a harmless no-op the second time
-/// (`mark_deadline_resolved`'s own `WHERE status = 'pending'` guard).
+/// already established.
+///
+/// No `FOR UPDATE SKIP LOCKED` on the initial `SELECT` - two instances
+/// racing to fire the same row both submit under the identical
+/// idempotency key, so the second is a harmless `Deduplicated`. But
+/// unlike that fire-vs-fire race, a fire-vs-*cancel* race is not
+/// harmless: `catch_up_cancel_deadline` can flip this same row to
+/// `'cancelled'` concurrently, and if that landed between this
+/// function's own `SELECT` and its call to `decide_and_submit_command`,
+/// the row would end up recorded `'cancelled'` while the target command
+/// had already been submitted - see [docs/architecture.md §55](../../../docs/architecture.md#55-closing-the-canceldeadline-fire-vs-cancel-race).
+/// Each row is therefore atomically claimed (`'pending'` -> `'firing'`)
+/// immediately before submitting, via the same `UPDATE ... WHERE
+/// status = 'pending' RETURNING` shape `mark_deadline_resolved` already
+/// uses to make its own write idempotent. `catch_up_cancel_deadline`'s
+/// own `UPDATE ... WHERE status = 'pending'` then naturally loses the
+/// race once a row is `'firing'` - no change needed there, only a
+/// dedicated test proving it (`skilj/tests/deadlines.rs`).
 ///
 /// A due row whose own `target_command_type` isn't registered at all is
 /// marked `fired` without ever calling `decide_and_submit_command` -
 /// logged as a warning, not retried forever, the identical stance
 /// `catch_up_cross_context_route` already takes for its own "target
-/// `CommandType` isn't registered" case. A `Target` command that *is*
-/// submitted but gets rejected by its own `decide()` is marked `fired`
-/// too - a legitimate business outcome (`ScheduleDeadline`'s own doc
-/// comment), not a reason to retry.
+/// `CommandType` isn't registered" case. No claim needed on that path:
+/// no side effect has happened yet, so losing a race with a concurrent
+/// cancel there is just ordinary "cancelled before it fired" - the
+/// correct outcome, not a bug - so `mark_deadline_resolved` is called
+/// directly against the still-`'pending'` row. A `Target` command that
+/// *is* submitted but gets rejected by its own `decide()` is marked
+/// `fired` too - a legitimate business outcome (`ScheduleDeadline`'s own
+/// doc comment), not a reason to retry.
 #[allow(clippy::too_many_arguments)]
 pub async fn fire_due_deadlines(
     pool: &Pool,
@@ -7506,11 +7692,14 @@ pub async fn fire_due_deadlines(
     encryption_master_key: Option<&EncryptionMasterKey>,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
+    let stale_cutoff = now - deadline_firing_claim_stale_after();
     let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, correlation_id, target_bounded_context, target_command_type, payload \
-         FROM {schema}.deadlines WHERE status = 'pending' AND fire_at <= $1 \
+         FROM {schema}.deadlines \
+         WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \
          ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}"
     )))
+    .bind(stale_cutoff)
     .bind(now)
     .fetch_all(pool)
     .await?;
@@ -7528,6 +7717,31 @@ pub async fn fire_due_deadlines(
             mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
             continue;
         };
+        // Claims a `'pending'` row outright, or reclaims a `'firing'` one
+        // whose own `firing_at` is already past `stale_cutoff` - the
+        // identical condition the `SELECT` above already filtered on,
+        // re-checked here under the `UPDATE`'s own row lock so a second
+        // instance racing to reclaim the same stale row always loses
+        // (Postgres re-evaluates `WHERE` against the just-committed row
+        // once the first `UPDATE` releases it, and by then `firing_at`
+        // is `now`, no longer `<= stale_cutoff`).
+        let claimed: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.deadlines SET status = 'firing', firing_at = $1 \
+             WHERE id = $2 AND (status = 'pending' OR (status = 'firing' AND firing_at <= $3)) \
+             RETURNING id"
+        )))
+        .bind(now)
+        .bind(&row.id)
+        .bind(stale_cutoff)
+        .fetch_optional(pool)
+        .await?;
+        if claimed.is_none() {
+            // Lost the claim to a concurrent cancel, or to a concurrent
+            // instance's own fire/reclaim attempt on the same row -
+            // either way, correct to skip: this instance must not submit
+            // the target command.
+            continue;
+        }
         // Prefixed with `RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX` - see
         // that constant's own doc comment for why this is
         // defense-in-depth, not load-bearing, now that `idempotency_keys`
@@ -7575,6 +7789,12 @@ pub async fn fire_due_deadlines(
     Ok(())
 }
 
+/// `WHERE status IN ('pending', 'firing')` - called both directly
+/// against a still-`'pending'` row (the "target `CommandType` isn't
+/// registered" path, no claim taken) and against a row this same tick
+/// already claimed into `'firing'` (the normal fire path) - either way
+/// idempotent: a status that's already terminal (`'fired'`/`'cancelled'`)
+/// never matches, so a redelivered/duplicate call is a safe no-op.
 async fn mark_deadline_resolved(
     pool: &Pool,
     schema: &str,
@@ -7584,7 +7804,7 @@ async fn mark_deadline_resolved(
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.deadlines SET status = $1, resolved_at = $2 \
-         WHERE id = $3 AND status = 'pending'"
+         WHERE id = $3 AND status IN ('pending', 'firing')"
     )))
     .bind(status)
     .bind(now)

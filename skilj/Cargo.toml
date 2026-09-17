@@ -43,6 +43,14 @@ arc-swap.workspace = true
 
 [dev-dependencies]
 postgresql_embedded = "0.21.0"
+# Codeberg issue #25 review (docs/architecture.md §55): the
+# `fire_due_deadlines` fire-vs-cancel race regression test needs a
+# `deadlines` row in a known state and a cancel-shaped `UPDATE` it
+# controls precisely - both below `db::`'s own public surface, since
+# that table has no dedicated insert/read API of its own outside the
+# real `catch_up_schedule_deadline`/`catch_up_cancel_deadline` reactors
+# this test deliberately bypasses to get deterministic control.
+sqlx.workspace = true
 serde.workspace = true
 tracing-subscriber.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

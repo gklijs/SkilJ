@@ -300,6 +300,17 @@ async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
         template: None,
     };
     db::insert_bounded_context(pool, &bc).await.unwrap();
+    // `provision_bounded_context_schema` (inside `insert_bounded_context`
+    // above) creates `parked_deliveries` itself, but the belt-and-
+    // suspenders unique index (docs/architecture.md §56) is only ever
+    // added by this migration - normally run from `SkiljBuilder::build()`'s
+    // own startup loop, which this lower-level test bypasses entirely by
+    // calling `skilj_core::db` directly. `insert_parked_delivery`'s own
+    // `ON CONFLICT (source, kind, identifier)` needs that index to exist
+    // at all, in every bounded context this file parks into.
+    db::migrate_parked_deliveries_dedup_and_unique_index(pool, &bc.name)
+        .await
+        .unwrap();
     bc
 }
 
@@ -661,5 +672,91 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
             .await
             .unwrap();
         assert_eq!(commands.len(), 1);
+    });
+}
+
+/// Codeberg issue #25 review (docs/architecture.md §56): two concurrent
+/// catch-up ticks for the identical route/occurrence must never both
+/// park it - `catch_up_cross_context_route`'s own advisory lock should
+/// serialize them so only the first ever gets far enough to see the
+/// retry policy as exhausted; the second, once it acquires the lock,
+/// finds the cursor already advanced past the occurrence and has
+/// nothing left to do. Genuinely concurrent via `tokio::join!`, not
+/// sequenced with a sleep - the same "prove the race is closed, don't
+/// assume a lucky interleaving" shape
+/// `a_persistently_failing_target_parks_instead_of_blocking_forever`'s
+/// own file already uses for the sequential half of this mechanism.
+#[test]
+fn concurrent_catch_up_ticks_never_park_the_same_occurrence_twice() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let shipping_bc = seed_bounded_context(&pool).await;
+        let inventory_bc = seed_bounded_context(&pool).await;
+        let source_et = seed_order_shipped_event_type(&pool, &shipping_bc).await;
+        seed_command_type(&pool, &inventory_bc, "ReserveStock").await;
+        seed_stock_reserved_event_type(&pool, &inventory_bc).await;
+
+        let route_info = CrossContextRouteInfo {
+            name: ROUTE_NAME,
+            source_bounded_context: Box::leak(shipping_bc.name.clone().into_boxed_str()),
+            source_event_type: "OrderShipped",
+            target_bounded_context: Box::leak(inventory_bc.name.clone().into_boxed_str()),
+            target_command_type: "ReserveStock",
+            start_from: CrossContextRouteStartFrom::Beginning,
+        };
+        let route_dispatcher = PassthroughRouteDispatcher { info: route_info };
+        // Always fails - paired with `max_attempts: 1` below, a single
+        // failed attempt already exhausts the policy and parks, the
+        // narrowest possible window for the race this test targets.
+        let command_dispatcher = FlakyCommandDispatcher::new(usize::MAX);
+        let projection_dispatcher = NoopProjectionDispatcher;
+        let snapshot_dispatcher = NoopSnapshotDispatcher;
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(30),
+            1.0,
+            Duration::from_millis(30),
+            1,
+        );
+
+        insert_order_shipped(&pool, &shipping_bc, &source_et, "order-race").await;
+
+        // Two ticks for the identical route/occurrence, run concurrently
+        // rather than sequenced - without `catch_up_cross_context_route`'s
+        // own advisory lock, both would independently read the same
+        // not-yet-exhausted retry state, both fail once, both compute
+        // the policy as exhausted, and both call `insert_parked_delivery`
+        // for the identical occurrence.
+        let tick = || {
+            db::catch_up_cross_context_route(
+                &pool,
+                &route_info,
+                &route_dispatcher,
+                &command_dispatcher,
+                &projection_dispatcher,
+                &snapshot_dispatcher,
+                &broadcaster,
+                &event_cache,
+                None,
+                &retry_policy,
+            )
+        };
+        let (result_a, result_b) = tokio::join!(tick(), tick());
+        result_a.unwrap();
+        result_b.unwrap();
+
+        let parked = db::list_parked_deliveries(&pool, &inventory_bc.name)
+            .await
+            .unwrap();
+        assert_eq!(
+            parked.len(),
+            1,
+            "two concurrent catch-up ticks raced to park the identical occurrence twice - \
+             the advisory lock serializing catch_up_cross_context_route is not closing the race"
+        );
     });
 }

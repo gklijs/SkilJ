@@ -1790,6 +1790,18 @@ impl SkiljBuilder {
                     // brand-new per-bounded-context table already gets
                     // here.
                     skilj_core::db::ensure_parked_deliveries_table(pool, &bc.name).await?;
+                    // Codeberg issue #25 review (docs/architecture.md
+                    // §56): the concurrent-instance parked-delivery
+                    // duplication fix's own belt-and-suspenders unique
+                    // index, plus the one-time dedup a bounded context
+                    // that already hit the race needs before that index
+                    // can even be created. See
+                    // `migrate_parked_deliveries_dedup_and_unique_index`'s
+                    // own doc comment.
+                    skilj_core::db::migrate_parked_deliveries_dedup_and_unique_index(
+                        pool, &bc.name,
+                    )
+                    .await?;
                     Ok::<(), skilj_core::Error>(())
                 }
             })

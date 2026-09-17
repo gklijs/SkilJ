@@ -247,6 +247,18 @@ async fn setup() -> (Skilj, Pool, String, String, String) {
     skilj_core::db::insert_bounded_context(&pool, &bc)
         .await
         .unwrap();
+    // `bc` is created after `Skilj::builder(...).build()` already ran
+    // above, so it never goes through that call's own per-bounded-context
+    // startup migrations. `insert_parked_delivery`'s own `ON CONFLICT
+    // (source, kind, identifier)` (docs/architecture.md §56) needs this
+    // bounded context's `parked_deliveries` unique index to exist before
+    // this file's own direct `insert_parked_delivery` calls below can
+    // succeed - normally patched in by that startup loop, applied
+    // directly here instead since there's no second `build()` call to
+    // rely on.
+    skilj_core::db::migrate_parked_deliveries_dedup_and_unique_index(&pool, &bc.name)
+        .await
+        .unwrap();
 
     let mapping = RoleAccessMapping {
         role: role.clone(),

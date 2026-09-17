@@ -8409,3 +8409,151 @@ Codeberg issue #25, in full: §51 (Projection partitioning), §52
 (scoping - Snapshot partitioning built, CrossContextRoute found not to
 fit, the bridge gap found), §53 (the `read_cursors` checkout mechanism
 that gap needed), and this section (partitioning built on top of it).
+
+## 55. Closing the `CancelDeadline` fire-vs-cancel race
+
+A segmented review of everything since v0.0.6 (this project's own
+`/code-review ultra` normally does this in the cloud, but that costs
+real money the user didn't want to spend here - so this pass ran the
+review as ordinary in-session forks against three commit-range segments
+instead, then fixed what they found) turned up a real bug in §46's own
+`fire_due_deadlines`: it selected due-and-`pending` rows, called
+`decide_and_submit_command` (the real side effect), and only *afterward*
+marked the row `'fired'` via `mark_deadline_resolved`'s own
+`WHERE status = 'pending'` guard. Meanwhile `catch_up_cancel_deadline`
+runs on its own independent poll loop and can flip that same row to
+`'cancelled'` at any time via its own `WHERE status = 'pending'` update.
+If the cancel landed between the `SELECT` and the submission, the row
+ended up recorded `'cancelled'` while the target command had already
+run - exactly the outcome `CancelDeadline` exists to prevent, e.g. an
+order's cancel-if-unpaid deadline firing anyway right as the payment
+lands.
+
+The existing "deliberately no `FOR UPDATE SKIP LOCKED`" reasoning in
+`fire_due_deadlines`'s own doc comment only ever covered the *fire-vs-fire*
+race (two instances racing the same row both submit under the identical
+idempotency key, so the second is a harmless `Deduplicated`) - it never
+addressed fire-vs-*cancel*, and nothing else in the original issue #20
+pass closed that gap.
+
+**The fix**: each due row is now atomically claimed (`'pending'` ->
+`'firing'`) immediately before submitting, via an `UPDATE ... WHERE
+status = 'pending' RETURNING id` - only a row this instance actually
+claimed gets submitted. `catch_up_cancel_deadline`'s own cancel `UPDATE`
+already guards on `status = 'pending'`, so it naturally loses the race
+once a row is `'firing'`, with no change needed there. A due row whose
+own target `CommandType` isn't registered still resolves directly from
+`'pending'` (no claim) - no side effect happens on that path, so losing
+a race with a concurrent cancel there is just ordinary "cancelled before
+it fired," not a bug.
+
+**The new `'firing'` state needed its own crash-recovery story**: a
+process that crashes between claiming and resolving a row would
+otherwise leave it stuck `'firing'` forever, invisible to the `deadlines_due`
+partial index (which only covers `'pending'`). Closed with a new nullable
+`firing_at` timestamp column (patched into an already-provisioned
+bounded context the same `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` way
+`read_cursors.checked_out_at` was in §53) and a 5-minute staleness
+window: `fire_due_deadlines`'s own `SELECT`/claim now also match a
+`'firing'` row whose `firing_at` is older than that, atomically
+reclaiming it. Five minutes is long enough that a live instance's own
+`decide_and_submit_command` (a handful of DB round trips) never comes
+close, short enough that a genuinely crashed claim retries on a
+human-visible timescale. The retry is safe even if the original attempt
+actually committed its command before crashing -
+`RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX` makes the resubmission a
+harmless `Deduplicated`, the identical defense-in-depth the original
+fire-vs-fire race already relied on, now covering a second scenario.
+`mark_deadline_resolved`'s own guard widened from `status = 'pending'`
+to `status IN ('pending', 'firing')` to match, since it's now called
+from both states depending on the path.
+
+**Proof, not just the fix**: a new regression test
+(`skilj/tests/deadlines.rs`) inserts a real due-and-`pending` row and
+races the real `db::fire_due_deadlines` against a hand-issued
+cancel-shaped `UPDATE` via `tokio::join!` - not sequenced with a sleep.
+The assertion doesn't try to land inside a narrow timing window; it
+checks an invariant that must hold under *either* ordering the database
+lets win (`status == "cancelled"` implies the target command never ran,
+`status == "fired"` implies it did) - deterministic regardless of actual
+scheduling. Verified failing against the pre-fix code first (it failed
+with exactly the predicted symptom: `status` ends `"cancelled"` while
+the command still ran), then verified passing again with the fix
+restored - this project's own standing discipline of not trusting a new
+test until it's been shown to actually catch the bug it claims to.
+
+## 56. Closing the parked-delivery duplication race in `catch_up_cross_context_route`
+
+The same review pass (§55) found a second real bug, in §47's own
+retry/parking mechanism this time: `get_cross_context_route_retry_state`
+is a bare `SELECT` with no row lock, and `record_cross_context_route_retry_failure`/
+`update_cross_context_route_cursor` write back an absolute
+`retry_attempt_count` rather than an atomic increment. Two instances
+polling the same route concurrently could both read the same
+almost-exhausted retry state, both independently fail the identical
+submission, both compute the policy as exhausted, and both call
+`insert_parked_delivery` for the identical occurrence - two rows for one
+real failure, an operator-facing phantom duplicate. The underlying
+target-command submission itself was never at risk of duplicating (the
+reserved idempotency-key prefix already covers that), only the parking
+bookkeeping around it.
+
+This is the same shape of bug as the async `Projection` catch-up
+double-fold §51 fixed in this same commit range, and the `NOTIFY`
+double-delivery and `CrossContextRoute` idempotency-key bugs from
+earlier sessions before it - cross-instance races this project has
+repeatedly needed a dedicated lock or guard for, not something a green
+test suite catches on its own.
+
+**The fix, two layers**:
+
+1. **The must-have**: `catch_up_cross_context_route` now serializes its
+   *entire* tick per `route_name` with a blocking `pg_advisory_xact_lock`
+   - the identical primitive §53's `lock_read_cursor_for_consume` already
+   uses for its own claim race, just held on a dedicated lock-only
+   transaction here rather than the transaction the protected work
+   itself runs in. Threading one shared transaction through the whole
+   tick wasn't practical - it spans many independent pooled calls, and
+   `decide_and_submit_command` alone opens and commits its own nested
+   transaction - so a separate transaction that does nothing but hold
+   the lock for the tick's duration serializes callers just as
+   effectively, since what needs protecting is "only one instance runs
+   this route's tick at a time," not any single row. `pg_advisory_xact_lock`
+   releases automatically on commit or rollback, so there's no separate
+   unlock call to forget on any exit path, panics included.
+2. **Belt-and-suspenders**: a `UNIQUE` index on `parked_deliveries(source,
+   kind, identifier)` - the tuple identifying one real failed occurrence,
+   whichever `ParkedDeliveryKind` it is - so `insert_parked_delivery`'s
+   own `INSERT ... ON CONFLICT (source, kind, identifier) DO UPDATE`
+   turns any remaining duplicate-insert path, from this bug or a future
+   one, into a harmless upsert (refreshing the failure details onto the
+   existing row) instead of a second row. `RETURNING` so the id/fields
+   the function returns always describe the row that actually exists
+   afterward - the freshly generated id on a real insert, or the
+   winning row's own id on a conflict.
+
+**The unique index needed a real migration, not a bare `CREATE UNIQUE
+INDEX`**: a bounded context that already hit this race can have genuine
+duplicate rows sitting in `parked_deliveries` right now, and creating
+the index directly against those would fail outright at startup - a
+silent duplication bug turning into a hard crash. `migrate_parked_deliveries_dedup_and_unique_index`
+follows `migrate_idempotency_keys_client_id_scoping`'s own shape from
+§37: a dedicated transaction, a `pg_advisory_xact_lock` on the schema
+name, an idempotency check against `pg_indexes` so an already-migrated
+schema is a cheap no-op, then the real work - deleting every duplicate
+but the newest (by `(last_failed_at, id)`, `id` only breaking an exact
+tie) before creating the index. A duplicate row this deletes was never
+independently actionable - both were always the identical occurrence
+under `retryParkedDelivery`'s own terms - so discarding all but one
+loses no real operator-facing information.
+
+**Proof, not just the fix**: a new test
+(`skilj-core/tests/cross_context_route_parking.rs`,
+`concurrent_catch_up_ticks_never_park_the_same_occurrence_twice`) runs
+two real `db::catch_up_cross_context_route` ticks concurrently via
+`tokio::join!` against a target that always fails, paired with a
+`RetryPolicy` that exhausts after a single attempt - the narrowest
+possible window for this race. Verified failing against the pre-fix
+code first (both the advisory lock and the unique index/upsert
+temporarily reverted, reproducing exactly two parked rows for the one
+occurrence), then verified passing again with the fix restored.

@@ -604,3 +604,246 @@ fn a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag() {
         );
     });
 }
+
+// --- fire-vs-cancel race regression (Codeberg issue #25 review,
+// docs/architecture.md §55) ---
+//
+// Deliberately doesn't go through `ScheduleDeadline`/`CancelDeadline` at
+// all - the property under test is `db::fire_due_deadlines`'s own
+// claim-then-submit ordering against a concurrent `status = 'pending'`-
+// guarded cancel, which is exactly `catch_up_cancel_deadline`'s own
+// `UPDATE`'s shape regardless of which schedule/tag logic decided to run
+// it. A hand-inserted `deadlines` row and a hand-issued cancel `UPDATE`
+// exercise that shape directly and deterministically, rather than
+// relying on `catch_up_cancel_deadline`'s own background poll tick to
+// land inside a race window by chance.
+
+const DEADLINE_RACE_BOUNDED_CONTEXT: &str = "skilj_deadlines_test_race";
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct RaceCommandPayload {
+    order_id: String,
+}
+
+struct RaceCommand;
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct RaceFiredPayload {
+    order_id: String,
+}
+
+struct RaceFired;
+
+impl EventType for RaceFired {
+    type Payload = RaceFiredPayload;
+    const NAME: &'static str = "RaceFired";
+    const BOUNDED_CONTEXT: &'static str = DEADLINE_RACE_BOUNDED_CONTEXT;
+}
+
+enum RaceEvent {
+    RaceFired(RaceFiredPayload),
+}
+
+impl BoundedContextEvent for RaceEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "RaceFired" => Some(serde_json::from_str(&event.payload).map(RaceEvent::RaceFired)),
+            _ => None,
+        }
+    }
+}
+
+impl CommandType for RaceCommand {
+    type Payload = RaceCommandPayload;
+    type Event = RaceEvent;
+    const NAME: &'static str = "RaceCommand";
+    const BOUNDED_CONTEXT: &'static str = DEADLINE_RACE_BOUNDED_CONTEXT;
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "RaceFired".to_string(),
+                payload: serde_json::json!({ "order_id": payload.order_id }),
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct RaceFiredOrdersState {
+    order_ids: Vec<String>,
+}
+
+/// `sync: true` - the test below reads this state immediately after
+/// `fire_due_deadlines` returns, with no poll loop of its own to wait
+/// out.
+struct RaceFiredOrders;
+
+impl Projection for RaceFiredOrders {
+    type State = RaceFiredOrdersState;
+    type Event = RaceEvent;
+    const NAME: &'static str = "RaceFiredOrders";
+    const BOUNDED_CONTEXT: &'static str = DEADLINE_RACE_BOUNDED_CONTEXT;
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["RaceFired"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        let RaceEvent::RaceFired(payload) = event;
+        state.order_ids.push(payload.order_id.clone());
+    }
+}
+
+fn race_schema(bounded_context: &str) -> String {
+    format!("\"bc_{bounded_context}\"")
+}
+
+#[test]
+fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+
+        let race_bc = BoundedContext {
+            name: DEADLINE_RACE_BOUNDED_CONTEXT.to_string(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &race_bc).await.unwrap();
+
+        let race_mapping = RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: race_bc.clone(),
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &race_mapping)
+            .await
+            .unwrap();
+
+        let (skilj, report) = Skilj::builder(database_url)
+            .bounded_context(DEADLINE_RACE_BOUNDED_CONTEXT)
+            .event_type::<RaceFired>()
+            .command_type::<RaceCommand>()
+            .projection::<RaceFiredOrders>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        // A real due-and-`pending` row, inserted directly - see this
+        // section's own doc comment for why `catch_up_schedule_deadline`
+        // isn't used to create it here.
+        let schema = race_schema(DEADLINE_RACE_BOUNDED_CONTEXT);
+        let deadline_id = unique_name("race-deadline");
+        let now = test_now();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.deadlines \
+             (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+              target_command_type, payload, status, created_at) \
+             VALUES ($1, 'race-schedule', $2, '[]'::jsonb, NULL, $3, $4, $5, 'pending', $6)"
+        )))
+        .bind(&deadline_id)
+        .bind(now - chrono::Duration::seconds(1))
+        .bind(DEADLINE_RACE_BOUNDED_CONTEXT)
+        .bind(RaceCommand::NAME)
+        .bind(serde_json::json!({ "order_id": "race-order" }).to_string())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let command_dispatcher = skilj.command_dispatcher();
+        let projection_dispatcher = skilj.projection_dispatcher();
+        let snapshot_dispatcher = skilj.snapshot_dispatcher();
+        let broadcaster = skilj_core::event_store::EventBroadcaster::new(16);
+        let event_cache = skilj_core::event_cache::EventCache::new(0);
+
+        // The real `fire_due_deadlines` racing against a hand-issued
+        // `UPDATE` shaped exactly like `catch_up_cancel_deadline`'s own
+        // cancel - concurrent, via `tokio::join!`, not sequenced with a
+        // sleep. Whichever the database's own row-level locking lets win,
+        // the assertion below holds either way (see this section's own
+        // doc comment) - this isn't a race the test is trying to land
+        // inside a narrow window, it's an invariant that must survive
+        // either ordering.
+        let fire = db::fire_due_deadlines(
+            &pool,
+            &*command_dispatcher,
+            &*projection_dispatcher,
+            &*snapshot_dispatcher,
+            &broadcaster,
+            &event_cache,
+            DEADLINE_RACE_BOUNDED_CONTEXT,
+            now,
+            None,
+        );
+        let cancel = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.deadlines SET status = 'cancelled', resolved_at = $1 \
+             WHERE id = $2 AND status = 'pending'"
+        )))
+        .bind(now)
+        .bind(&deadline_id)
+        .execute(&pool);
+
+        let (fire_result, cancel_result) = tokio::join!(fire, cancel);
+        fire_result.unwrap();
+        cancel_result.unwrap();
+
+        let (status,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT status FROM {schema}.deadlines WHERE id = $1"
+        )))
+        .bind(&deadline_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let fired_state =
+            db::get_projection_state(&pool, DEADLINE_RACE_BOUNDED_CONTEXT, "RaceFiredOrders", "")
+                .await
+                .unwrap();
+        let command_ran = fired_state
+            .map(|s| {
+                let parsed: RaceFiredOrdersState = serde_json::from_str(&s).unwrap();
+                !parsed.order_ids.is_empty()
+            })
+            .unwrap_or(false);
+
+        match status.as_str() {
+            "cancelled" => assert!(
+                !command_ran,
+                "the row ended cancelled but its target command still ran - the \
+                 fire-vs-cancel race is not closed"
+            ),
+            "fired" => assert!(
+                command_ran,
+                "the row ended fired but its target command never actually ran"
+            ),
+            other => panic!(
+                "deadline ended in unexpected status {other:?} - claim/resolve did not \
+                 complete on either side of the race"
+            ),
+        }
+    });
+}
