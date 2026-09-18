@@ -1753,3 +1753,234 @@ fn submit_command_batch_isolates_a_failing_commands_savepoint_from_its_batch_mat
         assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 1);
     });
 }
+
+#[test]
+fn submit_command_batch_recycles_a_failed_commands_sequence_numbers_for_a_later_command_in_the_same_batch(
+) {
+    // Codeberg issue #32, round three: `commit_command_batch` now pools
+    // sequence-number reservations across the whole batch (one bigger
+    // `next_sequence_batch` call instead of one per command) rather than
+    // allocating strictly per command inside each one's own `SAVEPOINT`.
+    // The real risk that pooling introduces is a permanent gap: if a
+    // command draws numbers from the shared pool and then fails, those
+    // numbers must not simply be lost - they need to end up used by
+    // *some* successfully-committed event, or corrected back out of
+    // `{schema}.sequence` entirely, never left allocated-but-orphaned.
+    //
+    // Three commands, same shape as the "isolates" test above but with a
+    // *third*, unrelated command after the failing one: ShipOrder("A")
+    // succeeds (1 event), TriggerTwoEvents fails on its poison pill
+    // (would have needed 2), ShipOrder("B") succeeds (1 event). If the
+    // pool's own failed-draw recycling works, ShipOrder("B")'s event
+    // lands on one of the two numbers TriggerTwoEvents drew and then
+    // returned - sequence 1, not a fresh number past the reservation
+    // TriggerTwoEvents already made. If recycling were missing or
+    // broken (numbers simply abandoned on failure), either ShipOrder("B")
+    // would get a higher, non-recycled number while a lower one sits
+    // forever unused (a real gap `SequenceIsGaplessPerBoundedContext`
+    // forbids), or the final `next_sequence` would land somewhere other
+    // than the two real events actually justify.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        seed_poison_event_type(&pool, &bc).await;
+        let ship_order = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let trigger_two = seed_command_type(&pool, &bc, "TriggerTwoEvents").await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: "Poisonable".to_string(),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: true,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+        let dispatcher = TestCommandDispatcher::new();
+
+        let ship_a_payload = r#"{"order_id":"A"}"#;
+        let ship_a_decision = dispatcher
+            .dispatch(&bc.name, &ship_order.name, ship_a_payload, &[])
+            .unwrap()
+            .unwrap();
+        let poison_decision = dispatcher
+            .dispatch(&bc.name, &trigger_two.name, "{}", &[])
+            .unwrap()
+            .unwrap();
+        let ship_b_payload = r#"{"order_id":"B"}"#;
+        let ship_b_decision = dispatcher
+            .dispatch(&bc.name, &ship_order.name, ship_b_payload, &[])
+            .unwrap()
+            .unwrap();
+
+        let batch = vec![
+            batched(
+                &ship_order,
+                ship_a_payload,
+                ship_a_decision,
+                vec![Tag {
+                    key: "order".to_string(),
+                    value: Some("A".to_string()),
+                }],
+            ),
+            batched(&trigger_two, "{}", poison_decision, Vec::new()),
+            batched(
+                &ship_order,
+                ship_b_payload,
+                ship_b_decision,
+                vec![Tag {
+                    key: "order".to_string(),
+                    value: Some("B".to_string()),
+                }],
+            ),
+        ];
+
+        let mut results = db::submit_command_batch(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            &bc.name,
+            batch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 3);
+
+        let third = results.pop().unwrap();
+        let second = results.pop().unwrap();
+        let first = results.pop().unwrap();
+
+        match first.unwrap() {
+            SubmitCommandOutcome::Accepted { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].sequence, 0);
+            }
+            other => panic!("expected the first command to succeed, got {other:?}"),
+        }
+        assert!(
+            second.is_err(),
+            "the poison pill's Some(Err(..)) must fail only its own command"
+        );
+        match third.unwrap() {
+            SubmitCommandOutcome::Accepted { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(
+                    events[0].sequence, 1,
+                    "the third command's own event must land on the sequence number the \
+                     failed second command drew and gave back, not a fresh one past it - \
+                     otherwise sequence 1 would be a permanent gap"
+                );
+            }
+            other => panic!("expected the third command to succeed, got {other:?}"),
+        }
+
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+
+        // Exactly the two real events justify this - nothing reserved
+        // and never used was left dangling in `{schema}.sequence`.
+        assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 2);
+    });
+}
+
+#[test]
+fn submit_command_batch_deduplicates_a_repeated_idempotency_key_shared_by_two_commands_in_the_same_batch(
+) {
+    // The idempotency lookup (`decide_command_in_tx`'s own
+    // `lookup_idempotency_key` call) still runs against the batch
+    // leader's own `tx`, not `pool` - unchanged by the round-three split
+    // into `decide_command_in_tx`/`finish_accepted_command_in_tx` - so it
+    // must still see an *earlier command in this same batch*'s own
+    // idempotency-key insert, uncommitted but already visible on `tx`
+    // via that command's own released `SAVEPOINT`, exactly as it did
+    // before that split. If this regressed (say, the lookup silently
+    // moved to `pool`, a different connection that can't see `tx`'s
+    // uncommitted state), two concurrent callers retrying with the same
+    // idempotency key that happened to land in the same batch would both
+    // ship the order instead of the second one deduplicating.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+
+        let payload = r#"{"order_id":"A"}"#;
+        let decision = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+
+        let mut first = batched(
+            &ct,
+            payload,
+            decision.clone(),
+            vec![Tag {
+                key: "order".to_string(),
+                value: Some("A".to_string()),
+            }],
+        );
+        first.idempotency_key = Some("retry-key".to_string());
+        let mut second = batched(
+            &ct,
+            payload,
+            decision,
+            vec![Tag {
+                key: "order".to_string(),
+                value: Some("A".to_string()),
+            }],
+        );
+        second.idempotency_key = Some("retry-key".to_string());
+
+        let mut results = db::submit_command_batch(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            &bc.name,
+            vec![first, second],
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 2);
+
+        let second = results.pop().unwrap().unwrap();
+        let first = results.pop().unwrap().unwrap();
+
+        let first_sequence = match first {
+            SubmitCommandOutcome::Accepted { events, .. } => {
+                assert_eq!(events.len(), 1);
+                events[0].sequence
+            }
+            other => panic!("expected the first command to ship the order, got {other:?}"),
+        };
+        match second {
+            SubmitCommandOutcome::Deduplicated {
+                triggered_event_sequences,
+            } => {
+                assert_eq!(
+                    triggered_event_sequences,
+                    vec![first_sequence],
+                    "the second command's own idempotency lookup must see the first \
+                     command's already-inserted (if not yet durably committed) key"
+                );
+            }
+            other => panic!("expected the second, same-key command to deduplicate, got {other:?}"),
+        }
+
+        // Only one event ever landed - the deduplicated command produced
+        // nothing new.
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    });
+}

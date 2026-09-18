@@ -8950,3 +8950,109 @@ running at once - reproduced identically against unmodified `main`
 this pass introduced; every test file this pass actually touches passes
 cleanly and repeatably in isolation.
 
+## 60. Shrinking a batch's own per-command round trips further (Codeberg issue #32, round three)
+
+A follow-up load test against `skilj-helpdesk` (post-§59) confirmed the
+wedge was fixed and found roughly double the pre-batching throughput
+ceiling, but also confirmed §58's own module doc comment was right that
+the remaining ceiling is architectural: `commit_command_batch`'s
+per-command loop still paid several round trips *per command*, all
+inside the one lock hold the whole batch shares, that had nothing to do
+with each command's own real work. Two independent fixes, on a separate
+branch (`perf/batch-round-trip-reduction`), reviewed and tested before
+merging - not shipped from the load test's own read alone.
+
+**Fix one: stop re-fetching a `BoundedContext` row every batch already
+has in hand.** `submit_one_command_in_tx`'s own DCB-conflict delta check
+(`list_events_for_bounded_context_matching_tags`) re-fetched the
+bounded context row - plus, transitively, its `created_by_role_id`'s own
+`Role` row - via a fresh `pool` round trip every time `locked_highest >
+original_highest`, which is true for nearly every command once a batch
+has grown past one or two. Every command in one `CommandBatcher` batch
+shares the identical bounded context (that's what the queue is keyed
+on), and `command_type.bounded_context` is already that exact row -
+loaded once when the command type itself was resolved, already trusted
+elsewhere in the same function for `.name` without re-fetching. Added
+`list_events_for_bounded_context_matching_tags_with_bc`, taking `&BoundedContext`
+instead of a name to fetch; the public, name-taking function now just
+fetches once and delegates. Zero behaviour change, zero new fetches -
+purely deleting up to `MAX_BATCH_SIZE` (256) redundant round trips per
+batch.
+
+**Fix two: pool sequence-number allocation across a whole batch instead
+of once per command.** `next_sequence_batch` was called once per command
+inside its own `SAVEPOINT` - safe (a command's own rollback un-reserves
+exactly what it asked for) but still one `UPDATE {schema}.sequence ...
+RETURNING` round trip per command. A naive "allocate the whole batch's
+total up front" fix is actually unsafe: a command that fails *after* its
+numbers are allocated (an unregistered event type, a poison-pill
+projection) would otherwise leave those specific numbers permanently
+unused - a real gap `SequenceIsGaplessPerBoundedContext` forbids, since
+nothing recycles them to a later command.
+
+Fixed properly by first splitting the old, monolithic `submit_one_command_in_tx`
+into `decide_command_in_tx` (idempotency lookup, DCB-conflict redispatch,
+event-type warm-up - everything before a sequence number is needed,
+returning either a terminal `Rejected`/`Deduplicated` outcome or an
+`AcceptedDecision`) and `finish_accepted_command_in_tx` (everything from
+encryption resolution through the actual inserts, given sequence numbers
+already in hand). `submit_one_command_in_tx` itself survives as a thin
+`decide` → plain `next_sequence_batch` → `finish` composition, unchanged
+in observable behaviour, purely so `submit_command`'s own single-command
+path (no batching, no pool, nothing to amortise across) keeps working
+exactly as before.
+
+`commit_command_batch`'s own loop instead calls `decide_command_in_tx`
+directly against the *leader's `tx`* - wrapped in its own tiny
+`SAVEPOINT` purely so a genuine DB error from its one `tx`-scoped read
+(`lookup_idempotency_key`) can't abort `tx` and take every command still
+queued behind it down too, the isolation the old code got for free from
+running inside a per-command `SAVEPOINT` already - then, for an accepted
+decision, draws from a new `SequencePool` (also against `tx`, not a
+`SAVEPOINT`) before opening the write-phase `SAVEPOINT`
+(`finish_accepted_command_in_tx`) as before. Drawing against `tx`
+itself, deliberately outside any `SAVEPOINT`, is what makes pooling safe:
+a reservation survives a later command's real failure instead of being
+rolled back with it. `SequencePool` reserves in chunks sized to "how many
+commands are still left in this batch" (so a run of small, single-event
+commands can share one round trip), remembers each draw, and requires
+the caller to call exactly one of `confirm_last_draw` (the command
+committed - numbers truly spent) or `return_last_draw` (the command
+failed - numbers go back onto the *front* of the queue, in order, for
+whichever command draws next) once that command's outcome is known.
+Only genuinely unused numbers - left in the pool when the batch's own
+loop ends - are corrected back out of `{schema}.sequence` in one shot
+(`shrink_back`), right before the shared `tx.commit()`. Because the pool
+is only ever driven by one strictly sequential loop, never concurrently,
+the persisted `next_value` this leaves behind is provably identical to
+what one `next_sequence_batch` call per command, each inside its own
+`SAVEPOINT`, would have left - only the round-trip count differs. One
+accepted, documented behaviour change: a failure specifically in the
+pool's own refill `UPDATE` (not any per-command work) now fails the
+*whole* batch, the same `BatchFailed`-for-everyone treatment a final
+`tx.commit()` failure already gets, rather than being isolated to one
+command - a deliberate trade, since that operation deliberately runs
+outside any `SAVEPOINT` and a real failure there almost certainly means
+`tx`'s own connection is already broken for every command still to come.
+
+**Verified with new tests, not just re-running old ones**: `skilj-core/tests/submit_command.rs`
+gained `submit_command_batch_recycles_a_failed_commands_sequence_numbers_for_a_later_command_in_the_same_batch`
+(a three-command batch - accept, fail, accept - proving the third
+command's event lands on the sequence number the failing second command
+drew and gave back, not a fresh one past it, and that `next_sequence`
+afterward reflects only the two real events) and
+`submit_command_batch_deduplicates_a_repeated_idempotency_key_shared_by_two_commands_in_the_same_batch`
+(proving `decide_command_in_tx`'s idempotency lookup still sees an
+earlier same-batch command's own uncommitted-but-`SAVEPOINT`-released
+insert, unchanged by the decide/finish split). Every existing test in
+`skilj-core/tests/submit_command.rs` and `skilj-core/tests/command_batcher.rs`
+- including the two that already hand-prove sequence gaplessness and
+same-batch failure isolation - passes unchanged against real (embedded)
+Postgres, alongside `cargo check/clippy --workspace --all-targets -D
+warnings` and `cargo fmt --check` clean. Landed on its own branch
+(`perf/batch-round-trip-reduction`); no fresh end-to-end load-test
+number captured for this pass specifically - the round-trip counting
+above is derived from reading the code path, not measured throughput,
+so treat the ceiling improvement as directionally expected rather than
+quantified until re-run against `skilj-helpdesk`.
+

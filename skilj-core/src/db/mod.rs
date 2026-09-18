@@ -4991,7 +4991,31 @@ pub async fn list_events_for_bounded_context_matching_tags(
     let bc = get_bounded_context(pool, bounded_context).await?.expect(
         "list_events_for_bounded_context_matching_tags: bounded_context row must exist for any event referencing it",
     );
+    list_events_for_bounded_context_matching_tags_with_bc(pool, &bc, tags, after_sequence).await
+}
 
+/// The same query [`list_events_for_bounded_context_matching_tags`] runs,
+/// for a caller that already has the `BoundedContext` row in hand and
+/// would otherwise be re-fetching it redundantly - `submit_one_command_in_tx`'s
+/// own per-command DCB-conflict delta check is exactly that caller: every
+/// command in a `CommandBatcher` batch shares the identical bounded
+/// context (that's what the batch's own queue is keyed on), and
+/// `command_type.bounded_context` is already that same row, loaded once
+/// when the command type itself was resolved - re-fetching it (plus,
+/// transitively, `get_role` for its `created_by_role_id`) once per
+/// command in a large, self-tuning batch was pure round-trip waste sitting
+/// inside the batch leader's own held lock.
+async fn list_events_for_bounded_context_matching_tags_with_bc(
+    pool: &Pool,
+    bc: &BoundedContext,
+    tags: &[Tag],
+    after_sequence: Option<i64>,
+) -> crate::error::Result<Vec<Event>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let bounded_context = bc.name.as_str();
     let schema = schema_ident(bounded_context);
     // One `[Tag]`-shaped single-element JSONB array literal per wanted
     // tag - containment (`@>`) needs the right-hand side to be an array
@@ -6244,58 +6268,74 @@ pub async fn broadcast_appended_events(
     }
 }
 
-/// The post-lock half of `ProcessCommand` `submit_command` used to run
-/// inline - split out (Codeberg issue #32, round two) so
-/// `command_batcher::CommandBatcher`'s leader can run it once per command
-/// inside a *single* open, already-locked transaction shared by every
-/// command in its batch (via `tx.begin()`'s own `SAVEPOINT`-backed nested
-/// transaction, so one command's failure rolls back only its own work,
-/// not its batch-mates'), instead of each command separately opening its
-/// own transaction and re-acquiring the lock from scratch. `submit_command`
-/// itself now just calls this once, for a "batch" of exactly one command.
+/// What [`decide_command_in_tx`] settles on for a command whose decision
+/// was `Accepted` - everything [`finish_accepted_command_in_tx`] needs to
+/// actually write it, once sequence numbers are available. Kept as its
+/// own struct, rather than inlining decide's tail into finish, is what
+/// lets `commit_command_batch`'s own loop insert a [`SequencePool`] draw
+/// in between the two calls.
+struct AcceptedDecision {
+    event_specs: Vec<crate::shared::EventSpec>,
+    final_bounded_context_events: Vec<Event>,
+    event_types_by_name: std::collections::HashMap<String, EventType>,
+}
+
+/// [`decide_command_in_tx`]'s own return type - either a terminal outcome
+/// (`Rejected`/`Deduplicated`) that never needs a sequence number at all,
+/// or an [`AcceptedDecision`] still needing [`finish_accepted_command_in_tx`]
+/// to actually persist it.
+enum DecideOutcome {
+    Terminal(SubmitCommandOutcome),
+    Accepted(AcceptedDecision),
+}
+
+/// The read-only, no-sequence-number-needed half of what used to be one
+/// `submit_one_command_in_tx` - split out (Codeberg issue #32, round
+/// three: shrinking a batch's own per-command round trips further, after
+/// round two's group commit already amortised the lock acquisition
+/// itself) so `commit_command_batch`'s loop can run this directly
+/// against the *leader's own* `tx`, not a per-command `SAVEPOINT`. That
+/// matters for exactly one reason: it lets a [`SequencePool`] reservation -
+/// acquired against that same `tx`, in the gap between this call and
+/// [`finish_accepted_command_in_tx`]'s own `SAVEPOINT` - survive a later
+/// command's real failure instead of being rolled back with it, which is
+/// what makes pooling sequence numbers across several commands safe at
+/// all. See `SequencePool`'s own doc comment for the full reasoning.
 ///
-/// `locked_highest` and `sync_projections` are the caller's own, taken
-/// once per *batch* rather than once per command - see
-/// `lock_bounded_context_sequence`'s and
-/// `insert_event_and_update_sync_projections_in_tx`'s own doc comments
-/// for why both are safe to share this way. `extra_committed_events` is
-/// new here: events an *earlier command in this same batch* already
-/// inserted into `tx` (uncommitted, so a plain `pool` query - a different
-/// connection - could never see them) - folded into the same DCB-conflict
-/// redispatch check as `locked_highest`'s own delta-from-`pool` fetch,
-/// tag-filtered the identical way, so a same-batch conflict is caught
-/// exactly as reliably as a cross-instance one. Always `&[]` from
-/// `submit_command`'s own batch-of-one caller.
+/// Never touches `next_sequence_batch`, `resolve_encryption_keys`,
+/// `process_command`, or any insert - everything here is either a pure
+/// function or a read (`lookup_idempotency_key` against `tx` itself,
+/// everything else against `pool`), so running it directly on a
+/// long-lived `tx` shared by many commands, rather than inside its own
+/// disposable transaction, changes nothing about what it can safely see
+/// or do; a genuine failure here (an idempotency-lookup DB error, a
+/// decider error) is returned as a real `Err` and, in `commit_command_batch`'s
+/// own caller, is still wrapped in its own tiny `SAVEPOINT` purely so
+/// that failure can't sour `tx` for the commands still to come - see
+/// that function's own comment.
 ///
-/// `event_types_by_name`/`resolved` arrive already warmed up (see
-/// `warm_up_event_types_and_encryption_keys`) and are grown in place for
+/// `event_types_by_name` arrives already warmed up (see
+/// `warm_up_event_types_and_encryption_keys`) and is grown in place for
 /// whatever a redispatch still needs - identical to how `submit_command`
 /// itself used to do this inline.
 #[allow(clippy::too_many_arguments)]
-async fn submit_one_command_in_tx(
+async fn decide_command_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
-    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     command_type: &CommandType,
     payload: &str,
     client_id: &str,
-    correlation_id: Option<&str>,
-    causation_id: Option<&str>,
     bounded_context_events: &[Event],
     consistency_tags: &[Tag],
     matching_events: &[Event],
     initial_decision: crate::shared::CommandDecision,
-    encryption_master_key: Option<&EncryptionMasterKey>,
-    now: DateTime<Utc>,
     snapshot: Option<SnapshotContext<'_>>,
     idempotency_key: Option<&str>,
     locked_highest: i64,
-    sync_projections: &[Projection],
     extra_committed_events: &[Event],
     mut event_types_by_name: std::collections::HashMap<String, EventType>,
-    mut resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
-) -> crate::error::Result<SubmitCommandOutcome> {
+) -> crate::error::Result<DecideOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
     let original_highest = bounded_context_events
@@ -6308,15 +6348,17 @@ async fn submit_one_command_in_tx(
     // checked as early as possible, right after the lock that makes this
     // plain `SELECT` race-free (see `lookup_idempotency_key`'s own doc
     // comment). `initial_decision`/the redispatch logic below never runs
-    // on a hit - nothing is written, and (in the batched path) this
-    // command's own savepoint has nothing to roll back either.
+    // on a hit - nothing is written, and this command never reaches
+    // `finish_accepted_command_in_tx`'s own `SAVEPOINT` at all.
     if let Some(key) = idempotency_key {
         if let Some(triggered_event_sequences) =
             lookup_idempotency_key(&mut **tx, &schema, &command_type.name, client_id, key).await?
         {
-            return Ok(SubmitCommandOutcome::Deduplicated {
-                triggered_event_sequences,
-            });
+            return Ok(DecideOutcome::Terminal(
+                SubmitCommandOutcome::Deduplicated {
+                    triggered_event_sequences,
+                },
+            ));
         }
     }
 
@@ -6339,9 +6381,16 @@ async fn submit_one_command_in_tx(
     // fix for why the `pool` half of this is already tag-indexed rather
     // than an unfiltered range scan.
     let mut delta = if locked_highest > original_highest {
-        list_events_for_bounded_context_matching_tags(
+        // `command_type.bounded_context` is already this exact row -
+        // every command a `CommandBatcher` batch ever holds shares one
+        // bounded context (the queue is keyed on it), so there is never
+        // a fresher copy to fetch here. See
+        // `list_events_for_bounded_context_matching_tags_with_bc`'s own
+        // doc comment for why re-fetching it per command was pure
+        // round-trip waste inside the batch leader's held lock.
+        list_events_for_bounded_context_matching_tags_with_bc(
             pool,
-            &bounded_context_name,
+            &command_type.bounded_context,
             consistency_tags,
             Some(original_highest),
         )
@@ -6411,24 +6460,23 @@ async fn submit_one_command_in_tx(
                     KeyValue::new("outcome", "rejected"),
                 ],
             );
-            return Ok(SubmitCommandOutcome::Rejected {
+            return Ok(DecideOutcome::Terminal(SubmitCommandOutcome::Rejected {
                 reason,
                 kind,
                 matching_events: final_matching_events,
-            });
+            }));
         }
         crate::shared::CommandDecision::Accepted { events } => events,
     };
 
-    // process_command's own resolve_event_type/next_sequence stay plain
-    // sync closures (decide() and everything downstream is I/O-free per
-    // §1.1) - every EventType lookup and sequence allocation this call
-    // will need happens against the *final* event_specs (the redispatched
-    // ones, if a retry happened above). `event_types_by_name` arrived
-    // already warmed up for `initial_decision`'s own specs; this loop is
-    // what a redispatch's different specs still need, and its
-    // `Entry::Vacant` guard means it costs nothing extra when nothing
-    // changed.
+    // process_command's own resolve_event_type stays a plain sync closure
+    // (decide() and everything downstream is I/O-free per §1.1) - every
+    // EventType lookup this call will need happens against the *final*
+    // event_specs (the redispatched ones, if a retry happened above).
+    // `event_types_by_name` arrived already warmed up for `initial_decision`'s
+    // own specs; this loop is what a redispatch's different specs still
+    // need, and its `Entry::Vacant` guard means it costs nothing extra
+    // when nothing changed.
     for spec in &event_specs {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             event_types_by_name.entry(spec.event_type.clone())
@@ -6439,16 +6487,45 @@ async fn submit_one_command_in_tx(
         }
     }
 
-    // Allocated inside `tx`, after the lock above, in one round trip for
-    // every event this command decided - `next_sequence_batch`, not
-    // `event_specs.len()` separate `next_sequence` calls (Codeberg issue
-    // #32). A failure anywhere below (an unregistered event type,
-    // encryption resolution, the inserts themselves) rolls the whole
-    // allocation back with the rest of this command's own work - the
-    // whole transaction in the standalone path, just this command's own
-    // savepoint in the batched one.
-    let sequences =
-        next_sequence_batch(&mut **tx, &bounded_context_name, event_specs.len() as i64).await?;
+    Ok(DecideOutcome::Accepted(AcceptedDecision {
+        event_specs,
+        final_bounded_context_events,
+        event_types_by_name,
+    }))
+}
+
+/// The write half of what used to be one `submit_one_command_in_tx` -
+/// everything [`decide_command_in_tx`] couldn't do without real sequence
+/// numbers in hand. `sequences` is exactly `decided.event_specs.len()`
+/// numbers, already allocated by the caller (a plain `next_sequence_batch`
+/// call for `submit_command`'s own batch-of-one path, a shared
+/// [`SequencePool`] draw for `commit_command_batch`'s multi-command one) -
+/// this function itself never touches `{schema}.sequence` at all.
+#[allow(clippy::too_many_arguments)]
+async fn finish_accepted_command_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    pool: &Pool,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+    idempotency_key: Option<&str>,
+    sync_projections: &[Projection],
+    sequences: Vec<i64>,
+    decided: AcceptedDecision,
+    mut resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+) -> crate::error::Result<SubmitCommandOutcome> {
+    let bounded_context_name = command_type.bounded_context.name.clone();
+    let schema = schema_ident(&bounded_context_name);
+    let AcceptedDecision {
+        event_specs,
+        final_bounded_context_events,
+        event_types_by_name,
+    } = decided;
     let mut sequences = sequences.into_iter();
 
     // protect_sensitive_fields' own pre-resolution step, for the
@@ -6567,6 +6644,99 @@ async fn submit_one_command_in_tx(
     })
 }
 
+/// `submit_command`'s own batch-of-one composition of [`decide_command_in_tx`]
+/// and [`finish_accepted_command_in_tx`], with a plain per-call
+/// `next_sequence_batch` in between. Unlike `commit_command_batch`'s own
+/// loop, there is only ever one command here, so there is nothing to
+/// pool sequence numbers *across* - both halves run on the same flat
+/// `tx` `submit_command` opened, with no per-command `SAVEPOINT` layered
+/// on top of it at all, so a real failure in either half rolls back that
+/// one, whole transaction, exactly as before this function was split in
+/// two.
+#[allow(clippy::too_many_arguments)]
+async fn submit_one_command_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+    bounded_context_events: &[Event],
+    consistency_tags: &[Tag],
+    matching_events: &[Event],
+    initial_decision: crate::shared::CommandDecision,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+    snapshot: Option<SnapshotContext<'_>>,
+    idempotency_key: Option<&str>,
+    locked_highest: i64,
+    sync_projections: &[Projection],
+    extra_committed_events: &[Event],
+    event_types_by_name: std::collections::HashMap<String, EventType>,
+    resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+) -> crate::error::Result<SubmitCommandOutcome> {
+    let bounded_context_name = command_type.bounded_context.name.clone();
+    let decided = match decide_command_in_tx(
+        tx,
+        pool,
+        dispatcher,
+        command_type,
+        payload,
+        client_id,
+        bounded_context_events,
+        consistency_tags,
+        matching_events,
+        initial_decision,
+        snapshot,
+        idempotency_key,
+        locked_highest,
+        extra_committed_events,
+        event_types_by_name,
+    )
+    .await?
+    {
+        DecideOutcome::Terminal(outcome) => return Ok(outcome),
+        DecideOutcome::Accepted(decided) => decided,
+    };
+
+    // Allocated inside `tx`, after the lock above, in one round trip for
+    // every event this command decided - `next_sequence_batch`, not
+    // `event_specs.len()` separate `next_sequence` calls (Codeberg issue
+    // #32). A failure anywhere below (an unregistered event type,
+    // encryption resolution, the inserts themselves) rolls the whole
+    // allocation back with the rest of this command's own work - the
+    // whole transaction, since this path has no per-command `SAVEPOINT`
+    // of its own.
+    let sequences = next_sequence_batch(
+        &mut **tx,
+        &bounded_context_name,
+        decided.event_specs.len() as i64,
+    )
+    .await?;
+
+    finish_accepted_command_in_tx(
+        tx,
+        pool,
+        projection_dispatcher,
+        command_type,
+        payload,
+        client_id,
+        correlation_id,
+        causation_id,
+        encryption_master_key,
+        now,
+        idempotency_key,
+        sync_projections,
+        sequences,
+        decided,
+        resolved,
+    )
+    .await
+}
+
 /// The owned equivalent of [`SnapshotContext`] - that type borrows
 /// `state_json`, fine for a caller whose own stack frame outlives the
 /// call it's passed into, but a [`BatchedCommand`] has to survive being
@@ -6627,6 +6797,7 @@ pub type BatchedCommandResult = crate::error::Result<SubmitCommandOutcome>;
 /// #36).
 pub struct CommandBatchLeaderTx {
     tx: Transaction<'static, Postgres>,
+    bounded_context_name: String,
     locked_highest: i64,
     sync_projections: Vec<Projection>,
 }
@@ -6675,9 +6846,133 @@ pub async fn begin_command_batch_leader_tx(
     let sync_projections = sync_projections_for_bounded_context(pool, bounded_context_name).await?;
     Ok(CommandBatchLeaderTx {
         tx,
+        bounded_context_name: bounded_context_name.to_string(),
         locked_highest,
         sync_projections,
     })
+}
+
+/// A prefetched, batch-local block of not-yet-consumed sequence numbers -
+/// `commit_command_batch`'s own answer to `next_sequence_batch` being
+/// called once per command instead of once per batch (Codeberg issue #32,
+/// round three). Reserves numbers in chunks against the *leader's own*
+/// `tx`, never a per-command `SAVEPOINT` - specifically so a reservation
+/// survives a later command's real failure instead of being rolled back
+/// with it: today's per-command `next_sequence_batch` call is what
+/// currently makes gapless sequencing safe for a command that fails
+/// partway through (its own `SAVEPOINT` rollback un-reserves exactly what
+/// it asked for); pooling numbers across several commands means a
+/// command can end up holding numbers it never uses (a *later* command in
+/// the same batch is the one that fails, or the pool simply over-reserved
+/// as a heuristic), and those must still never be lost or duplicated.
+///
+/// `SequenceIsGaplessPerBoundedContext` stays honoured by two rules,
+/// together: (1) a draw's numbers are only ever permanently discarded
+/// ([`Self::confirm_last_draw`]) once the command that used them has
+/// actually committed; (2) a draw that instead fails
+/// ([`Self::return_last_draw`]) goes back onto the *front* of the queue,
+/// in its original order, so it is the very next thing handed to
+/// whichever command asks next - recycled, never wasted mid-batch. Only
+/// genuinely unused numbers - ones nobody ever drew, or ones returned and
+/// never redrawn because the batch ended first - are corrected back out
+/// of `{schema}.sequence` in one shot ([`Self::shrink_back`]), right
+/// before `tx.commit()`. Because every draw is either confirmed or
+/// returned before the next one starts (this pool is only ever driven by
+/// `commit_command_batch`'s own strictly sequential loop, never
+/// concurrently), the persisted `next_value` this leaves behind is always
+/// identical to what calling `next_sequence_batch` once per command,
+/// inside each one's own `SAVEPOINT`, would have left - only the number
+/// of round trips to get there differs.
+struct SequencePool {
+    reserved: std::collections::VecDeque<i64>,
+    last_draw: Vec<i64>,
+}
+
+impl SequencePool {
+    fn new() -> Self {
+        Self {
+            reserved: std::collections::VecDeque::new(),
+            last_draw: Vec::new(),
+        }
+    }
+
+    /// Pops `count` sequence numbers, refilling from `tx` first if the
+    /// pool doesn't already have enough. `refill_hint` (`commit_command_batch`
+    /// passes "how many commands are still left in this batch, this one
+    /// included") sizes that refill generously so a run of small,
+    /// single-event commands shares one round trip instead of paying for
+    /// one each; `refill_hint.max(count)` guarantees the refill is always
+    /// big enough for the command that triggered it, regardless of how
+    /// small a hint the caller passed. Remembers exactly what it handed
+    /// out as `last_draw`, so the caller can later call exactly one of
+    /// [`Self::confirm_last_draw`] or [`Self::return_last_draw`] once
+    /// that command's own outcome is known - never both, never neither.
+    async fn take(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+        bounded_context: &str,
+        count: i64,
+        refill_hint: i64,
+    ) -> crate::error::Result<Vec<i64>> {
+        if (self.reserved.len() as i64) < count {
+            let refill =
+                next_sequence_batch(&mut **tx, bounded_context, refill_hint.max(count)).await?;
+            self.reserved.extend(refill);
+        }
+        let drawn: Vec<i64> = (0..count)
+            .map(|_| {
+                self.reserved
+                    .pop_front()
+                    .expect("just topped up the pool to at least `count`")
+            })
+            .collect();
+        self.last_draw = drawn.clone();
+        Ok(drawn)
+    }
+
+    /// The command that drew `last_draw` committed successfully - those
+    /// numbers are truly spent, never returned to the pool.
+    fn confirm_last_draw(&mut self) {
+        self.last_draw.clear();
+    }
+
+    /// The command that drew `last_draw` failed - those numbers were
+    /// never actually used by any inserted event, so they go back onto
+    /// the *front* of the queue (preserving their original order) for
+    /// whichever command draws next, instead of being permanently lost.
+    fn return_last_draw(&mut self) {
+        for value in self.last_draw.drain(..).rev() {
+            self.reserved.push_front(value);
+        }
+    }
+
+    /// Gives back whatever's left reserved-but-never-confirmed once the
+    /// batch's own loop is done - see this struct's own doc comment for
+    /// why this one corrective `UPDATE`, run once per batch, is all
+    /// `SequenceIsGaplessPerBoundedContext` needs, regardless of how many
+    /// refills happened or how many draws were returned and re-drawn
+    /// along the way.
+    async fn shrink_back(
+        self,
+        tx: &mut Transaction<'_, Postgres>,
+        bounded_context: &str,
+    ) -> crate::error::Result<()> {
+        debug_assert!(
+            self.last_draw.is_empty(),
+            "every draw must be confirmed or returned before shrink_back runs"
+        );
+        let leftover = self.reserved.len() as i64;
+        if leftover > 0 {
+            let schema = schema_ident(bounded_context);
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {schema}.sequence SET next_value = next_value - $1"
+            )))
+            .bind(leftover)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 /// The batched form of the "locked half" of `ProcessCommand` -
@@ -6733,40 +7028,114 @@ pub async fn commit_command_batch(
 ) -> crate::error::Result<Vec<BatchedCommandResult>> {
     let CommandBatchLeaderTx {
         mut tx,
+        bounded_context_name,
         locked_highest,
         sync_projections,
     } = leader_tx;
 
     let mut results = Vec::with_capacity(batch.len());
     let mut extra_committed_events: Vec<Event> = Vec::new();
+    let mut sequence_pool = SequencePool::new();
+    let batch_len = batch.len();
 
-    for item in batch {
-        let mut nested = tx.begin().await?;
-        let outcome = submit_one_command_in_tx(
-            &mut nested,
+    for (idx, item) in batch.into_iter().enumerate() {
+        // `decide_command_in_tx` never writes anything, but it does run
+        // directly on `tx` (not a disposable transaction of its own) so
+        // that the `SequencePool` draw below can too - see that
+        // function's and `SequencePool`'s own doc comments. Wrapped in
+        // its own tiny `SAVEPOINT` anyway, purely so a genuine DB error
+        // from its one `tx`-scoped read (`lookup_idempotency_key`) can't
+        // abort `tx` itself and take every command still queued behind
+        // this one down with it - the same isolation guarantee the old,
+        // unsplit function got for free from being called inside a
+        // per-command `SAVEPOINT` already.
+        let mut decide_tx = tx.begin().await?;
+        let decide_result = decide_command_in_tx(
+            &mut decide_tx,
             pool,
             dispatcher,
-            projection_dispatcher,
             &item.command_type,
             &item.payload,
             &item.client_id,
-            item.correlation_id.as_deref(),
-            item.causation_id.as_deref(),
             &item.bounded_context_events,
             &item.consistency_tags,
             &item.matching_events,
             item.initial_decision,
-            encryption_master_key,
-            item.now,
             item.snapshot.as_ref().map(|s| SnapshotContext {
                 state_json: &s.state_json,
                 as_of_sequence: s.as_of_sequence,
             }),
             item.idempotency_key.as_deref(),
             locked_highest,
-            &sync_projections,
             &extra_committed_events,
             item.event_types_by_name,
+        )
+        .await;
+
+        let decided = match decide_result {
+            Ok(DecideOutcome::Terminal(outcome)) => {
+                decide_tx.commit().await?;
+                results.push(Ok(outcome));
+                continue;
+            }
+            Ok(DecideOutcome::Accepted(decided)) => {
+                decide_tx.commit().await?;
+                decided
+            }
+            Err(e) => {
+                decide_tx.rollback().await?;
+                results.push(Err(e));
+                continue;
+            }
+        };
+
+        // Reserved against `tx` itself, not the `nested` `SAVEPOINT`
+        // opened below - see `SequencePool`'s own doc comment for why
+        // that's what lets a later command's failure recycle these
+        // instead of burning a permanent gap. `refill_hint` is "how many
+        // commands (including this one) are still left to process" - an
+        // upper bound on how many single-event commands could still
+        // share whatever this refill provisions.
+        let refill_hint = (batch_len - idx) as i64;
+        let sequences = match sequence_pool
+            .take(
+                &mut tx,
+                &bounded_context_name,
+                decided.event_specs.len() as i64,
+                refill_hint,
+            )
+            .await
+        {
+            Ok(sequences) => sequences,
+            Err(e) => {
+                // A failure bumping `{schema}.sequence` on `tx` itself -
+                // not a per-command problem any `SAVEPOINT` isolates,
+                // since this call deliberately runs outside one. Same
+                // treatment as a final `tx.commit()` failure below:
+                // nothing in this batch is trustworthy from here, so
+                // every command - this one and everything still
+                // queued - gets the caller's own uniform `BatchFailed`
+                // treatment instead of a partial `results`.
+                return Err(e);
+            }
+        };
+
+        let mut nested = tx.begin().await?;
+        let outcome = finish_accepted_command_in_tx(
+            &mut nested,
+            pool,
+            projection_dispatcher,
+            &item.command_type,
+            &item.payload,
+            &item.client_id,
+            item.correlation_id.as_deref(),
+            item.causation_id.as_deref(),
+            encryption_master_key,
+            item.now,
+            item.idempotency_key.as_deref(),
+            &sync_projections,
+            sequences,
+            decided,
             item.resolved,
         )
         .await;
@@ -6778,6 +7147,7 @@ pub async fn commit_command_batch(
                 // same batch, but still no more durable than the rest of
                 // `tx` until the one `tx.commit()` below succeeds.
                 nested.commit().await?;
+                sequence_pool.confirm_last_draw();
                 if let SubmitCommandOutcome::Accepted { ref events, .. } = outcome {
                     extra_committed_events.extend(events.iter().cloned());
                 }
@@ -6792,11 +7162,15 @@ pub async fn commit_command_batch(
                 // `tx.begin()` reuses it, not merely queued by a
                 // fire-and-forget `Drop`.
                 nested.rollback().await?;
+                sequence_pool.return_last_draw();
                 results.push(Err(e));
             }
         }
     }
 
+    sequence_pool
+        .shrink_back(&mut tx, &bounded_context_name)
+        .await?;
     tx.commit().await?;
     Ok(results)
 }
