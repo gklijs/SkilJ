@@ -465,3 +465,78 @@ fn concurrent_submits_for_different_orders_all_accept_with_gapless_distinct_sequ
         assert_eq!(events.len(), CONCURRENCY);
     });
 }
+
+#[test]
+fn a_batch_leader_stuck_past_the_idle_in_transaction_timeout_is_killed_and_releases_the_lock() {
+    // Codeberg issue #36's own recommendation #3, proved end to end rather
+    // than just read from the code: a batch leader's transaction that
+    // never sends another statement after acquiring the bounded-context
+    // lock - for whatever reason, a genuine hang included - must not wedge
+    // every other writer to that bounded context forever. This test
+    // fakes the "leader never comes back" half directly (a real hang is
+    // hard to manufacture deterministically) via
+    // `db::begin_command_batch_leader_tx` on its own, held idle well past
+    // a short configured timeout, then proves a *separate*, real
+    // `CommandBatcher` submission to the very same bounded context still
+    // completes - which it only can if Postgres actually terminated the
+    // stuck session and released its `FOR UPDATE` lock on its own, since
+    // nothing in this test ever explicitly commits or rolls back the
+    // stuck transaction before that second submission starts.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+
+        let stuck_leader_tx = db::begin_command_batch_leader_tx(
+            &pool,
+            &bc.name,
+            Some(std::time::Duration::from_millis(200)),
+        )
+        .await
+        .expect("acquiring the lock for the stuck leader must succeed");
+
+        // Long enough that Postgres's own `idle_in_transaction_session_timeout`
+        // (200ms, set above) has certainly already fired and killed this
+        // session - nothing here sends it another statement in the
+        // meantime, exactly the "leader never comes back" failure mode
+        // Codeberg issue #36 describes.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let batcher = CommandBatcher::new();
+        let dispatcher = ShipOrderDispatcher;
+        let broadcaster = EventBroadcaster::new(64);
+        let event_cache = EventCache::new(1000);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            submit(
+                &pool,
+                &batcher,
+                &dispatcher,
+                &broadcaster,
+                &event_cache,
+                &ct,
+                r#"{"order_id":"A"}"#,
+            ),
+        )
+        .await
+        .expect(
+            "a fresh submission to the same bounded context must not hang behind a killed \
+             leader's stale lock - Postgres terminating the idle session must have released it",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(outcome, SubmitCommandOutcome::Accepted { .. }),
+            "expected the fresh submission to be accepted, got {outcome:?}"
+        );
+
+        // The stuck leader's own transaction was never committed (Postgres
+        // killed the session before that could happen) - dropping it here
+        // is just cleanup, not a correctness assertion.
+        drop(stuck_leader_tx);
+    });
+}

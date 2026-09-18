@@ -90,6 +90,15 @@ struct PendingCommand {
 
 type Queue = Arc<Mutex<Vec<PendingCommand>>>;
 
+/// The default for [`CommandBatcher::with_idle_in_transaction_timeout`] -
+/// see that method's own doc comment. 30 seconds is generous for
+/// everything a batch leader's own transaction legitimately does (one row
+/// lock, a handful of metadata reads, up to `MAX_BATCH_SIZE` commands'
+/// worth of decider/projection work, all of it CPU-bound or against the
+/// same already-warm database), so tripping it is always a real stall,
+/// never an ordinary slow batch.
+const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// See this module's own doc comment for the full design. `Clone` is
 /// cheap - `Arc`-wrapped internals, the identical "hand out a cheap
 /// clone, not an `Arc<Skilj>`" reasoning `EventCache`/`EventBroadcaster`
@@ -97,6 +106,7 @@ type Queue = Arc<Mutex<Vec<PendingCommand>>>;
 #[derive(Clone)]
 pub struct CommandBatcher {
     queues: Arc<RwLock<HashMap<String, Queue>>>,
+    idle_in_transaction_timeout: std::time::Duration,
 }
 
 impl Default for CommandBatcher {
@@ -109,7 +119,21 @@ impl CommandBatcher {
     pub fn new() -> Self {
         Self {
             queues: Arc::new(RwLock::new(HashMap::new())),
+            idle_in_transaction_timeout: DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT,
         }
+    }
+
+    /// Codeberg issue #36's own recommendation #3: a defense-in-depth
+    /// backstop against a batch leader's transaction stalling - for any
+    /// reason, root cause fixed or not - while holding the bounded-context
+    /// lock. Issued as `SET LOCAL idle_in_transaction_session_timeout` on
+    /// the leader's own transaction (see `db::begin_command_batch_leader_tx`'s
+    /// own doc comment), so Postgres itself kills a genuinely stuck leader
+    /// and releases the lock instead of every writer to that bounded
+    /// context queueing forever behind a wedge nothing else ever clears.
+    pub fn with_idle_in_transaction_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.idle_in_transaction_timeout = timeout;
+        self
     }
 
     /// The `Queue` for `bounded_context`, creating it (empty) on first
@@ -300,13 +324,25 @@ impl CommandBatcher {
     }
 
     /// Only ever called by whichever `submit` caller found itself the
-    /// leader above. Everything between here and the `tx.begin()`
-    /// `db::submit_command_batch` does internally - the pool checkout,
-    /// the `SELECT ... FOR UPDATE` wait - is exactly the window other
-    /// callers keep queueing behind; only once that's done do we drain
-    /// the queue (taking everyone who joined, capped at
+    /// leader above. Everything between here and the lock actually being
+    /// granted (`db::begin_command_batch_leader_tx`'s own `pool.begin()`
+    /// plus the real `SELECT ... FOR UPDATE` wait) is exactly the window
+    /// other callers keep queueing behind; only once that's done do we
+    /// drain the queue (taking everyone who joined, capped at
     /// `MAX_BATCH_SIZE`), so the batch this call ends up processing can
     /// be considerably larger than one.
+    ///
+    /// Codeberg issue #36: this ordering - lock first, drain second - used
+    /// to be reversed (the queue was drained before the lock was even
+    /// requested), which quietly defeated the self-tuning design this
+    /// module's own doc comment describes: a caller almost never found
+    /// anyone else already queued, since nothing had yet given concurrent
+    /// arrivals time to queue up. Draining is unconditional once the lock
+    /// step finishes, success or failure alike - a follower that queued
+    /// during the wait must never be left behind in a queue nobody drains
+    /// again, since leadership for a *new* batch is only ever assigned to
+    /// whoever finds the queue empty (see `submit`'s own `is_leader`
+    /// check), and a queue nobody drains never goes empty.
     #[allow(clippy::too_many_arguments)]
     async fn run_as_leader(
         &self,
@@ -319,9 +355,16 @@ impl CommandBatcher {
         bounded_context_name: &str,
         queue: &Queue,
     ) -> Result<SubmitCommandOutcome> {
+        let leader_tx = crate::db::begin_command_batch_leader_tx(
+            pool,
+            bounded_context_name,
+            Some(self.idle_in_transaction_timeout),
+        )
+        .await;
+
         // `drain_up_to` never returns empty for the leader's own call -
         // it just pushed itself onto this exact queue above. Split into
-        // parallel vecs up front: `db::submit_command_batch` wants owned
+        // parallel vecs up front: `db::commit_command_batch` wants owned
         // `BatchedCommand`s to process, and the `reply` senders are
         // needed again afterward, in the same order, to distribute
         // results - `unzip` keeps that pairing without the awkwardness
@@ -332,12 +375,30 @@ impl CommandBatcher {
             Vec<oneshot::Sender<BatchedCommandResult>>,
         ) = pending.into_iter().map(|p| (p.command, p.reply)).unzip();
 
-        let results = crate::db::submit_command_batch(
+        let leader_tx = match leader_tx {
+            Ok(leader_tx) => leader_tx,
+            Err(e) => {
+                // Couldn't even acquire the lock for this batch - nothing
+                // in `batch` was ever attempted, so every command, leader's
+                // own included, gets an equivalent error. `Error` isn't
+                // `Clone` (`sqlx::Error` inside it isn't), so every
+                // follower gets `BatchFailed` carrying the same rendered
+                // message rather than the original typed error - only the
+                // leader's own return value below keeps that original.
+                let message = e.to_string();
+                for reply in replies.drain(1..) {
+                    let _ = reply.send(Err(Error::BatchFailed(message.clone())));
+                }
+                return Err(e);
+            }
+        };
+
+        let results = crate::db::commit_command_batch(
+            leader_tx,
             pool,
             dispatcher,
             projection_dispatcher,
             encryption_master_key,
-            bounded_context_name,
             batch,
         )
         .await;
@@ -345,14 +406,11 @@ impl CommandBatcher {
         let results = match results {
             Ok(results) => results,
             Err(e) => {
-                // The shared transaction itself failed (lock acquisition
-                // or the final commit) - nothing in this batch is
-                // trustworthy, so every command, leader's own included,
-                // gets an equivalent error. `Error` isn't `Clone`
-                // (`sqlx::Error` inside it isn't), so every follower gets
-                // `BatchFailed` carrying the same rendered message rather
-                // than the original typed error - only the leader's own
-                // return value below keeps that original.
+                // The shared transaction's final commit itself failed -
+                // nothing in this batch is trustworthy, so every command,
+                // leader's own included, gets an equivalent error. Same
+                // `Error`-isn't-`Clone` reasoning as the lock-failure arm
+                // above.
                 let message = e.to_string();
                 for reply in replies.drain(1..) {
                     let _ = reply.send(Err(Error::BatchFailed(message.clone())));

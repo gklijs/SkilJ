@@ -6621,27 +6621,85 @@ pub struct BatchedCommand {
 /// this one command's own savepoint, not its batch-mates'.
 pub type BatchedCommandResult = crate::error::Result<SubmitCommandOutcome>;
 
+/// What [`begin_command_batch_leader_tx`] hands to [`commit_command_batch`] -
+/// see each of their own doc comments for why acquiring the lock and
+/// running the batch are split into two functions at all (Codeberg issue
+/// #36).
+pub struct CommandBatchLeaderTx {
+    tx: Transaction<'static, Postgres>,
+    locked_highest: i64,
+    sync_projections: Vec<Projection>,
+}
+
+/// The lock-acquiring half of [`submit_command_batch`], pulled out
+/// (Codeberg issue #36) so `command_batcher::CommandBatcher::run_as_leader`
+/// can await this - the one part of the batch's own processing whose
+/// duration is meant to grow the batch, per this module's own doc comment
+/// on the self-tuning design - *before* draining the queue, not after.
+/// The previous, unsplit `submit_command_batch` made `run_as_leader` drain
+/// first and lock second, which defeated that self-tuning window (a batch
+/// almost never grew past whoever raced to become leader) and, worse,
+/// meant that if this step alone hung, the caller had no chance to
+/// give every already-queued follower a real answer, since draining
+/// happened somewhere the caller no longer controlled once this
+/// combined function was already inside it.
+///
+/// `idle_in_transaction_session_timeout`, when `Some`, is issued as a
+/// `SET LOCAL` on this transaction's own connection right after opening
+/// it, before the lock wait - a defense-in-depth backstop (Codeberg issue
+/// #36's own recommendation #3): if this transaction's connection ever
+/// does stall indefinitely - a stuck decider, a hung downstream await,
+/// anything that leaves it holding the bounded-context lock without
+/// making forward progress - Postgres itself kills the idle session
+/// after the timeout, releasing the lock so a later batch can proceed
+/// instead of every writer to this bounded context queueing forever
+/// behind a wedge no automatic mechanism ever clears. `SET LOCAL` scopes
+/// the change to this one transaction; it's gone the moment `tx` commits,
+/// rolls back, or (if the timeout itself fires) Postgres closes it, so it
+/// never leaks onto whatever this pooled connection is handed to next.
+pub async fn begin_command_batch_leader_tx(
+    pool: &Pool,
+    bounded_context_name: &str,
+    idle_in_transaction_session_timeout: Option<std::time::Duration>,
+) -> crate::error::Result<CommandBatchLeaderTx> {
+    let mut tx = pool.begin().await?;
+    if let Some(timeout) = idle_in_transaction_session_timeout {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL idle_in_transaction_session_timeout = '{}ms'",
+            timeout.as_millis()
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
+    let locked_highest = lock_bounded_context_sequence(&mut tx, bounded_context_name).await?;
+    let sync_projections = sync_projections_for_bounded_context(pool, bounded_context_name).await?;
+    Ok(CommandBatchLeaderTx {
+        tx,
+        locked_highest,
+        sync_projections,
+    })
+}
+
 /// The batched form of the "locked half" of `ProcessCommand` -
 /// `submit_command`'s own doc comment describes the single-command
-/// shape this generalises. Opens one transaction and takes the
-/// bounded-context lock exactly once (`lock_bounded_context_sequence`),
-/// then runs every command in `batch`, *in order*, each inside its own
-/// nested transaction (`tx.begin()`, which sqlx backs with a real
-/// Postgres `SAVEPOINT` for a `Transaction` that is itself already
-/// inside one) - so one command's real failure (as opposed to an
-/// ordinary `Rejected` decision, which is never an `Err` at all) rolls
-/// back only its own work, `ROLLBACK TO SAVEPOINT`, not the whole
-/// batch's. Every command that succeeds is `RELEASE SAVEPOINT`d
-/// immediately, keeping its writes visible to whichever command in the
-/// batch runs next (see `extra_committed_events` below) without making
-/// them durable yet - that's still `tx.commit()`, called exactly once,
-/// after the whole batch has been processed.
+/// shape this generalises. Takes the already-locked transaction
+/// [`begin_command_batch_leader_tx`] produced and runs every command in
+/// `batch`, *in order*, each inside its own nested transaction
+/// (`tx.begin()`, which sqlx backs with a real Postgres `SAVEPOINT` for a
+/// `Transaction` that is itself already inside one) - so one command's
+/// real failure (as opposed to an ordinary `Rejected` decision, which is
+/// never an `Err` at all) rolls back only its own work, `ROLLBACK TO
+/// SAVEPOINT`, not the whole batch's. Every command that succeeds is
+/// `RELEASE SAVEPOINT`d immediately, keeping its writes visible to
+/// whichever command in the batch runs next (see `extra_committed_events`
+/// below) without making them durable yet - that's still `tx.commit()`,
+/// called exactly once, after the whole batch has been processed.
 ///
 /// This is what makes batching commands from *different*, concurrently-
 /// submitting callers into one lock acquisition possible at all
 /// (Codeberg issue #32, round two - see `command_batcher`'s own module
 /// doc comment for the throughput problem this exists to close): the
-/// lock this function takes is held for the combined work of every
+/// lock `leader_tx` already holds is held for the combined work of every
 /// command in `batch`, not re-acquired per command, so N commands that
 /// would previously have queued for N separate lock acquisitions instead
 /// share one.
@@ -6658,25 +6716,26 @@ pub type BatchedCommandResult = crate::error::Result<SubmitCommandOutcome>;
 /// Returns one [`BatchedCommandResult`] per input command, same order,
 /// only once `tx.commit()` has actually succeeded - nothing here is
 /// reported back to any caller as durable before it truly is. A failure
-/// acquiring the lock, or committing at the end, is returned as the
-/// outer `Err` instead - at that point no per-command outcome is
-/// trustworthy (a failed commit could mean anything committed or
-/// nothing did), so the caller (`command_batcher::CommandBatcher`) is
-/// expected to treat every command in the batch as failed identically,
-/// not to guess from whatever this function got partway through
-/// computing.
-#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context_name, batch_size = batch.len()))]
-pub async fn submit_command_batch(
+/// committing at the end is returned as the outer `Err` instead - at that
+/// point no per-command outcome is trustworthy (a failed commit could
+/// mean anything committed or nothing did), so the caller
+/// (`command_batcher::CommandBatcher`) is expected to treat every command
+/// in the batch as failed identically, not to guess from whatever this
+/// function got partway through computing.
+#[tracing::instrument(skip_all, fields(batch_size = batch.len()))]
+pub async fn commit_command_batch(
+    leader_tx: CommandBatchLeaderTx,
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     encryption_master_key: Option<&EncryptionMasterKey>,
-    bounded_context_name: &str,
     batch: Vec<BatchedCommand>,
 ) -> crate::error::Result<Vec<BatchedCommandResult>> {
-    let mut tx = pool.begin().await?;
-    let locked_highest = lock_bounded_context_sequence(&mut tx, bounded_context_name).await?;
-    let sync_projections = sync_projections_for_bounded_context(pool, bounded_context_name).await?;
+    let CommandBatchLeaderTx {
+        mut tx,
+        locked_highest,
+        sync_projections,
+    } = leader_tx;
 
     let mut results = Vec::with_capacity(batch.len());
     let mut extra_committed_events: Vec<Event> = Vec::new();
@@ -6740,6 +6799,34 @@ pub async fn submit_command_batch(
 
     tx.commit().await?;
     Ok(results)
+}
+
+/// [`begin_command_batch_leader_tx`] immediately followed by
+/// [`commit_command_batch`], with no `idle_in_transaction_session_timeout`
+/// and nothing drained from a shared queue in between - the whole-batch-
+/// in-one-call shape every direct caller (this crate's own
+/// `submit_command.rs` tests, which hand-build a batch up front) wants.
+/// `command_batcher::CommandBatcher::run_as_leader` calls the two halves
+/// separately instead, draining its own queue in the gap between them -
+/// see that function's own doc comment for why.
+pub async fn submit_command_batch(
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    bounded_context_name: &str,
+    batch: Vec<BatchedCommand>,
+) -> crate::error::Result<Vec<BatchedCommandResult>> {
+    let leader_tx = begin_command_batch_leader_tx(pool, bounded_context_name, None).await?;
+    commit_command_batch(
+        leader_tx,
+        pool,
+        dispatcher,
+        projection_dispatcher,
+        encryption_master_key,
+        batch,
+    )
+    .await
 }
 
 /// What [`resolve_command_submission`] settles on - everything both

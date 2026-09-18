@@ -582,6 +582,9 @@ impl Skilj {
             // §53) - matches `config.read_cursor_checkout_lease`'s own
             // default in specs/skilj.allium.
             read_cursor_checkout_lease: std::time::Duration::from_secs(5 * 60),
+            // Codeberg issue #36's own recommendation #3 - matches
+            // `command_batcher::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT`.
+            command_batch_idle_in_transaction_timeout: std::time::Duration::from_secs(30),
             encryption_master_key: None,
             event_broadcast_capacity: 1024,
             event_cache_warm_up_count: 1000,
@@ -1218,6 +1221,7 @@ pub struct SkiljBuilder {
     scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
     read_cursor_checkout_lease: std::time::Duration,
+    command_batch_idle_in_transaction_timeout: std::time::Duration,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
@@ -1462,6 +1466,23 @@ impl SkiljBuilder {
         self
     }
 
+    /// A batch leader's own `SET LOCAL idle_in_transaction_session_timeout`,
+    /// on the transaction holding the bounded-context lock for the whole
+    /// batch it's processing - `skilj_core::command_batcher::CommandBatcher
+    /// ::with_idle_in_transaction_timeout`'s own doc comment for the full
+    /// design (Codeberg issue #36's own recommendation #3: a defense-in-
+    /// depth backstop, not a feature to tune for ordinary throughput).
+    /// Defaults to 30 seconds - generous for any real batch, short enough
+    /// that a genuinely stuck leader's lock is released well before an
+    /// operator would otherwise notice a bounded context has wedged.
+    pub fn command_batch_idle_in_transaction_timeout(
+        mut self,
+        timeout: std::time::Duration,
+    ) -> Self {
+        self.command_batch_idle_in_transaction_timeout = timeout;
+        self
+    }
+
     /// `protect_sensitive_fields`'s own envelope-encryption master key -
     /// see `skilj_core::encryption`'s own module doc comment for the full
     /// design. Optional: a bounded context with no real `sensitive_fields`
@@ -1670,7 +1691,8 @@ impl SkiljBuilder {
         // schema, so nothing here is shared mutable state across
         // iterations - safe to run out of order.
         let event_cache = EventCache::new(self.event_cache_warm_up_count);
-        let command_batcher = skilj_core::command_batcher::CommandBatcher::new();
+        let command_batcher = skilj_core::command_batcher::CommandBatcher::new()
+            .with_idle_in_transaction_timeout(self.command_batch_idle_in_transaction_timeout);
         stream::iter(bounded_contexts_for_warm_up)
             .map(|bc| {
                 let pool = &pool;

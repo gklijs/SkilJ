@@ -8825,3 +8825,128 @@ identically whether a command is alone in its own batch or one of 256,
 and idempotency-key deduplication (§37) is checked per command, inside
 its own savepoint, unchanged.
 
+## 59. Fixing §58's own permanent-hang regression, and closing the cross-instance routing investigation alongside it (Codeberg issues #36, #35)
+
+A real load test against `skilj-helpdesk` (Codeberg issue #36) found
+that §58's `CommandBatcher` didn't just fail to raise the throughput
+ceiling under heavy load - it could wedge a whole bounded context
+*permanently*: one connection stuck `idle in transaction` holding the
+`sequence` row's lock forever, every other writer queueing behind it
+with no self-recovery short of a server restart. Investigated alongside
+Codeberg issue #35 (cross-instance command routing), filed in the same
+window and sharing the identical lock/leader machinery - closing both
+together turned out to matter, not just be convenient: §35's own
+recommended future design (see below) builds on exactly the seam this
+fix introduces.
+
+**A real, confirmed bug: `run_as_leader` drained the queue *before*
+acquiring the lock, not after.** `command_batcher`'s own module doc
+comment always described the self-tuning design as "the leader does not
+immediately grab whatever's in the queue - it first does the slow part
+(`pool.begin()` plus the actual `SELECT ... FOR UPDATE` wait) ... and
+only then drains the queue." The code never did that: `run_as_leader`
+called `drain_up_to` first and `db::submit_command_batch` (lock included)
+second. In practice this meant a caller almost never found anyone else
+already queued - the whole point of the self-tuning design, growing
+batches under contention precisely when amortising the lock matters
+most, was quietly defeated from day one. Worse, under real concurrent
+load this produces something closer to the *pre-batching* shape (many
+separate leaders, each opening their own transaction and queueing for
+the same row lock) while paying the batcher's own extra bookkeeping on
+top - plausibly part of why the load test found a *worse* failure mode,
+not just the same ceiling.
+
+Fixed by splitting `db::submit_command_batch` into two halves:
+`db::begin_command_batch_leader_tx` (opens `tx`, optionally sets the
+idle-in-transaction backstop below, takes `lock_bounded_context_sequence`,
+fetches `sync_projections`) and `db::commit_command_batch` (runs the
+per-command `SAVEPOINT` loop and the final `tx.commit()`, unchanged from
+before). `run_as_leader` now awaits the lock-acquiring half *first*,
+drains the queue *unconditionally* right after - success or failure
+alike, so a follower that joined during the wait is never left stranded
+in a queue nobody will drain again, since a *new* leader is only ever
+assigned when the queue is found empty - and only then calls the
+processing half with whatever the drain collected. `submit_command_batch`
+itself survives as a thin wrapper (`begin` immediately followed by
+`commit`, no queue involved) purely so this crate's own hand-built-batch
+tests (`skilj-core/tests/submit_command.rs`) keep working unchanged.
+
+**Defense-in-depth backstop, regardless of whether this was the load
+test's *only* cause**: `begin_command_batch_leader_tx` takes an optional
+`idle_in_transaction_session_timeout` and, when set, issues `SET LOCAL
+idle_in_transaction_session_timeout` on the leader's own transaction
+right after opening it - scoped to that one transaction only (`SET
+LOCAL` unwinds at commit/rollback/timeout, never leaking onto whatever
+the pooled connection serves next). If a batch leader's connection ever
+does stall indefinitely for *any* reason - this bug, a stuck decider, a
+hung downstream await, something not yet found - Postgres itself kills
+the idle session and releases the row lock, so a later batch can proceed
+instead of every writer to that bounded context queueing forever behind
+a wedge nothing else ever clears. `CommandBatcher::with_idle_in_transaction_timeout`
+(default 30 seconds - generous for any real batch, short enough that an
+operator would never need to notice and restart) and
+`SkiljBuilder::command_batch_idle_in_transaction_timeout` wire it through
+the same "sensible default, escape hatch alongside it" register as
+`read_cursor_checkout_lease`/`pool_options`. Proven end to end, not just
+read from the code: `a_batch_leader_stuck_past_the_idle_in_transaction_timeout_is_killed_and_releases_the_lock`
+(`skilj-core/tests/command_batcher.rs`) fakes a leader that never comes
+back via `begin_command_batch_leader_tx` directly, sleeps well past the
+configured timeout, then proves a *separate* real submission to the same
+bounded context still completes - verified to actually fail (timing out
+at 5s) with the timeout disabled, before being restored, so the test is
+known to exercise the real mechanism and not pass vacuously.
+
+**Codeberg issue #35, closed alongside this rather than separately**:
+investigated whether multiple `skilj` instances routing commands with
+overlapping DCB tags to different instances is a correctness risk.
+Conclusion: no bug. The `sequence` row's `FOR UPDATE` lock is a standard
+Postgres row lock - it serializes every transaction wanting it
+regardless of which process or instance opened it, and `submit_one_command_in_tx`'s
+"optimistic dispatch, recheck under lock, redispatch on conflict" shape
+was already built for exactly this (a caller's own stale optimistic read
+is a stale read whether the thing that beat it there was on the same
+instance or a different one - not new, not specific to §58's batching).
+What multiple instances *do* lose is §58's own batching benefit: its
+queue is in-process (`Arc<RwLock<HashMap<...>>>` inside one `Skilj`), so
+a load balancer spreading a hot bounded context's traffic across N
+instances means each instance's own batcher only ever sees ~1/N of the
+concurrent volume - smaller batches, more separate lock acquisitions in
+aggregate, and adding instances to handle more load can make contention
+on that one row *worse*, not better. Recommended future direction (not
+built here - a genuinely new subsystem, deserving its own design pass):
+a raw-command table plus a DB-elected single worker per bounded context,
+generalising `CommandBatcher` itself across instances the same way this
+already works within one - "whichever instance holds a session-scoped
+advisory lock on a dedicated pinned connection is the leader" in place of
+"whichever caller finds the queue empty," auto-released (and so
+auto-failed-over) the instant that connection drops, reusing every
+coordination mechanism `cross_instance.rs` already proves out (Postgres
+as the only coordination substrate, `NOTIFY`/`LISTEN` for at-most-once
+wake-up, no instance discovery ever) rather than inventing peer-to-peer
+RPC. Opt-in per bounded context, defaulting to today's direct
+in-process path.
+
+**Why closing both together mattered**: this session's own
+`begin_command_batch_leader_tx`/`commit_command_batch` split is exactly
+the seam that future cross-instance design needs - "acquire this bounded
+context's exclusive right to process the next batch" is now a single,
+swappable step, separate from "process whatever batch you're handed."
+A cross-instance leader-election implementation can replace the body of
+the first half (a plain `pool.begin()` + row lock) with the
+advisory-lock-based election #35 describes, without touching the second
+half at all. Splitting them apart for issue #36's own reasons happened
+to do most of the structural work issue #35's future implementation
+would have needed anyway.
+
+**Verified**: `cargo build/clippy/test --workspace` and `cargo fmt
+--check` clean, real Postgres throughout (`skilj-core/tests/command_batcher.rs`'s
+existing two concurrency tests, unchanged, still pass; one new test
+added, described above). A workspace-wide `cargo test --workspace` run
+also surfaced pre-existing, unrelated `PoolTimedOut`/schema-race
+flakiness in a few `skilj/tests/*` files under this environment's own
+resource pressure from many embedded-Postgres-backed test binaries
+running at once - reproduced identically against unmodified `main`
+(`0451fd0`) via `git stash`, so confirmed pre-existing, not a regression
+this pass introduced; every test file this pass actually touches passes
+cleanly and repeatably in isolation.
+
