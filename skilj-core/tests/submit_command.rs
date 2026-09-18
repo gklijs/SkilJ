@@ -1529,3 +1529,227 @@ fn submit_command_batches_sequence_allocation_for_a_multi_event_command() {
         assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 2);
     });
 }
+
+/// A `BatchedCommand` sharing every batch-wide collaborator this test's
+/// batch calls need - only the fields that vary per command in these
+/// tests are exposed as parameters, the rest fixed to what `TestCommandDispatcher`'s
+/// `ShipOrder`/`TriggerTwoEvents` fixtures expect.
+fn batched(
+    command_type: &CommandType,
+    payload: &str,
+    initial_decision: CommandDecision,
+    consistency_tags: Vec<Tag>,
+) -> db::BatchedCommand {
+    db::BatchedCommand {
+        command_type: command_type.clone(),
+        payload: payload.to_string(),
+        client_id: "client-1".to_string(),
+        correlation_id: None,
+        causation_id: None,
+        bounded_context_events: Vec::new(),
+        consistency_tags,
+        matching_events: Vec::new(),
+        initial_decision,
+        now: test_now(),
+        snapshot: None,
+        idempotency_key: None,
+        event_types_by_name: std::collections::HashMap::new(),
+        resolved: std::collections::HashMap::new(),
+    }
+}
+
+#[test]
+fn submit_command_batch_detects_a_dcb_conflict_between_two_commands_in_the_same_batch() {
+    // Codeberg issue #32, round two: `db::submit_command_batch` lets two
+    // *different* commands share one lock acquisition. The DB-committed-
+    // delta half of the DCB conflict check (`locked_highest >
+    // original_highest`) alone cannot catch a conflict *within* the same
+    // batch - both commands here start from `bounded_context_events:
+    // vec![]` (`original_highest = -1`), exactly what two real
+    // concurrent callers each independently deciding "nothing exists yet
+    // for this order" would have computed before ever joining a batch -
+    // and a freshly provisioned bounded context's own `sequence.next_value`
+    // starts at `-1` too, so `locked_highest (-1) > original_highest
+    // (-1)` is false for *both* commands: the pre-existing delta-fetch
+    // branch never even runs. Only `extra_committed_events` - the second
+    // command in the batch seeing the first one's own freshly-inserted-
+    // but-not-yet-committed `OrderShipped` event - can catch this. If
+    // that wiring were missing or broken, both commands would be
+    // accepted, silently double-shipping the same order.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+
+        let payload = r#"{"order_id":"A"}"#;
+        let tags = vec![Tag {
+            key: "order".to_string(),
+            value: Some("A".to_string()),
+        }];
+        // Each command's own initial decision, computed exactly the way
+        // a real concurrent caller would - optimistically, against no
+        // matching_events, before either has any idea the other exists.
+        let decision_1 = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+        let decision_2 = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(dispatcher.call_count(), 2);
+
+        let batch = vec![
+            batched(&ct, payload, decision_1, tags.clone()),
+            batched(&ct, payload, decision_2, tags),
+        ];
+
+        let mut results = db::submit_command_batch(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            &bc.name,
+            batch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 2);
+
+        let second = results.pop().unwrap().unwrap();
+        let first = results.pop().unwrap().unwrap();
+
+        match first {
+            SubmitCommandOutcome::Accepted { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].sequence, 0);
+            }
+            other => panic!("expected the first command to ship the order, got {other:?}"),
+        }
+        match second {
+            SubmitCommandOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, "already shipped");
+            }
+            other => panic!(
+                "expected the second command to be rejected as a same-batch DCB conflict, got \
+                 {other:?}"
+            ),
+        }
+
+        // The redispatch this test exists to prove happened - not just
+        // that the final outcome happens to look right. Two initial
+        // calls (above) plus exactly one redispatch, for the second
+        // command only (the first never conflicts with anything).
+        assert_eq!(dispatcher.call_count(), 3);
+
+        // Only one event ever landed - the rejected command produced
+        // nothing.
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    });
+}
+
+#[test]
+fn submit_command_batch_isolates_a_failing_commands_savepoint_from_its_batch_mates() {
+    // A real per-command failure (the poison-pill projection, same
+    // mechanism `submit_command_rolls_back_the_command_and_every_event_together_when_a_later_event_fails_to_insert`
+    // above uses) must roll back only *that* command's own work - via
+    // its own `SAVEPOINT` - not the whole batch's, and must not corrupt
+    // sequence allocation for the commands after it either.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        seed_poison_event_type(&pool, &bc).await;
+        let ship_order = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let trigger_two = seed_command_type(&pool, &bc, "TriggerTwoEvents").await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: "Poisonable".to_string(),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: Vec::new(),
+            sync: true,
+            caught_up_to: None,
+        };
+        db::upsert_projection(&pool, &projection).await.unwrap();
+        let dispatcher = TestCommandDispatcher::new();
+
+        let ship_payload = r#"{"order_id":"A"}"#;
+        let ship_decision = dispatcher
+            .dispatch(&bc.name, &ship_order.name, ship_payload, &[])
+            .unwrap()
+            .unwrap();
+        let poison_decision = dispatcher
+            .dispatch(&bc.name, &trigger_two.name, "{}", &[])
+            .unwrap()
+            .unwrap();
+
+        let batch = vec![
+            batched(
+                &ship_order,
+                ship_payload,
+                ship_decision,
+                vec![Tag {
+                    key: "order".to_string(),
+                    value: Some("A".to_string()),
+                }],
+            ),
+            batched(&trigger_two, "{}", poison_decision, Vec::new()),
+        ];
+
+        let mut results = db::submit_command_batch(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            &bc.name,
+            batch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 2);
+
+        let second = results.pop().unwrap();
+        let first = results.pop().unwrap();
+
+        match first.unwrap() {
+            SubmitCommandOutcome::Accepted { events, .. } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].sequence, 0);
+            }
+            other => panic!("expected the first command to succeed, got {other:?}"),
+        }
+        assert!(
+            second.is_err(),
+            "the poison pill's Some(Err(..)) must fail only its own command"
+        );
+
+        // Only the first command's own event survived - the second
+        // command's own savepoint rolled back both its events (the
+        // poison pill fails on the *second* one, but the whole command's
+        // savepoint rolls back together, same as the standalone
+        // `submit_command` rollback test).
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type.name, "OrderShipped");
+
+        // The second command's own provisional sequence allocation
+        // (`next_sequence_batch`, for its two events) rolled back with
+        // its savepoint too - the next real allocation continues right
+        // after the first command's own single event, no gap, no
+        // overlap, and no sequence burned on a command that never
+        // landed.
+        assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 1);
+    });
+}

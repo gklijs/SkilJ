@@ -49,6 +49,23 @@ pub enum Error {
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    /// Only ever produced by `command_batcher::CommandBatcher` - a
+    /// follower's own outcome when the batch leader that took its
+    /// request couldn't produce one at all: the leader's own lock
+    /// acquisition or final commit failed (in which case every command
+    /// in that batch shares this, not just the leader's own error,
+    /// since nothing in the batch is trustworthy once the shared
+    /// transaction itself is in doubt - see `db::submit_command_batch`'s
+    /// own doc comment), or the leader's task ended without ever sending
+    /// a reply at all (a bug, not a real database error, but a follower
+    /// still needs *some* `Result` to return). Carries the underlying
+    /// failure's own rendered message - `crate::error::Error` isn't
+    /// `Clone` (it wraps `sqlx::Error`, which isn't either), so this is
+    /// the one case where the original typed error can't be handed to
+    /// every affected caller directly.
+    #[error("command batch failed: {0}")]
+    BatchFailed(String),
+
     /// Distinct from `Database` above - a migration failure means the
     /// schema itself couldn't be brought up to date (a startup-time
     /// concern, raised by `Skilj::builder().build()` - see docs/
@@ -81,6 +98,7 @@ impl SkiljRejection for Error {
             Error::NoDeciderRegistered => "no_decider_registered",
             Error::Database(_) => "database_error",
             Error::Migration(_) => "migration_error",
+            Error::BatchFailed(_) => "database_error",
         }
     }
 
@@ -95,6 +113,7 @@ impl SkiljRejection for Error {
             Error::NoDeciderRegistered => self.to_string(),
             Error::Database(e) => e.to_string(),
             Error::Migration(e) => e.to_string(),
+            Error::BatchFailed(msg) => msg.clone(),
         }
     }
 }

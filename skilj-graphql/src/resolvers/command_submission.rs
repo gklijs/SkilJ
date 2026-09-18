@@ -155,25 +155,33 @@ pub fn submit_command_field() -> Field {
                 // each duplicating the dance. `required_role` above is
                 // still this resolver's own concern - checked before
                 // this call, not folded into it, since REST triggering
-                // never needs it (§1.3.1).
-                let outcome = skilj_core::db::decide_and_submit_command(
-                    &state.pool,
-                    state.dispatcher.as_ref(),
-                    state.projection_dispatcher.as_ref(),
-                    state.snapshot_dispatcher.as_ref(),
-                    &state.event_broadcaster,
-                    &state.event_cache,
-                    &authorised.command_type,
-                    &authorised.payload,
-                    &authorised.client_id,
-                    authorised.correlation_id.as_deref(),
-                    authorised.causation_id.as_deref(),
-                    state.encryption_master_key.as_ref(),
-                    Utc::now(),
-                    idempotency_key.as_deref(),
-                )
-                .await
-                .map_err(to_graphql_error)?;
+                // never needs it (§1.3.1). Routed through
+                // `state.command_batcher` rather than calling that
+                // function directly (Codeberg issue #32, round two) -
+                // this resolver's own real-world concurrent traffic is
+                // exactly what `CommandBatcher` exists to coalesce into
+                // fewer bounded-context lock acquisitions; see its own
+                // module doc comment.
+                let outcome = state
+                    .command_batcher
+                    .decide_and_submit(
+                        &state.pool,
+                        state.dispatcher.as_ref(),
+                        state.projection_dispatcher.as_ref(),
+                        state.snapshot_dispatcher.as_ref(),
+                        &state.event_broadcaster,
+                        &state.event_cache,
+                        &authorised.command_type,
+                        &authorised.payload,
+                        &authorised.client_id,
+                        authorised.correlation_id.as_deref(),
+                        authorised.causation_id.as_deref(),
+                        state.encryption_master_key.as_ref(),
+                        Utc::now(),
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+                    .map_err(to_graphql_error)?;
 
                 Ok(Some(FieldValue::owned_any(match outcome {
                     // §5.4/§7.3: a legitimate business outcome, not a

@@ -179,6 +179,15 @@ fn status_for(err: &CoreError) -> StatusCode {
         // - no request ever reaches a route handler while it's unresolved,
         // so this arm is unreachable in practice, not merely unlikely.
         CoreError::Migration(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // `command_batcher::CommandBatcher`'s own follower-facing error -
+        // a batch this request's own command happened to share failed at
+        // the shared-transaction level (lock acquisition or the final
+        // commit), or its own batch leader's task ended without replying
+        // at all. Neither is this caller's fault, and neither maps to
+        // any more specific real database error it could itself recover
+        // from - the identical `INTERNAL_SERVER_ERROR` `CoreError::Database`
+        // already gets.
+        CoreError::BatchFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

@@ -199,6 +199,16 @@ pub struct Skilj {
     /// `createBoundedContextFromTemplate`'s own resolver (ultra-review
     /// bug_001).
     template_cache: skilj_core::template_cache::TemplateCache,
+    /// Codeberg issue #32 (round two) - see `skilj_core::command_batcher`'s
+    /// own module doc comment for the group-commit design this exists to
+    /// run. One shared, process-wide batcher, constructed once in
+    /// `.build()`, the same "one instance, not two" treatment
+    /// `event_broadcaster`/`event_cache` already get, for the identical
+    /// reason: every concurrently-submitted command needs to reach the
+    /// one batcher every other concurrent submission does, regardless of
+    /// which surface (REST trigger, GraphQL `submitCommand`, parked-
+    /// delivery redrive) produced it.
+    command_batcher: skilj_core::command_batcher::CommandBatcher,
 }
 
 /// `CommandDispatcher`'s own implementer - a thin wrapper around the
@@ -663,6 +673,7 @@ impl Skilj {
             // conversions already use.
             chrono::Duration::from_std(self.read_cursor_checkout_lease)
                 .unwrap_or(chrono::Duration::zero()),
+            self.command_batcher.clone(),
         )
     }
 
@@ -717,6 +728,7 @@ impl Skilj {
             revocation_broadcaster: self.revocation_broadcaster.clone(),
             event_cache: self.event_cache.clone(),
             template_cache: self.template_cache.clone(),
+            command_batcher: self.command_batcher.clone(),
         }
     }
 }
@@ -1658,6 +1670,7 @@ impl SkiljBuilder {
         // schema, so nothing here is shared mutable state across
         // iterations - safe to run out of order.
         let event_cache = EventCache::new(self.event_cache_warm_up_count);
+        let command_batcher = skilj_core::command_batcher::CommandBatcher::new();
         stream::iter(bounded_contexts_for_warm_up)
             .map(|bc| {
                 let pool = &pool;
@@ -1843,6 +1856,7 @@ impl SkiljBuilder {
                 revocation_broadcaster: revocation_broadcaster.clone(),
                 event_cache: event_cache.clone(),
                 template_cache: template_cache.clone(),
+                command_batcher: command_batcher.clone(),
             })
             .await?,
         );
@@ -1863,6 +1877,7 @@ impl SkiljBuilder {
             event_cache,
             schema_registry,
             template_cache,
+            command_batcher,
         };
 
         // The single shared background task backing §8 item 6's async

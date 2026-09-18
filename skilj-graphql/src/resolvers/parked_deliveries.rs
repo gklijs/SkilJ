@@ -98,23 +98,30 @@ async fn redrive_parked_delivery(
             .expect("CrossContextRoute-kind ParkedDelivery's own target CommandType still exists");
             let payload = serde_json::to_string(&delivery.request_json)
                 .expect("serde_json::Value serialization is infallible");
-            db::decide_and_submit_command(
-                &state.pool,
-                state.dispatcher.as_ref(),
-                state.projection_dispatcher.as_ref(),
-                state.snapshot_dispatcher.as_ref(),
-                &state.event_broadcaster,
-                &state.event_cache,
-                &target_command_type,
-                &payload,
-                "parked-delivery-retry",
-                None,
-                None,
-                state.encryption_master_key.as_ref(),
-                Utc::now(),
-                None,
-            )
-            .await?;
+            // Codeberg issue #32 (round two): routed through
+            // `state.command_batcher` rather than calling
+            // `db::decide_and_submit_command` directly - a redrive is
+            // just as much real, externally-triggerable submission
+            // volume as the original delivery was.
+            state
+                .command_batcher
+                .decide_and_submit(
+                    &state.pool,
+                    state.dispatcher.as_ref(),
+                    state.projection_dispatcher.as_ref(),
+                    state.snapshot_dispatcher.as_ref(),
+                    &state.event_broadcaster,
+                    &state.event_cache,
+                    &target_command_type,
+                    &payload,
+                    "parked-delivery-retry",
+                    None,
+                    None,
+                    state.encryption_master_key.as_ref(),
+                    Utc::now(),
+                    None,
+                )
+                .await?;
         }
         ParkedDeliveryKind::ExternalEvent => {
             let access_token_id = delivery
@@ -179,23 +186,27 @@ async fn redrive_parked_delivery(
                 redrive.correlation_id,
                 redrive.causation_id,
             )?;
-            db::decide_and_submit_command(
-                &state.pool,
-                state.dispatcher.as_ref(),
-                state.projection_dispatcher.as_ref(),
-                state.snapshot_dispatcher.as_ref(),
-                &state.event_broadcaster,
-                &state.event_cache,
-                &authorised.command_type,
-                &authorised.payload,
-                &authorised.client_id,
-                authorised.correlation_id.as_deref(),
-                authorised.causation_id.as_deref(),
-                state.encryption_master_key.as_ref(),
-                Utc::now(),
-                None,
-            )
-            .await?;
+            // Codeberg issue #32 (round two) - see the identical comment
+            // on the `CrossContextRoute` branch above.
+            state
+                .command_batcher
+                .decide_and_submit(
+                    &state.pool,
+                    state.dispatcher.as_ref(),
+                    state.projection_dispatcher.as_ref(),
+                    state.snapshot_dispatcher.as_ref(),
+                    &state.event_broadcaster,
+                    &state.event_cache,
+                    &authorised.command_type,
+                    &authorised.payload,
+                    &authorised.client_id,
+                    authorised.correlation_id.as_deref(),
+                    authorised.causation_id.as_deref(),
+                    state.encryption_master_key.as_ref(),
+                    Utc::now(),
+                    None,
+                )
+                .await?;
         }
     }
     Ok(())

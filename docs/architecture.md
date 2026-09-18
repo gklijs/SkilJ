@@ -8675,3 +8675,153 @@ test (same decider, `Poisonable` registered) already exercised the batch
 call's own rollback path unchanged - both provisionally allocated
 sequences roll back together on the poison event's failure, same as
 before this pass.
+
+## 58. Group-commit batching for `submit_command` (Codeberg issue #32, round two)
+
+§57's round-trip reductions helped, but a follow-up load test against
+`skilj-helpdesk` still found the same ceiling, because shortening one
+command's own critical section does nothing about the fundamental shape
+of the problem: every command commit to one bounded context is *fully
+serialized* through that one `sequence` row's lock (required for
+`SequenceIsGaplessPerBoundedContext`/`DynamicConsistencyBoundaryHonoured`,
+still not something this pass touches), so under real concurrent load
+the throughput ceiling is `1 / (lock hold time)`, full stop, no matter
+how short each individual hold is. §57's own write-up already flagged
+this as a real, separately-scoped follow-up rather than something it
+rejected - this is that follow-up.
+
+**The lever: make one lock acquisition serve more than one command.**
+`skilj-core/src/command_batcher.rs`'s `CommandBatcher` implements a
+"group commit" - standard database terminology for the same pattern
+write-ahead-log flushes and MySQL's binlog use. Instead of every
+concurrent caller independently opening its own transaction and queueing
+for the lock, callers that arrive close together in time are coalesced
+into one shared batch, processed by whichever one of them becomes that
+batch's *leader* inside a single transaction (`db::submit_command_batch`),
+committed once. N queued callers that used to mean N separate lock
+acquisitions now mean one.
+
+**Self-tuning, no batch-window or batch-size knob to guess.** A caller
+becomes the leader for a new batch only when it finds its bounded
+context's own queue empty at the moment it pushes onto it - a check made
+under the same `Mutex` acquisition as the push itself, so leadership for
+a given batch is assigned unambiguously, exactly once. The leader does
+*not* immediately grab whatever's in the queue: it first does the slow
+part (`pool.begin()` plus the actual `SELECT ... FOR UPDATE` wait, which
+is exactly the time other commands are still arriving and queueing
+behind it under real contention) and only *then* drains the queue,
+taking everyone who joined in the meantime (capped at `MAX_BATCH_SIZE =
+256`, so a pathological pile-up still bounds one batch's own lock hold
+time and memory rather than growing unboundedly - nothing is lost, the
+remainder just becomes a later batch). Under low load, a lone caller
+becomes its own leader, finds nobody else queued once its lock is
+acquired, and pays essentially the identical latency a standalone
+`submit_command` call always had - a batch of one. Under heavy load -
+exactly the case the load test found collapsing - the leader's own wait
+for the lock is naturally longer, so more callers accumulate in that
+same window, producing a *larger* batch precisely when amortising the
+lock acquisition matters most.
+
+**Making `submit_command`'s own machinery reentrant per command, not
+just once, was the real implementation work.** Its post-lock half is now
+`submit_one_command_in_tx`, callable against a transaction (or, in the
+batched path, a `SAVEPOINT`-backed nested transaction - `tx.begin()` on
+an already-open `sqlx::Transaction`) that some earlier command in the
+same batch already used, rather than always a fresh one. `db::submit_command_batch`
+opens one transaction, takes the bounded-context lock exactly once
+(`lock_bounded_context_sequence`), fetches `sync_projections` once for
+the whole batch (identical reasoning to §57 item 2), then runs every
+command in order, each inside its own `SAVEPOINT`: a real per-command
+failure (an unregistered event type, a database error - never an
+ordinary `Rejected` decision, which isn't an `Err` at all) rolls back
+only that command's own work (`ROLLBACK TO SAVEPOINT`, awaited
+explicitly rather than left to `Drop`, since every command in the loop
+shares one underlying connection and the rollback must be known-complete
+before the next `tx.begin()` reuses it) - not its batch-mates', and not
+the shared lock. `submit_command` itself is now just this same function
+called for a batch of exactly one.
+
+**Same-batch DCB conflicts need a second detection path, not just
+`locked_highest`.** The pre-existing conflict check compares
+`locked_highest` (the bounded context's own latest sequence, read under
+the lock) against `original_highest` (the caller's optimistic read) -
+but two commands *in the same batch* can each have computed an identical
+`original_highest` before either knew the other existed, and neither
+one's own insert is visible to a plain `pool` query yet (it's sitting
+uncommitted on `tx`'s own connection). `submit_one_command_in_tx` takes
+a new `extra_committed_events` parameter for exactly this: every accepted
+command's own events, accumulated in memory by `submit_command_batch` as
+it works through the batch and handed to each subsequent command,
+tag-filtered the same way the `pool`-sourced delta already is. Proven by
+`submit_command_batch_detects_a_dcb_conflict_between_two_commands_in_the_same_batch`
+(`skilj-core/tests/submit_command.rs`) - without this, two same-batch
+commands shipping the same order would both be accepted, silently
+double-shipping it.
+
+**The pre-lock warm-up (§57 item 3) moves earlier still.** Rather than
+whichever caller becomes leader running it once, serially, for the whole
+batch, `warm_up_event_types_and_encryption_keys` is pulled out of
+`submit_command` into its own function and run by *every* caller,
+fully in parallel, before any of them join the shared queue at all
+(`CommandBatcher::submit`). Still governed by the identical
+`Entry::Vacant`/`resolved.contains_key` guards that make it tolerant of
+being partial, stale, or simply unused (a redispatch inside
+`submit_one_command_in_tx` can still add specs the warm-up never saw) -
+this is purely about moving already-safe-to-parallelize work earlier,
+not a new correctness mechanism.
+
+**Wiring**: `Skilj` now owns one process-wide `CommandBatcher` (`skilj/src/lib.rs`),
+constructed once in `.build()` and cloned into `RestState`/`GraphqlState`
+alongside `event_broadcaster`/`event_cache` - the identical "one shared
+instance, not a redundant second one" treatment those already get, for
+the same reason: every concurrently-submitting caller across both wire
+surfaces needs to reach the *same* batcher. `skilj-rest`'s
+`post_commands_trigger` and `skilj-graphql`'s `submitCommand` resolver
+and parked-delivery redrive - real, externally-triggered, potentially
+bursty submission volume, exactly what this exists to coalesce - now
+call `CommandBatcher::decide_and_submit` instead of
+`db::decide_and_submit_command` directly. The lower-volume, periodic
+internal callers (the cross-context event router's own tick,
+`fire_due_deadlines`) deliberately still call `db::decide_and_submit_command`
+directly: batching buys the least where a caller is already ticking on
+its own schedule rather than arriving as a burst of concurrent external
+requests, and routing them through the batcher would only add a
+queueing indirection with no real coalescing to show for it.
+
+**A new error variant for followers**: `Error::BatchFailed(String)` -
+what a non-leader caller gets back if the leader's own lock acquisition
+or final commit failed (every command in that batch shares this, since
+nothing in it is trustworthy once the shared transaction is in doubt) or
+if the leader's task ended without ever sending a reply at all (a bug,
+not a real database error, but a follower still needs *some* `Result`).
+Carries the underlying failure's own rendered message rather than the
+original typed error, since `crate::error::Error` isn't `Clone` (it
+wraps `sqlx::Error`, which isn't either) - the leader's own return value
+keeps the original. `skilj-rest`'s `status_for` maps it to the identical
+`INTERNAL_SERVER_ERROR` `Error::Database` already gets; it isn't this
+caller's fault and doesn't map to anything more specific it could itself
+recover from.
+
+**Verified**: `cargo build/clippy/test --workspace` and `cargo fmt
+--check` clean, real Postgres throughout. Two new tests in
+`skilj-core/tests/command_batcher.rs` exercise `CommandBatcher` itself,
+end to end, under real concurrency:
+`concurrent_submits_for_the_same_order_accept_exactly_one_and_reject_the_rest`
+and `concurrent_submits_for_different_orders_all_accept_with_gapless_distinct_sequences`.
+Two new tests in `skilj-core/tests/submit_command.rs` exercise
+`db::submit_command_batch` directly - the same-batch DCB-conflict
+detection above, and
+`submit_command_batch_isolates_a_failing_commands_savepoint_from_its_batch_mates`
+(the poison-pill mechanism §22's own rollback test uses, proving a
+second command's real failure rolls back only its own savepoint and its
+own provisional sequence allocation, leaving the first command's event
+and `next_sequence`'s own continuation both intact).
+
+**What this does not change**: the bounded-context lock itself, its
+scope, or the invariants it protects, exactly as §57 already noted -
+every command in a batch still commits inside the one transaction that
+holds that lock, `DynamicConsistencyBoundaryHonoured` is enforced
+identically whether a command is alone in its own batch or one of 256,
+and idempotency-key deduplication (§37) is checked per command, inside
+its own savepoint, unchanged.
+

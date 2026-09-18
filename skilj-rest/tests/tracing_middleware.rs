@@ -21,6 +21,7 @@ use opentelemetry::trace::TracerProvider;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::testing::trace::new_test_exporter;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use skilj_core::command_batcher::CommandBatcher;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{Event, EventBroadcaster};
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher, SnapshotDispatcher};
@@ -166,6 +167,7 @@ async fn a_request_with_a_traceparent_header_continues_that_trace() {
         EventBroadcaster::new(4),
         EventCache::new(4),
         chrono::Duration::minutes(5),
+        CommandBatcher::new(),
     );
 
     let injected_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";

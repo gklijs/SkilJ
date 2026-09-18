@@ -110,6 +110,16 @@ pub struct GraphqlState {
     /// design and why this lives in `skilj-core`, not here or in the
     /// `skilj` facade crate that first held it.
     pub template_cache: skilj_core::template_cache::TemplateCache,
+    /// `submitCommand`'s and parked-delivery redrive's own real,
+    /// externally-triggered submission volume - exactly what
+    /// `CommandBatcher` exists to coalesce into fewer bounded-context
+    /// lock acquisitions (Codeberg issue #32, round two) - the identical
+    /// `CommandBatcher` `Skilj::rest_router()` hands `skilj-rest`'s own
+    /// `CommandTrigger` route, reused here for the same reason
+    /// `dispatcher`/`event_broadcaster` above are: one shared, process-
+    /// wide batcher, not a second one that would only ever coalesce
+    /// this surface's own traffic against itself.
+    pub command_batcher: skilj_core::command_batcher::CommandBatcher,
 }
 
 /// Mounts a fresh `axum::Router` at `/graphql` against an already-built

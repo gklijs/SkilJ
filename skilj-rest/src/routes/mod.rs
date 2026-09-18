@@ -60,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use skilj_core::access_control::{
     CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
 };
+use skilj_core::command_batcher::CommandBatcher;
 use skilj_core::db::{self, AccessTokenKind, Pool};
 use skilj_core::encryption::EncryptionMasterKey;
 use skilj_core::event_cache::EventCache;
@@ -93,6 +94,11 @@ struct AppState {
     /// `skilj::SkiljBuilder::read_cursor_checkout_lease`'s own doc
     /// comment (Codeberg issue #25, docs/architecture.md §53).
     read_cursor_checkout_lease: chrono::Duration,
+    /// Codeberg issue #32 (round two) - `post_commands_trigger`'s own
+    /// real, externally-triggered submission volume is exactly what
+    /// `CommandBatcher` exists to coalesce; see its own module doc
+    /// comment.
+    command_batcher: CommandBatcher,
 }
 
 /// One request-level span per REST call, its parent set from an incoming
@@ -190,6 +196,7 @@ pub fn router(
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
     read_cursor_checkout_lease: chrono::Duration,
+    command_batcher: CommandBatcher,
 ) -> Router {
     Router::new()
         .route("/v1/events/external", post(post_events_external))
@@ -209,6 +216,7 @@ pub fn router(
             event_broadcaster,
             event_cache,
             read_cursor_checkout_lease,
+            command_batcher,
         })
 }
 
@@ -896,23 +904,30 @@ async fn post_commands_trigger(
     // `skilj-graphql`'s identical `submitCommand` resolver (and the
     // cross-context event router) via `skilj_core::db::
     // decide_and_submit_command` rather than each duplicating the dance.
-    let outcome = db::decide_and_submit_command(
-        &state.pool,
-        state.dispatcher.as_ref(),
-        state.projection_dispatcher.as_ref(),
-        state.snapshot_dispatcher.as_ref(),
-        &state.event_broadcaster,
-        &state.event_cache,
-        &authorised.command_type,
-        &authorised.payload,
-        &authorised.client_id,
-        authorised.correlation_id.as_deref(),
-        authorised.causation_id.as_deref(),
-        state.encryption_master_key.as_ref(),
-        Utc::now(),
-        idempotency_key,
-    )
-    .await?;
+    // Routed through `state.command_batcher` rather than calling that
+    // function directly (Codeberg issue #32, round two) - this route's
+    // own real-world concurrent traffic is exactly what
+    // `CommandBatcher` exists to coalesce into fewer bounded-context
+    // lock acquisitions; see its own module doc comment.
+    let outcome = state
+        .command_batcher
+        .decide_and_submit(
+            &state.pool,
+            state.dispatcher.as_ref(),
+            state.projection_dispatcher.as_ref(),
+            state.snapshot_dispatcher.as_ref(),
+            &state.event_broadcaster,
+            &state.event_cache,
+            &authorised.command_type,
+            &authorised.payload,
+            &authorised.client_id,
+            authorised.correlation_id.as_deref(),
+            authorised.causation_id.as_deref(),
+            state.encryption_master_key.as_ref(),
+            Utc::now(),
+            idempotency_key,
+        )
+        .await?;
 
     Ok(Json(match outcome {
         // §5.4/§7.3: a legitimate business outcome, not an HTTP error -

@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::Request;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+use skilj_core::command_batcher::CommandBatcher;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{Event, EventBroadcaster};
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher, SnapshotDispatcher};
@@ -148,6 +149,7 @@ async fn a_request_records_the_http_server_request_duration_histogram() {
         EventBroadcaster::new(4),
         EventCache::new(4),
         chrono::Duration::minutes(5),
+        CommandBatcher::new(),
     );
 
     let request = Request::builder()

@@ -48,7 +48,7 @@ use chrono::{DateTime, Utc};
 use opentelemetry::metrics::{Counter, Meter};
 use opentelemetry::KeyValue;
 use sqlx::types::Json;
-use sqlx::{Postgres, Transaction};
+use sqlx::{Acquire, Postgres, Transaction};
 use std::sync::LazyLock;
 
 /// This crate's own OTel instrumentation scope. `opentelemetry::global::meter(...)`
@@ -6070,36 +6070,106 @@ pub async fn submit_command(
     idempotency_key: Option<&str>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
-    let schema = schema_ident(&bounded_context_name);
-    let original_highest = bounded_context_events
-        .iter()
-        .map(|e| e.sequence)
-        .max()
-        .unwrap_or_else(|| snapshot.as_ref().map(|s| s.as_of_sequence).unwrap_or(-1));
 
     // Codeberg issue #32: a pre-lock warm-up for the common, no-DCB-conflict
     // path - mirrors `create_and_insert_external_event`/
     // `create_and_insert_direct_event`'s own "resolve encryption keys
     // before opening the transaction" shape, extended here to event-type
-    // lookups too. `initial_decision`'s own event_specs are exactly what a
-    // redispatch-free commit will need; the post-lock code further down
-    // still runs unconditionally and is what actually governs correctness
-    // (its `Entry::Vacant`/`resolved.contains_key` guards already tolerate
-    // this warm-up being partial, stale - a redispatch below can still add
-    // to both maps - or skipped entirely, e.g. a Rejected initial_decision
-    // never enters this block). This exists purely to shorten the
-    // bounded-context lock's own hold span for the case that matters most:
-    // the large majority of commands that never hit a DCB conflict at all.
+    // lookups too. See `warm_up_event_types_and_encryption_keys`'s own
+    // doc comment for why this is always safe, never just an
+    // optimisation this function's own correctness depends on.
+    let (event_types_by_name, resolved) = warm_up_event_types_and_encryption_keys(
+        pool,
+        &bounded_context_name,
+        command_type,
+        payload,
+        &initial_decision,
+        encryption_master_key,
+    )
+    .await?;
+
+    let mut tx = pool.begin().await?;
+    let locked_highest = lock_bounded_context_sequence(&mut tx, &bounded_context_name).await?;
+    // Fetched once for the whole submission, not once per event (Codeberg
+    // issue #32) - and only now, after the lock above is already held,
+    // which is what keeps this read race-free against
+    // `promote_projection_rebuild` (see
+    // `insert_event_and_update_sync_projections_in_tx`'s own doc comment).
+    let sync_projections =
+        sync_projections_for_bounded_context(pool, &bounded_context_name).await?;
+
+    let outcome = submit_one_command_in_tx(
+        &mut tx,
+        pool,
+        dispatcher,
+        projection_dispatcher,
+        command_type,
+        payload,
+        client_id,
+        correlation_id,
+        causation_id,
+        bounded_context_events,
+        consistency_tags,
+        matching_events,
+        initial_decision,
+        encryption_master_key,
+        now,
+        snapshot,
+        idempotency_key,
+        locked_highest,
+        &sync_projections,
+        &[],
+        event_types_by_name,
+        resolved,
+    )
+    .await?;
+
+    tx.commit().await?;
+    broadcast_appended_events(pool, broadcaster, event_cache, &outcome).await;
+
+    Ok(outcome)
+}
+
+/// The pre-lock warm-up `submit_command`/`command_batcher::CommandBatcher::submit`
+/// both run before ever opening a transaction: every `EventType` an
+/// accepted `initial_decision`'s own event_specs names, and every
+/// `EncryptionKey` those events' (and the command's own) sensitive
+/// fields need. A no-op (both maps come back empty) for a `Rejected`
+/// `initial_decision` - nothing to warm up for a command that was never
+/// going to write anything.
+///
+/// **Always safe, never a correctness dependency**: `submit_one_command_in_tx`'s
+/// own post-lock code re-runs the identical resolution unconditionally
+/// against whatever `event_specs` actually governs by the time it runs
+/// (the redispatched ones, if a DCB conflict forced a retry) - its
+/// `Entry::Vacant`/`resolved.contains_key` guards make every call here a
+/// no-op the second time, and tolerate this warm-up being partial, stale,
+/// or skipped entirely just as well as they tolerate it being complete.
+/// This function exists purely to shorten the bounded-context lock's own
+/// hold span (`submit_command`) or to move that work fully in parallel,
+/// before a request ever joins a shared batch queue at all
+/// (`CommandBatcher::submit`) - not to change what's correct.
+pub async fn warm_up_event_types_and_encryption_keys(
+    pool: &Pool,
+    bounded_context_name: &str,
+    command_type: &CommandType,
+    payload: &str,
+    initial_decision: &crate::shared::CommandDecision,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<(
+    std::collections::HashMap<String, EventType>,
+    std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+)> {
     let mut event_types_by_name: std::collections::HashMap<String, EventType> =
         std::collections::HashMap::new();
     let mut resolved = std::collections::HashMap::new();
-    if let crate::shared::CommandDecision::Accepted { events } = &initial_decision {
+    if let crate::shared::CommandDecision::Accepted { events } = initial_decision {
         for spec in events {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 event_types_by_name.entry(spec.event_type.clone())
             {
                 if let Some(et) =
-                    get_event_type(pool, &bounded_context_name, &spec.event_type).await?
+                    get_event_type(pool, bounded_context_name, &spec.event_type).await?
                 {
                     entry.insert(et);
                 }
@@ -6107,7 +6177,7 @@ pub async fn submit_command(
         }
         resolve_encryption_keys(
             pool,
-            &bounded_context_name,
+            bounded_context_name,
             &command_type.sensitive_fields,
             payload,
             encryption_master_key,
@@ -6119,7 +6189,7 @@ pub async fn submit_command(
                 let spec_payload = spec.payload.to_string();
                 resolve_encryption_keys(
                     pool,
-                    &bounded_context_name,
+                    bounded_context_name,
                     &event_type.sensitive_fields,
                     &spec_payload,
                     encryption_master_key,
@@ -6129,23 +6199,120 @@ pub async fn submit_command(
             }
         }
     }
+    Ok((event_types_by_name, resolved))
+}
 
-    let mut tx = pool.begin().await?;
+/// The `SELECT ... FOR UPDATE` peek `submit_command`'s own doc comment
+/// describes, pulled out so `submit_command_batch`'s leader can take it
+/// exactly once per batch too, instead of once per command - the actual
+/// mechanism this whole pass (Codeberg issue #32, round two) exists to
+/// amortise across as many concurrently-arriving commands as possible.
+async fn lock_bounded_context_sequence(
+    tx: &mut Transaction<'_, Postgres>,
+    bounded_context: &str,
+) -> crate::error::Result<i64> {
+    let schema = schema_ident(bounded_context);
     let (locked_highest,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT next_value FROM {schema}.sequence FOR UPDATE"
     )))
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
+    Ok(locked_highest)
+}
+
+/// `EventSubscription`'s own real-time delivery - after the commit, not
+/// before, the same rule `insert_event_and_update_sync_projections`
+/// itself already follows. Shared by `submit_command`'s own single-request
+/// path and `command_batcher::CommandBatcher`'s batched one - both commit
+/// once, then need every event that commit produced broadcast exactly
+/// this way; a no-op for `Rejected`/`Deduplicated` outcomes, which
+/// produced nothing to broadcast.
+pub async fn broadcast_appended_events(
+    pool: &Pool,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    outcome: &SubmitCommandOutcome,
+) {
+    let SubmitCommandOutcome::Accepted { events, .. } = outcome else {
+        return;
+    };
+    for event in events {
+        broadcaster.publish(event);
+        record_event_appended(event);
+        notify_event_appended(pool, event, broadcaster.instance_id()).await;
+        event_cache.append(event).await;
+    }
+}
+
+/// The post-lock half of `ProcessCommand` `submit_command` used to run
+/// inline - split out (Codeberg issue #32, round two) so
+/// `command_batcher::CommandBatcher`'s leader can run it once per command
+/// inside a *single* open, already-locked transaction shared by every
+/// command in its batch (via `tx.begin()`'s own `SAVEPOINT`-backed nested
+/// transaction, so one command's failure rolls back only its own work,
+/// not its batch-mates'), instead of each command separately opening its
+/// own transaction and re-acquiring the lock from scratch. `submit_command`
+/// itself now just calls this once, for a "batch" of exactly one command.
+///
+/// `locked_highest` and `sync_projections` are the caller's own, taken
+/// once per *batch* rather than once per command - see
+/// `lock_bounded_context_sequence`'s and
+/// `insert_event_and_update_sync_projections_in_tx`'s own doc comments
+/// for why both are safe to share this way. `extra_committed_events` is
+/// new here: events an *earlier command in this same batch* already
+/// inserted into `tx` (uncommitted, so a plain `pool` query - a different
+/// connection - could never see them) - folded into the same DCB-conflict
+/// redispatch check as `locked_highest`'s own delta-from-`pool` fetch,
+/// tag-filtered the identical way, so a same-batch conflict is caught
+/// exactly as reliably as a cross-instance one. Always `&[]` from
+/// `submit_command`'s own batch-of-one caller.
+///
+/// `event_types_by_name`/`resolved` arrive already warmed up (see
+/// `warm_up_event_types_and_encryption_keys`) and are grown in place for
+/// whatever a redispatch still needs - identical to how `submit_command`
+/// itself used to do this inline.
+#[allow(clippy::too_many_arguments)]
+async fn submit_one_command_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+    bounded_context_events: &[Event],
+    consistency_tags: &[Tag],
+    matching_events: &[Event],
+    initial_decision: crate::shared::CommandDecision,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+    snapshot: Option<SnapshotContext<'_>>,
+    idempotency_key: Option<&str>,
+    locked_highest: i64,
+    sync_projections: &[Projection],
+    extra_committed_events: &[Event],
+    mut event_types_by_name: std::collections::HashMap<String, EventType>,
+    mut resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+) -> crate::error::Result<SubmitCommandOutcome> {
+    let bounded_context_name = command_type.bounded_context.name.clone();
+    let schema = schema_ident(&bounded_context_name);
+    let original_highest = bounded_context_events
+        .iter()
+        .map(|e| e.sequence)
+        .max()
+        .unwrap_or_else(|| snapshot.as_ref().map(|s| s.as_of_sequence).unwrap_or(-1));
 
     // Codeberg issue #12: a cached prior answer, not a new decision -
     // checked as early as possible, right after the lock that makes this
     // plain `SELECT` race-free (see `lookup_idempotency_key`'s own doc
     // comment). `initial_decision`/the redispatch logic below never runs
-    // on a hit - `tx` is simply dropped (implicit rollback), the same as
-    // every other early return in this function; nothing was written.
+    // on a hit - nothing is written, and (in the batched path) this
+    // command's own savepoint has nothing to roll back either.
     if let Some(key) = idempotency_key {
         if let Some(triggered_event_sequences) =
-            lookup_idempotency_key(&mut *tx, &schema, &command_type.name, client_id, key).await?
+            lookup_idempotency_key(&mut **tx, &schema, &command_type.name, client_id, key).await?
         {
             return Ok(SubmitCommandOutcome::Deduplicated {
                 triggered_event_sequences,
@@ -6162,74 +6329,76 @@ pub async fn submit_command(
     // comment).
     let mut final_matching_events = matching_events.to_vec();
 
-    if locked_highest > original_highest {
-        // Something committed between the caller's own optimistic read
-        // and this lock - but only a match on our own consistency_tags
-        // is an actual DCB conflict; an unrelated event elsewhere in the
-        // same bounded context changes nothing dispatch() would see, so
-        // redispatching over it would be pure waste. docs/architecture.md
-        // §19's "Problem 1" fix: `original_highest` is now the highest
-        // sequence among `bounded_context_events` itself (already
-        // tag-scoped by every caller of this function - see their own
-        // comments), so it's exactly the DCB boundary for these tags,
-        // and this delta fetch can go straight to the tag-indexed query
-        // instead of an unfiltered range scan followed by an in-memory
-        // tag check. This branch now runs more often than it used to in
-        // a busy, multi-entity bounded context - `locked_highest`
-        // reflects the whole bounded context's own latest sequence,
-        // while a tag-scoped `original_highest` moves more slowly for a
-        // quiet entity, so the two diverge on every commit elsewhere -
-        // but each run is a small indexed query rather than a full scan,
-        // so this is still a net win.
-        let delta = list_events_for_bounded_context_matching_tags(
+    // Something committed between the caller's own optimistic read and
+    // this lock - either genuinely committed (`locked_highest >
+    // original_highest`, fetched from `pool`) or, new in this pass, an
+    // earlier command in this same batch (`extra_committed_events`,
+    // already sitting in `tx` but invisible to a `pool` query since it
+    // isn't committed yet). Only a match on our own consistency_tags is
+    // an actual DCB conflict; see docs/architecture.md §19's "Problem 1"
+    // fix for why the `pool` half of this is already tag-indexed rather
+    // than an unfiltered range scan.
+    let mut delta = if locked_highest > original_highest {
+        list_events_for_bounded_context_matching_tags(
             pool,
             &bounded_context_name,
             consistency_tags,
             Some(original_highest),
         )
-        .await?;
-        if !delta.is_empty() {
-            final_bounded_context_events.extend(delta);
-            final_bounded_context_events.sort_by_key(|e| e.sequence);
-            let (_boundary, redispatch_matching_events) =
-                crate::event_store::consistency_boundary_and_matching_events(
-                    &final_bounded_context_events,
-                    consistency_tags,
-                );
-            // docs/architecture.md §19: a snapshot-accelerated initial
-            // decision redispatches through `dispatch_from_snapshot`
-            // again too, not the ordinary `dispatch` - the snapshot's
-            // own folded prefix (`snapshot.state_json`) still represents
-            // real history `redispatch_matching_events` alone doesn't
-            // (it's the tag-indexed delta since the snapshot, same as
-            // `bounded_context_events` already was); calling the
-            // ordinary path here would silently drop everything the
-            // snapshot had already folded.
-            final_decision = match &snapshot {
-                Some(ctx) => match dispatcher.dispatch_from_snapshot(
-                    &bounded_context_name,
-                    &command_type.name,
-                    payload,
-                    ctx.state_json,
-                    &redispatch_matching_events,
-                ) {
-                    None => return Err(crate::error::Error::NoDeciderRegistered),
-                    Some(Err(e)) => return Err(e),
-                    Some(Ok(d)) => d,
-                },
-                None => match dispatcher.dispatch(
-                    &bounded_context_name,
-                    &command_type.name,
-                    payload,
-                    &redispatch_matching_events,
-                ) {
-                    None => return Err(crate::error::Error::NoDeciderRegistered),
-                    Some(Err(e)) => return Err(e),
-                    Some(Ok(d)) => d,
-                },
-            };
-            final_matching_events = redispatch_matching_events;
-        }
+        .await?
+    } else {
+        Vec::new()
+    };
+    delta.extend(
+        extra_committed_events
+            .iter()
+            .filter(|e| {
+                e.sequence > original_highest && consistency_tags.iter().any(|t| e.tags.contains(t))
+            })
+            .cloned(),
+    );
+
+    if !delta.is_empty() {
+        final_bounded_context_events.extend(delta);
+        final_bounded_context_events.sort_by_key(|e| e.sequence);
+        let (_boundary, redispatch_matching_events) =
+            crate::event_store::consistency_boundary_and_matching_events(
+                &final_bounded_context_events,
+                consistency_tags,
+            );
+        // docs/architecture.md §19: a snapshot-accelerated initial
+        // decision redispatches through `dispatch_from_snapshot`
+        // again too, not the ordinary `dispatch` - the snapshot's
+        // own folded prefix (`snapshot.state_json`) still represents
+        // real history `redispatch_matching_events` alone doesn't
+        // (it's the tag-indexed delta since the snapshot, same as
+        // `bounded_context_events` already was); calling the
+        // ordinary path here would silently drop everything the
+        // snapshot had already folded.
+        final_decision = match &snapshot {
+            Some(ctx) => match dispatcher.dispatch_from_snapshot(
+                &bounded_context_name,
+                &command_type.name,
+                payload,
+                ctx.state_json,
+                &redispatch_matching_events,
+            ) {
+                None => return Err(crate::error::Error::NoDeciderRegistered),
+                Some(Err(e)) => return Err(e),
+                Some(Ok(d)) => d,
+            },
+            None => match dispatcher.dispatch(
+                &bounded_context_name,
+                &command_type.name,
+                payload,
+                &redispatch_matching_events,
+            ) {
+                None => return Err(crate::error::Error::NoDeciderRegistered),
+                Some(Err(e)) => return Err(e),
+                Some(Ok(d)) => d,
+            },
+        };
+        final_matching_events = redispatch_matching_events;
     }
 
     let event_specs = match final_decision {
@@ -6255,11 +6424,11 @@ pub async fn submit_command(
     // sync closures (decide() and everything downstream is I/O-free per
     // §1.1) - every EventType lookup and sequence allocation this call
     // will need happens against the *final* event_specs (the redispatched
-    // ones, if a retry happened above). `event_types_by_name` was already
-    // warmed up before the lock for `initial_decision`'s own specs (see
-    // that block's own comment); this loop is what a redispatch's
-    // different specs still need, and its `Entry::Vacant` guard means it
-    // costs nothing extra when nothing changed.
+    // ones, if a retry happened above). `event_types_by_name` arrived
+    // already warmed up for `initial_decision`'s own specs; this loop is
+    // what a redispatch's different specs still need, and its
+    // `Entry::Vacant` guard means it costs nothing extra when nothing
+    // changed.
     for spec in &event_specs {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             event_types_by_name.entry(spec.event_type.clone())
@@ -6273,12 +6442,13 @@ pub async fn submit_command(
     // Allocated inside `tx`, after the lock above, in one round trip for
     // every event this command decided - `next_sequence_batch`, not
     // `event_specs.len()` separate `next_sequence` calls (Codeberg issue
-    // #32: each one used to be its own round trip while this lock was
-    // held). A failure anywhere below (an unregistered event type,
+    // #32). A failure anywhere below (an unregistered event type,
     // encryption resolution, the inserts themselves) rolls the whole
-    // allocation back with the rest of this transaction.
+    // allocation back with the rest of this command's own work - the
+    // whole transaction in the standalone path, just this command's own
+    // savepoint in the batched one.
     let sequences =
-        next_sequence_batch(&mut *tx, &bounded_context_name, event_specs.len() as i64).await?;
+        next_sequence_batch(&mut **tx, &bounded_context_name, event_specs.len() as i64).await?;
     let mut sequences = sequences.into_iter();
 
     // protect_sensitive_fields' own pre-resolution step, for the
@@ -6288,8 +6458,8 @@ pub async fn submit_command(
     // outside this transaction is exactly the same "don't hold the
     // sequence row lock across a master-key wrap" reasoning
     // `create_and_insert_external_event`'s own doc comment gives, doubly
-    // so here since this is the lock `submit_command` itself holds.
-    // `resolved` was already warmed up before the lock for
+    // so here since this is the lock `submit_command`/`CommandBatcher`
+    // itself holds. `resolved` arrived already warmed up for
     // `initial_decision`'s own payloads; `resolve_encryption_keys`'s own
     // `contains_key` guard makes every call below a no-op unless a
     // redispatch actually changed what needs resolving.
@@ -6347,29 +6517,22 @@ pub async fn submit_command(
     )?;
 
     // Command and every one of its triggered events, in the one
-    // transaction `tx` has held since the lock above -
-    // DynamicConsistencyBoundaryHonoured's actual enforcement: a failure
-    // partway through this loop rolls the command insert back too,
-    // rather than leaving a persisted Command with only some of its
-    // events.
+    // (savepoint-scoped, in the batched path) transaction `tx` has held
+    // since the lock above - DynamicConsistencyBoundaryHonoured's actual
+    // enforcement: a failure partway through this loop rolls the command
+    // insert back too, rather than leaving a persisted Command with only
+    // some of its events.
     let command_key_ids = encryption_key_ids(&result.command.encryption_keys, &resolved);
-    let command_id = insert_command(&mut tx, &result.command, &command_key_ids).await?;
-    // Fetched once for every event this command triggers, not once per
-    // event (Codeberg issue #32) - and only now, after the lock above is
-    // already held, which is what keeps this read race-free against
-    // `promote_projection_rebuild` (see `insert_event_and_update_sync_projections_in_tx`'s
-    // own doc comment).
-    let sync_projections =
-        sync_projections_for_bounded_context(pool, &bounded_context_name).await?;
+    let command_id = insert_command(tx, &result.command, &command_key_ids).await?;
     for event in &result.events {
         let event_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
         insert_event_and_update_sync_projections_in_tx(
-            &mut tx,
+            tx,
             event,
             Some(command_id),
             projection_dispatcher,
             &event_key_ids,
-            &sync_projections,
+            sync_projections,
         )
         .await?;
     }
@@ -6378,7 +6541,7 @@ pub async fn submit_command(
         let triggered_event_sequences: Vec<i64> =
             result.events.iter().map(|e| e.sequence).collect();
         insert_idempotency_key(
-            &mut *tx,
+            &mut **tx,
             &schema,
             &command_type.name,
             client_id,
@@ -6387,18 +6550,6 @@ pub async fn submit_command(
             now,
         )
         .await?;
-    }
-
-    tx.commit().await?;
-
-    // EventSubscription's own real-time delivery - after the commit, not
-    // before, the same rule `insert_event_and_update_sync_projections`
-    // itself already follows.
-    for event in &result.events {
-        broadcaster.publish(event);
-        record_event_appended(event);
-        notify_event_appended(pool, event, broadcaster.instance_id()).await;
-        event_cache.append(event).await;
     }
 
     COMMANDS_PROCESSED.add(
@@ -6416,45 +6567,212 @@ pub async fn submit_command(
     })
 }
 
-/// The full "optimistic decide, then locked submit" sequence
-/// `ProcessCommand` describes end to end, for a caller that already has
-/// a resolved `CommandType` and a JSON payload in hand: derive
-/// consistency tags, resolve a snapshot context if one applies
-/// (`resolve_snapshot_context`), fetch matching events (tag-indexed -
-/// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s own "Problem 1" fix), `dispatch()` once
-/// optimistically, then hand off to [`submit_command`] for the real,
-/// locked recheck-and-retry.
+/// The owned equivalent of [`SnapshotContext`] - that type borrows
+/// `state_json`, fine for a caller whose own stack frame outlives the
+/// call it's passed into, but a [`BatchedCommand`] has to survive being
+/// handed to a *different* task (`command_batcher::CommandBatcher`'s
+/// batch leader, which may be a different concurrently-running request's
+/// own task entirely) - see `BatchedCommand`'s own doc comment.
+#[derive(Debug, Clone)]
+pub struct OwnedSnapshotContext {
+    pub state_json: String,
+    pub as_of_sequence: i64,
+}
+
+/// One command's worth of everything [`submit_one_command_in_tx`] needs,
+/// entirely owned rather than borrowed - what a request becomes once it
+/// has to survive being queued for, and processed by, some other task
+/// entirely (`command_batcher::CommandBatcher`'s batch leader is
+/// whichever concurrently-submitting caller happened to arrive first;
+/// every other command in its batch is, from the leader's own stack
+/// frame's perspective, a different task's data). The shared collaborators
+/// [`submit_command`]'s own signature also takes - `pool`, `dispatcher`,
+/// `projection_dispatcher`, `encryption_master_key` - are deliberately
+/// *not* part of this struct: within one process they are the same
+/// `Arc`/reference for every command a `CommandBatcher` ever processes
+/// (all ultimately sourced from the one `Skilj` instance), so the batch
+/// leader already has its own copy and simply reuses it for every command
+/// in the batch rather than each one carrying a redundant copy.
+pub struct BatchedCommand {
+    pub command_type: CommandType,
+    pub payload: String,
+    pub client_id: String,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+    pub bounded_context_events: Vec<Event>,
+    pub consistency_tags: Vec<Tag>,
+    pub matching_events: Vec<Event>,
+    pub initial_decision: crate::shared::CommandDecision,
+    pub now: DateTime<Utc>,
+    pub snapshot: Option<OwnedSnapshotContext>,
+    pub idempotency_key: Option<String>,
+    /// Pre-lock-warmed by this command's own original caller, via
+    /// `warm_up_event_types_and_encryption_keys`, before it ever joined a
+    /// batch queue - see that function's own doc comment for why this is
+    /// always safe and never a correctness dependency.
+    pub event_types_by_name: std::collections::HashMap<String, EventType>,
+    pub resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+}
+
+/// What one command in a [`submit_command_batch`] call settles on - the
+/// same [`SubmitCommandOutcome`] a standalone `submit_command` call would
+/// have produced for it, had it run alone; `Err` only for a real failure
+/// (an unregistered event type, a database error) that rolled back just
+/// this one command's own savepoint, not its batch-mates'.
+pub type BatchedCommandResult = crate::error::Result<SubmitCommandOutcome>;
+
+/// The batched form of the "locked half" of `ProcessCommand` -
+/// `submit_command`'s own doc comment describes the single-command
+/// shape this generalises. Opens one transaction and takes the
+/// bounded-context lock exactly once (`lock_bounded_context_sequence`),
+/// then runs every command in `batch`, *in order*, each inside its own
+/// nested transaction (`tx.begin()`, which sqlx backs with a real
+/// Postgres `SAVEPOINT` for a `Transaction` that is itself already
+/// inside one) - so one command's real failure (as opposed to an
+/// ordinary `Rejected` decision, which is never an `Err` at all) rolls
+/// back only its own work, `ROLLBACK TO SAVEPOINT`, not the whole
+/// batch's. Every command that succeeds is `RELEASE SAVEPOINT`d
+/// immediately, keeping its writes visible to whichever command in the
+/// batch runs next (see `extra_committed_events` below) without making
+/// them durable yet - that's still `tx.commit()`, called exactly once,
+/// after the whole batch has been processed.
 ///
-/// Previously this exact sequence was independently duplicated by
-/// `skilj-rest`'s `post_commands_trigger` and `skilj-graphql`'s
-/// `submitCommand` resolver (each one's own comments cross-referenced
-/// the other as "the identical branch") - both now call through here
-/// instead, and it is also what `SkiljBuilder`'s cross-context event
-/// router (docs/architecture.md's own write-up of that pass) uses to
-/// submit a routed command in-process, a third caller with no REST/
-/// GraphQL wire concerns of its own to keep separate from this. `None`
-/// from `dispatch`/`dispatch_from_snapshot` (no decider registered for
-/// this `(bounded_context, command_type)` pair - `CommandDispatcher::
-/// dispatch`'s own doc comment on why that's reachable in principle)
-/// surfaces as `Error::NoDeciderRegistered`, the same variant every
-/// caller already converts into its own wire error today.
-#[allow(clippy::too_many_arguments)]
-pub async fn decide_and_submit_command(
+/// This is what makes batching commands from *different*, concurrently-
+/// submitting callers into one lock acquisition possible at all
+/// (Codeberg issue #32, round two - see `command_batcher`'s own module
+/// doc comment for the throughput problem this exists to close): the
+/// lock this function takes is held for the combined work of every
+/// command in `batch`, not re-acquired per command, so N commands that
+/// would previously have queued for N separate lock acquisitions instead
+/// share one.
+///
+/// `extra_committed_events` threading: `submit_one_command_in_tx`'s own
+/// DCB-conflict redispatch check needs to see events *this same batch*
+/// already produced, not just ones truly committed by some earlier,
+/// separate transaction - a plain `pool` query can't see them (they're
+/// uncommitted, on `tx`'s own connection, invisible to any other
+/// connection until `tx.commit()`), so this loop accumulates every
+/// accepted command's own `events` in memory as it goes and hands the
+/// running total to each subsequent command.
+///
+/// Returns one [`BatchedCommandResult`] per input command, same order,
+/// only once `tx.commit()` has actually succeeded - nothing here is
+/// reported back to any caller as durable before it truly is. A failure
+/// acquiring the lock, or committing at the end, is returned as the
+/// outer `Err` instead - at that point no per-command outcome is
+/// trustworthy (a failed commit could mean anything committed or
+/// nothing did), so the caller (`command_batcher::CommandBatcher`) is
+/// expected to treat every command in the batch as failed identically,
+/// not to guess from whatever this function got partway through
+/// computing.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context_name, batch_size = batch.len()))]
+pub async fn submit_command_batch(
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    bounded_context_name: &str,
+    batch: Vec<BatchedCommand>,
+) -> crate::error::Result<Vec<BatchedCommandResult>> {
+    let mut tx = pool.begin().await?;
+    let locked_highest = lock_bounded_context_sequence(&mut tx, bounded_context_name).await?;
+    let sync_projections = sync_projections_for_bounded_context(pool, bounded_context_name).await?;
+
+    let mut results = Vec::with_capacity(batch.len());
+    let mut extra_committed_events: Vec<Event> = Vec::new();
+
+    for item in batch {
+        let mut nested = tx.begin().await?;
+        let outcome = submit_one_command_in_tx(
+            &mut nested,
+            pool,
+            dispatcher,
+            projection_dispatcher,
+            &item.command_type,
+            &item.payload,
+            &item.client_id,
+            item.correlation_id.as_deref(),
+            item.causation_id.as_deref(),
+            &item.bounded_context_events,
+            &item.consistency_tags,
+            &item.matching_events,
+            item.initial_decision,
+            encryption_master_key,
+            item.now,
+            item.snapshot.as_ref().map(|s| SnapshotContext {
+                state_json: &s.state_json,
+                as_of_sequence: s.as_of_sequence,
+            }),
+            item.idempotency_key.as_deref(),
+            locked_highest,
+            &sync_projections,
+            &extra_committed_events,
+            item.event_types_by_name,
+            item.resolved,
+        )
+        .await;
+
+        match outcome {
+            Ok(outcome) => {
+                // Releases this command's own savepoint - its writes stay
+                // in `tx`, visible to every subsequent command in this
+                // same batch, but still no more durable than the rest of
+                // `tx` until the one `tx.commit()` below succeeds.
+                nested.commit().await?;
+                if let SubmitCommandOutcome::Accepted { ref events, .. } = outcome {
+                    extra_committed_events.extend(events.iter().cloned());
+                }
+                results.push(Ok(outcome));
+            }
+            Err(e) => {
+                // `ROLLBACK TO SAVEPOINT`, awaited explicitly rather than
+                // left to `nested`'s own `Drop` - both end up issuing the
+                // same statement, but every subsequent command in this
+                // loop shares `tx`'s one underlying connection, so the
+                // rollback must be known-complete before the next
+                // `tx.begin()` reuses it, not merely queued by a
+                // fire-and-forget `Drop`.
+                nested.rollback().await?;
+                results.push(Err(e));
+            }
+        }
+    }
+
+    tx.commit().await?;
+    Ok(results)
+}
+
+/// What [`resolve_command_submission`] settles on - everything both
+/// [`decide_and_submit_command`] and `command_batcher::CommandBatcher::decide_and_submit`
+/// need to hand off to their own "locked half" ([`submit_command`] or
+/// [`CommandBatcher::submit`](crate::command_batcher::CommandBatcher::submit)
+/// respectively), computed identically by both.
+pub struct ResolvedCommandSubmission {
+    pub bounded_context_events: Vec<Event>,
+    pub consistency_tags: Vec<Tag>,
+    pub matching_events: Vec<Event>,
+    pub decision: crate::shared::CommandDecision,
+    pub snapshot_context: Option<ResolvedSnapshot>,
+}
+
+/// The optimistic, unlocked half of `ProcessCommand`'s own "optimistic
+/// decide, then locked submit" sequence - derive consistency tags,
+/// resolve a snapshot context if one applies (`resolve_snapshot_context`),
+/// fetch matching events (tag-indexed - [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s
+/// own "Problem 1" fix), `dispatch()` once optimistically. Shared by
+/// [`decide_and_submit_command`] (hands the result to [`submit_command`])
+/// and `command_batcher::CommandBatcher::decide_and_submit` (hands it to
+/// [`CommandBatcher::submit`](crate::command_batcher::CommandBatcher::submit)
+/// instead) - both need the identical resolution, only what happens with
+/// it afterward differs.
+pub async fn resolve_command_submission(
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
     snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
-    broadcaster: &crate::event_store::EventBroadcaster,
     event_cache: &crate::event_cache::EventCache,
     command_type: &CommandType,
     payload: &str,
-    client_id: &str,
-    correlation_id: Option<&str>,
-    causation_id: Option<&str>,
-    encryption_master_key: Option<&EncryptionMasterKey>,
-    now: DateTime<Utc>,
-    idempotency_key: Option<&str>,
-) -> crate::error::Result<SubmitCommandOutcome> {
+) -> crate::error::Result<ResolvedCommandSubmission> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let consistency_tags = crate::event_store::derive_tags(&command_type.tag_mappings, payload);
 
@@ -6506,6 +6824,71 @@ pub async fn decide_and_submit_command(
             .ok_or(crate::error::Error::NoDeciderRegistered)??,
     };
 
+    Ok(ResolvedCommandSubmission {
+        bounded_context_events,
+        consistency_tags,
+        matching_events,
+        decision,
+        snapshot_context,
+    })
+}
+
+/// The full "optimistic decide, then locked submit" sequence
+/// `ProcessCommand` describes end to end, for a caller that already has
+/// a resolved `CommandType` and a JSON payload in hand - see
+/// [`resolve_command_submission`] for the optimistic half this hands off
+/// to [`submit_command`] for the real, locked recheck-and-retry.
+///
+/// Previously this exact sequence was independently duplicated by
+/// `skilj-rest`'s `post_commands_trigger` and `skilj-graphql`'s
+/// `submitCommand` resolver (each one's own comments cross-referenced
+/// the other as "the identical branch") - both now call through here
+/// instead, and it is also what `SkiljBuilder`'s cross-context event
+/// router (docs/architecture.md's own write-up of that pass) uses to
+/// submit a routed command in-process, a third caller with no REST/
+/// GraphQL wire concerns of its own to keep separate from this. `None`
+/// from `dispatch`/`dispatch_from_snapshot` (no decider registered for
+/// this `(bounded_context, command_type)` pair - `CommandDispatcher::
+/// dispatch`'s own doc comment on why that's reachable in principle)
+/// surfaces as `Error::NoDeciderRegistered`, the same variant every
+/// caller already converts into its own wire error today.
+///
+/// **Not routed through `command_batcher::CommandBatcher`** - this stays
+/// the direct, unbatched path, still exactly what it always was. High-
+/// volume, externally-triggered submission (REST/GraphQL command
+/// submission, parked-delivery redrive) uses `CommandBatcher::decide_and_submit`
+/// instead (Codeberg issue #32, round two); the lower-volume, periodic
+/// internal ones (the cross-context event router's own tick,
+/// `fire_due_deadlines`) still call through here, deliberately - batching
+/// buys the least where a caller is already ticking on its own schedule
+/// rather than arriving as a burst of concurrent external requests.
+#[allow(clippy::too_many_arguments)]
+pub async fn decide_and_submit_command(
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+    idempotency_key: Option<&str>,
+) -> crate::error::Result<SubmitCommandOutcome> {
+    let resolved = resolve_command_submission(
+        pool,
+        dispatcher,
+        snapshot_dispatcher,
+        event_cache,
+        command_type,
+        payload,
+    )
+    .await?;
+
     submit_command(
         pool,
         dispatcher,
@@ -6517,16 +6900,19 @@ pub async fn decide_and_submit_command(
         client_id,
         correlation_id,
         causation_id,
-        &bounded_context_events,
-        &consistency_tags,
-        &matching_events,
-        decision,
+        &resolved.bounded_context_events,
+        &resolved.consistency_tags,
+        &resolved.matching_events,
+        resolved.decision,
         encryption_master_key,
         now,
-        snapshot_context.as_ref().map(|ctx| SnapshotContext {
-            state_json: &ctx.state_json,
-            as_of_sequence: ctx.as_of_sequence,
-        }),
+        resolved
+            .snapshot_context
+            .as_ref()
+            .map(|ctx| SnapshotContext {
+                state_json: &ctx.state_json,
+                as_of_sequence: ctx.as_of_sequence,
+            }),
         idempotency_key,
     )
     .await
