@@ -18,7 +18,11 @@ deleting it - keeps a record of what this list already caught.
   and a community org for third-party projects
   (<https://github.com/temporal-community>) to submit to. Worth doing
   once `skilj-temporal` is actually published to crates.io (see
-  `RELEASING.md`), not before.
+  `RELEASING.md`), not before. 2026-09-19: the docs integrations page
+  has no third-party submission path and lists no Rust, so the real route
+  is the Code Exchange; submitted as
+  [temporal-community/code-exchange#131](https://github.com/temporal-community/code-exchange/issues/131).
+  Move to "Done" once accepted or declined.
 
 ## Done
 
