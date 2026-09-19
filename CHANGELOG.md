@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-09-19
+
 ### Added
 
 - Group-commit command batching: concurrent commands to the same bounded
@@ -421,7 +423,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.7...HEAD
+[Unreleased]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.8...HEAD
+[0.0.8]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.7...v0.0.8
 [0.0.7]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.6...v0.0.7
 [0.0.6]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.5...v0.0.6
 [0.0.5]: https://codeberg.org/gklijs/SklilJ/compare/v0.0.4...v0.0.5
