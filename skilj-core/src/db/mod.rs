@@ -7170,6 +7170,15 @@ pub struct CommandBatchLeaderTx {
 /// the change to this one transaction; it's gone the moment `tx` commits,
 /// rolls back, or (if the timeout itself fires) Postgres closes it, so it
 /// never leaks onto whatever this pooled connection is handed to next.
+///
+/// What the timeout does and doesn't measure: Postgres's idle clock only
+/// runs *between* statements on this session, and restarts after each
+/// one - so it bounds the gap between two consecutive statements (one
+/// command's in-memory decide, or a run of consecutive rejected commands
+/// that issue none), never the whole batch. The blocked
+/// `SELECT ... FOR UPDATE` lock wait is an *active* statement, so it is
+/// not covered (nor meant to be): the timeout only protects the phase
+/// after the lock is held.
 pub async fn begin_command_batch_leader_tx(
     pool: &Pool,
     bounded_context_name: &str,
@@ -7528,6 +7537,15 @@ pub async fn commit_command_batch(
 
         match outcome {
             Ok(outcome) => {
+                // A failure of this savepoint statement itself (as with
+                // `tx.begin()`/`nested.rollback()` below) means the shared
+                // connection is unusable, not that this one command is bad,
+                // so it deliberately aborts the whole batch: the
+                // transaction can no longer be committed, and the earlier
+                // commands' writes live only in it. Per-command failures
+                // (`finish_accepted_command_in_tx` returning `Err`) are
+                // the ones isolated by the savepoint - see the `Err` arm.
+                //
                 // Releases this command's own savepoint - its writes stay
                 // in `tx`, visible to every subsequent command in this
                 // same batch, but still no more durable than the rest of

@@ -187,7 +187,7 @@ fn status_for(err: &CoreError) -> StatusCode {
         // any more specific real database error it could itself recover
         // from - the identical `INTERNAL_SERVER_ERROR` `CoreError::Database`
         // already gets.
-        CoreError::BatchFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        CoreError::BatchFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

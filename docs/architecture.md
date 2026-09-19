@@ -9266,3 +9266,14 @@ change the fact that a properly multi-tenant deployment would mostly
 sidestep this lock's contention entirely. Landed on
 `perf/batch-round-trip-reduction`, same branch as §60/§61.
 
+
+## 63. Code-review fixes for the group-commit batcher (post-0.0.7 review)
+
+A `/code-review high v0.0.7..HEAD` pass over the batching work (§58-§62) found six things; two were real permanent-hang bugs of the same class as issue #36.
+
+1. **Over-`MAX_BATCH_SIZE` remainder was stranded (real).** Leadership is only assigned to a push that finds the queue empty. `drain_up_to` left the remainder queued, so nobody was ever elected for it. `run_as_leader` now loops (lock, drain, process) until a drain empties the queue; `drain_up_to` reports whether a remainder exists, atomically with the drain. Test: 300 queued commands behind an externally held lock all get answered.
+2. **Leader election was not cancellation-safe (real).** The leader runs inside the caller's request future, which the server can drop (client disconnect). A `LeaderGuard` stays armed until a drain empties the queue; if dropped first it fails everything still queued with a retryable `BatchFailed` and empties the queue, so the next push elects a fresh leader. This required switching the queue to a `std::sync::Mutex` (the guard's `Drop` is synchronous; the lock is never held across an await). Followers are failed rather than promoted - promoting one would mean moving its already-queued command out from under its own waiting future, for a rare case. Test: leader aborted mid-lock-wait, follower answered, later submit succeeds.
+3. **Pool exhaustion (real, latent).** Each leader pins a connection while its decide/persist reads need more. A semaphore in `CommandBatcher` (sized lazily to half the pool's `max_connections`, minimum 1) caps concurrent leaders across bounded contexts, so non-leader work can always get a connection.
+4. **Idle timeout across a big batch (mostly a misreading).** Postgres's idle clock restarts after every statement, so it bounds the gap between two statements, not the batch. Documented on `begin_command_batch_leader_tx`; no code change. Lock wait is an active statement and is deliberately not covered.
+5. **Follower errors lost their type (partly fixed).** `Error::BatchFailed` is now `{ code, message }`, copied from the original error, so `extensions.code` matches what the leader sees. The HTTP status stays 500 and the typed variant is still lost (`Error` is not `Clone`).
+6. **Savepoint statement failure aborts the whole batch (correct as is).** If `tx.begin()`/`commit()`/`rollback()` on a savepoint fails, the shared connection is unusable and the earlier commands' writes exist only in that transaction, so failing the batch is the only consistent outcome. Per-command failures are still isolated by the savepoint. Comment added.

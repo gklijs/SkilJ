@@ -63,8 +63,14 @@ pub enum Error {
     /// `Clone` (it wraps `sqlx::Error`, which isn't either), so this is
     /// the one case where the original typed error can't be handed to
     /// every affected caller directly.
-    #[error("command batch failed: {0}")]
-    BatchFailed(String),
+    ///
+    /// `code` is the *original* error's own [`SkiljRejection::code`], so a
+    /// follower's machine-readable `extensions.code` matches what the
+    /// leader's own typed error reports, rather than collapsing to a
+    /// generic value; only the typed variant itself (and so its HTTP
+    /// status mapping, always 500 here) is lost.
+    #[error("command batch failed: {message}")]
+    BatchFailed { code: String, message: String },
 
     /// Distinct from `Database` above - a migration failure means the
     /// schema itself couldn't be brought up to date (a startup-time
@@ -98,7 +104,7 @@ impl SkiljRejection for Error {
             Error::NoDeciderRegistered => "no_decider_registered",
             Error::Database(_) => "database_error",
             Error::Migration(_) => "migration_error",
-            Error::BatchFailed(_) => "database_error",
+            Error::BatchFailed { code, .. } => code,
         }
     }
 
@@ -113,7 +119,26 @@ impl SkiljRejection for Error {
             Error::NoDeciderRegistered => self.to_string(),
             Error::Database(e) => e.to_string(),
             Error::Migration(e) => e.to_string(),
-            Error::BatchFailed(msg) => msg.clone(),
+            Error::BatchFailed { message, .. } => message.clone(),
+        }
+    }
+}
+
+impl Error {
+    /// The follower-facing stand-in for `cause` - see [`Error::BatchFailed`].
+    pub fn batch_failed(cause: &Error) -> Error {
+        Error::BatchFailed {
+            code: cause.code().to_string(),
+            message: cause.message(),
+        }
+    }
+
+    /// A batch failure that has no underlying `Error` to copy from
+    /// (a cancelled or vanished leader).
+    pub fn batch_failed_msg(message: impl Into<String>) -> Error {
+        Error::BatchFailed {
+            code: "database_error".to_string(),
+            message: message.into(),
         }
     }
 }

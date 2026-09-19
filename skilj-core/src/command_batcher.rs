@@ -65,16 +65,17 @@ use crate::shared::{CommandDecision, Tag};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use std::sync::Mutex;
+use tokio::sync::{oneshot, RwLock, Semaphore};
 
 /// A hard ceiling on how many commands one lock acquisition processes,
 /// regardless of how many piled up while the leader waited for the
 /// lock - a pathological worst case (thousands of callers queued behind
 /// one very slow commit) still bounds one batch's own lock hold time and
 /// memory, at the cost of spilling the remainder into a follow-up batch
-/// (whichever caller is first to find the queue empty next becomes that
-/// one's own leader - nothing is lost or dropped, just processed one
-/// batch later).
+/// (the same leader keeps draining and processing follow-up batches until
+/// the queue is empty - see `run_as_leader` - so nothing is lost or
+/// dropped, just processed one batch later).
 const MAX_BATCH_SIZE: usize = 256;
 
 /// One caller's request, sitting in a per-bounded-context queue - see
@@ -107,6 +108,12 @@ const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT: std::time::Duration = std::time::Dura
 pub struct CommandBatcher {
     queues: Arc<RwLock<HashMap<String, Queue>>>,
     idle_in_transaction_timeout: std::time::Duration,
+    /// Caps how many batch leaders (each pinning one pool connection for
+    /// its whole batch while still needing *more* pool connections for
+    /// its decide/persist reads) can run at once across every bounded
+    /// context, sized lazily from the pool's own `max_connections` - see
+    /// `leader_permits`.
+    leader_permits: Arc<std::sync::OnceLock<Arc<Semaphore>>>,
 }
 
 impl Default for CommandBatcher {
@@ -120,7 +127,23 @@ impl CommandBatcher {
         Self {
             queues: Arc::new(RwLock::new(HashMap::new())),
             idle_in_transaction_timeout: DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT,
+            leader_permits: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// At most half the pool (minimum one) may be pinned by batch leaders
+    /// at once, so a leader's own further `pool` reads (and every other
+    /// caller's warm-up/optimistic resolve) can always still get a
+    /// connection - without this, enough concurrently-active bounded
+    /// contexts could leave every connection held by a leader that is
+    /// itself waiting on `pool.acquire()` (a pool-exhaustion stall).
+    fn leader_permits(&self, pool: &Pool) -> Arc<Semaphore> {
+        self.leader_permits
+            .get_or_init(|| {
+                let permits = (pool.options().get_max_connections() as usize / 2).max(1);
+                Arc::new(Semaphore::new(permits))
+            })
+            .clone()
     }
 
     /// Codeberg issue #36's own recommendation #3: a defense-in-depth
@@ -223,7 +246,7 @@ impl CommandBatcher {
         let queue = self.queue_for(&bounded_context_name).await;
         let (reply_tx, reply_rx) = oneshot::channel();
         let is_leader = {
-            let mut queue = queue.lock().await;
+            let mut queue = lock_queue(&queue);
             queue.push(PendingCommand {
                 command,
                 reply: reply_tx,
@@ -237,8 +260,8 @@ impl CommandBatcher {
 
         if !is_leader {
             return reply_rx.await.unwrap_or_else(|_| {
-                Err(Error::BatchFailed(
-                    "command batch leader task ended without producing a result".to_string(),
+                Err(Error::batch_failed_msg(
+                    "command batch leader task ended without producing a result",
                 ))
             });
         }
@@ -333,16 +356,27 @@ impl CommandBatcher {
     /// be considerably larger than one.
     ///
     /// Codeberg issue #36: this ordering - lock first, drain second - used
-    /// to be reversed (the queue was drained before the lock was even
-    /// requested), which quietly defeated the self-tuning design this
-    /// module's own doc comment describes: a caller almost never found
-    /// anyone else already queued, since nothing had yet given concurrent
-    /// arrivals time to queue up. Draining is unconditional once the lock
-    /// step finishes, success or failure alike - a follower that queued
-    /// during the wait must never be left behind in a queue nobody drains
-    /// again, since leadership for a *new* batch is only ever assigned to
-    /// whoever finds the queue empty (see `submit`'s own `is_leader`
-    /// check), and a queue nobody drains never goes empty.
+    /// to be reversed, which quietly defeated the self-tuning design this
+    /// module's own doc comment describes. Draining is unconditional once
+    /// the lock step finishes, success or failure alike - a follower that
+    /// queued during the wait must never be left behind in a queue nobody
+    /// drains again, since leadership for a *new* batch is only ever
+    /// assigned to whoever finds the queue empty (see `submit`'s own
+    /// `is_leader` check), and a queue nobody drains never goes empty.
+    ///
+    /// Two further guarantees keep that invariant true:
+    /// - **Over-cap remainder**: if more than `MAX_BATCH_SIZE` commands
+    ///   are queued, this leader keeps going - lock, drain, process -
+    ///   until a drain empties the queue, and only then returns its own
+    ///   (already-known) result. No one else can become leader while the
+    ///   queue is non-empty, so it must be this one.
+    /// - **Cancellation**: this future runs inside the caller's own
+    ///   request future, which the server may drop at any await point
+    ///   (client disconnect, timeout). A [`LeaderGuard`] stays armed
+    ///   until a drain empties the queue; if this future is dropped
+    ///   first, the guard fails everything still queued (a retryable
+    ///   `BatchFailed`) and empties the queue, so the next caller becomes
+    ///   a fresh leader instead of every later caller hanging forever.
     #[allow(clippy::too_many_arguments)]
     async fn run_as_leader(
         &self,
@@ -355,118 +389,157 @@ impl CommandBatcher {
         bounded_context_name: &str,
         queue: &Queue,
     ) -> Result<SubmitCommandOutcome> {
-        // Timed separately from `commit_command_batch`'s own per-phase log
-        // (Codeberg issue #32, round four investigation) - this is the
-        // "waiting for the lock" half (`pool.begin()` plus the real
-        // `SELECT ... FOR UPDATE` wait), as distinct from the "processing
-        // once held" half that log breaks down further.
-        let lock_wait_started = std::time::Instant::now();
-        let leader_tx = crate::db::begin_command_batch_leader_tx(
-            pool,
-            bounded_context_name,
-            Some(self.idle_in_transaction_timeout),
-        )
-        .await;
-        let lock_wait_elapsed = lock_wait_started.elapsed();
-        tracing::info!(
-            bounded_context = %bounded_context_name,
-            lock_wait_us = lock_wait_elapsed.as_micros(),
-            "command batch leader lock wait"
-        );
-
-        // `drain_up_to` never returns empty for the leader's own call -
-        // it just pushed itself onto this exact queue above. Split into
-        // parallel vecs up front: `db::commit_command_batch` wants owned
-        // `BatchedCommand`s to process, and the `reply` senders are
-        // needed again afterward, in the same order, to distribute
-        // results - `unzip` keeps that pairing without the awkwardness
-        // of trying to partially move out of `PendingCommand` twice.
-        let pending = self.drain_up_to(queue, MAX_BATCH_SIZE).await;
-        let (batch, mut replies): (
-            Vec<BatchedCommand>,
-            Vec<oneshot::Sender<BatchedCommandResult>>,
-        ) = pending.into_iter().map(|p| (p.command, p.reply)).unzip();
-
-        let leader_tx = match leader_tx {
-            Ok(leader_tx) => leader_tx,
-            Err(e) => {
-                // Couldn't even acquire the lock for this batch - nothing
-                // in `batch` was ever attempted, so every command, leader's
-                // own included, gets an equivalent error. `Error` isn't
-                // `Clone` (`sqlx::Error` inside it isn't), so every
-                // follower gets `BatchFailed` carrying the same rendered
-                // message rather than the original typed error - only the
-                // leader's own return value below keeps that original.
-                let message = e.to_string();
-                for reply in replies.drain(1..) {
-                    let _ = reply.send(Err(Error::BatchFailed(message.clone())));
-                }
-                return Err(e);
-            }
+        let mut guard = LeaderGuard {
+            queue: queue.clone(),
+            armed: true,
         };
+        let permits = self.leader_permits(pool);
+        let mut own_result: Option<Result<SubmitCommandOutcome>> = None;
 
-        let results = crate::db::commit_command_batch(
-            leader_tx,
-            pool,
-            dispatcher,
-            projection_dispatcher,
-            encryption_master_key,
-            batch,
-        )
-        .await;
+        loop {
+            // Held for the whole lock-wait-plus-batch, released at the
+            // end of this iteration - see `leader_permits`.
+            let _permit = permits
+                .acquire()
+                .await
+                .expect("leader semaphore is never closed");
 
-        let results = match results {
-            Ok(results) => results,
-            Err(e) => {
-                // The shared transaction's final commit itself failed -
-                // nothing in this batch is trustworthy, so every command,
-                // leader's own included, gets an equivalent error. Same
-                // `Error`-isn't-`Clone` reasoning as the lock-failure arm
-                // above.
-                let message = e.to_string();
-                for reply in replies.drain(1..) {
-                    let _ = reply.send(Err(Error::BatchFailed(message.clone())));
-                }
-                return Err(e);
+            // Timed separately from `commit_command_batch`'s own
+            // per-phase log - this is the "waiting for the lock" half.
+            let lock_wait_started = std::time::Instant::now();
+            let leader_tx = crate::db::begin_command_batch_leader_tx(
+                pool,
+                bounded_context_name,
+                Some(self.idle_in_transaction_timeout),
+            )
+            .await;
+            tracing::info!(
+                bounded_context = %bounded_context_name,
+                lock_wait_us = lock_wait_started.elapsed().as_micros(),
+                "command batch leader lock wait"
+            );
+
+            // Never empty on the first pass (the leader's own entry is
+            // in there); on later passes only entered when the previous
+            // drain reported a remainder, which nobody else can take.
+            let (pending, more_remaining) = drain_up_to(queue, MAX_BATCH_SIZE);
+            if !more_remaining {
+                // Atomic with the drain above (no await between them):
+                // the queue is empty, so leadership is released.
+                guard.armed = false;
             }
-        };
+            let first_pass = own_result.is_none();
+            let (batch, mut replies): (
+                Vec<BatchedCommand>,
+                Vec<oneshot::Sender<BatchedCommandResult>>,
+            ) = pending.into_iter().map(|p| (p.command, p.reply)).unzip();
+            // The leader is always `batch[0]` of the *first* batch only.
+            let skip = usize::from(first_pass);
 
-        // Every accepted command's own events, across the whole batch,
-        // broadcast together once the shared commit has actually
-        // succeeded - the identical post-commit choke point
-        // `db::broadcast_appended_events` already is for the standalone
-        // path, just run once per batch member here instead of once per
-        // call.
-        for outcome in results.iter().flatten() {
-            crate::db::broadcast_appended_events(pool, broadcaster, event_cache, outcome).await;
+            let outcome = match leader_tx {
+                Err(e) => Err(e),
+                Ok(leader_tx) => {
+                    crate::db::commit_command_batch(
+                        leader_tx,
+                        pool,
+                        dispatcher,
+                        projection_dispatcher,
+                        encryption_master_key,
+                        batch,
+                    )
+                    .await
+                }
+            };
+
+            match outcome {
+                Err(e) => {
+                    // Lock acquisition or the shared transaction's final
+                    // commit failed - nothing in this batch is
+                    // trustworthy, so every command gets an equivalent
+                    // error. `Error` isn't `Clone`, so followers get a
+                    // `BatchFailed` carrying the original's code and
+                    // message; only the leader's own return value keeps
+                    // the original typed error.
+                    for reply in replies.drain(skip..) {
+                        let _ = reply.send(Err(Error::batch_failed(&e)));
+                    }
+                    if first_pass {
+                        own_result = Some(Err(e));
+                    }
+                }
+                Ok(results) => {
+                    // Every accepted command's own events, across the
+                    // whole batch, broadcast together once the shared
+                    // commit has actually succeeded.
+                    for outcome in results.iter().flatten() {
+                        crate::db::broadcast_appended_events(
+                            pool,
+                            broadcaster,
+                            event_cache,
+                            outcome,
+                        )
+                        .await;
+                    }
+                    let mut results = results.into_iter();
+                    if first_pass {
+                        own_result = Some(results.next().expect(
+                            "run_as_leader's own batch always has at least its own leader in it",
+                        ));
+                    }
+                    for (reply, result) in replies.into_iter().skip(skip).zip(results) {
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+
+            if !more_remaining {
+                break;
+            }
         }
 
-        // The leader is always `batch[0]`/`replies[0]`/`results[0]` - it
-        // was alone in the queue when it pushed itself (that's what made
-        // it the leader), and every follower only ever joins *after*
-        // that push.
-        let mut results = results.into_iter();
-        let own_result = results
-            .next()
-            .expect("run_as_leader's own batch always has at least its own leader in it");
-        for (reply, result) in replies.into_iter().skip(1).zip(results) {
-            let _ = reply.send(result);
-        }
-        own_result
+        own_result.expect("the first pass always records the leader's own result")
     }
+}
 
-    /// Takes everything currently queued (up to `max`), leaving the
-    /// queue empty for whoever pushes next to become a fresh leader for
-    /// a new batch. A push that arrives while this drain holds the
-    /// queue's lock simply waits for it, then (finding the queue empty
-    /// again) becomes that new batch's own leader - no request is ever
-    /// silently skipped or merged into the wrong batch.
-    async fn drain_up_to(&self, queue: &Queue, max: usize) -> Vec<PendingCommand> {
-        let mut queue = queue.lock().await;
-        if queue.len() <= max {
-            std::mem::take(&mut *queue)
-        } else {
-            queue.drain(..max).collect()
+fn lock_queue(queue: &Queue) -> std::sync::MutexGuard<'_, Vec<PendingCommand>> {
+    // Never held across an await and never panics while held, but a
+    // poisoned lock must not itself wedge every later caller.
+    queue.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Takes everything currently queued (up to `max`). The second element
+/// is whether entries remain afterwards - if so the queue is *not* empty,
+/// so no new leader can arise and the current one must keep draining. When
+/// it is `false` the queue is empty and a push that arrives next becomes
+/// a fresh leader for a new batch.
+fn drain_up_to(queue: &Queue, max: usize) -> (Vec<PendingCommand>, bool) {
+    let mut queue = lock_queue(queue);
+    if queue.len() <= max {
+        (std::mem::take(&mut *queue), false)
+    } else {
+        (queue.drain(..max).collect(), true)
+    }
+}
+
+/// Armed for as long as the current leader is the one responsible for
+/// eventually emptying the queue. If the leader's future is dropped
+/// while armed (cancellation), everything still queued is failed and the
+/// queue emptied so leadership can be re-elected by the next push.
+struct LeaderGuard {
+    queue: Queue,
+    armed: bool,
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let stranded = std::mem::take(&mut *lock_queue(&self.queue));
+        for pending in stranded {
+            let _ = pending.reply.send(Err(Error::batch_failed_msg(
+                "the command batch leader was cancelled before processing this command; retry",
+            )));
         }
     }
 }

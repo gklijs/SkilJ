@@ -540,3 +540,143 @@ fn a_batch_leader_stuck_past_the_idle_in_transaction_timeout_is_killed_and_relea
         drop(stuck_leader_tx);
     });
 }
+
+#[test]
+fn more_queued_commands_than_one_batch_holds_are_all_still_answered() {
+    // The over-`MAX_BATCH_SIZE` remainder must not be stranded: hold the
+    // bounded-context lock from outside so every submit queues up behind
+    // one leader, then release it. 300 > 256, so a single drain can't
+    // take them all - the same leader has to keep going until the queue
+    // is empty, or the leftover callers (and every later one) hang.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+
+        let held = db::begin_command_batch_leader_tx(&pool, &bc.name, None)
+            .await
+            .unwrap();
+
+        let batcher = CommandBatcher::new();
+        let dispatcher = Arc::new(ShipOrderDispatcher);
+        let broadcaster = Arc::new(EventBroadcaster::new(64));
+        let event_cache = Arc::new(EventCache::new(1000));
+
+        const CONCURRENCY: usize = 300;
+        let mut handles = Vec::with_capacity(CONCURRENCY);
+        for i in 0..CONCURRENCY {
+            let pool = pool.clone();
+            let batcher = batcher.clone();
+            let dispatcher = dispatcher.clone();
+            let broadcaster = broadcaster.clone();
+            let event_cache = event_cache.clone();
+            let ct = ct.clone();
+            handles.push(tokio::spawn(async move {
+                submit(
+                    &pool,
+                    &batcher,
+                    &dispatcher,
+                    &broadcaster,
+                    &event_cache,
+                    &ct,
+                    &format!(r#"{{"order_id":"order-{i}"}}"#),
+                )
+                .await
+            }));
+        }
+
+        // Give every caller time to finish its pre-lock work and queue.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        drop(held);
+
+        for handle in handles {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), handle)
+                .await
+                .expect("a queued command was stranded past the batch-size cap")
+                .unwrap()
+                .unwrap();
+            assert!(matches!(outcome, SubmitCommandOutcome::Accepted { .. }));
+        }
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), CONCURRENCY);
+    });
+}
+
+#[test]
+fn a_cancelled_batch_leader_does_not_strand_followers_or_wedge_the_queue() {
+    // The leader's future is dropped while waiting for the lock (a client
+    // disconnect). Followers already queued must get an answer, and a
+    // later submission must be able to become a fresh leader.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+
+        let held = db::begin_command_batch_leader_tx(&pool, &bc.name, None)
+            .await
+            .unwrap();
+
+        let batcher = CommandBatcher::new();
+        let dispatcher = Arc::new(ShipOrderDispatcher);
+        let broadcaster = Arc::new(EventBroadcaster::new(64));
+        let event_cache = Arc::new(EventCache::new(1000));
+
+        let spawn_submit = |order: &'static str| {
+            let pool = pool.clone();
+            let batcher = batcher.clone();
+            let dispatcher = dispatcher.clone();
+            let broadcaster = broadcaster.clone();
+            let event_cache = event_cache.clone();
+            let ct = ct.clone();
+            tokio::spawn(async move {
+                submit(
+                    &pool,
+                    &batcher,
+                    &dispatcher,
+                    &broadcaster,
+                    &event_cache,
+                    &ct,
+                    &format!(r#"{{"order_id":"{order}"}}"#),
+                )
+                .await
+            })
+        };
+
+        let leader = spawn_submit("A");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let follower = spawn_submit("B");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        leader.abort();
+        let _ = leader.await;
+        drop(held);
+
+        let follower_outcome = tokio::time::timeout(std::time::Duration::from_secs(10), follower)
+            .await
+            .expect("a follower must be answered when its leader is cancelled")
+            .unwrap();
+        assert!(
+            matches!(
+                follower_outcome,
+                Ok(SubmitCommandOutcome::Accepted { .. })
+                    | Err(skilj_core::error::Error::BatchFailed { .. })
+            ),
+            "unexpected follower outcome: {follower_outcome:?}"
+        );
+
+        let fresh = tokio::time::timeout(std::time::Duration::from_secs(10), spawn_submit("C"))
+            .await
+            .expect("the queue must not stay wedged after a cancelled leader")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(fresh, SubmitCommandOutcome::Accepted { .. }));
+    });
+}
