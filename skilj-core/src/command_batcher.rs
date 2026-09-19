@@ -355,12 +355,24 @@ impl CommandBatcher {
         bounded_context_name: &str,
         queue: &Queue,
     ) -> Result<SubmitCommandOutcome> {
+        // Timed separately from `commit_command_batch`'s own per-phase log
+        // (Codeberg issue #32, round four investigation) - this is the
+        // "waiting for the lock" half (`pool.begin()` plus the real
+        // `SELECT ... FOR UPDATE` wait), as distinct from the "processing
+        // once held" half that log breaks down further.
+        let lock_wait_started = std::time::Instant::now();
         let leader_tx = crate::db::begin_command_batch_leader_tx(
             pool,
             bounded_context_name,
             Some(self.idle_in_transaction_timeout),
         )
         .await;
+        let lock_wait_elapsed = lock_wait_started.elapsed();
+        tracing::info!(
+            bounded_context = %bounded_context_name,
+            lock_wait_us = lock_wait_elapsed.as_micros(),
+            "command batch leader lock wait"
+        );
 
         // `drain_up_to` never returns empty for the leader's own call -
         // it just pushed itself onto this exact queue above. Split into

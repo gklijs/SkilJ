@@ -9056,3 +9056,213 @@ above is derived from reading the code path, not measured throughput,
 so treat the ceiling improvement as directionally expected rather than
 quantified until re-run against `skilj-helpdesk`.
 
+## 61. Closing §60's own measurement gap, a real load-test surprise about `skilj-helpdesk`'s own tenancy shape, and one more round-trip cut (Codeberg issue #32, round four)
+
+§60 shipped without a fresh load-test number. This pass re-ran the exact
+`docs/load-test-report-2026-09-18c.md` methodology against §60's own
+commit (`5fa2e67`) and reproduced its numbers closely (throughput within
+a few percent at every step), confirming the setup is faithful - then
+went further than any prior pass by adding real instrumentation instead
+of reasoning from throughput deltas alone.
+
+**A `skilj.command_batch.size` histogram (plus a matching `tracing::info!`
+line for zero-infra grepping) settles what three prior load-test reports
+only speculated about.** Batch size *does* scale with load exactly as
+`command_batcher`'s own doc comment predicts - mean batch size climbed
+1.25 (8 workers) → 1.98 (20) → 6.30 (40) → 15.0 (80), batch-of-one share
+dropping from 82% to 9% - but aggregate throughput stayed flat at ~27/s
+across the 20/40/80-worker steps regardless. That rules out "the batcher
+isn't forming big enough batches" as an explanation for the ceiling, with
+real measurement rather than inference: the remaining cost is
+per-command work inside the batch, not batch formation itself, exactly
+as §58/§59/§60's own analyses already suspected but never confirmed.
+
+**A bigger finding, unrelated to `skilj-core` itself: `skilj-helpdesk`'s
+own single shared "helpdesk" bounded context - the thing every one of
+these four load tests has been measuring the throughput ceiling *of* -
+is an explicitly documented placeholder, not the target architecture.**
+`specs/skilj-helpdesk.allium` calls for one tenant bounded context per
+company via `skilj/CreateBoundedContextFromTemplate`; `helpdesk.rs`'s own
+module doc comment says multi-tenant provisioning is deferred, keeping
+Company and Ticket side by side in one context "to prove the real
+`decide()` logic, not the tenancy mechanism around it." Once that lands,
+three (or three thousand) companies' traffic stops sharing one lock
+entirely. This doesn't change anything in `skilj-core` - `CreateBoundedContextFromTemplate`
+already exists as a library guarantee - but it means `skilj-helpdesk`'s
+own ~27-28/s ceiling is "one bounded context under this workload," not a
+`skilj-core` ceiling, and the highest-leverage next step for that
+project's real throughput is wiring up the deferred tenant provisioning,
+not further round-trip work here.
+
+**Two `skilj-core` changes landed anyway, real but narrower than hoped:**
+
+- **Batching the `command_encryption_keys`/`event_encryption_keys` join
+  inserts** (one `INSERT ... SELECT $1, unnest($2::bigint[])` instead of
+  one round trip per key) **and parallelizing `resolve_encryption_keys`**
+  in `finish_accepted_command_in_tx` (gathering every distinct subject
+  across a command's own payload and all its accepted events' payloads
+  up front - pure, no I/O - deduping, then resolving the survivors
+  concurrently via `futures_util::future::try_join_all` instead of one
+  payload at a time). Correct and tested (`skilj-core`'s full suite,
+  including `tests/encryption.rs`, passes unchanged), but a **null result
+  for `skilj-helpdesk` specifically**: that bounded context declares zero
+  `sensitive_fields` anywhere, so `encryption_key_ids` and the resolved-subject
+  list are always empty for its workload - re-running steps 3 and 5
+  against this build showed no real throughput change, exactly as
+  expected once checked. Real value for any deployment that *does* use
+  `sensitive_fields` (`skilj-demo`, or a future `skilj-helpdesk` PII
+  feature), just not this one. `futures-util` moved from `skilj-core`'s
+  `dev-dependencies` to real `[dependencies]` for this (previously only
+  a test dependency for the Codeberg issue #15 warm-up-concurrency A/B
+  test).
+
+- **Moving the same-batch idempotency check off `tx` entirely, removing
+  `decide_command_in_tx`'s own `SAVEPOINT`.** `decide_command_in_tx` used
+  `tx` for exactly one thing - `lookup_idempotency_key` - and that own
+  doc comment already says the bounded-context lock makes a plain `pool`
+  read just as race-free as a `tx`-scoped one for anything genuinely
+  already committed (the identical reasoning the DCB delta query a few
+  lines below it already relies on, via `pool`, for the exact same lock).
+  The only case a `pool` read can't see is a same-batch, not-yet-committed
+  duplicate - covered by a new in-memory `batch_idempotency_keys: HashMap<(command_type_name,
+  client_id, idempotency_key), triggered_event_sequences>` in
+  `commit_command_batch`'s own loop, populated right after each accepted
+  command's persist succeeds, checked first, `pool` as the fallback - the
+  exact same two-source shape `extra_committed_events` already
+  established for the DCB case. With no `tx`-scoped statement left inside
+  it, `decide_command_in_tx` needed no `SAVEPOINT` of its own at all -
+  §60's `decide_tx` wrapper is gone outright (not merged with the
+  write-phase `nested` `SAVEPOINT`; those two were investigated for
+  merging first and found genuinely incompatible - `SequencePool`'s own
+  draw deliberately sits *outside* any `SAVEPOINT`, between decide and
+  finish, specifically so a rolled-back command's sequence numbers can be
+  recycled rather than silently gapped, so folding decide and finish into
+  one `SAVEPOINT` would pull the draw inside one and break
+  `SequenceIsGaplessPerBoundedContext`). One fewer `SAVEPOINT`/`RELEASE`
+  round-trip pair per command, unconditionally - every command, not just
+  ones carrying an idempotency key. Verified by the tests that already
+  hand-prove this exact scenario -
+  `submit_command_batch_deduplicates_a_repeated_idempotency_key_shared_by_two_commands_in_the_same_batch`
+  and `submit_command_with_the_same_idempotency_key_from_two_different_clients_does_not_collide`
+  both pass unchanged, alongside the rest of `skilj-core`'s 736-test
+  suite, `cargo clippy --all-targets -D warnings`, and `cargo fmt --check`.
+
+**A fuller "pipeline `decide(i+1)` concurrently with `persist(i)`" design
+was investigated and deliberately not built.** Even with the idempotency
+check off `tx`, real concurrency between two commands' own `tx`-bound
+work (the sequence draw, the actual inserts) is impossible within one
+connection - not a tuning problem but a hard constraint: Rust's borrow
+checker won't allow two live `&mut tx` borrows at once, and one Postgres
+connection can't have two statements in flight regardless. The only
+genuine overlap available is CPU-only `dispatcher.decide()` work (and a
+`pool`-only delta query, when a real conflict is suspected) against an
+*adjacent* command's `tx`-bound writes - real, but for the common
+no-conflict case `decide_command_in_tx` now does close to zero I/O
+already, leaving little to actually overlap. Building a full tag-based
+dependency scheduler for that uncertain a return, in the same code area
+that already produced two real regressions (§59, Codeberg issues #36/#35),
+wasn't judged worth it this round. Landed on `perf/batch-round-trip-reduction`,
+same branch as §60.
+
+## 62. Finding and fixing the real ceiling: a redispatch check's own row-materialization cost (Codeberg issue #32, round four, continued)
+
+§61's SAVEPOINT removal, measured directly against `skilj-helpdesk`,
+moved throughput by an amount indistinguishable from this environment's
+own run-to-run noise (§61 itself said so plainly). Digging into *why*
+required going further than any prior pass in this whole issue: real
+per-phase wall-clock instrumentation inside `commit_command_batch`
+itself (`decide_us`/`sequence_us`/`persist_us`/`commit_us`, one
+`tracing::info!` line per batch), not just round-trip counting from
+reading the code.
+
+**What it found**: at real concurrent load, `decide` - not `persist` -
+was 77-86% of the batch loop's own wall-clock time, averaging
+15-18ms/command. Tracing one level further in, 86% of *that* was one
+specific call: the DCB-conflict redispatch check
+(`list_events_for_bounded_context_matching_tags_with_bc`), which fires
+for essentially every command once a batch is large enough that its
+shared `locked_highest` has outrun some individual command's own stale
+pre-lock snapshot - true of nearly every command under real load,
+regardless of whether a genuine conflict exists (59% of these queries
+returned zero rows). And *within* that query, splitting pool-acquire
+from execution from row-materialization found the query itself was
+fast (under 2ms combined) - the real cost was building the `Event`
+objects for whatever rows it *did* return: `get_event_type` (its own
+redundant `get_bounded_context` re-fetch, the identical class of bug
+§60's "fix one" already closed at a different call site) and, far more
+expensive, `event_origin_from_row`'s `command_triggered` case, which
+fetches the *entire* originating `Command` via `get_command_by_id` -
+itself several round trips deep (`get_command_type` →
+`get_bounded_context` → `get_role`) - **per row, uncached, every single
+time**. Measured precisely: 98% of the row-processing loop's own cost
+was this one chain.
+
+**Two wrong turns before the real fix, both caught by measuring rather
+than assuming**:
+
+1. Threading a caller's already-warmed `event_types_by_name` map into
+   the delta query's own row loop, reasoning it duplicated work
+   `decide_command_in_tx` had already done. Built, tested, shipped to a
+   load test - **zero measurable effect**. The map is warmed for the
+   command's own *future* events, not the *historical* events a delta
+   query re-checks - almost never the same types, so the cache was
+   real but almost never hit for this call site. A useful, correct,
+   harmless change in its own right (kept), just not the fix.
+2. Parallelizing the row loop's per-row fetches via `try_join_all` -
+   the same technique §61/`finish_accepted_command_in_tx` already used
+   successfully for `resolve_encryption_keys`. Measured *worse*:
+   accepted throughput at step 5 dropped to 22.5/s (from a ~27/s
+   baseline) even though `decide_us` itself fell 3x (18ms → 6.4ms/command).
+   The batch loop's own lock-wait time exploded to ~1.7s mean (up from
+   under 100ms) - bursting many simultaneous connection requests out of
+   an already-contended pool starved the *next* batch's own lock
+   acquisition, a real regression this session caught and reverted
+   before it ever left the branch, not a hypothetical risk. The lesson,
+   confirmed rather than assumed: this workload was never short on
+   *parallelism*, it was short on *total round-trip count* against a
+   size-capped connection pool - concurrency without reduction just
+   moves the queueing, it doesn't remove it.
+
+**The fix that actually worked: batch, don't parallelize.** Two new
+functions, `get_commands_by_ids_with_bc` and
+`get_event_types_by_names_with_bc`, each one `WHERE id/name = ANY($1)`
+round trip for however many distinct commands/event-types a delta
+result needs - collapsing what used to be up to one
+`get_command_by_id`-chain per row into one query for the whole batch's
+own row set (plus one more for the distinct `command_type`s those
+commands reference, itself taking `bc` directly rather than re-fetching
+it - same `_with_bc` pattern as `get_event_type_with_bc`/§60's original
+fix). `event_origin_from_row` itself is untouched, and unused for this
+call site now - its logic is inlined here against the pre-fetched maps,
+since building an `EventOrigin` from data already in hand is pure/sync,
+no `.await` needed per row at all once the two batched fetches are done.
+
+**Measured, not assumed**: full `skilj-core` suite (736 tests, including
+`submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict`
+and the other DCB/redispatch tests that exercise this exact path with
+real `command_triggered` events) passes unchanged, `clippy --all-targets
+-D warnings` and `fmt --check` clean. Against `skilj-helpdesk`, real
+before/after load-test numbers, same methodology as every prior report:
+
+| step | workers | before (§61 baseline) | after |
+|---|---|---|---|
+| 3 | 20 | ~27/s | **45.10/s** (+67%) |
+| 5 | 80 | ~27/s | **57.75/s** (+115%) |
+
+Phase timing on the fixed build confirms the mechanism, not just the
+headline number: `decide_us` fell from ~18ms to ~5.7ms/command, mean
+lock-wait time at step 5 dropped to ~482ms (nowhere near the failed
+concurrent attempt's ~1.7s), and mean batch size *grew* to ~34.5 (up
+from ~15-16) - the self-tuning batcher given more room to work now that
+each batch's own processing is faster, a virtuous cycle rather than a
+coincidence.
+
+**What's still open**: `skilj-helpdesk`'s own deferred per-company
+tenant provisioning (§61's other finding) remains the bigger, separate
+lever for that project's real-world ceiling - this fix raises the
+throughput of *one* bounded context under contention, which is exactly
+what today's single-shared-context deployment shape needs, but doesn't
+change the fact that a properly multi-tenant deployment would mostly
+sidestep this lock's contention entirely. Landed on
+`perf/batch-round-trip-reduction`, same branch as §60/§61.
+

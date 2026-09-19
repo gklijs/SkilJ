@@ -45,7 +45,7 @@ use crate::event_store::{
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use crate::shared::{Metadata, PrivateField, SensitiveField, Tag, TagMapping};
 use chrono::{DateTime, Utc};
-use opentelemetry::metrics::{Counter, Meter};
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::KeyValue;
 use sqlx::types::Json;
 use sqlx::{Acquire, Postgres, Transaction};
@@ -81,6 +81,24 @@ static EVENTS_APPENDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter()
         .u64_counter("skilj.events.appended")
         .with_description("Events appended to the event store.")
+        .build()
+});
+
+/// How many commands `CommandBatcher::run_as_leader` actually coalesced
+/// into one `commit_command_batch` lock acquisition - the one number
+/// none of the `docs/load-test-report-2026-09-18*.md` passes ever
+/// measured (all three skipped OTel/Grafana), even though it's exactly
+/// what would confirm or refute their shared "batch amortisation is
+/// maxed out, per-command work now dominates" reading of the throughput
+/// numbers. Recorded once per `commit_command_batch` call, by
+/// `bounded_context` - a distribution consistently near 1 under real
+/// concurrent load would mean the self-tuning batcher isn't actually
+/// forming large batches, a very different diagnosis than "batches are
+/// large but per-command work inside them is the bottleneck".
+static COMMAND_BATCH_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_histogram("skilj.command_batch.size")
+        .with_description("Commands coalesced into one command-batch lock acquisition.")
         .build()
 });
 
@@ -2362,14 +2380,58 @@ pub async fn get_event_type(
     let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
         return Ok(None);
     };
-    let schema = schema_ident(bounded_context);
+    get_event_type_with_bc(pool, &bc, name).await
+}
+
+/// [`get_event_type`]'s own `bc`-in-hand sibling (Codeberg issue #32,
+/// round four - same precedent §60 already set for
+/// `list_events_for_bounded_context_matching_tags_with_bc`): skips the
+/// `get_bounded_context` call entirely for a caller who already has the
+/// row - `list_events_for_bounded_context_matching_tags_with_bc`'s own
+/// row-processing loop, one call per distinct event type in a delta
+/// result, is exactly the caller this was added for - measured (a real
+/// load test, not just reading the code) spending the majority of its
+/// own wall-clock time re-fetching a `BoundedContext` (plus, transitively,
+/// its own `created_by_role_id`'s `Role`) it never needed to ask for
+/// again.
+async fn get_event_type_with_bc(
+    pool: &Pool,
+    bc: &BoundedContext,
+    name: &str,
+) -> crate::error::Result<Option<EventType>> {
+    let schema = schema_ident(&bc.name);
     let row: Option<EventTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = $1"
     )))
     .bind(name)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| r.into_domain(bc)))
+    Ok(row.map(|r| r.into_domain(bc.clone())))
+}
+
+/// `get_event_type_with_bc`'s batched sibling - `get_command_types_by_names_with_bc`'s
+/// own precedent, one `WHERE name = ANY($1)` round trip for a whole set
+/// of names. `names` empty returns an empty map without touching
+/// Postgres.
+async fn get_event_types_by_names_with_bc(
+    pool: &Pool,
+    bc: &BoundedContext,
+    names: &[&str],
+) -> crate::error::Result<std::collections::HashMap<String, EventType>> {
+    if names.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let schema = schema_ident(&bc.name);
+    let rows: Vec<EventTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = ANY($1)"
+    )))
+    .bind(names)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.name.clone(), row.into_domain(bc.clone())))
+        .collect())
 }
 
 /// Every `EventType` in `bounded_context` currently opted into
@@ -3199,13 +3261,19 @@ pub async fn insert_command(
     .fetch_one(&mut **tx)
     .await?;
 
-    for encryption_key_id in encryption_key_ids {
+    // One multi-row insert via `unnest` instead of one round trip per
+    // key - most commands carry zero or one, but a command whose
+    // payload touches several `sensitive_field_subjects` can carry
+    // several, and each used to be its own serialized `INSERT` inside
+    // this transaction's own held lock (docs/architecture.md's load-test
+    // §: `commit_command_batch`'s per-command critical section).
+    if !encryption_key_ids.is_empty() {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.command_encryption_keys (command_id, encryption_key_id) \
-             VALUES ($1, $2)"
+             SELECT $1, unnest($2::bigint[])"
         )))
         .bind(id)
-        .bind(encryption_key_id)
+        .bind(encryption_key_ids)
         .execute(&mut **tx)
         .await?;
     }
@@ -3230,6 +3298,121 @@ pub async fn get_command_by_id(
         Some(row) => Ok(Some(row.into_domain(pool, bounded_context).await?)),
         None => Ok(None),
     }
+}
+
+/// `get_command_by_id`'s batched sibling - one `WHERE id = ANY($1)`
+/// round trip for however many distinct commands a caller needs, instead
+/// of one round trip (each several deep via `CommandRow::into_domain`'s
+/// own `get_command_type`) per id. Built for
+/// `list_events_for_bounded_context_matching_tags_with_bc`'s own
+/// row-processing loop (docs/architecture.md §61's round four) - a real
+/// load test found resolving each `command_triggered` row's origin one
+/// at a time was the single biggest cost inside `commit_command_batch`'s
+/// own held lock, and a first, *concurrent* attempt at fixing it
+/// measured worse (bursting many simultaneous connection requests
+/// starved the next batch's own lock acquisition) before this batched
+/// version replaced it. `ids` empty returns an empty map without
+/// touching Postgres. Takes `bc` (not a bounded context name) for the
+/// identical "caller already has this row, don't re-fetch it" reasoning
+/// `get_event_type_with_bc` gives.
+async fn get_commands_by_ids_with_bc(
+    pool: &Pool,
+    bc: &BoundedContext,
+    ids: &[i64],
+) -> crate::error::Result<std::collections::HashMap<i64, Command>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let schema = schema_ident(&bc.name);
+    let rows: Vec<CommandRowWithId> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, {COMMAND_COLUMNS} FROM {schema}.commands WHERE id = ANY($1)"
+    )))
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut distinct_type_names: Vec<&str> = Vec::new();
+    for row in &rows {
+        if !distinct_type_names.contains(&row.command_type_name.as_str()) {
+            distinct_type_names.push(&row.command_type_name);
+        }
+    }
+    let command_types = get_command_types_by_names_with_bc(pool, bc, &distinct_type_names).await?;
+
+    let mut commands = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let command_type = command_types
+            .get(&row.command_type_name)
+            .expect("commands row references a command_types row that no longer exists")
+            .clone();
+        commands.insert(
+            row.id,
+            Command {
+                id: row.external_id,
+                bounded_context: command_type.bounded_context.clone(),
+                command_type,
+                payload: row.payload,
+                metadata: Metadata {
+                    r#type: row.metadata_type,
+                    version: row.metadata_version,
+                    client_id: row.metadata_client_id,
+                    created_at: row.metadata_created_at,
+                    correlation_id: row.metadata_correlation_id,
+                    causation_id: row.metadata_causation_id,
+                },
+                encryption_keys: Vec::new(),
+                consistency_tags: row.consistency_tags.0,
+                consistency_boundary: row.consistency_boundary,
+            },
+        );
+    }
+    Ok(commands)
+}
+
+/// `CommandRow`'s own sibling with the internal `BIGSERIAL` id included -
+/// `get_commands_by_ids_with_bc`'s own `WHERE id = ANY($1)` needs it to
+/// map each returned row back to the id that requested it, which
+/// `CommandRow` itself never carries (every other caller already knows
+/// the id it asked for).
+#[derive(sqlx::FromRow)]
+struct CommandRowWithId {
+    id: i64,
+    external_id: String,
+    command_type_name: String,
+    payload: String,
+    metadata_type: String,
+    metadata_version: i64,
+    metadata_client_id: String,
+    metadata_created_at: DateTime<Utc>,
+    metadata_correlation_id: Option<String>,
+    metadata_causation_id: Option<String>,
+    consistency_tags: Json<Vec<Tag>>,
+    consistency_boundary: Option<i64>,
+}
+
+/// `get_command_type`'s batched sibling - `get_event_type_with_bc`'s own
+/// precedent, extended to a whole set of names in one `WHERE name =
+/// ANY($1)` round trip. `names` empty returns an empty map without
+/// touching Postgres.
+async fn get_command_types_by_names_with_bc(
+    pool: &Pool,
+    bc: &BoundedContext,
+    names: &[&str],
+) -> crate::error::Result<std::collections::HashMap<String, CommandType>> {
+    if names.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let schema = schema_ident(&bc.name);
+    let rows: Vec<CommandTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {COMMAND_TYPE_COLUMNS} FROM {schema}.command_types WHERE name = ANY($1)"
+    )))
+    .bind(names)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.name.clone(), row.into_domain(bc.clone())))
+        .collect())
 }
 
 /// `get_command_by_id`'s own sibling, addressed by `Command.id`
@@ -4991,7 +5174,8 @@ pub async fn list_events_for_bounded_context_matching_tags(
     let bc = get_bounded_context(pool, bounded_context).await?.expect(
         "list_events_for_bounded_context_matching_tags: bounded_context row must exist for any event referencing it",
     );
-    list_events_for_bounded_context_matching_tags_with_bc(pool, &bc, tags, after_sequence).await
+    list_events_for_bounded_context_matching_tags_with_bc(pool, &bc, tags, after_sequence, None)
+        .await
 }
 
 /// The same query [`list_events_for_bounded_context_matching_tags`] runs,
@@ -5010,6 +5194,7 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
     bc: &BoundedContext,
     tags: &[Tag],
     after_sequence: Option<i64>,
+    known_event_types: Option<&std::collections::HashMap<String, EventType>>,
 ) -> crate::error::Result<Vec<Event>> {
     if tags.is_empty() {
         return Ok(Vec::new());
@@ -5053,25 +5238,97 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
     }
     let rows: Vec<EventRowAnyType> = query.fetch_all(pool).await?;
 
+    let row_count = rows.len();
+    let row_loop_started = std::time::Instant::now();
+
+    // Every distinct event type this result set needs that
+    // `known_event_types` (a caller's already-warmed map, e.g.
+    // `decide_command_in_tx`'s own) doesn't already answer, batched into
+    // one `WHERE name = ANY($1)` round trip - `get_commands_by_ids_with_bc`'s
+    // own precedent below, same reasoning: a batched query, not a
+    // concurrent burst of small ones (a first, concurrent attempt at
+    // fixing this whole row-processing loop measured worse overall, by
+    // starving the next batch's own lock acquisition - see this
+    // function's own doc comment for the full story).
     let mut event_types: std::collections::HashMap<String, EventType> =
         std::collections::HashMap::new();
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        if !event_types.contains_key(&row.event_type_name) {
-            let et = get_event_type(pool, bounded_context, &row.event_type_name)
-                .await?
-                .expect("events row references an event_types row that no longer exists");
-            event_types.insert(row.event_type_name.clone(), et);
+    let mut missing_type_names: Vec<&str> = Vec::new();
+    for row in &rows {
+        if event_types.contains_key(&row.event_type_name) {
+            continue;
         }
-        let origin = event_origin_from_row(
-            pool,
-            bounded_context,
-            &row.origin_kind,
-            row.origin_source_content,
-            row.origin_source_context,
-            row.origin_command_id,
-        )
-        .await?;
+        match known_event_types.and_then(|m| m.get(&row.event_type_name)) {
+            Some(et) => {
+                event_types.insert(row.event_type_name.clone(), et.clone());
+            }
+            None => {
+                if !missing_type_names.contains(&row.event_type_name.as_str()) {
+                    missing_type_names.push(&row.event_type_name);
+                }
+            }
+        }
+    }
+    let event_type_lookup_started = std::time::Instant::now();
+    event_types.extend(get_event_types_by_names_with_bc(pool, bc, &missing_type_names).await?);
+    let event_type_lookup_elapsed = event_type_lookup_started.elapsed();
+
+    // The real cost this whole investigation found (docs/architecture.md
+    // §61's round four): a `command_triggered` row's own origin needs the
+    // *entire* originating `Command` (`get_command_by_id`, itself several
+    // round trips deep - `get_command_type` → `get_bounded_context` →
+    // `get_role`). A first attempt fetched these concurrently, one
+    // `event_origin_from_row` future per row - measured *worse*, not
+    // better: bursting many simultaneous connection requests out of a
+    // shared, already-contended pool starved the *next* batch's own lock
+    // acquisition (`command batch leader lock wait` climbed to ~1.7s mean
+    // in that measurement). This instead batches the distinct
+    // `origin_command_id`s this result set actually needs into one
+    // `WHERE id = ANY($1)` query (`get_commands_by_ids_with_bc`, itself
+    // internally batching the distinct `command_type_name`s the same
+    // way) - one or two round trips total for the whole row set, not one
+    // per row, concurrent or not.
+    let origin_lookup_started = std::time::Instant::now();
+    let mut command_ids: Vec<i64> = Vec::new();
+    for row in &rows {
+        if row.origin_kind == "command_triggered" {
+            if let Some(id) = row.origin_command_id {
+                if !command_ids.contains(&id) {
+                    command_ids.push(id);
+                }
+            }
+        }
+    }
+    let commands_by_id = get_commands_by_ids_with_bc(pool, bc, &command_ids).await?;
+    let mut origins = Vec::with_capacity(rows.len());
+    for row in &rows {
+        origins.push(match row.origin_kind.as_str() {
+            "external_triggered" => EventOrigin::ExternalTriggered {
+                source_content: row
+                    .origin_source_content
+                    .clone()
+                    .expect("external_triggered event row without origin_source_content"),
+                source_context: row.origin_source_context.clone(),
+            },
+            "directly_created" => EventOrigin::DirectlyCreated,
+            "system_triggered" => EventOrigin::SystemTriggered,
+            "command_triggered" => {
+                let command_id = row
+                    .origin_command_id
+                    .expect("command_triggered event row without origin_command_id");
+                let command = commands_by_id
+                    .get(&command_id)
+                    .expect("events row references a commands row that no longer exists");
+                EventOrigin::CommandTriggered {
+                    command: Box::new(command.clone()),
+                }
+            }
+            other => panic!("events row has unknown origin_kind {other:?}"),
+        });
+    }
+    let origin_lookup_elapsed = origin_lookup_started.elapsed();
+
+    let mut events = Vec::with_capacity(rows.len());
+    for (row, origin) in rows.into_iter().zip(origins) {
         events.push(Event {
             bounded_context: bc.clone(),
             event_type: event_types[&row.event_type_name].clone(),
@@ -5090,6 +5347,13 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
             origin,
         });
     }
+    tracing::info!(
+        row_count,
+        row_loop_us = row_loop_started.elapsed().as_micros(),
+        event_type_lookup_us = event_type_lookup_elapsed.as_micros(),
+        origin_lookup_us = origin_lookup_elapsed.as_micros(),
+        "delta query row-processing loop"
+    );
     Ok(events)
 }
 
@@ -5546,13 +5810,17 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
     // the caller back alongside it, threaded through here so this
     // transaction can also link the join rows atomically with the event
     // insert they belong to.
-    for encryption_key_id in encryption_key_ids {
+    // Same `unnest`-batched insert as `insert_command`'s own
+    // `command_encryption_keys` above, same reasoning - one round trip
+    // for however many keys this event's payload needed, not one per
+    // key.
+    if !encryption_key_ids.is_empty() {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {schema}.event_encryption_keys (event_sequence, encryption_key_id) \
-             VALUES ($1, $2)"
+             SELECT $1, unnest($2::bigint[])"
         )))
         .bind(event.sequence)
-        .bind(encryption_key_id)
+        .bind(encryption_key_ids)
         .execute(&mut **tx)
         .await?;
     }
@@ -6320,7 +6588,6 @@ enum DecideOutcome {
 /// itself used to do this inline.
 #[allow(clippy::too_many_arguments)]
 async fn decide_command_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     command_type: &CommandType,
@@ -6334,6 +6601,10 @@ async fn decide_command_in_tx(
     idempotency_key: Option<&str>,
     locked_highest: i64,
     extra_committed_events: &[Event],
+    extra_committed_idempotency_keys: &std::collections::HashMap<
+        (String, String, String),
+        Vec<i64>,
+    >,
     mut event_types_by_name: std::collections::HashMap<String, EventType>,
 ) -> crate::error::Result<DecideOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
@@ -6346,14 +6617,41 @@ async fn decide_command_in_tx(
 
     // Codeberg issue #12: a cached prior answer, not a new decision -
     // checked as early as possible, right after the lock that makes this
-    // plain `SELECT` race-free (see `lookup_idempotency_key`'s own doc
-    // comment). `initial_decision`/the redispatch logic below never runs
-    // on a hit - nothing is written, and this command never reaches
-    // `finish_accepted_command_in_tx`'s own `SAVEPOINT` at all.
+    // race-free (see `lookup_idempotency_key`'s own doc comment).
+    // `initial_decision`/the redispatch logic below never runs on a hit -
+    // nothing is written, and this command never reaches
+    // `finish_accepted_command_in_tx` at all.
+    //
+    // Same two-source shape `extra_committed_events` already uses for the
+    // DCB delta below it: `extra_committed_idempotency_keys` is this
+    // batch's own in-memory record of idempotency keys an *earlier*
+    // command in this same, still-uncommitted batch already claimed
+    // (`commit_command_batch`'s own accumulator, populated right after
+    // each accepted command's own persist succeeds) - the only case a
+    // plain `pool` read below can't see, since those rows live only on
+    // the leader's own connection until the whole batch commits. Anything
+    // genuinely already committed by an earlier, separate transaction *is*
+    // visible to a plain `pool` read, for the identical reason
+    // `lookup_idempotency_key`'s own doc comment gives the DCB delta query
+    // a few lines below: the bounded-context lock already fully
+    // serializes every writer, so nothing uncommitted from any *other*
+    // transaction can exist to miss. This is what lets `decide_command_in_tx`
+    // run without ever touching the leader's own `tx` at all - no
+    // per-command `SAVEPOINT` is needed to isolate a DB error here, since
+    // there is no `tx`-scoped statement left to isolate one from.
     if let Some(key) = idempotency_key {
-        if let Some(triggered_event_sequences) =
-            lookup_idempotency_key(&mut **tx, &schema, &command_type.name, client_id, key).await?
-        {
+        let cache_key = (
+            command_type.name.clone(),
+            client_id.to_string(),
+            key.to_string(),
+        );
+        let triggered_event_sequences = match extra_committed_idempotency_keys.get(&cache_key) {
+            Some(sequences) => Some(sequences.clone()),
+            None => {
+                lookup_idempotency_key(pool, &schema, &command_type.name, client_id, key).await?
+            }
+        };
+        if let Some(triggered_event_sequences) = triggered_event_sequences {
             return Ok(DecideOutcome::Terminal(
                 SubmitCommandOutcome::Deduplicated {
                     triggered_event_sequences,
@@ -6388,13 +6686,31 @@ async fn decide_command_in_tx(
         // `list_events_for_bounded_context_matching_tags_with_bc`'s own
         // doc comment for why re-fetching it per command was pure
         // round-trip waste inside the batch leader's held lock.
-        list_events_for_bounded_context_matching_tags_with_bc(
+        //
+        // Timed separately (Codeberg issue #32, round four investigation)
+        // - `commit_command_batch`'s own per-batch `decide_us` total was
+        // far higher than CPU-only decide work should cost; this pins
+        // down whether this specific query, firing whenever a busy
+        // batch's fixed `locked_highest` has outrun some individual
+        // command's own pre-lock snapshot (which real concurrent load
+        // makes the common case, not the rare-conflict case this branch
+        // was written for), is where that time actually goes.
+        let delta_query_started = std::time::Instant::now();
+        let result = list_events_for_bounded_context_matching_tags_with_bc(
             pool,
             &command_type.bounded_context,
             consistency_tags,
             Some(original_highest),
+            Some(&event_types_by_name),
         )
-        .await?
+        .await?;
+        tracing::info!(
+            bounded_context = %bounded_context_name,
+            delta_query_us = delta_query_started.elapsed().as_micros(),
+            delta_rows = result.len(),
+            "command decide delta query"
+        );
+        result
     } else {
         Vec::new()
     };
@@ -6537,30 +6853,52 @@ async fn finish_accepted_command_in_tx(
     // `create_and_insert_external_event`'s own doc comment gives, doubly
     // so here since this is the lock `submit_command`/`CommandBatcher`
     // itself holds. `resolved` arrived already warmed up for
-    // `initial_decision`'s own payloads; `resolve_encryption_keys`'s own
-    // `contains_key` guard makes every call below a no-op unless a
-    // redispatch actually changed what needs resolving.
-    resolve_encryption_keys(
-        pool,
-        &bounded_context_name,
-        &command_type.sensitive_fields,
-        payload,
-        encryption_master_key,
-        &mut resolved,
-    )
-    .await?;
+    // `initial_decision`'s own payloads.
+    //
+    // Every distinct `(subject_key, subject_value)` subject the command's
+    // own payload and every accepted event's payload will need is
+    // gathered up front instead of resolved payload-by-payload -
+    // `sensitive_field_subjects` is pure and I/O-free, so collecting all
+    // of them first costs nothing. Deduped here (and against whatever
+    // `resolved` already carries) so the concurrent resolution below
+    // never double-provisions the same subject twice - the same
+    // guarantee `resolve_encryption_keys`'s own serial `contains_key`
+    // skip gave one payload at a time, just computed across every
+    // payload in this command in one pass instead of only within each
+    // call. Once deduped, every remaining subject is provably distinct,
+    // so - unlike resolving them one payload at a time - they're safe to
+    // resolve concurrently: what used to be N round trips serialized
+    // inside this same held lock becomes one concurrent batch of them.
+    let mut needed_subjects: Vec<(String, String)> =
+        crate::event_store::sensitive_field_subjects(&command_type.sensitive_fields, payload);
     for spec in &event_specs {
         if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
-            let spec_payload = spec.payload.to_string();
-            resolve_encryption_keys(
-                pool,
-                &bounded_context_name,
+            needed_subjects.extend(crate::event_store::sensitive_field_subjects(
                 &event_type.sensitive_fields,
-                &spec_payload,
-                encryption_master_key,
-                &mut resolved,
-            )
-            .await?;
+                &spec.payload.to_string(),
+            ));
+        }
+    }
+    needed_subjects.retain(|pair| !resolved.contains_key(pair));
+    needed_subjects.sort();
+    needed_subjects.dedup();
+
+    if !needed_subjects.is_empty() {
+        let master_key = encryption_master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+        let provisioned = futures_util::future::try_join_all(needed_subjects.iter().map(
+            |(subject_key, subject_value)| {
+                get_or_create_encryption_key(
+                    pool,
+                    &bounded_context_name,
+                    subject_key,
+                    subject_value,
+                    master_key,
+                )
+            },
+        ))
+        .await?;
+        for (subject, provisioned) in needed_subjects.into_iter().zip(provisioned) {
+            resolved.insert(subject, provisioned);
         }
     }
 
@@ -6680,7 +7018,6 @@ async fn submit_one_command_in_tx(
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let decided = match decide_command_in_tx(
-        tx,
         pool,
         dispatcher,
         command_type,
@@ -6694,6 +7031,11 @@ async fn submit_one_command_in_tx(
         idempotency_key,
         locked_highest,
         extra_committed_events,
+        // This is `submit_command`'s own batch-of-one path - no other
+        // command shares `tx`'s lock hold, so there is never a same-batch
+        // idempotency key to find in memory; every real hit comes from
+        // `lookup_idempotency_key`'s own `pool` read.
+        &std::collections::HashMap::new(),
         event_types_by_name,
     )
     .await?
@@ -7033,25 +7375,60 @@ pub async fn commit_command_batch(
         sync_projections,
     } = leader_tx;
 
+    COMMAND_BATCH_SIZE.record(
+        batch.len() as u64,
+        &[KeyValue::new(
+            "bounded_context",
+            bounded_context_name.clone(),
+        )],
+    );
+    // A plain log line alongside the histogram above - purely so a load
+    // test can grep achieved batch sizes straight out of server logs
+    // without standing up an OTLP receiver, per
+    // docs/load-test-report-2026-09-18*.md's own "skipped OTel/Grafana"
+    // reasoning. The histogram is the lasting instrument; this is the
+    // zero-infra way to read it for one investigation.
+    tracing::info!(
+        bounded_context = %bounded_context_name,
+        batch_size = batch.len(),
+        "command batch committed"
+    );
+
+    // Temporary per-phase wall-clock accumulators (Codeberg issue #32,
+    // round four investigation) - the batch-size histogram above already
+    // ruled out "batches aren't forming large enough to amortise" as the
+    // explanation for the flat ~27/s ceiling; this is the next
+    // measurement, not more reasoning from round-trip counting alone:
+    // which of decide/sequence-draw/persist actually eats the wall-clock
+    // time inside the held lock. One log line per batch, greppable, same
+    // zero-infra reasoning as the batch-size line above.
+    let mut decide_total = std::time::Duration::ZERO;
+    let mut sequence_total = std::time::Duration::ZERO;
+    let mut persist_total = std::time::Duration::ZERO;
+
     let mut results = Vec::with_capacity(batch.len());
     let mut extra_committed_events: Vec<Event> = Vec::new();
+    // `decide_command_in_tx`'s own second in-memory accumulator, alongside
+    // `extra_committed_events` above - an earlier command in this same,
+    // still-uncommitted batch that claimed an idempotency key is only
+    // visible here, not to a `pool` read, until the whole batch commits.
+    // See `decide_command_in_tx`'s own doc comment for the full reasoning
+    // (mirrors `extra_committed_events` exactly). Keyed by
+    // `(command_type_name, client_id, idempotency_key)`.
+    let mut batch_idempotency_keys: std::collections::HashMap<(String, String, String), Vec<i64>> =
+        std::collections::HashMap::new();
     let mut sequence_pool = SequencePool::new();
     let batch_len = batch.len();
 
     for (idx, item) in batch.into_iter().enumerate() {
-        // `decide_command_in_tx` never writes anything, but it does run
-        // directly on `tx` (not a disposable transaction of its own) so
-        // that the `SequencePool` draw below can too - see that
-        // function's and `SequencePool`'s own doc comments. Wrapped in
-        // its own tiny `SAVEPOINT` anyway, purely so a genuine DB error
-        // from its one `tx`-scoped read (`lookup_idempotency_key`) can't
-        // abort `tx` itself and take every command still queued behind
-        // this one down with it - the same isolation guarantee the old,
-        // unsplit function got for free from being called inside a
-        // per-command `SAVEPOINT` already.
-        let mut decide_tx = tx.begin().await?;
+        // `decide_command_in_tx` never touches `tx` at all - every read it
+        // does runs against `pool` or this loop's own in-memory
+        // accumulators (see its own doc comment) - so, unlike the sequence
+        // draw and `finish_accepted_command_in_tx` below, it needs no
+        // `SAVEPOINT` of its own: there is no `tx`-scoped statement here
+        // for one to isolate a DB error from.
+        let decide_started = std::time::Instant::now();
         let decide_result = decide_command_in_tx(
-            &mut decide_tx,
             pool,
             dispatcher,
             &item.command_type,
@@ -7068,22 +7445,19 @@ pub async fn commit_command_batch(
             item.idempotency_key.as_deref(),
             locked_highest,
             &extra_committed_events,
+            &batch_idempotency_keys,
             item.event_types_by_name,
         )
         .await;
+        decide_total += decide_started.elapsed();
 
         let decided = match decide_result {
             Ok(DecideOutcome::Terminal(outcome)) => {
-                decide_tx.commit().await?;
                 results.push(Ok(outcome));
                 continue;
             }
-            Ok(DecideOutcome::Accepted(decided)) => {
-                decide_tx.commit().await?;
-                decided
-            }
+            Ok(DecideOutcome::Accepted(decided)) => decided,
             Err(e) => {
-                decide_tx.rollback().await?;
                 results.push(Err(e));
                 continue;
             }
@@ -7097,15 +7471,17 @@ pub async fn commit_command_batch(
         // upper bound on how many single-event commands could still
         // share whatever this refill provisions.
         let refill_hint = (batch_len - idx) as i64;
-        let sequences = match sequence_pool
+        let sequence_started = std::time::Instant::now();
+        let sequence_result = sequence_pool
             .take(
                 &mut tx,
                 &bounded_context_name,
                 decided.event_specs.len() as i64,
                 refill_hint,
             )
-            .await
-        {
+            .await;
+        sequence_total += sequence_started.elapsed();
+        let sequences = match sequence_result {
             Ok(sequences) => sequences,
             Err(e) => {
                 // A failure bumping `{schema}.sequence` on `tx` itself -
@@ -7120,6 +7496,16 @@ pub async fn commit_command_batch(
             }
         };
 
+        // Captured before `finish_accepted_command_in_tx` below moves
+        // `item.resolved` out of `item` - needed afterward, once the
+        // command's own outcome is known, to record its idempotency key
+        // (if any) into `batch_idempotency_keys` for the next command's
+        // own `decide_command_in_tx` to see.
+        let command_type_name = item.command_type.name.clone();
+        let client_id = item.client_id.clone();
+        let idempotency_key = item.idempotency_key.clone();
+
+        let persist_started = std::time::Instant::now();
         let mut nested = tx.begin().await?;
         let outcome = finish_accepted_command_in_tx(
             &mut nested,
@@ -7147,9 +7533,18 @@ pub async fn commit_command_batch(
                 // same batch, but still no more durable than the rest of
                 // `tx` until the one `tx.commit()` below succeeds.
                 nested.commit().await?;
+                persist_total += persist_started.elapsed();
                 sequence_pool.confirm_last_draw();
                 if let SubmitCommandOutcome::Accepted { ref events, .. } = outcome {
                     extra_committed_events.extend(events.iter().cloned());
+                    if let Some(key) = idempotency_key {
+                        let triggered_event_sequences: Vec<i64> =
+                            events.iter().map(|e| e.sequence).collect();
+                        batch_idempotency_keys.insert(
+                            (command_type_name, client_id, key),
+                            triggered_event_sequences,
+                        );
+                    }
                 }
                 results.push(Ok(outcome));
             }
@@ -7162,6 +7557,7 @@ pub async fn commit_command_batch(
                 // `tx.begin()` reuses it, not merely queued by a
                 // fire-and-forget `Drop`.
                 nested.rollback().await?;
+                persist_total += persist_started.elapsed();
                 sequence_pool.return_last_draw();
                 results.push(Err(e));
             }
@@ -7171,7 +7567,20 @@ pub async fn commit_command_batch(
     sequence_pool
         .shrink_back(&mut tx, &bounded_context_name)
         .await?;
+    let commit_started = std::time::Instant::now();
     tx.commit().await?;
+    let commit_elapsed = commit_started.elapsed();
+
+    tracing::info!(
+        bounded_context = %bounded_context_name,
+        batch_size = batch_len,
+        decide_us = decide_total.as_micros(),
+        sequence_us = sequence_total.as_micros(),
+        persist_us = persist_total.as_micros(),
+        commit_us = commit_elapsed.as_micros(),
+        "command batch phase timing"
+    );
+
     Ok(results)
 }
 

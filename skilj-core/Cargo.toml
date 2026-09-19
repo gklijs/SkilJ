@@ -47,6 +47,13 @@ arc-swap.workspace = true
 # persistently-failing occurrence. See docs/architecture.md's
 # parked-deliveries section.
 skilj-retry.workspace = true
+# `commit_command_batch`'s own `finish_accepted_command_in_tx`: resolving
+# several distinct EncryptionKey subjects (a command's payload plus its
+# accepted events') concurrently instead of one at a time inside the
+# batch leader's held lock - `try_join_all`. Also used by this crate's
+# own warm-up concurrency test below, which is what first pulled this
+# crate in.
+futures-util.workspace = true
 
 [dev-dependencies]
 postgresql_embedded = "0.21.0"
@@ -64,8 +71,3 @@ tracing-subscriber.workspace = true
 # (`opentelemetry_sdk::metrics::InMemoryMetricExporter`) the metrics
 # test uses instead of a real OTLP collector.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-# Codeberg issue #15: only for a real, timed A/B comparison of sequential
-# vs. `buffer_unordered` concurrent fan-out over per-bounded-context
-# warm-up work, proving the concurrency actually helps rather than
-# assuming it from the code shape alone.
-futures-util.workspace = true
