@@ -585,6 +585,8 @@ impl Skilj {
             // Codeberg issue #36's own recommendation #3 - matches
             // `command_batcher::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT`.
             command_batch_idle_in_transaction_timeout: std::time::Duration::from_secs(30),
+            command_batch_max_size: skilj_core::command_batcher::DEFAULT_MAX_BATCH_SIZE,
+            command_batch_max_concurrent_leaders: None,
             encryption_master_key: None,
             event_broadcast_capacity: 1024,
             event_cache_warm_up_count: 1000,
@@ -1222,6 +1224,8 @@ pub struct SkiljBuilder {
     projection_query_wait_timeout: std::time::Duration,
     read_cursor_checkout_lease: std::time::Duration,
     command_batch_idle_in_transaction_timeout: std::time::Duration,
+    command_batch_max_size: usize,
+    command_batch_max_concurrent_leaders: Option<usize>,
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
@@ -1483,6 +1487,23 @@ impl SkiljBuilder {
         self
     }
 
+    /// The most commands one bounded-context lock acquisition processes
+    /// (default 256) - see `CommandBatcher::with_max_batch_size` and
+    /// docs/performance.md.
+    pub fn command_batch_max_size(mut self, max_size: usize) -> Self {
+        self.command_batch_max_size = max_size;
+        self
+    }
+
+    /// The most batch leaders running at once across all bounded contexts
+    /// (default: half the pool's `max_connections`) - see
+    /// `CommandBatcher::with_max_concurrent_leaders` and
+    /// docs/performance.md.
+    pub fn command_batch_max_concurrent_leaders(mut self, max_leaders: usize) -> Self {
+        self.command_batch_max_concurrent_leaders = Some(max_leaders);
+        self
+    }
+
     /// `protect_sensitive_fields`'s own envelope-encryption master key -
     /// see `skilj_core::encryption`'s own module doc comment for the full
     /// design. Optional: a bounded context with no real `sensitive_fields`
@@ -1692,7 +1713,12 @@ impl SkiljBuilder {
         // iterations - safe to run out of order.
         let event_cache = EventCache::new(self.event_cache_warm_up_count);
         let command_batcher = skilj_core::command_batcher::CommandBatcher::new()
-            .with_idle_in_transaction_timeout(self.command_batch_idle_in_transaction_timeout);
+            .with_idle_in_transaction_timeout(self.command_batch_idle_in_transaction_timeout)
+            .with_max_batch_size(self.command_batch_max_size);
+        let command_batcher = match self.command_batch_max_concurrent_leaders {
+            Some(n) => command_batcher.with_max_concurrent_leaders(n),
+            None => command_batcher,
+        };
         stream::iter(bounded_contexts_for_warm_up)
             .map(|bc| {
                 let pool = &pool;

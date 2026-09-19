@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: breaking changes may land in minor/patch versions until 1.0).
 
+## [Unreleased]
+
+### Added
+
+- Group-commit command batching: concurrent commands to the same bounded
+  context now share one lock acquisition and one commit, raising measured
+  single-bounded-context throughput from ~27/s to ~45-60/s in the
+  `skilj-helpdesk` load test. Includes several rounds of round-trip cuts
+  inside the held lock (Codeberg issues #32, #35, #36). See
+  [docs/architecture.md §58-§62](docs/architecture.md) and the new
+  [docs/performance.md](docs/performance.md).
+- New builder options `command_batch_max_size` (default 256) and
+  `command_batch_max_concurrent_leaders` (default half the pool), plus
+  `CommandBatcher::with_max_batch_size` / `with_max_concurrent_leaders` and
+  `command_batcher::DEFAULT_MAX_BATCH_SIZE`.
+- `command_batch_idle_in_transaction_timeout` builder option: a backstop
+  that lets Postgres kill a stuck batch leader and release the
+  bounded-context lock.
+
+### Changed
+
+- **Breaking (pre-1.0):** `Error::BatchFailed` is now
+  `BatchFailed { code, message }` instead of `BatchFailed(String)`. Its
+  `code()` reports the original error's code rather than a fixed
+  `database_error`.
+- Per-batch timing log lines are now `debug` instead of `info`.
+
+### Fixed
+
+- A batch leader whose request future was dropped (client disconnect,
+  timeout) could leave later commands to that bounded context waiting
+  forever; stranded followers now get a retryable `BatchFailed` and the
+  next request becomes leader.
+- More than the max batch size queued commands could leave the remainder
+  unprocessed forever; the leader now keeps draining until the queue is
+  empty.
+- Batch leaders are capped so they cannot exhaust the connection pool
+  waiting on each other.
+
 ## [0.0.7] - 2026-09-17
 
 ### Added

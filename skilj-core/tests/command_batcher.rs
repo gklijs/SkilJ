@@ -680,3 +680,156 @@ fn a_cancelled_batch_leader_does_not_strand_followers_or_wedge_the_queue() {
         assert!(matches!(fresh, SubmitCommandOutcome::Accepted { .. }));
     });
 }
+
+#[test]
+fn a_small_configured_max_batch_size_still_answers_every_queued_command() {
+    // `with_max_batch_size(3)` forces the remainder-draining loop to run
+    // several times for 20 commands, and `with_max_concurrent_leaders(1)`
+    // exercises the leader semaphore's explicit override.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+
+        let held = db::begin_command_batch_leader_tx(&pool, &bc.name, None)
+            .await
+            .unwrap();
+
+        let batcher = CommandBatcher::new()
+            .with_max_batch_size(3)
+            .with_max_concurrent_leaders(1);
+        let dispatcher = Arc::new(ShipOrderDispatcher);
+        let broadcaster = Arc::new(EventBroadcaster::new(64));
+        let event_cache = Arc::new(EventCache::new(1000));
+
+        const CONCURRENCY: usize = 20;
+        let mut handles = Vec::new();
+        for i in 0..CONCURRENCY {
+            let (pool, batcher, dispatcher, broadcaster, event_cache, ct) = (
+                pool.clone(),
+                batcher.clone(),
+                dispatcher.clone(),
+                broadcaster.clone(),
+                event_cache.clone(),
+                ct.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                submit(
+                    &pool,
+                    &batcher,
+                    &dispatcher,
+                    &broadcaster,
+                    &event_cache,
+                    &ct,
+                    &format!(r#"{{"order_id":"order-{i}"}}"#),
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        drop(held);
+
+        for handle in handles {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+                .await
+                .expect("a queued command was stranded")
+                .unwrap()
+                .unwrap();
+            assert!(matches!(outcome, SubmitCommandOutcome::Accepted { .. }));
+        }
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), CONCURRENCY);
+    });
+}
+
+#[test]
+fn random_client_disconnects_under_load_never_wedge_the_queue() {
+    // Churn: many submitters, roughly every third aborted at a staggered
+    // moment (leaders and followers alike, before and after they join the
+    // queue). Afterwards a fresh submission must still complete promptly,
+    // and every surviving submitter must have gotten *some* answer.
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+
+        let batcher = CommandBatcher::new().with_max_batch_size(8);
+        let dispatcher = Arc::new(ShipOrderDispatcher);
+        let broadcaster = Arc::new(EventBroadcaster::new(64));
+        let event_cache = Arc::new(EventCache::new(1000));
+
+        const CONCURRENCY: usize = 90;
+        let mut survivors = Vec::new();
+        for i in 0..CONCURRENCY {
+            let (pool, batcher, dispatcher, broadcaster, event_cache, ct) = (
+                pool.clone(),
+                batcher.clone(),
+                dispatcher.clone(),
+                broadcaster.clone(),
+                event_cache.clone(),
+                ct.clone(),
+            );
+            let handle = tokio::spawn(async move {
+                submit(
+                    &pool,
+                    &batcher,
+                    &dispatcher,
+                    &broadcaster,
+                    &event_cache,
+                    &ct,
+                    &format!(r#"{{"order_id":"churn-{i}"}}"#),
+                )
+                .await
+            });
+            if i % 3 == 0 {
+                let abort = handle.abort_handle();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis((i as u64 % 7) * 4)).await;
+                    abort.abort();
+                });
+            } else {
+                survivors.push(handle);
+            }
+        }
+
+        for handle in survivors {
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), handle)
+                .await
+                .expect("a surviving submitter hung after other clients disconnected")
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(SubmitCommandOutcome::Accepted { .. })
+                        | Err(skilj_core::error::Error::BatchFailed { .. })
+                ),
+                "unexpected outcome: {outcome:?}"
+            );
+        }
+
+        let fresh = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            submit(
+                &pool,
+                &batcher,
+                &dispatcher,
+                &broadcaster,
+                &event_cache,
+                &ct,
+                r#"{"order_id":"after-churn"}"#,
+            ),
+        )
+        .await
+        .expect("the queue is wedged after client-disconnect churn")
+        .unwrap();
+        assert!(matches!(fresh, SubmitCommandOutcome::Accepted { .. }));
+    });
+}

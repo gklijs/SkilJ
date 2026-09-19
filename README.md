@@ -114,6 +114,8 @@ banking and courses) if you want to see more before committing.
 - [`docs/architecture.md`](docs/architecture.md) - how that's actually built in Rust, including
   the reasoning behind each design decision. It's written as a running design log, so later
   sections assume you've read the earlier ones.
+- [`docs/performance.md`](docs/performance.md) - what limits command throughput, measured
+  numbers, and the batching knobs.
 - [`docs/rest-event-reading.md`](docs/rest-event-reading.md) - the three ways to consume the REST
   event stream and when to use each.
 - [`docs/temporal-integration.md`](docs/temporal-integration.md) - pairing skilj with

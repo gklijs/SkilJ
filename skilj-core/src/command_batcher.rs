@@ -42,7 +42,7 @@
 //! accumulate in that same window, producing a *larger* batch precisely
 //! when amortising the lock acquisition matters most. No artificial
 //! sleep, no fixed batch-size cap needed for this to self-tune (though
-//! `MAX_BATCH_SIZE` below still bounds the pathological case).
+//! the configured max batch size below still bounds the pathological case).
 //!
 //! **Correctness, not just throughput**: every invariant `submit_command`
 //! itself guarantees still holds, unweakened - see `db::submit_command_batch`'s
@@ -68,7 +68,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{oneshot, RwLock, Semaphore};
 
-/// A hard ceiling on how many commands one lock acquisition processes,
+/// The default for [`CommandBatcher::with_max_batch_size`]. A hard ceiling on how many commands one lock acquisition processes,
 /// regardless of how many piled up while the leader waited for the
 /// lock - a pathological worst case (thousands of callers queued behind
 /// one very slow commit) still bounds one batch's own lock hold time and
@@ -76,7 +76,7 @@ use tokio::sync::{oneshot, RwLock, Semaphore};
 /// (the same leader keeps draining and processing follow-up batches until
 /// the queue is empty - see `run_as_leader` - so nothing is lost or
 /// dropped, just processed one batch later).
-const MAX_BATCH_SIZE: usize = 256;
+pub const DEFAULT_MAX_BATCH_SIZE: usize = 256;
 
 /// One caller's request, sitting in a per-bounded-context queue - see
 /// this module's own doc comment. Every entry carries a `reply` sender,
@@ -94,7 +94,7 @@ type Queue = Arc<Mutex<Vec<PendingCommand>>>;
 /// The default for [`CommandBatcher::with_idle_in_transaction_timeout`] -
 /// see that method's own doc comment. 30 seconds is generous for
 /// everything a batch leader's own transaction legitimately does (one row
-/// lock, a handful of metadata reads, up to `MAX_BATCH_SIZE` commands'
+/// lock, a handful of metadata reads, up to the configured max batch size commands'
 /// worth of decider/projection work, all of it CPU-bound or against the
 /// same already-warm database), so tripping it is always a real stall,
 /// never an ordinary slow batch.
@@ -114,6 +114,8 @@ pub struct CommandBatcher {
     /// context, sized lazily from the pool's own `max_connections` - see
     /// `leader_permits`.
     leader_permits: Arc<std::sync::OnceLock<Arc<Semaphore>>>,
+    max_batch_size: usize,
+    max_concurrent_leaders: Option<usize>,
 }
 
 impl Default for CommandBatcher {
@@ -128,7 +130,29 @@ impl CommandBatcher {
             queues: Arc::new(RwLock::new(HashMap::new())),
             idle_in_transaction_timeout: DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT,
             leader_permits: Arc::new(std::sync::OnceLock::new()),
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            max_concurrent_leaders: None,
         }
+    }
+
+    /// The most commands one lock acquisition processes (default
+    /// [`DEFAULT_MAX_BATCH_SIZE`]). A larger value amortizes the lock and
+    /// commit over more commands; a smaller one bounds how long one batch
+    /// holds the bounded-context lock and how much work a single failed
+    /// batch takes down with it. Values below 1 are treated as 1.
+    pub fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
+        self.max_batch_size = max_batch_size.max(1);
+        self
+    }
+
+    /// The most batch leaders that may run at once across all bounded
+    /// contexts (each pins one pool connection for its whole batch).
+    /// Defaults to half the pool's `max_connections` (minimum 1) - see
+    /// `leader_permits`. Values below 1 are treated as 1. Must be set
+    /// before the first command is submitted.
+    pub fn with_max_concurrent_leaders(mut self, max_concurrent_leaders: usize) -> Self {
+        self.max_concurrent_leaders = Some(max_concurrent_leaders.max(1));
+        self
     }
 
     /// At most half the pool (minimum one) may be pinned by batch leaders
@@ -140,7 +164,9 @@ impl CommandBatcher {
     fn leader_permits(&self, pool: &Pool) -> Arc<Semaphore> {
         self.leader_permits
             .get_or_init(|| {
-                let permits = (pool.options().get_max_connections() as usize / 2).max(1);
+                let permits = self
+                    .max_concurrent_leaders
+                    .unwrap_or((pool.options().get_max_connections() as usize / 2).max(1));
                 Arc::new(Semaphore::new(permits))
             })
             .clone()
@@ -352,7 +378,7 @@ impl CommandBatcher {
     /// plus the real `SELECT ... FOR UPDATE` wait) is exactly the window
     /// other callers keep queueing behind; only once that's done do we
     /// drain the queue (taking everyone who joined, capped at
-    /// `MAX_BATCH_SIZE`), so the batch this call ends up processing can
+    /// the configured max batch size), so the batch this call ends up processing can
     /// be considerably larger than one.
     ///
     /// Codeberg issue #36: this ordering - lock first, drain second - used
@@ -365,7 +391,7 @@ impl CommandBatcher {
     /// `is_leader` check), and a queue nobody drains never goes empty.
     ///
     /// Two further guarantees keep that invariant true:
-    /// - **Over-cap remainder**: if more than `MAX_BATCH_SIZE` commands
+    /// - **Over-cap remainder**: if more than the configured max batch size commands
     ///   are queued, this leader keeps going - lock, drain, process -
     ///   until a drain empties the queue, and only then returns its own
     ///   (already-known) result. No one else can become leader while the
@@ -413,7 +439,7 @@ impl CommandBatcher {
                 Some(self.idle_in_transaction_timeout),
             )
             .await;
-            tracing::info!(
+            tracing::debug!(
                 bounded_context = %bounded_context_name,
                 lock_wait_us = lock_wait_started.elapsed().as_micros(),
                 "command batch leader lock wait"
@@ -422,7 +448,7 @@ impl CommandBatcher {
             // Never empty on the first pass (the leader's own entry is
             // in there); on later passes only entered when the previous
             // drain reported a remainder, which nobody else can take.
-            let (pending, more_remaining) = drain_up_to(queue, MAX_BATCH_SIZE);
+            let (pending, more_remaining) = drain_up_to(queue, self.max_batch_size);
             if !more_remaining {
                 // Atomic with the drain above (no await between them):
                 // the queue is empty, so leadership is released.

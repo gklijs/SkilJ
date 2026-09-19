@@ -7397,13 +7397,13 @@ pub async fn commit_command_batch(
     // docs/load-test-report-2026-09-18*.md's own "skipped OTel/Grafana"
     // reasoning. The histogram is the lasting instrument; this is the
     // zero-infra way to read it for one investigation.
-    tracing::info!(
+    tracing::debug!(
         bounded_context = %bounded_context_name,
         batch_size = batch.len(),
         "command batch committed"
     );
 
-    // Temporary per-phase wall-clock accumulators (Codeberg issue #32,
+    // Per-phase wall-clock accumulators (Codeberg issue #32,
     // round four investigation) - the batch-size histogram above already
     // ruled out "batches aren't forming large enough to amortise" as the
     // explanation for the flat ~27/s ceiling; this is the next
@@ -7589,7 +7589,7 @@ pub async fn commit_command_batch(
     tx.commit().await?;
     let commit_elapsed = commit_started.elapsed();
 
-    tracing::info!(
+    tracing::debug!(
         bounded_context = %bounded_context_name,
         batch_size = batch_len,
         decide_us = decide_total.as_micros(),
