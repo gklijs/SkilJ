@@ -279,7 +279,12 @@ async fn setup() -> (
         .await
         .unwrap();
 
+    // Small per-instance pool: every test leaks a live `Skilj`, so the default
+    // 10-connection pools of ~10 tests exhaust the shared embedded Postgres's
+    // 100 connections and the last `build()` fails with `PoolTimedOut`.
+
     let (skilj, report) = Skilj::builder(database_url)
+        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
         .bounded_context(bc_name.clone())
         .event_type::<MoneyDeposited>()
         .command_type::<WithdrawMoney>()

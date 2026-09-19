@@ -172,7 +172,12 @@ async fn setup() -> (Skilj, String, String) {
         .await
         .unwrap();
 
+    // Small per-instance pool: every test leaks a live `Skilj`, so the default
+    // 10-connection pools of ~10 tests exhaust the shared embedded Postgres's
+    // 100 connections and the last `build()` fails with `PoolTimedOut`.
+
     let (skilj, report) = Skilj::builder(database_url)
+        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
         .bounded_context(bc_name.clone())
         .event_type::<MoneyDeposited>()
         .reconciliation_role(external_subject)
@@ -538,7 +543,12 @@ fn a_latest_token_never_serves_history_that_predates_its_own_minting() {
             .await
             .unwrap();
 
+        // Small per-instance pool: every test leaks a live `Skilj`, so the default
+        // 10-connection pools of ~10 tests exhaust the shared embedded Postgres's
+        // 100 connections and the last `build()` fails with `PoolTimedOut`.
+
         let (skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .reconciliation_role(external_subject)
@@ -678,7 +688,12 @@ fn an_at_sequence_token_replays_history_after_a_chosen_cutoff_but_not_before_it(
             .await
             .unwrap();
 
+        // Small per-instance pool: every test leaks a live `Skilj`, so the default
+        // 10-connection pools of ~10 tests exhaust the shared embedded Postgres's
+        // 100 connections and the last `build()` fails with `PoolTimedOut`.
+
         let (skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .reconciliation_role(external_subject)
@@ -808,7 +823,12 @@ fn an_at_time_token_replays_history_after_a_chosen_cutoff_but_not_before_it() {
             .await
             .unwrap();
 
+        // Small per-instance pool: every test leaks a live `Skilj`, so the default
+        // 10-connection pools of ~10 tests exhaust the shared embedded Postgres's
+        // 100 connections and the last `build()` fails with `PoolTimedOut`.
+
         let (skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .reconciliation_role(external_subject)
