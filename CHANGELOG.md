@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   just removed panicked (seven `.expect()` sites in `skilj-core::db`)
   instead of returning an error; it now returns `RowNotFound` like any
   other database error.
+- Follow-up sweep of the same panic shape one level deeper: reading an
+  `EventType`/`CommandType`/`Command` row that a concurrent
+  `DeleteBoundedContext` had just taken out from under an in-flight
+  `list_events`/`list_events_from`/access-token/command-conversion call
+  also panicked instead of erroring (11 more sites, via new
+  `require_event_type`/`require_command_type`/`require_command`
+  helpers). Two lookalike sites were checked and deliberately left as
+  panics: their own batch query already fails loudly on a dropped schema
+  before ever reaching the lookup, so a miss there is a genuine data
+  inconsistency, not this race.
 
 ### Security
 

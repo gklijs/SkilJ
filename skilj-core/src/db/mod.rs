@@ -2116,6 +2116,44 @@ async fn require_bounded_context(pool: &Pool, name: &str) -> crate::error::Resul
         .ok_or_else(|| sqlx::Error::RowNotFound.into())
 }
 
+/// Like [`require_bounded_context`], for an `EventType` a caller already
+/// has a stored reference to (an `events`/`access_tokens` row's own
+/// `event_type_name`) - the identical `hard_delete_bounded_context` race
+/// applies: the whole schema, `event_types` included, can vanish between
+/// an earlier query in the same function and this one.
+async fn require_event_type(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+) -> crate::error::Result<EventType> {
+    get_event_type(pool, bounded_context, name)
+        .await?
+        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+}
+
+/// [`require_event_type`]'s `CommandType` sibling.
+async fn require_command_type(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+) -> crate::error::Result<CommandType> {
+    get_command_type(pool, bounded_context, name)
+        .await?
+        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+}
+
+/// [`require_event_type`]'s `Command` sibling, for an `events` row's own
+/// `origin_command_id`.
+async fn require_command(
+    pool: &Pool,
+    bounded_context: &str,
+    id: i64,
+) -> crate::error::Result<Command> {
+    get_command_by_id(pool, bounded_context, id)
+        .await?
+        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+}
+
 #[tracing::instrument(skip_all, fields(name = %name))]
 pub async fn get_bounded_context(
     pool: &Pool,
@@ -3193,9 +3231,8 @@ impl CommandRow {
         pool: &Pool,
         bounded_context: &str,
     ) -> crate::error::Result<Command> {
-        let command_type = get_command_type(pool, bounded_context, &self.command_type_name)
-            .await?
-            .expect("commands row references a command_types row that no longer exists");
+        let command_type =
+            require_command_type(pool, bounded_context, &self.command_type_name).await?;
         Ok(Command {
             id: self.external_id,
             bounded_context: command_type.bounded_context.clone(),
@@ -3351,6 +3388,15 @@ async fn get_commands_by_ids_with_bc(
 
     let mut commands = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
+        // Unlike `get_command_type`'s own lookup (see `require_command_type`),
+        // `get_command_types_by_names_with_bc` queries `{schema}.command_types`
+        // directly with the `bc` already in hand - no internal existence
+        // recheck to silently swallow. A `hard_delete_bounded_context` race
+        // dropping the schema between the `commands` query above and this one
+        // surfaces as a real `sqlx::Error` from that `.await?`, not a `None`
+        // reaching this lookup - so a genuine miss here is a real bug in the
+        // data (a `commands` row outliving the `command_types` row it names),
+        // not a race, and this stays a panic.
         let command_type = command_types
             .get(&row.command_type_name)
             .expect("commands row references a command_types row that no longer exists")
@@ -4841,9 +4887,7 @@ async fn event_origin_from_row(
         "command_triggered" => {
             let command_id =
                 command_id.expect("command_triggered event row without origin_command_id");
-            let command = get_command_by_id(pool, bounded_context, command_id)
-                .await?
-                .expect("events row references a commands row that no longer exists");
+            let command = require_command(pool, bounded_context, command_id).await?;
             EventOrigin::CommandTriggered {
                 command: Box::new(command),
             }
@@ -4902,12 +4946,8 @@ pub async fn list_events(
     bounded_context: &str,
     event_type_name: &str,
 ) -> crate::error::Result<Vec<Event>> {
-    let bc = get_bounded_context(pool, bounded_context)
-        .await?
-        .expect("list_events: bounded_context row must exist for any event_type referencing it");
-    let et = get_event_type(pool, bounded_context, event_type_name)
-        .await?
-        .expect("list_events: event_type row must exist for any event referencing it");
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    let et = require_event_type(pool, bounded_context, event_type_name).await?;
 
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -4977,9 +5017,7 @@ pub async fn list_events_for_bounded_context(
     let mut events = Vec::with_capacity(rows.len());
     for row in rows {
         if !event_types.contains_key(&row.event_type_name) {
-            let et = get_event_type(pool, bounded_context, &row.event_type_name)
-                .await?
-                .expect("events row references an event_types row that no longer exists");
+            let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
             event_types.insert(row.event_type_name.clone(), et);
         }
         let origin = event_origin_from_row(
@@ -5042,9 +5080,7 @@ pub async fn list_events_for_bounded_context_from(
     let mut events = Vec::with_capacity(rows.len());
     for row in rows {
         if !event_types.contains_key(&row.event_type_name) {
-            let et = get_event_type(pool, bounded_context, &row.event_type_name)
-                .await?
-                .expect("events row references an event_types row that no longer exists");
+            let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
             event_types.insert(row.event_type_name.clone(), et);
         }
         let origin = event_origin_from_row(
@@ -5110,9 +5146,7 @@ pub async fn list_events_for_bounded_context_from_limited(
     let mut events = Vec::with_capacity(rows.len());
     for row in rows {
         if !event_types.contains_key(&row.event_type_name) {
-            let et = get_event_type(pool, bounded_context, &row.event_type_name)
-                .await?
-                .expect("events row references an event_types row that no longer exists");
+            let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
             event_types.insert(row.event_type_name.clone(), et);
         }
         let origin = event_origin_from_row(
@@ -5317,6 +5351,13 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
                 let command_id = row
                     .origin_command_id
                     .expect("command_triggered event row without origin_command_id");
+                // `commands_by_id` came from `get_commands_by_ids_with_bc`
+                // (see its own sibling note in `get_commands_by_ids_with_bc`
+                // above) - a `bc`-in-hand, no-recheck batch query, so a
+                // `hard_delete_bounded_context` race surfaces as a real
+                // `Err` before this lookup, not a silent miss. A genuine
+                // miss here is a real bug (an `events` row outliving the
+                // `commands` row it names), not a race.
                 let command = commands_by_id
                     .get(&command_id)
                     .expect("events row references a commands row that no longer exists");
@@ -5387,9 +5428,7 @@ pub async fn get_event_by_sequence(
         return Ok(None);
     };
 
-    let et = get_event_type(pool, bounded_context, &row.event_type_name)
-        .await?
-        .expect("events row references an event_types row that no longer exists");
+    let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
     let origin = event_origin_from_row(
         pool,
         bounded_context,
@@ -5447,9 +5486,7 @@ pub async fn list_recent_events_for_bounded_context(
     let mut events = Vec::with_capacity(rows.len());
     for row in rows {
         if !event_types.contains_key(&row.event_type_name) {
-            let et = get_event_type(pool, bounded_context, &row.event_type_name)
-                .await?
-                .expect("events row references an event_types row that no longer exists");
+            let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
             event_types.insert(row.event_type_name.clone(), et);
         }
         let origin = event_origin_from_row(
@@ -5497,9 +5534,7 @@ pub async fn list_events_from(
     after_sequence: i64,
 ) -> crate::error::Result<Vec<Event>> {
     let bc = require_bounded_context(pool, bounded_context).await?;
-    let et = get_event_type(pool, bounded_context, event_type_name)
-        .await?
-        .expect("list_events_from: event_type row must exist for any event referencing it");
+    let et = require_event_type(pool, bounded_context, event_type_name).await?;
 
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -11128,9 +11163,8 @@ macro_rules! get_event_type_access_token {
                 .columns
                 .event_type_name
                 .expect(concat!($kind, " access_tokens row without event_type_name"));
-            let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
-                .await?
-                .expect("access_tokens row references an event_type that no longer exists");
+            let event_type =
+                require_event_type(pool, &row.bounded_context, &event_type_name).await?;
             Ok(Some($return_type {
                 id: row.columns.id,
                 secret: row.columns.secret,
@@ -11173,9 +11207,7 @@ pub async fn get_event_read_token(
         .columns
         .event_type_name
         .expect("event_read access_tokens row without event_type_name");
-    let event_type = get_event_type(pool, &row.bounded_context, &event_type_name)
-        .await?
-        .expect("access_tokens row references an event_type that no longer exists");
+    let event_type = require_event_type(pool, &row.bounded_context, &event_type_name).await?;
     Ok(Some(EventReadToken {
         id: row.columns.id,
         secret: row.columns.secret,
@@ -11208,9 +11240,7 @@ pub async fn get_command_token(
         .columns
         .command_type_name
         .expect("command access_tokens row without command_type_name");
-    let command_type = get_command_type(pool, &row.bounded_context, &command_type_name)
-        .await?
-        .expect("access_tokens row references a command_type that no longer exists");
+    let command_type = require_command_type(pool, &row.bounded_context, &command_type_name).await?;
     Ok(Some(CommandToken {
         id: row.columns.id,
         secret: row.columns.secret,

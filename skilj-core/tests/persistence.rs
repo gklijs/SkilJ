@@ -1799,6 +1799,33 @@ fn reading_a_hard_deleted_bounded_context_errors_instead_of_panicking() {
     });
 }
 
+/// `list_events`/`list_events_from` take an `event_type_name` the caller
+/// already resolved from somewhere else - a `hard_delete_bounded_context`
+/// race can make it stale for the same reason a stale `bounded_context`
+/// name can (`get_event_type` internally rechecks the registry row and
+/// comes back `None` once it's gone) - but a plain unregistered name on a
+/// bounded context that's still very much alive reaches the exact same
+/// `require_event_type` call and used to panic identically. Cheaper to
+/// trigger deterministically than the true race, and just as real a way
+/// to reach it: any caller passing a name that was never registered for
+/// this bounded context, not only a raced-out one.
+#[test]
+fn listing_events_for_an_unregistered_event_type_errors_instead_of_panicking() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+
+        assert!(db::list_events(&pool, &bc.name, "NoSuchEventType")
+            .await
+            .is_err());
+        assert!(db::list_events_from(&pool, &bc.name, "NoSuchEventType", 0)
+            .await
+            .is_err());
+    });
+}
+
 // --- EncryptionKey (§SubjectErasure) ---
 
 #[test]
