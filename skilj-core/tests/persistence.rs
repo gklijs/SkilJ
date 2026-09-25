@@ -1777,6 +1777,28 @@ fn hard_delete_drops_the_schema_and_cascades_the_registry_row() {
     });
 }
 
+/// A read against a bounded context that has been hard-deleted (or never
+/// existed) must come back as an `Err`, not a panic: the caller's own
+/// access check can pass just before a concurrent `DeleteBoundedContext`
+/// lands, and a panic here takes the whole request task down with it
+/// instead of surfacing as an ordinary error response.
+#[test]
+fn reading_a_hard_deleted_bounded_context_errors_instead_of_panicking() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        db::hard_delete_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+
+        assert!(db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .is_err());
+    });
+}
+
 // --- EncryptionKey (§SubjectErasure) ---
 
 #[test]

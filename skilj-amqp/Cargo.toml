@@ -23,8 +23,8 @@ skilj-retry.workspace = true
 # rustls, not native-tls: the same TLS backend choice this workspace's
 # own `reqwest`/`jsonwebtoken` dependencies already make - Solace/Azure
 # Service Bus both require TLS (`amqps://`) in any real deployment.
-fe2o3-amqp = { version = "0.17", features = ["rustls"] }
-fe2o3-amqp-types = "0.17"
+fe2o3-amqp = { version = "0.18", features = ["rustls"] }
+fe2o3-amqp-types = "0.18"
 
 [lib]
 name = "skilj_amqp"

@@ -2104,6 +2104,18 @@ fn bounded_context_from_row(
     }
 }
 
+/// Like `get_bounded_context`, for callers that already hold a name they
+/// expect to exist. A missing row still comes back as an ordinary
+/// `sqlx::Error::RowNotFound` rather than a panic: the caller's own access
+/// check can pass just before a concurrent `hard_delete_bounded_context`
+/// lands, and that race must surface as an error response, not take the
+/// request task down.
+async fn require_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<BoundedContext> {
+    get_bounded_context(pool, name)
+        .await?
+        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+}
+
 #[tracing::instrument(skip_all, fields(name = %name))]
 pub async fn get_bounded_context(
     pool: &Pool,
@@ -2834,9 +2846,7 @@ pub async fn get_or_create_encryption_key(
     subject_value: &str,
     master_key: &EncryptionMasterKey,
 ) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
-    let bc = get_bounded_context(pool, bounded_context).await?.expect(
-        "get_or_create_encryption_key: bounded_context row must exist for any caller reaching this",
-    );
+    let bc = require_bounded_context(pool, bounded_context).await?;
     let schema = schema_ident(bounded_context);
 
     if let Some(row) =
@@ -4950,9 +4960,7 @@ pub async fn list_events_for_bounded_context(
     pool: &Pool,
     bounded_context: &str,
 ) -> crate::error::Result<Vec<Event>> {
-    let bc = get_bounded_context(pool, bounded_context).await?.expect(
-        "list_events_for_bounded_context: bounded_context row must exist for any event referencing it",
-    );
+    let bc = require_bounded_context(pool, bounded_context).await?;
 
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -5015,9 +5023,7 @@ pub async fn list_events_for_bounded_context_from(
     bounded_context: &str,
     after_sequence: i64,
 ) -> crate::error::Result<Vec<Event>> {
-    let bc = get_bounded_context(pool, bounded_context).await?.expect(
-        "list_events_for_bounded_context_from: bounded_context row must exist for any event referencing it",
-    );
+    let bc = require_bounded_context(pool, bounded_context).await?;
 
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -5084,9 +5090,7 @@ pub async fn list_events_for_bounded_context_from_limited(
     after_sequence: i64,
     limit: i64,
 ) -> crate::error::Result<Vec<Event>> {
-    let bc = get_bounded_context(pool, bounded_context).await?.expect(
-        "list_events_for_bounded_context_from_limited: bounded_context row must exist for any event referencing it",
-    );
+    let bc = require_bounded_context(pool, bounded_context).await?;
 
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -5171,9 +5175,7 @@ pub async fn list_events_for_bounded_context_matching_tags(
         return Ok(Vec::new());
     }
 
-    let bc = get_bounded_context(pool, bounded_context).await?.expect(
-        "list_events_for_bounded_context_matching_tags: bounded_context row must exist for any event referencing it",
-    );
+    let bc = require_bounded_context(pool, bounded_context).await?;
     list_events_for_bounded_context_matching_tags_with_bc(pool, &bc, tags, after_sequence, None)
         .await
 }
@@ -5426,10 +5428,7 @@ pub async fn list_recent_events_for_bounded_context(
     bounded_context: &str,
     limit: usize,
 ) -> crate::error::Result<Vec<Event>> {
-    let bc = get_bounded_context(pool, bounded_context).await?.expect(
-        "list_recent_events_for_bounded_context: bounded_context row must exist for any event \
-         referencing it",
-    );
+    let bc = require_bounded_context(pool, bounded_context).await?;
 
     let schema = schema_ident(bounded_context);
     let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -5497,9 +5496,7 @@ pub async fn list_events_from(
     event_type_name: &str,
     after_sequence: i64,
 ) -> crate::error::Result<Vec<Event>> {
-    let bc = get_bounded_context(pool, bounded_context).await?.expect(
-        "list_events_from: bounded_context row must exist for any event_type referencing it",
-    );
+    let bc = require_bounded_context(pool, bounded_context).await?;
     let et = get_event_type(pool, bounded_context, event_type_name)
         .await?
         .expect("list_events_from: event_type row must exist for any event referencing it");

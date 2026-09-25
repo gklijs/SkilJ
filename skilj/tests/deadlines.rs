@@ -588,11 +588,27 @@ fn a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag() {
              (differently-scheduled) CancelOrder deadline"
         );
 
-        let cancellations_state =
-            db::get_projection_state(&pool, ORDERS_BOUNDED_CONTEXT, "OrderCancellations", "")
-                .await
-                .unwrap()
-                .unwrap();
+        // Polled rather than read once: the reminders loop above only waits
+        // on `RemindersSent`, and under a loaded machine the
+        // `OrderCancellations` projection's own catch-up tick can land a
+        // moment later than that one's.
+        let mut cancellations_state = None;
+        for _ in 0..80 {
+            cancellations_state =
+                db::get_projection_state(&pool, ORDERS_BOUNDED_CONTEXT, "OrderCancellations", "")
+                    .await
+                    .unwrap();
+            if cancellations_state
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<OrderCancellationsState>(s).ok())
+                .is_some_and(|c| !c.cancelled_order_ids.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let cancellations_state = cancellations_state
+            .expect("OrderCancellations projection state never appeared within 2s");
         let cancellations: OrderCancellationsState =
             serde_json::from_str(&cancellations_state).unwrap();
         assert_eq!(

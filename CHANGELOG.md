@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `skilj-amqp`: `fe2o3-amqp`/`fe2o3-amqp-types` 0.17 -> 0.18 (upstream now
+  ships both; verified against the real Artemis broker tests).
+
+### Fixed
+
+- Reading a bounded context that a concurrent `DeleteBoundedContext` had
+  just removed panicked (seven `.expect()` sites in `skilj-core::db`)
+  instead of returning an error; it now returns `RowNotFound` like any
+  other database error.
+
+### Security
+
+- Lockfile bump of `rustls` 0.23.44 -> 0.23.45 for RUSTSEC-2026-0285
+  (TLS 1.3 handshake messages accepted across encryption level
+  boundaries). Reached only through optional/dev TLS paths (OTLP export
+  over `reqwest`, `fe2o3-amqp`, testcontainers' `bollard`); no source
+  change needed.
+
 ## [0.0.8] - 2026-09-19
 
 ### Added
