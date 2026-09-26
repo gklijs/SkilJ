@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `skilj-amqp`: `fe2o3-amqp`/`fe2o3-amqp-types` 0.17 -> 0.18 (upstream now
   ships both; verified against the real Artemis broker tests).
+- `skilj-core`: `jsonschema` 0.56 -> 0.58 (checked the two intervening
+  releases' changelogs against this crate's own narrow usage -
+  `validator_for`/`is_valid` only, `default-features = false` - none of
+  the breaking changes apply; picks up upstream fixes for a `oneOf`
+  canonicalization bug and two numeric-keyword panics).
 
 ### Fixed
 

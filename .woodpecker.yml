@@ -75,10 +75,20 @@ steps:
       # way (docs/architecture.md's own dep-bump/panic-fix passes hit
       # this exact trap under WSL). Capture the output and fail loudly
       # if that ever happens here, instead of trusting a green build.
+      # Only the Postgres-flavoured skip messages are checked, not every
+      # "skipping: ..." line: this container also has no Docker daemon,
+      # so the Kafka/AMQP/NATS/Temporal bridge tests skip on every CI
+      # run today too (a separate, pre-existing, already-accepted gap in
+      # CI's own coverage, not something to newly fail the build over -
+      # see CONTRIBUTING.md's own DOCKER_HOST note). Every Postgres skip
+      # site, direct or through the shared connect_and_migrate/
+      # check_reachable helpers, always names its source as either
+      # "embedded PostgreSQL" or "DATABASE_URL" (grep the workspace for
+      # `eprintln!("skipping:` to confirm before narrowing this further).
       - cargo test --workspace > /tmp/test-output.log 2>&1 || test_exit=$?
       - cat /tmp/test-output.log
       - |
-        if grep -q '^skipping: ' /tmp/test-output.log; then
+        if grep -qE '^skipping:.*(DATABASE_URL|PostgreSQL)' /tmp/test-output.log; then
           echo "ERROR: one or more Postgres-backed tests silently skipped (see the 'skipping: ...' lines above) instead of running - CI must never report green without actually exercising the persistence layer." >&2
           exit 1
         fi
