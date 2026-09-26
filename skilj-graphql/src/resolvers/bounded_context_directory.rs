@@ -3,7 +3,7 @@
 //! for real, and passes every context straight through unfiltered (see
 //! its own doc comment).
 
-use super::{load_bounded_context_with_mappings, require_caller};
+use super::{load_bounded_context_with_mappings, not_found, require_caller};
 use crate::error::to_graphql_error;
 use crate::gql_types::BoundedContextWithMappings;
 use crate::GraphqlState;
@@ -27,11 +27,19 @@ pub fn field() -> Field {
 
                 let mut with_mappings: Vec<BoundedContextWithMappings> =
                     Vec::with_capacity(listed.len());
+                // The widest window of this race in the codebase: an
+                // admin-facing "list everything" request that loops over
+                // every listed context doing real per-item work, while any
+                // one of them (an already-archived context is eligible)
+                // can be hard-deleted by a *different* concurrent request
+                // at any point during that loop - an ordinary error for
+                // that one item, not a panic that takes the whole listing
+                // (and the request serving it) down.
                 for bc in listed {
                     let loaded = load_bounded_context_with_mappings(&state.pool, &bc.name)
                         .await
                         .map_err(to_graphql_error)?
-                        .expect("just listed this bounded context - it must be readable back");
+                        .ok_or_else(|| not_found("BoundedContext", &bc.name))?;
                     with_mappings.push(loaded);
                 }
 

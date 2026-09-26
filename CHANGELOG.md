@@ -39,6 +39,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like any other failed redrive. New `skilj_core::error::Error::
   row_not_found()` gives `skilj-graphql` the same error shape `db`'s own
   `require_*` helpers use, without a new `sqlx` dependency just for it.
+- Same shape a third time, in four `skilj-graphql` mutations/queries that
+  each write or read a `BoundedContext` and then immediately reload it
+  with a nested `.expect("...it must still be there")`:
+  `archiveBoundedContext`, `deleteBoundedContext`,
+  `resyncBoundedContextFromTemplate`, and - the widest window of the
+  four, an admin "list everything" query looping over every listed
+  context doing real per-item work - `boundedContexts`. All four can
+  have a concurrent `deleteBoundedContext` land in the gap; all four now
+  return an ordinary `BoundedContext_not_found` GraphQL error instead of
+  panicking. A fifth, identical-looking site in `addBoundedContext` was
+  checked and left alone: `deleteBoundedContext` requires `Archived`,
+  and a context this call just inserted is `Active`, so that one
+  genuinely cannot race - documented inline instead of "fixed" into a
+  false positive.
 
 ### Security
 

@@ -7,7 +7,7 @@
 //! parameter, not an `Option`, so a caller with no mapping at all for
 //! this context needs a resolver-level rejection, not a library one.
 
-use super::{load_bounded_context_with_mappings, require_caller};
+use super::{load_bounded_context_with_mappings, not_found, require_caller};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -49,10 +49,17 @@ pub fn field() -> Field {
                     .await
                     .map_err(to_graphql_error)?;
 
+                // A concurrent `deleteBoundedContext` (which requires exactly
+                // the `Archived` status this request's own write above just
+                // gave it) could in principle land in the gap between that
+                // write and this reload - narrow (two sequential awaits,
+                // nothing else in between), but the same "ordinary error,
+                // not a panic" treatment every other version of this race
+                // gets elsewhere in this codebase.
                 let with_mappings = load_bounded_context_with_mappings(&state.pool, &name)
                     .await
                     .map_err(to_graphql_error)?
-                    .expect("just archived this bounded context - it must be readable back");
+                    .ok_or_else(|| not_found("BoundedContext", &name))?;
                 Ok(Some(FieldValue::owned_any(with_mappings)))
             })
         },

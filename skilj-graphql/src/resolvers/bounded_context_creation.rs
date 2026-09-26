@@ -32,6 +32,15 @@ pub fn field() -> Field {
                     .await
                     .map_err(to_graphql_error)?;
 
+                // Unlike the identical-looking reload in
+                // `bounded_context_archival`/`bounded_context_deletion`/
+                // `bounded_context_directory`/`bounded_context_templating`,
+                // this one really can't race a concurrent
+                // `deleteBoundedContext`: `bootstrap::delete_bounded_context`
+                // requires `Archived`, and a context this call just inserted
+                // is `Active` - it isn't yet eligible for deletion by
+                // anyone, so a missing row here would be a real bug in this
+                // function itself, not a race. Stays a panic.
                 let with_mappings = load_bounded_context_with_mappings(&state.pool, &name)
                     .await
                     .map_err(to_graphql_error)?

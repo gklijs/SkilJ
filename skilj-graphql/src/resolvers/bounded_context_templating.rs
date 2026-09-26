@@ -456,13 +456,16 @@ pub fn resync_bounded_context_from_template_field() -> Field {
                 )
                 .await?;
 
+                // `apply_template_registrations` above does real, multi-step
+                // work (registering event/command types), a genuinely wider
+                // window than the other versions of this race elsewhere in
+                // this codebase for a concurrent `deleteBoundedContext` to
+                // land in - an ordinary error, not a panic, same treatment.
                 let with_mappings =
                     load_bounded_context_with_mappings(&state.pool, &bounded_context_name)
                         .await
                         .map_err(to_graphql_error)?
-                        .expect(
-                            "just resynced this bounded context - it must still be readable back",
-                        );
+                        .ok_or_else(|| not_found("BoundedContext", &bounded_context_name))?;
                 Ok(Some(FieldValue::owned_any(with_mappings)))
             })
         },

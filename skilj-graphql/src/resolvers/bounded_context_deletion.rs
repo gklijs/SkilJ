@@ -3,7 +3,7 @@
 //! `BoundedContextArchival`'s per-context admin grant - see
 //! `bootstrap::delete_bounded_context`'s own doc comment).
 
-use super::{load_bounded_context_with_mappings, require_caller};
+use super::{load_bounded_context_with_mappings, not_found, require_caller};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -28,10 +28,16 @@ pub fn field() -> Field {
                     .await
                     .map_err(to_graphql_error)?
                     .ok_or_else(|| super::not_found("BoundedContext", &name))?;
+                // Two concurrent `deleteBoundedContext` calls for the same
+                // name (a caller's own timed-out retry, say) could have the
+                // first one's `hard_delete_bounded_context` land between
+                // this request's own `get_bounded_context` above and this
+                // reload - an ordinary error, not a panic, same as every
+                // other version of this race.
                 let with_mappings = load_bounded_context_with_mappings(&state.pool, &name)
                     .await
                     .map_err(to_graphql_error)?
-                    .expect("just loaded this bounded context above - it must still be there");
+                    .ok_or_else(|| not_found("BoundedContext", &name))?;
 
                 skilj_core::bootstrap::delete_bounded_context(&caller, &bounded_context)
                     .map_err(to_graphql_error)?;
