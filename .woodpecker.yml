@@ -1,11 +1,9 @@
 ## Codeberg-hosted CI - see docs/architecture.md and CONTRIBUTING.md for
-## the checks themselves. `.forgejo/workflows/ci.yml` is the identical
-## pipeline written for Forgejo Actions; that path needs a self-hosted
-## runner Codeberg doesn't provide out of the box, so this Woodpecker
-## config (Codeberg's own first-class hosted CI - see
-## https://docs.codeberg.org/ci/) is what actually runs without any
-## infrastructure of our own. Keep both in sync if the check list ever
-## changes; this file is the one that runs automatically today.
+## the checks themselves. A Forgejo Actions pipeline was considered
+## first but needs a self-hosted runner Codeberg doesn't provide out of
+## the box, so this Woodpecker config (Codeberg's own first-class hosted
+## CI - see https://docs.codeberg.org/ci/) is what actually runs, and
+## the only pipeline definition in this repo.
 ##
 ## Must be enabled once per repo at https://ci.codeberg.org/repos/add
 ## before it starts building - adding this file alone doesn't register
@@ -64,4 +62,24 @@ steps:
       - rustup component add clippy
       - cargo build --workspace --all-targets
       - cargo clippy --workspace --all-targets -- -D warnings
-      - cargo test --workspace
+      # This container has no DATABASE_URL/Postgres service, so every
+      # Postgres-backed test falls onto its own `postgresql_embedded`
+      # fallback (see e.g. skilj-core/tests/persistence.rs's own doc
+      # comment) - and that fallback is designed to self-skip with a
+      # "skipping: ..." stderr note, not fail, when it can't reach a
+      # database at all. That's the right call for a contributor's own
+      # sandboxed machine, but it means a broken embedded-Postgres
+      # download/start in *this* container (missing libxml2, no egress,
+      # ...) would silently turn every persistence test into a no-op
+      # while `cargo test` still exits 0 - discovered locally the hard
+      # way (docs/architecture.md's own dep-bump/panic-fix passes hit
+      # this exact trap under WSL). Capture the output and fail loudly
+      # if that ever happens here, instead of trusting a green build.
+      - cargo test --workspace > /tmp/test-output.log 2>&1 || test_exit=$?
+      - cat /tmp/test-output.log
+      - |
+        if grep -q '^skipping: ' /tmp/test-output.log; then
+          echo "ERROR: one or more Postgres-backed tests silently skipped (see the 'skipping: ...' lines above) instead of running - CI must never report green without actually exercising the persistence layer." >&2
+          exit 1
+        fi
+      - test "${test_exit:-0}" -eq 0

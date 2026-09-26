@@ -918,21 +918,13 @@ proptest! {
 
 // ---------------------------------------------------------------------
 // surface-actor.EventFetch / surface-exposure.EventFetch /
-// surface-provides.EventFetch - stale note, corrected
+// surface-provides.EventFetch
 // ---------------------------------------------------------------------
 //
-// This used to say these three needed REST-boundary scaffolding that
-// didn't exist anywhere yet ("skilj-rest/src/auth.rs and
-// skilj-rest/src/routes/mod.rs are both still `// TODO` in full"). Long
-// since untrue - skilj-rest is a real, published, extensively tested
-// crate. The exact axum `tower::ServiceExt::oneshot` tests this note
-// asked for already exist: `skilj/tests/event_fetch_rest.rs` covers a
-// wrong-secret 401 (`get_events_rejects_a_wrong_secret_for_a_known_token_id_with_401`),
-// a correct EventFetch response returning `event_type.name`/`schema`/
-// `schema_version` (`get_events_and_consume_expose_the_real_event_type_schema`),
-// and `FetchEvents`/`ConsumeEvents`/`AcknowledgeEvents` all appearing at
-// their real routes. What's still true is narrower than the old note
-// claimed: these three obligation *ids* specifically aren't bookkept as
-// covered by name in any pass's own "obligations covered here" count -
-// a documentation gap to close with a fresh pass over `allium plan`'s
-// own output, not a missing-implementation one.
+// These three obligation *ids* aren't bookkept as covered by name in
+// any pass's own "obligations covered here" count - a documentation gap
+// to close with a fresh pass over `allium plan`'s own output, not a
+// missing-implementation one. Real coverage exists in
+// `skilj/tests/event_fetch_rest.rs` (a wrong-secret 401, a correct
+// EventFetch response, and `FetchEvents`/`ConsumeEvents`/
+// `AcknowledgeEvents` all at their real routes).

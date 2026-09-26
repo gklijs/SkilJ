@@ -678,19 +678,12 @@ fn create_direct_event_rejects_a_payload_naming_no_owner_at_all_when_scoped() {
 
 // ---------------------------------------------------------------------
 // surface-actor / surface-provides for ExternalEventIngestion and
-// DirectEventCreation - stale note, corrected
+// DirectEventCreation
 // ---------------------------------------------------------------------
 //
-// This used to say these four obligations were uncovered because
-// skilj-rest didn't exist yet ("still `// TODO` in full"). That's long
-// since untrue - skilj-rest is a real, published, extensively tested
-// crate, and real end-to-end REST tests against exactly these two
-// surfaces already exist: `skilj/tests/payload_validation.rs`
-// (`direct_event_creation_rejects_a_payload_that_does_not_match_the_schema_with_400`/
-// `..._rejects_an_event_whose_owner_does_not_match_the_tokens_scope`) and
-// `skilj/tests/event_creation_atomicity.rs`. What's still true is
-// narrower than the old note claimed: these four obligation *ids*
-// specifically aren't bookkept as covered by name in any pass's own
-// "obligations covered here" count - a documentation gap to close with
-// a fresh pass over `allium plan`'s own output, not a missing-
-// implementation one.
+// These four obligation *ids* aren't bookkept as covered by name in any
+// pass's own "obligations covered here" count - a documentation gap to
+// close with a fresh pass over `allium plan`'s own output, not a
+// missing-implementation one. Real end-to-end coverage exists in
+// `skilj/tests/payload_validation.rs` and
+// `skilj/tests/event_creation_atomicity.rs`.

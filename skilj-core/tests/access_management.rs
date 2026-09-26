@@ -718,19 +718,9 @@ fn resolve_role_by_external_subject_rejects_when_no_roles_exist_at_all() {
 // caller already has the relevant mappings as whatever it passed in to
 // revoke_role/grant_role_access_mapping.
 //
-// surface-actor/surface-provides.AccessManagement - stale note,
-// corrected. This used to say these needed GraphQL scaffolding that
-// didn't exist yet ("skilj-graphql/src/resolvers/mod.rs and schema.rs
-// are still `// TODO` in full"). Long since untrue - skilj-graphql is a
-// real, published, extensively tested crate, and
-// `skilj/tests/graphql_admin_console.rs`'s own
-// `full_admin_console_lifecycle_end_to_end` already exercises real
-// access control over these exact mutations end to end (an
-// unauthenticated caller rejected, a non-superadmin caller rejected
-// distinctly, then a real superadmin's own createRole/grantRoleAccessMapping/
-// revokeRoleAccessMapping/revokeRole calls succeeding). What's still
-// true is narrower than the old note claimed: these two obligation ids
-// specifically aren't bookkept as covered by name in any pass's own
-// "obligations covered here" count - a documentation gap to close with
-// a fresh pass over `allium plan`'s own output, not a missing-
-// implementation one.
+// surface-actor/surface-provides.AccessManagement: these two obligation
+// ids aren't bookkept as covered by name in any pass's own "obligations
+// covered here" count - a documentation gap to close with a fresh pass
+// over `allium plan`'s own output, not a missing-implementation one.
+// Real coverage exists in `skilj/tests/graphql_admin_console.rs`'s
+// `full_admin_console_lifecycle_end_to_end`.
