@@ -309,9 +309,22 @@ async fn resolve_token<T: TokenLookup>(
     match db::access_token_kind(&state.pool, &credential.id).await? {
         None => Err(RestError::UnrecognisedCredential),
         Some(kind) if kind == T::KIND => {
-            let token = T::get(&state.pool, &credential.id)
-                .await?
-                .expect("access_token_kind matched T::KIND, so T::get finding none is a real bug");
+            // `access_token_kind` and `T::get` each independently re-resolve
+            // this token's own bounded context (`fetch_access_token_row`'s
+            // own `access_token_index` lookup, then a per-schema row fetch) -
+            // two full round trips, not one shared read. A concurrent
+            // `DeleteBoundedContext` landing in the gap between them makes
+            // this `None`, the identical race `skilj_core::db`'s own
+            // `require_event_type`/`require_command_type` and
+            // `skilj-graphql`'s `redrive_parked_delivery` already treat as
+            // an ordinary outcome rather than "a real bug" - and on this
+            // code path, every authenticated REST request runs it, not just
+            // an occasional admin retry. From the caller's own point of
+            // view a token that's vanished out from under it should look
+            // exactly like one that was never recognised, not a 500.
+            let Some(token) = T::get(&state.pool, &credential.id).await? else {
+                return Err(RestError::UnrecognisedCredential);
+            };
             if secret_matches(&hash_secret(&credential.secret), token.secret()) {
                 Ok(token)
             } else {

@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a context this call just inserted is `Active`, so that one
   genuinely cannot race - documented inline instead of "fixed" into a
   false positive.
+- Same shape a fourth time, in `skilj-rest`'s `resolve_token` - the
+  highest-traffic version found yet, since it runs on *every*
+  authenticated REST request, not just an occasional admin action.
+  `access_token_kind` and the matching `TokenLookup::get` each
+  independently re-resolve a bearer token's own bounded context; a
+  concurrent `DeleteBoundedContext` landing between the two used to
+  panic with "a real bug" instead of the ordinary `401
+  UnrecognisedCredential` a caller whose token has genuinely vanished
+  should see either way.
 
 ### Security
 
