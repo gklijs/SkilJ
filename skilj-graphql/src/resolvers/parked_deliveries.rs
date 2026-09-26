@@ -82,20 +82,24 @@ async fn redrive_parked_delivery(
                 .target_command_type
                 .as_deref()
                 .expect("CrossContextRoute-kind ParkedDelivery always carries target_command_type");
-            // `CommandType` rows are never hard-deleted in this codebase
+            // `CommandType` rows are never hard-deleted individually
             // (only ever added to - see docs/architecture.md's own
-            // additive-only-schema-evolution write-up), so a `None` here
-            // would be a real, unrecoverable bug elsewhere, not a
-            // retry-worthy condition - the same "references a row that
-            // no longer exists" invariant `CommandRow::into_domain`'s own
-            // `.expect()` already relies on.
+            // additive-only-schema-evolution write-up) - but the *whole*
+            // target bounded context can be, via `DeleteBoundedContext`,
+            // entirely independently of the (still-alive) context this
+            // delivery is parked in and retried from. A stranded delivery
+            // pointed at an already-gone target is a real, retry-worthy
+            // outcome an operator can hit by ordinary use of both
+            // surfaces, not a programming error - an ordinary `Err` here
+            // (leaving the row parked, same as any other failed redrive),
+            // not a panic.
             let target_command_type = db::get_command_type(
                 &state.pool,
                 target_bounded_context,
                 target_command_type_name,
             )
             .await?
-            .expect("CrossContextRoute-kind ParkedDelivery's own target CommandType still exists");
+            .ok_or_else(skilj_core::error::Error::row_not_found)?;
             let payload = serde_json::to_string(&delivery.request_json)
                 .expect("serde_json::Value serialization is infallible");
             // Codeberg issue #32 (round two): routed through
@@ -128,14 +132,19 @@ async fn redrive_parked_delivery(
                 .access_token_id
                 .as_deref()
                 .expect("ExternalEvent-kind ParkedDelivery always carries access_token_id");
-            // Access tokens are revoked (a status flip
-            // `create_and_insert_external_event`'s own `TokenNotActive`
-            // check below catches), never hard-deleted - see this
-            // function's own `target_command_type` lookup above for the
-            // identical reasoning.
+            // Access tokens themselves are only ever revoked (a status
+            // flip `create_and_insert_external_event`'s own
+            // `TokenNotActive` check below catches, once we have the row
+            // in hand), never deleted individually - a `None` here can
+            // only mean the token's own bounded context was hard-deleted
+            // out from under this call, between the row fetch above and
+            // this lookup. A much tighter window than the
+            // `target_bounded_context` race above (it'd have to be this
+            // delivery's *own* bounded context, mid-request), but the
+            // same principle applies: an ordinary `Err`, not a panic.
             let token = db::get_external_event_token(&state.pool, access_token_id)
                 .await?
-                .expect("ExternalEvent-kind ParkedDelivery's own access token still exists");
+                .ok_or_else(skilj_core::error::Error::row_not_found)?;
             // `request_json` is always this exact shape - written
             // verbatim from a real `ExternalEventRequest` body by
             // `skilj-rest`'s own `POST /v1/parked-deliveries` handler,
@@ -173,9 +182,11 @@ async fn redrive_parked_delivery(
                 .access_token_id
                 .as_deref()
                 .expect("CommandTrigger-kind ParkedDelivery always carries access_token_id");
+            // See the identical `ExternalEvent` branch above for why this
+            // is an ordinary `Err`, not a panic.
             let token = db::get_command_token(&state.pool, access_token_id)
                 .await?
-                .expect("CommandTrigger-kind ParkedDelivery's own access token still exists");
+                .ok_or_else(skilj_core::error::Error::row_not_found)?;
             let redrive: CommandTriggerRedrive = serde_json::from_value(delivery.request_json.clone())
                 .expect("CommandTrigger-kind ParkedDelivery's own request_json matches CommandTriggerRedrive");
             let payload = serde_json::to_string(&redrive.payload)

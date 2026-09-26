@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panics: their own batch query already fails loudly on a dropped schema
   before ever reaching the lookup, so a miss there is a genuine data
   inconsistency, not this race.
+- Same shape again, in `skilj-graphql`'s `retryParkedDelivery`: a
+  `CrossContextRoute`-kind `ParkedDelivery`'s own `target_bounded_context`
+  can be hard-deleted independently of (and long after) the context the
+  delivery is parked and retried in, and the `ExternalEvent`/
+  `CommandTrigger` token lookups have the same gap for their own,
+  narrower window. All three used to panic on a stale reference; retrying
+  a stranded delivery now fails gracefully and leaves the row parked,
+  like any other failed redrive. New `skilj_core::error::Error::
+  row_not_found()` gives `skilj-graphql` the same error shape `db`'s own
+  `require_*` helpers use, without a new `sqlx` dependency just for it.
 
 ### Security
 

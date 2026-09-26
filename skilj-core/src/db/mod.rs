@@ -2113,7 +2113,7 @@ fn bounded_context_from_row(
 async fn require_bounded_context(pool: &Pool, name: &str) -> crate::error::Result<BoundedContext> {
     get_bounded_context(pool, name)
         .await?
-        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+        .ok_or_else(crate::error::Error::row_not_found)
 }
 
 /// Like [`require_bounded_context`], for an `EventType` a caller already
@@ -2128,7 +2128,7 @@ async fn require_event_type(
 ) -> crate::error::Result<EventType> {
     get_event_type(pool, bounded_context, name)
         .await?
-        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+        .ok_or_else(crate::error::Error::row_not_found)
 }
 
 /// [`require_event_type`]'s `CommandType` sibling.
@@ -2139,7 +2139,7 @@ async fn require_command_type(
 ) -> crate::error::Result<CommandType> {
     get_command_type(pool, bounded_context, name)
         .await?
-        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+        .ok_or_else(crate::error::Error::row_not_found)
 }
 
 /// [`require_event_type`]'s `Command` sibling, for an `events` row's own
@@ -2151,7 +2151,7 @@ async fn require_command(
 ) -> crate::error::Result<Command> {
     get_command_by_id(pool, bounded_context, id)
         .await?
-        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+        .ok_or_else(crate::error::Error::row_not_found)
 }
 
 #[tracing::instrument(skip_all, fields(name = %name))]

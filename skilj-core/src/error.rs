@@ -141,6 +141,17 @@ impl Error {
             message: message.into(),
         }
     }
+
+    /// A row a caller expected to still exist doesn't - the same shape
+    /// `db::require_bounded_context`/`require_event_type`/
+    /// `require_command_type`/`require_command` already produce for the
+    /// identical situation inside this crate's own `db` module, exposed
+    /// here so a caller outside it (`skilj-graphql`'s own
+    /// `redrive_parked_delivery`, for one) can report the same outcome
+    /// without needing `sqlx` as a direct dependency just for this.
+    pub fn row_not_found() -> Error {
+        Error::Database(sqlx::Error::RowNotFound)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

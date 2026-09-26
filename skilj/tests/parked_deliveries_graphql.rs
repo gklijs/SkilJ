@@ -507,3 +507,116 @@ fn parked_deliveries_are_listed_retried_and_discarded_over_real_graphql() {
         );
     });
 }
+
+/// A `CrossContextRoute`-kind `ParkedDelivery`'s `target_bounded_context`
+/// names a *different* bounded context than the one it's parked in - one
+/// that can be hard-deleted (`DeleteBoundedContext`) entirely independently
+/// of the still-very-much-alive context the delivery itself lives in and
+/// is browsed/retried from. `redrive_parked_delivery`'s own
+/// `target_command_type`/access-token lookups used to `.expect()` that
+/// row/token still existed, reasoning only about individual-row deletion
+/// ("`CommandType` rows are never hard-deleted") and missing that the
+/// *whole* target bounded context - `command_types` table included - can
+/// vanish via `hard_delete_bounded_context`. Retrying a delivery stranded
+/// by exactly that must come back as an ordinary GraphQL error, not take
+/// the request down (and, critically, not the server with it) - proven
+/// here by making a second, unrelated request over the same router
+/// afterward.
+#[test]
+fn retrying_a_delivery_whose_target_bounded_context_was_hard_deleted_errors_gracefully() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _access_token_id) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        // A second, independent bounded context - the CrossContextRoute's
+        // own target - created, given a real CommandType, then hard-deleted
+        // entirely before the parked delivery pointed at it is ever retried.
+        let target_bc_name = unique_name("target");
+        let target_bc = BoundedContext {
+            name: target_bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &target_bc).await.unwrap();
+        db::migrate_parked_deliveries_dedup_and_unique_index(&pool, &target_bc.name)
+            .await
+            .unwrap();
+        let command_type = skilj_core::event_store::CommandType {
+            bounded_context: target_bc.clone(),
+            name: "WithdrawMoney".to_string(),
+            schema: r#"{"properties":{"amount":{"type":"number"}}}"#.to_string(),
+            schema_version: 1,
+            tag_mappings: Vec::new(),
+            owner_tag_key: None,
+            sensitive_fields: Vec::new(),
+            private_fields: Vec::new(),
+            rest_trigger_allowed: false,
+        };
+        db::upsert_command_type(&pool, &command_type).await.unwrap();
+        db::hard_delete_bounded_context(&pool, &target_bc.name)
+            .await
+            .unwrap();
+
+        let seeded = db::insert_parked_delivery(
+            &pool,
+            &bc_name,
+            "cross-context-route",
+            db::ParkedDeliveryKind::CrossContextRoute,
+            "route-1:0:1",
+            None,
+            Some(&target_bc.name),
+            Some(&command_type.name),
+            &json!({ "payload": { "amount": 10 }, "correlationId": null, "causationId": null }),
+            "target unreachable",
+            3,
+            test_now(),
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+            json!({ "bc": bc_name, "id": seeded.id }),
+        )
+        .await;
+        assert!(
+            response.get("errors").is_some(),
+            "a delivery targeting a hard-deleted bounded context must fail gracefully, \
+             not succeed: {response:?}"
+        );
+
+        // The delivery stays parked - a failed retry doesn't discard it.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { parkedDeliveries(boundedContext: $bc) { id } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["parkedDeliveries"].as_array().unwrap().len(),
+            1,
+            "a delivery that failed to redrive must stay parked, not be dropped"
+        );
+
+        // The server itself is still alive - a plain panic (rather than an
+        // ordinary error) inside the resolver would have shown up here as
+        // a broken connection instead of a clean response.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { parkedDeliveries(boundedContext: $bc) { id } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+    });
+}
