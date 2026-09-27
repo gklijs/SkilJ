@@ -201,14 +201,14 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
     // unlike everything registered above, which is why this is the one
     // part of this function that can genuinely fail at runtime (see the
     // .expect() below, which no longer covers this).
-    if let Some((objects, enums, union)) = projection_types {
+    if let Some((objects, enums, union, admitted)) = projection_types {
         for object in objects {
             builder = builder.register(object);
         }
         for enum_type in enums {
             builder = builder.register(enum_type);
         }
-        builder = builder.register(union);
+        builder = builder.register(union).data(admitted);
     }
 
     // Wraps every resolved field, across all 17 resolver modules, in a

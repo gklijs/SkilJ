@@ -59,7 +59,7 @@
 //! all this module ever has.
 
 use async_graphql::dynamic::{Enum, Field, FieldFuture, FieldValue, Object, TypeRef, Union};
-use async_graphql::{Name, Value};
+use async_graphql::{ErrorExtensions, Name, Value};
 use serde_json::Map;
 use skilj_core::db::{self, Pool};
 
@@ -67,10 +67,10 @@ use skilj_core::db::{self, Pool};
 /// shared by `build` (which registers it) and `resolvers::projection_query`
 /// (which tags its `FieldValue` with it), so both always agree. Bounded
 /// context names are already constrained to a safe identifier pattern
-/// (`bootstrap::valid_bounded_context_name`); projection names aren't -
-/// any more than `EventType`/`CommandType` names already aren't - so a
-/// projection registered with GraphQL-unsafe characters in its name is a
-/// pre-existing class of gap this doesn't newly introduce.
+/// (`bootstrap::valid_bounded_context_name`); projection names aren't,
+/// and `_` in either part makes the result ambiguous - `build` rejects a
+/// projection whose name comes out invalid or taken (`admit_type_names`),
+/// and [`AdmittedProjections`] keeps the resolvers from rendering one.
 pub fn graphql_type_name(bounded_context: &str, projection_name: &str) -> String {
     format!("{bounded_context}_{projection_name}")
 }
@@ -81,13 +81,41 @@ pub fn graphql_type_name(bounded_context: &str, projection_name: &str) -> String
 /// least one usable member. An empty union isn't valid to register, and
 /// "nothing to offer" is a legitimate startup state - a fresh app with
 /// no projections registered yet, not an error.
+/// Which `(bounded_context, projection)` pairs [`build`] actually gave a
+/// GraphQL type - registered as schema data, and checked by the
+/// `projection` query and `projectionUpdates` subscription before they
+/// render anything. Keyed by the pair, not the type name: an excluded
+/// projection whose name *collided* would otherwise be rendered through
+/// the other projection's type, since [`graphql_type_name`] gives both the
+/// same name.
+#[derive(Default)]
+pub struct AdmittedProjections(std::collections::HashSet<(String, String)>);
+
+impl AdmittedProjections {
+    pub fn require(&self, bounded_context: &str, projection: &str) -> async_graphql::Result<()> {
+        if self
+            .0
+            .contains(&(bounded_context.to_string(), projection.to_string()))
+        {
+            return Ok(());
+        }
+        Err(async_graphql::Error::new(format!(
+            "projection {bounded_context:?}/{projection:?} has no GraphQL type in this schema \
+             (see the server log for why it was excluded)"
+        ))
+        .extend_with(|_, ext| ext.set("code", "projection_not_in_schema")))
+    }
+}
+
 pub async fn build(
     pool: &Pool,
-) -> skilj_core::error::Result<Option<(Vec<Object>, Vec<Enum>, Union)>> {
+) -> skilj_core::error::Result<Option<(Vec<Object>, Vec<Enum>, Union, AdmittedProjections)>> {
     let mut objects = Vec::new();
     let mut enums: Vec<Enum> = Vec::new();
     let mut union = Union::new("ProjectionResult");
     let mut any = false;
+    let mut taken_type_names = std::collections::HashSet::new();
+    let mut admitted = AdmittedProjections::default();
 
     for bc in db::list_bounded_contexts(pool).await? {
         for projection in db::list_projections_for_bounded_context(pool, &bc.name).await? {
@@ -95,27 +123,52 @@ pub async fn build(
             let Some(root): Option<serde_json::Value> =
                 serde_json::from_str(&projection.schema).ok()
             else {
-                eprintln!(
-                    "skilj: projection {:?}/{:?} has an unparseable schema - excluded from \
-                     ProjectionQuery this run",
-                    bc.name, projection.name
+                tracing::warn!(
+                    bounded_context = bc.name,
+                    projection = projection.name,
+                    "projection has an unparseable schema - excluded from ProjectionQuery \
+                     this run"
                 );
                 continue;
             };
             let mut extra = Vec::new();
-            let Some(object) =
-                object_from_schema_value(&type_name, &root, &root, 0, &mut extra, &mut enums)
-            else {
-                eprintln!(
-                    "skilj: projection {:?}/{:?} has no usable top-level properties - excluded \
-                     from ProjectionQuery this run",
-                    bc.name, projection.name
+            let mut projection_enums = Vec::new();
+            let Some(object) = object_from_schema_value(
+                &type_name,
+                &root,
+                &root,
+                0,
+                &mut extra,
+                &mut projection_enums,
+            ) else {
+                tracing::warn!(
+                    bounded_context = bc.name,
+                    projection = projection.name,
+                    "projection has no usable top-level properties - excluded from \
+                     ProjectionQuery this run"
                 );
                 continue;
             };
+            if let Err(reason) = admit_type_names(
+                &mut taken_type_names,
+                std::iter::once(object.type_name())
+                    .chain(extra.iter().map(Object::type_name))
+                    .chain(projection_enums.iter().map(Enum::type_name)),
+            ) {
+                tracing::warn!(
+                    bounded_context = bc.name,
+                    projection = projection.name,
+                    "{reason} - projection excluded from ProjectionQuery this run"
+                );
+                continue;
+            }
             union = union.possible_type(type_name);
             objects.push(object);
             objects.extend(extra);
+            enums.extend(projection_enums);
+            admitted
+                .0
+                .insert((bc.name.clone(), projection.name.clone()));
             any = true;
         }
     }
@@ -123,7 +176,51 @@ pub async fn build(
     if !any {
         return Ok(None);
     }
-    Ok(Some((objects, enums, union)))
+    Ok(Some((objects, enums, union, admitted)))
+}
+
+/// Claims every GraphQL type name one projection generates, all or
+/// nothing. `async_graphql`'s dynamic schema silently keeps only the
+/// *last* type registered under a name, and generated names can collide
+/// across projections: `{bounded_context}_{projection}` is ambiguous when
+/// either part contains `_` (`a_b` + `c` and `a` + `b_c`), and a nested
+/// shape's `{parent}_{field}` can equal another projection's top-level
+/// name. A collision used to mean one projection's results silently came
+/// back shaped as another's; an invalid name (a projection named
+/// `order-summary`) produced a schema GraphQL clients can't parse.
+/// Either way the later projection is now excluded, with the reason, the
+/// same treatment an unparseable schema already gets.
+fn admit_type_names<'a>(
+    taken: &mut std::collections::HashSet<String>,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<(), String> {
+    let names: Vec<&str> = names.collect();
+    let mut own = std::collections::HashSet::new();
+    for name in &names {
+        if !is_valid_graphql_name(name) {
+            return Err(format!(
+                "generated GraphQL type name {name:?} is not a valid GraphQL name"
+            ));
+        }
+        if taken.contains(*name) || !own.insert(*name) {
+            return Err(format!(
+                "generated GraphQL type name {name:?} is already used by another projection's types"
+            ));
+        }
+    }
+    taken.extend(names.into_iter().map(String::from));
+    Ok(())
+}
+
+/// GraphQL's `Name`: `/[_A-Za-z][_0-9A-Za-z]*/`, minus the `__` prefix
+/// the spec reserves for introspection.
+fn is_valid_graphql_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !name.starts_with("__")
 }
 
 /// `schema` describes the object being built right now (the whole
@@ -155,7 +252,23 @@ fn object_from_schema_value(
         .and_then(|v| v.as_object());
 
     let mut object = Object::new(type_name.to_string());
+    let mut field_names = std::collections::HashSet::new();
     for (field_name, field_schema) in properties {
+        // Same silent-overwrite hazard as `admit_type_names`, one level
+        // down: `total_amount` and `totalAmount` both become
+        // `totalAmount`, and a key like `total-amount` (a serde rename)
+        // isn't a GraphQL name at all. Skipped before `build_field`, so no
+        // nested type is ever named after it either.
+        let gql_name = snake_to_camel(field_name);
+        if !is_valid_graphql_name(&gql_name) || !field_names.insert(gql_name.clone()) {
+            tracing::warn!(
+                type_name,
+                field = field_name.as_str(),
+                "projection state field has no usable, unique GraphQL name - left out of \
+                 ProjectionQuery"
+            );
+            continue;
+        }
         let nullable = !required.contains(field_name);
         let field = build_field(
             type_name,
@@ -788,5 +901,65 @@ mod tests {
         assert_eq!(snake_to_camel("total"), "total");
         assert_eq!(snake_to_camel("account_total"), "accountTotal");
         assert_eq!(snake_to_camel("a_b_c"), "aBC");
+    }
+
+    #[test]
+    fn graphql_names_follow_the_spec_grammar() {
+        for valid in ["a", "_a", "Order", "shop_Order_items", "a1"] {
+            assert!(is_valid_graphql_name(valid), "{valid}");
+        }
+        for invalid in ["", "1a", "order-summary", "a b", "__Type", "é"] {
+            assert!(!is_valid_graphql_name(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn colliding_or_invalid_type_names_exclude_the_later_projection_whole() {
+        let mut taken = std::collections::HashSet::new();
+        // bounded context `a_b` + projection `c`, with one nested shape.
+        admit_type_names(&mut taken, ["a_b_c", "a_b_c_items"].into_iter()).unwrap();
+        // bounded context `a` + projection `b_c`: the same top-level name.
+        let err = admit_type_names(&mut taken, ["a_b_c", "a_b_c_other"].into_iter()).unwrap_err();
+        assert!(err.contains("\"a_b_c\""), "{err}");
+        // A top-level name equal to an earlier nested one.
+        assert!(admit_type_names(&mut taken, ["a_b_c_items"].into_iter()).is_err());
+        // All or nothing: the rejected projection's other name wasn't claimed.
+        admit_type_names(&mut taken, ["a_b_c_other"].into_iter()).unwrap();
+        assert!(admit_type_names(&mut taken, ["shop_order-summary"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn a_field_without_a_usable_unique_graphql_name_is_left_out() {
+        let schema = serde_json::json!({
+            "properties": {
+                "total_amount": { "type": "integer" },
+                "totalAmount": { "type": "integer" },
+                "net-amount": { "type": "integer" },
+                "status": { "type": "string" },
+            }
+        });
+        let object = object_from_schema_value(
+            "shop_Order",
+            &schema,
+            &schema,
+            0,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let sdl = async_graphql::dynamic::Schema::build("Query", None, None)
+            .register(Object::new("Query").field(Field::new(
+                "order",
+                TypeRef::named("shop_Order"),
+                |_| FieldFuture::new(async { Ok(None::<FieldValue>) }),
+            )))
+            .register(object)
+            .finish()
+            .unwrap()
+            .sdl();
+        assert!(sdl.contains("totalAmount: Int"), "{sdl}");
+        assert_eq!(sdl.matches("totalAmount").count(), 1, "{sdl}");
+        assert!(!sdl.contains("net"), "{sdl}");
+        assert!(sdl.contains("status: String"), "{sdl}");
     }
 }

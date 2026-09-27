@@ -63,6 +63,15 @@ pub fn projection_updates_field() -> SubscriptionField {
                 let access_mapping =
                     require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
                 let name = ctx.args.try_get("name")?.string()?.to_string();
+                // Checked once: a running subscription stays on the schema
+                // (and admitted set) it started under.
+                super::projection_query::require_admitted(
+                    &ctx,
+                    &state,
+                    &bounded_context_name,
+                    &name,
+                )
+                .await?;
                 let key = ctx
                     .args
                     .get("key")

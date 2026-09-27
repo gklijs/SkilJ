@@ -206,6 +206,29 @@ pub(crate) async fn fetch_projection_result(
     Ok((value, graphql_type_name(bounded_context_name, name)))
 }
 
+/// [`crate::projection_types::AdmittedProjections::require`], except that
+/// a projection that doesn't exist at all is still `Projection_not_found`
+/// rather than `projection_not_in_schema` - only the refusal path pays
+/// for the lookup that tells the two apart.
+pub(crate) async fn require_admitted(
+    ctx: &async_graphql::dynamic::ResolverContext<'_>,
+    state: &GraphqlState,
+    bounded_context_name: &str,
+    name: &str,
+) -> async_graphql::Result<()> {
+    let Err(refused) = ctx
+        .data::<crate::projection_types::AdmittedProjections>()?
+        .require(bounded_context_name, name)
+    else {
+        return Ok(());
+    };
+    skilj_core::db::get_projection(&state.pool, bounded_context_name, name)
+        .await
+        .map_err(to_graphql_error)?
+        .ok_or_else(|| not_found("Projection", name))?;
+    Err(refused)
+}
+
 pub fn field() -> Field {
     Field::new("projection", TypeRef::named_nn("ProjectionResult"), |ctx| {
         FieldFuture::new(async move {
@@ -214,6 +237,7 @@ pub fn field() -> Field {
             let access_mapping =
                 require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
             let name = ctx.args.try_get("name")?.string()?.to_string();
+            require_admitted(&ctx, state, &bounded_context_name, &name).await?;
             let key = ctx
                 .args
                 .get("key")

@@ -1565,3 +1565,135 @@ fn keyed_projection_decrypt_on_read_end_to_end() {
         assert_eq!(response["data"]["projection"]["email"], ciphertext);
     });
 }
+
+/// Two projections whose generated GraphQL type names collide - bounded
+/// context `{p}_x` with projection `Y`, and bounded context `{p}` with
+/// projection `x_Y`, both `{p}_x_Y`. `async_graphql` keeps only one type
+/// per name, so before this was checked the other projection's queries
+/// silently rendered through the wrong type. Now exactly one is served;
+/// the other is refused with `projection_not_in_schema`, and the
+/// schema's `{p}_x_Y` type has one projection's fields, unmixed.
+#[test]
+fn colliding_projection_type_names_serve_one_and_refuse_the_other() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let admin_subject = unique_name("admin");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &role).await.unwrap();
+
+        let prefix = unique_name("pq");
+        let pairs = [
+            (format!("{prefix}_x"), "Y", "total", "integer"),
+            (prefix.clone(), "x_Y", "label", "string"),
+        ];
+        for (bc_name, projection, field, json_type) in &pairs {
+            let bc = BoundedContext {
+                name: bc_name.clone(),
+                status: BoundedContextStatus::Active,
+                created_at: test_now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            };
+            skilj_core::db::insert_bounded_context(&pool, &bc)
+                .await
+                .unwrap();
+            skilj_core::db::insert_role_access_mapping(
+                &pool,
+                &RoleAccessMapping {
+                    role: role.clone(),
+                    bounded_context: bc.clone(),
+                    level: AccessLevel::Admin,
+                    can_read_sensitive: false,
+                    scope: None,
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            skilj_core::db::upsert_projection(
+                &pool,
+                &skilj_core::projections::Projection {
+                    bounded_context: bc,
+                    name: projection.to_string(),
+                    schema: json!({ "properties": { *field: { "type": json_type } } })
+                        .to_string(),
+                    schema_version: 1,
+                    consumed_event_types: Vec::new(),
+                    sync: false,
+                    caught_up_to: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let type_name = format!("{prefix}_x_Y");
+        for (bc_name, projection, ..) in &pairs {
+            assert_eq!(
+                skilj_graphql::projection_types::graphql_type_name(bc_name, projection),
+                type_name
+            );
+        }
+
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let jwt = sign_jwt(&admin_subject);
+
+        let mut served = Vec::new();
+        for (bc_name, projection, field, _) in &pairs {
+            let response = graphql_request(
+                &router,
+                Some(&jwt),
+                "query($bc: String!, $name: String!) { projection(boundedContext: $bc, name: $name) { __typename } }",
+                json!({ "bc": bc_name, "name": projection }),
+            )
+            .await;
+            match response.get("errors") {
+                None => {
+                    assert_eq!(response["data"]["projection"]["__typename"], json!(type_name));
+                    served.push(*field);
+                }
+                Some(errors) => assert_eq!(
+                    errors[0]["extensions"]["code"], "projection_not_in_schema",
+                    "{response:?}"
+                ),
+            }
+        }
+        assert_eq!(served.len(), 1, "exactly one of the two is served");
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($t: String!) { __type(name: $t) { fields { name } } }",
+            json!({ "t": type_name }),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["__type"]["fields"],
+            json!([{ "name": served[0] }]),
+            "the type is the served projection's own: {response:?}"
+        );
+    });
+}
