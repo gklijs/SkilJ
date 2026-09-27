@@ -572,27 +572,45 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
         // A successful manual retry - the exact redrive
         // `retryParkedDelivery`'s own resolver makes: resubmit the
         // parked row's own stored payload through `decide_and_submit_command`
-        // directly (the dispatcher now accepts, call 3 is past
-        // `fail_until`). On success the row is deleted.
+        // under `parked_delivery_redrive_identity` (the dispatcher now
+        // accepts, call 3 is past `fail_until`). On success the row is
+        // deleted.
         let payload = serde_json::to_string(&after_failed_retry.request_json).unwrap();
-        db::decide_and_submit_command(
-            &pool,
-            &command_dispatcher,
-            &projection_dispatcher,
-            &snapshot_dispatcher,
-            &broadcaster,
-            &event_cache,
-            &target_ct,
-            &payload,
-            "parked-delivery-retry",
-            None,
-            None,
-            None,
-            Utc::now(),
-            None,
+        let (client_id, idempotency_key) = db::parked_delivery_redrive_identity(
+            &after_failed_retry,
+            db::CROSS_CONTEXT_ROUTE_CLIENT_ID,
         )
-        .await
         .unwrap();
+        assert_eq!(client_id, db::CROSS_CONTEXT_ROUTE_CLIENT_ID);
+        let redrive = || {
+            db::decide_and_submit_command(
+                &pool,
+                &command_dispatcher,
+                &projection_dispatcher,
+                &snapshot_dispatcher,
+                &broadcaster,
+                &event_cache,
+                &target_ct,
+                &payload,
+                &client_id,
+                None,
+                None,
+                None,
+                Utc::now(),
+                Some(&idempotency_key),
+            )
+        };
+        assert!(matches!(
+            redrive().await.unwrap(),
+            db::SubmitCommandOutcome::Accepted { .. }
+        ));
+        // Redriving again - a retry whose submission committed but whose
+        // row delete then failed - lands nothing new: it runs under the
+        // same key the route itself used.
+        assert!(matches!(
+            redrive().await.unwrap(),
+            db::SubmitCommandOutcome::Deduplicated { .. }
+        ));
         let deleted = db::delete_parked_delivery(&pool, &inventory_bc.name, &parked_delivery.id)
             .await
             .unwrap();

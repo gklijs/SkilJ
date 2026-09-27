@@ -1190,6 +1190,14 @@ pub const RESERVED_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-cross-context-route:";
 /// mechanisms under one name.
 pub const RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-deadline:";
 
+/// `db::parked_delivery_redrive_identity`'s own per-row keys for a
+/// `CommandTrigger`-kind redrive. That redrive runs under the bridge
+/// token's own `client_id`, a partition the token's own REST calls also
+/// write keys into, so the reservation keeps a caller-chosen key from
+/// ever colliding with one (it could only ever affect that same token's
+/// redrives - `idempotency_keys` is `client_id`-scoped).
+pub const RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-parked-delivery:";
+
 /// Checked by `authorise_command_trigger`/`authorise_command_submission`'s
 /// own two REST/GraphQL callers, immediately after either reads a
 /// caller-supplied `idempotencyKey`/`Idempotency-Key` value - never
@@ -1209,7 +1217,8 @@ pub fn reject_reserved_idempotency_key(idempotency_key: Option<&str>) -> crate::
     match idempotency_key {
         Some(key)
             if key.starts_with(RESERVED_IDEMPOTENCY_KEY_PREFIX)
-                || key.starts_with(RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX) =>
+                || key.starts_with(RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX)
+                || key.starts_with(RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX) =>
         {
             Err(Error::ReservedIdempotencyKeyPrefix.into())
         }

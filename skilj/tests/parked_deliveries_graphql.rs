@@ -827,3 +827,74 @@ fn retrying_a_delivery_with_a_malformed_stored_request_errors_gracefully() {
         );
     });
 }
+
+/// Two `retryParkedDelivery` calls for the same row racing each other (a
+/// double-clicked button, two operators, a client retrying after a
+/// timeout) must redrive it once, not once each. The `ExternalEvent`
+/// kind is used because, without a `dedupe` cursor, nothing below the
+/// resolver would catch a second redrive - so a duplicate shows up as a
+/// second real event.
+#[test]
+fn concurrent_retries_of_one_parked_delivery_redrive_it_once() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, access_token_id) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let seeded = db::insert_parked_delivery(
+            &pool,
+            &bc_name,
+            "kafka-inbound",
+            db::ParkedDeliveryKind::ExternalEvent,
+            "orders:0:77",
+            Some(&access_token_id),
+            None,
+            None,
+            &json!({ "payload": { "amount": 7 }, "sourceContent": "kafka:orders:0:77" }),
+            "connection refused",
+            3,
+            test_now(),
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        let retry = || {
+            graphql_request(
+                &router,
+                Some(&jwt),
+                "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+                json!({ "bc": bc_name, "id": seeded.id }),
+            )
+        };
+        let (first, second) = tokio::join!(retry(), retry());
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one parked delivery redriven twice: {first:?} / {second:?}"
+        );
+        // Exactly one caller did the redrive. The other either overlapped
+        // it (the retry lock was held) or arrived just after (the row was
+        // already gone).
+        let errors: Vec<_> = [&first, &second]
+            .into_iter()
+            .filter_map(|r| r.get("errors"))
+            .collect();
+        assert_eq!(errors.len(), 1, "{first:?} / {second:?}");
+        let code = errors[0][0]["extensions"]["code"].as_str().unwrap();
+        assert!(
+            ["ParkedDelivery_retry_in_progress", "ParkedDelivery_not_found"].contains(&code),
+            "{code}"
+        );
+        assert!(db::list_parked_deliveries(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}

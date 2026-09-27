@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Idempotency keys starting with `skilj-parked-delivery:` are now
+  reserved, like `skilj-cross-context-route:` and `skilj-deadline:`, and
+  a caller-supplied one is rejected with
+  `reserved_idempotency_key_prefix`.
 - `skilj-amqp`: `fe2o3-amqp`/`fe2o3-amqp-types` 0.17 -> 0.18 (upstream now
   ships both; verified against the real Artemis broker tests).
 - `skilj-core`: `jsonschema` 0.56 -> 0.58 (checked the two intervening
@@ -86,8 +90,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_projection`/`get_projection_rebuild`) had the same race and now
   return `RowNotFound` via `require_event_type`. New regression test
   uses a Postgres trigger to land the removal in the exact gap every run.
+- A bounded context added at runtime (`addBoundedContext`) lacked
+  `parked_deliveries`' unique index until the next restart, so every
+  `insert_parked_delivery` into it (a `CrossContextRoute` exhausting its
+  retries, or `POST /v1/parked-deliveries`) failed on its `ON CONFLICT`.
+  Provisioning now creates the index itself.
+- `retryParkedDelivery` panicked on a stored `request` body that didn't
+  match its kind's wire shape. It now returns an ordinary
+  `invalid_parked_delivery_request` error and leaves the row parked.
+- JWT authentication rejected concurrent requests with
+  `unknown_signing_key` while the IdP's JWKS was being fetched. The first
+  request to miss the key cache started the fetch; every other miss
+  during it was turned away by the refetch rate limit. So each cold
+  start, and each IdP signing-key rotation, 401'd whatever requests
+  arrived during that fetch. Concurrent misses now wait for the one
+  in-flight fetch and use its result.
+- `retryParkedDelivery` could redrive one parked delivery twice: two
+  concurrent retries of the same row (a double-click, two operators, a
+  client retrying after a timeout) each read it and each resubmitted it.
+  Retries of one row are now serialized; the loser gets
+  `ParkedDelivery_retry_in_progress` or `ParkedDelivery_not_found`.
+  Command-kind redrives also now carry an idempotency key, so a redrive
+  whose command committed but whose row delete failed doesn't land a
+  second time. A `CrossContextRoute` redrive reuses the route's own
+  client id (`cross-context-route`, previously `parked-delivery-retry`)
+  and the exact key the route's original attempt used, so an attempt
+  that committed despite reporting a failure dedupes too.
 
 ### Security
+
+- `POST /v1/parked-deliveries` could be used by one bridge credential to
+  overwrite another credential's parked delivery: the dedup key was
+  `(source, kind, identifier)` only, so reporting the same (guessable)
+  identifier upserted the caller's own `request` body onto the other
+  token's row, which `retryParkedDelivery` then redrives under that
+  *other* token's authority. The unique key now includes the access
+  token; a startup migration moves existing schemas onto it and drops
+  the old index. The route also now rejects a revoked token (`403`,
+  nothing downstream re-checks it) and a `request` body that isn't its
+  kind's route shape (`400 invalid_parked_delivery_request`).
 
 - Lockfile bump of `rustls` 0.23.44 -> 0.23.45 for RUSTSEC-2026-0285
   (TLS 1.3 handshake messages accepted across encryption level

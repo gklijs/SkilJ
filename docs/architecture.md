@@ -1169,6 +1169,8 @@ skilj refetches once before rejecting the token — no background refresh
 task to manage the lifecycle of. Paired with a minimum time between
 refetches (on the order of a few seconds) so a caller can't cheaply force
 repeated JWKS fetches by presenting JWTs with garbage `kid` values.
+The refetch is single-flight: misses that arrive while one is in flight
+wait for it rather than hitting the rate limit (see §65).
 
 **Crate: `jsonwebtoken`**, not a full OIDC-discovery crate like
 `openidconnect`. Skilj only needs signature verification against a known
@@ -8522,7 +8524,8 @@ test suite catches on its own.
    releases automatically on commit or rollback, so there's no separate
    unlock call to forget on any exit path, panics included.
 2. **Belt-and-suspenders**: a `UNIQUE` index on `parked_deliveries(source,
-   kind, identifier)` - the tuple identifying one real failed occurrence,
+   kind, identifier)` (since widened to include the access token - see
+   §64) - the tuple identifying one real failed occurrence,
    whichever `ParkedDeliveryKind` it is - so `insert_parked_delivery`'s
    own `INSERT ... ON CONFLICT (source, kind, identifier) DO UPDATE`
    turns any remaining duplicate-insert path, from this bug or a future
@@ -9281,3 +9284,29 @@ A `/code-review high v0.0.7..HEAD` pass over the batching work (§58-§62) found
 **Follow-up in the same pass**: `max_batch_size` and the leader-permit cap are now configurable (`CommandBatcher::with_max_batch_size`/`with_max_concurrent_leaders`, `SkiljBuilder::command_batch_max_size`/`command_batch_max_concurrent_leaders`); per-batch timing logs dropped from `info` to `debug`; new `docs/performance.md`; two more tests (small configured batch size drains fully; random client-disconnect churn never wedges the queue). The `skilj-helpdesk` load test was not re-run against this change - it is a separate ~16-minute multi-step harness.
 
 **The `PoolTimedOut` test flake, root-caused.** `skilj/tests/command_trigger.rs` and `event_fetch_rest.rs` failed intermittently (a "pool starving under sandbox variance" hypothesis in earlier load-test reports). Real cause: every test leaks a live `Skilj` whose background tasks keep its default 10-connection pool open, so ~10 tests sharing one embedded Postgres exhaust its 100-connection limit and the last `build()` fails after the 30s acquire timeout - reproducible even with `--test-threads=1`, and it predates the batching work. Fixed test-side by giving those files' `Skilj::builder` a 4-connection pool; both files now pass in ~1s / ~3s. No library change.
+
+## 64. Hardening `POST /v1/parked-deliveries` (§47 follow-up)
+
+A review of §47's bridge-facing parking route found four things, all fixed:
+
+1. **Cross-credential overwrite (security).** §56's unique index keyed one occurrence on `(source, kind, identifier)`. Bridge identifiers are guessable (`orders:0:7`), so a second `ExternalEventToken`/`CommandToken` in the same bounded context reporting that identifier hit the `ON CONFLICT ... DO UPDATE` and swapped its own `request_json` onto the first token's row. `retryParkedDelivery` redrives under the row's `access_token_id` - the *first* token - so the second caller got its payload submitted with someone else's authority. The key is now `(source, kind, identifier, COALESCE(access_token_id, ''))`. `COALESCE` rather than `NULLS NOT DISTINCT` (Postgres 15+ only) so `CrossContextRoute`'s always-`NULL` rows still dedupe against each other; a real token id is never empty.
+2. **Migration.** `migrate_parked_deliveries_dedup_and_unique_index` now handles three starting states: no index (dedupe on the new key, create it), legacy index only (the legacy key is strictly stricter, so the same dedupe pass finds nothing; create the new index, drop the legacy one), and new index only (no-op). Test: `legacy_parked_delivery_index_migrates_to_the_token_scoped_one`.
+3. **Runtime-added bounded contexts had no index at all.** The index was only ever created by `build()`'s startup migration loop, so a context added via `addBoundedContext` failed every `insert_parked_delivery` (Postgres refuses an `ON CONFLICT` target with no matching unique index) until restart. `provision_bounded_context_schema` now creates it. The two test files that used to call the migration by hand to paper over this no longer do, so they now prove the fix.
+4. **Unchecked input, then a panic.** The route stored `request` as arbitrary JSON; `redrive_parked_delivery` then `.expect()`ed it decoded as the kind's redrive DTO. The route now validates `request` against the same DTO its kind's original route takes (`ExternalEventRequest`/`CommandTriggerRequest`), and the redrive returns the new `event_store::Error::InvalidParkedDeliveryRequest` (400 / `invalid_parked_delivery_request`) for a row stored before the check existed. Also, unlike every other REST route, nothing downstream of this one re-checks token status (`insert_parked_delivery` is a plain write, not a core rule), so a revoked token could keep writing rows; it is now refused with `TokenNotActive`.
+
+Tests: `parked_delivery_reports_are_shape_checked_token_scoped_and_need_an_active_token` and `retrying_a_delivery_with_a_malformed_stored_request_errors_gracefully` in `skilj/tests/parked_deliveries_graphql.rs`.
+
+## 65. Two concurrency bugs: JWKS cold-cache 401s and double-redriven parked deliveries
+
+Found while writing a concurrent-retry test for §64's follow-up: the test's two parallel GraphQL requests failed *authentication* before they ever reached the code under test.
+
+**1. `JwksCache::key_for` turned away concurrent misses.** On a cache miss it stamped `last_refetch` and then fetched. Any other miss arriving while that fetch was in flight saw a refetch "less than `min_refetch_interval` ago" and returned `None`, which is `unknown_signing_key`. Every cold start, and every IdP signing-key rotation (a new `kid`), therefore 401'd all requests that arrived while the JWKS fetch was in progress. The rate limit was meant to stop garbage `kid`s from forcing a refetch per request, not to reject valid tokens arriving during a legitimate one. The fix is single-flight: `last_refetch` is now a `tokio::sync::Mutex` held across the fetch, and the key cache is re-checked after acquiring it, so waiters get the leader's result. The rate limit still applies once no fetch is in flight. Test: `concurrent_cold_cache_lookups_all_succeed_off_one_refetch` (8 concurrent verifies against a JWKS endpoint that takes 200ms to respond: all succeed, exactly one fetch). It failed deterministically before the fix.
+
+**2. `retryParkedDelivery` redrove a row once per concurrent caller.** The resolver read the row, redrove it, then deleted it, with nothing in between stopping a second caller doing the same. Reproduced deterministically: two concurrent retries of one `ExternalEvent`-kind row produced two events. Fixed in two layers, like §56:
+
+- *Serialization.* `db::try_lock_parked_delivery_for_retry` takes a `pg_try_advisory_xact_lock` on `(bounded_context, id)` in a lock-only transaction held until the resolver returns, and the row is only read after that. Non-blocking rather than `pg_advisory_xact_lock`, because a blocked waiter would pin a pooled connection while the holder still needs connections for its own redrive (a burst of retries on a small pool could starve it), and for an operator action "already being retried" (`ParkedDelivery_retry_in_progress`) is the more useful answer anyway.
+- *Idempotency on command redrives.* Previously both command kinds redrove with no idempotency key, so a redrive whose command committed but whose row delete failed would land again on the next retry. `db::parked_delivery_redrive_identity` now supplies the `(client_id, idempotency_key)`. For `CrossContextRoute` that is the route's own client id and the *exact* key its original attempt used (`cross_context_route_idempotency_key`, now shared with `catch_up_cross_context_route` so they can't drift), which also dedupes an original attempt that committed but reported an error to the route. For `CommandTrigger` it is the token's client id plus a new reserved per-row key prefix, `skilj-parked-delivery:`. `ExternalEvent` has no idempotency key mechanism; its only protection across the delete-failed gap is the optional `dedupe` cursor the bridge sent, which the serialization above doesn't replace. That gap (redrive committed, delete failed, operator retries) remains for an `ExternalEvent` row without a cursor.
+
+Visible change: a redriven `CrossContextRoute` command's `client_id` is now `cross-context-route`, not `parked-delivery-retry`. It is the route's command either way, and the key only dedupes under the route's own client id.
+
+Tests: `concurrent_retries_of_one_parked_delivery_redrive_it_once` (`skilj/tests/parked_deliveries_graphql.rs`, failed with 2 events before the fix, stable over 5 runs after), and the redrive in `a_persistently_failing_target_parks_instead_of_blocking_forever` now goes through `parked_delivery_redrive_identity` and asserts that a second redrive is `Deduplicated`.

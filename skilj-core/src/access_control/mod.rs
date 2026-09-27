@@ -619,7 +619,10 @@ pub struct JwksCache {
     jwks_endpoint: reqwest::Url,
     min_refetch_interval: std::time::Duration,
     keys: tokio::sync::RwLock<std::collections::HashMap<String, jsonwebtoken::DecodingKey>>,
-    last_refetch: tokio::sync::RwLock<Option<std::time::Instant>>,
+    /// Held across the whole refetch, not just the timestamp update, so
+    /// concurrent misses queue behind one in-flight fetch and then see
+    /// its result - see `key_for`.
+    last_refetch: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl JwksCache {
@@ -629,7 +632,7 @@ impl JwksCache {
             jwks_endpoint,
             min_refetch_interval: std::time::Duration::from_secs(5),
             keys: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            last_refetch: tokio::sync::RwLock::new(None),
+            last_refetch: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -640,20 +643,27 @@ impl JwksCache {
     /// either way it still can't be found, which
     /// `verify_and_extract_subject` below turns into
     /// `Error::UnknownSigningKey`.
+    ///
+    /// Single-flight: the refetch runs while holding `last_refetch`, and
+    /// the cache is checked again once that lock is acquired. A caller
+    /// that missed while another caller's fetch was in flight therefore
+    /// waits for it and finds the key, rather than seeing a refetch "too
+    /// recent" and being rejected - which used to 401 every concurrent
+    /// request on a cold start or an IdP key rotation.
     async fn key_for(&self, kid: &str) -> crate::error::Result<Option<jsonwebtoken::DecodingKey>> {
         if let Some(key) = self.keys.read().await.get(kid) {
             return Ok(Some(key.clone()));
         }
 
-        {
-            let mut last_refetch = self.last_refetch.write().await;
-            let now = std::time::Instant::now();
-            if last_refetch.is_some_and(|last| now.duration_since(last) < self.min_refetch_interval)
-            {
-                return Ok(None);
-            }
-            *last_refetch = Some(now);
+        let mut last_refetch = self.last_refetch.lock().await;
+        if let Some(key) = self.keys.read().await.get(kid) {
+            return Ok(Some(key.clone()));
         }
+        let now = std::time::Instant::now();
+        if last_refetch.is_some_and(|last| now.duration_since(last) < self.min_refetch_interval) {
+            return Ok(None);
+        }
+        *last_refetch = Some(now);
 
         self.refetch().await?;
         Ok(self.keys.read().await.get(kid).cloned())

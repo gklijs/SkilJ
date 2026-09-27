@@ -23,6 +23,7 @@ use super::{not_found, require_admin_mapping};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
+use async_graphql::ErrorExtensions;
 use chrono::Utc;
 use serde::Deserialize;
 use skilj_core::db::{self, ParkedDelivery, ParkedDeliveryKind};
@@ -110,6 +111,9 @@ async fn redrive_parked_delivery(
             .ok_or_else(skilj_core::error::Error::row_not_found)?;
             let payload = serde_json::to_string(&delivery.request_json)
                 .expect("serde_json::Value serialization is infallible");
+            let (client_id, idempotency_key) =
+                db::parked_delivery_redrive_identity(delivery, db::CROSS_CONTEXT_ROUTE_CLIENT_ID)
+                    .expect("CrossContextRoute-kind redrives always carry an idempotency key");
             // Codeberg issue #32 (round two): routed through
             // `state.command_batcher` rather than calling
             // `db::decide_and_submit_command` directly - a redrive is
@@ -126,12 +130,12 @@ async fn redrive_parked_delivery(
                     &state.event_cache,
                     &target_command_type,
                     &payload,
-                    "parked-delivery-retry",
+                    &client_id,
                     None,
                     None,
                     state.encryption_master_key.as_ref(),
                     Utc::now(),
-                    None,
+                    Some(&idempotency_key),
                 )
                 .await?;
         }
@@ -201,6 +205,9 @@ async fn redrive_parked_delivery(
                 redrive.correlation_id,
                 redrive.causation_id,
             )?;
+            let (client_id, idempotency_key) =
+                db::parked_delivery_redrive_identity(delivery, &authorised.client_id)
+                    .expect("CommandTrigger-kind redrives always carry an idempotency key");
             // Codeberg issue #32 (round two) - see the identical comment
             // on the `CrossContextRoute` branch above.
             state
@@ -214,12 +221,12 @@ async fn redrive_parked_delivery(
                     &state.event_cache,
                     &authorised.command_type,
                     &authorised.payload,
-                    &authorised.client_id,
+                    &client_id,
                     authorised.correlation_id.as_deref(),
                     authorised.causation_id.as_deref(),
                     state.encryption_master_key.as_ref(),
                     Utc::now(),
-                    None,
+                    Some(&idempotency_key),
                 )
                 .await?;
         }
@@ -273,6 +280,22 @@ pub fn retry_parked_delivery_field() -> Field {
                 require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
                 let id = ctx.args.try_get("id")?.string()?.to_string();
 
+                // Held until this resolver returns - see
+                // `try_lock_parked_delivery_for_retry`. The row is read
+                // only once the lock is ours, so a retry that lost a race
+                // with one that already succeeded sees it gone.
+                let _retry_lock =
+                    db::try_lock_parked_delivery_for_retry(&state.pool, &bounded_context_name, &id)
+                        .await
+                        .map_err(to_graphql_error)?
+                        .ok_or_else(|| {
+                            async_graphql::Error::new(format!(
+                                "ParkedDelivery {id:?} is already being retried"
+                            ))
+                            .extend_with(|_, ext| {
+                                ext.set("code", "ParkedDelivery_retry_in_progress")
+                            })
+                        })?;
                 let delivery = db::get_parked_delivery(&state.pool, &bounded_context_name, &id)
                     .await
                     .map_err(to_graphql_error)?

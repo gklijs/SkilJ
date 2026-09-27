@@ -8317,6 +8317,111 @@ pub async fn get_parked_delivery(
     Ok(row.map(ParkedDelivery::from))
 }
 
+/// The `client_id` every `CrossContextRoute` submission runs under -
+/// server-derived, never caller-suppliable (see
+/// `RESERVED_IDEMPOTENCY_KEY_PREFIX`'s own doc comment).
+pub const CROSS_CONTEXT_ROUTE_CLIENT_ID: &str = "cross-context-route";
+
+/// A `CrossContextRoute`-kind parked row's `source` is this prefix plus
+/// the route's name; its `identifier` is the source event's sequence.
+const CROSS_CONTEXT_ROUTE_PARKED_SOURCE_PREFIX: &str = "cross-context-route:";
+
+/// The idempotency key one route's submission for one source event runs
+/// under - shared by `catch_up_cross_context_route` and
+/// [`parked_delivery_redrive_identity`], so a redrive of a parked
+/// occurrence dedupes against the original attempt if that attempt did
+/// commit after all.
+fn cross_context_route_idempotency_key(route_name: &str, source_sequence: &str) -> String {
+    format!(
+        "{}{route_name}:{source_sequence}",
+        crate::event_store::RESERVED_IDEMPOTENCY_KEY_PREFIX
+    )
+}
+
+/// The `(client_id, idempotency_key)` `retryParkedDelivery` redrives a
+/// command-kind [`ParkedDelivery`] under, so that however many times it
+/// is redriven (a retry whose submission committed but whose row delete
+/// then failed, or one racing a lost lock) the command lands once:
+///
+/// - `CrossContextRoute`: the route's own client id and the exact key its
+///   original attempt used. An attempt that failed on the caller's side
+///   but committed anyway (a dropped connection after `COMMIT`) is then
+///   a `Deduplicated` no-op on redrive, not a second command.
+/// - `CommandTrigger`: the token's own client id (`caller_client_id`) and
+///   a key reserved to this row
+///   (`RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX`). The bridge's
+///   original request carried no key this row stored, so there is nothing
+///   to dedupe against across the original attempt - only across
+///   redrives.
+///
+/// `None` for `ExternalEvent`, which has no idempotency key; its only
+/// dedupe is the optional `dedupe` cursor the bridge sent.
+pub fn parked_delivery_redrive_identity(
+    delivery: &ParkedDelivery,
+    caller_client_id: &str,
+) -> Option<(String, String)> {
+    match delivery.kind {
+        ParkedDeliveryKind::CrossContextRoute => {
+            match delivery
+                .source
+                .strip_prefix(CROSS_CONTEXT_ROUTE_PARKED_SOURCE_PREFIX)
+            {
+                Some(route_name) => Some((
+                    CROSS_CONTEXT_ROUTE_CLIENT_ID.to_string(),
+                    cross_context_route_idempotency_key(route_name, &delivery.identifier),
+                )),
+                // Only `catch_up_cross_context_route` writes this kind,
+                // always with that prefix; kept total rather than
+                // panicking on a hand-edited row.
+                None => Some((
+                    CROSS_CONTEXT_ROUTE_CLIENT_ID.to_string(),
+                    format!(
+                        "{}{}",
+                        crate::event_store::RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX,
+                        delivery.id
+                    ),
+                )),
+            }
+        }
+        ParkedDeliveryKind::CommandTrigger => Some((
+            caller_client_id.to_string(),
+            format!(
+                "{}{}",
+                crate::event_store::RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX,
+                delivery.id
+            ),
+        )),
+        ParkedDeliveryKind::ExternalEvent => None,
+    }
+}
+
+/// `retryParkedDelivery`'s serialization: a lock-only transaction holding
+/// a `pg_try_advisory_xact_lock` on this one parked row, the same
+/// lock-only-transaction shape `catch_up_cross_context_route` uses per
+/// route (docs/architecture.md §56). The caller re-reads the row *after*
+/// this returns and keeps the transaction alive until its redrive and the
+/// row's delete (or failure record) are done; dropping or committing it
+/// releases the lock. Without it, two retries of one row both read it,
+/// both redrive, and the delivery lands twice.
+///
+/// `None` when another retry of the same row holds the lock. Non-blocking
+/// on purpose: a waiter would pin a pooled connection while the holder
+/// still needs connections for its own redrive, and for an operator
+/// action "already being retried" is a better answer than a queue.
+pub async fn try_lock_parked_delivery_for_retry(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+) -> crate::error::Result<Option<Transaction<'static, Postgres>>> {
+    let mut lock_tx = pool.begin().await?;
+    let acquired: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(format!("parked_delivery:{bounded_context}:{id}"))
+            .fetch_one(&mut *lock_tx)
+            .await?;
+    Ok(acquired.then_some(lock_tx))
+}
+
 /// `retryParkedDelivery`'s own failed-again path - the row stays parked,
 /// but its own `error`/`attempt_count`/`last_failed_at` reflect this
 /// latest attempt rather than only the original one, so an operator
@@ -8653,12 +8758,8 @@ async fn catch_up_cross_context_route_locked(
                 // never externally suppliable), which closes that gap
                 // structurally - this reservation is kept as a harmless
                 // second layer, not the load-bearing defense it was.
-                let idempotency_key = format!(
-                    "{}{}:{}",
-                    crate::event_store::RESERVED_IDEMPOTENCY_KEY_PREFIX,
-                    route.name,
-                    event.sequence
-                );
+                let idempotency_key =
+                    cross_context_route_idempotency_key(route.name, &event.sequence.to_string());
                 // Codeberg issue #18: the routed command finally gets a
                 // real answer to "what caused this" - forward-carrying
                 // the source event's own correlation_id (always present
@@ -8676,7 +8777,7 @@ async fn catch_up_cross_context_route_locked(
                     event_cache,
                     &target_command_type,
                     &target_payload,
-                    "cross-context-route",
+                    CROSS_CONTEXT_ROUTE_CLIENT_ID,
                     event.metadata.correlation_id.as_deref(),
                     Some(&crate::event_store::event_causation_id(event)),
                     encryption_master_key,
@@ -8718,7 +8819,10 @@ async fn catch_up_cross_context_route_locked(
                             insert_parked_delivery(
                                 pool,
                                 route.target_bounded_context,
-                                &format!("cross-context-route:{}", route.name),
+                                &format!(
+                                    "{CROSS_CONTEXT_ROUTE_PARKED_SOURCE_PREFIX}{}",
+                                    route.name
+                                ),
                                 ParkedDeliveryKind::CrossContextRoute,
                                 &event.sequence.to_string(),
                                 None,

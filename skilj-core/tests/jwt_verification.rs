@@ -99,6 +99,16 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// outlives the test (never explicitly stopped) - each test binds its
 /// own fresh port, so nothing collides.
 async fn serve_jwks() -> String {
+    serve_jwks_counting(std::time::Duration::ZERO, Default::default()).await
+}
+
+/// `serve_jwks`, but each response is held back by `delay` and counted in
+/// `fetches` - lets a test keep a refetch in flight while other callers
+/// arrive, and see how many fetches actually went out.
+async fn serve_jwks_counting(
+    delay: std::time::Duration,
+    fetches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> String {
     let jwks = json!({
         "keys": [{
             "kty": "RSA",
@@ -113,7 +123,12 @@ async fn serve_jwks() -> String {
         "/jwks.json",
         axum::routing::get(move || {
             let jwks = jwks.clone();
-            async move { axum::Json(jwks) }
+            let fetches = fetches.clone();
+            async move {
+                fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                axum::Json(jwks)
+            }
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -305,5 +320,40 @@ fn verify_and_extract_subject_rejects_an_unknown_kid_even_after_refetch() {
             .await
             .unwrap_err();
         assert_eq!(err.code(), "unknown_signing_key");
+    });
+}
+
+/// Callers arriving while a refetch is already in flight wait for it
+/// instead of being turned away by the refetch rate limit. Before, the
+/// first cache miss stamped the "last refetch" time and started the
+/// fetch, and every other miss during that fetch saw a refetch "too
+/// recent" and got `unknown_signing_key` - so a cold start, or an IdP key
+/// rotation, rejected every concurrent request until the fetch finished.
+/// The slow endpoint keeps the fetch in flight while the others arrive.
+#[test]
+fn concurrent_cold_cache_lookups_all_succeed_off_one_refetch() {
+    runtime().block_on(async {
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let jwks_url =
+            serve_jwks_counting(std::time::Duration::from_millis(200), fetches.clone()).await;
+        let config = idp_config(&jwks_url);
+        let cache = JwksCache::new(config.jwks_endpoint.clone());
+        let jwt = sign_jwt(
+            "sub",
+            "user-123",
+            TEST_KID,
+            TEST_ISSUER,
+            TEST_PRIVATE_KEY_PEM,
+            false,
+        );
+
+        let results = futures_util::future::join_all(
+            (0..8).map(|_| verify_and_extract_subject(&jwt, &config, &cache)),
+        )
+        .await;
+        for result in results {
+            assert_eq!(result.unwrap(), "user-123");
+        }
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
     });
 }
