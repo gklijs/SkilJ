@@ -162,6 +162,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses a single aggregate query, or (catch-up) handles at most 1000
   events per tick and continues on the next.
 
+- `POST /v1/events/consume/ack` ran outside the per-token lock consume
+  uses, so two concurrent acknowledgements could both pass the "no
+  regression" check and the lower one land last - moving a manual-ack
+  cursor backwards and redelivering events - and an ack could interleave
+  with a consume's claim. Acks are now serialized with consume.
+
 ### Security
 
 - `/graphql` had no per-request limits. The body was read whole, with no

@@ -11952,7 +11952,7 @@ pub async fn apply_cursor_update(
 /// held (Codeberg issue #25's investigation, docs/architecture.md §53).
 #[tracing::instrument(skip_all)]
 pub async fn record_acknowledgement(
-    pool: &Pool,
+    executor: impl sqlx::PgExecutor<'_>,
     token: &EventReadToken,
     sequence: i64,
     updated_at: DateTime<Utc>,
@@ -11965,7 +11965,7 @@ pub async fn record_acknowledgement(
     .bind(sequence)
     .bind(updated_at)
     .bind(&token.id)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

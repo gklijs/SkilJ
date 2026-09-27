@@ -9420,3 +9420,14 @@ Each subscription holds its own event-broadcast receiver and filters every commi
 Wire note: `async_graphql` reports this resolver error as a `next` message carrying `errors`, followed by `complete` - not a protocol-level `error` message - the same as any other subscription resolver error.
 
 Test: `a_connection_holds_at_most_max_subscriptions_at_once` (limit 2: two run, a third is refused, completing one lets a fourth start). With the guard's release removed, the fourth is refused and the test fails.
+
+## 75. Acknowledgements serialized with consume
+
+`POST /v1/events/consume/ack` read the token's `ReadCursor`, checked `rule AcknowledgeEvents`' `sequence >= cursor.sequence` in Rust, and wrote the new position - three separate autocommit steps, outside the per-token advisory lock `GET /v1/events/consume` takes (§53). Two races followed:
+
+- **Two acks** could both pass against the same old cursor, and the lower one could land last, moving the cursor *backwards* - violating the rule's own requirement and redelivering the events in between. Reproduced deterministically: a `BEFORE UPDATE` trigger stalls the ack of 10 inside its write (Postgres takes the row lock before firing a `BEFORE` row trigger, so it holds the row). The ack of 5 meanwhile reads the still-uncommitted cursor (-1), passes, queues on the row, and then overwrites 10 with 5 - answered `200`. A first version of the test stalled the *lower* ack instead and passed without the fix, for exactly that row-lock reason, before being turned around.
+- **An ack interleaving with a consume** could have the consume's claim (`checked_out_at`) written after the ack had cleared it, leaving a lease nobody holds and the next consumer served nothing until it expired.
+
+Fix: the ack route runs in one transaction under `lock_read_cursor_for_consume`, with the cursor read inside it, exactly as consume does; `db::record_acknowledgement` now takes any executor. Test: `concurrent_acknowledgements_never_move_the_cursor_backwards` (the ack of 5 is now refused with `409 AcknowledgementRegresses` and the cursor stays at 10).
+
+Manual-ack clients now acknowledge once per page (§69), which makes this path busier than it was.

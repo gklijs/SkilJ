@@ -12,6 +12,14 @@ based on how your own process fails, not just on which is "best":
 
 A few things that trip people up:
 
+- **Every read returns one page, not everything.** Each `GET /v1/events` and each `consume` call
+  returns at most `max_events_per_read` events (default 1000, set on the server's
+  `SkiljBuilder`), oldest first. A short page just means you're caught up for now; a full page
+  means there may be more. Keep asking: for `GET /v1/events`, pass the response's `nextCursor`
+  as the next call's `after` until a call returns no events; for `consume`, simply call again (it
+  continues from its own cursor). With manual-ack, acknowledge the last event you handled before
+  asking for the next page - the next page starts after the acknowledged one. A replay of a long
+  history (below) arrives this way too, a page per call.
 - **One token = one read position.** If you want two independent places in the stream (say, two
   worker instances), mint two `EventReadToken`s rather than trying to share one — there's no
   separate "consumer name" to pass.

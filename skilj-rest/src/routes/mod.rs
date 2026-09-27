@@ -918,11 +918,24 @@ async fn post_events_consume_ack(
     Json(body): Json<AckRequest>,
 ) -> Result<impl IntoResponse, RestError> {
     let token = resolve_token::<EventReadToken>(&state, &credential).await?;
-    let cursor = db::get_read_cursor(&state.pool, &token).await?;
+    // Same transaction-plus-per-token-lock shape as `get_events_consume`
+    // (docs/architecture.md §53, §75): the check (`sequence >=
+    // cursor.sequence`) and the write must see the same cursor. Unlocked,
+    // two acks could both pass against the same old cursor and the lower
+    // one land last - the cursor moving backwards - and an ack could
+    // interleave with a consume's claim.
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(skilj_core::error::Error::from)?;
+    db::lock_read_cursor_for_consume(&mut tx, &token).await?;
+    let cursor = db::get_read_cursor(&mut *tx, &token).await?;
 
     let (sequence, updated_at) =
         event_store::acknowledge_events(&token, cursor.as_ref(), body.sequence, Utc::now())?;
-    db::record_acknowledgement(&state.pool, &token, sequence, updated_at).await?;
+    db::record_acknowledgement(&mut *tx, &token, sequence, updated_at).await?;
+    tx.commit().await.map_err(skilj_core::error::Error::from)?;
 
     Ok(Json(EmptyResponse {}))
 }

@@ -1141,3 +1141,122 @@ fn reads_serve_bounded_pages_and_continue_where_they_stopped() {
         assert_eq!(amounts(&next), vec![8]);
     });
 }
+
+async fn post_ack(router: &axum::Router, credential: &str, sequence: i64) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/events/consume/ack")
+        .header("authorization", format!("Bearer {credential}"))
+        .header("content-type", "application/json")
+        .body(Body::from(format!(r#"{{"sequence":{sequence}}}"#)))
+        .unwrap();
+    router.clone().oneshot(request).await.unwrap().status()
+}
+
+/// Two acknowledgements racing on one manual-ack cursor must never move
+/// it backwards (`rule AcknowledgeEvents`' `sequence >= cursor.sequence`).
+/// A trigger stalls the ack of 10 inside its own write (holding the row
+/// lock); the ack of 5 meanwhile reads the still-uncommitted cursor,
+/// passes its check against it, and queues on the row lock.
+/// Unserialized, it then overwrites 10 with 5 - the cursor regresses and
+/// events 6-10 would be redelivered. Serialized with consume's per-token
+/// lock, the ack of 5 waits for the whole ack of 10 and then re-reads the
+/// cursor, so it is refused as a regression and the cursor stays at 10.
+#[test]
+fn concurrent_acknowledgements_never_move_the_cursor_backwards() {
+    runtime().block_on(async {
+        let Some(database_url) = test_db().await else {
+            return;
+        };
+        let pool = db::connect(&database_url).await.unwrap();
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        let mapping = RoleAccessMapping {
+            role,
+            bounded_context: bc,
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &mapping)
+            .await
+            .unwrap();
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.rest_router();
+        let event_type = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        let token = access_control::create_event_read_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            None,
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_event_read_token(&pool, &token).await.unwrap();
+        let reader = format!("{}.{}", token.id, token.secret);
+        // Creates the manual-ack cursor (at -1, nothing to serve).
+        get_json(&router, &reader, "/v1/events/consume?mode=manual").await;
+
+        let schema = format!("\"bc_{bc_name}\"");
+        for ddl in [
+            format!(
+                "CREATE FUNCTION {schema}.stall_ack_of_10() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN IF NEW.sequence = 10 THEN PERFORM pg_sleep(0.5); END IF; RETURN NEW; END $$"
+            ),
+            format!(
+                "CREATE TRIGGER stall_ack_of_10 BEFORE UPDATE ON {schema}.read_cursors \
+                 FOR EACH ROW EXECUTE FUNCTION {schema}.stall_ack_of_10()"
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(ddl))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let (ten, five) = tokio::join!(post_ack(&router, &reader, 10), async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            post_ack(&router, &reader, 5).await
+        });
+        assert_eq!(ten, StatusCode::OK);
+        // Serialized, the ack of 5 sees the committed 10 and is refused.
+        assert_eq!(five, StatusCode::CONFLICT);
+        let cursor = db::get_read_cursor(&pool, &token).await.unwrap().unwrap();
+        assert_eq!(cursor.sequence, 10, "the cursor regressed");
+    });
+}

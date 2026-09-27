@@ -105,8 +105,8 @@ let signal_on_payment_confirmed = EventTypeMapping {
 ```
 
 **Mint each `credential` with `startFrom: LATEST`, not the default, unless a backfill is
-genuinely what you want.** An `EventReadToken`'s first `consume` call replays its entire history
-by default (see [`docs/rest-event-reading.md`](rest-event-reading.md) and [`docs/architecture.md` §43](architecture.md#new-subscriber-replay-fix)) -
+genuinely what you want.** A new `EventReadToken`'s `consume` calls replay its entire history
+by default, a page per call (see [`docs/rest-event-reading.md`](rest-event-reading.md) and [`docs/architecture.md` §43](architecture.md#new-subscriber-replay-fix)) -
 wiring `start_on_order_placed` above against an `OrderPlaced` type that already has months of
 history would start one `OrderFulfillment` workflow execution per historical order the moment
 this mapping's first poll runs, not just for orders placed from then on. Pass `startFrom: LATEST`
