@@ -164,6 +164,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `/graphql` had no per-request limits. The body was read whole, with no
+  size cap, before authentication (an unauthenticated multi-megabyte
+  request was read and executed; multipart parts were spilled to temp
+  files unbounded), queries had no depth or complexity limit, and
+  aliasing one history-reading field many times multiplied the per-read
+  page cap. New `SkiljBuilder::graphql_limits(GraphqlLimits { .. })`:
+  `max_request_body_bytes` (default 2 MiB, `413` beyond it),
+  `max_depth` (24), `max_complexity` (2000) and `max_expensive_fields`
+  (10 selections of `queryEvents`/`countEvents`/`fetchCommands`/
+  `projection` per request, aliases included; `query_too_expensive`
+  beyond it). The defaults fit the standard introspection query.
 - `POST /v1/parked-deliveries` could be used by one bridge credential to
   overwrite another credential's parked delivery: the dedup key was
   `(source, kind, identifier)` only, so reporting the same (guessable)

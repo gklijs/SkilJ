@@ -76,6 +76,7 @@ pub use skilj_core::plugin::{
     requires_role, CancelDeadline, CommandType, CrossContextRoute, EventType, Projection,
     ScheduleDeadline, Snapshot, DEFAULT_BOUNDED_CONTEXT,
 };
+pub use skilj_graphql::limits::GraphqlLimits;
 /// See `skilj_macros::auto_register`'s own doc comment - unlike
 /// `requires_role` above, this one is facade-specific (its expansion
 /// names `EventTypeRegistrar`/`CommandTypeRegistrar`/`ProjectionRegistrar`/
@@ -148,6 +149,8 @@ pub struct Skilj {
     /// `SkiljBuilder::max_events_per_read`'s own doc comment. Handed to
     /// both `rest_router()` and the GraphQL state.
     max_events_per_read: usize,
+    /// See `SkiljBuilder::graphql_limits`.
+    graphql_limits: skilj_graphql::limits::GraphqlLimits,
     /// `protect_sensitive_fields`'s own envelope-encryption master key -
     /// see `SkiljBuilder::encryption_master_key`'s own doc comment.
     /// `None` when never configured - fine as long as no bounded context
@@ -587,6 +590,7 @@ impl Skilj {
             // default in specs/skilj.allium.
             read_cursor_checkout_lease: std::time::Duration::from_secs(5 * 60),
             max_events_per_read: skilj_core::event_store::DEFAULT_MAX_EVENTS_PER_READ,
+            graphql_limits: skilj_graphql::limits::GraphqlLimits::default(),
             // Codeberg issue #36's own recommendation #3 - matches
             // `command_batcher::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT`.
             command_batch_idle_in_transaction_timeout: std::time::Duration::from_secs(30),
@@ -735,6 +739,7 @@ impl Skilj {
             snapshot_dispatcher: self.snapshot_dispatcher(),
             projection_query_wait_timeout: self.projection_query_wait_timeout,
             max_events_per_read: self.max_events_per_read,
+            limits: self.graphql_limits,
             encryption_master_key: self.encryption_master_key.clone(),
             event_broadcaster: self.event_broadcaster.clone(),
             revocation_broadcaster: self.revocation_broadcaster.clone(),
@@ -1231,6 +1236,7 @@ pub struct SkiljBuilder {
     projection_query_wait_timeout: std::time::Duration,
     read_cursor_checkout_lease: std::time::Duration,
     max_events_per_read: usize,
+    graphql_limits: skilj_graphql::limits::GraphqlLimits,
     command_batch_idle_in_transaction_timeout: std::time::Duration,
     command_batch_max_size: usize,
     command_batch_max_concurrent_leaders: Option<usize>,
@@ -1494,6 +1500,18 @@ impl SkiljBuilder {
         self
     }
 
+    /// Per-request bounds on the GraphQL endpoint - largest accepted
+    /// body (413 beyond it, checked before authentication), deepest
+    /// query, most fields per query, and how many history-scanning fields
+    /// (`queryEvents`, `countEvents`, `fetchCommands`, `projection`) one
+    /// request may select, aliases included. See
+    /// [`skilj_graphql::limits::GraphqlLimits`] for the defaults, which fit
+    /// the standard introspection query GraphiQL and codegen tools send.
+    pub fn graphql_limits(mut self, limits: skilj_graphql::limits::GraphqlLimits) -> Self {
+        self.graphql_limits = limits;
+        self
+    }
+
     /// A batch leader's own `SET LOCAL idle_in_transaction_session_timeout`,
     /// on the transaction holding the bounded-context lock for the whole
     /// batch it's processing - `skilj_core::command_batcher::CommandBatcher
@@ -1716,6 +1734,7 @@ impl SkiljBuilder {
         let projection_query_wait_timeout = self.projection_query_wait_timeout;
         let read_cursor_checkout_lease = self.read_cursor_checkout_lease;
         let max_events_per_read = self.max_events_per_read;
+        let graphql_limits = self.graphql_limits;
         let encryption_master_key = self.encryption_master_key;
         let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
         let revocation_broadcaster = RevocationBroadcaster::new();
@@ -1925,6 +1944,7 @@ impl SkiljBuilder {
                 }),
                 projection_query_wait_timeout,
                 max_events_per_read,
+                limits: graphql_limits,
                 encryption_master_key: encryption_master_key.clone(),
                 event_broadcaster: event_broadcaster.clone(),
                 revocation_broadcaster: revocation_broadcaster.clone(),
@@ -1946,6 +1966,7 @@ impl SkiljBuilder {
             projection_query_wait_timeout,
             read_cursor_checkout_lease,
             max_events_per_read,
+            graphql_limits,
             encryption_master_key,
             event_broadcaster,
             revocation_broadcaster,

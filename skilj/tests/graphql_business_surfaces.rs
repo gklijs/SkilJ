@@ -581,7 +581,11 @@ async fn setup_with(
         .await
         .unwrap();
 
+    // Small per-instance pool: every test leaks a live `Skilj`, so the default
+    // 10-connection pools of ~10 tests exhaust the shared embedded Postgres's
+    // 100 connections and the last `build()` fails with `PoolTimedOut`.
     let builder = Skilj::builder(database_url.clone())
+        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
         .identity_provider(IdpConfig::new(
             jwks_url.parse().unwrap(),
             TEST_ISSUER,
@@ -1748,6 +1752,105 @@ fn fetch_commands_serves_bounded_pages_over_graphql() {
         assert_eq!(
             response["errors"][0]["extensions"]["code"], "Command_not_found",
             "{response:?}"
+        );
+    });
+}
+
+/// The standard full introspection query (graphql-js `getIntrospectionQuery`),
+/// what GraphiQL and codegen tools send - must stay within every limit.
+const FULL_INTROSPECTION_QUERY: &str = r#"
+query IntrospectionQuery {
+  __schema {
+    queryType { name } mutationType { name } subscriptionType { name }
+    types { ...FullType }
+    directives { name description locations args { ...InputValue } }
+  }
+}
+fragment FullType on __Type {
+  kind name description
+  fields(includeDeprecated: true) {
+    name description args { ...InputValue } type { ...TypeRef } isDeprecated deprecationReason
+  }
+  inputFields { ...InputValue }
+  interfaces { ...TypeRef }
+  enumValues(includeDeprecated: true) { name description isDeprecated deprecationReason }
+  possibleTypes { ...TypeRef }
+}
+fragment InputValue on __InputValue { name description type { ...TypeRef } defaultValue }
+fragment TypeRef on __Type {
+  kind name
+  ofType { kind name ofType { kind name ofType { kind name ofType { kind name
+    ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } }
+}
+"#;
+
+/// `/graphql` is bounded before anything else runs: an oversized body is
+/// refused with 413 even unauthenticated (the body used to be read whole,
+/// with no cap, before the handler's auth check); a query aliasing an
+/// expensive list field many times is refused (each alias would otherwise
+/// get its own full page, multiplying `max_events_per_read`); and so is a
+/// query nested absurdly deep. The standard introspection query still
+/// passes all of it.
+#[test]
+fn graphql_requests_are_bounded_in_size_depth_and_expensive_fields() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt, _role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let huge = json!({
+            "query": "{ __typename }",
+            "variables": { "padding": "x".repeat(3 * 1024 * 1024) },
+        })
+        .to_string();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("content-type", "application/json")
+                    .body(Body::from(huge))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let aliases: String = (0..20)
+            .map(|i| format!(r#"c{i}: countEvents(boundedContext: $bc, eventTypes: []) "#))
+            .collect();
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            &format!("query($bc: String!) {{ {aliases} }}"),
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "query_too_expensive",
+            "{response:?}"
+        );
+
+        let deep = format!(
+            "{{ __schema {{ types {{ fields {{ type {}name{} }} }} }} }}",
+            "{ ofType ".repeat(30),
+            " }".repeat(30)
+        );
+        let response = graphql_request(&router, Some(&jwt), &deep, json!({})).await;
+        assert!(response.get("errors").is_some(), "{response:?}");
+
+        let response =
+            graphql_request(&router, Some(&jwt), FULL_INTROSPECTION_QUERY, json!({})).await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        assert!(
+            response["data"]["__schema"]["types"]
+                .as_array()
+                .unwrap()
+                .len()
+                > 10
         );
     });
 }

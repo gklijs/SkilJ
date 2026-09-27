@@ -9,6 +9,7 @@
 pub mod auth;
 mod error;
 pub mod gql_types;
+pub mod limits;
 pub mod projection_types;
 pub mod resolvers;
 pub mod schema;
@@ -74,6 +75,8 @@ pub struct GraphqlState {
     /// `config.max_events_per_read` - the most events one `queryEvents`
     /// returns. See `skilj::SkiljBuilder::max_events_per_read`.
     pub max_events_per_read: usize,
+    /// Per-request bounds on `/graphql` - see [`limits::GraphqlLimits`].
+    pub limits: limits::GraphqlLimits,
     /// `submitCommand`'s own bridge into `protect_sensitive_fields` for
     /// the events/command it produces (§SubjectErasure) - the identical
     /// `Option<EncryptionMasterKey>` `Skilj::rest_router()` hands its own
@@ -142,11 +145,15 @@ pub async fn router(
     registry: Arc<schema::SchemaRegistry>,
     state: GraphqlState,
 ) -> skilj_core::error::Result<axum::Router> {
+    let max_body = state.limits.max_request_body_bytes;
     Ok(axum::Router::new()
         .route(
             "/graphql",
             axum::routing::post(graphql_handler).get(graphql_ws_handler),
         )
+        .layer(axum::middleware::from_fn(move |request, next| {
+            limits::limit_request_body(max_body, request, next)
+        }))
         .layer(axum::middleware::from_fn(trace_request))
         .with_state((registry, state)))
 }

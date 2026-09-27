@@ -219,6 +219,13 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
     // only" boundary every other library crate here keeps. See
     // docs/architecture.md's tracing section.
     builder = builder.extension(async_graphql::extensions::Tracing);
+    // docs/architecture.md §72 - see `crate::limits`.
+    builder = builder
+        .limit_depth(state.limits.max_depth)
+        .limit_complexity(state.limits.max_complexity)
+        .extension(crate::limits::ExpensiveFieldBudget {
+            max: state.limits.max_expensive_fields,
+        });
 
     Ok(builder.data(state).finish().expect(
         "every type registered above this point is fixed at compile time; every one \
