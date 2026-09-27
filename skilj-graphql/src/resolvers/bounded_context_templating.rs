@@ -138,9 +138,6 @@ async fn apply_template_registrations(
         skilj_core::db::list_projections_for_bounded_context(pool, &template.name)
             .await
             .map_err(to_graphql_error)?;
-    let tenant_events = skilj_core::db::list_events_for_bounded_context(pool, &tenant.name)
-        .await
-        .map_err(to_graphql_error)?;
     for source in template_projections {
         let mut consumed_event_types = Vec::with_capacity(source.consumed_event_types.len());
         for consumed in &source.consumed_event_types {
@@ -162,6 +159,10 @@ async fn apply_template_registrations(
         .await
         .map_err(to_graphql_error)?;
 
+        let tenant_events =
+            skilj_core::db::witness_events_of_types(pool, &tenant.name, &consumed_event_types)
+                .await
+                .map_err(to_graphql_error)?;
         let registration = skilj_core::projections::register_projection(
             &mapping,
             tenant,

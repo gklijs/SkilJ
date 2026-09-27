@@ -200,36 +200,54 @@ pub fn count_events_field() -> Field {
 
             // See `query_events_field`'s own identical comment - same
             // §19 "Problem 1" fix, same tags-supplied-or-not branch.
-            let bounded_context_events = match tags.as_deref() {
+            // An aggregate over everything matching (rule `CountEvents`
+            // is deliberately not paged), but never loaded whole: a
+            // non-empty `tags` filter uses the tag index (already
+            // narrowed); otherwise history is walked a chunk at a time and
+            // the rule's own pure count summed per chunk - it runs at
+            // least once, so its validation errors still surface.
+            let count_in = |events: &[skilj_core::event_store::Event]| {
+                skilj_core::event_store::count_events(
+                    &access_mapping,
+                    &event_types,
+                    tags.as_deref(),
+                    correlation_id.as_deref(),
+                    events,
+                )
+            };
+            let count = match tags.as_deref() {
                 Some(wanted) if !wanted.is_empty() => {
-                    skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
+                    let tagged =
+                        skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
+                            &state.pool,
+                            &state.event_cache,
+                            &bounded_context_name,
+                            wanted,
+                            None,
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
+                    count_in(&tagged).map_err(to_graphql_error)?
+                }
+                _ => {
+                    let mut total = 0;
+                    skilj_core::db::for_each_event_chunk(
                         &state.pool,
                         &state.event_cache,
                         &bounded_context_name,
-                        wanted,
                         None,
+                        -1,
+                        state.max_events_per_read,
+                        |chunk| {
+                            total += count_in(chunk)?;
+                            Ok(true)
+                        },
                     )
                     .await
-                    .map_err(to_graphql_error)?
+                    .map_err(to_graphql_error)?;
+                    total
                 }
-                _ => skilj_core::db::list_events_for_bounded_context_cached(
-                    &state.pool,
-                    &state.event_cache,
-                    &bounded_context_name,
-                    -1,
-                )
-                .await
-                .map_err(to_graphql_error)?,
             };
-
-            let count = skilj_core::event_store::count_events(
-                &access_mapping,
-                &event_types,
-                tags.as_deref(),
-                correlation_id.as_deref(),
-                &bounded_context_events,
-            )
-            .map_err(to_graphql_error)?;
 
             Ok(Some(async_graphql::Value::from(count)))
         })

@@ -152,6 +152,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   querying or subscribing to it returns `projection_not_in_schema`; an
   unusable or duplicate field name drops just that field.
 
+- Several paths loaded a bounded context's entire event history into
+  memory: `countEvents`, every event subscription (on each subscribe and
+  reconnect, only to find the latest sequence), projection registration
+  (including every projection's reconciliation at startup, only to check
+  whether any consumed event exists), `CrossContextRoute`/deadline
+  catch-up ticks, and a new sync projection's history fold. Each now
+  reads a chunk at a time, uses a single aggregate query, or (catch-up)
+  handles at most 1000 events per tick and continues on the next.
+
 ### Security
 
 - `POST /v1/parked-deliveries` could be used by one bridge credential to

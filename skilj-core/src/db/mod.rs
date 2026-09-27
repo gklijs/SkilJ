@@ -5630,6 +5630,85 @@ pub async fn list_events_from(
     Ok(events)
 }
 
+/// At most one event of each of `event_types`, in `bounded_context` -
+/// what `projections::register_projection` needs for its only use of
+/// history: whether *any* event of a consumed type exists yet (so a new
+/// sync projection needs a history fold). One witness per type answers
+/// that exactly as the full history would, without loading it - which
+/// the `registerProjection` mutation, every projection's startup
+/// reconciliation and template resync all used to do.
+pub async fn witness_events_of_types(
+    pool: &Pool,
+    bounded_context: &str,
+    event_types: &[EventType],
+) -> crate::error::Result<Vec<Event>> {
+    let mut witnesses = Vec::new();
+    for event_type in event_types {
+        witnesses.extend(
+            list_events_from_limited(pool, bounded_context, &event_type.name, -1, 1).await?,
+        );
+    }
+    Ok(witnesses)
+}
+
+/// How many source events one `CrossContextRoute`/`ScheduleDeadline`/
+/// `CancelDeadline` catch-up tick loads at most - the rest wait for the
+/// next tick, which picks up from the persisted cursor.
+pub const MAX_EVENTS_PER_CATCH_UP_TICK: i64 = 1000;
+
+/// [`list_events_cached`], at most `limit` events.
+async fn list_events_cached_limited(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    event_type_name: &str,
+    after_sequence: i64,
+    limit: i64,
+) -> crate::error::Result<Vec<Event>> {
+    match cache
+        .try_events_after(pool, bounded_context, after_sequence)
+        .await?
+    {
+        Some(events) => Ok(events
+            .into_iter()
+            .filter(|e| e.event_type.name == event_type_name)
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .collect()),
+        None => {
+            list_events_from_limited(
+                pool,
+                bounded_context,
+                event_type_name,
+                after_sequence,
+                limit,
+            )
+            .await
+        }
+    }
+}
+
+/// The highest sequence of `event_type_name` in `bounded_context`
+/// (only among events created at or before `created_at_or_before`, when
+/// given), or `-1` - a new catch-up cursor's `Latest`/`AtTime` seed, as
+/// one aggregate query.
+async fn highest_sequence_of_type(
+    pool: &Pool,
+    bounded_context: &str,
+    event_type_name: &str,
+    created_at_or_before: Option<DateTime<Utc>>,
+) -> crate::error::Result<i64> {
+    let schema = schema_ident(bounded_context);
+    let (max,): (Option<i64>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT MAX(sequence) FROM {schema}.events WHERE event_type_name = $1 \
+         AND ($2::timestamptz IS NULL OR metadata_created_at <= $2)"
+    )))
+    .bind(event_type_name)
+    .bind(created_at_or_before)
+    .fetch_one(pool)
+    .await?;
+    Ok(max.unwrap_or(-1))
+}
+
 /// [`list_events_from`] capped at `limit` events - [`for_each_event_chunk`]'s
 /// Postgres fallback for a type-scoped read.
 pub async fn list_events_from_limited(
@@ -8853,37 +8932,34 @@ async fn catch_up_cross_context_route_locked(
     let existing_cursor =
         get_cross_context_route_cursor(pool, route.source_bounded_context, route.name).await?;
     let cursor = existing_cursor.unwrap_or(-1);
-    let events = list_events_cached(
-        pool,
-        event_cache,
-        route.source_bounded_context,
-        route.source_event_type,
-        cursor,
-    )
-    .await?;
-
     if existing_cursor.is_none()
         && route.start_from != crate::plugin::CrossContextRouteStartFrom::Beginning
     {
-        // See this function's own doc comment's "First-ever tick" note -
-        // `events` above already is the full history from `-1`, loaded
-        // for exactly this purpose; nothing in it gets dispatched.
+        // First-ever tick: seed the cursor and dispatch nothing. The
+        // seed is one `MAX(sequence)`, not a scan of the loaded history.
         let seed = match route.start_from {
             crate::plugin::CrossContextRouteStartFrom::Beginning => {
                 unreachable!("excluded by this branch's own condition above")
             }
             crate::plugin::CrossContextRouteStartFrom::Latest => {
-                events.iter().map(|e| e.sequence).max().unwrap_or(-1)
+                highest_sequence_of_type(
+                    pool,
+                    route.source_bounded_context,
+                    route.source_event_type,
+                    None,
+                )
+                .await?
             }
             crate::plugin::CrossContextRouteStartFrom::AtSequence(n) => n,
             crate::plugin::CrossContextRouteStartFrom::AtTime(unix_secs) => {
                 let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
-                events
-                    .iter()
-                    .filter(|e| e.metadata.created_at <= threshold)
-                    .map(|e| e.sequence)
-                    .max()
-                    .unwrap_or(-1)
+                highest_sequence_of_type(
+                    pool,
+                    route.source_bounded_context,
+                    route.source_event_type,
+                    Some(threshold),
+                )
+                .await?
             }
         };
         update_cross_context_route_cursor(
@@ -8896,6 +8972,19 @@ async fn catch_up_cross_context_route_locked(
         .await?;
         return Ok(());
     }
+
+    // At most `MAX_EVENTS_PER_CATCH_UP_TICK` per tick - the cursor
+    // persists per processed event, so the next tick continues exactly
+    // where this one stopped, and a long backlog is never loaded whole.
+    let events = list_events_cached_limited(
+        pool,
+        event_cache,
+        route.source_bounded_context,
+        route.source_event_type,
+        cursor,
+        MAX_EVENTS_PER_CATCH_UP_TICK,
+    )
+    .await?;
 
     // Codeberg issue #21 - see this function's own doc comment. Read
     // once per tick, ahead of the loop: only the loop's own first
@@ -9200,34 +9289,34 @@ pub async fn catch_up_schedule_deadline(
     let existing_cursor =
         get_deadline_cursor(pool, schedule.source_bounded_context, schedule.name).await?;
     let cursor = existing_cursor.unwrap_or(-1);
-    let events = list_events_cached(
-        pool,
-        event_cache,
-        schedule.source_bounded_context,
-        schedule.source_event_type,
-        cursor,
-    )
-    .await?;
-
     if existing_cursor.is_none()
         && schedule.start_from != crate::plugin::DeadlinePollStartFrom::Beginning
     {
+        // First-ever tick: seed the cursor and dispatch nothing. The
+        // seed is one `MAX(sequence)`, not a scan of the loaded history.
         let seed = match schedule.start_from {
             crate::plugin::DeadlinePollStartFrom::Beginning => {
                 unreachable!("excluded by this branch's own condition above")
             }
             crate::plugin::DeadlinePollStartFrom::Latest => {
-                events.iter().map(|e| e.sequence).max().unwrap_or(-1)
+                highest_sequence_of_type(
+                    pool,
+                    schedule.source_bounded_context,
+                    schedule.source_event_type,
+                    None,
+                )
+                .await?
             }
             crate::plugin::DeadlinePollStartFrom::AtSequence(n) => n,
             crate::plugin::DeadlinePollStartFrom::AtTime(unix_secs) => {
                 let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
-                events
-                    .iter()
-                    .filter(|e| e.metadata.created_at <= threshold)
-                    .map(|e| e.sequence)
-                    .max()
-                    .unwrap_or(-1)
+                highest_sequence_of_type(
+                    pool,
+                    schedule.source_bounded_context,
+                    schedule.source_event_type,
+                    Some(threshold),
+                )
+                .await?
             }
         };
         update_deadline_cursor(
@@ -9240,6 +9329,19 @@ pub async fn catch_up_schedule_deadline(
         .await?;
         return Ok(());
     }
+
+    // At most `MAX_EVENTS_PER_CATCH_UP_TICK` per tick - the cursor
+    // persists per processed event, so the next tick continues exactly
+    // where this one stopped, and a long backlog is never loaded whole.
+    let events = list_events_cached_limited(
+        pool,
+        event_cache,
+        schedule.source_bounded_context,
+        schedule.source_event_type,
+        cursor,
+        MAX_EVENTS_PER_CATCH_UP_TICK,
+    )
+    .await?;
 
     let schema = schema_ident(schedule.source_bounded_context);
     for event in &events {
@@ -9316,34 +9418,34 @@ pub async fn catch_up_cancel_deadline(
     let existing_cursor =
         get_deadline_cursor(pool, cancel.source_bounded_context, cancel.name).await?;
     let cursor = existing_cursor.unwrap_or(-1);
-    let events = list_events_cached(
-        pool,
-        event_cache,
-        cancel.source_bounded_context,
-        cancel.source_event_type,
-        cursor,
-    )
-    .await?;
-
     if existing_cursor.is_none()
         && cancel.start_from != crate::plugin::DeadlinePollStartFrom::Beginning
     {
+        // First-ever tick: seed the cursor and dispatch nothing. The
+        // seed is one `MAX(sequence)`, not a scan of the loaded history.
         let seed = match cancel.start_from {
             crate::plugin::DeadlinePollStartFrom::Beginning => {
                 unreachable!("excluded by this branch's own condition above")
             }
             crate::plugin::DeadlinePollStartFrom::Latest => {
-                events.iter().map(|e| e.sequence).max().unwrap_or(-1)
+                highest_sequence_of_type(
+                    pool,
+                    cancel.source_bounded_context,
+                    cancel.source_event_type,
+                    None,
+                )
+                .await?
             }
             crate::plugin::DeadlinePollStartFrom::AtSequence(n) => n,
             crate::plugin::DeadlinePollStartFrom::AtTime(unix_secs) => {
                 let threshold = DateTime::from_timestamp(unix_secs, 0).unwrap_or(Utc::now());
-                events
-                    .iter()
-                    .filter(|e| e.metadata.created_at <= threshold)
-                    .map(|e| e.sequence)
-                    .max()
-                    .unwrap_or(-1)
+                highest_sequence_of_type(
+                    pool,
+                    cancel.source_bounded_context,
+                    cancel.source_event_type,
+                    Some(threshold),
+                )
+                .await?
             }
         };
         update_deadline_cursor(
@@ -9356,6 +9458,19 @@ pub async fn catch_up_cancel_deadline(
         .await?;
         return Ok(());
     }
+
+    // At most `MAX_EVENTS_PER_CATCH_UP_TICK` per tick - the cursor
+    // persists per processed event, so the next tick continues exactly
+    // where this one stopped, and a long backlog is never loaded whole.
+    let events = list_events_cached_limited(
+        pool,
+        event_cache,
+        cancel.source_bounded_context,
+        cancel.source_event_type,
+        cursor,
+        MAX_EVENTS_PER_CATCH_UP_TICK,
+    )
+    .await?;
 
     let target_schema = schema_ident(cancel.deadline_schedule_bounded_context);
     for event in &events {
@@ -10953,7 +11068,6 @@ pub async fn fold_history_into_new_sync_projection(
 ) -> crate::error::Result<Projection> {
     let bounded_context = &projection.bounded_context.name;
     let schema = schema_ident(bounded_context);
-    let events = list_events_for_bounded_context(pool, bounded_context).await?;
     let default_state_json = dispatcher
         .default_state(bounded_context, &projection.name)
         .unwrap_or_default();
@@ -10962,70 +11076,89 @@ pub async fn fold_history_into_new_sync_projection(
         .flatten();
 
     let mut caught_up_to = None;
-    for event in &events {
-        let mut tx = pool.begin().await?;
+    // History a chunk at a time rather than all at once; each event still
+    // commits in its own transaction, exactly as before.
+    let mut after = -1;
+    loop {
+        let events = list_events_for_bounded_context_from_limited(
+            pool,
+            bounded_context,
+            after,
+            MAX_EVENTS_PER_CATCH_UP_TICK,
+        )
+        .await?;
+        let exhausted = (events.len() as i64) < MAX_EVENTS_PER_CATCH_UP_TICK;
+        if let Some(last) = events.last() {
+            after = last.sequence;
+        }
+        for event in &events {
+            let mut tx = pool.begin().await?;
 
-        let keys = dispatcher
-            .keys(bounded_context, &projection.name, event)
-            .unwrap_or_default();
-        for key in &keys {
-            // `as_of_sequence` guard - see `catch_up_bounded_context`'s
-            // identical comment. This function's own race is different in
-            // shape (two instances both reconciling the *same brand-new*
-            // registration concurrently - `register_projection`'s own
-            // `existing = None` read-then-decide has no claim mechanism,
-            // so both would call this function at once) but the same
-            // per-row fix closes it: whichever instance's transaction
-            // commits a key's row first, the other's own `RETURNING`
-            // here sees `as_of_sequence` already at `event.sequence` and
-            // skips instead of folding again.
-            let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
-                &mut *tx,
-                &schema,
-                &projection.name,
-                key,
-                &default_state_json,
-            )
-            .await?;
-            if as_of_sequence >= event.sequence {
-                continue;
+            let keys = dispatcher
+                .keys(bounded_context, &projection.name, event)
+                .unwrap_or_default();
+            for key in &keys {
+                // `as_of_sequence` guard - see `catch_up_bounded_context`'s
+                // identical comment. This function's own race is different in
+                // shape (two instances both reconciling the *same brand-new*
+                // registration concurrently - `register_projection`'s own
+                // `existing = None` read-then-decide has no claim mechanism,
+                // so both would call this function at once) but the same
+                // per-row fix closes it: whichever instance's transaction
+                // commits a key's row first, the other's own `RETURNING`
+                // here sees `as_of_sequence` already at `event.sequence` and
+                // skips instead of folding again.
+                let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
+                    &mut *tx,
+                    &schema,
+                    &projection.name,
+                    key,
+                    &default_state_json,
+                )
+                .await?;
+                if as_of_sequence >= event.sequence {
+                    continue;
+                }
+
+                let new_state = match dispatcher.project(
+                    bounded_context,
+                    &projection.name,
+                    &current_state,
+                    event,
+                    key,
+                ) {
+                    Some(result) => result?,
+                    None => current_state,
+                };
+
+                apply_projection_fold_update(
+                    &mut *tx,
+                    &schema,
+                    "projection_state",
+                    "",
+                    &projection.name,
+                    key,
+                    &new_state,
+                    owner_tag_key,
+                    event,
+                )
+                .await?;
             }
 
-            let new_state = match dispatcher.project(
-                bounded_context,
-                &projection.name,
-                &current_state,
-                event,
-                key,
-            ) {
-                Some(result) => result?,
-                None => current_state,
-            };
-
-            apply_projection_fold_update(
-                &mut *tx,
-                &schema,
-                "projection_state",
-                "",
-                &projection.name,
-                key,
-                &new_state,
-                owner_tag_key,
-                event,
-            )
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
+            )))
+            .bind(event.sequence)
+            .bind(&projection.name)
+            .execute(&mut *tx)
             .await?;
+
+            tx.commit().await?;
+            caught_up_to = Some(event.sequence);
         }
-
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
-        )))
-        .bind(event.sequence)
-        .bind(&projection.name)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        caught_up_to = Some(event.sequence);
+        if exhausted {
+            break;
+        }
     }
 
     Ok(Projection {

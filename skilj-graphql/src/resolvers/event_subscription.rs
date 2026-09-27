@@ -165,16 +165,23 @@ pub fn all_events_field() -> SubscriptionField {
             // either) - silently missed, on both sides at once.
             let mut rx = state.event_broadcaster.subscribe();
 
-            let bounded_context_events =
-                skilj_core::db::list_events_for_bounded_context(&state.pool, &bounded_context_name)
-                    .await
-                    .map_err(to_graphql_error)?;
+            // The rule's default starting point is the bounded context's
+            // latest sequence - one `MAX(sequence)`, resolved here and
+            // passed as an explicit `from_sequence`, rather than loading
+            // every event just to take their maximum (the pure function's
+            // only use for its history argument).
+            let from_sequence = resolve_from_sequence(
+                &state.pool,
+                &bounded_context_name,
+                from_sequence,
+            )
+            .await?;
 
             let initial = event_store::create_all_events_subscription(
                 &access_mapping,
                 event_types,
-                from_sequence,
-                &bounded_context_events,
+                Some(from_sequence),
+                &[],
                 chrono::Utc::now(),
             )
             .map_err(to_graphql_error)?;
@@ -347,17 +354,20 @@ pub fn events_by_type_field() -> SubscriptionField {
             // audit finding #7).
             let mut rx = state.event_broadcaster.subscribe();
 
-            let bounded_context_events =
-                skilj_core::db::list_events_for_bounded_context(&state.pool, &bounded_context_name)
-                    .await
-                    .map_err(to_graphql_error)?;
+            // See `all_events_field`'s identical step.
+            let from_sequence = resolve_from_sequence(
+                &state.pool,
+                &bounded_context_name,
+                from_sequence,
+            )
+            .await?;
 
             let initial = event_store::create_event_type_subscription(
                 &access_mapping,
                 &event_type,
                 filters,
-                from_sequence,
-                &bounded_context_events,
+                Some(from_sequence),
+                &[],
                 chrono::Utc::now(),
             )
             .map_err(to_graphql_error)?;
@@ -492,4 +502,21 @@ pub fn events_by_type_field() -> SubscriptionField {
         "fromSequence",
         TypeRef::named(TypeRef::INT),
     ))
+}
+
+/// `from_sequence ?? <the bounded context's latest sequence, or -1>` -
+/// both subscription rules' `starting_point`. Must run after the
+/// broadcaster subscription, like the snapshot read it replaces.
+async fn resolve_from_sequence(
+    pool: &skilj_core::db::Pool,
+    bounded_context: &str,
+    from_sequence: Option<i64>,
+) -> async_graphql::Result<i64> {
+    match from_sequence {
+        Some(sequence) => Ok(sequence),
+        None => Ok(skilj_core::db::latest_sequence(pool, bounded_context)
+            .await
+            .map_err(to_graphql_error)?
+            .unwrap_or(-1)),
+    }
 }

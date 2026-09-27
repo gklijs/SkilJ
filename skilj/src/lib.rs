@@ -3038,8 +3038,12 @@ async fn reconcile_projections(
             ProjectionRebuildStatus::Pending,
         )
         .await?;
-        let bounded_context_events =
-            skilj_core::db::list_events_for_bounded_context(pool, bounded_context_name).await?;
+        let bounded_context_events = skilj_core::db::witness_events_of_types(
+            pool,
+            bounded_context_name,
+            &consumed_event_types,
+        )
+        .await?;
 
         let registration = skilj_core::projections::register_projection(
             &mapping,

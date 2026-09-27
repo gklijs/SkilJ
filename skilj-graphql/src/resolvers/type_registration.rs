@@ -305,9 +305,10 @@ pub fn register_projection_field() -> Field {
                 )
                 .await
                 .map_err(to_graphql_error)?;
-                let bounded_context_events = skilj_core::db::list_events_for_bounded_context(
+                let bounded_context_events = skilj_core::db::witness_events_of_types(
                     &state.pool,
                     &bounded_context_name,
+                    &consumed_event_types,
                 )
                 .await
                 .map_err(to_graphql_error)?;

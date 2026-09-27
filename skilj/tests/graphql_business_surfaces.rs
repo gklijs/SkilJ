@@ -1666,6 +1666,17 @@ fn query_events_serves_bounded_pages_over_graphql() {
             );
         }
         assert_eq!(pages, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
+
+        // countEvents stays a total over everything - summed across the
+        // same three chunks, not capped at one.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { countEvents(boundedContext: $bc, eventTypes: [\"MoneyDeposited\"]) }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(response["data"]["countEvents"], 7, "{response:?}");
     });
 }
 

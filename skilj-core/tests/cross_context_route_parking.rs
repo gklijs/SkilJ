@@ -831,3 +831,66 @@ fn legacy_parked_delivery_index_migrates_to_the_token_scoped_one() {
         );
     });
 }
+
+/// One catch-up tick loads at most `MAX_EVENTS_PER_CATCH_UP_TICK` source
+/// events, so a new route over a long backlog never loads it whole; the
+/// next tick continues from the persisted cursor. 1003 events against a
+/// 1000-event cache window: the first tick misses the cache (the
+/// `LIMIT`ed Postgres path), the second hits it.
+#[test]
+fn a_catch_up_tick_is_bounded_and_the_next_one_continues() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let shipping_bc = seed_bounded_context(&pool).await;
+        let inventory_bc = seed_bounded_context(&pool).await;
+        let source_et = seed_order_shipped_event_type(&pool, &shipping_bc).await;
+        seed_command_type(&pool, &inventory_bc, "ReserveStock").await;
+        seed_stock_reserved_event_type(&pool, &inventory_bc).await;
+        let route_info = CrossContextRouteInfo {
+            name: ROUTE_NAME,
+            source_bounded_context: Box::leak(shipping_bc.name.clone().into_boxed_str()),
+            source_event_type: "OrderShipped",
+            target_bounded_context: Box::leak(inventory_bc.name.clone().into_boxed_str()),
+            target_command_type: "ReserveStock",
+            start_from: CrossContextRouteStartFrom::Beginning,
+        };
+        let route_dispatcher = PassthroughRouteDispatcher { info: route_info };
+        let command_dispatcher = FlakyCommandDispatcher::new(0);
+        let event_cache = EventCache::new(1000);
+        let cap = db::MAX_EVENTS_PER_CATCH_UP_TICK as usize;
+        for i in 0..cap + 3 {
+            insert_order_shipped(&pool, &shipping_bc, &source_et, &format!("order-{i}")).await;
+        }
+
+        let (projection_dispatcher, snapshot_dispatcher) =
+            (NoopProjectionDispatcher, NoopSnapshotDispatcher);
+        let broadcaster = EventBroadcaster::new(16);
+        let retry_policy = skilj_retry::RetryPolicy::default();
+        let tick = || {
+            db::catch_up_cross_context_route(
+                &pool,
+                &route_info,
+                &route_dispatcher,
+                &command_dispatcher,
+                &projection_dispatcher,
+                &snapshot_dispatcher,
+                &broadcaster,
+                &event_cache,
+                None,
+                &retry_policy,
+            )
+        };
+        tick().await.unwrap();
+        assert_eq!(command_dispatcher.call_count(), cap);
+        tick().await.unwrap();
+        assert_eq!(command_dispatcher.call_count(), cap + 3);
+        tick().await.unwrap();
+        assert_eq!(
+            command_dispatcher.call_count(),
+            cap + 3,
+            "nothing left to route"
+        );
+    });
+}
