@@ -18,6 +18,15 @@
 //! (`skilj-demo/src/banking.rs`, which uses none of those), not to
 //! guess ahead of a second real use case.
 //!
+//! **A spec that can't produce working code is refused up front.**
+//! [`generate`] checks names (the bounded context's against skilj's own
+//! rule; type and field names as Rust identifiers - a keyword field such
+//! as `type` is fine, emitted as `r#type`), duplicate fields, tags naming
+//! undeclared fields, and any two declarations generating the same Rust
+//! item, and returns every problem at once as [`Error::Invalid`] - rather
+//! than panicking in `build.rs`, failing inside generated code, or
+//! failing registration at startup.
+//!
 //! **`decide()`/`project()` stay hand-written Rust, always.** A
 //! generated `CommandType::decide()` is one line, delegating to a
 //! plain free function (`decide_<snake_case(NAME)>`) the including
@@ -43,6 +52,11 @@ pub enum Error {
     /// the expected shape - a real user-facing error, surfaced through
     /// `build.rs` as a build failure with `toml`'s own message.
     Toml(toml::de::Error),
+    /// The `.skilj.toml` parses but can't produce working code - an
+    /// invalid name, a duplicate, a tag naming an undeclared field, two
+    /// types generating the same Rust item. Every problem found, not just
+    /// the first.
+    Invalid(Vec<String>),
     /// The `TokenStream` this crate emitted doesn't parse as a valid
     /// `syn::File` - a bug in this crate's own `emit` module, never a
     /// user error; nothing about a well-formed `.skilj.toml` file
@@ -54,6 +68,13 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Toml(e) => write!(f, "invalid .skilj.toml: {e}"),
+            Error::Invalid(problems) => {
+                write!(f, "invalid .skilj.toml:")?;
+                for problem in problems {
+                    write!(f, "\n  - {problem}")?;
+                }
+                Ok(())
+            }
             Error::Generated(e) => {
                 write!(f, "skilj-codegen generated code that failed to parse - this is a bug in skilj-codegen itself, not in your .skilj.toml: {e}")
             }
@@ -70,6 +91,10 @@ impl std::error::Error for Error {}
 /// doc comment for what the output covers.
 pub fn generate(toml_source: &str) -> Result<String, Error> {
     let spec: BoundedContextSpec = toml::from_str(toml_source).map_err(Error::Toml)?;
+    let problems = spec::validate(&spec);
+    if !problems.is_empty() {
+        return Err(Error::Invalid(problems));
+    }
     let tokens = emit::emit(&spec);
     let file: syn::File = syn::parse2(tokens).map_err(Error::Generated)?;
     Ok(prettyplease::unparse(&file))

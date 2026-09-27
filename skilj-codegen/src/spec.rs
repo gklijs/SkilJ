@@ -85,3 +85,132 @@ pub enum FieldType {
     I64,
     Bool,
 }
+
+/// Rust's keywords (2024 edition, strict and reserved) - a type name may
+/// not be one; a field name may, emitted as a raw identifier (`r#type`),
+/// which serde and schemars both still name `type` on the wire.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+    "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", "abstract", "become", "box", "do", "final", "macro",
+    "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+];
+
+/// Keywords that can't be raw identifiers either.
+const NOT_RAW_IDENTIFIERS: &[&str] = &["self", "Self", "super", "crate", "_"];
+
+pub(crate) fn is_keyword(name: &str) -> bool {
+    RUST_KEYWORDS.contains(&name)
+}
+
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && name != "_"
+}
+
+/// skilj-core's `valid_bounded_context_name`, mirrored (this crate
+/// doesn't depend on skilj-core): a lowercase ASCII letter, then lowercase
+/// letters, digits or `_`, at most 40 characters.
+fn is_bounded_context_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 40
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Every problem with `spec` that would otherwise surface as a panic in
+/// `build.rs`, a compile error inside generated code, or a registration
+/// failure at startup - all of them, not just the first, so one build
+/// shows everything to fix. Empty when `spec` is sound.
+pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !is_bounded_context_name(&spec.bounded_context) {
+        problems.push(format!(
+            "bounded_context {:?} must start with a lowercase letter and contain only \
+             lowercase letters, digits and `_` (at most 40 characters)",
+            spec.bounded_context
+        ));
+    }
+
+    // Everything `emit` names, in one set: marker types are unit structs,
+    // so they share the value namespace with `BOUNDED_CONTEXT` and the
+    // `decide_*` functions.
+    let mut generated: BTreeMap<String, String> = BTreeMap::new();
+    let mut claim = |name: String, what: String, problems: &mut Vec<String>| {
+        if let Some(earlier) = generated.get(&name) {
+            problems.push(format!(
+                "{what} generates `{name}`, which {earlier} already generates"
+            ));
+        } else {
+            generated.insert(name, what);
+        }
+    };
+    claim(
+        "BOUNDED_CONTEXT".to_string(),
+        "the bounded_context constant".to_string(),
+        &mut problems,
+    );
+    if is_bounded_context_name(&spec.bounded_context) {
+        claim(
+            crate::emit::event_enum_name(&spec.bounded_context),
+            "the bounded context's event enum".to_string(),
+            &mut problems,
+        );
+    }
+
+    let types = spec
+        .event_types
+        .iter()
+        .map(|e| ("event_type", &e.name, &e.fields, &e.tags))
+        .chain(
+            spec.command_types
+                .iter()
+                .map(|c| ("command_type", &c.name, &c.fields, &c.tags)),
+        );
+    for (kind, name, fields, tags) in types {
+        let what = format!("{kind} {name:?}");
+        if !is_identifier(name) || is_keyword(name) {
+            problems.push(format!(
+                "{what}: the name must be a Rust identifier (a letter or `_`, then letters, \
+                 digits or `_`) and not a keyword"
+            ));
+            continue;
+        }
+        claim(name.clone(), what.clone(), &mut problems);
+        claim(format!("{name}Payload"), what.clone(), &mut problems);
+        if kind == "command_type" {
+            claim(
+                format!("decide_{}", crate::emit::pascal_case_to_snake_case(name)),
+                what.clone(),
+                &mut problems,
+            );
+        }
+
+        let mut field_names = std::collections::BTreeSet::new();
+        for field in fields {
+            if !is_identifier(&field.name) || NOT_RAW_IDENTIFIERS.contains(&field.name.as_str()) {
+                problems.push(format!(
+                    "{what}: field {:?} must be a Rust identifier (a letter or `_`, then \
+                     letters, digits or `_`; keywords are fine except self/Self/super/crate)",
+                    field.name
+                ));
+            }
+            if !field_names.insert(field.name.as_str()) {
+                problems.push(format!("{what}: field {:?} is declared twice", field.name));
+            }
+        }
+        for (tag_key, field) in tags {
+            if !field_names.contains(field.as_str()) {
+                problems.push(format!(
+                    "{what}: tag {tag_key:?} maps to field {field:?}, which this type doesn't declare"
+                ));
+            }
+        }
+    }
+    problems
+}

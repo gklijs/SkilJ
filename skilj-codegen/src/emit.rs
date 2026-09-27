@@ -17,7 +17,7 @@ pub fn emit(spec: &BoundedContextSpec) -> TokenStream {
         pub const BOUNDED_CONTEXT: &str = #bc_name;
     };
 
-    let event_enum_ident = format_ident!("{}Event", snake_case_to_pascal_case(bc_name));
+    let event_enum_ident = format_ident!("{}", event_enum_name(bc_name));
 
     let event_items = spec.event_types.iter().map(emit_event_type);
     let command_items = spec
@@ -53,7 +53,7 @@ fn field_type_tokens(ty: FieldType) -> TokenStream {
 fn payload_struct(type_name: &str, fields: &[FieldSpec]) -> (syn::Ident, TokenStream) {
     let struct_ident = format_ident!("{type_name}Payload");
     let field_tokens = fields.iter().map(|f| {
-        let field_ident = format_ident!("{}", f.name);
+        let field_ident = field_ident(&f.name);
         let ty = field_type_tokens(f.ty);
         quote! { pub #field_ident: #ty }
     });
@@ -185,7 +185,24 @@ fn emit_event_enum(spec: &BoundedContextSpec, enum_ident: &syn::Ident) -> TokenS
 
 /// "DepositMoney" -> "deposit_money" - the naming convention
 /// `emit_command_type`'s own generated `decide()` delegates through.
-fn pascal_case_to_snake_case(s: &str) -> String {
+/// The bounded context's generated event enum's name - shared with
+/// `spec::validate`'s collision check.
+pub(crate) fn event_enum_name(bounded_context: &str) -> String {
+    format!("{}Event", snake_case_to_pascal_case(bounded_context))
+}
+
+/// A payload field's identifier - a raw one (`r#type`) for a keyword,
+/// which serde and schemars still name `type` on the wire.
+/// `spec::validate` has already refused anything that can't be either.
+fn field_ident(name: &str) -> syn::Ident {
+    if crate::spec::is_keyword(name) {
+        syn::Ident::new_raw(name, proc_macro2::Span::call_site())
+    } else {
+        format_ident!("{}", name)
+    }
+}
+
+pub(crate) fn pascal_case_to_snake_case(s: &str) -> String {
     let mut result = String::new();
     for (i, c) in s.chars().enumerate() {
         if c.is_uppercase() {

@@ -136,3 +136,98 @@ fn a_typo_d_field_name_is_a_real_error_not_silently_dropped() {
     let result = skilj_codegen::generate(toml);
     assert!(matches!(result, Err(skilj_codegen::Error::Toml(_))));
 }
+
+fn invalid(toml: &str) -> Vec<String> {
+    match skilj_codegen::generate(toml) {
+        Err(skilj_codegen::Error::Invalid(problems)) => problems,
+        other => panic!("expected Error::Invalid, got {other:?}"),
+    }
+}
+
+/// Inputs that used to panic inside `build.rs` (`format_ident!` on a
+/// non-identifier), pass through to a rustc error inside generated code,
+/// or be blamed on skilj-codegen itself - now each a plain, named
+/// problem, and all of them reported at once.
+#[test]
+fn an_unusable_spec_is_a_list_of_named_problems_not_a_panic() {
+    let problems = invalid(
+        r#"
+        bounded_context = "Bad-Name"
+        [[event_type]]
+        name = "order-placed"
+        [[event_type]]
+        name = "Deposited"
+        fields = [
+            { name = "amount", type = "i64" },
+            { name = "amount", type = "string" },
+            { name = "self", type = "string" },
+        ]
+        tags = { account = "account_id" }
+        [[command_type]]
+        name = "Deposited"
+    "#,
+    );
+    let all = problems.join("\n");
+    for expected in [
+        "bounded_context \"Bad-Name\"",
+        "event_type \"order-placed\": the name must be a Rust identifier",
+        "field \"amount\" is declared twice",
+        "field \"self\" must be a Rust identifier",
+        "tag \"account\" maps to field \"account_id\", which this type doesn't declare",
+        "command_type \"Deposited\" generates `Deposited`, which event_type \"Deposited\" already generates",
+    ] {
+        assert!(all.contains(expected), "missing {expected:?} in:\n{all}");
+    }
+}
+
+#[test]
+fn a_type_named_like_the_generated_event_enum_collides() {
+    let problems = invalid(
+        r#"
+        bounded_context = "banking"
+        [[event_type]]
+        name = "BankingEvent"
+    "#,
+    );
+    assert!(
+        problems[0].contains("which the bounded context's event enum already generates"),
+        "{problems:?}"
+    );
+}
+
+/// A keyword field name is common in JSON (`type`) and is supported, as a
+/// raw identifier - not refused, and not left to fail as generated code.
+#[test]
+fn a_keyword_field_is_emitted_as_a_raw_identifier() {
+    let output = skilj_codegen::generate(
+        r#"
+        bounded_context = "shop"
+        [[event_type]]
+        name = "ItemAdded"
+        fields = [ { name = "type", type = "string" } ]
+        tags = { kind = "type" }
+    "#,
+    )
+    .unwrap();
+    assert!(output.contains("pub r#type: String"), "{output}");
+    // The tag mapping names the wire field, `type`, not `r#type`.
+    assert!(output.contains(r#"field : "type""#), "{output}");
+}
+
+/// What makes the raw identifier above the right choice: serde and
+/// schemars both name an `r#type` field plain `type` on the wire and in
+/// the JSON schema skilj registers, so payloads look as the TOML says.
+#[test]
+fn a_raw_identifier_field_is_plain_type_on_the_wire_and_in_the_schema() {
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Payload {
+        r#type: String,
+    }
+    let json = serde_json::to_value(Payload {
+        r#type: "book".into(),
+    })
+    .unwrap();
+    assert_eq!(json, serde_json::json!({ "type": "book" }));
+    let schema = serde_json::to_value(schemars::schema_for!(Payload)).unwrap();
+    assert!(schema["properties"].get("type").is_some(), "{schema}");
+}

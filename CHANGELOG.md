@@ -162,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses a single aggregate query, or (catch-up) handles at most 1000
   events per tick and continues on the next.
 
+- `skilj-codegen` validated nothing beyond the TOML's shape: an invalid
+  type or bounded-context name panicked inside `build.rs`, a field named
+  `type` was reported as a bug in skilj-codegen, duplicates and name
+  collisions surfaced as rustc errors inside generated code, and a tag
+  naming an undeclared field only failed at startup registration. Each
+  is now a named problem in a new `Error::Invalid`, all reported at
+  once; keyword field names (`type`) are supported as raw identifiers.
 - Re-registering a scheduled `EventType` (as every instance does at
   startup) wrote back the `schedule_position`/`last_fired_at` it had
   read, so a scheduler firing in between was undone and the occurrence

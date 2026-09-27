@@ -9439,3 +9439,18 @@ Manual-ack clients now acknowledge once per page (§69), which makes this path b
 Fix, in the upsert itself so every caller (the GraphQL mutation, startup reconciliation, template resync) gets it: on conflict `last_fired_at` is not written at all, and `schedule_position` takes the new value only `WHEN EXCLUDED.system_triggered_allowed AND NOT <current row>.system_triggered_allowed` - the pure function's own "scheduling newly enabled" test, evaluated against the row as it is now rather than the stale read. Test: `re_registration_never_rewinds_what_the_scheduler_advanced` (`skilj-core/tests/persistence.rs`), which also checks that opting in still sets the position. Two backlog tests in `skilj/tests/scheduled_events.rs` had simulated an outage by rewinding `schedule_position` through `upsert_event_type` - relying on exactly this behaviour. One then failed, and the `skip`-policy one kept passing only vacuously (no backlog at all). Both now set the position directly (`force_schedule_position`), as a stalled scheduler would leave it.
 
 Checked and left alone: `upsert_projection` writes `caught_up_to` from the registration's copy the same way. A rewound `caught_up_to` only causes a rescan: the fold skips any event at or below a state row's own `as_of_sequence`, so nothing is folded twice, and registration legitimately sets `caught_up_to` after a new sync projection's history fold.
+
+## 77. `skilj-codegen` validates a spec before emitting it
+
+`generate` parsed a `.skilj.toml` (with `deny_unknown_fields`, so typos in *keys* were already caught) and emitted code straight from it, with no check on the *values*. Probed directly:
+
+| Input | Before |
+|---|---|
+| type name `order-placed`, bounded context `Bad-Name` | **panic** in `build.rs` (`format_ident!` on a non-identifier) |
+| field named `type` | `Error::Generated` - whose message says "a bug in skilj-codegen itself, not in your .skilj.toml" |
+| duplicate type, duplicate field, an event and a command with the same name, a type named like the generated `<Context>Event` enum | "Ok", then a rustc error inside `$OUT_DIR` code |
+| tag mapped to an undeclared field | "Ok", then `InvalidTagMapping` when the application registers types at startup |
+
+Now `spec::validate` runs first and returns every problem at once as the new `Error::Invalid(Vec<String>)`. It checks the bounded context name against skilj-core's `valid_bounded_context_name` (mirrored, since this crate doesn't depend on skilj-core); type names as Rust identifiers and not keywords; field names as identifiers; duplicate fields; tags naming declared fields; and every generated name in one set (types, `…Payload` structs, the event enum, `decide_*` functions, `BOUNDED_CONTEXT`), since the marker types are unit structs sharing the value namespace. Keyword *field* names are supported rather than refused: JSON payloads use `type` routinely, and a raw identifier (`r#type`) is still named `type` by serde and schemars - checked by a test, since that's what makes the choice right; only `self`/`Self`/`super`/`crate`/`_`, which can't be raw, are refused. `Error::Generated`'s "a bug in skilj-codegen" wording is now true again.
+
+Tests: four new ones in `skilj-codegen/tests/generate.rs` (every problem named in one error; a collision with the generated enum; `r#type` emitted with tag field `type`; `r#type` is `type` on the wire and in the schema). `skilj-demo`'s real `banking.skilj.toml` passes unchanged.
