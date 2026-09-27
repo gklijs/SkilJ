@@ -107,6 +107,13 @@ impl EventCache {
     /// cap every bounded context's own window is held to afterward -
     /// see this module's own doc comment for why those are the same
     /// number, not two separate knobs.
+    /// A zero `capacity` is a cache that's off: it holds nothing, and
+    /// every lookup misses (`Ok(None)`), so callers read Postgres. It used
+    /// to hold nothing yet report every bounded context as empty.
+    fn is_disabled(&self) -> bool {
+        self.capacity == 0
+    }
+
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -124,6 +131,9 @@ impl EventCache {
     /// `try_events_after`/`append` call finds and treats identically to
     /// one this function warmed.
     pub async fn warm(&self, pool: &Pool, bounded_context: &str) -> crate::error::Result<()> {
+        if self.is_disabled() {
+            return Ok(());
+        }
         let recent =
             crate::db::list_recent_events_for_bounded_context(pool, bounded_context, self.capacity)
                 .await?;
@@ -146,6 +156,9 @@ impl EventCache {
     /// a freshly `warm`ed one for a context with fewer than `capacity`
     /// events total.
     pub async fn append(&self, event: &Event) {
+        if self.is_disabled() {
+            return;
+        }
         let mut contexts = self.contexts.write().await;
         let window = contexts
             .entry(event.bounded_context.name.clone())
@@ -167,6 +180,28 @@ impl EventCache {
         };
         let latest = crate::db::latest_sequence(pool, bounded_context).await?;
         if known == latest {
+            return Ok(());
+        }
+        // A cold window (never warmed - e.g. a bounded context added at
+        // runtime) or one further behind than it can hold is refilled
+        // from the recent tail, as `warm` does, rather than loading every
+        // event since `known` (the whole history, when cold) only to keep
+        // the last `capacity` of them (docs/architecture.md §79).
+        let behind_by = latest.map(|l| l - known.unwrap_or(-1)).unwrap_or(0);
+        if known.is_none() || behind_by > i64::try_from(self.capacity).unwrap_or(i64::MAX) {
+            let recent = crate::db::list_recent_events_for_bounded_context(
+                pool,
+                bounded_context,
+                self.capacity,
+            )
+            .await?;
+            let mut contexts = self.contexts.write().await;
+            contexts.insert(
+                bounded_context.to_string(),
+                ContextWindow {
+                    events: recent.into(),
+                },
+            );
             return Ok(());
         }
         let delta = crate::db::list_events_for_bounded_context_from(
@@ -200,6 +235,9 @@ impl EventCache {
         bounded_context: &str,
         after_sequence: i64,
     ) -> crate::error::Result<Option<Vec<Event>>> {
+        if self.is_disabled() {
+            return Ok(None);
+        }
         self.freshen(pool, bounded_context).await?;
         let contexts = self.contexts.read().await;
         let Some(window) = contexts.get(bounded_context) else {
@@ -264,6 +302,9 @@ impl EventCache {
         bounded_context: &str,
         sequence: i64,
     ) -> crate::error::Result<Option<Event>> {
+        if self.is_disabled() {
+            return Ok(None);
+        }
         self.freshen(pool, bounded_context).await?;
         let contexts = self.contexts.read().await;
         let Some(window) = contexts.get(bounded_context) else {

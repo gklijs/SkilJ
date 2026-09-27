@@ -230,3 +230,12 @@ async fn subscribing_before_the_snapshot_catches_a_racing_event_without_deliveri
          delivered live, or a caller would see it twice"
     );
 }
+
+/// `SkiljBuilder::event_broadcast_capacity(0)` reaches here; a zero
+/// capacity used to panic inside `tokio::sync::broadcast::channel`,
+/// taking `build()` down with it.
+#[test]
+fn a_zero_capacity_broadcaster_is_still_usable() {
+    let broadcaster = skilj_core::event_store::EventBroadcaster::new(0);
+    let _receiver = broadcaster.subscribe();
+}

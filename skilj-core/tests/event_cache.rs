@@ -311,3 +311,70 @@ fn try_event_by_sequence_finds_a_cached_event_and_misses_a_not_yet_seen_one() {
         assert_eq!(missing, None);
     });
 }
+
+/// A zero-capacity cache - the natural way to turn it off - used to keep
+/// no events yet report every bounded context as empty: reads served from
+/// it (fetch, consume, queryEvents, catch-up) silently returned nothing,
+/// after loading the whole history into the window and discarding it. A
+/// zero-capacity cache is now a cache that's off: every lookup misses, so
+/// callers read Postgres.
+#[test]
+fn a_zero_capacity_cache_misses_instead_of_claiming_nothing_exists() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        for _ in 0..3 {
+            insert_event_bypassing_cache(&pool, &bc, &et).await;
+        }
+        let cache = EventCache::new(0);
+        assert!(
+            cache
+                .try_events_after(&pool, &bc.name, -1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a disabled cache must miss, not claim the context is empty"
+        );
+        let events = db::list_events_cached(&pool, &cache, &bc.name, &et.name, -1)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 3);
+    });
+}
+
+/// A cold window (a bounded context never warmed, e.g. added at runtime)
+/// fills from the recent tail, like `warm`, instead of loading the whole
+/// history to keep only `capacity` of it - and still answers a read
+/// reaching further back as a miss.
+#[test]
+fn a_cold_window_fills_from_the_recent_tail() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let mut sequences = Vec::new();
+        for _ in 0..5 {
+            sequences.push(insert_event_bypassing_cache(&pool, &bc, &et).await.sequence);
+        }
+        let cache = EventCache::new(2);
+        let tail = cache
+            .try_events_after(&pool, &bc.name, sequences[2])
+            .await
+            .unwrap()
+            .expect("the last two events are within the window");
+        assert_eq!(
+            tail.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            sequences[3..].to_vec()
+        );
+        assert!(cache
+            .try_events_after(&pool, &bc.name, -1)
+            .await
+            .unwrap()
+            .is_none());
+    });
+}

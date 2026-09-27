@@ -1569,6 +1569,8 @@ impl SkiljBuilder {
     /// silent gaps, ever). Defaults to 1024 - the same "sensible default,
     /// opt-in override" register `async_projection_poll_interval` already
     /// lives in.
+    ///
+    /// Clamped to at least 1 - a zero-capacity broadcast channel can't exist.
     pub fn event_broadcast_capacity(mut self, capacity: usize) -> Self {
         self.event_broadcast_capacity = capacity;
         self
@@ -1583,6 +1585,8 @@ impl SkiljBuilder {
     /// live in. Also the steady-state cap every bounded context's own
     /// window is held to afterward - see `skilj_core::event_cache`'s own
     /// module doc comment for why those are the same number.
+    ///
+    /// `0` turns the cache off: every read goes to Postgres.
     pub fn event_cache_warm_up_count(mut self, count: usize) -> Self {
         self.event_cache_warm_up_count = count;
         self

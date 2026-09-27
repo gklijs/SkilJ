@@ -2967,7 +2967,9 @@ impl EventBroadcaster {
     /// receiver starts reporting `Lagged` - see
     /// `SkiljBuilder::event_broadcast_capacity`'s own doc comment.
     pub fn new(capacity: usize) -> Self {
-        let (sender, _receiver) = tokio::sync::broadcast::channel(capacity);
+        // `broadcast::channel` panics on a zero capacity; one is the
+        // smallest real buffer (a slow subscriber then lags sooner).
+        let (sender, _receiver) = tokio::sync::broadcast::channel(capacity.max(1));
         Self {
             sender,
             instance_id: crate::shared::generate_token_id(),

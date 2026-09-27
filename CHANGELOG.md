@@ -162,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses a single aggregate query, or (catch-up) handles at most 1000
   events per tick and continues on the next.
 
+- `event_cache_warm_up_count(0)` - a natural way to turn the event
+  cache off - made every cache-backed read (`GET /v1/events`, consume,
+  `queryEvents`, catch-up) silently return no events, after loading the
+  whole history on each call. Zero now disables the cache (reads go to
+  Postgres). A cold cache window (e.g. a bounded context added at
+  runtime) now fills from the recent tail instead of loading the whole
+  history. `event_broadcast_capacity(0)` no longer panics in `build()`.
 - `skilj-retry`: `next_backoff` panicked for a `max_backoff` of
   `Duration::MAX` or a negative multiplier - inside background retry
   loops, stopping them - and callers storing a due time turned a
