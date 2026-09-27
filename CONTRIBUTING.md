@@ -83,17 +83,21 @@ tests skip gracefully (the same `skipping:` tolerance every other
 real-dependency test in this codebase already has) if Docker still
 can't be reached after that.
 
-A `postgresql_embedded`-backed test process's own data directory lives
-under `/tmp` by default. On a small `/tmp` (a tmpfs capped well under
-the host's real disk, common in a container or a WSL distro) a long
-testing session can fill it entirely - observed as `cargo test` runs
-slowing down or a test's own temp-file writes failing with `ENOSPC`,
-not as a clean `skipping:` message the way the libxml2 issue above is.
-`df -h /tmp` to check, and `rm -rf /tmp/.tmp*` plus killing any
-still-running `postgres`/embedded-server child processes
-(`pkill -9 -f postgresql` or similar) to clear it - safe, since nothing
-under `/tmp` from these tests is meant to survive past the run that
-created it.
+The embedded Postgres a test binary starts (via `skilj-test-support`),
+and the Kafka/Artemis/NATS containers the bridge crates' tests start,
+are cleaned up by a small watchdog process once that test binary exits
+- normally, on a panic, on Ctrl-C, or when killed. Before that existed,
+each test binary left its server running and its data dir under `/tmp`
+behind; on a RAM-backed `/tmp` (a tmpfs, as on WSL) a few full
+workspace runs filled it, observed as `ENOSPC` failures and slow or
+timing-out tests, and very likely behind several WSL crashes
+(docs/architecture.md §66). If you still see leftovers - from runs
+before this fix, or from a VM crash that took the watchdog down too -
+`df -h /tmp`, `ps -C postgres`, and `docker ps` show them; stop the
+servers (`kill` their `postgres -D /tmp/.tmp...` postmaster), then
+`rm -rf /tmp/.tmp*` and `docker rm -f` the containers. Setting
+`DATABASE_URL` to one Postgres you run yourself avoids embedded servers
+entirely.
 
 A separate, easier-to-miss disk-space issue: `target/` lives on the
 *real* root filesystem, not `/tmp`, and a long session doing many full

@@ -1,12 +1,15 @@
 # Releasing
 
-The workspace has 15 crates. 14 are published to crates.io:
+The workspace has 16 crates. 14 are published to crates.io:
 `skilj-macros`, `skilj-core`, `skilj-graphql`, `skilj-rest`, `skilj`,
 `skilj-codegen`, `skilj-tui`, `skilj-inspector`, `skilj-temporal`,
 `skilj-kafka`, `skilj-amqp`, `skilj-nats`, `skilj-test-fixture`,
 `skilj-retry`. `skilj-demo` is not (`publish = false` in its
 `Cargo.toml` - it's a worked example, not a library anyone should
-depend on).
+depend on), and neither is `skilj-test-support` (the workspace's own
+test harness). Other crates reference it only as a path-only
+dev-dependency with no `version`, which `cargo publish` strips from the
+published manifest - so it never needs publishing or a version bump.
 
 ## Version sync
 

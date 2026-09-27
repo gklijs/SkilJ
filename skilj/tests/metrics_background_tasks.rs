@@ -15,30 +15,13 @@ use skilj::Skilj;
 use skilj_core::db::{self, Pool};
 use std::time::Duration;
 
-async fn provisioned_database_url() -> Option<(String, Option<postgresql_embedded::PostgreSQL>)> {
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        return Some((url, None));
-    }
-    let mut server = postgresql_embedded::PostgreSQL::default();
-    if server.setup().await.is_err() || server.start().await.is_err() {
-        eprintln!(
-            "skipping: DATABASE_URL not set and embedded PostgreSQL setup/start failed \
-             (no network egress, or a missing system library like libxml2)"
-        );
-        return None;
-    }
-    let database_name = "skilj_metrics_background_tasks_test";
-    if server.create_database(database_name).await.is_err() {
-        eprintln!("skipping: embedded PostgreSQL create_database failed");
-        return None;
-    }
-    let url = server.settings().url(database_name);
-    Some((url, Some(server)))
+async fn provisioned_database_url() -> Option<String> {
+    skilj_test_support::database_url("skilj_metrics_background_tasks_test").await
 }
 
 #[tokio::test]
 async fn each_background_loop_records_the_tick_duration_histogram() {
-    let Some((database_url, _embedded)) = provisioned_database_url().await else {
+    let Some(database_url) = provisioned_database_url().await else {
         return;
     };
     let pool: Pool = match db::connect(&database_url).await {

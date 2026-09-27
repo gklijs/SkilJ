@@ -65,7 +65,10 @@ async fn test_nats() -> Option<&'static str> {
 async fn provision_nats() -> Option<TestNats> {
     let cmd = NatsServerCmd::default().with_jetstream();
     let container = match Nats::default().with_cmd(&cmd).start().await {
-        Ok(container) => container,
+        Ok(container) => {
+            skilj_test_support::remove_container_on_exit(container.id());
+            container
+        }
         Err(e) => {
             eprintln!(
                 "skipping: starting the ephemeral NATS container failed \

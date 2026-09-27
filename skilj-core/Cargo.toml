@@ -56,7 +56,7 @@ skilj-retry.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
-postgresql_embedded = "0.21.0"
+skilj-test-support = { path = "../skilj-test-support" }
 proptest.workspace = true
 # Only to serve a real JWKS document from a real local HTTP server in
 # access_control's own JWT-verification tests - skilj-core stays zero

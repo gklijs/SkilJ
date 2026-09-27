@@ -40,4 +40,5 @@ path = "src/lib.rs"
 # CONTRIBUTING.md's own note on the DOCKER_HOST quirk this needs
 # working around on WSL.
 testcontainers-modules = { version = "0.15", features = ["kafka"] }
+skilj-test-support = { path = "../skilj-test-support" }
 axum = { workspace = true }

@@ -59,34 +59,16 @@ impl ProjectionDispatcher for NoopProjectionDispatcher {
     // here would return.
 }
 
-async fn provisioned_pool() -> Option<(db::Pool, Option<postgresql_embedded::PostgreSQL>)> {
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        let pool = db::connect(&url).await.ok()?;
-        db::migrate(&pool).await.ok()?;
-        return Some((pool, None));
-    }
-    let mut server = postgresql_embedded::PostgreSQL::default();
-    if server.setup().await.is_err() || server.start().await.is_err() {
-        eprintln!(
-            "skipping: DATABASE_URL not set and embedded PostgreSQL setup/start failed \
-             (no network egress, or a missing system library like libxml2)"
-        );
-        return None;
-    }
-    let database_name = "skilj_metrics_instrumentation_test";
-    if server.create_database(database_name).await.is_err() {
-        eprintln!("skipping: embedded PostgreSQL create_database failed");
-        return None;
-    }
-    let url = server.settings().url(database_name);
+async fn provisioned_pool() -> Option<db::Pool> {
+    let url = skilj_test_support::database_url("skilj_metrics_instrumentation_test").await?;
     let pool = db::connect(&url).await.ok()?;
     db::migrate(&pool).await.ok()?;
-    Some((pool, Some(server)))
+    Some(pool)
 }
 
 #[tokio::test]
 async fn appending_an_event_records_the_events_appended_counter() {
-    let Some((pool, _embedded)) = provisioned_pool().await else {
+    let Some(pool) = provisioned_pool().await else {
         return;
     };
 

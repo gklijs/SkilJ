@@ -23,7 +23,6 @@ use skilj_core::shared::{generate_token_id, Metadata};
 
 struct TestDb {
     pool: Pool,
-    _embedded: Option<postgresql_embedded::PostgreSQL>,
 }
 
 static TEST_DB: tokio::sync::OnceCell<Option<TestDb>> = tokio::sync::OnceCell::const_new();
@@ -57,31 +56,11 @@ async fn provision() -> Option<TestDb> {
             eprintln!("skipping: DATABASE_URL migration failed: {e}");
             return None;
         }
-        return Some(TestDb {
-            pool,
-            _embedded: None,
-        });
+        return Some(TestDb { pool });
     }
 
-    let mut server = postgresql_embedded::PostgreSQL::default();
-    if let Err(e) = server.setup().await {
-        eprintln!(
-            "skipping: DATABASE_URL not set and embedded PostgreSQL setup failed \
-             (no network egress to fetch the binary, or a missing system library \
-             like libxml2 it links against): {e}"
-        );
-        return None;
-    }
-    if let Err(e) = server.start().await {
-        eprintln!("skipping: embedded PostgreSQL failed to start: {e}");
-        return None;
-    }
-    let database_name = "skilj_event_cache_test";
-    if let Err(e) = server.create_database(database_name).await {
-        eprintln!("skipping: embedded PostgreSQL create_database failed: {e}");
-        return None;
-    }
-    let pool = match db::connect(&server.settings().url(database_name)).await {
+    let url = skilj_test_support::database_url("skilj_event_cache_test").await?;
+    let pool = match db::connect(&url).await {
         Ok(pool) => pool,
         Err(e) => {
             eprintln!("skipping: connecting to embedded PostgreSQL failed: {e}");
@@ -92,10 +71,7 @@ async fn provision() -> Option<TestDb> {
         eprintln!("skipping: migrating embedded PostgreSQL failed: {e}");
         return None;
     }
-    Some(TestDb {
-        pool,
-        _embedded: Some(server),
-    })
+    Some(TestDb { pool })
 }
 
 fn unique_name(prefix: &str) -> String {

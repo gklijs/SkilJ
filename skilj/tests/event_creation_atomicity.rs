@@ -45,7 +45,6 @@ impl EventType for MoneyDeposited {
 
 struct TestDb {
     database_url: String,
-    _embedded: Option<postgresql_embedded::PostgreSQL>,
 }
 
 static TEST_DB: tokio::sync::OnceCell<Option<TestDb>> = tokio::sync::OnceCell::const_new();
@@ -85,37 +84,13 @@ async fn provision() -> Option<TestDb> {
     let database_url = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         database_url
     } else {
-        let mut server = postgresql_embedded::PostgreSQL::default();
-        if let Err(e) = server.setup().await {
-            eprintln!(
-                "skipping: DATABASE_URL not set and embedded PostgreSQL setup failed \
-                 (no network egress to fetch the binary, or a missing system library \
-                 like libxml2 it links against): {e}"
-            );
-            return None;
-        }
-        if let Err(e) = server.start().await {
-            eprintln!("skipping: embedded PostgreSQL failed to start: {e}");
-            return None;
-        }
-        let database_name = "skilj_event_creation_atomicity_test";
-        if let Err(e) = server.create_database(database_name).await {
-            eprintln!("skipping: embedded PostgreSQL create_database failed: {e}");
-            return None;
-        }
-        let url = server.settings().url(database_name);
+        let url = skilj_test_support::database_url("skilj_event_creation_atomicity_test").await?;
         connect_and_migrate(&url, "embedded PostgreSQL").await?;
-        return Some(TestDb {
-            database_url: url,
-            _embedded: Some(server),
-        });
+        return Some(TestDb { database_url: url });
     };
 
     connect_and_migrate(&database_url, "DATABASE_URL").await?;
-    Some(TestDb {
-        database_url,
-        _embedded: None,
-    })
+    Some(TestDb { database_url })
 }
 
 fn unique_name(prefix: &str) -> String {

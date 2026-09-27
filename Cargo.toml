@@ -16,6 +16,7 @@ members = [
     "skilj-amqp",
     "skilj-nats",
     "skilj-test-fixture",
+    "skilj-test-support",
 ]
 
 # See docs/architecture.md for why each crate exists and what it owns.

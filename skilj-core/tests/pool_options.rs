@@ -23,7 +23,6 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 struct TestDb {
     database_url: String,
-    _embedded: Option<postgresql_embedded::PostgreSQL>,
 }
 
 static TEST_DB: tokio::sync::OnceCell<Option<TestDb>> = tokio::sync::OnceCell::const_new();
@@ -38,34 +37,11 @@ async fn test_database_url() -> Option<String> {
 
 async fn provision() -> Option<TestDb> {
     if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        return Some(TestDb {
-            database_url,
-            _embedded: None,
-        });
+        return Some(TestDb { database_url });
     }
-    let mut server = postgresql_embedded::PostgreSQL::default();
-    if let Err(e) = server.setup().await {
-        eprintln!(
-            "skipping: DATABASE_URL not set and embedded PostgreSQL setup failed \
-             (no network egress to fetch the binary, or a missing system library \
-             like libxml2 it links against): {e}"
-        );
-        return None;
-    }
-    if let Err(e) = server.start().await {
-        eprintln!("skipping: embedded PostgreSQL failed to start: {e}");
-        return None;
-    }
-    let database_name = "skilj_pool_options_test";
-    if let Err(e) = server.create_database(database_name).await {
-        eprintln!("skipping: embedded PostgreSQL create_database failed: {e}");
-        return None;
-    }
-    let database_url = server.settings().url(database_name);
-    Some(TestDb {
-        database_url,
-        _embedded: Some(server),
-    })
+    let url = skilj_test_support::database_url("skilj_pool_options_test").await?;
+    let database_url = url;
+    Some(TestDb { database_url })
 }
 
 /// The whole point: a pool built via `connect_with` actually carries the

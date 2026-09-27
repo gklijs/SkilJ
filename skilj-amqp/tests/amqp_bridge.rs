@@ -73,7 +73,10 @@ async fn provision_broker() -> Option<TestBroker> {
         .with_wait_for(WaitFor::message_on_stdout("AMQ221007"))
         .with_env_var("ANONYMOUS_LOGIN", "true");
     let container = match image.start().await {
-        Ok(container) => container,
+        Ok(container) => {
+            skilj_test_support::remove_container_on_exit(container.id());
+            container
+        }
         Err(e) => {
             eprintln!(
                 "skipping: starting the ephemeral Artemis container failed \

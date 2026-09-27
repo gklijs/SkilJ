@@ -37,4 +37,5 @@ path = "src/lib.rs"
 # external system" reasoning, and CONTRIBUTING.md for the DOCKER_HOST
 # quirk this needs working around on WSL.
 testcontainers = "0.27"
+skilj-test-support = { path = "../skilj-test-support" }
 axum = { workspace = true }

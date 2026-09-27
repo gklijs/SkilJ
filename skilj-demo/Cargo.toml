@@ -36,7 +36,7 @@ jsonwebtoken.workspace = true
 skilj-codegen.workspace = true
 
 [dev-dependencies]
-postgresql_embedded = "0.21.0"
+skilj-test-support = { path = "../skilj-test-support" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 skilj-test-fixture.workspace = true

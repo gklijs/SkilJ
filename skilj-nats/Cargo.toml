@@ -33,4 +33,5 @@ path = "src/lib.rs"
 # itself. See skilj-kafka's own Cargo.toml for the identical "mock
 # skilj, real external system" reasoning.
 testcontainers-modules = { version = "0.15", features = ["nats"] }
+skilj-test-support = { path = "../skilj-test-support" }
 axum = { workspace = true }

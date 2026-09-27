@@ -61,10 +61,9 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 struct TestKafka {
     bootstrap_servers: String,
     // Never read directly - kept alive for as long as `TEST_KAFKA`
-    // itself is, which is the whole test binary's lifetime, the same
-    // "held by the static, dropped at process exit" treatment
-    // `postgresql_embedded::PostgreSQL` gets in every other test file's
-    // own `TestDb`.
+    // itself is, which is the whole test binary's lifetime. A static is
+    // never dropped, so the container is removed by the watchdog
+    // `provision_kafka` registers, not by this handle.
     _container: testcontainers_modules::testcontainers::ContainerAsync<apache::Kafka>,
 }
 
@@ -83,7 +82,10 @@ async fn test_kafka() -> Option<&'static str> {
 
 async fn provision_kafka() -> Option<TestKafka> {
     let node = match apache::Kafka::default().start().await {
-        Ok(node) => node,
+        Ok(node) => {
+            skilj_test_support::remove_container_on_exit(node.id());
+            node
+        }
         Err(e) => {
             eprintln!(
                 "skipping: starting the ephemeral Kafka container failed \

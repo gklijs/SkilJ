@@ -1,0 +1,12 @@
+[package]
+name = "skilj-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Postgres provisioning for skilj's own integration tests. Not part of the library."
+publish = false
+
+[dependencies]
+postgresql_embedded = "0.21.0"
+tokio.workspace = true
