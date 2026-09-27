@@ -144,6 +144,10 @@ pub struct Skilj {
     /// in `.build()`" treatment `projection_query_wait_timeout` already
     /// gets, for the identical reason.
     read_cursor_checkout_lease: std::time::Duration,
+    /// `config.max_events_per_read` - see
+    /// `SkiljBuilder::max_events_per_read`'s own doc comment. Handed to
+    /// both `rest_router()` and the GraphQL state.
+    max_events_per_read: usize,
     /// `protect_sensitive_fields`'s own envelope-encryption master key -
     /// see `SkiljBuilder::encryption_master_key`'s own doc comment.
     /// `None` when never configured - fine as long as no bounded context
@@ -582,6 +586,7 @@ impl Skilj {
             // §53) - matches `config.read_cursor_checkout_lease`'s own
             // default in specs/skilj.allium.
             read_cursor_checkout_lease: std::time::Duration::from_secs(5 * 60),
+            max_events_per_read: skilj_core::event_store::DEFAULT_MAX_EVENTS_PER_READ,
             // Codeberg issue #36's own recommendation #3 - matches
             // `command_batcher::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT`.
             command_batch_idle_in_transaction_timeout: std::time::Duration::from_secs(30),
@@ -678,6 +683,7 @@ impl Skilj {
             // conversions already use.
             chrono::Duration::from_std(self.read_cursor_checkout_lease)
                 .unwrap_or(chrono::Duration::zero()),
+            self.max_events_per_read,
             self.command_batcher.clone(),
         )
     }
@@ -728,6 +734,7 @@ impl Skilj {
             projection_dispatcher: self.projection_dispatcher(),
             snapshot_dispatcher: self.snapshot_dispatcher(),
             projection_query_wait_timeout: self.projection_query_wait_timeout,
+            max_events_per_read: self.max_events_per_read,
             encryption_master_key: self.encryption_master_key.clone(),
             event_broadcaster: self.event_broadcaster.clone(),
             revocation_broadcaster: self.revocation_broadcaster.clone(),
@@ -1223,6 +1230,7 @@ pub struct SkiljBuilder {
     scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
     read_cursor_checkout_lease: std::time::Duration,
+    max_events_per_read: usize,
     command_batch_idle_in_transaction_timeout: std::time::Duration,
     command_batch_max_size: usize,
     command_batch_max_concurrent_leaders: Option<usize>,
@@ -1470,6 +1478,22 @@ impl SkiljBuilder {
         self
     }
 
+    /// The most events one `GET /v1/events`, `GET /v1/events/consume` or
+    /// GraphQL `queryEvents` returns - `config.max_events_per_read` in
+    /// specs/skilj.allium. Each serves the first that many matching
+    /// events in sequence order, and a caller continues from the last
+    /// one: `after`/`nextCursor` for `GET /v1/events`, `afterSequence`
+    /// for `queryEvents`, and the server-side cursor for consume (which
+    /// the bridges already poll in a loop). Keeps one read of a long
+    /// history - a new consumer starting from the beginning, a fetch
+    /// with no `after` - from loading and returning all of it at once.
+    /// Defaults to 1000 (`DEFAULT_MAX_EVENTS_PER_READ`). Clamped to at
+    /// least 1: a page of zero could never make progress.
+    pub fn max_events_per_read(mut self, max: usize) -> Self {
+        self.max_events_per_read = max.max(1);
+        self
+    }
+
     /// A batch leader's own `SET LOCAL idle_in_transaction_session_timeout`,
     /// on the transaction holding the bounded-context lock for the whole
     /// batch it's processing - `skilj_core::command_batcher::CommandBatcher
@@ -1691,6 +1715,7 @@ impl SkiljBuilder {
         let poll_interval = self.async_projection_poll_interval;
         let projection_query_wait_timeout = self.projection_query_wait_timeout;
         let read_cursor_checkout_lease = self.read_cursor_checkout_lease;
+        let max_events_per_read = self.max_events_per_read;
         let encryption_master_key = self.encryption_master_key;
         let event_broadcaster = EventBroadcaster::new(self.event_broadcast_capacity);
         let revocation_broadcaster = RevocationBroadcaster::new();
@@ -1899,6 +1924,7 @@ impl SkiljBuilder {
                     template_cache: template_cache.clone(),
                 }),
                 projection_query_wait_timeout,
+                max_events_per_read,
                 encryption_master_key: encryption_master_key.clone(),
                 event_broadcaster: event_broadcaster.clone(),
                 revocation_broadcaster: revocation_broadcaster.clone(),
@@ -1919,6 +1945,7 @@ impl SkiljBuilder {
             identity_provider,
             projection_query_wait_timeout,
             read_cursor_checkout_lease,
+            max_events_per_read,
             encryption_master_key,
             event_broadcaster,
             revocation_broadcaster,

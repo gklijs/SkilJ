@@ -5563,6 +5563,39 @@ pub async fn list_events_from(
     Ok(events)
 }
 
+/// [`list_events_from`] capped at `limit` events - [`for_each_event_chunk`]'s
+/// Postgres fallback for a type-scoped read.
+pub async fn list_events_from_limited(
+    pool: &Pool,
+    bounded_context: &str,
+    event_type_name: &str,
+    after_sequence: i64,
+    limit: i64,
+) -> crate::error::Result<Vec<Event>> {
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    let et = require_event_type(pool, bounded_context, event_type_name).await?;
+
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
+         metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \
+         origin_kind, origin_source_content, origin_source_context, \
+         origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \
+         ORDER BY sequence LIMIT $3"
+    )))
+    .bind(event_type_name)
+    .bind(after_sequence)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        events.push(row.into_domain(pool, bc.clone(), et.clone()).await?);
+    }
+    Ok(events)
+}
+
 /// `FetchEvents`/`ConsumeEvents`'s own real read path - see
 /// `crate::event_cache`'s own module doc comment for the full design.
 /// Tries the cache first; `list_events_from` above is the fallback, so a
@@ -5586,6 +5619,107 @@ pub async fn list_events_cached(
             .collect()),
         None => list_events_from(pool, bounded_context, event_type_name, after_sequence).await,
     }
+}
+
+/// Walks a bounded context's events after `after_sequence`, in sequence
+/// order, `chunk_size` at a time - only `event_type_name`'s when given -
+/// handing each chunk to `visit` until it returns `false` or
+/// history runs out. Cache-first per chunk, like `list_events_cached`;
+/// the Postgres fallback is `LIMIT`ed, so a long history is never loaded
+/// whole. This is how the `config.max_events_per_read`-bounded reads
+/// (`FetchEvents`, `ConsumeEvents`, `QueryEvents`) find their page without
+/// holding more than a chunk plus that page in memory - see
+/// [`collect_event_page`].
+pub async fn for_each_event_chunk(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    event_type_name: Option<&str>,
+    mut after_sequence: i64,
+    chunk_size: usize,
+    mut visit: impl FnMut(&[Event]) -> crate::error::Result<bool>,
+) -> crate::error::Result<()> {
+    let chunk_size = chunk_size.max(1);
+    let limit = i64::try_from(chunk_size).unwrap_or(i64::MAX);
+    loop {
+        let chunk = match cache
+            .try_events_after(pool, bounded_context, after_sequence)
+            .await?
+        {
+            Some(events) => {
+                // The window is complete from `after_sequence` on, so a
+                // short type-filtered result here is the real end.
+                let chunk: Vec<Event> = events
+                    .into_iter()
+                    .filter(|e| event_type_name.is_none_or(|name| e.event_type.name == name))
+                    .take(chunk_size)
+                    .collect();
+                let exhausted = chunk.len() < chunk_size;
+                (chunk, exhausted)
+            }
+            None => {
+                let chunk = match event_type_name {
+                    Some(name) => {
+                        list_events_from_limited(pool, bounded_context, name, after_sequence, limit)
+                            .await?
+                    }
+                    None => {
+                        list_events_for_bounded_context_from_limited(
+                            pool,
+                            bounded_context,
+                            after_sequence,
+                            limit,
+                        )
+                        .await?
+                    }
+                };
+                let exhausted = chunk.len() < chunk_size;
+                (chunk, exhausted)
+            }
+        };
+        let (chunk, exhausted) = chunk;
+        if let Some(last) = chunk.last() {
+            after_sequence = last.sequence;
+        }
+        if !visit(&chunk)? || exhausted {
+            return Ok(());
+        }
+    }
+}
+
+/// One bounded page: walks [`for_each_event_chunk`], `max_events` at a
+/// time (so memory stays at about a chunk plus the page), and asks `select`
+/// for the events to serve out of each chunk (given how many more fit),
+/// stopping once `max_events` are selected or history ends. `select` is
+/// the rule's own pure function (`event_store::fetch_events_page` and
+/// friends), so the page is exactly the first `max_events` it would have
+/// served over the whole history. It runs at least once, even on an
+/// empty history, so its own validation errors still surface.
+#[allow(clippy::too_many_arguments)]
+pub async fn collect_event_page(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    event_type_name: Option<&str>,
+    after_sequence: i64,
+    max_events: usize,
+    mut select: impl FnMut(&[Event], usize) -> crate::error::Result<Vec<Event>>,
+) -> crate::error::Result<Vec<Event>> {
+    let mut page = Vec::new();
+    for_each_event_chunk(
+        pool,
+        cache,
+        bounded_context,
+        event_type_name,
+        after_sequence,
+        max_events,
+        |chunk| {
+            page.extend(select(chunk, max_events - page.len())?);
+            Ok(page.len() < max_events)
+        },
+    )
+    .await?;
+    Ok(page)
 }
 
 /// `QueryEvents`/`CountEvents`'s own real read path when no `tags`

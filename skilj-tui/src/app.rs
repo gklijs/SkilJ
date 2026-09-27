@@ -71,7 +71,8 @@ impl TextInput {
 pub enum AppEvent {
     Term(TermEvent),
     LiveEvent(Result<Value, ClientError>),
-    QueryEventsResult(Result<Value, ClientError>),
+    /// `true` when this is a next page (`n`) to append, not a fresh query.
+    QueryEventsResult(Result<Value, ClientError>, bool),
     QueryEventsTypesResult(Result<Value, ClientError>),
     CommandResult(Result<Value, ClientError>),
     CommandTypesResult(Result<Value, ClientError>),
@@ -132,6 +133,9 @@ pub struct QueryEventsTab {
     pub results: Vec<Value>,
     pub query_error: Option<String>,
     pub query_loading: bool,
+    /// The event types the shown results were queried with - what `n`
+    /// (next page) re-queries, even if the checkboxes changed since.
+    pub queried_types: Vec<Value>,
 }
 
 /// Commands - Codeberg issue #8. Picking a type and filling in its
@@ -250,6 +254,7 @@ impl App {
                 results: Vec::new(),
                 query_error: None,
                 query_loading: false,
+                queried_types: Vec::new(),
             },
             commands: CommandsTab {
                 stage: CommandsStage::Picking {
@@ -297,15 +302,23 @@ impl App {
                 self.live_connected = false;
                 self.status = Some(format!("live events: {e}"));
             }
-            AppEvent::QueryEventsResult(result) => {
+            AppEvent::QueryEventsResult(result, append) => {
                 self.query_events.query_loading = false;
                 match result {
                     Ok(data) => {
-                        self.query_events.results = data
+                        let page = data
                             .get("queryEvents")
                             .and_then(Value::as_array)
                             .cloned()
                             .unwrap_or_default();
+                        if append {
+                            if page.is_empty() {
+                                self.status = Some("no more events".into());
+                            }
+                            self.query_events.results.extend(page);
+                        } else {
+                            self.query_events.results = page;
+                        }
                         self.query_events.query_error = None;
                     }
                     Err(e) => self.query_events.query_error = Some(e.to_string()),
@@ -556,6 +569,7 @@ impl App {
             }
             KeyCode::Char('r') => self.fetch_event_types(),
             KeyCode::Enter => self.submit_query_events(),
+            KeyCode::Char('n') => self.next_query_events_page(),
             _ => {}
         }
     }
@@ -590,6 +604,29 @@ impl App {
                 Some("select at least one event type (Space to toggle)".into());
             return;
         }
+        self.query_events.queried_types = event_types.clone();
+        self.run_query_events(event_types, None);
+    }
+
+    /// `queryEvents` returns at most the server's `max_events_per_read`
+    /// per call; `n` asks for the page after the last shown event.
+    fn next_query_events_page(&mut self) {
+        if self.query_events.query_loading || self.query_events.queried_types.is_empty() {
+            return;
+        }
+        let after = self
+            .query_events
+            .results
+            .last()
+            .and_then(|e| e.get("sequence"))
+            .and_then(Value::as_i64);
+        let Some(after) = after else {
+            return;
+        };
+        self.run_query_events(self.query_events.queried_types.clone(), Some(after));
+    }
+
+    fn run_query_events(&mut self, event_types: Vec<Value>, after: Option<i64>) {
         self.query_events.query_loading = true;
         self.query_events.query_error = None;
         let client = self.client.clone();
@@ -598,13 +635,14 @@ impl App {
         tokio::spawn(async move {
             let result = client
                 .request(
-                    "query($bc: String!, $types: [String!]!) { \
-                        queryEvents(boundedContext: $bc, eventTypes: $types) { sequence payload } \
+                    "query($bc: String!, $types: [String!]!, $after: Int) { \
+                        queryEvents(boundedContext: $bc, eventTypes: $types, afterSequence: $after) \
+                        { sequence payload } \
                     }",
-                    serde_json::json!({ "bc": bounded_context, "types": event_types }),
+                    serde_json::json!({ "bc": bounded_context, "types": event_types, "after": after }),
                 )
                 .await;
-            let _ = tx.send(AppEvent::QueryEventsResult(result));
+            let _ = tx.send(AppEvent::QueryEventsResult(result, after.is_some()));
         });
     }
 

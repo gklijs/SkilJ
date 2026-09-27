@@ -69,50 +69,57 @@ pub fn query_events_field() -> Field {
                     .and_then(|v| v.string().ok())
                     .map(|s| s.to_string());
 
-                // docs/architecture.md §19's "Problem 1" fix: a non-empty
-                // `tags` filter can go straight to the tag-indexed query
-                // instead of pulling the whole bounded context and
-                // filtering in memory - `query_events`'s own
-                // `event_types`/`tags` filters below still run
-                // unchanged, just over an already-narrowed candidate set
-                // rather than everything. No `tags` filter (the common
-                // "browse everything" case, or an `event_types`-only
-                // filter) keeps the existing full fetch - narrowing that
-                // case is a separate, unaddressed optimisation.
-                let bounded_context_events = match tags.as_deref() {
+                // At most `max_events_per_read` events are served - the
+                // caller pages on with `afterSequence` = the last one's
+                // `sequence`. docs/architecture.md §19's "Problem 1" fix:
+                // a non-empty `tags` filter goes straight to the
+                // tag-indexed query (already narrowed, so loaded whole,
+                // then paged); otherwise the bounded context's history is
+                // walked a chunk at a time until the page is full.
+                let select = |events: &[skilj_core::event_store::Event], max: usize| {
+                    skilj_core::event_store::query_events_select(
+                        &access_mapping,
+                        &event_types,
+                        tags.as_deref(),
+                        after_sequence,
+                        correlation_id.as_deref(),
+                        events,
+                        max,
+                    )
+                };
+                let page = match tags.as_deref() {
                     Some(wanted) if !wanted.is_empty() => {
-                        skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
+                        let tagged =
+                            skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
+                                &state.pool,
+                                &state.event_cache,
+                                &bounded_context_name,
+                                wanted,
+                                after_sequence,
+                            )
+                            .await
+                            .map_err(to_graphql_error)?;
+                        select(&tagged, state.max_events_per_read)
+                    }
+                    _ => {
+                        skilj_core::db::collect_event_page(
                             &state.pool,
                             &state.event_cache,
                             &bounded_context_name,
-                            wanted,
-                            after_sequence,
+                            None,
+                            after_sequence.unwrap_or(-1),
+                            state.max_events_per_read,
+                            select,
                         )
                         .await
-                        .map_err(to_graphql_error)?
                     }
-                    _ => skilj_core::db::list_events_for_bounded_context_cached(
-                        &state.pool,
-                        &state.event_cache,
-                        &bounded_context_name,
-                        after_sequence.unwrap_or(-1),
-                    )
-                    .await
-                    .map_err(to_graphql_error)?,
-                };
+                }
+                .map_err(to_graphql_error)?;
 
-                // Decrypt-on-read's own pre-resolution step - scoped to
-                // events matching the caller's own `eventTypes` argument
-                // (the cheapest part of query_events' own filter to
-                // replicate here without duplicating the whole thing);
-                // `tags`/`afterSequence` may narrow the actual results
-                // further, so this may resolve a few more keys than
-                // strictly needed, never fewer - no correctness impact.
+                // Decrypt-on-read's own pre-resolution step - only for
+                // the events actually served.
                 let mut data_keys = std::collections::HashMap::new();
-                for e in bounded_context_events.iter().filter(|e| {
-                    e.bounded_context == access_mapping.bounded_context
-                        && (event_types.is_empty() || event_types.contains(&e.event_type))
-                }) {
+                for e in &page {
                     resolve_read_data_keys(
                         &state.pool,
                         &bounded_context_name,
@@ -127,15 +134,16 @@ pub fn query_events_field() -> Field {
 
                 let private_field_grants =
                     super::load_private_field_grants(&state.pool, &bounded_context_name).await?;
-                let results = skilj_core::event_store::query_events(
+                let results = skilj_core::event_store::query_events_page(
                     &access_mapping,
                     &event_types,
                     tags.as_deref(),
                     after_sequence,
                     correlation_id.as_deref(),
-                    &bounded_context_events,
+                    &page,
                     |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
                     &private_field_grants,
+                    state.max_events_per_read,
                 )
                 .map_err(to_graphql_error)?;
 

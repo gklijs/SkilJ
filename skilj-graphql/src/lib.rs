@@ -71,6 +71,9 @@ pub struct GraphqlState {
     /// same register `SkiljBuilder::async_projection_poll_interval`
     /// already lives in. See `resolvers::projection_query::wait_until_caught_up`.
     pub projection_query_wait_timeout: Duration,
+    /// `config.max_events_per_read` - the most events one `queryEvents`
+    /// returns. See `skilj::SkiljBuilder::max_events_per_read`.
+    pub max_events_per_read: usize,
     /// `submitCommand`'s own bridge into `protect_sensitive_fields` for
     /// the events/command it produces (§SubjectErasure) - the identical
     /// `Option<EncryptionMasterKey>` `Skilj::rest_router()` hands its own

@@ -167,6 +167,7 @@ async fn a_request_with_a_traceparent_header_continues_that_trace() {
         EventBroadcaster::new(4),
         EventCache::new(4),
         chrono::Duration::minutes(5),
+        skilj_core::event_store::DEFAULT_MAX_EVENTS_PER_READ,
         CommandBatcher::new(),
     );
 

@@ -58,8 +58,8 @@ use axum_extra::extract::Query;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use skilj_core::access_control::{
-    CommandToken, DirectCreationToken, Error as AccessControlError, EventReadToken,
-    ExternalEventToken, TokenStatus,
+    CommandToken, DirectCreationToken, Error as AccessControlError, EventReadStartPosition,
+    EventReadToken, ExternalEventToken, TokenStatus,
 };
 use skilj_core::command_batcher::CommandBatcher;
 use skilj_core::db::{self, AccessTokenKind, Pool};
@@ -95,6 +95,10 @@ struct AppState {
     /// `skilj::SkiljBuilder::read_cursor_checkout_lease`'s own doc
     /// comment (Codeberg issue #25, docs/architecture.md §53).
     read_cursor_checkout_lease: chrono::Duration,
+    /// `config.max_events_per_read` - the most events one `GET
+    /// /v1/events` or `GET /v1/events/consume` serves. See
+    /// `skilj::SkiljBuilder::max_events_per_read`.
+    max_events_per_read: usize,
     /// Codeberg issue #32 (round two) - `post_commands_trigger`'s own
     /// real, externally-triggered submission volume is exactly what
     /// `CommandBatcher` exists to coalesce; see its own module doc
@@ -197,6 +201,7 @@ pub fn router(
     event_broadcaster: EventBroadcaster,
     event_cache: EventCache,
     read_cursor_checkout_lease: chrono::Duration,
+    max_events_per_read: usize,
     command_batcher: CommandBatcher,
 ) -> Router {
     Router::new()
@@ -217,6 +222,7 @@ pub fn router(
             event_broadcaster,
             event_cache,
             read_cursor_checkout_lease,
+            max_events_per_read: max_events_per_read.max(1),
             command_batcher,
         })
 }
@@ -753,22 +759,27 @@ async fn get_events(
 ) -> Result<impl IntoResponse, RestError> {
     let filters = parse_filter_params(&query.filter)?;
     let token = resolve_token::<EventReadToken>(&state, &credential).await?;
-    let events = db::list_events_cached(
+    // At most `max_events_per_read`, loaded a chunk at a time - a caller
+    // pages on with `after` = this response's `nextCursor`.
+    let matched = db::collect_event_page(
         &state.pool,
         &state.event_cache,
         &token.event_type.bounded_context.name,
-        &token.event_type.name,
+        Some(&token.event_type.name),
         query.after.unwrap_or(-1),
+        state.max_events_per_read,
+        |chunk, remaining| {
+            event_store::fetch_events_page(
+                &token,
+                chunk,
+                &filters,
+                query.after,
+                query.correlation_id.as_deref(),
+                remaining,
+            )
+        },
     )
     .await?;
-
-    let matched = event_store::fetch_events(
-        &token,
-        &events,
-        &filters,
-        query.after,
-        query.correlation_id.as_deref(),
-    )?;
     let next_cursor = matched
         .last()
         .map(|e| e.sequence.to_string())
@@ -827,23 +838,62 @@ async fn get_events_consume(
         .map_err(skilj_core::error::Error::from)?;
     db::lock_read_cursor_for_consume(&mut tx, &token).await?;
     let existing_cursor = db::get_read_cursor(&mut *tx, &token).await?;
-    let events = db::list_events_cached(
+    let bounded_context_name = &token.event_type.bounded_context.name;
+    // Where serving starts: the cursor, or for a new one its seed
+    // (`initial_consume_position`) - which for `Latest`/`AtTime` is the
+    // highest qualifying sequence in the whole history, found a chunk at
+    // a time rather than by loading all of it.
+    let position = match &existing_cursor {
+        Some(cursor) => cursor.sequence,
+        None => match token.start_from {
+            EventReadStartPosition::Latest | EventReadStartPosition::AtTime => {
+                let mut position = -1;
+                db::for_each_event_chunk(
+                    &state.pool,
+                    &state.event_cache,
+                    bounded_context_name,
+                    Some(&token.event_type.name),
+                    -1,
+                    state.max_events_per_read,
+                    |chunk| {
+                        position =
+                            position.max(event_store::initial_consume_position(&token, chunk));
+                        Ok(true)
+                    },
+                )
+                .await?;
+                position
+            }
+            _ => event_store::initial_consume_position(&token, std::iter::empty()),
+        },
+    };
+    // The page after `position`: `fetch_events_page` applies exactly the
+    // filters `ConsumeEvents` serves by (type, `filters`, owner scope),
+    // and `consume_events_page` below re-applies them over this already
+    // bounded set along with the lease and cursor logic.
+    let candidates = db::collect_event_page(
         &state.pool,
         &state.event_cache,
-        &token.event_type.bounded_context.name,
-        &token.event_type.name,
-        existing_cursor.as_ref().map(|c| c.sequence).unwrap_or(-1),
+        bounded_context_name,
+        Some(&token.event_type.name),
+        position,
+        state.max_events_per_read,
+        |chunk, remaining| {
+            event_store::fetch_events_page(&token, chunk, &filters, Some(position), None, remaining)
+        },
     )
     .await?;
 
-    let result = event_store::consume_events(
+    let result = event_store::consume_events_page(
         &token,
         existing_cursor.as_ref(),
         ack_mode,
-        &events,
+        position,
+        &candidates,
         &filters,
         Utc::now(),
         state.read_cursor_checkout_lease,
+        state.max_events_per_read,
     )?;
     db::apply_cursor_update(&mut *tx, &token, &result.cursor_update).await?;
     tx.commit().await.map_err(skilj_core::error::Error::from)?;

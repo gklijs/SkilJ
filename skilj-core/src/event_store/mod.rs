@@ -2452,6 +2452,14 @@ pub fn forget_subject(
     })
 }
 
+/// `config.max_events_per_read`'s spec default: the most events one
+/// `FetchEvents`/`ConsumeEvents`/`QueryEvents` serves - the first that
+/// many matching, in sequence order. A caller pages on from the last
+/// served sequence (`after_sequence`, or the consume cursor), so nothing
+/// is skipped. `SkiljBuilder::max_events_per_read` overrides it; the
+/// `*_page` variants of those three functions take the value explicitly.
+pub const DEFAULT_MAX_EVENTS_PER_READ: usize = 1000;
+
 /// See `rule QueryEvents`. `bounded_context_events` is every `Event`
 /// matching what this call needs, the same full-snapshot shape
 /// `consistency_boundary_and_matching_events` takes `Event`s in - real
@@ -2483,6 +2491,65 @@ pub fn query_events(
     resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
     private_field_grants: &[PrivateFieldGrant],
 ) -> crate::error::Result<Vec<(i64, String)>> {
+    query_events_page(
+        access_mapping,
+        event_types,
+        tags,
+        after_sequence,
+        correlation_id,
+        bounded_context_events,
+        resolve_data_key,
+        private_field_grants,
+        DEFAULT_MAX_EVENTS_PER_READ,
+    )
+}
+
+/// [`query_events`] with an explicit `config.max_events_per_read`:
+/// [`query_events_select`], then each selected event rendered.
+#[allow(clippy::too_many_arguments)]
+pub fn query_events_page(
+    access_mapping: &RoleAccessMapping,
+    event_types: &[EventType],
+    tags: Option<&[Tag]>,
+    after_sequence: Option<i64>,
+    correlation_id: Option<&str>,
+    bounded_context_events: &[Event],
+    resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
+    private_field_grants: &[PrivateFieldGrant],
+    max_events: usize,
+) -> crate::error::Result<Vec<(i64, String)>> {
+    Ok(query_events_select(
+        access_mapping,
+        event_types,
+        tags,
+        after_sequence,
+        correlation_id,
+        bounded_context_events,
+        max_events,
+    )?
+    .iter()
+    .map(|e| {
+        (
+            e.sequence,
+            render_event(e, access_mapping, &resolve_data_key, private_field_grants),
+        )
+    })
+    .collect())
+}
+
+/// `rule QueryEvents`' `requires` and its `candidates` - which events a
+/// query serves, at most `max_events`, not yet rendered. Separate from
+/// rendering so `skilj-graphql` can pick its page a chunk at a time and
+/// then resolve decryption keys for just the events it serves.
+pub fn query_events_select(
+    access_mapping: &RoleAccessMapping,
+    event_types: &[EventType],
+    tags: Option<&[Tag]>,
+    after_sequence: Option<i64>,
+    correlation_id: Option<&str>,
+    bounded_context_events: &[Event],
+    max_events: usize,
+) -> crate::error::Result<Vec<Event>> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
     }
@@ -2512,12 +2579,8 @@ pub fn query_events(
             correlation_id.is_none_or(|id| e.metadata.correlation_id.as_deref() == Some(id))
         })
         .filter(|e| event_owner_scope_satisfied(e, access_mapping.scope.as_deref()))
-        .map(|e| {
-            (
-                e.sequence,
-                render_event(e, access_mapping, &resolve_data_key, private_field_grants),
-            )
-        })
+        .take(max_events)
+        .cloned()
         .collect())
 }
 
@@ -2918,6 +2981,27 @@ pub fn fetch_events(
     after_sequence: Option<i64>,
     correlation_id: Option<&str>,
 ) -> crate::error::Result<Vec<Event>> {
+    fetch_events_page(
+        token,
+        events,
+        filters,
+        after_sequence,
+        correlation_id,
+        DEFAULT_MAX_EVENTS_PER_READ,
+    )
+}
+
+/// [`fetch_events`] with an explicit `config.max_events_per_read`. Also
+/// what `skilj-rest` calls once per chunk while paging through history
+/// (see `db::collect_event_page`).
+pub fn fetch_events_page(
+    token: &EventReadToken,
+    events: &[Event],
+    filters: &[Filter],
+    after_sequence: Option<i64>,
+    correlation_id: Option<&str>,
+    max_events: usize,
+) -> crate::error::Result<Vec<Event>> {
     if token.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
     }
@@ -2942,6 +3026,7 @@ pub fn fetch_events(
             correlation_id.is_none_or(|id| e.metadata.correlation_id.as_deref() == Some(id))
         })
         .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
+        .take(max_events)
         .cloned()
         .collect())
 }
@@ -3008,6 +3093,78 @@ pub fn consume_events(
     now: chrono::DateTime<chrono::Utc>,
     checkout_lease: chrono::Duration,
 ) -> crate::error::Result<ConsumeEventsResult> {
+    consume_events_page(
+        token,
+        existing_cursor,
+        ack_mode,
+        initial_consume_position(token, events),
+        events,
+        filters,
+        now,
+        checkout_lease,
+        DEFAULT_MAX_EVENTS_PER_READ,
+    )
+}
+
+/// Where a token's *new* `ReadCursor` starts - rule `ConsumeEvents`'
+/// `position` for `is_new`, from `token.start_from`. `Latest`/`AtTime`
+/// are the greatest qualifying sequence in `history`, so a caller can
+/// scan history in chunks and keep the maximum of each chunk's result
+/// (`-1` means none) instead of loading it all at once. `Latest`/`AtTime`
+/// are scoped exactly as a served event is (an event outside this
+/// token's own scope was never visible to it, so it can't count as
+/// "already seen" either), but blind to any call's `filters`, which vary
+/// call to call and must never move where a one-time seed lands.
+/// `AtSequence` is the caller-chosen value, unvalidated.
+pub fn initial_consume_position<'a>(
+    token: &EventReadToken,
+    history: impl IntoIterator<Item = &'a Event>,
+) -> i64 {
+    let read_type = &token.event_type;
+    let qualifying = history
+        .into_iter()
+        .filter(|e| e.bounded_context == read_type.bounded_context)
+        .filter(|e| &e.event_type == read_type)
+        .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()));
+    match token.start_from {
+        EventReadStartPosition::Beginning => -1,
+        EventReadStartPosition::Latest => qualifying.map(|e| e.sequence).max().unwrap_or(-1),
+        EventReadStartPosition::AtSequence => token.start_at_sequence.expect(
+            "create_event_read_token guarantees start_at_sequence is Some when \
+             start_from = AtSequence",
+        ),
+        EventReadStartPosition::AtTime => {
+            let threshold = token.start_at_time.expect(
+                "create_event_read_token guarantees start_at_time is Some when \
+                 start_from = AtTime",
+            );
+            qualifying
+                .filter(|e| e.metadata.created_at <= threshold)
+                .map(|e| e.sequence)
+                .max()
+                .unwrap_or(-1)
+        }
+    }
+}
+
+/// [`consume_events`] with a new cursor's starting position already
+/// resolved (`new_cursor_position`, from [`initial_consume_position`];
+/// ignored when `existing_cursor` is `Some`) and an explicit
+/// `config.max_events_per_read`. `events` then only needs to hold the
+/// candidates after that position - which is what lets `skilj-rest` load
+/// them a chunk at a time.
+#[allow(clippy::too_many_arguments)]
+pub fn consume_events_page(
+    token: &EventReadToken,
+    existing_cursor: Option<&ReadCursor>,
+    ack_mode: Option<AckMode>,
+    new_cursor_position: i64,
+    events: &[Event],
+    filters: &[Filter],
+    now: chrono::DateTime<chrono::Utc>,
+    checkout_lease: chrono::Duration,
+    max_events: usize,
+) -> crate::error::Result<ConsumeEventsResult> {
     if token.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
     }
@@ -3033,49 +3190,9 @@ pub fn consume_events(
         .or_else(|| existing_cursor.map(|c| c.ack_mode))
         .expect("is_new implies ack_mode.is_some(), checked above");
 
-    // See `EventReadToken.start_from`'s own doc comment and rule
-    // `ConsumeEvents`' `latest_position`/`at_time_position` bindings.
-    // `Latest`/`AtTime` are both scoped exactly as a served event is (an
-    // event outside this token's own scope was never visible to it, so
-    // it can't count as "already seen" either), but deliberately blind
-    // to this call's own `filters` argument, which varies call to call
-    // and must never change where a one-time seed lands. `AtSequence`
-    // needs no computation at all - the caller-chosen value is the
-    // position, unvalidated, the same "opaque value" treatment `scope`
-    // gets.
-    let position = match existing_cursor {
-        Some(cursor) => cursor.sequence,
-        None => match token.start_from {
-            EventReadStartPosition::Beginning => -1,
-            EventReadStartPosition::Latest => events
-                .iter()
-                .filter(|e| e.bounded_context == read_type.bounded_context)
-                .filter(|e| &e.event_type == read_type)
-                .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
-                .map(|e| e.sequence)
-                .max()
-                .unwrap_or(-1),
-            EventReadStartPosition::AtSequence => token.start_at_sequence.expect(
-                "create_event_read_token guarantees start_at_sequence is Some when \
-                 start_from = AtSequence",
-            ),
-            EventReadStartPosition::AtTime => {
-                let threshold = token.start_at_time.expect(
-                    "create_event_read_token guarantees start_at_time is Some when \
-                     start_from = AtTime",
-                );
-                events
-                    .iter()
-                    .filter(|e| e.bounded_context == read_type.bounded_context)
-                    .filter(|e| &e.event_type == read_type)
-                    .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
-                    .filter(|e| e.metadata.created_at <= threshold)
-                    .map(|e| e.sequence)
-                    .max()
-                    .unwrap_or(-1)
-            }
-        },
-    };
+    // See `initial_consume_position` for how a new cursor's position is
+    // chosen; the caller resolved it already.
+    let position = existing_cursor.map_or(new_cursor_position, |cursor| cursor.sequence);
 
     // `manual_ack` only, and always `false` when `is_new` (a cursor just
     // being provisioned was never claimed by anyone) - see
@@ -3103,6 +3220,7 @@ pub fn consume_events(
             .filter(|e| e.sequence > position)
             .filter(|e| matches_filters(e, filters))
             .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
+            .take(max_events)
             .cloned()
             .collect()
     };

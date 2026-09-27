@@ -529,6 +529,13 @@ fn sign_jwt(subject: &str) -> String {
 /// requirement and `CommandSubmission`'s `Write | Admin` check), and that
 /// Role's own signed JWT.
 async fn setup() -> (Skilj, Pool, String, String, Role) {
+    setup_with(|builder| builder).await
+}
+
+/// `setup()`, with a hook to adjust the builder before `build()`.
+async fn setup_with(
+    configure: impl FnOnce(skilj::SkiljBuilder) -> skilj::SkiljBuilder,
+) -> (Skilj, Pool, String, String, Role) {
     let database_url = test_database_url()
         .await
         .expect("test_database_url() must be Some - caller already checked");
@@ -574,7 +581,7 @@ async fn setup() -> (Skilj, Pool, String, String, Role) {
         .await
         .unwrap();
 
-    let (skilj, report) = Skilj::builder(database_url.clone())
+    let builder = Skilj::builder(database_url.clone())
         .identity_provider(IdpConfig::new(
             jwks_url.parse().unwrap(),
             TEST_ISSUER,
@@ -592,10 +599,8 @@ async fn setup() -> (Skilj, Pool, String, String, Role) {
         .event_type::<TicketOpened>()
         .snapshot::<TicketTotalSnapshot>()
         .command_type::<OpenTicket>()
-        .reconciliation_role(admin_subject)
-        .build()
-        .await
-        .unwrap();
+        .reconciliation_role(admin_subject);
+    let (skilj, report) = configure(builder).build().await.unwrap();
     assert_eq!(report.skipped_no_access, Vec::<String>::new());
 
     let jwt = sign_jwt(&role.external_subject);
@@ -1592,5 +1597,71 @@ fn private_field_grant_lifecycle_end_to_end() {
         let grants = response["data"]["listPrivateFieldGrants"].as_array().unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0]["status"], "REVOKED");
+    });
+}
+
+/// `queryEvents` serves at most `max_events_per_read` events (3 here),
+/// oldest first, and a caller pages on with `afterSequence` = the last
+/// one's `sequence`. With a two-event cache window, the early pages come
+/// from the bounded-context-wide Postgres read, `LIMIT`ed per chunk.
+#[test]
+fn query_events_serves_bounded_pages_over_graphql() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt, _role) = setup_with(|builder| {
+            builder
+                .max_events_per_read(3)
+                .event_cache_warm_up_count(2)
+        })
+        .await;
+        let router = skilj.graphql_router().await.unwrap();
+        for amount in 1..=7 {
+            let response = graphql_request(
+                &router,
+                Some(&jwt),
+                SUBMIT_COMMAND_MUTATION,
+                json!({
+                    "bc": bc_name,
+                    "name": "WithdrawMoney",
+                    "payload": format!(r#"{{"amount":{amount}}}"#),
+                }),
+            )
+            .await;
+            assert_eq!(response["data"]["submitCommand"]["accepted"], true, "{response:?}");
+        }
+
+        let mut after: Option<i64> = None;
+        let mut pages = Vec::new();
+        loop {
+            let response = graphql_request(
+                &router,
+                Some(&jwt),
+                "query($bc: String!, $after: Int) { \
+                    queryEvents(boundedContext: $bc, eventTypes: [\"MoneyDeposited\"], afterSequence: $after) \
+                    { sequence payload } }",
+                json!({ "bc": bc_name, "after": after }),
+            )
+            .await;
+            assert!(response.get("errors").is_none(), "{response:?}");
+            let events = response["data"]["queryEvents"].as_array().unwrap().clone();
+            if events.is_empty() {
+                break;
+            }
+            after = events.last().unwrap()["sequence"].as_i64();
+            pages.push(
+                events
+                    .iter()
+                    .map(|e| {
+                        serde_json::from_str::<serde_json::Value>(e["payload"].as_str().unwrap())
+                            .unwrap()["amount"]
+                            .as_i64()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(pages, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
     });
 }

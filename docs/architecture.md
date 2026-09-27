@@ -1224,9 +1224,12 @@ POST /v1/events/direct
 
 GET /v1/events?filter=field:op:value&filter=field2:op2:value2&after=41
   -> 200 { "events": [...], "nextCursor": "44" }   # cursor = sequence, same convention as §5.3
+  # At most max_events_per_read events (default 1000, §69), oldest first: page on with
+  # after=nextCursor until a call returns no events.
 
 GET /v1/events/consume?mode=auto|manual&filter=field:op:value
   -> 200 { "events": [...] }
+  # Also at most max_events_per_read per call; the next call continues from the cursor.
   # mode required on a token's first call, optional (and validated to match) after that -
   # see entity ReadCursor in the spec. No "after"/cursor param at all: the position lives
   # server-side, keyed by the token alone. filter= is the identical repeatable param
@@ -9339,3 +9342,21 @@ Each registered projection gets a GraphQL type named `{bounded_context}_{project
 Fix, in line with how this module already treats an unparseable projection schema (exclude it and log why, rather than fail the whole schema): `build` claims each projection's generated names all-or-nothing (`admit_type_names`). A projection whose names are invalid or already taken is excluded with a `tracing::warn!`. A state field without a valid, unique GraphQL name is left out (before any nested type gets named after it). The admitted `(bounded_context, projection)` pairs go into the schema as `AdmittedProjections` data, and `projection` / `projectionUpdates` refuse anything outside it with `projection_not_in_schema`. That set is keyed by the pair, not the type name, because a colliding pair shares the name. This module's two `eprintln!` warnings became `tracing::warn!`, matching the crate's "emit via `tracing` only" rule stated in `schema.rs`.
 
 Tests: `colliding_projection_type_names_serve_one_and_refuse_the_other` (`skilj/tests/projection_query.rs`; both served before, exactly one after, and the shared type carries only the served projection's field) plus unit tests for the name grammar, all-or-nothing admission and field skipping.
+
+
+## 69. Bounded event reads (`config.max_events_per_read`)
+
+`GET /v1/events`, `GET /v1/events/consume` and GraphQL `queryEvents` each served *every* matching event after their cursor, and loaded the whole remaining history into memory first to find them. A new consumer starting from the beginning of a long history, or one `GET /v1/events` without `after`, made the server load and serialize all of it in one response - enough to exhaust memory on either end.
+
+**Spec.** `specs/skilj.allium` leaves paging to the wire contract, but *what* a rule serves is spec behaviour, so it now says so: a new `config.max_events_per_read` (default 1000) and a black-box `first_by_sequence(events, n)`. `FetchEvents`, `ConsumeEvents` and `QueryEvents` serve `first_by_sequence(<what they served before>, config.max_events_per_read)`. That keeps every rule's continuation exact: `ConsumeEvents`' auto-advance already moved the cursor to `highest_sequence(served)`, and a manual-ack caller acks the last event it handled, so a prefix is never skipped. The cap counts *served* events, not scanned candidates. A cap on candidates would leave a filtered consumer whose next N candidates all miss its filter with an empty page and an unmoved cursor forever. `CountEvents` stays unbounded - it is an aggregate, not a page. `allium check`/`analyse` unchanged (0 findings; 22 diagnostics, 5 findings as before).
+
+**Implementation.**
+- Pure functions keep their signatures (`fetch_events`, `consume_events`, `query_events` apply `DEFAULT_MAX_EVENTS_PER_READ`); `*_page` variants take the cap explicitly. `consume_events`' new-cursor seed moved into `initial_consume_position(token, history)`, a maximum, so it can be computed chunk by chunk; `consume_events_page` takes the resolved seed. `query_events_select` separates choosing a page from rendering it, since `skilj-graphql` resolves decryption keys asynchronously for just the served events.
+- `db::for_each_event_chunk` walks a bounded context's history (optionally one event type) in chunks, cache-first per chunk with a `LIMIT`ed Postgres fallback (`list_events_from_limited`, `list_events_for_bounded_context_from_limited`). `db::collect_event_page` builds one page on it, calling the rule's own pure function per chunk, so the page is exactly the first N it would have served over the whole history. The chunk size is the page size, so memory stays at roughly one chunk plus one page, tuned by the one setting.
+- `SkiljBuilder::max_events_per_read` (clamped to at least 1) reaches the REST state and `GraphqlState`. `skilj_rest::router` gained the parameter.
+- `skilj-tui`'s query view shows how many events it has and loads the next page with `n`; it used to show one unbounded result. The Kafka/AMQP/NATS/Temporal bridges already poll consume in a loop and need no change. `skilj-inspector` reads Postgres directly and is unaffected.
+- Not bounded: a tag-filtered `queryEvents` still loads its tag-index matches whole before paging them - already narrowed by the index, and the page it returns is capped.
+
+**Breaking** for a `GET /v1/events` or `queryEvents` client that assumed one call returns everything: it must page (`after`=`nextCursor` / `afterSequence` = the last `sequence`) until a call returns nothing.
+
+Tests: `reads_serve_bounded_pages_and_continue_where_they_stopped` (`skilj/tests/event_fetch_rest.rs`: page size 3 and a two-event cache window, so chunks come from both Postgres and the cache; `GET /v1/events` pages 7 events as 3+3+1 via `nextCursor`, a filtered page `[1,3,5]` fills across chunks, consume pages 3+3+1+0, and a `Latest` consumer minted after seven events seeds past all of them. Making the chunk walk stop after one chunk turns the filtered page into `[1,3]`) and `query_events_serves_bounded_pages_over_graphql` (`skilj/tests/graphql_business_surfaces.rs`, the bounded-context-wide path).

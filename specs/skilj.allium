@@ -1702,8 +1702,23 @@ entity PrivateFieldGrant {
 -- cycle never trips it, short enough that a caller which crashes after
 -- being served (and so never acknowledges) does not leave the stream
 -- stuck for long.
+--
+-- max_events_per_read bounds how many events one FetchEvents,
+-- ConsumeEvents or QueryEvents serves: the first that many matching
+-- events, in sequence order. Without it one read of a long history -
+-- a new consumer starting from the beginning, a fetch with no
+-- after_sequence - would serve all of it at once. It bounds a page, not
+-- what is readable: each of those rules serves a prefix and continues
+-- from exactly where it stopped (FetchEvents' and QueryEvents' callers
+-- pass the last served sequence back as after_sequence; ConsumeEvents'
+-- cursor advances, or is acknowledged, past the last served event), so
+-- nothing is ever skipped. It counts served events, not scanned ones: a
+-- page is only short when nothing further matches, so a filtered
+-- consumer always makes progress. CountEvents stays unbounded - it is an
+-- aggregate, not a page.
 config {
     read_cursor_checkout_lease: Duration = 5.minutes
+    max_events_per_read: Integer = 1000
 }
 
 ------------------------------------------------------------
@@ -2664,8 +2679,10 @@ rule FetchEvents {
     -- unless the minting admin named one, and for an event type that
     -- declares no owner dimension. See rule QueryEvents' guidance on
     -- event_owner_scope_satisfied.
-    let served = filter(candidates, e =>
-        matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope))
+    let served = first_by_sequence(
+        filter(candidates, e =>
+            matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope)),
+        config.max_events_per_read)
 
     ensures:
         EventsDelivered(
@@ -2794,6 +2811,10 @@ rule FetchEvents {
 -- highest_sequence(events) is a black box in the same trivial register as
 -- the filter(events, ...) beside it: the greatest Event.sequence among a
 -- set of events, or null when that set is empty.
+--
+-- first_by_sequence(events, n) is another: the n events with the lowest
+-- Event.sequence among a set, or all of them when there are n or fewer.
+-- It is how config.max_events_per_read bounds a read.
 
 rule ConsumeEvents {
     when: ConsumeEvents(token, ack_mode?, filters)
@@ -2899,8 +2920,10 @@ rule ConsumeEvents {
     -- filtered or scope-narrowed view of them.
     let served =
         if is_leased: []
-        else: filter(candidates, e =>
-            matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope))
+        else: first_by_sequence(
+            filter(candidates, e =>
+                matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope)),
+            config.max_events_per_read)
 
     -- Unchanged when nothing matched, in either mode: an auto_advance
     -- cursor has nothing new to advance past, and a manual_ack one never
@@ -3958,7 +3981,9 @@ rule QueryEvents {
     -- superadmin named one, and for any event whose type declares no owner
     -- dimension - see the event_owner_scope_satisfied paragraphs in the
     -- guidance below.
-    let candidates = filter(matched, e => event_owner_scope_satisfied(e, access_mapping.scope))
+    let candidates = first_by_sequence(
+        filter(matched, e => event_owner_scope_satisfied(e, access_mapping.scope)),
+        config.max_events_per_read)
 
     ensures:
         EventsQueried(

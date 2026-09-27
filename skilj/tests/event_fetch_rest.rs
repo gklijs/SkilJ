@@ -969,3 +969,175 @@ fn two_concurrent_manual_consumes_never_both_serve_the_same_batch() {
         );
     });
 }
+
+async fn get_json(router: &axum::Router, credential: &str, uri: &str) -> serde_json::Value {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {credential}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::OK, "{json}");
+    json
+}
+
+fn amounts(page: &serde_json::Value) -> Vec<i64> {
+    page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["payload"]["amount"].as_i64().unwrap())
+        .collect()
+}
+
+/// `config.max_events_per_read`: every read serves at most that many
+/// events (here 3, which also makes each history chunk 3 events), in
+/// sequence order, and continues exactly where it stopped - `GET
+/// /v1/events` via `nextCursor`, consume via its server-side cursor. The
+/// cap counts *served* events: a filtered page spans as many chunks as
+/// it takes to fill. A new `Latest` consumer's seed is found by scanning
+/// every chunk, not just the first.
+#[test]
+fn reads_serve_bounded_pages_and_continue_where_they_stopped() {
+    runtime().block_on(async {
+        let Some(database_url) = test_db().await else {
+            return;
+        };
+        let pool = db::connect(&database_url).await.unwrap();
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        let mapping = RoleAccessMapping {
+            role,
+            bounded_context: bc,
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &mapping)
+            .await
+            .unwrap();
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .reconciliation_role(external_subject)
+            .max_events_per_read(3)
+            // A two-event cache window: earlier chunks come from
+            // Postgres (`LIMIT`ed), the tail from the cache - both of
+            // `for_each_event_chunk`'s paths.
+            .event_cache_warm_up_count(2)
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.rest_router();
+        let event_type = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        let mint_read = |start_from: Option<EventReadStartPosition>| {
+            let token = access_control::create_event_read_token(
+                &mapping,
+                &event_type,
+                generate_token_id(),
+                generate_token_secret(),
+                None,
+                start_from,
+                None,
+                None,
+                test_now(),
+            )
+            .unwrap();
+            let pool = pool.clone();
+            async move {
+                db::insert_event_read_token(&pool, &token).await.unwrap();
+                format!("{}.{}", token.id, token.secret)
+            }
+        };
+        let direct = access_control::create_direct_creation_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct)
+            .await
+            .unwrap();
+        let direct = format!("{}.{}", direct.id, direct.secret);
+        for amount in 1..=7 {
+            deposit(&router, &direct, amount).await;
+        }
+
+        // GET /v1/events pages through all seven via nextCursor.
+        let reader = mint_read(None).await;
+        let mut uri = "/v1/events".to_string();
+        let mut pages = Vec::new();
+        loop {
+            let page = get_json(&router, &reader, &uri).await;
+            let served = amounts(&page);
+            if served.is_empty() {
+                break;
+            }
+            pages.push(served);
+            uri = format!("/v1/events?after={}", page["nextCursor"].as_str().unwrap());
+        }
+        assert_eq!(pages, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
+
+        // A filtered page fills from as many chunks as it takes.
+        let page = get_json(&router, &reader, "/v1/events?filter=amount:in:1,3,5,7").await;
+        assert_eq!(amounts(&page), vec![1, 3, 5]);
+
+        // Consume pages the same way, off its own cursor.
+        let consumer = mint_read(None).await;
+        let mut consumed = Vec::new();
+        for call in 0..4 {
+            let uri = if call == 0 {
+                "/v1/events/consume?mode=auto"
+            } else {
+                "/v1/events/consume"
+            };
+            consumed.push(amounts(&get_json(&router, &consumer, uri).await));
+        }
+        assert_eq!(
+            consumed,
+            vec![vec![1, 2, 3], vec![4, 5, 6], vec![7], Vec::<i64>::new()]
+        );
+
+        // A Latest consumer minted now seeds at the true latest event
+        // (seventh, found in the third chunk), so it sees only what comes
+        // after.
+        let latest = mint_read(Some(EventReadStartPosition::Latest)).await;
+        let first = get_json(&router, &latest, "/v1/events/consume?mode=auto").await;
+        assert_eq!(amounts(&first), Vec::<i64>::new());
+        deposit(&router, &direct, 8).await;
+        let next = get_json(&router, &latest, "/v1/events/consume").await;
+        assert_eq!(amounts(&next), vec![8]);
+    });
+}

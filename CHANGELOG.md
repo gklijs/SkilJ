@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (wire):** `GET /v1/events`, `GET /v1/events/consume` and
+  GraphQL `queryEvents` now return at most `max_events_per_read` events
+  per call (default 1000), oldest first, instead of everything after the
+  cursor - and load history in chunks rather than all at once, so one
+  read of a long history can no longer exhaust memory. Page on with
+  `after`=`nextCursor` (`GET /v1/events`) or `afterSequence` = the last
+  returned `sequence` (`queryEvents`) until a call returns no events;
+  consume continues from its cursor as before. New
+  `SkiljBuilder::max_events_per_read`; `skilj_rest::router` takes it as
+  a new parameter. `skilj-tui`'s query view pages with `n`. The spec
+  models the cap as `config.max_events_per_read`.
 - Idempotency keys starting with `skilj-parked-delivery:` are now
   reserved, like `skilj-cross-context-route:` and `skilj-deadline:`, and
   a caller-supplied one is rejected with
@@ -125,6 +136,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second time. `POST /v1/parked-deliveries` now accepts `idempotencyKey`
   (the original header) for `command_trigger` reports, and the redrive
   reuses it. `skilj-kafka`, `skilj-amqp` and `skilj-nats` send it.
+- `ProjectionQuery`: two projections whose generated GraphQL type names
+  collided (`{bounded_context}_{projection}` is ambiguous once either
+  contains `_`) were both served, one silently rendered through the
+  other's type. A projection or state field whose name isn't a valid
+  GraphQL name produced a schema clients couldn't parse. Such a
+  projection is now left out of the schema with a logged reason, and
+  querying or subscribing to it returns `projection_not_in_schema`; an
+  unusable or duplicate field name drops just that field.
 
 ### Security
 
