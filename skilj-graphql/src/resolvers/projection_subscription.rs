@@ -110,7 +110,14 @@ pub fn projection_updates_field() -> SubscriptionField {
 
                 let role_id = access_mapping.role.id.clone();
 
+                // Released when this stream is dropped - see
+                // `crate::limits::acquire_subscription_slot`.
+                let slot = crate::limits::acquire_subscription_slot(
+                    &ctx,
+                    state.limits.max_subscriptions_per_connection,
+                )?;
                 Ok(asynk_strim::try_stream_fn(move |mut yielder| async move {
+                    let _slot = slot;
                     yielder
                         .yield_ok(FieldValue::owned_any(initial_value).with_type(type_name.clone()))
                         .await;

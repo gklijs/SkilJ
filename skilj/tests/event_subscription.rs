@@ -1237,3 +1237,138 @@ fn an_oversized_websocket_message_closes_the_connection() {
         }
     });
 }
+
+/// `GraphqlLimits::max_subscriptions_per_connection`: once a connection
+/// has that many subscriptions running, another is refused with
+/// `too_many_subscriptions`; completing one frees its slot for the next.
+#[test]
+fn a_connection_holds_at_most_max_subscriptions_at_once() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let reader_subject = unique_name("reader");
+        let reader_role = Role {
+            id: generate_token_id(),
+            external_subject: reader_subject.clone(),
+            name: "Reader".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &reader_role)
+            .await
+            .unwrap();
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: reader_role,
+                bounded_context: bc,
+                level: AccessLevel::Read,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .graphql_limits(skilj::GraphqlLimits {
+                max_subscriptions_per_connection: 2,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
+        ws_send_json(
+            &mut ws,
+            json!({
+                "type": "connection_init",
+                "payload": { "Authorization": format!("Bearer {}", sign_jwt(&reader_subject)) },
+            }),
+        )
+        .await;
+        assert_eq!(ws_recv_json(&mut ws).await["type"], "connection_ack");
+
+        let subscribe = |id: &str| {
+            json!({
+                "id": id,
+                "type": "subscribe",
+                "payload": {
+                    "query": "subscription($bc: String!) { allEvents(boundedContext: $bc) { sequence } }",
+                    "variables": { "bc": bc_name },
+                },
+            })
+        };
+        for id in ["1", "2"] {
+            ws_send_json(&mut ws, subscribe(id)).await;
+        }
+        assert_eq!(
+            ws_try_recv_json(&mut ws, Duration::from_millis(500)).await,
+            None,
+            "two subscriptions fit"
+        );
+
+        // A resolver error arrives as `next` carrying `errors`, then the
+        // server's own `complete` for that id.
+        ws_send_json(&mut ws, subscribe("3")).await;
+        let refused = ws_recv_json(&mut ws).await;
+        assert_eq!(refused["id"], "3", "{refused}");
+        assert_eq!(
+            refused["payload"]["errors"][0]["extensions"]["code"], "too_many_subscriptions",
+            "{refused}"
+        );
+        let completed = ws_recv_json(&mut ws).await;
+        assert_eq!(
+            (completed["id"].as_str(), completed["type"].as_str()),
+            (Some("3"), Some("complete")),
+            "{completed}"
+        );
+
+        // The server acknowledges a client `complete` with its own, once
+        // it has dropped that subscription's stream (and so its slot).
+        ws_send_json(&mut ws, json!({ "id": "1", "type": "complete" })).await;
+        let completed = ws_recv_json(&mut ws).await;
+        assert_eq!(
+            (completed["id"].as_str(), completed["type"].as_str()),
+            (Some("1"), Some("complete")),
+            "{completed}"
+        );
+        ws_send_json(&mut ws, subscribe("4")).await;
+        assert_eq!(
+            ws_try_recv_json(&mut ws, Duration::from_millis(500)).await,
+            None,
+            "completing one freed its slot"
+        );
+    });
+}

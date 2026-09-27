@@ -30,6 +30,11 @@ pub struct GraphqlLimits {
     /// aliases and fragments included - each serves a full page (or, for
     /// `countEvents`, scans history) on its own. Default 10.
     pub max_expensive_fields: usize,
+    /// Most subscriptions one websocket connection may have running at
+    /// once; another is refused with `too_many_subscriptions` until one
+    /// ends. Each holds its own event-broadcast receiver and filters
+    /// every committed event. Default 100.
+    pub max_subscriptions_per_connection: usize,
 }
 
 impl Default for GraphqlLimits {
@@ -39,6 +44,7 @@ impl Default for GraphqlLimits {
             max_depth: 24,
             max_complexity: 2000,
             max_expensive_fields: 10,
+            max_subscriptions_per_connection: 100,
         }
     }
 }
@@ -136,6 +142,54 @@ fn count_expensive<'a>(
             }
         })
         .sum()
+}
+
+/// One websocket connection's count of running subscriptions - inserted
+/// into the connection's data at `connection_init`, so every subscription
+/// resolver on that connection sees the same counter.
+#[derive(Clone, Default)]
+pub(crate) struct ConnectionSubscriptions(Arc<std::sync::atomic::AtomicUsize>);
+
+/// One running subscription's claim on its connection's
+/// [`ConnectionSubscriptions`], released on drop - owned by the
+/// subscription's stream, so it goes when the stream does, however that
+/// happens (client `complete`, the stream ending, the connection closing).
+pub(crate) struct SubscriptionSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for SubscriptionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Claims a subscription slot on this resolver's connection, or refuses
+/// with `too_many_subscriptions` when `max` are already running. `None`
+/// outside a websocket connection (no [`ConnectionSubscriptions`] in the
+/// data - e.g. a schema executed directly), where there's no connection
+/// to bound.
+pub(crate) fn acquire_subscription_slot(
+    ctx: &async_graphql::dynamic::ResolverContext<'_>,
+    max: usize,
+) -> async_graphql::Result<Option<SubscriptionSlot>> {
+    use async_graphql::ErrorExtensions;
+    use std::sync::atomic::Ordering;
+
+    let Ok(connection) = ctx.data::<ConnectionSubscriptions>() else {
+        return Ok(None);
+    };
+    connection
+        .0
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| {
+            (running < max).then_some(running + 1)
+        })
+        .map_err(|running| {
+            async_graphql::Error::new(format!(
+                "this connection already has {running} subscriptions running; at most {max} \
+                 are allowed - complete one first"
+            ))
+            .extend_with(|_, ext| ext.set("code", "too_many_subscriptions"))
+        })?;
+    Ok(Some(SubscriptionSlot(connection.0.clone())))
 }
 
 /// `POST /graphql`'s body cap: reads at most `max` bytes (so a missing or

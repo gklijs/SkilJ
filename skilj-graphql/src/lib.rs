@@ -311,6 +311,9 @@ async fn graphql_ws_handler(
                         .await?;
                         let mut data = async_graphql::Data::default();
                         data.insert(role);
+                        // docs/architecture.md §74 - this connection's
+                        // own running-subscription count.
+                        data.insert(limits::ConnectionSubscriptions::default());
                         Ok(data)
                     }
                 })

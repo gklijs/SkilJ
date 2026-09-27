@@ -189,7 +189,14 @@ pub fn all_events_field() -> SubscriptionField {
             let role_id = access_mapping.role.id.clone();
             let bounded_context_name = bounded_context_name.clone();
 
+            // Released when this stream is dropped - see
+            // `crate::limits::acquire_subscription_slot`.
+            let slot = crate::limits::acquire_subscription_slot(
+                &ctx,
+                state.limits.max_subscriptions_per_connection,
+            )?;
             Ok(asynk_strim::try_stream_fn(move |mut yielder| async move {
+                let _slot = slot;
                 let mut current = Subscription::AllEventsSubscription(Box::new(initial));
                 let mut revocation_rx = state.revocation_broadcaster.subscribe();
                 loop {
@@ -375,7 +382,14 @@ pub fn events_by_type_field() -> SubscriptionField {
             let role_id = access_mapping.role.id.clone();
             let bounded_context_name = bounded_context_name.clone();
 
+            // Released when this stream is dropped - see
+            // `crate::limits::acquire_subscription_slot`.
+            let slot = crate::limits::acquire_subscription_slot(
+                &ctx,
+                state.limits.max_subscriptions_per_connection,
+            )?;
             Ok(asynk_strim::try_stream_fn(move |mut yielder| async move {
+                let _slot = slot;
                 let mut current = Subscription::EventTypeSubscription(Box::new(initial));
                 let mut revocation_rx = state.revocation_broadcaster.subscribe();
                 loop {

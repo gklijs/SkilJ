@@ -176,7 +176,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `projection` per request, aliases included; `query_too_expensive`
   beyond it). The defaults fit the standard introspection query. The
   body cap also applies to each GraphQL websocket message, which used to
-  accept axum's default 64 MiB, unauthenticated.
+  accept axum's default 64 MiB, unauthenticated. And one websocket
+  connection may run at most `max_subscriptions_per_connection`
+  subscriptions at once (default 100; `too_many_subscriptions` beyond
+  it).
 - `POST /v1/parked-deliveries` could be used by one bridge credential to
   overwrite another credential's parked delivery: the dedup key was
   `(source, kind, identifier)` only, so reporting the same (guessable)
