@@ -2388,6 +2388,15 @@ const EVENT_TYPE_COLUMNS: &str =
 /// calls this yet this pass; used directly by tests/seeding until
 /// `RegisterEventType` itself has a GraphQL route in front of it.
 #[tracing::instrument(skip_all)]
+/// Registration's write. `schedule_position` and `last_fired_at` belong to
+/// the scheduler once a row exists - it advances them under `FOR UPDATE`
+/// while registration reads them unlocked - so on conflict they come from
+/// the row as it is now, not from `et` (a possibly stale read):
+/// `last_fired_at` is never overwritten, and `schedule_position` only at
+/// the opt-in moment, scheduling being newly enabled against the current
+/// row (docs/architecture.md §76). Writing `et`'s copies back used to
+/// rewind a position the scheduler had just advanced, re-firing the
+/// occurrence - every instance re-registers every type at startup.
 pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Result<()> {
     let schema = schema_ident(&et.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -2402,8 +2411,11 @@ pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Res
             system_triggered_allowed = EXCLUDED.system_triggered_allowed, \
             system_triggered_schedule = EXCLUDED.system_triggered_schedule, \
             missed_occurrence_policy = EXCLUDED.missed_occurrence_policy, \
-            schedule_position = EXCLUDED.schedule_position, \
-            last_fired_at = EXCLUDED.last_fired_at, \
+            schedule_position = CASE \
+                WHEN EXCLUDED.system_triggered_allowed \
+                    AND NOT {schema}.event_types.system_triggered_allowed \
+                THEN EXCLUDED.schedule_position \
+                ELSE {schema}.event_types.schedule_position END, \
             event_read_allowed = EXCLUDED.event_read_allowed, \
             private_fields = EXCLUDED.private_fields"
     )))

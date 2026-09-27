@@ -162,6 +162,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses a single aggregate query, or (catch-up) handles at most 1000
   events per tick and continues on the next.
 
+- Re-registering a scheduled `EventType` (as every instance does at
+  startup) wrote back the `schedule_position`/`last_fired_at` it had
+  read, so a scheduler firing in between was undone and the occurrence
+  fired again. Registration now leaves both to the scheduler, except
+  for the position set when scheduling is newly enabled.
 - `POST /v1/events/consume/ack` ran outside the per-token lock consume
   uses, so two concurrent acknowledgements could both pass the "no
   regression" check and the lower one land last - moving a manual-ack

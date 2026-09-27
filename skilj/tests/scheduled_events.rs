@@ -309,7 +309,11 @@ fn skip_policy_resolves_a_real_backlog_without_replaying_it() {
             .unwrap();
         let backlog_start = Utc::now() - chrono::Duration::seconds(10);
         event_type.schedule_position = Some(backlog_start);
-        db::upsert_event_type(&pool, &event_type).await.unwrap();
+        // Written directly, as a stalled scheduler would have left it:
+        // registration deliberately never rewinds the scheduler's own
+        // position (docs/architecture.md §76), so `upsert_event_type`
+        // can't be used to simulate an outage.
+        force_schedule_position(&pool, &event_type, backlog_start).await;
 
         // Give the scheduler several ticks to notice the backlog and
         // resolve it via SkipMissedOccurrences, then a little more to
@@ -387,7 +391,11 @@ fn fire_once_resolves_a_real_backlog_into_its_own_last_occurrence_and_does_not_s
             .unwrap();
         let backlog_start = Utc::now() - chrono::Duration::seconds(10);
         event_type.schedule_position = Some(backlog_start);
-        db::upsert_event_type(&pool, &event_type).await.unwrap();
+        // Written directly, as a stalled scheduler would have left it:
+        // registration deliberately never rewinds the scheduler's own
+        // position (docs/architecture.md §76), so `upsert_event_type`
+        // can't be used to simulate an outage.
+        force_schedule_position(&pool, &event_type, backlog_start).await;
 
         // Give the scheduler several ticks to resolve the backlog - if
         // the bug this test guards against ever regresses, this loop
@@ -453,4 +461,22 @@ fn fire_once_resolves_a_real_backlog_into_its_own_last_occurrence_and_does_not_s
             "fire_once stalled again after resolving the initial backlog"
         );
     });
+}
+
+/// Sets `schedule_position` the way only the scheduler itself does - the
+/// backlog tests' outage simulation.
+async fn force_schedule_position(
+    pool: &skilj_core::db::Pool,
+    event_type: &skilj_core::event_store::EventType,
+    position: chrono::DateTime<Utc>,
+) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE \"bc_{}\".event_types SET schedule_position = $1 WHERE name = $2",
+        event_type.bounded_context.name
+    )))
+    .bind(position)
+    .bind(&event_type.name)
+    .execute(pool)
+    .await
+    .unwrap();
 }

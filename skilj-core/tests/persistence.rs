@@ -2070,3 +2070,63 @@ fn list_active_data_keys_for_subject_value_errors_when_master_key_missing_but_a_
         }
     });
 }
+
+/// `schedule_position`/`last_fired_at` belong to the scheduler once a row
+/// exists. Re-registration (every instance re-registers every type at
+/// startup) builds its `EventType` from an unlocked read; if the scheduler
+/// fires between that read and the write, writing the stale copies back
+/// would rewind the position and re-fire the occurrence. The one moment
+/// registration does set the position - scheduling newly enabled - still
+/// works.
+#[test]
+fn re_registration_never_rewinds_what_the_scheduler_advanced() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let enabled_at = test_now() - chrono::Duration::hours(1);
+        let enabled = EventType {
+            system_triggered_allowed: true,
+            system_triggered_schedule: Some("0 0 * * * * *".to_string()),
+            missed_occurrence_policy: Some(
+                skilj_core::event_store::MissedOccurrencePolicy::ReplayBacklog,
+            ),
+            schedule_position: Some(enabled_at),
+            ..et.clone()
+        };
+        db::upsert_event_type(&pool, &enabled).await.unwrap();
+        let stale = db::get_event_type(&pool, &bc.name, &et.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stale.schedule_position,
+            Some(enabled_at),
+            "opting in sets it"
+        );
+
+        // The scheduler fires, after registration's read.
+        let fired_at = test_now();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{}\".event_types SET schedule_position = $1, last_fired_at = $1 \
+             WHERE name = $2",
+            bc.name
+        )))
+        .bind(fired_at)
+        .bind(&et.name)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Registration writes what it read.
+        db::upsert_event_type(&pool, &stale).await.unwrap();
+        let after = db::get_event_type(&pool, &bc.name, &et.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.schedule_position, Some(fired_at));
+        assert_eq!(after.last_fired_at, Some(fired_at));
+    });
+}
