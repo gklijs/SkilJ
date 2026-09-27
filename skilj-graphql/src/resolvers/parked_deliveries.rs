@@ -61,6 +61,14 @@ struct CommandTriggerRedrive {
     causation_id: Option<String>,
 }
 
+fn decode_request<T: serde::de::DeserializeOwned>(
+    request_json: &serde_json::Value,
+) -> skilj_core::error::Result<T> {
+    serde_json::from_value(request_json.clone()).map_err(|e| {
+        skilj_core::event_store::Error::InvalidParkedDeliveryRequest(e.to_string()).into()
+    })
+}
+
 /// Redrives one [`ParkedDelivery`] through the same core function its
 /// original attempt would have called. `Ok(())` covers every outcome
 /// that means "this delivery is no longer stuck" - a business rejection
@@ -145,16 +153,12 @@ async fn redrive_parked_delivery(
             let token = db::get_external_event_token(&state.pool, access_token_id)
                 .await?
                 .ok_or_else(skilj_core::error::Error::row_not_found)?;
-            // `request_json` is always this exact shape - written
-            // verbatim from a real `ExternalEventRequest` body by
-            // `skilj-rest`'s own `POST /v1/parked-deliveries` handler,
-            // never caller-supplied free-form JSON.
-            let redrive: ExternalEventRedrive = serde_json::from_value(
-                delivery.request_json.clone(),
-            )
-            .expect(
-                "ExternalEvent-kind ParkedDelivery's own request_json matches ExternalEventRedrive",
-            );
+            // `request_json` is bridge-supplied JSON. `POST
+            // /v1/parked-deliveries` now rejects one that doesn't have
+            // this shape, but a row stored before that check existed may
+            // not - an ordinary `Err` (the row stays parked for an
+            // operator to discard), not a panic.
+            let redrive: ExternalEventRedrive = decode_request(&delivery.request_json)?;
             let payload = serde_json::to_string(&redrive.payload)
                 .expect("serde_json::Value serialization is infallible");
             db::create_and_insert_external_event(
@@ -187,8 +191,8 @@ async fn redrive_parked_delivery(
             let token = db::get_command_token(&state.pool, access_token_id)
                 .await?
                 .ok_or_else(skilj_core::error::Error::row_not_found)?;
-            let redrive: CommandTriggerRedrive = serde_json::from_value(delivery.request_json.clone())
-                .expect("CommandTrigger-kind ParkedDelivery's own request_json matches CommandTriggerRedrive");
+            // See the identical `ExternalEvent` branch above.
+            let redrive: CommandTriggerRedrive = decode_request(&delivery.request_json)?;
             let payload = serde_json::to_string(&redrive.payload)
                 .expect("serde_json::Value serialization is infallible");
             let authorised = skilj_core::event_store::authorise_command_trigger(

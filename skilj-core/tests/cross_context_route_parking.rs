@@ -300,17 +300,6 @@ async fn seed_bounded_context(pool: &Pool) -> BoundedContext {
         template: None,
     };
     db::insert_bounded_context(pool, &bc).await.unwrap();
-    // `provision_bounded_context_schema` (inside `insert_bounded_context`
-    // above) creates `parked_deliveries` itself, but the belt-and-
-    // suspenders unique index (docs/architecture.md §56) is only ever
-    // added by this migration - normally run from `SkiljBuilder::build()`'s
-    // own startup loop, which this lower-level test bypasses entirely by
-    // calling `skilj_core::db` directly. `insert_parked_delivery`'s own
-    // `ON CONFLICT (source, kind, identifier)` needs that index to exist
-    // at all, in every bounded context this file parks into.
-    db::migrate_parked_deliveries_dedup_and_unique_index(pool, &bc.name)
-        .await
-        .unwrap();
     bc
 }
 
@@ -757,6 +746,93 @@ fn concurrent_catch_up_ticks_never_park_the_same_occurrence_twice() {
             1,
             "two concurrent catch-up ticks raced to park the identical occurrence twice - \
              the advisory lock serializing catch_up_cross_context_route is not closing the race"
+        );
+    });
+}
+
+/// `migrate_parked_deliveries_dedup_and_unique_index` converging a schema
+/// migrated under the earlier `(source, kind, identifier)` index onto the
+/// token-scoped one: the legacy index is dropped, the new one is in place
+/// (so a second token's report of the same occurrence gets its own row,
+/// while `CrossContextRoute`'s own `NULL`-token rows still upsert onto
+/// each other), and re-running it is a no-op.
+#[test]
+fn legacy_parked_delivery_index_migrates_to_the_token_scoped_one() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let schema = format!("\"bc_{}\"", bc.name);
+        // Recreate the pre-migration state: only the legacy index.
+        for ddl in [
+            format!("DROP INDEX {schema}.parked_deliveries_occurrence_key"),
+            format!(
+                "CREATE UNIQUE INDEX parked_deliveries_source_kind_identifier_key \
+                 ON {schema}.parked_deliveries (source, kind, identifier)"
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(ddl))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..2 {
+            db::migrate_parked_deliveries_dedup_and_unique_index(&pool, &bc.name)
+                .await
+                .unwrap();
+        }
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT indexname::text FROM pg_indexes \
+             WHERE schemaname = $1 AND tablename = 'parked_deliveries' ORDER BY 1",
+        )
+        .bind(format!("bc_{}", bc.name))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes,
+            vec!["parked_deliveries_occurrence_key", "parked_deliveries_pkey"]
+        );
+
+        let park = |kind, token: Option<&'static str>| {
+            let pool = pool.clone();
+            let bc_name = bc.name.clone();
+            async move {
+                db::insert_parked_delivery(
+                    &pool,
+                    &bc_name,
+                    "kafka-inbound",
+                    kind,
+                    "orders:0:1",
+                    token,
+                    None,
+                    None,
+                    &serde_json::json!({}),
+                    "boom",
+                    1,
+                    test_now(),
+                    test_now(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let a = park(ParkedDeliveryKind::ExternalEvent, Some("token-a")).await;
+        let a_again = park(ParkedDeliveryKind::ExternalEvent, Some("token-a")).await;
+        let b = park(ParkedDeliveryKind::ExternalEvent, Some("token-b")).await;
+        let route = park(ParkedDeliveryKind::CrossContextRoute, None).await;
+        let route_again = park(ParkedDeliveryKind::CrossContextRoute, None).await;
+        assert_eq!(a.id, a_again.id);
+        assert_ne!(a.id, b.id);
+        assert_eq!(route.id, route_again.id);
+        assert_eq!(
+            db::list_parked_deliveries(&pool, &bc.name)
+                .await
+                .unwrap()
+                .len(),
+            3
         );
     });
 }

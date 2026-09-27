@@ -58,7 +58,8 @@ use axum_extra::extract::Query;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use skilj_core::access_control::{
-    CommandToken, DirectCreationToken, EventReadToken, ExternalEventToken,
+    CommandToken, DirectCreationToken, Error as AccessControlError, EventReadToken,
+    ExternalEventToken, TokenStatus,
 };
 use skilj_core::command_batcher::CommandBatcher;
 use skilj_core::db::{self, AccessTokenKind, Pool};
@@ -998,13 +999,22 @@ async fn post_parked_deliveries(
     credential: BearerCredential,
     Json(body): Json<ParkedDeliveryRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let (bounded_context_name, access_token_id, kind) = match body.kind {
+    // Unlike every other route here, nothing downstream re-checks the
+    // token's own status - `insert_parked_delivery` is a plain write, not
+    // a skilj-core rule - so a revoked credential is refused here rather
+    // than left able to keep writing rows. `request` is checked against
+    // the exact body shape its kind's original route takes (the same
+    // DTOs, not a copy), since `retryParkedDelivery` later decodes it as
+    // exactly that.
+    let (bounded_context_name, access_token_id, status, kind, shape_check) = match body.kind {
         ParkedDeliveryKindRequest::ExternalEvent => {
             let token = resolve_token::<ExternalEventToken>(&state, &credential).await?;
             (
                 token.event_type.bounded_context.name,
                 token.id,
+                token.status,
                 db::ParkedDeliveryKind::ExternalEvent,
+                serde_json::from_value::<ExternalEventRequest>(body.request.clone()).map(|_| ()),
             )
         }
         ParkedDeliveryKindRequest::CommandTrigger => {
@@ -1012,10 +1022,20 @@ async fn post_parked_deliveries(
             (
                 token.command_type.bounded_context.name,
                 token.id,
+                token.status,
                 db::ParkedDeliveryKind::CommandTrigger,
+                serde_json::from_value::<CommandTriggerRequest>(body.request.clone()).map(|_| ()),
             )
         }
     };
+    if status != TokenStatus::Active {
+        return Err(skilj_core::error::Error::from(AccessControlError::TokenNotActive).into());
+    }
+    shape_check.map_err(|e| {
+        skilj_core::error::Error::from(event_store::Error::InvalidParkedDeliveryRequest(
+            e.to_string(),
+        ))
+    })?;
 
     let delivery = db::insert_parked_delivery(
         &state.pool,

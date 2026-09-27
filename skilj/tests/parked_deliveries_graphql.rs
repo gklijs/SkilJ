@@ -247,18 +247,11 @@ async fn setup() -> (Skilj, Pool, String, String, String) {
     skilj_core::db::insert_bounded_context(&pool, &bc)
         .await
         .unwrap();
-    // `bc` is created after `Skilj::builder(...).build()` already ran
-    // above, so it never goes through that call's own per-bounded-context
-    // startup migrations. `insert_parked_delivery`'s own `ON CONFLICT
-    // (source, kind, identifier)` (docs/architecture.md §56) needs this
-    // bounded context's `parked_deliveries` unique index to exist before
-    // this file's own direct `insert_parked_delivery` calls below can
-    // succeed - normally patched in by that startup loop, applied
-    // directly here instead since there's no second `build()` call to
-    // rely on.
-    skilj_core::db::migrate_parked_deliveries_dedup_and_unique_index(&pool, &bc.name)
-        .await
-        .unwrap();
+    // Deliberately no `migrate_parked_deliveries_dedup_and_unique_index`
+    // call: `bc` is created after `build()` already ran, like one added
+    // at runtime via `addBoundedContext`, so `insert_parked_delivery`'s
+    // own `ON CONFLICT` works here only because provisioning itself now
+    // creates the unique index it needs.
 
     let mapping = RoleAccessMapping {
         role: role.clone(),
@@ -618,5 +611,219 @@ fn retrying_a_delivery_whose_target_bounded_context_was_hard_deleted_errors_grac
         )
         .await;
         assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+    });
+}
+
+/// Mints a fresh, active `ExternalEventToken` for `setup()`'s own
+/// `MoneyDeposited` event type, returning `(id, plaintext secret)` - what
+/// a REST caller actually presents. Its own admin role/mapping, since
+/// `setup()` hands back only a JWT and a token id, not the mapping itself.
+async fn mint_external_event_token(pool: &Pool, bc_name: &str) -> (String, String) {
+    let bc = db::get_bounded_context(pool, bc_name)
+        .await
+        .unwrap()
+        .unwrap();
+    let role = Role {
+        id: generate_token_id(),
+        external_subject: unique_name("minter"),
+        name: "Minter".to_string(),
+        superadmin: false,
+        status: RoleStatus::Active,
+        created_at: test_now(),
+        revoked_at: None,
+    };
+    db::insert_role(pool, &role).await.unwrap();
+    let mapping = RoleAccessMapping {
+        role,
+        bounded_context: bc,
+        level: AccessLevel::Admin,
+        can_read_sensitive: false,
+        scope: None,
+        status: RoleStatus::Active,
+        created_at: test_now(),
+        revoked_at: None,
+    };
+    db::insert_role_access_mapping(pool, &mapping)
+        .await
+        .unwrap();
+    let event_type = db::get_event_type(pool, bc_name, "MoneyDeposited")
+        .await
+        .unwrap()
+        .unwrap();
+    let secret = generate_token_secret();
+    let token = access_control::create_external_event_token(
+        &mapping,
+        &event_type,
+        generate_token_id(),
+        secret.clone(),
+        None,
+        test_now(),
+    )
+    .unwrap();
+    db::insert_external_event_token(pool, &token).await.unwrap();
+    (token.id, secret)
+}
+
+async fn report_parked_delivery(
+    router: &axum::Router,
+    (id, secret): &(String, String),
+    identifier: &str,
+    request: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/parked-deliveries")
+        .header("authorization", format!("Bearer {id}.{secret}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "source": "kafka-inbound",
+                "kind": "external_event",
+                "identifier": identifier,
+                "error": "connection refused",
+                "attemptCount": 3,
+                "firstFailedAt": test_now(),
+                "request": request,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// `POST /v1/parked-deliveries`' own report handling: a `request` body
+/// that isn't its kind's route shape is a 400 (`retryParkedDelivery`
+/// would otherwise be left decoding it); a second credential reporting an
+/// occurrence another credential already parked gets its own row rather
+/// than upserting onto that one (which used to swap the second caller's
+/// `request_json` in under the *first* token's id - what a redrive runs
+/// under); and a revoked credential is a 403 (nothing downstream of this
+/// route re-checks token status).
+#[test]
+fn parked_delivery_reports_are_shape_checked_token_scoped_and_need_an_active_token() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, _jwt, _token_id) = setup().await;
+        let router = skilj.rest_router();
+        let first = mint_external_event_token(&pool, &bc_name).await;
+        let second = mint_external_event_token(&pool, &bc_name).await;
+        let valid_request = json!({
+            "payload": { "amount": 5 },
+            "sourceContent": "kafka:orders:0:7",
+        });
+
+        let (status, body) = report_parked_delivery(&router, &first, "orders:0:6", json!(42)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["code"], "invalid_parked_delivery_request", "{body:?}");
+
+        let (status, body) =
+            report_parked_delivery(&router, &first, "orders:0:7", valid_request.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body:?}");
+        // The same token re-reporting its own occurrence still upserts.
+        let (status, _) =
+            report_parked_delivery(&router, &first, "orders:0:7", valid_request.clone()).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = report_parked_delivery(
+            &router,
+            &second,
+            "orders:0:7",
+            json!({ "payload": { "amount": 1_000_000 }, "sourceContent": "forged" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body:?}");
+        let parked = db::list_parked_deliveries(&pool, &bc_name).await.unwrap();
+        assert_eq!(parked.len(), 2, "one row per reporting token: {parked:?}");
+        let firsts: Vec<_> = parked
+            .iter()
+            .filter(|d| d.access_token_id.as_deref() == Some(first.0.as_str()))
+            .collect();
+        assert_eq!(firsts.len(), 1);
+        assert_eq!(
+            firsts[0].request_json["payload"],
+            json!({ "amount": 5 }),
+            "the first token's parked body must be untouched by the second's report"
+        );
+
+        db::revoke_access_token(&pool, &first.0, test_now())
+            .await
+            .unwrap();
+        let (status, body) =
+            report_parked_delivery(&router, &first, "orders:0:8", valid_request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+        assert_eq!(
+            db::list_parked_deliveries(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a revoked token must not be able to park anything"
+        );
+    });
+}
+
+/// A row whose `request_json` doesn't have its kind's shape - stored
+/// before `POST /v1/parked-deliveries` checked it - used to panic
+/// `retryParkedDelivery` on an `.expect()`. Now an ordinary GraphQL
+/// error, the row stays parked, and the server keeps serving.
+#[test]
+fn retrying_a_delivery_with_a_malformed_stored_request_errors_gracefully() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, access_token_id) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let seeded = db::insert_parked_delivery(
+            &pool,
+            &bc_name,
+            "kafka-inbound",
+            db::ParkedDeliveryKind::ExternalEvent,
+            "orders:0:13",
+            Some(&access_token_id),
+            None,
+            None,
+            &json!(["not", "an", "ExternalEventRequest"]),
+            "connection refused",
+            1,
+            test_now(),
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+            json!({ "bc": bc_name, "id": seeded.id }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "invalid_parked_delivery_request",
+            "{response:?}"
+        );
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { parkedDeliveries(boundedContext: $bc) { id } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["parkedDeliveries"].as_array().unwrap().len(),
+            1
+        );
     });
 }

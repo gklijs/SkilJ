@@ -495,6 +495,16 @@ async fn provision_bounded_context_schema(
     // (build()'s own startup loop only, not here - see that function's
     // own doc comment).
     ensure_parked_deliveries_table(&mut **tx, bounded_context).await?;
+    // Created here too, not only by `build()`'s own startup migration:
+    // `insert_parked_delivery`'s `ON CONFLICT` can't run at all without
+    // it, and a bounded context added at runtime (`addBoundedContext`)
+    // would otherwise lack it until the next restart. Safe unguarded -
+    // the table was only just created, so it has no rows to conflict.
+    sqlx::query(sqlx::AssertSqlSafe(parked_deliveries_occurrence_index_ddl(
+        &schema,
+    )))
+    .execute(&mut **tx)
+    .await?;
     // Codeberg issue #20 - `ensure_deadlines_table`'s own two-index shape
     // run directly against this transaction rather than calling that
     // function (it takes `&Pool`, not a transaction - see its own doc
@@ -8104,15 +8114,38 @@ pub async fn ensure_parked_deliveries_table<'e>(
     Ok(())
 }
 
-const PARKED_DELIVERIES_DEDUP_INDEX: &str = "parked_deliveries_source_kind_identifier_key";
+/// The index this module's first parked-delivery migration created -
+/// `(source, kind, identifier)` alone. Replaced by
+/// [`PARKED_DELIVERIES_OCCURRENCE_INDEX`]; kept only so
+/// `migrate_parked_deliveries_dedup_and_unique_index` can drop it.
+const PARKED_DELIVERIES_LEGACY_DEDUP_INDEX: &str = "parked_deliveries_source_kind_identifier_key";
+
+const PARKED_DELIVERIES_OCCURRENCE_INDEX: &str = "parked_deliveries_occurrence_key";
+
+/// The `UNIQUE` index `insert_parked_delivery`'s own `ON CONFLICT` infers
+/// against - one row per `(source, kind, identifier)` *per access token*.
+/// The token is part of the key because it's what `retryParkedDelivery`
+/// redrives under: with it left out, a second bridge credential
+/// reporting a (guessable) identifier another credential already parked
+/// would upsert onto that row, swapping its own `request_json` in under
+/// the first token's authority. `COALESCE` rather than `NULLS NOT
+/// DISTINCT` (Postgres 15+ only) so `CrossContextRoute`'s own
+/// always-`NULL` rows still dedupe against each other; a real token id is
+/// never empty, so `''` can't collide with one.
+fn parked_deliveries_occurrence_index_ddl(schema: &str) -> String {
+    format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS {PARKED_DELIVERIES_OCCURRENCE_INDEX} \
+         ON {schema}.parked_deliveries (source, kind, identifier, (COALESCE(access_token_id, '')))"
+    )
+}
 
 /// Codeberg issue #25 review (docs/architecture.md §56): belt-and-suspenders
 /// for `catch_up_cross_context_route`'s own advisory-lock fix above -
-/// a `UNIQUE` index on `(source, kind, identifier)` (the tuple that
-/// identifies one real failed occurrence, whichever `ParkedDeliveryKind`
-/// it is) so `insert_parked_delivery`'s own `ON CONFLICT` can turn any
-/// remaining duplicate-insert path, from this bug or a future one, into
-/// a harmless upsert instead of a second row.
+/// a `UNIQUE` index identifying one real failed occurrence (see
+/// [`parked_deliveries_occurrence_index_ddl`] for its exact key) so
+/// `insert_parked_delivery`'s own `ON CONFLICT` can turn any remaining
+/// duplicate-insert path, from this bug or a future one, into a harmless
+/// upsert instead of a second row.
 ///
 /// A live bounded context that already hit the race this fixes can have
 /// real duplicate rows sitting in `parked_deliveries` already - creating
@@ -8130,6 +8163,13 @@ const PARKED_DELIVERIES_DEDUP_INDEX: &str = "parked_deliveries_source_kind_ident
 /// the identical occurrence records under `retryParkedDelivery`'s own
 /// terms - so discarding all but one loses no real operator-facing
 /// information, unlike `idempotency_keys`' own pre-migration rows.
+///
+/// A schema migrated under the earlier, narrower
+/// `(source, kind, identifier)` index converges here too: that index is
+/// strictly stricter, so its rows never violate the wider one, and it's
+/// dropped once the wider one exists. A bounded context provisioned
+/// after this existed already has the wider index from
+/// `provision_bounded_context_schema` itself, and is a no-op here.
 pub async fn migrate_parked_deliveries_dedup_and_unique_index(
     pool: &Pool,
     bounded_context: &str,
@@ -8144,32 +8184,39 @@ pub async fn migrate_parked_deliveries_dedup_and_unique_index(
         .execute(&mut *tx)
         .await?;
 
-    let already_migrated: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1 FROM pg_indexes
-            WHERE schemaname = $1 AND indexname = $2
-        )",
+    let (has_current, has_legacy): (bool, bool) = sqlx::query_as(
+        "SELECT \
+            EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND indexname = $2), \
+            EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND indexname = $3)",
     )
     .bind(&raw_schema)
-    .bind(PARKED_DELIVERIES_DEDUP_INDEX)
+    .bind(PARKED_DELIVERIES_OCCURRENCE_INDEX)
+    .bind(PARKED_DELIVERIES_LEGACY_DEDUP_INDEX)
     .fetch_one(&mut *tx)
     .await?;
 
-    if already_migrated {
+    if has_current && !has_legacy {
         tx.commit().await?;
         return Ok(());
     }
 
+    if !has_current {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {schema}.parked_deliveries a USING {schema}.parked_deliveries b \
+             WHERE a.source = b.source AND a.kind = b.kind AND a.identifier = b.identifier \
+             AND a.access_token_id IS NOT DISTINCT FROM b.access_token_id \
+             AND (a.last_failed_at, a.id) < (b.last_failed_at, b.id)"
+        )))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(parked_deliveries_occurrence_index_ddl(
+            &schema,
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DELETE FROM {schema}.parked_deliveries a USING {schema}.parked_deliveries b \
-         WHERE a.source = b.source AND a.kind = b.kind AND a.identifier = b.identifier \
-         AND (a.last_failed_at, a.id) < (b.last_failed_at, b.id)"
-    )))
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE UNIQUE INDEX IF NOT EXISTS {PARKED_DELIVERIES_DEDUP_INDEX} \
-         ON {schema}.parked_deliveries (source, kind, identifier)"
+        "DROP INDEX IF EXISTS {schema}.{PARKED_DELIVERIES_LEGACY_DEDUP_INDEX}"
     )))
     .execute(&mut *tx)
     .await?;
@@ -8183,9 +8230,10 @@ pub async fn migrate_parked_deliveries_dedup_and_unique_index(
 /// already uses - see its own doc comment) rather than left to the
 /// caller, since nothing about a parked delivery's own identity needs to
 /// be caller-chosen or caller-visible before this call returns it.
-/// `ON CONFLICT (source, kind, identifier)` (docs/architecture.md §56)
-/// turns a duplicate-occurrence insert into an upsert that refreshes the
-/// failure details onto the existing row rather than a second one -
+/// `ON CONFLICT` on [`parked_deliveries_occurrence_index_ddl`]'s key
+/// (docs/architecture.md §56) turns a duplicate-occurrence insert into an
+/// upsert that refreshes the failure details onto the existing row
+/// rather than a second one -
 /// `RETURNING` so the id/fields this returns always describe the row
 /// that actually exists afterward, real either way (the fresh `id` this
 /// generated, or the winning row's own from an earlier insert).
@@ -8213,7 +8261,7 @@ pub async fn insert_parked_delivery(
           target_command_type, request_json, error, attempt_count, first_failed_at, \
           last_failed_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-         ON CONFLICT (source, kind, identifier) DO UPDATE SET \
+         ON CONFLICT (source, kind, identifier, (COALESCE(access_token_id, ''))) DO UPDATE SET \
          request_json = EXCLUDED.request_json, \
          error = EXCLUDED.error, \
          attempt_count = EXCLUDED.attempt_count, \

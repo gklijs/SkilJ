@@ -616,6 +616,17 @@ pub enum Error {
     /// codebase itself embeds anywhere).
     #[error("correlation_id/causation_id must be at most {CORRELATION_ID_MAX_LEN} characters")]
     CorrelationIdTooLong,
+
+    /// Not spec-modeled (parked deliveries are Rust-only, Codeberg issue
+    /// #21): a parked delivery's own `request` body doesn't have the wire
+    /// shape its `kind`'s original REST route takes (`POST
+    /// /v1/events/external`'s or `POST /v1/commands/trigger`'s body).
+    /// Rejected up front by `POST /v1/parked-deliveries` itself, and
+    /// raised again by `retryParkedDelivery` for a row stored before that
+    /// check existed - either way an ordinary error, never a panic on
+    /// bridge-supplied JSON.
+    #[error("parked delivery request does not match its kind's request shape: {0}")]
+    InvalidParkedDeliveryRequest(String),
 }
 
 impl SkiljRejection for Error {
@@ -650,6 +661,7 @@ impl SkiljRejection for Error {
             Error::UnregisteredEventType(_) => "unregistered_event_type",
             Error::PayloadDecodeFailed(_) => "payload_decode_failed",
             Error::CorrelationIdTooLong => "correlation_id_too_long",
+            Error::InvalidParkedDeliveryRequest(_) => "invalid_parked_delivery_request",
         }
     }
 
