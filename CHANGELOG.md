@@ -157,9 +157,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconnect, only to find the latest sequence), projection registration
   (including every projection's reconciliation at startup, only to check
   whether any consumed event exists), `CrossContextRoute`/deadline
-  catch-up ticks, and a new sync projection's history fold. Each now
-  reads a chunk at a time, uses a single aggregate query, or (catch-up)
-  handles at most 1000 events per tick and continues on the next.
+  catch-up ticks, async projection/rebuild and snapshot catch-up, and a
+  new sync projection's history fold. Each now reads a chunk at a time,
+  uses a single aggregate query, or (catch-up) handles at most 1000
+  events per tick and continues on the next.
 
 ### Security
 

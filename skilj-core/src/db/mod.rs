@@ -5651,9 +5651,11 @@ pub async fn witness_events_of_types(
     Ok(witnesses)
 }
 
-/// How many source events one `CrossContextRoute`/`ScheduleDeadline`/
-/// `CancelDeadline` catch-up tick loads at most - the rest wait for the
-/// next tick, which picks up from the persisted cursor.
+/// How many events one background catch-up tick loads at most - for a
+/// `CrossContextRoute`/`ScheduleDeadline`/`CancelDeadline` source, an
+/// async projection or rebuild (`catch_up_bounded_context`) or a snapshot
+/// (`catch_up_snapshots`). The rest wait for the next tick, which picks
+/// up from the persisted cursor/`caught_up_to`/snapshot progress.
 pub const MAX_EVENTS_PER_CATCH_UP_TICK: i64 = 1000;
 
 /// [`list_events_cached`], at most `limit` events.
@@ -10028,7 +10030,16 @@ pub async fn catch_up_bounded_context(
     let events = if min_caught_up >= latest {
         Vec::new()
     } else {
-        list_events_for_bounded_context_from(pool, bounded_context, min_caught_up).await?
+        // At most `MAX_EVENTS_PER_CATCH_UP_TICK`: progress persists per
+        // event, so a new projection/rebuild/snapshot over a long history
+        // catches up over several ticks instead of loading it whole.
+        list_events_for_bounded_context_from_limited(
+            pool,
+            bounded_context,
+            min_caught_up,
+            MAX_EVENTS_PER_CATCH_UP_TICK,
+        )
+        .await?
     };
 
     for event in &events {
@@ -10637,7 +10648,16 @@ pub async fn catch_up_snapshots(
     let events = if unpartitioned_snapshot_names.is_empty() || min_caught_up >= latest {
         Vec::new()
     } else {
-        list_events_for_bounded_context_from(pool, bounded_context, min_caught_up).await?
+        // At most `MAX_EVENTS_PER_CATCH_UP_TICK`: progress persists per
+        // event, so a new projection/rebuild/snapshot over a long history
+        // catches up over several ticks instead of loading it whole.
+        list_events_for_bounded_context_from_limited(
+            pool,
+            bounded_context,
+            min_caught_up,
+            MAX_EVENTS_PER_CATCH_UP_TICK,
+        )
+        .await?
     };
 
     for event in &events {

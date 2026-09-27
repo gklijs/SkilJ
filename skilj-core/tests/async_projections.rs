@@ -1215,3 +1215,52 @@ fn a_rebuild_removed_mid_tick_is_skipped_not_a_panic() {
         );
     });
 }
+
+/// A cold-start catch-up over a history longer than
+/// `MAX_EVENTS_PER_CATCH_UP_TICK` folds exactly that many events in its
+/// first tick (so the backlog is never loaded whole) and finishes on the
+/// next, with the same final state as an unbounded fold.
+#[test]
+fn a_cold_start_catch_up_over_a_long_history_spans_ticks() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        let cap = db::MAX_EVENTS_PER_CATCH_UP_TICK;
+        let mut sequences = Vec::new();
+        for _ in 0..cap + 3 {
+            sequences.push(insert_plain_event(&pool, &bc, &et, 1).await);
+        }
+
+        let caught_up_to = |pool: Pool, bc: String| async move {
+            db::get_projection(&pool, &bc, "AccountBalance")
+                .await
+                .unwrap()
+                .unwrap()
+                .caught_up_to
+        };
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+        assert_eq!(
+            caught_up_to(pool.clone(), bc.name.clone()).await,
+            Some(sequences[cap as usize - 1])
+        );
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+        assert_eq!(
+            caught_up_to(pool.clone(), bc.name.clone()).await,
+            sequences.last().copied()
+        );
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                .await
+                .unwrap(),
+            Some((cap + 3).to_string())
+        );
+    });
+}
