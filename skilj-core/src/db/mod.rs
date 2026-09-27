@@ -3505,6 +3505,73 @@ pub async fn get_command_by_external_id(
     }
 }
 
+/// Where the command `external_id` sits in its bounded context's
+/// recording order - the internal `commands.id` key, which only ever
+/// grows with each insert. Rule `FetchCommands`' `recorded_after`: a
+/// `fetchCommands` page continues after this position. `None` when no
+/// such command exists here.
+pub async fn command_recording_position(
+    pool: &Pool,
+    bounded_context: &str,
+    external_id: &str,
+) -> crate::error::Result<Option<i64>> {
+    let schema = schema_ident(bounded_context);
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT id FROM {schema}.commands WHERE external_id = $1"
+    )))
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+#[derive(sqlx::FromRow)]
+struct PositionedCommandRow {
+    id: i64,
+    #[sqlx(flatten)]
+    row: CommandRow,
+}
+
+/// One bounded `fetchCommands` page: the bounded context's commands
+/// recorded after `after_position` (`-1` for the start), in recording
+/// order, `max_commands` at a time, with `select` - the rule's own pure
+/// function - choosing what to serve from each chunk (given how many
+/// more fit) until the page is full or history ends. Rule
+/// `FetchCommands`' `first_by_recording`, the command counterpart to
+/// [`collect_event_page`]. `select` runs at least once, so its own
+/// validation errors surface even on an empty history.
+pub async fn collect_command_page(
+    pool: &Pool,
+    bounded_context: &str,
+    mut after_position: i64,
+    max_commands: usize,
+    mut select: impl FnMut(&[Command], usize) -> crate::error::Result<Vec<Command>>,
+) -> crate::error::Result<Vec<Command>> {
+    let chunk_size = max_commands.max(1);
+    let limit = i64::try_from(chunk_size).unwrap_or(i64::MAX);
+    let schema = schema_ident(bounded_context);
+    let mut page = Vec::new();
+    loop {
+        let rows: Vec<PositionedCommandRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT id, {COMMAND_COLUMNS} FROM {schema}.commands \
+             WHERE id > $1 ORDER BY id LIMIT $2"
+        )))
+        .bind(after_position)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        let exhausted = rows.len() < chunk_size;
+        let mut chunk = Vec::with_capacity(rows.len());
+        for positioned in rows {
+            after_position = positioned.id;
+            chunk.push(positioned.row.into_domain(pool, bounded_context).await?);
+        }
+        page.extend(select(&chunk, chunk_size - page.len())?);
+        if page.len() >= chunk_size || exhausted {
+            return Ok(page);
+        }
+    }
+}
+
 /// Every `Command` currently stored for a whole bounded context - the
 /// full-snapshot parameter `fetch_commands`' own `bounded_context_commands`
 /// expects (same treatment `list_events_for_bounded_context` gets for

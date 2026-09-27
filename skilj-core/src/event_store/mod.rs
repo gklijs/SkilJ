@@ -525,6 +525,11 @@ pub enum Error {
     #[error("this triggered_event belongs to a different bounded context than the grant's")]
     TriggeredEventNotInBoundedContext,
 
+    /// Rule `FetchCommands`' `after_command` requirement - where a page
+    /// continues from must be a command of the grant's own bounded context.
+    #[error("this after_command belongs to a different bounded context than the grant's")]
+    AfterCommandNotInBoundedContext,
+
     #[error("this EventReadToken's cursor mode doesn't match what was requested")]
     CursorAckModeMismatch,
 
@@ -647,6 +652,7 @@ impl SkiljRejection for Error {
             Error::EventTypeNotInBoundedContext => "event_type_not_in_bounded_context",
             Error::CommandTypeNotInBoundedContext => "command_type_not_in_bounded_context",
             Error::TriggeredEventNotInBoundedContext => "triggered_event_not_in_bounded_context",
+            Error::AfterCommandNotInBoundedContext => "after_command_not_in_bounded_context",
             Error::EncryptionKeyNotActive => "encryption_key_not_active",
             Error::CursorAckModeMismatch => "cursor_ack_mode_mismatch",
             Error::NotManualAckCursor => "not_manual_ack_cursor",
@@ -2697,6 +2703,41 @@ pub fn fetch_commands(
     resolve_data_key: impl Fn(&str, &str) -> Option<DataKey>,
     private_field_grants: &[PrivateFieldGrant],
 ) -> crate::error::Result<Vec<String>> {
+    Ok(fetch_commands_select(
+        access_mapping,
+        command_types,
+        after,
+        before,
+        triggered_event,
+        correlation_id,
+        None,
+        bounded_context_commands,
+        DEFAULT_MAX_EVENTS_PER_READ,
+    )?
+    .iter()
+    .map(|c| render_command(c, access_mapping, &resolve_data_key, private_field_grants))
+    .collect())
+}
+
+/// `rule FetchCommands`' `requires` and its `candidates`, not yet
+/// rendered: at most `max_commands`, taken in the order given.
+/// `bounded_context_commands` must already be in recording order and
+/// only hold commands recorded after `after_command` - what
+/// `db::collect_command_page` hands it - since recording order isn't
+/// part of `Command` itself; `after_command` is checked here only for the
+/// rule's own bounded-context requirement.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_commands_select(
+    access_mapping: &RoleAccessMapping,
+    command_types: &[CommandType],
+    after: Option<chrono::DateTime<chrono::Utc>>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    triggered_event: Option<&Event>,
+    correlation_id: Option<&str>,
+    after_command: Option<&Command>,
+    bounded_context_commands: &[Command],
+    max_commands: usize,
+) -> crate::error::Result<Vec<Command>> {
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
     }
@@ -2711,6 +2752,9 @@ pub fn fetch_commands(
     }
     if triggered_event.is_some_and(|te| te.bounded_context != access_mapping.bounded_context) {
         return Err(Error::TriggeredEventNotInBoundedContext.into());
+    }
+    if after_command.is_some_and(|c| c.bounded_context != access_mapping.bounded_context) {
+        return Err(Error::AfterCommandNotInBoundedContext.into());
     }
 
     Ok(bounded_context_commands
@@ -2731,7 +2775,8 @@ pub fn fetch_commands(
             correlation_id.is_none_or(|id| c.metadata.correlation_id.as_deref() == Some(id))
         })
         .filter(|c| command_owner_scope_satisfied(c, access_mapping.scope.as_deref()))
-        .map(|c| render_command(c, access_mapping, &resolve_data_key, private_field_grants))
+        .take(max_commands)
+        .cloned()
         .collect())
 }
 

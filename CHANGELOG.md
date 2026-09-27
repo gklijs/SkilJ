@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SkiljBuilder::max_events_per_read`; `skilj_rest::router` takes it as
   a new parameter. `skilj-tui`'s query view pages with `n`. The spec
   models the cap as `config.max_events_per_read`.
+- **Breaking (wire):** GraphQL `fetchCommands` returns
+  `[QueriedCommand!]!` (`id`, `createdAt`, `payload`) instead of
+  `[String!]!`, at most `max_events_per_read` per call in the order the
+  commands were recorded, and takes `afterCommandId` (the last returned
+  `id`) to page on. It used to load and render the bounded context's
+  whole command history, in no particular order, with a database round
+  trip per command.
 - Idempotency keys starting with `skilj-parked-delivery:` are now
   reserved, like `skilj-cross-context-route:` and `skilj-deadline:`, and
   a caller-supplied one is rejected with

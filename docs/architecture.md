@@ -1427,7 +1427,10 @@ implementation, in dependency order:
    flat `[String!]!` with plain `after`/`before` timestamp arguments, no
    Relay envelope — `Command` carries no exposed id, so a literal
    `edges{node,cursor}`/`pageInfo` shape (§5.3's stated default) doesn't
-   naturally fit it, confirmed with the user rather than forced. Two more
+   naturally fit it, confirmed with the user rather than forced.
+   (Superseded in §70, again with the user: `fetchCommands` now returns
+   `{ id, createdAt, payload }` objects and pages via `afterCommandId`,
+   still without a Relay envelope.) Two more
    small persistence gaps filled: `db::get_event_by_sequence`
    (`InspectEvent`'s own lookup key) and
    `db::list_commands_for_bounded_context` (`FetchCommands`' full-snapshot
@@ -9360,3 +9363,16 @@ Tests: `colliding_projection_type_names_serve_one_and_refuse_the_other` (`skilj/
 **Breaking** for a `GET /v1/events` or `queryEvents` client that assumed one call returns everything: it must page (`after`=`nextCursor` / `afterSequence` = the last `sequence`) until a call returns nothing.
 
 Tests: `reads_serve_bounded_pages_and_continue_where_they_stopped` (`skilj/tests/event_fetch_rest.rs`: page size 3 and a two-event cache window, so chunks come from both Postgres and the cache; `GET /v1/events` pages 7 events as 3+3+1 via `nextCursor`, a filtered page `[1,3,5]` fills across chunks, consume pages 3+3+1+0, and a `Latest` consumer minted after seven events seeds past all of them. Making the chunk walk stop after one chunk turns the filtered page into `[1,3]`) and `query_events_serves_bounded_pages_over_graphql` (`skilj/tests/graphql_business_surfaces.rs`, the bounded-context-wide path).
+
+
+## 70. Bounded, pageable `fetchCommands`
+
+The command-side counterpart to §69, and the worse case of the two. `fetchCommands` loaded the bounded context's entire command history (`list_commands_for_bounded_context`, with no `ORDER BY`, so in whatever order Postgres returned rows), then made a database round trip per matching command to resolve decryption keys, then rendered all of them. It returned bare payload strings with no id or timestamp, so a client couldn't have paged even if it wanted to. §8's earlier decision to keep it a flat `[String!]!` was made when `Command` had no exposed id; that no longer holds.
+
+**Spec.** `FetchCommands` (and the `CommandQuery` surface) gains an optional `after_command`, with the same bounded-context requirement `triggered_event` already has, and serves `first_by_recording(<candidates recorded after after_command>, config.max_events_per_read)`. The two new black boxes are `recorded_after(a, b)` and `first_by_recording(commands, n)`. `Command` has no sequence, but this library records commands in an order, and that is what pages follow. They don't follow `created_at`: two commands can share a timestamp, and a page boundary between them would skip or repeat one. The cap is the same `config.max_events_per_read` - despite its name it covers commands too, noted in the spec, rather than renaming a setting just added. `allium check`/`analyse` unchanged.
+
+**Wire (breaking).** `fetchCommands(..., afterCommandId: String)` returns `[QueriedCommand!]!` `{ id, createdAt, payload }` instead of `[String!]!`. `id` is the command's own `Command.id`, and passing it back as `afterCommandId` gets the next page; there is no separate opaque cursor. An unknown `afterCommandId` is `Command_not_found` rather than a silent restart from the beginning. Within the workspace only tests called it.
+
+**Implementation.** `db::command_recording_position` maps a command id to its `commands.id` key (a `BIGSERIAL`, so it only grows with insertion). `db::collect_command_page` walks commands after that position `ORDER BY id LIMIT <page size>`, a chunk at a time, calling the pure `event_store::fetch_commands_select` per chunk - the rule's filters and cap, now separate from rendering, the same split `query_events_select` got. Recording order isn't part of the domain `Command`, so the loader applies `recorded_after` and the ordering, and the pure function checks `after_command`'s bounded context (new `AfterCommandNotInBoundedContext`). Decryption keys are resolved for the served page only. `fetch_commands` keeps its signature (rendered strings, default cap) for existing callers.
+
+Test: `fetch_commands_serves_bounded_pages_over_graphql` (page size 3: seven commands come back 3+3+1 in recording order via `afterCommandId`, each with `createdAt`; an unknown id is `Command_not_found`). The two existing `fetchCommands` assertions in the same file moved to the object shape.

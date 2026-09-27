@@ -1715,7 +1715,8 @@ entity PrivateFieldGrant {
 -- nothing is ever skipped. It counts served events, not scanned ones: a
 -- page is only short when nothing further matches, so a filtered
 -- consumer always makes progress. CountEvents stays unbounded - it is an
--- aggregate, not a page.
+-- aggregate, not a page. FetchCommands is bounded by the same value (see
+-- first_by_recording), so despite the name it caps commands too.
 config {
     read_cursor_checkout_lease: Duration = 5.minutes
     max_events_per_read: Integer = 1000
@@ -2815,6 +2816,11 @@ rule FetchEvents {
 -- first_by_sequence(events, n) is another: the n events with the lowest
 -- Event.sequence among a set, or all of them when there are n or fewer.
 -- It is how config.max_events_per_read bounds a read.
+--
+-- Commands have no sequence, but this library records them in an order:
+-- recorded_after(a, b) is whether a was recorded after b, and
+-- first_by_recording(commands, n) the n recorded earliest - how
+-- FetchCommands bounds its page by the same config.max_events_per_read.
 
 rule ConsumeEvents {
     when: ConsumeEvents(token, ack_mode?, filters)
@@ -3806,7 +3812,7 @@ rule ProcessCommand {
 -- and reading the ones submitted before that is the point.
 
 rule FetchCommands {
-    when: FetchCommands(access_mapping, command_types, after?, before?, triggered_event?)
+    when: FetchCommands(access_mapping, command_types, after?, before?, triggered_event?, after_command?)
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
 
@@ -3820,6 +3826,12 @@ rule FetchCommands {
     requires:
         triggered_event = null
         or triggered_event?.bounded_context = access_mapping.bounded_context
+
+    -- after_command is where the previous page stopped - the last command
+    -- it served - and the same scoping applies to it.
+    requires:
+        after_command = null
+        or after_command?.bounded_context = access_mapping.bounded_context
 
     let matched =
         Commands where bounded_context = access_mapping.bounded_context
@@ -3842,7 +3854,16 @@ rule FetchCommands {
     -- true for a grant that names no scope, which is every grant unless a
     -- superadmin named one, and for any command whose type declares no
     -- owner dimension.
-    let candidates = filter(matched, c => command_owner_scope_satisfied(c, access_mapping.scope))
+    -- Bounded like the event reads (see config.max_events_per_read): the
+    -- first that many in the order they were recorded, continuing after
+    -- after_command when given. Recording order, not created_at, since two
+    -- commands can share a timestamp; a page boundary between them would
+    -- otherwise skip or repeat one.
+    let candidates = first_by_recording(
+        filter(matched, c =>
+            command_owner_scope_satisfied(c, access_mapping.scope)
+                and (after_command = null or recorded_after(c, after_command))),
+        config.max_events_per_read)
 
     ensures:
         CommandsDelivered(
@@ -7636,7 +7657,7 @@ surface CommandQuery {
     facing access_mapping: AdminAccess
 
     provides:
-        FetchCommands(access_mapping, command_types, after?, before?, triggered_event?)
+        FetchCommands(access_mapping, command_types, after?, before?, triggered_event?, after_command?)
 
     @guarantee GrantScopedToBoundedContext
         -- An admin-level grant only authorises reading commands submitted

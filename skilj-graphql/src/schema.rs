@@ -186,6 +186,7 @@ async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
     .register(gql_types::access_token_union())
     .register(gql_types::tag_input())
     .register(gql_types::queried_event_object())
+    .register(gql_types::queried_command_object())
     .register(gql_types::matching_event_object())
     .register(gql_types::event_origin_object())
     .register(gql_types::event_meta_object())

@@ -136,6 +136,7 @@ fn status_for(err: &CoreError) -> StatusCode {
             EventStoreError::EventTypeNotInBoundedContext => StatusCode::FORBIDDEN,
             EventStoreError::CommandTypeNotInBoundedContext => StatusCode::FORBIDDEN,
             EventStoreError::TriggeredEventNotInBoundedContext => StatusCode::FORBIDDEN,
+            EventStoreError::AfterCommandNotInBoundedContext => StatusCode::FORBIDDEN,
             EventStoreError::InvalidTagMapping => StatusCode::BAD_REQUEST,
             EventStoreError::InvalidSensitiveField => StatusCode::BAD_REQUEST,
             EventStoreError::PayloadDoesNotMatchSchema => StatusCode::BAD_REQUEST,

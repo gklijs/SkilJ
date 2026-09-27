@@ -13,13 +13,13 @@
 use super::{not_found, parse_rfc3339, require_admin_mapping, resolve_read_data_keys};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
-use async_graphql::dynamic::{Field, FieldFuture, InputValue, TypeRef};
+use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
 /// `fetchCommands(boundedContext: String!, commandTypes: [String!]!, after: String, before: String, triggeredEvent: Int, correlationId: String): [String!]!`
 pub fn fetch_commands_field() -> Field {
     Field::new(
         "fetchCommands",
-        TypeRef::named_nn_list_nn(TypeRef::STRING),
+        TypeRef::named_nn_list_nn("QueriedCommand"),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -82,21 +82,64 @@ pub fn fetch_commands_field() -> Field {
                     .and_then(|v| v.string().ok())
                     .map(|s| s.to_string());
 
-                let bounded_context_commands = skilj_core::db::list_commands_for_bounded_context(
+                // Where the previous page stopped (rule `FetchCommands`'
+                // `after_command`), resolved to its recording position.
+                let after_command_id = ctx
+                    .args
+                    .get("afterCommandId")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
+                let (after_command, after_position) = match &after_command_id {
+                    Some(id) => {
+                        let command = skilj_core::db::get_command_by_external_id(
+                            &state.pool,
+                            &bounded_context_name,
+                            id,
+                        )
+                        .await
+                        .map_err(to_graphql_error)?
+                        .ok_or_else(|| not_found("Command", id))?;
+                        let position = skilj_core::db::command_recording_position(
+                            &state.pool,
+                            &bounded_context_name,
+                            id,
+                        )
+                        .await
+                        .map_err(to_graphql_error)?
+                        .ok_or_else(|| not_found("Command", id))?;
+                        (Some(command), position)
+                    }
+                    None => (None, -1),
+                };
+
+                // At most `max_events_per_read` commands, in recording
+                // order, loaded a chunk at a time.
+                let page = skilj_core::db::collect_command_page(
                     &state.pool,
                     &bounded_context_name,
+                    after_position,
+                    state.max_events_per_read,
+                    |chunk, remaining| {
+                        skilj_core::event_store::fetch_commands_select(
+                            &access_mapping,
+                            &command_types,
+                            after,
+                            before,
+                            triggered_event.as_ref(),
+                            correlation_id.as_deref(),
+                            after_command.as_ref(),
+                            chunk,
+                            remaining,
+                        )
+                    },
                 )
                 .await
                 .map_err(to_graphql_error)?;
 
-                // Same scoped-to-commandTypes pre-resolution `queryEvents`
-                // uses - see that resolver's own comment for why this
-                // doesn't try to replicate fetch_commands' full filter.
+                // Decryption keys for the served commands only.
                 let mut data_keys = std::collections::HashMap::new();
-                for c in bounded_context_commands.iter().filter(|c| {
-                    c.bounded_context == access_mapping.bounded_context
-                        && (command_types.is_empty() || command_types.contains(&c.command_type))
-                }) {
+                for c in &page {
                     resolve_read_data_keys(
                         &state.pool,
                         &bounded_context_name,
@@ -111,25 +154,18 @@ pub fn fetch_commands_field() -> Field {
 
                 let private_field_grants =
                     super::load_private_field_grants(&state.pool, &bounded_context_name).await?;
-                let rendered = skilj_core::event_store::fetch_commands(
-                    &access_mapping,
-                    &command_types,
-                    after,
-                    before,
-                    triggered_event.as_ref(),
-                    correlation_id.as_deref(),
-                    &bounded_context_commands,
-                    |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
-                    &private_field_grants,
-                )
-                .map_err(to_graphql_error)?;
-
-                Ok(Some(
-                    rendered
-                        .into_iter()
-                        .map(async_graphql::Value::from)
-                        .collect::<Vec<_>>(),
-                ))
+                Ok(Some(FieldValue::list(page.iter().map(|c| {
+                    FieldValue::owned_any((
+                        c.id.clone(),
+                        c.metadata.created_at.to_rfc3339(),
+                        skilj_core::event_store::render_command(
+                            c,
+                            &access_mapping,
+                            &|sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                            &private_field_grants,
+                        ),
+                    ))
+                }))))
             })
         },
     )
@@ -140,6 +176,10 @@ pub fn fetch_commands_field() -> Field {
     .argument(InputValue::new(
         "commandTypes",
         TypeRef::named_nn_list_nn(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "afterCommandId",
+        TypeRef::named(TypeRef::STRING),
     ))
     .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
     .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING)))

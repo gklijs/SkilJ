@@ -728,6 +728,18 @@ pub fn queried_event_object() -> Object {
     })
 }
 
+/// `fetchCommands`' per-command shape: `(id, createdAt, rendered payload)`.
+/// `id` is the command's own `Command.id` - what a caller passes back as
+/// `afterCommandId` to get the next page (rule `FetchCommands`'
+/// `after_command`).
+pub fn queried_command_object() -> Object {
+    gql_object!((String, String, String) => "QueriedCommand" {
+        scalar "id": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.0.clone()),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.1.clone()),
+        scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.2.clone()),
+    })
+}
+
 /// `SubmitCommandResult.matchingEvents`' own per-row shape (Codeberg
 /// issue #7's DCB conflict visualizer) - a real `Event`, not
 /// `QueriedEvent`'s `(i64, String)` pair, since `eventTypeName` matters

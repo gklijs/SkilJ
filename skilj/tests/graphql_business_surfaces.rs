@@ -801,7 +801,7 @@ fn full_business_surfaces_lifecycle_end_to_end() {
         let response = graphql_request(
             &router,
             Some(&jwt),
-            "query($bc: String!) { fetchCommands(boundedContext: $bc, commandTypes: [\"WithdrawMoney\"]) }",
+            "query($bc: String!) { fetchCommands(boundedContext: $bc, commandTypes: [\"WithdrawMoney\"]) { id payload } }",
             json!({ "bc": bc_name }),
         )
         .await;
@@ -860,14 +860,17 @@ fn full_business_surfaces_lifecycle_end_to_end() {
             &router,
             Some(&jwt),
             "query($bc: String!, $corr: String) { \
-                fetchCommands(boundedContext: $bc, commandTypes: [], correlationId: $corr) \
+                fetchCommands(boundedContext: $bc, commandTypes: [], correlationId: $corr) { payload } \
             }",
             json!({ "bc": bc_name, "corr": "test-correlation-42" }),
         )
         .await;
         assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
         let correlated_commands = response["data"]["fetchCommands"].as_array().unwrap();
-        assert_eq!(correlated_commands, &vec![json!(r#"{"amount":1}"#)]);
+        assert_eq!(
+            correlated_commands,
+            &vec![json!({ "payload": r#"{"amount":1}"# })]
+        );
 
         // Gating: no caller at all is rejected for submitCommand, before
         // anything runs.
@@ -1663,5 +1666,77 @@ fn query_events_serves_bounded_pages_over_graphql() {
             );
         }
         assert_eq!(pages, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
+    });
+}
+
+/// `fetchCommands` serves at most `max_events_per_read` commands (3
+/// here) in the order they were recorded, and a caller pages on with
+/// `afterCommandId` = the last one's `id`. An unknown `afterCommandId` is
+/// `Command_not_found`, not a silent restart from the beginning.
+#[test]
+fn fetch_commands_serves_bounded_pages_over_graphql() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt, _role) =
+            setup_with(|builder| builder.max_events_per_read(3)).await;
+        let router = skilj.graphql_router().await.unwrap();
+        for amount in 1..=7 {
+            let response = graphql_request(
+                &router,
+                Some(&jwt),
+                SUBMIT_COMMAND_MUTATION,
+                json!({
+                    "bc": bc_name,
+                    "name": "WithdrawMoney",
+                    "payload": format!(r#"{{"amount":{amount}}}"#),
+                }),
+            )
+            .await;
+            assert_eq!(response["data"]["submitCommand"]["accepted"], true, "{response:?}");
+        }
+
+        let query = "query($bc: String!, $after: String) { \
+            fetchCommands(boundedContext: $bc, commandTypes: [\"WithdrawMoney\"], afterCommandId: $after) \
+            { id createdAt payload } }";
+        let mut after: Option<String> = None;
+        let mut pages = Vec::new();
+        loop {
+            let response =
+                graphql_request(&router, Some(&jwt), query, json!({ "bc": bc_name, "after": after }))
+                    .await;
+            assert!(response.get("errors").is_none(), "{response:?}");
+            let commands = response["data"]["fetchCommands"].as_array().unwrap().clone();
+            if commands.is_empty() {
+                break;
+            }
+            assert!(commands.iter().all(|c| c["createdAt"].is_string()));
+            after = commands.last().unwrap()["id"].as_str().map(str::to_string);
+            pages.push(
+                commands
+                    .iter()
+                    .map(|c| {
+                        serde_json::from_str::<serde_json::Value>(c["payload"].as_str().unwrap())
+                            .unwrap()["amount"]
+                            .as_i64()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(pages, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            query,
+            json!({ "bc": bc_name, "after": "no-such-command" }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "Command_not_found",
+            "{response:?}"
+        );
     });
 }
