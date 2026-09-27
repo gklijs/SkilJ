@@ -17,7 +17,9 @@ use std::sync::Arc;
 pub struct GraphqlLimits {
     /// Largest accepted `POST /graphql` body, in bytes - anything larger
     /// is `413 Payload Too Large`, checked before authentication or
-    /// parsing. Default 2 MiB, axum's own default for a JSON body.
+    /// parsing - and largest websocket message/frame, beyond which the
+    /// subscription connection is closed. Default 2 MiB, axum's own
+    /// default for a JSON body.
     pub max_request_body_bytes: usize,
     /// Deepest selection nesting a query may have. Default 24; the full
     /// introspection query needs about 14.

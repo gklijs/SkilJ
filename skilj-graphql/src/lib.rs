@@ -289,7 +289,14 @@ async fn graphql_ws_handler(
     // torn reads" treatment `graphql_handler` gets, just held for
     // longer.
     let schema = (*registry.current()).clone();
+    // The same cap `POST /graphql` bodies get (docs/architecture.md §73):
+    // each websocket message is a GraphQL document too, and it arrives
+    // before (or without) any credential - axum's own default would
+    // otherwise accept 64 MiB per message.
+    let max_message = state.limits.max_request_body_bytes;
     upgrade
+        .max_message_size(max_message)
+        .max_frame_size(max_message)
         .protocols(async_graphql::http::ALL_WEBSOCKET_PROTOCOLS)
         .on_upgrade(move |socket| {
             async_graphql_axum::GraphQLWebSocket::new(socket, schema, protocol)

@@ -1190,3 +1190,50 @@ fn events_by_type_subscription_narrows_by_a_real_in_filter() {
         );
     });
 }
+
+/// The websocket endpoint shares `/graphql`'s body cap: a message larger
+/// than `GraphqlLimits::max_request_body_bytes` closes the connection
+/// instead of being read and parsed. Unauthenticated connections are
+/// accepted (a subscription may need no caller), so without the cap
+/// anyone could make the server buffer axum's default 64 MiB per message.
+#[test]
+fn an_oversized_websocket_message_closes_the_connection() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
+        ws_send_json(&mut ws, json!({ "type": "connection_init", "payload": {} })).await;
+        assert_eq!(ws_recv_json(&mut ws).await["type"], "connection_ack");
+
+        let huge = json!({
+            "id": "1",
+            "type": "subscribe",
+            "payload": {
+                "query": "{ __typename }",
+                "variables": { "padding": "x".repeat(3 * 1024 * 1024) },
+            },
+        });
+        // The send itself may fail once the server drops the connection.
+        let _ = ws.send(Message::text(huge.to_string())).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the server neither answered nor closed within 5s");
+        match outcome {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+            Some(Ok(other)) => panic!("an oversized message was processed: {other:?}"),
+        }
+    });
+}
