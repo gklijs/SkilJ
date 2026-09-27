@@ -9476,3 +9476,16 @@ Fix: a zero capacity is a disabled cache - `warm`/`append` do nothing and every 
 Also from the same sweep of configuration values that reach tokio primitives: `event_broadcast_capacity(0)` panicked inside `tokio::sync::broadcast::channel` during `build()`; `EventBroadcaster::new` now clamps to 1. (`CommandBatcher`'s knobs already clamped; poll intervals only reach `tokio::time::sleep`, where zero is a busy loop, not a panic.)
 
 Tests: `a_zero_capacity_cache_misses_instead_of_claiming_nothing_exists` (failed before), `a_cold_window_fills_from_the_recent_tail`, `a_zero_capacity_broadcaster_is_still_usable`.
+
+## 80. A panic in plugin code no longer ends a background task
+
+Every background task `SkiljBuilder::build` spawns (async projection and snapshot catch-up, `CrossContextRoute`/`ScheduleDeadline`/`CancelDeadline` catch-up, deadline firing, the scheduler) is one detached `tokio::spawn` looping over a `for_each_concurrent` fan-out, and each unit of that fan-out runs application code: `Projection::project`, `Snapshot` folds, routes' and deadlines' mappings, deciders. Errors were handled per unit (logged, counted, retried next tick), but a *panic* - an `unwrap()` on a bad assumption in a projection - unwound out of `for_each_concurrent` and ended the task. For the async projection task that meant one buggy projection in one bounded context stopped async catch-up for **every** bounded context, permanently, with no signal beyond tokio's own panic message on stderr. Reproduced: a projection that panics in bounded context A, then an event in bounded context B - B's async projection never updated.
+
+Fix: `contain_panic(task, unit, work)` wraps each unit (per bounded context, route, or deadline schedule) in `catch_unwind`. A panic is logged at `error` with the task, unit and panic message, and counted as `skilj.background_task.errors{task, reason="panicked"}`; the unit's open transaction rolls back when dropped during the unwind, so the next tick retries it, exactly like a unit that returned an error. A deterministic bug in one projection therefore panics once per tick in its own bounded context - loud, but contained - and nothing else is affected.
+
+Checked and left alone:
+- **The cross-instance listener** runs no application code (it refetches events and rebuilds the GraphQL schema from registered metadata), so it isn't wrapped.
+- **The request path.** A decider or sync projection that panics while `CommandBatcher` is running a batch drops the batch's reply senders, so followers get a retryable `BatchFailed` rather than hanging, and `LeaderGuard` empties the queue on unwind so the next caller becomes leader (§59). The panicking request's own connection is dropped by the server; the process keeps running.
+- **The Kafka/AMQP/NATS/Temporal bridges** run their own loops outside this crate and aren't covered here.
+
+Test: `a_panicking_projection_does_not_stop_catch_up_for_other_bounded_contexts` (`skilj/tests/background_task_panics.rs`): a panicking async projection in one bounded context, then an event in another. The healthy projection never updated before the fix; after it, the broken projection panics every tick and the healthy one catches up.

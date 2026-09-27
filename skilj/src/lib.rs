@@ -64,6 +64,40 @@ static BACKGROUND_TASK_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// builder option later if a real need for tuning it ever comes up.
 const BACKGROUND_TASK_CONCURRENCY: usize = 16;
 
+/// Runs one unit of a background task's work (one bounded context's, one
+/// route's, one deadline schedule's), turning a panic into a logged error
+/// and a `reason = "panicked"` error count. The units run application
+/// plugin code (`Projection::project`, `Snapshot`s, routes, deadlines,
+/// deciders), and each task is a single detached `tokio::spawn`: an
+/// uncontained panic unwound out of `for_each_concurrent` and ended the
+/// task for every bounded context, for the rest of the process's life,
+/// with nothing but tokio's own panic message to show for it
+/// (docs/architecture.md §80). Whatever the unit had open rolls back when
+/// its transaction is dropped during the unwind, so the next tick retries
+/// it, like any other failed unit.
+async fn contain_panic(
+    task: &'static str,
+    unit: String,
+    work: impl std::future::Future<Output = ()>,
+) {
+    use futures_util::FutureExt;
+    if let Err(panic) = std::panic::AssertUnwindSafe(work).catch_unwind().await {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        tracing::error!(task, unit = %unit, panic = %message, "background task unit panicked");
+        BACKGROUND_TASK_ERRORS.add(
+            1,
+            &[
+                KeyValue::new("task", task),
+                KeyValue::new("reason", "panicked"),
+            ],
+        );
+    }
+}
+
 /// Re-exported so a crate using `#[auto_register]` (whose expansion emits
 /// `::skilj::inventory::submit! { ... }`) needs only its existing `skilj`
 /// dependency - not a direct one on `inventory` too. Not meant to be used
@@ -2010,7 +2044,7 @@ impl SkiljBuilder {
                                 .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
                                     let poll_pool = poll_pool.clone();
                                     let poll_dispatcher = poll_dispatcher.clone();
-                                    async move {
+                                    contain_panic("async_projection", bc.name.clone(), async move {
                                         if let Err(e) = skilj_core::db::catch_up_bounded_context(
                                             &poll_pool,
                                             &bc.name,
@@ -2031,7 +2065,7 @@ impl SkiljBuilder {
                                                 ],
                                             );
                                         }
-                                    }
+                                    })
                                 })
                                 .await;
                         }
@@ -2085,7 +2119,7 @@ impl SkiljBuilder {
                                 .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
                                     let snapshot_pool = snapshot_pool.clone();
                                     let snapshot_dispatcher = snapshot_dispatcher.clone();
-                                    async move {
+                                    contain_panic("snapshot", bc.name.clone(), async move {
                                         if let Err(e) = skilj_core::db::catch_up_snapshots(
                                             &snapshot_pool,
                                             &bc.name,
@@ -2106,7 +2140,7 @@ impl SkiljBuilder {
                                                 ],
                                             );
                                         }
-                                    }
+                                    })
                                 })
                                 .await;
                         }
@@ -2176,35 +2210,39 @@ impl SkiljBuilder {
                             let route_broadcaster = route_broadcaster.clone();
                             let route_event_cache = route_event_cache.clone();
                             let route_encryption_master_key = route_encryption_master_key.clone();
-                            async move {
-                                if let Err(e) = skilj_core::db::catch_up_cross_context_route(
-                                    &route_pool,
-                                    &route,
-                                    route_dispatcher.as_ref(),
-                                    route_command_dispatcher.as_ref(),
-                                    route_projection_dispatcher.as_ref(),
-                                    route_snapshot_dispatcher.as_ref(),
-                                    &route_broadcaster,
-                                    &route_event_cache,
-                                    route_encryption_master_key.as_ref(),
-                                    &route_retry_policy,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        route = %route.name,
-                                        error = %e,
-                                        "cross-context route catch-up failed"
-                                    );
-                                    BACKGROUND_TASK_ERRORS.add(
-                                        1,
-                                        &[
-                                            KeyValue::new("task", "cross_context_route"),
-                                            KeyValue::new("reason", "catch_up_failed"),
-                                        ],
-                                    );
-                                }
-                            }
+                            contain_panic(
+                                "cross_context_route",
+                                route.name.to_string(),
+                                async move {
+                                    if let Err(e) = skilj_core::db::catch_up_cross_context_route(
+                                        &route_pool,
+                                        &route,
+                                        route_dispatcher.as_ref(),
+                                        route_command_dispatcher.as_ref(),
+                                        route_projection_dispatcher.as_ref(),
+                                        route_snapshot_dispatcher.as_ref(),
+                                        &route_broadcaster,
+                                        &route_event_cache,
+                                        route_encryption_master_key.as_ref(),
+                                        &route_retry_policy,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            route = %route.name,
+                                            error = %e,
+                                            "cross-context route catch-up failed"
+                                        );
+                                        BACKGROUND_TASK_ERRORS.add(
+                                            1,
+                                            &[
+                                                KeyValue::new("task", "cross_context_route"),
+                                                KeyValue::new("reason", "catch_up_failed"),
+                                            ],
+                                        );
+                                    }
+                                },
+                            )
                         })
                         .await;
                 }
@@ -2246,29 +2284,33 @@ impl SkiljBuilder {
                             let schedule_deadline_dispatcher = schedule_deadline_dispatcher.clone();
                             let schedule_deadline_event_cache =
                                 schedule_deadline_event_cache.clone();
-                            async move {
-                                if let Err(e) = skilj_core::db::catch_up_schedule_deadline(
-                                    &schedule_deadline_pool,
-                                    &schedule,
-                                    schedule_deadline_dispatcher.as_ref(),
-                                    &schedule_deadline_event_cache,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        schedule = %schedule.name,
-                                        error = %e,
-                                        "schedule deadline catch-up failed"
-                                    );
-                                    BACKGROUND_TASK_ERRORS.add(
-                                        1,
-                                        &[
-                                            KeyValue::new("task", "schedule_deadline"),
-                                            KeyValue::new("reason", "catch_up_failed"),
-                                        ],
-                                    );
-                                }
-                            }
+                            contain_panic(
+                                "schedule_deadline",
+                                schedule.name.to_string(),
+                                async move {
+                                    if let Err(e) = skilj_core::db::catch_up_schedule_deadline(
+                                        &schedule_deadline_pool,
+                                        &schedule,
+                                        schedule_deadline_dispatcher.as_ref(),
+                                        &schedule_deadline_event_cache,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            schedule = %schedule.name,
+                                            error = %e,
+                                            "schedule deadline catch-up failed"
+                                        );
+                                        BACKGROUND_TASK_ERRORS.add(
+                                            1,
+                                            &[
+                                                KeyValue::new("task", "schedule_deadline"),
+                                                KeyValue::new("reason", "catch_up_failed"),
+                                            ],
+                                        );
+                                    }
+                                },
+                            )
                         })
                         .await;
                 }
@@ -2298,7 +2340,7 @@ impl SkiljBuilder {
                             let cancel_deadline_pool = cancel_deadline_pool.clone();
                             let cancel_deadline_dispatcher = cancel_deadline_dispatcher.clone();
                             let cancel_deadline_event_cache = cancel_deadline_event_cache.clone();
-                            async move {
+                            contain_panic("cancel_deadline", cancel.name.to_string(), async move {
                                 if let Err(e) = skilj_core::db::catch_up_cancel_deadline(
                                     &cancel_deadline_pool,
                                     &cancel,
@@ -2320,7 +2362,7 @@ impl SkiljBuilder {
                                         ],
                                     );
                                 }
-                            }
+                            })
                         })
                         .await;
                 }
@@ -2614,36 +2656,38 @@ async fn deadline_fire_tick(
         }
     };
     stream::iter(&bounded_contexts)
-        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| async move {
-            if bc.status != skilj_core::event_store::BoundedContextStatus::Active {
-                return;
-            }
-            if let Err(e) = skilj_core::db::fire_due_deadlines(
-                pool,
-                command_dispatcher,
-                projection_dispatcher,
-                snapshot_dispatcher,
-                broadcaster,
-                event_cache,
-                &bc.name,
-                now,
-                encryption_master_key,
-            )
-            .await
-            {
-                tracing::warn!(
-                    bounded_context = %bc.name,
-                    error = %e,
-                    "deadline fire tick failed"
-                );
-                BACKGROUND_TASK_ERRORS.add(
-                    1,
-                    &[
-                        KeyValue::new("task", "deadline_fire"),
-                        KeyValue::new("reason", "fire_due_deadlines_failed"),
-                    ],
-                );
-            }
+        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
+            contain_panic("deadline_fire", bc.name.clone(), async move {
+                if bc.status != skilj_core::event_store::BoundedContextStatus::Active {
+                    return;
+                }
+                if let Err(e) = skilj_core::db::fire_due_deadlines(
+                    pool,
+                    command_dispatcher,
+                    projection_dispatcher,
+                    snapshot_dispatcher,
+                    broadcaster,
+                    event_cache,
+                    &bc.name,
+                    now,
+                    encryption_master_key,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        bounded_context = %bc.name,
+                        error = %e,
+                        "deadline fire tick failed"
+                    );
+                    BACKGROUND_TASK_ERRORS.add(
+                        1,
+                        &[
+                            KeyValue::new("task", "deadline_fire"),
+                            KeyValue::new("reason", "fire_due_deadlines_failed"),
+                        ],
+                    );
+                }
+            })
         })
         .await;
 }
@@ -2745,15 +2789,19 @@ async fn scheduler_tick(
     // did, not a behaviour change).
     stream::iter(&bounded_contexts)
         .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
-            scheduler_tick_for_bounded_context(
-                pool,
-                projection_dispatcher,
-                event_dispatcher,
-                broadcaster,
-                event_cache,
-                encryption_master_key,
-                now,
-                bc,
+            contain_panic(
+                "scheduler",
+                bc.name.clone(),
+                scheduler_tick_for_bounded_context(
+                    pool,
+                    projection_dispatcher,
+                    event_dispatcher,
+                    broadcaster,
+                    event_cache,
+                    encryption_master_key,
+                    now,
+                    bc,
+                ),
             )
         })
         .await;

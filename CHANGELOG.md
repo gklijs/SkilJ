@@ -193,6 +193,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression" check and the lower one land last - moving a manual-ack
   cursor backwards and redelivering events - and an ack could interleave
   with a consume's claim. Acks are now serialized with consume.
+- A panic in application plugin code run by a background task (a
+  `Projection::project` or `Snapshot` fold, a `CrossContextRoute`, a
+  deadline, a scheduled event's projections) ended that task for every
+  bounded context for the rest of the process's life: one buggy async
+  projection in one bounded context silently stopped async projection
+  catch-up everywhere. Each bounded context's (or route's) unit of work
+  now runs with its panic contained: logged at `error`, counted as
+  `skilj.background_task.errors{reason="panicked"}`, rolled back and
+  retried next tick, while every other unit carries on.
 
 ### Security
 
