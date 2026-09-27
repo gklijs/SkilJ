@@ -157,12 +157,12 @@ futures-util = "0.3"
 # sets its parent, and only then instruments the rest of the request with
 # it - see `skilj-rest::routes::trace_request`'s own doc comment.
 tracing = "0.1"
-opentelemetry = "0.32"
-opentelemetry-http = "0.32"
-tracing-opentelemetry = "0.33"
+opentelemetry = "0.33"
+opentelemetry-http = "0.33"
+tracing-opentelemetry = "0.34"
 # skilj-demo only, from here down
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-opentelemetry_sdk = { version = "0.32" }
+opentelemetry_sdk = { version = "0.33" }
 # `reqwest-blocking-client`, not `reqwest-client`: the SDK's own default
 # batch processors/periodic reader each run their own dedicated OS
 # thread, not a Tokio task - the exporter's `async fn export()` still
@@ -176,13 +176,13 @@ opentelemetry_sdk = { version = "0.32" }
 # this reason - this was a deviation from that default worth reverting,
 # not a case for reaching into the SDK's separate (and still
 # `experimental_*`-feature-gated) async-runtime batch processor variants.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs", "metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs", "metrics"] }
 # Bridges `tracing::info!`/`warn!`/etc. events into OpenTelemetry's own
 # *Logs* signal (a second, separate OTLP pipeline from the trace spans
 # above) - see docs/architecture.md's tracing section. No new call sites
 # needed anywhere: every `tracing` event already in the codebase is what
 # this exports.
-opentelemetry-appender-tracing = "0.32"
+opentelemetry-appender-tracing = "0.33"
 
 # Path dependencies between skilj's own crates
 skilj-core = { path = "skilj-core", version = "0.0.8" }

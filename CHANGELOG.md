@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validator_for`/`is_valid` only, `default-features = false` - none of
   the breaking changes apply; picks up upstream fixes for a `oneOf`
   canonicalization bug and two numeric-keyword panics).
+- OpenTelemetry stack 0.32 -> 0.33 (`opentelemetry`, `opentelemetry-http`,
+  `opentelemetry_sdk`, `opentelemetry-otlp`, `opentelemetry-appender-tracing`)
+  and `tracing-opentelemetry` 0.33 -> 0.34. No code changes needed. An
+  application installing its own tracer/meter provider must move to the
+  0.33 line as well: `opentelemetry`'s globals are per crate version, so a
+  0.32 provider would silently receive none of skilj's spans or metrics.
 
 ### Fixed
 
