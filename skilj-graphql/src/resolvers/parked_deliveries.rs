@@ -60,6 +60,9 @@ struct CommandTriggerRedrive {
     payload: serde_json::Value,
     correlation_id: Option<String>,
     causation_id: Option<String>,
+    /// Not part of `CommandTriggerRequest` itself: the original request's
+    /// `Idempotency-Key` header, merged in by `POST /v1/parked-deliveries`.
+    idempotency_key: Option<String>,
 }
 
 fn decode_request<T: serde::de::DeserializeOwned>(
@@ -111,9 +114,12 @@ async fn redrive_parked_delivery(
             .ok_or_else(skilj_core::error::Error::row_not_found)?;
             let payload = serde_json::to_string(&delivery.request_json)
                 .expect("serde_json::Value serialization is infallible");
-            let (client_id, idempotency_key) =
-                db::parked_delivery_redrive_identity(delivery, db::CROSS_CONTEXT_ROUTE_CLIENT_ID)
-                    .expect("CrossContextRoute-kind redrives always carry an idempotency key");
+            let (client_id, idempotency_key) = db::parked_delivery_redrive_identity(
+                delivery,
+                db::CROSS_CONTEXT_ROUTE_CLIENT_ID,
+                None,
+            )
+            .expect("CrossContextRoute-kind redrives always carry an idempotency key");
             // Codeberg issue #32 (round two): routed through
             // `state.command_batcher` rather than calling
             // `db::decide_and_submit_command` directly - a redrive is
@@ -165,6 +171,17 @@ async fn redrive_parked_delivery(
             let redrive: ExternalEventRedrive = decode_request(&delivery.request_json)?;
             let payload = serde_json::to_string(&redrive.payload)
                 .expect("serde_json::Value serialization is infallible");
+            let fallback_partition_key = db::parked_delivery_redrive_dedupe_partition_key(delivery);
+            let dedupe = match &redrive.dedupe {
+                Some(d) => db::DedupeCursor {
+                    partition_key: &d.partition_key,
+                    sequence: d.sequence,
+                },
+                None => db::DedupeCursor {
+                    partition_key: &fallback_partition_key,
+                    sequence: 1,
+                },
+            };
             db::create_and_insert_external_event(
                 &state.pool,
                 state.projection_dispatcher.as_ref(),
@@ -176,10 +193,7 @@ async fn redrive_parked_delivery(
                 redrive.source_context,
                 redrive.correlation_id,
                 redrive.causation_id,
-                redrive.dedupe.as_ref().map(|d| db::DedupeCursor {
-                    partition_key: &d.partition_key,
-                    sequence: d.sequence,
-                }),
+                Some(dedupe),
                 Utc::now(),
                 state.encryption_master_key.as_ref(),
             )
@@ -205,9 +219,17 @@ async fn redrive_parked_delivery(
                 redrive.correlation_id,
                 redrive.causation_id,
             )?;
-            let (client_id, idempotency_key) =
-                db::parked_delivery_redrive_identity(delivery, &authorised.client_id)
-                    .expect("CommandTrigger-kind redrives always carry an idempotency key");
+            // Checked at report time too; again here for a row that
+            // predates that check.
+            skilj_core::event_store::reject_reserved_idempotency_key(
+                redrive.idempotency_key.as_deref(),
+            )?;
+            let (client_id, idempotency_key) = db::parked_delivery_redrive_identity(
+                delivery,
+                &authorised.client_id,
+                redrive.idempotency_key.as_deref(),
+            )
+            .expect("CommandTrigger-kind redrives always carry an idempotency key");
             // Codeberg issue #32 (round two) - see the identical comment
             // on the `CrossContextRoute` branch above.
             state

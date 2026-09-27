@@ -627,6 +627,24 @@ fn inbound_request_body(
     }
 }
 
+/// The `Idempotency-Key` a `Trigger` mapping's request carries for the
+/// message at `partition_key`/`offset` - `None` for `Record`, which
+/// dedupes via its body's own `dedupe` cursor instead. Shared by
+/// [`dispatch_inbound_message`] (as the header) and
+/// [`report_parked_delivery`] (so `retryParkedDelivery` redrives under
+/// the same key, deduping against the original attempt if it committed
+/// after all).
+fn inbound_idempotency_key(
+    mapping: &InboundMapping,
+    partition_key: &str,
+    offset: i64,
+) -> Option<String> {
+    match mapping.action {
+        InboundAction::Record { .. } => None,
+        InboundAction::Trigger { .. } => Some(format!("{partition_key}:{offset}")),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_inbound_message(
     http: &reqwest::Client,
@@ -661,7 +679,11 @@ pub async fn dispatch_inbound_message(
         InboundAction::Trigger { .. } => {
             http.post(format!("{skilj_base_url}/v1/commands/trigger"))
                 .bearer_auth(&mapping.credential)
-                .header("Idempotency-Key", format!("{partition_key}:{offset}"))
+                .header(
+                    "Idempotency-Key",
+                    inbound_idempotency_key(mapping, &partition_key, offset)
+                        .expect("a Trigger mapping always has an idempotency key"),
+                )
                 .json(&body)
                 .send()
                 .await?
@@ -688,8 +710,9 @@ pub async fn dispatch_inbound_message(
 /// capability-based design this bridge's every other call already
 /// relies on). `identifier` is `"{topic}:{partition}:{offset}"` -
 /// `request` is [`inbound_request_body`]'s own output, the exact body
-/// that kept failing, stored verbatim so a later `retryParkedDelivery`
-/// redrives the identical request.
+/// that kept failing, and `idempotency_key` the header it was sent with
+/// ([`inbound_idempotency_key`]), both stored so a later
+/// `retryParkedDelivery` redrives the identical request.
 #[allow(clippy::too_many_arguments)]
 async fn report_parked_delivery(
     http: &reqwest::Client,
@@ -697,6 +720,7 @@ async fn report_parked_delivery(
     mapping: &InboundMapping,
     identifier: &str,
     request: &serde_json::Value,
+    idempotency_key: Option<&str>,
     error: &str,
     attempt_count: u32,
     first_failed_at: DateTime<Utc>,
@@ -712,6 +736,7 @@ async fn report_parked_delivery(
             "attemptCount": attempt_count,
             "firstFailedAt": first_failed_at.to_rfc3339(),
             "request": request,
+            "idempotencyKey": idempotency_key,
         }))
         .send()
         .await?;
@@ -828,12 +853,15 @@ pub async fn run_inbound(
                                     causation_id,
                                 );
                                 let identifier = format!("{partition_key}:{offset}");
+                                let idempotency_key =
+                                    inbound_idempotency_key(mapping, &partition_key, offset);
                                 if let Err(report_err) = report_parked_delivery(
                                     http,
                                     skilj_base_url,
                                     mapping,
                                     &identifier,
                                     &body,
+                                    idempotency_key.as_deref(),
                                     &e.to_string(),
                                     attempt,
                                     failed_at,

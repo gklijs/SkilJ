@@ -668,6 +668,20 @@ fn message_identifier(meta: &InboundMessageMeta) -> String {
 /// already has. Exposed separately from [`run_inbound`] so it can be
 /// tested directly against a plain [`InboundMessageMeta`] and raw
 /// payload bytes, without needing a real `fe2o3_amqp` delivery object.
+/// The `Idempotency-Key` a `Trigger` mapping's request carries: the
+/// message's own AMQP `message-id`, when the sender set one - `None` otherwise,
+/// and always for `Record`, which dedupes via its body's `dedupe` cursor.
+/// Shared by [`dispatch_inbound_message`] (as the header) and
+/// [`report_parked_delivery`] (so `retryParkedDelivery` redrives under
+/// the same key, deduping against the original attempt if it committed
+/// after all).
+fn inbound_idempotency_key(mapping: &InboundMapping, meta: &InboundMessageMeta) -> Option<String> {
+    match mapping.action {
+        InboundAction::Record { .. } => None,
+        InboundAction::Trigger { .. } => meta.message_id.as_ref().map(message_id_to_string),
+    }
+}
+
 pub async fn dispatch_inbound_message(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -691,8 +705,8 @@ pub async fn dispatch_inbound_message(
                 .post(format!("{skilj_base_url}/v1/commands/trigger"))
                 .bearer_auth(&mapping.credential)
                 .json(&body);
-            if let Some(id) = &meta.message_id {
-                request = request.header("Idempotency-Key", message_id_to_string(id));
+            if let Some(key) = inbound_idempotency_key(mapping, meta) {
+                request = request.header("Idempotency-Key", key);
             }
             request.send().await?
         }
@@ -722,6 +736,7 @@ async fn report_parked_delivery(
     mapping: &InboundMapping,
     identifier: &str,
     request: &serde_json::Value,
+    idempotency_key: Option<&str>,
     error: &str,
     attempt_count: u32,
     first_failed_at: DateTime<Utc>,
@@ -737,6 +752,7 @@ async fn report_parked_delivery(
             "attemptCount": attempt_count,
             "firstFailedAt": first_failed_at.to_rfc3339(),
             "request": request,
+            "idempotencyKey": idempotency_key,
         }))
         .send()
         .await?;
@@ -848,12 +864,14 @@ pub async fn run_inbound(
                             serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
                         let body = inbound_request_body(mapping, &meta, &payload_json);
                         let identifier = message_identifier(&meta);
+                        let idempotency_key = inbound_idempotency_key(mapping, &meta);
                         if let Err(report_err) = report_parked_delivery(
                             http,
                             skilj_base_url,
                             mapping,
                             &identifier,
                             &body,
+                            idempotency_key.as_deref(),
                             &e.to_string(),
                             attempt,
                             failed_at,

@@ -135,6 +135,10 @@ struct MockSkiljState {
     /// `an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap`'s
     /// own deterministic trigger.
     fail_acks: Arc<Mutex<usize>>,
+    /// Same idea, for `POST /v1/commands/trigger`; the `Idempotency-Key`
+    /// each refused attempt carried goes into `failed_trigger_keys`.
+    fail_trigger_requests: Arc<Mutex<usize>>,
+    failed_trigger_keys: Arc<Mutex<Vec<Option<String>>>>,
     /// Every `POST /v1/parked-deliveries` body this mock ever received.
     parked_deliveries: Arc<Mutex<Vec<Value>>>,
 }
@@ -224,6 +228,18 @@ async fn post_commands_trigger(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    {
+        let mut remaining = state.fail_trigger_requests.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            state
+                .failed_trigger_keys
+                .lock()
+                .unwrap()
+                .push(idempotency_key);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(Value::Null));
+        }
+    }
     state
         .trigger_requests
         .lock()
@@ -773,6 +789,92 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
             0,
             "every attempt failed, so a real event must never have been created"
         );
+    });
+}
+
+/// The `Trigger` counterpart: the parked report carries the
+/// `Idempotency-Key` the failing attempts were sent with, so
+/// `retryParkedDelivery` can redrive under it and dedupe against an
+/// attempt that committed without the bridge hearing back.
+#[test]
+fn a_parked_trigger_message_reports_the_idempotency_key_it_was_sent_with() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("trigger-in-parking");
+        create_topic(bootstrap_servers, &topic).await;
+
+        let mock_state = MockSkiljState::default();
+        *mock_state.fail_trigger_requests.lock().unwrap() = 2;
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-trigger-parking")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+        producer
+            .send(
+                FutureRecord::to(&topic).payload(r#"{"amount":5}"#).key("k"),
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            topic.clone(),
+            InboundMapping {
+                credential: "command-token".to_string(),
+                action: InboundAction::Trigger {
+                    command_type: "Deposit".to_string(),
+                },
+            },
+        );
+        let http = reqwest::Client::new();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            2,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mappings, &retry_policy).await;
+        });
+
+        // See `an_inbound_message_parks_and_reports_after_exhausting_retries`
+        // for the 20s budget.
+        let mut parked = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(p) = mock_state.parked_deliveries.lock().unwrap().first() {
+                parked = Some(p.clone());
+                break;
+            }
+        }
+        let parked =
+            parked.expect("run_inbound must have reported a parked delivery within the timeout");
+        assert_eq!(parked["kind"], json!("command_trigger"));
+        let sent = mock_state.failed_trigger_keys.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        let sent_key = sent[0]
+            .clone()
+            .expect("a Trigger request always carries a key");
+        assert_eq!(sent[1].as_deref(), Some(sent_key.as_str()));
+        assert!(sent_key.starts_with(&format!("{topic}:")), "{sent_key}");
+        assert_eq!(parked["idempotencyKey"], json!(sent_key));
+        assert!(parked["request"].get("idempotencyKey").is_none());
     });
 }
 

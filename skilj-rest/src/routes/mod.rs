@@ -644,6 +644,13 @@ struct ParkedDeliveryRequest {
     attempt_count: i32,
     first_failed_at: chrono::DateTime<Utc>,
     request: serde_json::Value,
+    /// `command_trigger` only: the `Idempotency-Key` header the original
+    /// `POST /v1/commands/trigger` carried, which isn't part of `request`
+    /// (the body). Stored with it so `retryParkedDelivery` redrives
+    /// under the same key - which dedupes against the original attempt
+    /// if that attempt committed after all (a lost response, say) -
+    /// rather than landing the command a second time.
+    idempotency_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1036,6 +1043,20 @@ async fn post_parked_deliveries(
             e.to_string(),
         ))
     })?;
+    let mut request = body.request;
+    if let Some(idempotency_key) = body.idempotency_key {
+        if !matches!(kind, db::ParkedDeliveryKind::CommandTrigger) {
+            return Err(skilj_core::error::Error::from(
+                event_store::Error::InvalidParkedDeliveryRequest(
+                    "idempotencyKey only applies to kind command_trigger".to_string(),
+                ),
+            )
+            .into());
+        }
+        event_store::reject_reserved_idempotency_key(Some(&idempotency_key))?;
+        // An object: it just parsed as `CommandTriggerRequest`.
+        request["idempotencyKey"] = serde_json::Value::String(idempotency_key);
+    }
 
     let delivery = db::insert_parked_delivery(
         &state.pool,
@@ -1046,7 +1067,7 @@ async fn post_parked_deliveries(
         Some(&access_token_id),
         None,
         None,
-        &body.request,
+        &request,
         &body.error,
         body.attempt_count,
         body.first_failed_at,

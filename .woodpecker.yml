@@ -85,10 +85,19 @@ steps:
       # check_reachable helpers, always names its source as either
       # "embedded PostgreSQL" or "DATABASE_URL" (grep the workspace for
       # `eprintln!("skipping:` to confirm before narrowing this further).
-      - cargo test --workspace > /tmp/test-output.log 2>&1 || test_exit=$?
+      #
+      # `--nocapture` is what makes this check work at all: the skip note
+      # is printed from inside a test that then passes, and libtest
+      # swallows a passing test's output - without it, a run where every
+      # Postgres test skipped logged no "skipping:" line and this grep
+      # could never match (reproduced with an unreachable DATABASE_URL:
+      # 59 "passing" persistence tests, zero matches). Not anchored with
+      # `^` for the same reason: with tests running in parallel, a note
+      # can land mid-line after another test's own `test ... ` prefix.
+      - cargo test --workspace -- --nocapture > /tmp/test-output.log 2>&1 || test_exit=$?
       - cat /tmp/test-output.log
       - |
-        if grep -qE '^skipping:.*(DATABASE_URL|PostgreSQL)' /tmp/test-output.log; then
+        if grep -qE 'skipping:.*(DATABASE_URL|PostgreSQL)' /tmp/test-output.log; then
           echo "ERROR: one or more Postgres-backed tests silently skipped (see the 'skipping: ...' lines above) instead of running - CI must never report green without actually exercising the persistence layer." >&2
           exit 1
         fi

@@ -873,3 +873,305 @@ fn concurrent_retries_of_one_parked_delivery_redrive_it_once() {
             .is_empty());
     });
 }
+
+/// A retry whose redrive commits but whose row delete then fails leaves
+/// the row parked; retrying it again must not land the event a second
+/// time. An `ExternalEvent` request without a `dedupe` cursor has no key
+/// of its own to dedupe on, so the redrive supplies one per parked row.
+/// A trigger that rejects the `DELETE` puts the failure in exactly that
+/// gap.
+#[test]
+fn a_retry_after_a_failed_row_delete_does_not_land_the_event_twice() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, access_token_id) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let schema = format!("\"bc_{bc_name}\"");
+
+        let seeded = db::insert_parked_delivery(
+            &pool,
+            &bc_name,
+            "kafka-inbound",
+            db::ParkedDeliveryKind::ExternalEvent,
+            "orders:0:88",
+            Some(&access_token_id),
+            None,
+            None,
+            &json!({ "payload": { "amount": 8 }, "sourceContent": "kafka:orders:0:88" }),
+            "connection refused",
+            3,
+            test_now(),
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        for ddl in [
+            format!(
+                "CREATE FUNCTION {schema}.refuse_delete() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN RAISE EXCEPTION 'delete refused by test'; END $$"
+            ),
+            format!(
+                "CREATE TRIGGER refuse_delete BEFORE DELETE ON {schema}.parked_deliveries \
+                 FOR EACH ROW EXECUTE FUNCTION {schema}.refuse_delete()"
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(ddl))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let retry = || {
+            graphql_request(
+                &router,
+                Some(&jwt),
+                "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+                json!({ "bc": bc_name, "id": seeded.id }),
+            )
+        };
+
+        let response = retry().await;
+        assert!(response.get("errors").is_some(), "{response:?}");
+        assert_eq!(
+            db::list_events_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the redrive itself committed"
+        );
+        assert_eq!(
+            db::list_parked_deliveries(&pool, &bc_name).await.unwrap().len(),
+            1,
+            "the row delete failed, so it is still parked"
+        );
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER refuse_delete ON {schema}.parked_deliveries"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let response = retry().await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        assert_eq!(
+            db::list_events_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the second retry must not create the event again"
+        );
+        assert!(db::list_parked_deliveries(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
+// --- a real, registered CommandType, for the CommandTrigger-kind tests ---
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+struct DepositPayload {
+    amount: i64,
+}
+
+struct Deposited;
+
+impl skilj::EventType for Deposited {
+    type Payload = DepositPayload;
+    const NAME: &'static str = "Deposited";
+}
+
+enum DepositEvent {
+    #[allow(dead_code)]
+    Deposited(DepositPayload),
+}
+
+impl skilj_core::plugin::BoundedContextEvent for DepositEvent {
+    fn try_from_event(
+        event: &skilj_core::event_store::Event,
+    ) -> Option<Result<Self, serde_json::Error>> {
+        (event.event_type.name == "Deposited")
+            .then(|| serde_json::from_str(&event.payload).map(DepositEvent::Deposited))
+    }
+}
+
+struct Deposit;
+
+impl skilj::CommandType for Deposit {
+    type Payload = DepositPayload;
+    type Event = DepositEvent;
+    const NAME: &'static str = "Deposit";
+    fn rest_trigger_allowed() -> bool {
+        true
+    }
+    fn decide(
+        payload: &Self::Payload,
+        _matching_events: &[Self::Event],
+    ) -> skilj_core::shared::CommandDecision {
+        skilj_core::shared::CommandDecision::Accepted {
+            events: vec![skilj_core::shared::EventSpec {
+                event_type: "Deposited".to_string(),
+                payload: json!({ "amount": payload.amount }),
+            }],
+        }
+    }
+}
+
+/// A bridge whose `POST /v1/commands/trigger` (with `Idempotency-Key`)
+/// committed but never saw the response parks the message anyway, with
+/// the key it sent. Retrying it must be a `Deduplicated` no-op against
+/// that original submission, not a second command - the key is a header,
+/// not part of the parked body, so before `idempotencyKey` was accepted
+/// the redrive had no way to know it.
+#[test]
+fn retrying_a_parked_trigger_whose_original_attempt_committed_is_deduplicated() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = db::connect(&database_url).await.unwrap();
+        let admin_subject = unique_name("admin");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let bc_name = unique_name("deposits");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        let mapping = RoleAccessMapping {
+            role,
+            bounded_context: bc,
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role_access_mapping(&pool, &mapping)
+            .await
+            .unwrap();
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(db::PgPoolOptions::new().max_connections(4))
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<Deposited>()
+            .command_type::<Deposit>()
+            .reconciliation_role(admin_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        let command_type = db::get_command_type(&pool, &bc_name, "Deposit")
+            .await
+            .unwrap()
+            .unwrap();
+        let secret = generate_token_secret();
+        let token = access_control::create_command_token(
+            &mapping,
+            &command_type,
+            generate_token_id(),
+            secret.clone(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_command_token(&pool, &token).await.unwrap();
+        let bearer = format!("Bearer {}.{secret}", token.id);
+        let rest = skilj.rest_router();
+        let post = |uri: &'static str, key: Option<&'static str>, body: serde_json::Value| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", bearer.clone())
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header("Idempotency-Key", key);
+            }
+            rest.clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        };
+
+        // The original attempt: it commits - the bridge just never learns.
+        let original = json!({ "payload": { "amount": 25 } });
+        let response = post("/v1/commands/trigger", Some("orders:0:9"), original.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A reserved key is refused at report time, like on the trigger
+        // route itself.
+        let report = |key: &str| {
+            json!({
+                "source": "kafka-inbound",
+                "kind": "command_trigger",
+                "identifier": "orders:0:9",
+                "error": "timed out",
+                "attemptCount": 3,
+                "firstFailedAt": test_now(),
+                "request": original,
+                "idempotencyKey": key,
+            })
+        };
+        let response = post(
+            "/v1/parked-deliveries",
+            None,
+            report("skilj-parked-delivery:forged"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = post("/v1/parked-deliveries", None, report("orders:0:9"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parked_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let router = skilj.graphql_router().await.unwrap();
+        let response = graphql_request(
+            &router,
+            Some(&sign_jwt(&admin_subject)),
+            "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+            json!({ "bc": bc_name, "id": parked_id }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        assert_eq!(
+            db::list_commands_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the redrive must dedupe against the original, committed attempt"
+        );
+        assert!(db::list_parked_deliveries(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}

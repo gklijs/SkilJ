@@ -555,6 +555,7 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
         let (client_id, idempotency_key) = db::parked_delivery_redrive_identity(
             &after_failed_retry,
             db::CROSS_CONTEXT_ROUTE_CLIENT_ID,
+            None,
         )
         .unwrap();
         assert_eq!(client_id, db::CROSS_CONTEXT_ROUTE_CLIENT_ID);

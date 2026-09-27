@@ -8347,18 +8347,19 @@ fn cross_context_route_idempotency_key(route_name: &str, source_sequence: &str) 
 ///   original attempt used. An attempt that failed on the caller's side
 ///   but committed anyway (a dropped connection after `COMMIT`) is then
 ///   a `Deduplicated` no-op on redrive, not a second command.
-/// - `CommandTrigger`: the token's own client id (`caller_client_id`) and
-///   a key reserved to this row
-///   (`RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX`). The bridge's
-///   original request carried no key this row stored, so there is nothing
-///   to dedupe against across the original attempt - only across
-///   redrives.
+/// - `CommandTrigger`: the token's own client id (`caller_client_id`)
+///   and `original_idempotency_key` - the `Idempotency-Key` the bridge's
+///   original request carried, when it reported one - so an original
+///   attempt that committed after all dedupes too. Without one, a key
+///   reserved to this row (`RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX`),
+///   which only dedupes across redrives.
 ///
-/// `None` for `ExternalEvent`, which has no idempotency key; its only
-/// dedupe is the optional `dedupe` cursor the bridge sent.
+/// `None` for `ExternalEvent`, which has no idempotency key - see
+/// [`parked_delivery_redrive_dedupe_partition_key`] for its equivalent.
 pub fn parked_delivery_redrive_identity(
     delivery: &ParkedDelivery,
     caller_client_id: &str,
+    original_idempotency_key: Option<&str>,
 ) -> Option<(String, String)> {
     match delivery.kind {
         ParkedDeliveryKind::CrossContextRoute => {
@@ -8385,14 +8386,38 @@ pub fn parked_delivery_redrive_identity(
         }
         ParkedDeliveryKind::CommandTrigger => Some((
             caller_client_id.to_string(),
-            format!(
-                "{}{}",
-                crate::event_store::RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX,
-                delivery.id
-            ),
+            match original_idempotency_key {
+                Some(key) => key.to_string(),
+                None => format!(
+                    "{}{}",
+                    crate::event_store::RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX,
+                    delivery.id
+                ),
+            },
         )),
         ParkedDeliveryKind::ExternalEvent => None,
     }
+}
+
+/// The `dedupe` partition an `ExternalEvent`-kind redrive uses when the
+/// bridge's own request carried no `dedupe` cursor, always at sequence
+/// `1`: one partition per parked row, under the row's own token (the
+/// watermark's `adapter_id`). The first redrive lands and sets the
+/// watermark; any later redrive of the same row - one whose event
+/// committed but whose row delete then failed - is `Redelivered`, not a
+/// second event. The `ExternalEvent` counterpart of
+/// [`parked_delivery_redrive_identity`]'s idempotency keys. Leaves one
+/// `external_message_cursors` row per such redrive, which is bounded by
+/// how often operators retry parked deliveries.
+///
+/// A request that did carry a cursor keeps it: that cursor also dedupes
+/// against the bridge's own original attempt, which this can't.
+pub fn parked_delivery_redrive_dedupe_partition_key(delivery: &ParkedDelivery) -> String {
+    format!(
+        "{}{}",
+        crate::event_store::RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX,
+        delivery.id
+    )
 }
 
 /// `retryParkedDelivery`'s serialization: a lock-only transaction holding

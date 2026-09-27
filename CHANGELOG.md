@@ -115,7 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second time. A `CrossContextRoute` redrive reuses the route's own
   client id (`cross-context-route`, previously `parked-delivery-retry`)
   and the exact key the route's original attempt used, so an attempt
-  that committed despite reporting a failure dedupes too.
+  that committed despite reporting a failure dedupes too. An
+  `ExternalEvent` redrive without a bridge-supplied `dedupe` cursor gets
+  one of its own (per parked row), so it can't land twice either.
+- A parked `CommandTrigger` delivery was redriven without the
+  `Idempotency-Key` its original request carried (a header, so not part
+  of the parked body). If that original attempt had committed and only
+  the response was lost, `retryParkedDelivery` created the command a
+  second time. `POST /v1/parked-deliveries` now accepts `idempotencyKey`
+  (the original header) for `command_trigger` reports, and the redrive
+  reuses it. `skilj-kafka`, `skilj-amqp` and `skilj-nats` send it.
 
 ### Security
 
