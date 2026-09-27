@@ -75,10 +75,46 @@ impl RetryPolicy {
     /// `attempt` is 1-based - the attempt number that just failed. Grows
     /// geometrically from `initial_backoff` by `multiplier` each further
     /// attempt, capped at `max_backoff` so it never grows unbounded.
+    ///
+    /// Always within `[0, max_backoff]` and never panics, whatever the
+    /// (public) fields hold - it runs inside long-lived background tasks,
+    /// where a panic stops the task. A multiplier that isn't a finite,
+    /// non-negative number is treated as `1.0` (constant backoff) rather
+    /// than producing a negative or NaN delay, and `max_backoff` is
+    /// returned as itself once reached - never round-tripped through
+    /// `f64`, which for `Duration::MAX` (an "uncapped" policy) doesn't fit
+    /// back into a `Duration`.
     pub fn next_backoff(&self, attempt: u32) -> Duration {
-        let exponent = attempt.saturating_sub(1);
-        let scaled = self.initial_backoff.as_secs_f64() * self.multiplier.powi(exponent as i32);
-        Duration::from_secs_f64(scaled.min(self.max_backoff.as_secs_f64()))
+        let multiplier = if self.multiplier.is_finite() && self.multiplier >= 0.0 {
+            self.multiplier
+        } else {
+            1.0
+        };
+        let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
+        let scaled = self.initial_backoff.as_secs_f64() * multiplier.powi(exponent);
+        if scaled.is_nan() || scaled >= self.max_backoff.as_secs_f64() {
+            return self.max_backoff;
+        }
+        Duration::try_from_secs_f64(scaled).map_or(self.max_backoff, |d| d.min(self.max_backoff))
+    }
+
+    /// When the next attempt is due: `now` plus [`next_backoff`], for a
+    /// caller that stores a due time rather than sleeping. Saturates at
+    /// the latest representable instant instead of either failing the
+    /// conversion to `chrono` - which callers used to answer with a zero
+    /// delay, retrying immediately and forever - or overflowing the
+    /// addition, which panics in chrono.
+    ///
+    /// [`next_backoff`]: RetryPolicy::next_backoff
+    pub fn next_attempt_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        attempt: u32,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let backoff = chrono::TimeDelta::from_std(self.next_backoff(attempt))
+            .unwrap_or(chrono::TimeDelta::MAX);
+        now.checked_add_signed(backoff)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
     }
 
     /// `attempt` is 1-based (the attempt number that just failed),

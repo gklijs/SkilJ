@@ -9176,11 +9176,8 @@ async fn catch_up_cross_context_route_locked(
                             retry_first_failed_at = None;
                             continue;
                         }
-                        let next_attempt_at = now
-                            + chrono::Duration::from_std(
-                                retry_policy.next_backoff(retry_attempt as u32),
-                            )
-                            .unwrap_or(chrono::Duration::zero());
+                        let next_attempt_at =
+                            retry_policy.next_attempt_at(now, retry_attempt as u32);
                         tracing::warn!(
                             sequence = event.sequence,
                             error = %e,

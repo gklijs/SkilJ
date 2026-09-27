@@ -452,7 +452,6 @@ pub async fn produce_once(
                     *retry_state = None;
                     continue;
                 }
-                let backoff = retry_policy.next_backoff(attempt);
                 tracing::warn!(
                     event_type = %mapping.event_type,
                     sequence = event.sequence,
@@ -461,8 +460,7 @@ pub async fn produce_once(
                     "publishing/acknowledging this event failed - will retry with backoff"
                 );
                 if let Some(state) = retry_state {
-                    state.next_attempt_at = now
-                        + chrono::Duration::from_std(backoff).unwrap_or(chrono::Duration::zero());
+                    state.next_attempt_at = retry_policy.next_attempt_at(now, attempt);
                 }
                 return Ok(served);
             }

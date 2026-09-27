@@ -162,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses a single aggregate query, or (catch-up) handles at most 1000
   events per tick and continues on the next.
 
+- `skilj-retry`: `next_backoff` panicked for a `max_backoff` of
+  `Duration::MAX` or a negative multiplier - inside background retry
+  loops, stopping them - and callers storing a due time turned a
+  backoff too large for chrono into a zero delay (an immediate, endless
+  retry) or overflowed the addition. `next_backoff` is now total, and
+  the new `RetryPolicy::next_attempt_at` saturates; the cross-context
+  route and the Kafka/AMQP/NATS bridges use it.
 - `skilj-codegen` validated nothing beyond the TOML's shape: an invalid
   type or bounded-context name panicked inside `build.rs`, a field named
   `type` was reported as a bug in skilj-codegen, duplicates and name

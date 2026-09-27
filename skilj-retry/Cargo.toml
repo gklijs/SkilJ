@@ -10,3 +10,6 @@ description = "A small, dependency-free backoff/attempt-cap policy shared by Cro
 [lib]
 name = "skilj_retry"
 path = "src/lib.rs"
+
+[dependencies]
+chrono.workspace = true
