@@ -1150,3 +1150,92 @@ fn catching_up_a_bounded_context_with_both_partitioned_and_unpartitioned_project
         assert_eq!(b, Some("20".to_string()));
     });
 }
+
+/// A `building` rebuild that vanishes *after* this tick's own fold loop
+/// but before its promote check re-reads it must be skipped, not panic -
+/// another instance's overlapping tick promoting it (which deletes the
+/// building row), or a `DeleteBoundedContext` landing mid-tick, both do
+/// exactly that. The re-read used to `.expect()` the row was still
+/// there, and since `SkiljBuilder::build()` drives every bounded
+/// context's catch-up from one spawned task, that single panic stopped
+/// async projection catch-up for the whole process until restart. A
+/// trigger that deletes the row the moment the fold stamps its
+/// `caught_up_to` lands the removal in exactly that gap every run,
+/// rather than hoping a real race hits it.
+#[test]
+fn a_rebuild_removed_mid_tick_is_skipped_not_a_panic() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        let existing = seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+
+        let rebuild = ProjectionRebuild {
+            projection: existing,
+            schema: r#"{"properties":{"total":{"type":"integer"}}}"#.to_string(),
+            schema_version: 2,
+            consumed_event_types: vec![et.clone()],
+            sync: false,
+            caught_up_to: None,
+            status: ProjectionRebuildStatus::Building,
+        };
+        db::upsert_projection_rebuild(&pool, &rebuild)
+            .await
+            .unwrap();
+
+        let schema = format!("\"bc_{}\"", bc.name);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {schema}.remove_rebuild_mid_tick() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+               DELETE FROM {schema}.projection_rebuild_state \
+                 WHERE projection_name = NEW.projection_name AND status = 'building'; \
+               DELETE FROM {schema}.projection_rebuild_consumed_event_types \
+                 WHERE projection_name = NEW.projection_name AND status = 'building'; \
+               DELETE FROM {schema}.projection_rebuilds \
+                 WHERE projection_name = NEW.projection_name AND status = 'building'; \
+               RETURN NULL; \
+             END $$"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER remove_rebuild_mid_tick \
+             AFTER UPDATE OF caught_up_to ON {schema}.projection_rebuilds \
+             FOR EACH ROW WHEN (NEW.status = 'building') \
+             EXECUTE FUNCTION {schema}.remove_rebuild_mid_tick()"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_plain_event(&pool, &bc, &et, 20).await;
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        // The removal stood and the live projection kept folding as normal.
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Building
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let live = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.schema_version, 1);
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                .await
+                .unwrap(),
+            Some("20".to_string())
+        );
+    });
+}

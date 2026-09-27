@@ -73,6 +73,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panic with "a real bug" instead of the ordinary `401
   UnrecognisedCredential` a caller whose token has genuinely vanished
   should see either way.
+- Same shape a fifth time, and the most serious: async `Projection`
+  catch-up. `catch_up_bounded_context` re-reads each `building`
+  `ProjectionRebuild` after its fold pass and `.expect()`ed it was still
+  there, but another instance's overlapping tick promoting it, or a
+  `DeleteBoundedContext` landing mid-tick, removes it. Because every
+  bounded context's catch-up runs on the one task `SkiljBuilder::build()`
+  spawns, that single panic silently stopped async projection catch-up
+  for the whole process until restart. The vanished rebuild is now
+  skipped. Two lookups of a projection's consumed event types
+  (`consumed_event_types`/`rebuild_consumed_event_types`, behind
+  `get_projection`/`get_projection_rebuild`) had the same race and now
+  return `RowNotFound` via `require_event_type`. New regression test
+  uses a Postgres trigger to land the removal in the exact gap every run.
 
 ### Security
 

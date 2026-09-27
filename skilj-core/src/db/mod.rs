@@ -3550,12 +3550,12 @@ async fn consumed_event_types(
 
     let mut event_types = Vec::with_capacity(names.len());
     for (event_type_name,) in names {
-        let et = get_event_type(pool, bounded_context, &event_type_name)
-            .await?
-            .expect(
-                "consumed_event_types join row references an event_types row that no longer exists",
-            );
-        event_types.push(et);
+        // `require_event_type`, not `.expect()`: a concurrent
+        // `hard_delete_bounded_context` committing between the join
+        // query above and this lookup makes `get_event_type` come back
+        // `None` (its own `get_bounded_context` misses), not a real
+        // dangling join row - see `require_bounded_context`.
+        event_types.push(require_event_type(pool, bounded_context, &event_type_name).await?);
     }
     Ok(event_types)
 }
@@ -4269,13 +4269,10 @@ async fn rebuild_consumed_event_types(
 
     let mut event_types = Vec::with_capacity(names.len());
     for (event_type_name,) in names {
-        let et = get_event_type(pool, bounded_context, &event_type_name)
-            .await?
-            .expect(
-                "projection_rebuild_consumed_event_types join row references an event_types \
-                 row that no longer exists",
-            );
-        event_types.push(et);
+        // Same race as `consumed_event_types` above: a concurrent
+        // `hard_delete_bounded_context` makes this a `RowNotFound`
+        // error, not a dangling join row.
+        event_types.push(require_event_type(pool, bounded_context, &event_type_name).await?);
     }
     Ok(event_types)
 }
@@ -9698,14 +9695,22 @@ pub async fn catch_up_bounded_context(
     }
 
     for rebuild in &building_rebuilds {
-        let current = get_projection_rebuild(
+        // It can have vanished since the fold loop above: another
+        // instance's overlapping tick may have promoted it (deleting the
+        // building row), or a `hard_delete_bounded_context` may have
+        // landed. Either way there's nothing left to promote - and a panic
+        // here would take down the one background task every bounded
+        // context's catch-up runs on, not just this tick.
+        let Some(current) = get_projection_rebuild(
             pool,
             bounded_context,
             &rebuild.projection.name,
             ProjectionRebuildStatus::Building,
         )
         .await?
-        .expect("a building rebuild this function just loaded can't have vanished mid-tick");
+        else {
+            continue;
+        };
         if current.caught_up_to.unwrap_or(-1) == latest {
             // A cheap fast-path filter, not the authoritative check
             // anymore (drift audit finding #6) - `promote_projection_rebuild`
