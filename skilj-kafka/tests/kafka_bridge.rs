@@ -141,6 +141,9 @@ struct MockSkiljState {
     failed_trigger_keys: Arc<Mutex<Vec<Option<String>>>>,
     /// Every `POST /v1/parked-deliveries` body this mock ever received.
     parked_deliveries: Arc<Mutex<Vec<Value>>>,
+    /// Same idea again, for `POST /v1/parked-deliveries` itself - the
+    /// report of a message that exhausted its retries also failing.
+    fail_parked_reports: Arc<Mutex<usize>>,
 }
 
 async fn get_events_consume(
@@ -215,6 +218,13 @@ async fn post_parked_deliveries(
     State(state): State<MockSkiljState>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    {
+        let mut remaining = state.fail_parked_reports.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({})));
+        }
+    }
     state.parked_deliveries.lock().unwrap().push(body);
     (StatusCode::CREATED, Json(json!({ "id": "parked-1" })))
 }
@@ -1114,6 +1124,101 @@ fn two_partitioned_mappings_together_produce_every_key_exactly_once() {
         assert_eq!(
             acked, expected_sequences,
             "every sequence must be acknowledged, owned by this partition or not"
+        );
+    });
+}
+
+/// docs/architecture.md §97: Kafka offsets are cumulative - committing a
+/// later message's offset commits every earlier one in its partition. So
+/// when a message exhausts its retries and its park report fails too
+/// (skilj still unreachable), the bridge must not move on: the next
+/// message succeeding would commit past it, and it would be neither
+/// processed nor parked - lost. Here the first message fails, its report
+/// fails twice, and the second message would succeed.
+#[test]
+fn a_message_whose_park_report_fails_is_never_committed_past() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-in-report-fails");
+        create_topic(bootstrap_servers, &topic).await;
+
+        let mock_state = MockSkiljState::default();
+        *mock_state.fail_external_requests.lock().unwrap() = 2;
+        *mock_state.fail_parked_reports.lock().unwrap() = 2;
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        for order in ["o-first", "o-second"] {
+            producer
+                .send(
+                    FutureRecord::to(&topic)
+                        .payload(&format!(r#"{{"orderId":"{order}"}}"#))
+                        .key("k"),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)
+                .unwrap();
+        }
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-report-fails")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            topic.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_kafka::http_client();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            2,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mappings, &retry_policy).await;
+        });
+
+        // Wait until the second message has been delivered.
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !mock_state.external_requests.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        let delivered: Vec<Value> = mock_state.external_requests.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "the second message was never delivered");
+        assert_eq!(delivered[0]["payload"], json!({ "orderId": "o-second" }));
+
+        // By then the first must have been parked - reported once the
+        // report endpoint recovered, before the bridge moved on.
+        let parked: Vec<Value> = mock_state.parked_deliveries.lock().unwrap().clone();
+        assert_eq!(
+            parked.len(),
+            1,
+            "the first message was skipped without being parked"
+        );
+        assert_eq!(
+            parked[0]["request"]["payload"],
+            json!({ "orderId": "o-first" })
         );
     });
 }

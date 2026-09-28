@@ -763,12 +763,17 @@ async fn report_parked_delivery(
 /// to skilj via [`report_parked_delivery`] and the offset is committed
 /// anyway - without that, a poison message would block this mapping's
 /// own durable commit point forever, redelivering an ever-growing
-/// backlog on every future restart. If the *report* itself fails, the
-/// offset is deliberately left uncommitted (a real gap - better a loud,
-/// visible redelivery loop than a silently unreported poison message).
-/// An unmapped topic or an empty payload is logged and skipped, also
-/// uncommitted - not silently swallowed, but also not something
-/// retrying could ever fix.
+/// backlog on every future restart. If the *report* itself fails, it is
+/// retried (with `retry_policy`'s backoff, logged each time) until it
+/// succeeds, and nothing after this message is consumed meanwhile:
+/// offsets are cumulative, so committing any later message would commit
+/// past this one and lose it (docs/architecture.md §97).
+/// An unmapped topic or an empty payload is logged and skipped - not
+/// silently swallowed, but also not something retrying could ever fix.
+/// Neither is committed here: an unmapped topic's messages stay
+/// uncommitted (they are redelivered once a mapping exists), while an
+/// empty payload's offset is committed past by the next message in its
+/// partition, as offsets are cumulative.
 ///
 /// `http` should be bounded by a timeout - [`http_client`] is - or one
 /// request stuck on a dead connection stalls this loop forever (§82).
@@ -856,7 +861,14 @@ pub async fn run_inbound(
                                 let identifier = format!("{partition_key}:{offset}");
                                 let idempotency_key =
                                     inbound_idempotency_key(mapping, &partition_key, offset);
-                                if let Err(report_err) = report_parked_delivery(
+                                // docs/architecture.md §97: Kafka offsets are
+                                // cumulative - committing any later message in
+                                // this partition would commit past this one too.
+                                // So until it is reported, this bridge doesn't
+                                // move on: moving on would lose it, neither
+                                // processed nor parked.
+                                let mut report_attempt: u32 = 0;
+                                while let Err(report_err) = report_parked_delivery(
                                     http,
                                     skilj_base_url,
                                     mapping,
@@ -869,14 +881,17 @@ pub async fn run_inbound(
                                 )
                                 .await
                                 {
+                                    report_attempt = report_attempt.saturating_add(1);
                                     tracing::error!(
                                         topic,
                                         partition,
                                         offset,
-                                        "reporting this parked delivery failed - not \
-                                         committing, will redeliver: {report_err}"
+                                        report_attempt,
+                                        "reporting this parked delivery failed - retrying; \
+                                         this partition waits until it succeeds: {report_err}"
                                     );
-                                    break;
+                                    tokio::time::sleep(retry_policy.next_backoff(report_attempt))
+                                        .await;
                                 }
                                 if let Err(commit_err) =
                                     consumer.commit_message(&msg, CommitMode::Async)

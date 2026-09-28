@@ -98,6 +98,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `skilj-kafka`: `run_inbound` could **lose** an inbound message. When a
+  message exhausted its retries and reporting it to
+  `POST /v1/parked-deliveries` failed too (skilj still unreachable), it
+  logged "not committing, will redeliver" and moved on - but Kafka
+  offsets are cumulative, so the next message in the partition
+  succeeding committed past it: never processed, never parked, never
+  redelivered. The report is now retried with backoff until it succeeds
+  before the bridge moves on. (`skilj-amqp`/`skilj-nats` settle each
+  message individually, so an unsettled one is redelivered and was never
+  at risk.)
 - Archiving a bounded context stopped commands and events from the
   GraphQL and REST surfaces, but not from the library's own internal
   submissions: a `CrossContextRoute` targeting it, a deadline firing into
