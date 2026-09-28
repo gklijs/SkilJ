@@ -95,8 +95,15 @@ and `PaymentConfirmed` signal that exact run later.
   full `temporalio-sdk` worker/Activity-authoring one - writing the
   actual Workflow/Activity definitions Temporal executes is a separate
   concern this skill and this crate don't cover.
-- Building `skilj-temporal` needs a local `protoc` on `PATH` (or
-  `PROTOC` set) - see CONTRIBUTING.md.
+- **Call `run`, not `poll_once` in a loop of your own.** A manual-ack
+  consume claims what it serves for the server's checkout lease (5
+  minutes by default), and the same token's next consume is served
+  nothing until then. `run` keeps a failed batch and retries it next
+  cycle; `poll_once` drops it, so a loop around `poll_once` stalls for
+  the whole lease after any failed dispatch (`docs/architecture.md`
+  §99).
+- No system `protoc` needed: `temporalio-client`'s vendored pure-Rust
+  proto compiler is enabled (since 0.0.5 - see CONTRIBUTING.md).
 
 See `skilj-temporal/tests/temporal_bridge.rs` for real, passing,
 end-to-end examples against an ephemeral Temporal service, and

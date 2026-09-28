@@ -257,6 +257,12 @@ async fn dispatch(
 /// mapping's own read cursor is already caught up) - not how many
 /// dispatched successfully, since a `NoCorrelationTag` skip is still a
 /// served, acknowledged event.
+///
+/// A failed dispatch drops what this call was served: calling it in a
+/// loop of your own after an error waits out the consume's checkout
+/// lease (5 minutes by default) before those events come back. [`run`]
+/// keeps them and retries them next cycle - use it for a long-running
+/// bridge (docs/architecture.md §99).
 pub async fn poll_once(
     http: &reqwest::Client,
     skilj_base_url: &str,
