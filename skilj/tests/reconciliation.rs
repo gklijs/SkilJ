@@ -593,6 +593,7 @@ fn an_older_version_starts_and_keeps_the_newer_registration() {
         let key = format!("{bc_name}/MoneyDeposited");
 
         let (_newer, report) = Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDepositedV2>()
             .reconciliation_role(external_subject.clone())
@@ -606,6 +607,7 @@ fn an_older_version_starts_and_keeps_the_newer_registration() {
             .unwrap();
 
         let (_older, report) = Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
             .bounded_context(bc_name.clone())
             .event_type::<MoneyDeposited>()
             .reconciliation_role(external_subject.clone())
@@ -625,6 +627,7 @@ fn an_older_version_starts_and_keeps_the_newer_registration() {
         assert_eq!(after.schema_version, stored.schema_version);
 
         let err = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
             .bounded_context(bc_name)
             .event_type::<MoneyDepositedIncompatible>()
             .reconciliation_role(external_subject)
@@ -636,5 +639,118 @@ fn an_older_version_starts_and_keeps_the_newer_registration() {
             skilj_core::error::SkiljRejection::code(&err),
             "schema_incompatible"
         );
+    });
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct AccountOpenedPayload {
+    user_id: String,
+    email: String,
+    note: String,
+    company: String,
+}
+
+fn account_tag_mappings() -> Vec<skilj_core::shared::TagMapping> {
+    vec![skilj_core::shared::TagMapping {
+        key: "company".to_string(),
+        field: "company".to_string(),
+    }]
+}
+
+/// A newer version: `email` sensitive, `note` private to its author,
+/// records owned by their `company` tag.
+struct AccountOpenedProtected;
+
+impl EventType for AccountOpenedProtected {
+    type Payload = AccountOpenedPayload;
+    const NAME: &'static str = "AccountOpened";
+    fn tag_mappings() -> Vec<skilj_core::shared::TagMapping> {
+        account_tag_mappings()
+    }
+    fn owner_tag_key() -> Option<&'static str> {
+        Some("company")
+    }
+    fn sensitive_fields() -> Vec<skilj_core::shared::SensitiveField> {
+        vec![skilj_core::shared::SensitiveField {
+            field: "email".to_string(),
+            subject_key: "user".to_string(),
+            subject_field: "user_id".to_string(),
+        }]
+    }
+    fn private_fields() -> Vec<skilj_core::shared::PrivateField> {
+        vec![skilj_core::shared::PrivateField {
+            field: "note".to_string(),
+            kind: skilj_core::shared::PrivateFieldKind::Own,
+            team: None,
+            addressee_field: None,
+        }]
+    }
+}
+
+/// The older version: same schema and tags, none of those protections.
+struct AccountOpenedPlain;
+
+impl EventType for AccountOpenedPlain {
+    type Payload = AccountOpenedPayload;
+    const NAME: &'static str = "AccountOpened";
+    fn tag_mappings() -> Vec<skilj_core::shared::TagMapping> {
+        account_tag_mappings()
+    }
+}
+
+/// docs/architecture.md §102: an older version starting after a newer one
+/// added protections must not remove them for everyone - the stored
+/// sensitive field, private field and owner tag key all survive its
+/// startup registration.
+#[test]
+fn an_older_version_never_removes_a_newer_versions_protections() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        let key = format!("{bc_name}/AccountOpened");
+
+        Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .event_type::<AccountOpenedProtected>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        let (_older, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .event_type::<AccountOpenedPlain>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.kept_protections, vec![key.clone()]);
+        assert_eq!(report.registered, vec![key]);
+
+        let stored = db::get_event_type(&pool, &bc_name, "AccountOpened")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .sensitive_fields
+                .iter()
+                .map(|s| s.field.as_str())
+                .collect::<Vec<_>>(),
+            vec!["email"],
+            "the sensitive field was removed - email would now be stored in plaintext"
+        );
+        assert_eq!(
+            stored
+                .private_fields
+                .iter()
+                .map(|p| p.field.as_str())
+                .collect::<Vec<_>>(),
+            vec!["note"]
+        );
+        assert_eq!(stored.owner_tag_key.as_deref(), Some("company"));
     });
 }

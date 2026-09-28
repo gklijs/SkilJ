@@ -358,6 +358,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Startup re-registration could silently **remove** a type's
+  protections for every instance: an older version of the application
+  (restarting mid-rollout, or rolled back to) that didn't declare a
+  sensitive field, private field or owner tag key a newer version had
+  added took it out of the shared registration - so the field was stored
+  in plaintext from then on (and beyond `forgetSubject`'s reach), shown
+  to every reader, or the type's owner scoping switched off. Startup
+  now keeps any protection the stored registration has that the process
+  lacks (logged, reported in the new
+  `ReconciliationReport::kept_protections`); removing one deliberately
+  takes the explicit GraphQL registration mutation.
 - Hard-deleting a bounded context frees its name for reuse, but the
   in-memory event cache keyed its windows by name and never evicted
   them: a bounded context recreated under the same name (for example a

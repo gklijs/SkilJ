@@ -47,6 +47,11 @@ When the stored registration is a valid evolution of the one this
 process declares, startup keeps the stored one and lists the type in
 `ReconciliationReport::kept_newer` instead of failing. The explicit
 `registerEventType`/`registerCommandType` mutations still refuse it.
+Likewise startup never *removes* a sensitive field, private field or
+owner tag key the stored registration has (reported in
+`ReconciliationReport::kept_protections`): deleting one from your type
+and redeploying does not turn it off - that takes the explicit
+registration mutation.
 
 **`TagMappingKeyDropped`** - re-registering with a `tag_mappings()` that
 drops a `key` an earlier registration already used. A tag key, once

@@ -820,6 +820,53 @@ pub struct ReconciliationReport {
     /// process rolled back to). The stored, newer registration is kept
     /// untouched instead of failing startup (docs/architecture.md §101).
     pub kept_newer: Vec<String>,
+    /// `EventType`s/`CommandType`s whose stored registration declares a
+    /// protection - a sensitive field, a private field, an owner tag key -
+    /// that this process's declaration lacks. Startup never removes one
+    /// (docs/architecture.md §102): it is kept alongside whatever this
+    /// process registers. Removing a protection deliberately takes the
+    /// explicit GraphQL registration mutation.
+    pub kept_protections: Vec<String>,
+}
+
+/// The protections a type's registration declares, with any the stored
+/// registration has and `ours` lacks added back - docs/architecture.md
+/// §102: startup never weakens a type. A sensitive or private field
+/// counts as present when `ours` declares any entry for the same field
+/// path (a changed declaration is a change, not a removal); the owner tag
+/// key when `ours` names one at all. Returns whether anything was added.
+fn keep_stored_protections(
+    ours_sensitive: &[skilj_core::shared::SensitiveField],
+    ours_private: &[skilj_core::shared::PrivateField],
+    ours_owner_tag_key: &Option<String>,
+    stored_sensitive: &[skilj_core::shared::SensitiveField],
+    stored_private: &[skilj_core::shared::PrivateField],
+    stored_owner_tag_key: &Option<String>,
+) -> (
+    Vec<skilj_core::shared::SensitiveField>,
+    Vec<skilj_core::shared::PrivateField>,
+    Option<String>,
+    bool,
+) {
+    let mut sensitive = ours_sensitive.to_vec();
+    for kept in stored_sensitive {
+        if !sensitive.iter().any(|s| s.field == kept.field) {
+            sensitive.push(kept.clone());
+        }
+    }
+    let mut private = ours_private.to_vec();
+    for kept in stored_private {
+        if !private.iter().any(|p| p.field == kept.field) {
+            private.push(kept.clone());
+        }
+    }
+    let owner_tag_key = ours_owner_tag_key
+        .clone()
+        .or_else(|| stored_owner_tag_key.clone());
+    let added = sensitive.len() != ours_sensitive.len()
+        || private.len() != ours_private.len()
+        || owner_tag_key != *ours_owner_tag_key;
+    (sensitive, private, owner_tag_key, added)
 }
 
 /// docs/architecture.md §101: the two rejections an *older* registration
@@ -3166,6 +3213,22 @@ async fn reconcile_event_types(
         };
 
         let existing = skilj_core::db::get_event_type(pool, bounded_context_name, name).await?;
+        let (sensitive_fields, private_fields, owner_tag_key, kept_protections) = match &existing {
+            Some(stored) => keep_stored_protections(
+                &registered.sensitive_fields,
+                &registered.private_fields,
+                &registered.owner_tag_key,
+                &stored.sensitive_fields,
+                &stored.private_fields,
+                &stored.owner_tag_key,
+            ),
+            None => (
+                registered.sensitive_fields.clone(),
+                registered.private_fields.clone(),
+                registered.owner_tag_key.clone(),
+                false,
+            ),
+        };
         let register = |existing: Option<&skilj_core::event_store::EventType>| {
             skilj_core::event_store::register_event_type(
                 &mapping,
@@ -3173,9 +3236,9 @@ async fn reconcile_event_types(
                 name.clone(),
                 registered.schema.clone(),
                 registered.tag_mappings.clone(),
-                registered.owner_tag_key.clone(),
-                registered.sensitive_fields.clone(),
-                registered.private_fields.clone(),
+                owner_tag_key.clone(),
+                sensitive_fields.clone(),
+                private_fields.clone(),
                 registered.external_creation_allowed,
                 registered.direct_creation_allowed,
                 registered.system_triggered_allowed,
@@ -3225,6 +3288,14 @@ async fn reconcile_event_types(
             }
             (Err(e), _) => return Err(e),
         };
+        if kept_protections {
+            tracing::warn!(
+                event_type = %key,
+                "this process's EventType declares fewer protections (sensitive/private \
+                 fields, owner tag key) than the stored registration - keeping the stored ones"
+            );
+            report.kept_protections.push(key.clone());
+        }
         skilj_core::db::upsert_event_type(pool, registration.event_type()).await?;
         report.registered.push(key);
     }
@@ -3247,6 +3318,22 @@ async fn reconcile_command_types(
         };
 
         let existing = skilj_core::db::get_command_type(pool, bounded_context_name, name).await?;
+        let (sensitive_fields, private_fields, owner_tag_key, kept_protections) = match &existing {
+            Some(stored) => keep_stored_protections(
+                &registered.sensitive_fields,
+                &registered.private_fields,
+                &registered.owner_tag_key,
+                &stored.sensitive_fields,
+                &stored.private_fields,
+                &stored.owner_tag_key,
+            ),
+            None => (
+                registered.sensitive_fields.clone(),
+                registered.private_fields.clone(),
+                registered.owner_tag_key.clone(),
+                false,
+            ),
+        };
         let register = |existing: Option<&skilj_core::event_store::CommandType>| {
             skilj_core::event_store::register_command_type(
                 &mapping,
@@ -3254,9 +3341,9 @@ async fn reconcile_command_types(
                 name.clone(),
                 registered.schema.clone(),
                 registered.tag_mappings.clone(),
-                registered.owner_tag_key.clone(),
-                registered.sensitive_fields.clone(),
-                registered.private_fields.clone(),
+                owner_tag_key.clone(),
+                sensitive_fields.clone(),
+                private_fields.clone(),
                 registered.rest_trigger_allowed,
                 existing,
             )
@@ -3292,6 +3379,14 @@ async fn reconcile_command_types(
             }
             (Err(e), _) => return Err(e),
         };
+        if kept_protections {
+            tracing::warn!(
+                command_type = %key,
+                "this process's CommandType declares fewer protections (sensitive/private \
+                 fields, owner tag key) than the stored registration - keeping the stored ones"
+            );
+            report.kept_protections.push(key.clone());
+        }
         skilj_core::db::upsert_command_type(pool, registration.command_type()).await?;
         report.registered.push(key);
     }
