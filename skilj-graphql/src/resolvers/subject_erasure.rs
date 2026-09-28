@@ -41,6 +41,17 @@ pub fn field() -> Field {
             let now = chrono::Utc::now();
             let destroyed = skilj_core::event_store::forget_subject(&access_mapping, &key, now)
                 .map_err(to_graphql_error)?;
+            // docs/architecture.md §91: parked deliveries hold the plaintext
+            // request, outside the key's reach. Before the key goes, so a
+            // failure here leaves forgetSubject retryable.
+            skilj_core::db::delete_parked_deliveries_for_subject(
+                &state.pool,
+                &bounded_context_name,
+                &subject_key,
+                &subject_value,
+            )
+            .await
+            .map_err(to_graphql_error)?;
             skilj_core::db::destroy_encryption_key(
                 &state.pool,
                 &bounded_context_name,

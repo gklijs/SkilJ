@@ -8869,6 +8869,115 @@ pub async fn record_parked_delivery_retry_failure(
     Ok(())
 }
 
+/// `forgetSubject`'s parked-delivery half (docs/architecture.md §91):
+/// deletes every parked delivery in `bounded_context` whose request
+/// references `(subject_key, subject_value)`, returning how many went. A
+/// parked `request_json` is the plaintext request as it was submitted -
+/// never encrypted - so destroying the subject's key leaves it readable to
+/// any admin, and `retryParkedDelivery` would re-create the subject's data
+/// under a fresh key. Called *before* the key is destroyed: if this failed
+/// afterwards, `forgetSubject` couldn't be retried (the key is no longer
+/// active) and the rows would stay.
+///
+/// A row references the subject when the payload its redrive would submit
+/// names it through the target type's own sensitive fields - exactly the
+/// subjects encryption would key it under (`sensitive_field_subjects`).
+/// A row whose target type can't be resolved (its token or bounded
+/// context gone) or whose request isn't the redrive's shape can't be
+/// redriven anyway; it is deleted if the subject value appears anywhere in
+/// its request, erring toward erasure.
+pub async fn delete_parked_deliveries_for_subject(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+) -> crate::error::Result<u64> {
+    let mut deleted = 0;
+    let mut after: Option<ParkedDeliveryCursor> = None;
+    loop {
+        let page = list_parked_deliveries_page(pool, bounded_context, after.as_ref(), 1000).await?;
+        let Some(last) = page.last() else {
+            return Ok(deleted);
+        };
+        after = Some(ParkedDeliveryCursor::of(last));
+        for delivery in &page {
+            if parked_delivery_references_subject(pool, delivery, subject_key, subject_value)
+                .await?
+                && delete_parked_delivery(pool, bounded_context, &delivery.id)
+                    .await?
+                    .is_some()
+            {
+                deleted += 1;
+            }
+        }
+    }
+}
+
+async fn parked_delivery_references_subject(
+    pool: &Pool,
+    delivery: &ParkedDelivery,
+    subject_key: &str,
+    subject_value: &str,
+) -> crate::error::Result<bool> {
+    let resolved: Option<(
+        Vec<crate::shared::SensitiveField>,
+        Option<&serde_json::Value>,
+    )> = match delivery.kind {
+        ParkedDeliveryKind::CrossContextRoute => {
+            match (
+                &delivery.target_bounded_context,
+                &delivery.target_command_type,
+            ) {
+                (Some(bc), Some(name)) => get_command_type(pool, bc, name)
+                    .await?
+                    .map(|ct| (ct.sensitive_fields, Some(&delivery.request_json))),
+                _ => None,
+            }
+        }
+        ParkedDeliveryKind::ExternalEvent => match &delivery.access_token_id {
+            Some(id) => get_external_event_token(pool, id).await?.map(|token| {
+                (
+                    token.event_type.sensitive_fields,
+                    delivery.request_json.get("payload"),
+                )
+            }),
+            None => None,
+        },
+        ParkedDeliveryKind::CommandTrigger => match &delivery.access_token_id {
+            Some(id) => get_command_token(pool, id).await?.map(|token| {
+                (
+                    token.command_type.sensitive_fields,
+                    delivery.request_json.get("payload"),
+                )
+            }),
+            None => None,
+        },
+    };
+    Ok(match resolved {
+        Some((sensitive_fields, Some(payload))) => {
+            let payload = serde_json::to_string(payload)
+                .expect("serde_json::Value serialization is infallible");
+            crate::event_store::sensitive_field_subjects(&sensitive_fields, &payload)
+                .iter()
+                .any(|(key, value)| key == subject_key && value == subject_value)
+        }
+        _ => json_mentions(&delivery.request_json, subject_value),
+    })
+}
+
+/// Whether `value` appears as a string leaf, or a number/bool rendered as
+/// a string, anywhere in `json`.
+fn json_mentions(json: &serde_json::Value, value: &str) -> bool {
+    match json {
+        serde_json::Value::String(s) => s == value,
+        serde_json::Value::Number(n) => n.to_string() == value,
+        serde_json::Value::Bool(b) => b.to_string() == value,
+        serde_json::Value::Array(items) => items.iter().any(|v| json_mentions(v, value)),
+        serde_json::Value::Object(fields) => fields.values().any(|v| json_mentions(v, value)),
+        serde_json::Value::Null => false,
+    }
+}
+
 /// `discardParkedDelivery`'s own write, and `retryParkedDelivery`'s own
 /// success path (a delivery that finally landed is no longer "stuck",
 /// so it leaves this table the same way a resolved

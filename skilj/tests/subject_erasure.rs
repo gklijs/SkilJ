@@ -79,6 +79,11 @@ impl EventType for AccountOpened {
     fn direct_creation_allowed() -> bool {
         true
     }
+    // For the parked-delivery half of forgetSubject (§91): an
+    // ExternalEvent-kind parked row carries this kind of token.
+    fn external_creation_allowed() -> bool {
+        true
+    }
     fn sensitive_fields() -> Vec<SensitiveField> {
         vec![SensitiveField {
             field: "email".to_string(),
@@ -349,6 +354,56 @@ fn subject_erasure_end_to_end() {
             skilj_core::event_store::EncryptionKeyStatus::Active
         );
 
+        // docs/architecture.md §91: parked deliveries hold the plaintext
+        // request. Three, parked by a bridge: one naming subject 42 through
+        // the event type's own sensitive field, one naming 43, and one whose
+        // token is gone (so its type can't be resolved) but whose request
+        // mentions 42.
+        let external_token = skilj_core::access_control::create_external_event_token(
+            &admin_mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        skilj_core::db::insert_external_event_token(&pool, &external_token)
+            .await
+            .unwrap();
+        let park = |identifier: &'static str, token_id: String, user_id: &'static str| {
+            let pool = pool.clone();
+            let bc_name = bc_name.clone();
+            async move {
+                skilj_core::db::insert_parked_delivery(
+                    &pool,
+                    &bc_name,
+                    "kafka-inbound",
+                    skilj_core::db::ParkedDeliveryKind::ExternalEvent,
+                    identifier,
+                    Some(&token_id),
+                    None,
+                    None,
+                    &json!({ "payload": { "email": "person@example.com", "user_id": user_id } }),
+                    "connection refused",
+                    1,
+                    test_now(),
+                    test_now(),
+                )
+                .await
+                .unwrap()
+                .id
+            }
+        };
+        park("users:0:1", external_token.id.clone(), "42").await;
+        let kept = park("users:0:2", external_token.id.clone(), "43").await;
+        park(
+            "users:0:3",
+            "a-token-that-no-longer-exists".to_string(),
+            "42",
+        )
+        .await;
+
         let graphql_router = skilj.graphql_router().await.unwrap();
         let admin_jwt = sign_jwt(&admin_role.external_subject);
 
@@ -371,6 +426,15 @@ fn subject_erasure_end_to_end() {
                 .unwrap(),
             None
         );
+        // ...and takes the parked plaintext naming subject 42 with it, both
+        // the resolvable row and the unresolvable one; 43's row stays.
+        let parked: Vec<String> = skilj_core::db::list_parked_deliveries(&pool, &bc_name)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(parked, vec![kept]);
 
         // A second forgetSubject on the same, now-destroyed subject is
         // rejected - there is nothing active left to find.

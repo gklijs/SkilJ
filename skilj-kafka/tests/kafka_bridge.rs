@@ -346,7 +346,30 @@ async fn create_topic(bootstrap_servers: &str, topic: &str) {
     // makes this real, worth doing regardless of how much of the
     // observed flakiness it alone accounts for.
     let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(30)));
-    admin.create_topics([&new_topic], &opts).await.unwrap();
+    // A freshly started container accepts connections before its broker
+    // can serve admin requests, and under a full-workspace test run that
+    // gap can outlast one timeout - every test's first create then failed
+    // together with `OperationTimedOut`. Retry with backoff; a timed-out
+    // attempt may still have been applied, so "already exists" is success.
+    let mut backoff = Duration::from_millis(500);
+    for attempt in 1..=6 {
+        let outcome = match admin.create_topics([&new_topic], &opts).await {
+            Ok(results) => match results.into_iter().next() {
+                Some(Ok(_)) => return,
+                Some(Err((_, rdkafka::types::RDKafkaErrorCode::TopicAlreadyExists))) => return,
+                Some(Err((_, code))) => format!("{code:?}"),
+                None => "no result for the topic".to_string(),
+            },
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            attempt < 6,
+            "creating topic {topic} failed after {attempt} attempts: {outcome}"
+        );
+        eprintln!("creating topic {topic} failed (attempt {attempt}), retrying: {outcome}");
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(8));
+    }
 }
 
 fn unique_topic(prefix: &str) -> String {

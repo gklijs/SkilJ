@@ -299,6 +299,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `forgetSubject` left the forgotten subject's data in plaintext in
+  `parked_deliveries`: a parked row holds the request exactly as it was
+  submitted (a bridge's event or command body, a route's target command
+  payload), never encrypted, so destroying the subject's key didn't touch
+  it. Any admin could still read it via `parkedDeliveries`, and
+  `retryParkedDelivery` would re-create the subject's data under a fresh
+  key. `forgetSubject` now first deletes every parked delivery in the
+  bounded context whose request names the subject through its target
+  type's sensitive fields (or, when that type can't be resolved, mentions
+  the subject value anywhere).
 - **Breaking (API):** GraphQL JWT verification ignored the `aud` claim
   entirely (`validate_aud = false`), so a token the configured IdP
   issued to *any other* application - same issuer, same signing keys,
