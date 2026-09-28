@@ -874,6 +874,8 @@ async fn provision_bounded_context_schema(
     .execute(&mut **tx)
     .await?;
 
+    // docs/architecture.md §104 - after every table it touches exists.
+    add_registration_version_columns(&mut **tx, bounded_context).await?;
     Ok(())
 }
 
@@ -1659,6 +1661,105 @@ pub async fn ensure_external_message_cursors_table<'e>(
         )"
     )))
     .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Which registration table [`registration_version`]/
+/// [`set_registration_version`] address (docs/architecture.md §104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationTable {
+    EventTypes,
+    CommandTypes,
+    Projections,
+}
+
+impl RegistrationTable {
+    fn table(self) -> &'static str {
+        match self {
+            RegistrationTable::EventTypes => "event_types",
+            RegistrationTable::CommandTypes => "command_types",
+            RegistrationTable::Projections => "projections",
+        }
+    }
+}
+
+async fn add_registration_version_columns<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS registered_by_version BIGINT;
+         ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS registered_by_version BIGINT;
+         ALTER TABLE {schema}.projections ADD COLUMN IF NOT EXISTS registered_by_version BIGINT"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// The `registered_by_version` column on a bounded context's
+/// `event_types`/`command_types`/`projections` - the application version
+/// that last registered each row at startup (`SkiljBuilder::
+/// application_version`, docs/architecture.md §104). Reconciliation metadata
+/// only, never part of the domain types, so nothing but reconciliation
+/// reads or writes it. Checked in `information_schema` first so a startup
+/// that finds it already there takes no table lock; `provision_bounded_context_schema`
+/// adds it for a new bounded context.
+pub async fn ensure_registration_version_columns(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let (present,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = $1 AND column_name = 'registered_by_version' \
+         AND table_name IN ('event_types', 'command_types', 'projections')",
+    )
+    .bind(format!("bc_{bounded_context}"))
+    .fetch_one(pool)
+    .await?;
+    if present < 3 {
+        add_registration_version_columns(pool, bounded_context).await?;
+    }
+    Ok(())
+}
+
+/// See [`ensure_registration_version_columns`]. `None` for a row no
+/// versioned process has registered (or no such row).
+pub async fn registration_version(
+    pool: &Pool,
+    bounded_context: &str,
+    table: RegistrationTable,
+    name: &str,
+) -> crate::error::Result<Option<i64>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT registered_by_version FROM {schema}.{} WHERE name = $1",
+        table.table()
+    )))
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(version,)| version))
+}
+
+/// See [`ensure_registration_version_columns`].
+pub async fn set_registration_version(
+    pool: &Pool,
+    bounded_context: &str,
+    table: RegistrationTable,
+    name: &str,
+    version: i64,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.{} SET registered_by_version = $1 WHERE name = $2",
+        table.table()
+    )))
+    .bind(version)
+    .bind(name)
+    .execute(pool)
     .await?;
     Ok(())
 }

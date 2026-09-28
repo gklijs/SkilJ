@@ -97,11 +97,19 @@ let (skilj, report) = Skilj::builder(database_url)
     .auto_register()
     .reconciliation_role("banking-service@example.com") // step 3's externalSubject
     .identity_provider(IdpConfig::new(jwks_url, issuer, audience, SigningAlgorithm::Rs256))
+    .application_version(build_number) // any number that only ever increases per release
     .build()
     .await?;
 
 assert!(report.skipped_no_access.is_empty());
 ```
+
+Set `application_version` in any deployment that runs more than one
+instance or ever rolls back: during a rolling deploy (or after a
+rollback) an older version's startup otherwise overwrites registrations
+a newer version made - flags, a projection's consumed event types (each
+flip a full rebuild). With it, an older process leaves newer
+registrations alone and lists them in `report.kept_newer`.
 
 If `skipped_no_access` isn't empty, re-check step 4 before anything
 else - see this skill's own top-level "one thing every mistake comes

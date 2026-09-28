@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SkiljBuilder::application_version(u64)`: an ever-increasing version
+  stamped on every `EventType`/`CommandType`/`Projection` registration
+  this process makes at startup. A process older than a registration's
+  stamp leaves it untouched (reported in `ReconciliationReport::kept_newer`),
+  so two versions running side by side - a rolling deploy, a rollback, an
+  old instance restarting mid-rollout - no longer undo each other's
+  registrations at every startup (flags, a projection's consumed event
+  types and so a full rebuild each time). Unset, startup behaves as
+  before. A new `registered_by_version` column is added to each bounded
+  context's registration tables on first use.
+
 ### Changed
 
 - **Wire:** `projection(..., waitForSequence:)` with a sequence past the

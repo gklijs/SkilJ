@@ -655,6 +655,7 @@ impl Skilj {
             // docs/architecture.md §87 - matches
             // `config.idempotency_key_retention` in specs/skilj.allium.
             idempotency_key_retention: Some(DEFAULT_IDEMPOTENCY_KEY_RETENTION),
+            application_version: None,
         }
     }
 
@@ -867,6 +868,86 @@ fn keep_stored_protections(
         || private.len() != ours_private.len()
         || owner_tag_key != *ours_owner_tag_key;
     (sensitive, private, owner_tag_key, added)
+}
+
+/// The startup registration side of `SkiljBuilder::application_version`
+/// (docs/architecture.md §104).
+struct RegistrationVersion {
+    version: Option<i64>,
+    /// Bounded contexts whose `registered_by_version` columns this startup
+    /// has already ensured.
+    ensured: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl RegistrationVersion {
+    fn new(version: Option<u64>) -> Self {
+        Self {
+            version: version.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+            ensured: Default::default(),
+        }
+    }
+
+    /// Whether this process is older than whatever last registered
+    /// `name` - only when both have a version.
+    async fn is_older_than_stored(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        table: skilj_core::db::RegistrationTable,
+        name: &str,
+    ) -> skilj_core::error::Result<bool> {
+        let Some(ours) = self.version else {
+            return Ok(false);
+        };
+        self.ensure_columns(pool, bounded_context).await?;
+        Ok(
+            skilj_core::db::registration_version(pool, bounded_context, table, name)
+                .await?
+                .is_some_and(|stored| ours < stored),
+        )
+    }
+
+    /// Once per bounded context per startup - see
+    /// `db::ensure_registration_version_columns`.
+    async fn ensure_columns(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+    ) -> skilj_core::error::Result<()> {
+        let first = self
+            .ensured
+            .lock()
+            .expect("never poisoned: nothing panics while holding it")
+            .insert(bounded_context.to_string());
+        if first {
+            skilj_core::db::ensure_registration_version_columns(pool, bounded_context).await?;
+        }
+        Ok(())
+    }
+
+    /// Stamps `name` as registered by this version, if it has one.
+    async fn stamp(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        table: skilj_core::db::RegistrationTable,
+        name: &str,
+    ) -> skilj_core::error::Result<()> {
+        match self.version {
+            Some(version) => {
+                self.ensure_columns(pool, bounded_context).await?;
+                skilj_core::db::set_registration_version(
+                    pool,
+                    bounded_context,
+                    table,
+                    name,
+                    version,
+                )
+                .await
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 /// docs/architecture.md §101: the two rejections an *older* registration
@@ -1364,6 +1445,7 @@ pub struct SkiljBuilder {
     event_cache_warm_up_count: usize,
     pool_options: Option<skilj_core::db::PgPoolOptions>,
     idempotency_key_retention: Option<std::time::Duration>,
+    application_version: Option<u64>,
 }
 
 impl SkiljBuilder {
@@ -1739,6 +1821,27 @@ impl SkiljBuilder {
         self
     }
 
+    /// This application's version, for startup registration
+    /// (docs/architecture.md §104): a number that only ever increases from
+    /// one release to the next - a build number, or a release's own
+    /// ordinal. Each `EventType`/`CommandType`/`Projection` row this
+    /// process registers at startup is stamped with it, and a process
+    /// whose version is *lower* than a row's stamp leaves that row exactly
+    /// as it is, reporting it in `ReconciliationReport::kept_newer`. That
+    /// is what lets two versions run side by side - a rolling deploy, a
+    /// rollback, an old instance restarting mid-rollout - without each
+    /// startup undoing the other's registrations: flags, projection
+    /// consumed event types (each flip a full projection rebuild), and
+    /// everything else the compatibility rules don't cover.
+    ///
+    /// Unset (the default), startup registers exactly as without it, and
+    /// leaves any existing stamp in place. Whatever the version, startup
+    /// never removes a protection (§102).
+    pub fn application_version(mut self, version: u64) -> Self {
+        self.application_version = Some(version);
+        self
+    }
+
     /// Never delete recorded idempotency keys (the behaviour before
     /// retention existed): a key deduplicates forever, and the
     /// `idempotency_keys` table grows with every keyed submission.
@@ -1859,15 +1962,17 @@ impl SkiljBuilder {
             )?
             .clone();
 
+            let version = RegistrationVersion::new(self.application_version);
             reconcile_event_types(
                 &pool,
                 &role,
                 &self.event_types,
                 &mut report,
                 chrono::Utc::now(),
+                &version,
             )
             .await?;
-            reconcile_command_types(&pool, &role, &command_types, &mut report).await?;
+            reconcile_command_types(&pool, &role, &command_types, &mut report, &version).await?;
             let reconciliation_dispatcher = ProjectionDispatcherImpl {
                 projections: projections.clone(),
                 template_cache: template_cache.clone(),
@@ -1878,6 +1983,7 @@ impl SkiljBuilder {
                 &projections,
                 &mut report,
                 &reconciliation_dispatcher,
+                &version,
             )
             .await?;
         }
@@ -3202,6 +3308,7 @@ async fn reconcile_event_types(
     event_types: &HashMap<(String, String), RegisteredEventType>,
     report: &mut ReconciliationReport,
     now: chrono::DateTime<chrono::Utc>,
+    version: &RegistrationVersion,
 ) -> Result<(), skilj_core::Error> {
     for ((bounded_context_name, name), registered) in event_types {
         let key = format!("{bounded_context_name}/{name}");
@@ -3213,6 +3320,23 @@ async fn reconcile_event_types(
         };
 
         let existing = skilj_core::db::get_event_type(pool, bounded_context_name, name).await?;
+        if existing.is_some()
+            && version
+                .is_older_than_stored(
+                    pool,
+                    bounded_context_name,
+                    skilj_core::db::RegistrationTable::EventTypes,
+                    name,
+                )
+                .await?
+        {
+            tracing::warn!(
+                event_type = %key,
+                "a newer application version registered this EventType - keeping its registration"
+            );
+            report.kept_newer.push(key);
+            continue;
+        }
         let (sensitive_fields, private_fields, owner_tag_key, kept_protections) = match &existing {
             Some(stored) => keep_stored_protections(
                 &registered.sensitive_fields,
@@ -3297,6 +3421,14 @@ async fn reconcile_event_types(
             report.kept_protections.push(key.clone());
         }
         skilj_core::db::upsert_event_type(pool, registration.event_type()).await?;
+        version
+            .stamp(
+                pool,
+                bounded_context_name,
+                skilj_core::db::RegistrationTable::EventTypes,
+                name,
+            )
+            .await?;
         report.registered.push(key);
     }
     Ok(())
@@ -3307,6 +3439,7 @@ async fn reconcile_command_types(
     role: &Role,
     command_types: &HashMap<(String, String), RegisteredCommandType>,
     report: &mut ReconciliationReport,
+    version: &RegistrationVersion,
 ) -> Result<(), skilj_core::Error> {
     for ((bounded_context_name, name), registered) in command_types {
         let key = format!("{bounded_context_name}/{name}");
@@ -3318,6 +3451,23 @@ async fn reconcile_command_types(
         };
 
         let existing = skilj_core::db::get_command_type(pool, bounded_context_name, name).await?;
+        if existing.is_some()
+            && version
+                .is_older_than_stored(
+                    pool,
+                    bounded_context_name,
+                    skilj_core::db::RegistrationTable::CommandTypes,
+                    name,
+                )
+                .await?
+        {
+            tracing::warn!(
+                command_type = %key,
+                "a newer application version registered this CommandType - keeping its registration"
+            );
+            report.kept_newer.push(key);
+            continue;
+        }
         let (sensitive_fields, private_fields, owner_tag_key, kept_protections) = match &existing {
             Some(stored) => keep_stored_protections(
                 &registered.sensitive_fields,
@@ -3388,6 +3538,14 @@ async fn reconcile_command_types(
             report.kept_protections.push(key.clone());
         }
         skilj_core::db::upsert_command_type(pool, registration.command_type()).await?;
+        version
+            .stamp(
+                pool,
+                bounded_context_name,
+                skilj_core::db::RegistrationTable::CommandTypes,
+                name,
+            )
+            .await?;
         report.registered.push(key);
     }
     Ok(())
@@ -3420,6 +3578,7 @@ async fn reconcile_projections(
     projections: &HashMap<(String, String), RegisteredProjection>,
     report: &mut ReconciliationReport,
     dispatcher: &dyn skilj_core::plugin::ProjectionDispatcher,
+    version: &RegistrationVersion,
 ) -> Result<(), skilj_core::Error> {
     for ((bounded_context_name, name), registered) in projections {
         let key = format!("{bounded_context_name}/{name}");
@@ -3441,6 +3600,23 @@ async fn reconcile_projections(
         };
 
         let existing = skilj_core::db::get_projection(pool, bounded_context_name, name).await?;
+        if existing.is_some()
+            && version
+                .is_older_than_stored(
+                    pool,
+                    bounded_context_name,
+                    skilj_core::db::RegistrationTable::Projections,
+                    name,
+                )
+                .await?
+        {
+            tracing::warn!(
+                projection = %key,
+                "a newer application version registered this Projection - keeping its registration"
+            );
+            report.kept_newer.push(key);
+            continue;
+        }
         // RegisterProjection's own `staged` is always the pending row -
         // see `skilj-graphql`'s `resolvers::type_registration`'s own
         // module doc comment for why every lookup here is explicit about
@@ -3529,6 +3705,16 @@ async fn reconcile_projections(
                 skilj_core::db::upsert_projection_rebuild(pool, &rebuild).await?;
             }
         }
+        // Stamped on the live row even when a rebuild was staged, so an
+        // older version doesn't stage one back before it's promoted.
+        version
+            .stamp(
+                pool,
+                bounded_context_name,
+                skilj_core::db::RegistrationTable::Projections,
+                name,
+            )
+            .await?;
         report.registered.push(key);
     }
     Ok(())

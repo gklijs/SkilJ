@@ -829,3 +829,164 @@ fn an_older_version_starts_and_keeps_the_newer_projection() {
         assert_eq!(after.schema_version, stored.schema_version);
     });
 }
+
+/// `MoneyDeposited` with direct creation switched off - a flag the
+/// compatibility rules don't govern.
+struct MoneyDepositedNoDirect;
+
+impl EventType for MoneyDepositedNoDirect {
+    type Payload = MoneyDepositedPayload;
+    const NAME: &'static str = "MoneyDeposited";
+    fn event_read_allowed() -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct MoneyWithdrawnPayload {
+    amount: i64,
+}
+
+struct MoneyWithdrawn;
+
+impl EventType for MoneyWithdrawn {
+    type Payload = MoneyWithdrawnPayload;
+    const NAME: &'static str = "MoneyWithdrawn";
+}
+
+/// `AccountBalance` as a newer version declares it: folding withdrawals
+/// too, with the same state.
+struct AccountBalanceWithWithdrawals;
+
+impl Projection for AccountBalanceWithWithdrawals {
+    type State = AccountBalanceState;
+    type Event = BankingEvent;
+    const NAME: &'static str = "AccountBalance";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["MoneyDeposited", "MoneyWithdrawn"]
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, key: &str) {
+        AccountBalance::project(state, event, key)
+    }
+}
+
+/// docs/architecture.md §104: with `application_version`, a process older
+/// than a registration's stamp leaves it exactly as it is - here a flag
+/// and a projection's consumed event types, neither of which §101-§103
+/// could tell apart from a deliberate change - while a newer version
+/// still changes them.
+#[test]
+fn an_older_application_version_never_overwrites_a_newer_ones_registrations() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        let build = |version: u64| {
+            Skilj::builder(database_url.clone())
+                .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+                .bounded_context(bc_name.clone())
+                .reconciliation_role(external_subject.clone())
+                .application_version(version)
+        };
+
+        build(2)
+            .event_type::<MoneyDeposited>()
+            .event_type::<MoneyWithdrawn>()
+            .projection::<AccountBalanceWithWithdrawals>()
+            .build()
+            .await
+            .unwrap();
+
+        let (_older, report) = build(1)
+            .event_type::<MoneyDepositedNoDirect>()
+            .event_type::<MoneyWithdrawn>()
+            .projection::<AccountBalance>()
+            .build()
+            .await
+            .unwrap();
+        let mut kept = report.kept_newer.clone();
+        kept.sort();
+        let mut expected = vec![
+            format!("{bc_name}/AccountBalance"),
+            format!("{bc_name}/MoneyDeposited"),
+            format!("{bc_name}/MoneyWithdrawn"),
+        ];
+        expected.sort();
+        assert_eq!(kept, expected);
+        let deposited = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            deposited.direct_creation_allowed,
+            "an older version flipped the flag"
+        );
+        let projection = db::get_projection(&pool, &bc_name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.consumed_event_types.len(),
+            2,
+            "an older version reverted the projection's consumed event types"
+        );
+
+        // A newer version still changes them.
+        let (_newer, report) = build(3)
+            .event_type::<MoneyDepositedNoDirect>()
+            .event_type::<MoneyWithdrawn>()
+            .build()
+            .await
+            .unwrap();
+        assert!(report.kept_newer.is_empty());
+        let deposited = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!deposited.direct_creation_allowed);
+    });
+}
+
+/// §104's upgrade path: a bounded context provisioned before
+/// `registered_by_version` existed gets the column at the first versioned
+/// startup, and is stamped.
+#[test]
+fn a_versioned_startup_adds_the_column_to_an_older_bounded_context() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        for table in ["event_types", "command_types", "projections"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE \"bc_{bc_name}\".{table} DROP COLUMN registered_by_version"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let (_skilj, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .reconciliation_role(external_subject)
+            .application_version(5)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.registered, vec![format!("{bc_name}/MoneyDeposited")]);
+        assert_eq!(
+            db::registration_version(
+                &pool,
+                &bc_name,
+                db::RegistrationTable::EventTypes,
+                "MoneyDeposited"
+            )
+            .await
+            .unwrap(),
+            Some(5)
+        );
+    });
+}
