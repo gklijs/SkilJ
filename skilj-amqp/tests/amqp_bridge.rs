@@ -145,6 +145,9 @@ struct MockSkiljState {
     fail_external_requests: Arc<Mutex<usize>>,
     fail_acks: Arc<Mutex<usize>>,
     parked_deliveries: Arc<Mutex<Vec<Value>>>,
+    /// `POST /v1/parked-deliveries` itself returns a 500 while this is
+    /// `> 0` (docs/architecture.md §98).
+    fail_parked_reports: Arc<Mutex<usize>>,
 }
 
 async fn get_events_consume(
@@ -216,6 +219,13 @@ async fn post_parked_deliveries(
     State(state): State<MockSkiljState>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    {
+        let mut remaining = state.fail_parked_reports.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({})));
+        }
+    }
     state.parked_deliveries.lock().unwrap().push(body);
     (StatusCode::CREATED, Json(json!({ "id": "parked-1" })))
 }
@@ -973,6 +983,102 @@ fn two_partitioned_mappings_together_send_every_key_exactly_once() {
         assert_eq!(
             acked, expected_sequences,
             "every sequence must be acknowledged, owned by this partition or not"
+        );
+    });
+}
+
+/// docs/architecture.md §98: a message that exhausted its retries and
+/// whose park report failed too used to be left unsettled - held by this
+/// link until the connection closed, never redelivered while the bridge
+/// kept running, and holding a unit of link credit. It is now released,
+/// so the broker redelivers it and the next round of retries reports it.
+/// Here: two failed dispatches, a failed report, then (redelivered) two
+/// more failed dispatches and a successful report.
+#[test]
+fn a_message_whose_park_report_fails_is_released_and_parked_on_redelivery() {
+    runtime().block_on(async {
+        let Some(url) = test_broker().await else {
+            return;
+        };
+        let address = unique_address("orders-report-fails");
+
+        let mock_state = MockSkiljState::default();
+        *mock_state.fail_external_requests.lock().unwrap() = 4;
+        *mock_state.fail_parked_reports.lock().unwrap() = 1;
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let (_send_conn, mut send_session) = connect(url, "report-fails-sender-conn").await;
+        let mut sender = Sender::attach(
+            &mut send_session,
+            "report-fails-sender-link",
+            address.as_str(),
+        )
+        .await
+        .unwrap();
+        let (_recv_conn, mut recv_session) = connect(url, "report-fails-receiver-conn").await;
+        let mut receiver = Receiver::attach(
+            &mut recv_session,
+            "report-fails-receiver-link",
+            address.as_str(),
+        )
+        .await
+        .unwrap();
+        sender
+            .send(
+                Message::builder()
+                    .data(br#"{"orderId":"o-released"}"#.to_vec())
+                    .build(),
+            )
+            .await
+            .unwrap()
+            .accepted_or_else(|o| format!("{o:?}"))
+            .unwrap();
+
+        let mut mappings = std::collections::HashMap::new();
+        mappings.insert(
+            address.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_amqp::http_client();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            2,
+        );
+        tokio::spawn(async move {
+            run_inbound(
+                &mut receiver,
+                &http,
+                &skilj_base_url,
+                &address,
+                &mappings,
+                &retry_policy,
+            )
+            .await;
+        });
+
+        let mut parked = Vec::new();
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            parked = mock_state.parked_deliveries.lock().unwrap().clone();
+            if !parked.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            parked.len(),
+            1,
+            "the message was never redelivered and parked"
+        );
+        assert_eq!(
+            parked[0]["request"]["payload"],
+            json!({ "orderId": "o-released" })
         );
     });
 }

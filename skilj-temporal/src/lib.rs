@@ -264,25 +264,59 @@ pub async fn poll_once(
     bounded_context: &str,
     mapping: &EventTypeMapping,
 ) -> Result<usize, BridgeError> {
-    let response = http
-        .get(format!("{skilj_base_url}/v1/events/consume?mode=manual"))
-        .bearer_auth(&mapping.credential)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
-    let consumed: ConsumeResponse = response.json().await?;
-    if consumed.event_type_name != mapping.event_type {
-        return Err(BridgeError::EventTypeMismatch {
-            declared: mapping.event_type.clone(),
-            actual: consumed.event_type_name,
-        });
+    poll_with_pending(
+        http,
+        skilj_base_url,
+        temporal,
+        bounded_context,
+        mapping,
+        &mut std::collections::VecDeque::new(),
+    )
+    .await
+}
+
+/// [`poll_once`] with a buffer of events already served but not yet
+/// acknowledged (docs/architecture.md §99). A manual-ack consume claims
+/// what it serves for `read_cursor_checkout_lease` (five minutes by
+/// default): until that runs out, or the events are acknowledged, the same
+/// token's next consume is served *nothing*, so that two bridge instances
+/// sharing a token never both get them. So a caller whose dispatch fails
+/// must keep the events and retry them itself - consuming again would
+/// wait out the lease. When `pending` is empty this consumes into it;
+/// either way it then dispatches and acknowledges from the front, and an
+/// error leaves the failing event and everything after it in `pending`
+/// for the next call. Returns how many events it worked through.
+async fn poll_with_pending(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    temporal: &Client,
+    bounded_context: &str,
+    mapping: &EventTypeMapping,
+    pending: &mut std::collections::VecDeque<ConsumedEvent>,
+) -> Result<usize, BridgeError> {
+    if pending.is_empty() {
+        let response = http
+            .get(format!("{skilj_base_url}/v1/events/consume?mode=manual"))
+            .bearer_auth(&mapping.credential)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(BridgeError::SkiljStatus { status, body });
+        }
+        let consumed: ConsumeResponse = response.json().await?;
+        if consumed.event_type_name != mapping.event_type {
+            return Err(BridgeError::EventTypeMismatch {
+                declared: mapping.event_type.clone(),
+                actual: consumed.event_type_name,
+            });
+        }
+        pending.extend(consumed.events);
     }
 
-    for event in &consumed.events {
+    let mut worked_through = 0;
+    while let Some(event) = pending.front() {
         match correlation_workflow_id(bounded_context, &mapping.correlation_tag_key, &event.tags) {
             Some(workflow_id) => {
                 dispatch(
@@ -317,8 +351,10 @@ pub async fn poll_once(
             let body = ack.text().await.unwrap_or_default();
             return Err(BridgeError::SkiljStatus { status, body });
         }
+        pending.pop_front();
+        worked_through += 1;
     }
-    Ok(consumed.events.len())
+    Ok(worked_through)
 }
 
 /// Runs [`poll_once`] forever, one mapping at a time in the order given,
@@ -355,10 +391,24 @@ pub async fn run(
     poll_interval: Duration,
 ) -> ! {
     let http = http_client();
+    // Per mapping, what it was served but hasn't acknowledged yet - kept
+    // across cycles so a failed dispatch is retried next cycle rather
+    // than waiting out the consume lease (docs/architecture.md §99).
+    let mut pending: Vec<std::collections::VecDeque<ConsumedEvent>> =
+        mappings.iter().map(|_| Default::default()).collect();
     loop {
         let mut served_any = false;
-        for mapping in mappings {
-            match poll_once(&http, skilj_base_url, temporal, bounded_context, mapping).await {
+        for (mapping, pending) in mappings.iter().zip(pending.iter_mut()) {
+            match poll_with_pending(
+                &http,
+                skilj_base_url,
+                temporal,
+                bounded_context,
+                mapping,
+                pending,
+            )
+            .await
+            {
                 Ok(served) => served_any |= served > 0,
                 Err(e) => {
                     tracing::error!(

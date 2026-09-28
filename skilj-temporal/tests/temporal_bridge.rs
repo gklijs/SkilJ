@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use skilj_temporal::{poll_once, EventTypeMapping, MappingAction};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::UntypedWorkflow;
 
@@ -494,6 +495,93 @@ fn a_mapping_whose_event_type_does_not_match_its_credential_is_rejected() {
         assert!(error.to_string().contains("OrderPlaced"));
         assert!(error.to_string().contains("PaymentConfirmed"));
 
+        let _ = temporal_server;
+    });
+}
+
+/// docs/architecture.md §99: a manual-ack consume claims what it serves,
+/// so an event whose dispatch failed isn't served again until the claim
+/// lapses (five minutes by default) - this mock never serves it again at
+/// all. `run` keeps it and retries it next cycle. Here the `Signal`
+/// mapping is polled before the `Start` one, so the signal's first attempt
+/// fails (no workflow yet) and must still be delivered once it exists.
+#[test]
+fn run_retries_a_failed_dispatch_without_consuming_it_again() {
+    runtime().block_on(async {
+        let Some(temporal_server) = start_temporal().await else {
+            return;
+        };
+        let temporal = connect_temporal(&format!("http://{}", temporal_server.target)).await;
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        enqueue(
+            &mock_state,
+            "start-token",
+            "OrderPlaced",
+            [json!({
+                "sequence": 1,
+                "eventType": "OrderPlaced",
+                "payload": { "orderId": "o-race" },
+                "tags": [{ "key": "order", "value": "o-race" }],
+            })],
+        );
+        enqueue(
+            &mock_state,
+            "signal-token",
+            "PaymentConfirmed",
+            [json!({
+                "sequence": 2,
+                "eventType": "PaymentConfirmed",
+                "payload": { "orderId": "o-race", "amount": 30 },
+                "tags": [{ "key": "order", "value": "o-race" }],
+            })],
+        );
+        let mappings = vec![
+            EventTypeMapping {
+                event_type: "PaymentConfirmed".to_string(),
+                credential: "signal-token".to_string(),
+                correlation_tag_key: "order".to_string(),
+                action: MappingAction::Signal {
+                    signal_name: "paymentConfirmed".to_string(),
+                },
+            },
+            EventTypeMapping {
+                event_type: "OrderPlaced".to_string(),
+                credential: "start-token".to_string(),
+                correlation_tag_key: "order".to_string(),
+                action: MappingAction::Start {
+                    workflow_type: "OrderFulfillment".to_string(),
+                    task_queue: "orders".to_string(),
+                },
+            },
+        ];
+        let target = temporal_server.target.clone();
+        tokio::spawn(async move {
+            let temporal = connect_temporal(&format!("http://{target}")).await;
+            skilj_temporal::run(
+                &skilj_base_url,
+                &temporal,
+                "rescue",
+                &mappings,
+                Duration::from_millis(100),
+            )
+            .await;
+        });
+
+        let mut acked = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            acked = mock_state.acked.lock().unwrap().clone();
+            if acked.contains(&("signal-token".to_string(), 2)) {
+                break;
+            }
+        }
+        assert!(
+            acked.contains(&("signal-token".to_string(), 2)),
+            "the signal whose first dispatch failed was never retried: {acked:?}"
+        );
+        let _ = temporal;
         let _ = temporal_server;
     });
 }

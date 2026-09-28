@@ -791,9 +791,12 @@ async fn report_parked_delivery(
 /// section. Once `retry_policy` exhausts, the message is reported to
 /// skilj via [`report_parked_delivery`] and the delivery is accepted
 /// anyway - without that, a poison message would block redelivery
-/// forever. If the *report* itself fails, the delivery is deliberately
-/// left un-accepted (a real gap - better a loud, visible redelivery loop
-/// than a silently unreported poison message).
+/// forever. If the *report* itself fails, the delivery is released
+/// (AMQP's "not processed" outcome), so the broker redelivers it and the
+/// next round of retries reports it again - a loud, visible redelivery
+/// loop rather than a silently unreported poison message. Left unsettled
+/// instead, it would stay with this link until the connection closed and
+/// hold a unit of its credit (docs/architecture.md §98).
 ///
 /// `http` should be bounded by a timeout - [`http_client`] is - or one
 /// request stuck on a dead connection stalls this loop forever (§82).
@@ -879,11 +882,20 @@ pub async fn run_inbound(
                         )
                         .await
                         {
+                            // docs/architecture.md §98: released, not left
+                            // unsettled - an unsettled delivery stays with
+                            // this link (redelivered only once the connection
+                            // closes) and holds a unit of its credit.
+                            // Released, the broker redelivers it now, and the
+                            // next round of retries reports it again.
                             tracing::error!(
                                 address,
-                                "reporting this parked delivery failed - not accepting, \
-                                 will redeliver: {report_err}"
+                                "reporting this parked delivery failed - releasing it \
+                                 for redelivery: {report_err}"
                             );
+                            if let Err(release_err) = receiver.release(&delivery).await {
+                                tracing::error!("releasing an AMQP delivery failed: {release_err}");
+                            }
                             break;
                         }
                         if let Err(accept_err) = receiver.accept(&delivery).await {

@@ -98,6 +98,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `skilj-temporal`: `run` dropped the events a cycle was served when a
+  dispatch failed, and relied on consuming them again - but a manual-ack
+  consume claims what it serves for `read_cursor_checkout_lease` (five
+  minutes by default), so the same token got nothing back until then. Any
+  transient Temporal failure, including the `Signal`-before-`Start` race
+  its own docs said "retries next `poll_interval`", stalled that mapping
+  for the whole lease. `run` now keeps each mapping's served but
+  unacknowledged events and retries them next cycle. `poll_once` is
+  unchanged.
+- `skilj-amqp`: when a message exhausted its retries and reporting it
+  to `POST /v1/parked-deliveries` failed too, the delivery was left
+  unsettled - held by the receiver's link until the connection closed, so
+  never redelivered while the bridge kept running, and holding a unit of
+  link credit (enough of them stalled the receiver). It is now
+  *released*, so the broker redelivers it and the next round of retries
+  reports it.
 - `skilj-kafka`: `run_inbound` could **lose** an inbound message. When a
   message exhausted its retries and reporting it to
   `POST /v1/parked-deliveries` failed too (skilj still unreachable), it
