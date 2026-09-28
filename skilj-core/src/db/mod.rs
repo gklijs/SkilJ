@@ -4234,6 +4234,25 @@ pub async fn get_projection_rebuild_state(
 }
 
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+/// Just `name`'s `caught_up_to` - `None` if no such projection, `Some(None)`
+/// if it has folded nothing yet. The one column `ProjectionQuery`'s
+/// `waitForSequence` loop polls, in one query rather than
+/// [`get_projection`]'s three (docs/architecture.md §88).
+pub async fn projection_caught_up_to(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+) -> crate::error::Result<Option<Option<i64>>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT caught_up_to FROM {schema}.projections WHERE name = $1"
+    )))
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(caught_up_to,)| caught_up_to))
+}
+
 pub async fn get_projection(
     pool: &Pool,
     bounded_context: &str,

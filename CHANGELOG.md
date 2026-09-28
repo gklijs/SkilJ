@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Wire:** `projection(..., waitForSequence:)` with a sequence past the
+  bounded context's latest committed event is now refused at once with
+  `wait_for_sequence_not_committed`, instead of polling until
+  `projection_query_wait_timeout` and failing with
+  `projection_caught_up_timed_out`. Any reader could otherwise make each
+  query - ten per request, with aliases - cost the whole timeout in
+  database polling. The legitimate wait also got cheaper: it polls one
+  column, backing off from 20 ms to 250 ms, instead of a three-query
+  lookup every 20 ms (~250 lookups for a 5 s wait, now about 25).
 - **Behaviour:** idempotency keys now expire. A recorded key
   deduplicates for `SkiljBuilder::idempotency_key_retention` (default
   one hour, `DEFAULT_IDEMPOTENCY_KEY_RETENTION`) and is then deleted by a

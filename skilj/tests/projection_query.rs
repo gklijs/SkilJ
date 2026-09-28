@@ -194,6 +194,24 @@ struct AccountBalanceState {
 /// also need to tolerate the background consumer's own poll cadence.
 struct AccountBalance;
 
+/// `AccountBalance` as an async projection, in a `Skilj` whose poll
+/// interval is an hour: after `build()`'s first tick it never catches up
+/// during the test, so waiting for a committed sequence genuinely times
+/// out (docs/architecture.md §88).
+struct LaggingBalance;
+
+impl Projection for LaggingBalance {
+    type State = AccountBalanceState;
+    type Event = BankingEvent;
+    const NAME: &'static str = "LaggingBalance";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["MoneyDeposited"]
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, key: &str) {
+        AccountBalance::project(state, event, key)
+    }
+}
+
 impl Projection for AccountBalance {
     type State = AccountBalanceState;
     type Event = BankingEvent;
@@ -510,8 +528,10 @@ fn projection_query_end_to_end() {
             .event_type::<MoneyDeposited>()
             .command_type::<WithdrawMoney>()
             .projection::<AccountBalance>()
+            .projection::<LaggingBalance>()
             .reconciliation_role(admin_subject)
             .projection_query_wait_timeout(std::time::Duration::from_millis(150))
+            .async_projection_poll_interval(std::time::Duration::from_secs(3600))
             .build()
             .await
             .unwrap();
@@ -578,9 +598,37 @@ fn projection_query_end_to_end() {
         );
         assert_eq!(response["data"]["projection"]["total"], 20);
 
-        // waitForSequence past anything that will ever be reached within
-        // the short configured timeout - a distinguishable timeout
-        // rejection (ReadYourWritesWhenRequested), not a generic error.
+        // A committed sequence the (async, hour-interval) projection
+        // hasn't reached within the short configured timeout - a
+        // distinguishable timeout rejection (ReadYourWritesWhenRequested),
+        // not a generic error.
+        let lagging_type =
+            skilj_graphql::projection_types::graphql_type_name(&bc_name, "LaggingBalance");
+        let lagging_query = format!(
+            "query($bc: String!, $name: String!, $wait: Int) {{ \
+                projection(boundedContext: $bc, name: $name, waitForSequence: $wait) {{ \
+                    ... on {lagging_type} {{ total }} \
+                }} \
+            }}"
+        );
+        let started = std::time::Instant::now();
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            &lagging_query,
+            json!({ "bc": bc_name, "name": "LaggingBalance", "wait": first_sequence }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "projection_caught_up_timed_out"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+
+        // docs/architecture.md §88: a sequence nothing has committed yet
+        // can't be one the caller knows - refused at once rather than
+        // waited on for the whole timeout.
+        let started = std::time::Instant::now();
         let response = graphql_request(
             &router,
             Some(&admin_jwt),
@@ -590,8 +638,9 @@ fn projection_query_end_to_end() {
         .await;
         assert_eq!(
             response["errors"][0]["extensions"]["code"],
-            "projection_caught_up_timed_out"
+            "wait_for_sequence_not_committed"
         );
+        assert!(started.elapsed() < std::time::Duration::from_millis(150));
 
         // A Read-level-only grant still succeeds - ProjectionQuery faces
         // ReadAccess, not AdminAccess (require_read_mapping, not

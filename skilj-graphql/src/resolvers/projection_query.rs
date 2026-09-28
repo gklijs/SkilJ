@@ -13,6 +13,7 @@ use crate::gql_types::ProjectionWithRebuild;
 use crate::projection_types::graphql_type_name;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
+use async_graphql::ErrorExtensions;
 use skilj_core::access_control::RoleAccessMapping;
 use skilj_core::db::Pool;
 
@@ -34,20 +35,26 @@ pub(crate) async fn wait_until_caught_up(
     wait_for_sequence: i64,
     timeout: std::time::Duration,
 ) -> skilj_core::error::Result<bool> {
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+    // docs/architecture.md §88: one column per poll, and a backoff - the
+    // first checks come quickly (an async projection's next tick is often
+    // imminent), later ones less often, so a query that waits out the
+    // whole timeout costs a few dozen reads rather than hundreds.
+    const FIRST_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+    const MAX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut interval = FIRST_POLL_INTERVAL;
     loop {
-        let projection =
-            skilj_core::db::get_projection(pool, bounded_context, projection_name).await?;
-        if let Some(projection) = &projection {
-            if projection.caught_up_to.unwrap_or(-1) >= wait_for_sequence {
-                return Ok(true);
-            }
+        let caught_up_to =
+            skilj_core::db::projection_caught_up_to(pool, bounded_context, projection_name).await?;
+        if caught_up_to.flatten().unwrap_or(-1) >= wait_for_sequence {
+            return Ok(true);
         }
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(interval.min(deadline - now)).await;
+        interval = (interval * 2).min(MAX_POLL_INTERVAL);
     }
 }
 
@@ -127,6 +134,24 @@ pub(crate) async fn fetch_projection_result(
         .map_err(to_graphql_error)?
         .ok_or_else(|| not_found("Projection", name))?;
 
+    // docs/architecture.md §88: `waitForSequence` names a sequence the
+    // caller already knows, i.e. one already committed. One past the
+    // latest committed sequence can't be, and would only ever wait out
+    // the whole timeout - refused at once instead.
+    if let Some(seq) = wait_for_sequence {
+        let latest = skilj_core::db::latest_sequence(&state.pool, bounded_context_name)
+            .await
+            .map_err(to_graphql_error)?
+            .unwrap_or(-1);
+        if seq > latest {
+            return Err(async_graphql::Error::new(format!(
+                "waitForSequence {seq} is past the latest committed sequence {latest} of \
+                 {bounded_context_name:?} - pass a sequence already committed, such as one \
+                 a submitted command triggered"
+            ))
+            .extend_with(|_, ext| ext.set("code", "wait_for_sequence_not_committed")));
+        }
+    }
     let caught_up = match wait_for_sequence {
         None => true,
         Some(seq) => wait_until_caught_up(

@@ -3056,6 +3056,18 @@ rule QueryProjection {
     -- required team, which is every projection unless one names one.
     requires: team_only_satisfied(projection, access_mapping)
 
+    -- wait_for_sequence names a position the caller already knows, which
+    -- means one already committed: the triggered events of a command it
+    -- submitted, or an event it read. A sequence past the bounded
+    -- context's latest committed event is not that, and waiting for it
+    -- would only spend the whole configured wait before failing - so it
+    -- is refused outright, as a malformed request rather than a timeout,
+    -- telling the caller not to retry the same value.
+    requires:
+        wait_for_sequence = null
+        or wait_for_sequence
+            < (Events where bounded_context = projection.bounded_context).count
+
     -- Blocks until the projection has caught up, and fails the query if
     -- it does not within the configured wait - see the
     -- await_projection_caught_up note above the rules. Vacuously true
@@ -7102,7 +7114,10 @@ surface ProjectionQuery {
         -- rules - and a timeout is reported distinguishably from any
         -- other rejection this surface can produce, so a caller knows to
         -- retry rather than treat it as permanent (see
-        -- ReadYourWritesWhenRequested above). The exact GraphQL error
+        -- ReadYourWritesWhenRequested above). A wait_for_sequence no event
+        -- has been committed at yet is refused at once instead of waited
+        -- on, distinguishably from the timeout: it cannot be a position
+        -- the caller learned, and retrying it would not help. The exact GraphQL error
         -- shape that carries that distinction stays deferred with the
         -- rest of the wire contract (see the scope header's exclusions).
 }
