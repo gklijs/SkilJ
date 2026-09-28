@@ -37,6 +37,15 @@ steps:
       # this exists (a past renumbering silently broke ~600 of them).
       - scripts/check-section-refs.sh
 
+  - name: check-template
+    image: rust:1-bookworm
+    commands:
+      # Generates templates/skilj-template and builds it against this
+      # workspace's crates - the template isn't a workspace member, so
+      # nothing else notices when a change breaks it
+      # (docs/architecture.md §105).
+      - scripts/check-template.sh
+
   - name: fmt
     image: rust:1-bookworm
     commands:

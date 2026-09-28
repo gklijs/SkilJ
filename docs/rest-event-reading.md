@@ -45,9 +45,17 @@ A few things that trip people up:
   at that moment. Naming one of these without its own value (or with the other one's) is
   refused, not silently defaulted.
 - **Manual-ack can redeliver duplicates, on purpose.** If you fetch a batch and crash before
-  acknowledging it, the next fetch serves the same batch again. This library doesn't de-duplicate
+  acknowledging it, a later fetch serves the same batch again. This library doesn't de-duplicate
   for you — your handler needs to be safe to run twice on the same event (e.g. keyed by the
   event's own `sequence`).
+- **A served, unacknowledged batch is claimed for a while.** A manual-ack fetch claims what it
+  serves for `read_cursor_checkout_lease` (default 5 minutes, set on the server's `SkiljBuilder`),
+  so that two workers sharing a token never both get the same events. Until you acknowledge or
+  the claim lapses, the *same token's* next fetch returns nothing. So if handling an event fails
+  and you want to retry, keep the batch you were served and retry it in memory - don't fetch
+  again expecting it back, or you'll wait out the whole lease (see
+  [§99](architecture.md) for a bridge that did exactly that). A crashed worker's batch comes back
+  once the claim lapses.
 - **Mixing modes on one token is allowed but not coordinated.** `GET /v1/events` (client-tracked)
   never reads or moves a token's server-side cursor, so using both against the same token gives
   you two positions that know nothing about each other.

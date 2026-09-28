@@ -111,6 +111,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `templates/skilj-template` didn't compile: it pinned `schemars` 0.8
+  while skilj uses `schemars` 1 (so no payload satisfied `JsonSchema`),
+  called `create_command_token` without its `scope` argument, and still
+  named skilj 0.0.7. It now builds against 0.0.8, and CI builds it
+  against the workspace (`scripts/check-template.sh`) so it can't
+  silently break again.
+- `docs/rest-event-reading.md` said a manual-ack batch that wasn't
+  acknowledged is served again by the next fetch. For the checkout lease
+  (5 minutes by default) the same token is served *nothing*; the guide
+  now says so, and to retry a failed batch in memory instead.
 - An instance running an **older** version of the application couldn't
   start once a newer version had registered a type with an added
   optional field or tag mapping: its startup reconciliation re-registered
