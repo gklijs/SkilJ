@@ -20,6 +20,11 @@ use skilj_core::error::SkiljRejection;
 pub fn to_graphql_error(rejection: impl SkiljRejection) -> async_graphql::Error {
     let code = rejection.code().to_string();
     let trace_id = current_trace_id();
+    // docs/architecture.md §93: the raw cause stays server-side, in this
+    // request's span, findable by the trace id the caller is given.
+    if let Some(detail) = rejection.internal_detail() {
+        tracing::error!(code = %code, error = %detail, "internal error answering a GraphQL request");
+    }
     async_graphql::Error::new(rejection.message()).extend_with(|_, ext| {
         ext.set("code", code);
         if let Some(trace_id) = &trace_id {
@@ -42,4 +47,17 @@ fn current_trace_id() -> Option<String> {
         .span_context()
         .trace_id();
     (trace_id != opentelemetry::trace::TraceId::INVALID).then(|| trace_id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    /// docs/architecture.md §93 - see `skilj-rest`'s identical test.
+    #[test]
+    fn a_database_error_does_not_reach_the_caller_verbatim() {
+        let raw = r#"duplicate key value violates unique constraint "bc_acme_corp_pkey""#;
+        let error = skilj_core::Error::Database(sqlx::Error::Protocol(raw.to_string()));
+        let rendered = super::to_graphql_error(error);
+        assert_eq!(rendered.message, "an internal database error occurred");
+        assert!(!format!("{rendered:?}").contains("acme_corp"));
+    }
 }

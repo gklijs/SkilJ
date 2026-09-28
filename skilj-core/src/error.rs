@@ -90,6 +90,16 @@ pub enum Error {
 pub trait SkiljRejection {
     fn code(&self) -> &str;
     fn message(&self) -> String;
+
+    /// Detail that must not reach a caller but belongs in the server's
+    /// log: the raw database or migration error behind a generic
+    /// [`message`](Self::message) (docs/architecture.md §93). The rendering
+    /// layers log it, in the request's span, when they turn this rejection
+    /// into a response. `None` for every business or access rejection,
+    /// whose message is already meant for the caller.
+    fn internal_detail(&self) -> Option<String> {
+        None
+    }
 }
 
 impl SkiljRejection for Error {
@@ -117,9 +127,27 @@ impl SkiljRejection for Error {
             Error::Encryption(e) => e.message(),
             Error::CommandRejected { reason, .. } => reason.clone(),
             Error::NoDeciderRegistered => self.to_string(),
-            Error::Database(e) => e.to_string(),
-            Error::Migration(e) => e.to_string(),
+            // docs/architecture.md §93: never the raw `sqlx`/Postgres text,
+            // which names schemas (bounded contexts, i.e. tenants),
+            // constraints and SQL. The caller gets the code, this, and the
+            // response's trace id; the detail goes to the server log.
+            Error::Database(sqlx::Error::RowNotFound) => {
+                "a record this request needed no longer exists".to_string()
+            }
+            Error::Database(sqlx::Error::PoolTimedOut) => {
+                "the server's database connections are all busy - retry shortly".to_string()
+            }
+            Error::Database(_) => "an internal database error occurred".to_string(),
+            Error::Migration(_) => "an internal database migration error occurred".to_string(),
             Error::BatchFailed { message, .. } => message.clone(),
+        }
+    }
+
+    fn internal_detail(&self) -> Option<String> {
+        match self {
+            Error::Database(e) => Some(e.to_string()),
+            Error::Migration(e) => Some(e.to_string()),
+            _ => None,
         }
     }
 }

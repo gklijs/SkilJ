@@ -196,7 +196,14 @@ fn status_for(err: &CoreError) -> StatusCode {
 impl IntoResponse for RestError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
-            RestError::Core(e) => (status_for(&e), e.code().to_string(), e.message()),
+            RestError::Core(e) => {
+                // docs/architecture.md §93: the raw cause stays server-side,
+                // in this request's span, findable by the returned trace id.
+                if let Some(detail) = e.internal_detail() {
+                    tracing::error!(code = %e.code(), error = %detail, "internal error answering a REST request");
+                }
+                (status_for(&e), e.code().to_string(), e.message())
+            }
             RestError::MissingCredential => (
                 StatusCode::UNAUTHORIZED,
                 "missing_credential".to_string(),
@@ -238,5 +245,47 @@ impl IntoResponse for RestError {
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RestError;
+    use axum::response::IntoResponse;
+
+    /// docs/architecture.md §93: a database error answers with its code
+    /// and a generic message - never the raw text, which names schemas
+    /// (bounded contexts, i.e. tenants), constraints and SQL.
+    #[tokio::test]
+    async fn a_database_error_does_not_reach_the_caller_verbatim() {
+        let raw = r#"relation "bc_acme_corp.events" does not exist"#;
+        let error = skilj_core::Error::Database(sqlx::Error::Protocol(raw.to_string()));
+        let response = RestError::Core(error).into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "database_error");
+        assert_eq!(body["message"], "an internal database error occurred");
+        assert!(!body.to_string().contains("acme_corp"), "{body}");
+    }
+
+    #[test]
+    fn a_vanished_row_and_pool_exhaustion_stay_distinguishable() {
+        use skilj_core::error::SkiljRejection;
+        assert_eq!(
+            skilj_core::Error::Database(sqlx::Error::RowNotFound).message(),
+            "a record this request needed no longer exists"
+        );
+        assert!(skilj_core::Error::Database(sqlx::Error::PoolTimedOut)
+            .message()
+            .contains("retry"));
+        // The detail is still there for the server log.
+        let error = skilj_core::Error::Database(sqlx::Error::Protocol("boom".to_string()));
+        assert!(error.internal_detail().unwrap().contains("boom"));
     }
 }
