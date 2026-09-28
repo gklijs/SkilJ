@@ -344,7 +344,7 @@ fn an_order_placed_event_is_sent_with_its_own_tag_as_the_group_id() {
             key_tag_key: Some("order".to_string()),
             partition: None,
         };
-        let http = reqwest::Client::new();
+        let http = skilj_amqp::http_client();
         let retry_policy = skilj_retry::RetryPolicy::default();
         let mut retry_state = None;
         let served = produce_once(
@@ -454,7 +454,7 @@ fn an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_dedup
                 event_type: "OrderPlaced".to_string(),
             },
         };
-        let http = reqwest::Client::new();
+        let http = skilj_amqp::http_client();
         dispatch_inbound_message(
             &http,
             &skilj_base_url,
@@ -551,7 +551,7 @@ fn an_inbound_record_message_forwards_its_own_correlation_and_causation_properti
                 event_type: "OrderPlaced".to_string(),
             },
         };
-        let http = reqwest::Client::new();
+        let http = skilj_amqp::http_client();
         dispatch_inbound_message(
             &http,
             &skilj_base_url,
@@ -630,7 +630,7 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_mess
                 command_type: "WithdrawMoney".to_string(),
             },
         };
-        let http = reqwest::Client::new();
+        let http = skilj_amqp::http_client();
         dispatch_inbound_message(
             &http,
             &skilj_base_url,
@@ -702,7 +702,7 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
             },
         );
 
-        let http = reqwest::Client::new();
+        let http = skilj_amqp::http_client();
         let retry_policy = skilj_retry::RetryPolicy::bounded(
             Duration::from_millis(10),
             1.0,
@@ -796,7 +796,7 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
             key_tag_key: Some("order".to_string()),
             partition: None,
         };
-        let http = reqwest::Client::new();
+        let http = skilj_amqp::http_client();
         let retry_policy = skilj_retry::RetryPolicy::bounded(
             Duration::from_millis(10),
             1.0,
@@ -901,7 +901,7 @@ fn two_partitioned_mappings_together_send_every_key_exactly_once() {
             .await
             .unwrap();
 
-        let http = reqwest::Client::new();
+        let http = skilj_amqp::http_client();
         let retry_policy = skilj_retry::RetryPolicy::default();
 
         let mapping_0 = OutboundMapping {

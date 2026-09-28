@@ -365,6 +365,43 @@ fn verify_and_extract_subject_accepts_any_configured_audience() {
     });
 }
 
+/// docs/architecture.md §82: a JWKS endpoint that accepts the connection
+/// and never answers must fail the fetch within the cache's timeout, and
+/// release the single-flight lock so later lookups aren't stuck behind it.
+#[test]
+fn a_stalled_jwks_endpoint_fails_the_fetch_instead_of_hanging() {
+    runtime().block_on(async {
+        let jwks_url =
+            serve_jwks_counting(std::time::Duration::from_secs(3600), Default::default()).await;
+        let config = idp_config(&jwks_url);
+        let cache = JwksCache::new(config.jwks_endpoint.clone())
+            .with_fetch_timeout(std::time::Duration::from_millis(200));
+        let jwt = sign_jwt(
+            "sub",
+            "user-123",
+            TEST_KID,
+            TEST_ISSUER,
+            TEST_PRIVATE_KEY_PEM,
+            false,
+        );
+
+        let bound = std::time::Duration::from_secs(5);
+        let first = tokio::time::timeout(bound, verify_and_extract_subject(&jwt, &config, &cache))
+            .await
+            .expect("the first lookup hung on the stalled JWKS endpoint")
+            .unwrap_err();
+        assert_eq!(first.code(), "jwks_fetch_failed");
+
+        // The lock was released: a second miss inside the minimum refetch
+        // interval answers at once rather than queueing forever.
+        let second = tokio::time::timeout(bound, verify_and_extract_subject(&jwt, &config, &cache))
+            .await
+            .expect("the second lookup was stuck behind the first fetch")
+            .unwrap_err();
+        assert_eq!(second.code(), "unknown_signing_key");
+    });
+}
+
 /// The reactive-refresh path ([docs/architecture.md §6](../../docs/architecture.md#idp-trust-configuration)): a `kid` the
 /// cache has never seen triggers exactly one JWKS refetch before giving
 /// up - still `None` afterward here, since the test server never

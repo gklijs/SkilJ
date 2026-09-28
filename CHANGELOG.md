@@ -193,6 +193,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression" check and the lower one land last - moving a manual-ack
   cursor backwards and redelivering events - and an ack could interleave
   with a consume's claim. Acks are now serialized with consume.
+- No outbound HTTP request had a timeout. The GraphQL JWKS fetch runs
+  under a single-flight lock, so an IdP endpoint that accepted the
+  connection and then stalled held that lock forever: every later
+  cache miss queued behind it, and after the next key rotation no one
+  could log in until restart. The fetch is now bounded
+  (`JwksCache::DEFAULT_FETCH_TIMEOUT`, 10 s; `with_fetch_timeout`). Likewise
+  a request stuck on a half-open connection stalled a Kafka/AMQP/NATS
+  outbound loop or `skilj_temporal::run` forever; each crate now has
+  `http_client()` (30 s request, 10 s connect timeout, `HTTP_REQUEST_TIMEOUT`)
+  which its own loops use and which `run_inbound`'s documentation asks
+  callers to pass.
 - A panic in application plugin code run by a background task (a
   `Projection::project` or `Snapshot` fold, a `CrossContextRoute`, a
   deadline, a scheduled event's projections) ended that task for every

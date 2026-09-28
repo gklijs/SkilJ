@@ -473,7 +473,7 @@ pub async fn run_outbound(
     poll_interval: std::time::Duration,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
-    let http = reqwest::Client::new();
+    let http = http_client();
     let mut retry_states: Vec<Option<OutboundRetryState>> = vec![None; mappings.len()];
     loop {
         let mut served_any = false;
@@ -794,6 +794,9 @@ async fn report_parked_delivery(
 /// forever. If the *report* itself fails, the delivery is deliberately
 /// left un-accepted (a real gap - better a loud, visible redelivery loop
 /// than a silently unreported poison message).
+///
+/// `http` should be bounded by a timeout - [`http_client`] is - or one
+/// request stuck on a dead connection stalls this loop forever (§82).
 pub async fn run_inbound(
     receiver: &mut AmqpReceiver,
     http: &reqwest::Client,
@@ -1010,5 +1013,57 @@ mod tests {
         let first = message_id_to_string(&MessageId::Ulong(7));
         let redelivered = message_id_to_string(&MessageId::Ulong(7));
         assert_eq!(first, redelivered);
+    }
+}
+
+/// How long one HTTP request to skilj may take, end to end, before it
+/// fails and the loop's own retry handling takes over. Without a bound, a
+/// request stuck on a half-open connection (a network partition, a
+/// stalled proxy) stalled the loop forever with nothing logged
+/// (docs/architecture.md §82). Retrying after a timeout is safe: inbound
+/// requests carry an idempotency key or dedupe cursor, and an outbound
+/// consume's checkout lease covers one that was served but never answered.
+pub const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `reqwest::Client` this crate's own loops use: bounded by
+/// [`HTTP_REQUEST_TIMEOUT`] and a 10-second connect timeout. Pass it to
+/// `run_inbound` too, unless the caller's own client is bounded already.
+pub fn http_client() -> reqwest::Client {
+    http_client_with_timeout(HTTP_REQUEST_TIMEOUT)
+}
+
+fn http_client_with_timeout(timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(std::time::Duration::from_secs(10).min(timeout))
+        .build()
+        .expect("a client with only timeouts configured always builds")
+}
+
+#[cfg(test)]
+mod http_client_tests {
+    /// A server that accepts the connection and never answers must fail
+    /// the request within the timeout, not hang the loop (§82).
+    #[tokio::test]
+    async fn a_stalled_skilj_fails_the_request_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                held.push(socket);
+            }
+        });
+        let client = super::http_client_with_timeout(std::time::Duration::from_millis(200));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .get(format!("http://{addr}/v1/events/consume"))
+                .send(),
+        )
+        .await
+        .expect("the request hung past its own timeout");
+        assert!(result.unwrap_err().is_timeout());
     }
 }

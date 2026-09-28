@@ -637,6 +637,14 @@ impl SigningAlgorithm {
 /// way this design depends on.
 pub struct JwksCache {
     client: reqwest::Client,
+    /// Bounds each JWKS fetch end to end (connect, send, read). The
+    /// refetch runs while holding `last_refetch`, so an unbounded fetch
+    /// against an IdP endpoint that accepted the connection and then
+    /// stalled held that lock forever: every later cache miss - including
+    /// the refetch a real key rotation needs - queued behind it, and no
+    /// JWT signed with a new key could be verified again until restart
+    /// (docs/architecture.md §82).
+    fetch_timeout: std::time::Duration,
     jwks_endpoint: reqwest::Url,
     min_refetch_interval: std::time::Duration,
     keys: tokio::sync::RwLock<std::collections::HashMap<String, jsonwebtoken::DecodingKey>>,
@@ -647,9 +655,20 @@ pub struct JwksCache {
 }
 
 impl JwksCache {
+    /// How long one JWKS fetch may take before it fails with
+    /// `JwksFetchFailed`.
+    pub const DEFAULT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Overrides [`DEFAULT_FETCH_TIMEOUT`](Self::DEFAULT_FETCH_TIMEOUT).
+    pub fn with_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.fetch_timeout = timeout;
+        self
+    }
+
     pub fn new(jwks_endpoint: reqwest::Url) -> Self {
         Self {
             client: reqwest::Client::new(),
+            fetch_timeout: Self::DEFAULT_FETCH_TIMEOUT,
             jwks_endpoint,
             min_refetch_interval: std::time::Duration::from_secs(5),
             keys: tokio::sync::RwLock::new(std::collections::HashMap::new()),
@@ -695,6 +714,7 @@ impl JwksCache {
         let jwks: jsonwebtoken::jwk::JwkSet = self
             .client
             .get(self.jwks_endpoint.clone())
+            .timeout(self.fetch_timeout)
             .send()
             .await
             .map_err(|e| Error::JwksFetchFailed(e.to_string()))?
