@@ -98,6 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `skilj-nats`: retrying one inbound message for longer than the
+  consumer's `ack_wait` (30 s by default; the default retry policy's
+  backoff reaches minutes) had JetStream redeliver it underneath the
+  retry loop, and every redelivered copy was dispatched again once the
+  original finished - four dispatches for one message in the test. While
+  waiting between retries the bridge now sends in-progress acks every
+  half `ack_wait`, keeping the message claimed.
 - `skilj-temporal`: `run` dropped the events a cycle was served when a
   dispatch failed, and relied on consuming them again - but a manual-ack
   consume claims what it serves for `read_cursor_checkout_lease` (five

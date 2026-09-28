@@ -811,6 +811,11 @@ pub async fn run_inbound(
     mapping: &InboundMapping,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
+    // docs/architecture.md §100: how often a message being retried is
+    // re-claimed - half the consumer's own `ack_wait`, so JetStream never
+    // sees it go unacknowledged long enough to redeliver it underneath us.
+    let claim_heartbeat =
+        (consumer.cached_info().config.ack_wait / 2).max(std::time::Duration::from_millis(100));
     loop {
         let mut messages = match consumer.messages().await {
             Ok(messages) => messages,
@@ -900,11 +905,39 @@ pub async fn run_inbound(
                             error = %e,
                             "dispatch failed - retrying after backoff"
                         );
-                        tokio::time::sleep(backoff).await;
+                        wait_keeping_claim(&message, backoff, claim_heartbeat).await;
                     }
                 }
             }
         }
+    }
+}
+
+/// Sleeps `total` while keeping `message` claimed: an in-progress ack
+/// (`AckKind::Progress`) now and every `heartbeat` after, each of which
+/// restarts the consumer's `ack_wait`. Without it, retrying one message for
+/// longer than `ack_wait` had JetStream redeliver it meanwhile, and every
+/// redelivered copy was dispatched again once the original finished
+/// (docs/architecture.md §100). A failed progress ack is only logged: the
+/// worst case is that redelivery, which skilj's own dedupe then absorbs.
+async fn wait_keeping_claim(
+    message: &JetstreamMessage,
+    total: std::time::Duration,
+    heartbeat: std::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        if let Err(e) = message
+            .ack_with(async_nats::jetstream::AckKind::Progress)
+            .await
+        {
+            tracing::warn!("sending an in-progress ack for a JetStream message failed: {e}");
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        tokio::time::sleep(heartbeat.min(deadline - now)).await;
     }
 }
 

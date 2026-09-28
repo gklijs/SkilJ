@@ -870,3 +870,75 @@ fn two_partitioned_mappings_together_publish_every_key_exactly_once() {
         );
     });
 }
+
+/// docs/architecture.md §100: JetStream redelivers a message not
+/// acknowledged within the consumer's `ack_wait`, so retrying one message
+/// for longer than that used to have it redelivered underneath the retry
+/// loop - each redelivered copy then dispatched again once the original
+/// finished. The bridge now keeps it claimed with in-progress acks while
+/// it waits. Here `ack_wait` is 1 s and the retries take about 3 s.
+#[test]
+fn a_message_retried_past_ack_wait_is_not_redelivered_meanwhile() {
+    runtime().block_on(async {
+        let Some(url) = test_nats().await else {
+            return;
+        };
+        let stream_name = unique_name("ORDERSSLOW");
+        let jetstream = jetstream_with_stream(url, &stream_name).await;
+        let consumer = jetstream
+            .get_stream(&stream_name)
+            .await
+            .unwrap()
+            .create_consumer(pull::Config {
+                durable_name: Some("slow-consumer".to_string()),
+                ack_wait: Duration::from_secs(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mock_state = MockSkiljState::default();
+        *mock_state.fail_external_requests.lock().unwrap() = 2;
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        jetstream
+            .publish(
+                format!("{stream_name}.in"),
+                r#"{"orderId":"o-slow"}"#.into(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mapping = InboundMapping {
+            credential: "external-token".to_string(),
+            action: InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        };
+        let http = skilj_nats::http_client();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(1500),
+            1.0,
+            Duration::from_millis(1500),
+            5,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mapping, &retry_policy).await;
+        });
+
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !mock_state.external_requests.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        // Long enough for any redelivered copy to be dispatched too.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            mock_state.external_requests.lock().unwrap().len(),
+            1,
+            "the message was redelivered while still being retried"
+        );
+    });
+}
