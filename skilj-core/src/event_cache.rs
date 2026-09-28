@@ -83,7 +83,37 @@ impl ContextWindow {
         self.events.front().map(|e| e.sequence)
     }
 
-    fn push(&mut self, event: Event, capacity: usize) {
+    /// Adds an event read from Postgres as part of a complete range (a
+    /// `freshen` delta): anything past the highest known sequence. One
+    /// already here - a concurrent `append` or `freshen` got to it first -
+    /// is skipped rather than held twice (docs/architecture.md §89).
+    fn push_from_database(&mut self, event: Event, capacity: usize) {
+        if self
+            .highest_known_sequence()
+            .is_some_and(|highest| event.sequence <= highest)
+        {
+            return;
+        }
+        self.push_unchecked(event, capacity);
+    }
+
+    /// Adds an event this process just committed, only if it extends the
+    /// window without a hole: exactly one past the highest known
+    /// sequence (or into an empty window, which vouches for nothing
+    /// before its first event). Commits don't reach this in order - a
+    /// concurrent commit's append, or another instance's event this cache
+    /// never hears of, can sit in between - so an event further ahead is
+    /// dropped instead of claiming the window is complete up to it; the
+    /// next read's `freshen` fills the range from Postgres. One at or
+    /// below the highest is already here (§89).
+    fn append_committed(&mut self, event: Event, capacity: usize) {
+        match self.highest_known_sequence() {
+            Some(highest) if event.sequence != highest + 1 => {}
+            _ => self.push_unchecked(event, capacity),
+        }
+    }
+
+    fn push_unchecked(&mut self, event: Event, capacity: usize) {
         self.events.push_back(event);
         while self.events.len() > capacity {
             self.events.pop_front();
@@ -148,13 +178,13 @@ impl EventCache {
     }
 
     /// The post-commit hook - called at the identical choke point
-    /// `EventBroadcaster::publish` already is, once per committed event,
-    /// regardless of origin. A bounded context this process has never
-    /// warmed or touched before (a race with warm-up, or a context
-    /// created after `.build()` returned) starts its own window here,
-    /// from empty - correctly covering from the beginning, the same as
-    /// a freshly `warm`ed one for a context with fewer than `capacity`
-    /// events total.
+    /// `EventBroadcaster::publish` already is, once per event this process
+    /// committed. It only ever extends the window contiguously (see
+    /// `ContextWindow::append_committed`): anything else is left for the
+    /// next read's `freshen` to load from Postgres. A bounded context this
+    /// process has never warmed or touched before (a race with warm-up, or
+    /// a context created after `.build()` returned) starts its own window
+    /// here, vouching only for this event onward.
     pub async fn append(&self, event: &Event) {
         if self.is_disabled() {
             return;
@@ -165,7 +195,7 @@ impl EventCache {
             .or_insert_with(|| ContextWindow {
                 events: VecDeque::new(),
             });
-        window.push(event.clone(), self.capacity);
+        window.append_committed(event.clone(), self.capacity);
     }
 
     /// Freshens `bounded_context`'s own window against Postgres (see
@@ -217,7 +247,7 @@ impl EventCache {
                 events: VecDeque::new(),
             });
         for event in delta {
-            window.push(event, self.capacity);
+            window.push_from_database(event, self.capacity);
         }
         Ok(())
     }

@@ -378,3 +378,68 @@ fn a_cold_window_fills_from_the_recent_tail() {
             .is_none());
     });
 }
+
+/// docs/architecture.md §89: instance A's window knows up to some event;
+/// instance B commits the next one (A's cache never hears of it); A then
+/// commits and appends its own. The window must not end up with a hole
+/// that a read would serve as if complete, silently skipping B's event.
+#[test]
+fn appending_past_an_unseen_event_does_not_leave_a_hole() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let first = insert_event_bypassing_cache(&pool, &bc, &et).await;
+
+        let instance_a = EventCache::new(1000);
+        instance_a.warm(&pool, &bc.name).await.unwrap();
+
+        let by_b = insert_event_bypassing_cache(&pool, &bc, &et).await;
+        let by_a = insert_event_bypassing_cache(&pool, &bc, &et).await;
+        instance_a.append(&by_a).await;
+
+        let served: Vec<i64> = instance_a
+            .try_events_after(&pool, &bc.name, first.sequence)
+            .await
+            .unwrap()
+            .expect("covered")
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(served, vec![by_b.sequence, by_a.sequence]);
+    });
+}
+
+/// §89: a read's freshen can load an event from Postgres between its
+/// commit and the committing instance's own `append`; the late append
+/// must not add it a second time.
+#[test]
+fn a_late_append_of_an_already_freshened_event_is_not_a_duplicate() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+
+        let cache = EventCache::new(1000);
+        cache.warm(&pool, &bc.name).await.unwrap();
+        let event = insert_event_bypassing_cache(&pool, &bc, &et).await;
+        // A read freshens first...
+        cache.try_events_after(&pool, &bc.name, -1).await.unwrap();
+        // ...then the committing path's append arrives.
+        cache.append(&event).await;
+
+        let served: Vec<i64> = cache
+            .try_events_after(&pool, &bc.name, -1)
+            .await
+            .unwrap()
+            .expect("covered")
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(served, vec![event.sequence]);
+    });
+}

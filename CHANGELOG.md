@@ -94,6 +94,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The in-memory event cache could **silently skip or duplicate events**.
+  Each committed event was appended to its bounded context's window
+  unconditionally, but commits don't arrive in order: another
+  instance's event (which this cache never hears of) or a concurrent
+  commit's slower post-commit step can sit in between. Appending event 12
+  to a window ending at 10 left a hole the next read trusted as
+  complete, since the window's highest sequence matched the database's. So
+  `GET /v1/events`, `GET /v1/events/consume` (whose cursor then moved past
+  the missing event for good), `queryEvents`, `countEvents` and the
+  cross-context-route/deadline catch-ups could all miss it. A read that
+  loaded an event from Postgres just before its committing instance's own
+  append added it twice. The window now only grows contiguously from
+  local commits and skips events it already holds; anything else is
+  filled from Postgres on the next read.
 - Reading a bounded context that a concurrent `DeleteBoundedContext` had
   just removed panicked (seven `.expect()` sites in `skilj-core::db`)
   instead of returning an error; it now returns `RowNotFound` like any
