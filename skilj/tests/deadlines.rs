@@ -839,3 +839,117 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
         }
     });
 }
+
+/// docs/architecture.md §96: a deadline lives in its source bounded
+/// context, whose fire tick keeps running - but its target is archived.
+/// Archiving stops new commands, so the deadline must be resolved without
+/// submitting, not left to be reclaimed and refused every few minutes
+/// forever (and, before `process_command` checked, not submitted into the
+/// archived context either).
+#[test]
+fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let mut contexts = Vec::new();
+        for prefix in ["source", "target"] {
+            let bc = BoundedContext {
+                name: unique_name(prefix),
+                status: BoundedContextStatus::Active,
+                created_at: test_now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            };
+            db::insert_bounded_context(&pool, &bc).await.unwrap();
+            db::insert_role_access_mapping(
+                &pool,
+                &RoleAccessMapping {
+                    role: role.clone(),
+                    bounded_context: bc.clone(),
+                    level: AccessLevel::Admin,
+                    can_read_sensitive: false,
+                    scope: None,
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            contexts.push(bc.name);
+        }
+        let (source, target) = (contexts[0].clone(), contexts[1].clone());
+
+        let (skilj, report) = Skilj::builder(database_url)
+            .bounded_context(target.clone())
+            .event_type::<RaceFired>()
+            .command_type::<RaceCommand>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+        db::update_bounded_context_status(&pool, &target, BoundedContextStatus::Archived)
+            .await
+            .unwrap();
+
+        let deadline_id = unique_name("deadline");
+        let now = test_now();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {}.deadlines \
+             (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+              target_command_type, payload, status, created_at) \
+             VALUES ($1, 'schedule', $2, '[]'::jsonb, NULL, $3, $4, $5, 'pending', $6)",
+            race_schema(&source)
+        )))
+        .bind(&deadline_id)
+        .bind(now - chrono::Duration::seconds(1))
+        .bind(&target)
+        .bind(RaceCommand::NAME)
+        .bind(serde_json::json!({ "order_id": "order-1" }).to_string())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        db::fire_due_deadlines(
+            &pool,
+            &*skilj.command_dispatcher(),
+            &*skilj.projection_dispatcher(),
+            &*skilj.snapshot_dispatcher(),
+            &skilj_core::event_store::EventBroadcaster::new(16),
+            &skilj_core::event_cache::EventCache::new(0),
+            &source,
+            now,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (status,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT status FROM {}.deadlines WHERE id = $1",
+            race_schema(&source)
+        )))
+        .bind(&deadline_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "fired");
+        assert!(db::list_events_for_bounded_context(&pool, &target)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}

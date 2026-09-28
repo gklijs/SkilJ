@@ -9896,6 +9896,22 @@ pub async fn fire_due_deadlines(
             mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
             continue;
         };
+        // docs/architecture.md §96: an archived target refuses the command
+        // (`process_command`), and would keep refusing it - left as an
+        // error, the claim would go stale and be retried every few minutes
+        // forever. Resolved the same way as an unregistered target.
+        if target_command_type.bounded_context.status
+            != crate::event_store::BoundedContextStatus::Active
+        {
+            tracing::warn!(
+                deadline_id = %row.id,
+                target_bounded_context = %row.target_bounded_context,
+                target_command_type = %row.target_command_type,
+                "deadline's own target bounded context is archived - marking fired without submitting"
+            );
+            mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
+            continue;
+        }
         // Claims a `'pending'` row outright, or reclaims a `'firing'` one
         // whose own `firing_at` is already past `stale_cutoff` - the
         // identical condition the `SELECT` above already filtered on,

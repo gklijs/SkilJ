@@ -900,3 +900,59 @@ fn a_catch_up_tick_is_bounded_and_the_next_one_continues() {
         );
     });
 }
+
+/// docs/architecture.md §96: archiving stops new commands and events. The
+/// public surfaces check that in their authorisation rules, but routes,
+/// deadlines and parked redrives submit through `decide_and_submit_command`
+/// directly - which must refuse an archived bounded context too.
+#[test]
+fn a_command_into_an_archived_bounded_context_is_refused() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let inventory_bc = seed_bounded_context(&pool).await;
+        seed_stock_reserved_event_type(&pool, &inventory_bc).await;
+        seed_command_type(&pool, &inventory_bc, "ReserveStock").await;
+        db::update_bounded_context_status(
+            &pool,
+            &inventory_bc.name,
+            skilj_core::event_store::BoundedContextStatus::Archived,
+        )
+        .await
+        .unwrap();
+        let target_ct = db::get_command_type(&pool, &inventory_bc.name, "ReserveStock")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = db::decide_and_submit_command(
+            &pool,
+            &FlakyCommandDispatcher::new(0),
+            &NoopProjectionDispatcher,
+            &NoopSnapshotDispatcher,
+            &EventBroadcaster::new(16),
+            &EventCache::new(1000),
+            &target_ct,
+            r#"{"order_id":"order-1"}"#,
+            db::CROSS_CONTEXT_ROUTE_CLIENT_ID,
+            None,
+            None,
+            None,
+            Utc::now(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            skilj_core::error::SkiljRejection::code(&err),
+            "bounded_context_archived"
+        );
+        assert!(
+            db::list_events_for_bounded_context(&pool, &inventory_bc.name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}

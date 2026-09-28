@@ -98,6 +98,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Archiving a bounded context stopped commands and events from the
+  GraphQL and REST surfaces, but not from the library's own internal
+  submissions: a `CrossContextRoute` targeting it, a deadline firing into
+  it, and `retryParkedDelivery` of a route delivery all still committed
+  commands and events into the archived context. Every command is now
+  refused for an archived context where it is decided, whatever path it
+  took; a route parks the refused delivery as usual, and a deadline whose
+  target is archived is resolved without submitting (as one whose target
+  command type is unregistered already was) instead of being reclaimed
+  and refused every few minutes forever.
 - Live `allEvents`/`eventsByType` subscriptions delivered events in the
   order they were *published* to this instance, not commit order, and
   could skip one entirely: two concurrent commits publish in either
@@ -303,6 +313,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Hard-deleting a bounded context frees its name for reuse, but the
+  in-memory event cache keyed its windows by name and never evicted
+  them: a bounded context recreated under the same name (for example a
+  new tenant given a deleted one's name) was served its **predecessor's**
+  cached events by every cache-backed read - `GET /v1/events`, consume,
+  `queryEvents`, `countEvents`, command decisions - on every instance
+  that had cached them, and once the new context's sequence passed the
+  old window its own events were mixed in. Each window now records the
+  identity of the `events` table it was filled from (read together with
+  the latest sequence, in the same query) and is refilled when that
+  changes.
 - REST and GraphQL error responses carried raw database error text in
   `message` - Postgres messages naming schemas (`bc_<bounded context>`,
   i.e. tenant names), constraints and SQL fragments - including to a

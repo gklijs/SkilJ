@@ -3941,6 +3941,14 @@ pub fn process_command(
     if !valid_correlation_id(correlation_id) || !valid_correlation_id(causation_id) {
         return Err(Error::CorrelationIdTooLong.into());
     }
+    // docs/architecture.md §96: archiving stops new commands and events.
+    // The public surfaces refuse an archived context in their own
+    // authorisation rules, but routes, deadlines and parked redrives
+    // submit without one - so the rule every command goes through
+    // enforces it for all of them.
+    if command_type.bounded_context.status != BoundedContextStatus::Active {
+        return Err(Error::BoundedContextArchived.into());
+    }
 
     let event_specs = match decision {
         CommandDecision::Accepted { events } => events,

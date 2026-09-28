@@ -3698,6 +3698,13 @@ rule ProcessCommand {
     let prior_outcome = recorded_acceptance(command_type, client_id, idempotency_key)
     requires: prior_outcome = null
 
+    -- Archiving stops new commands (see rule ArchiveBoundedContext), and
+    -- this is where every command is decided, whichever way it arrived:
+    -- the authorisation rules refuse an archived context already, but a
+    -- command this library submits on its own behalf - a routed or
+    -- deadline-fired one - reaches here without them.
+    requires: command_type.bounded_context.status = active
+
     -- Both carried here untouched from whichever surface authorised the
     -- command, and both checked separately by the same predicate - see the
     -- correlation note above the rules for what each means, why the check
