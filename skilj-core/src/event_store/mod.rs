@@ -2958,6 +2958,8 @@ pub fn deliver_to_subscriptions(
 #[derive(Clone)]
 pub struct EventBroadcaster {
     sender: tokio::sync::broadcast::Sender<Event>,
+    /// Bumped by [`signal_gap`](Self::signal_gap) - see there.
+    gaps: std::sync::Arc<tokio::sync::watch::Sender<u64>>,
     instance_id: String,
 }
 
@@ -2970,8 +2972,10 @@ impl EventBroadcaster {
         // `broadcast::channel` panics on a zero capacity; one is the
         // smallest real buffer (a slow subscriber then lags sooner).
         let (sender, _receiver) = tokio::sync::broadcast::channel(capacity.max(1));
+        let (gaps, _gaps_receiver) = tokio::sync::watch::channel(0);
         Self {
             sender,
+            gaps: std::sync::Arc::new(gaps),
             instance_id: crate::shared::generate_token_id(),
         }
     }
@@ -3013,6 +3017,24 @@ impl EventBroadcaster {
     /// itself already models this way.
     pub fn publish(&self, event: &Event) {
         let _ = self.sender.send(event.clone());
+    }
+
+    /// Tells every live subscriber that events may have been committed
+    /// that this broadcaster never published - the cross-instance
+    /// listener's connection dropped, and another instance's `NOTIFY`s
+    /// sent meanwhile are gone (docs/architecture.md §83). A subscriber
+    /// treats it exactly like its own receiver lagging: an event
+    /// subscription ends with `subscription_lagged` (`DeliveryIsAtMostOnce`:
+    /// no silent gaps), a projection subscription refetches.
+    pub fn signal_gap(&self) {
+        self.gaps.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// A receiver for [`signal_gap`](Self::signal_gap), taken alongside
+    /// [`subscribe`](Self::subscribe): its `changed()` resolves on the
+    /// next gap signalled after this call.
+    pub fn subscribe_gaps(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.gaps.subscribe()
     }
 }
 

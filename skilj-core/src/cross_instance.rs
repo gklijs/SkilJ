@@ -22,21 +22,17 @@
 //! §3.1); it has no reason to know `skilj-graphql`'s `SchemaRegistry`
 //! exists.
 //!
-//! **Delivery is at-most-once, deliberately** - a dropped connection
-//! reconnects on its own (`sqlx::postgres::PgListener::recv`'s own
-//! documented behavior: it re-establishes a connection from the same
-//! pool and automatically re-`LISTEN`s on every channel this `Listener`
-//! ever subscribed to), but any notification sent while disconnected is
-//! gone for good. Every message here is a liveliness signal only, never
-//! a correctness-bearing write - Postgres remains the durable source of
-//! truth throughout, so a missed message just means the same self-heal
-//! path a same-process lagged receiver already takes (a fresh read),
-//! never data loss for events or registrations. Revocation is the one
-//! asymmetric case - see `@guarantee DeliverySpansInstances`'s own
-//! second paragraph in the spec: a missed revocation reach doesn't leak
-//! events (`DeliverToSubscriptions` re-checks `access_mapping.status`
-//! live on every delivery regardless), but it does leave a revoked
-//! subscription open and silent for longer than the happy path.
+//! **Delivery is at-most-once, deliberately** - any notification sent
+//! while the listening connection is down is gone for good. Every
+//! message here is a liveliness signal only, never a correctness-bearing
+//! write; Postgres remains the durable source of truth. What makes that
+//! safe is that a loss is *noticed*: [`Listener::recv`] reconnects
+//! explicitly and returns [`Message::Resync`], and the caller re-reads
+//! everything the channels drive (docs/architecture.md §83). It used to
+//! rely on `PgListener::recv`'s transparent reconnect, which hid the
+//! loss entirely: a registration change made meanwhile left this
+//! instance's schema stale until the next one arrived, and local event
+//! subscribers silently skipped the missed events.
 
 use crate::access_control::RevokedMapping;
 use crate::db::Pool;
@@ -95,6 +91,13 @@ pub enum Message {
     /// exact type or bounded context changed doesn't matter, every
     /// listener reacts identically (rebuild the whole schema).
     RegistrationChanged,
+    /// Not a channel: the listening connection dropped and has been
+    /// re-established (and re-`LISTEN`ed) since the previous message, so
+    /// any notification sent in between was lost. Everything the three
+    /// channels drive has to be treated as possibly stale - rebuild the
+    /// schema, and tell local subscribers they may have missed events
+    /// (docs/architecture.md §83).
+    Resync,
 }
 
 #[derive(serde::Deserialize)]
@@ -127,7 +130,11 @@ struct RevokedPayload {
 /// three channels from [`connect`](Listener::connect) onward - callers
 /// only ever see already-decoded [`Message`]s, never raw channel names
 /// or JSON payloads.
-pub struct Listener(sqlx::postgres::PgListener);
+pub struct Listener {
+    pool: Pool,
+    /// `None` between a detected connection loss and the reconnect.
+    inner: Option<sqlx::postgres::PgListener>,
+}
 
 impl Listener {
     /// Opens one dedicated listening connection (from `pool`) and
@@ -135,6 +142,13 @@ impl Listener {
     /// instance is the intended shape - see `skilj::SkiljBuilder::build`'s
     /// own call site.
     pub async fn connect(pool: &Pool) -> crate::error::Result<Self> {
+        Ok(Self {
+            pool: pool.clone(),
+            inner: Some(Self::listen(pool).await?),
+        })
+    }
+
+    async fn listen(pool: &Pool) -> crate::error::Result<sqlx::postgres::PgListener> {
         let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
         listener
             .listen_all([
@@ -143,7 +157,7 @@ impl Listener {
                 REGISTRATION_CHANGED_CHANNEL,
             ])
             .await?;
-        Ok(Self(listener))
+        Ok(listener)
     }
 
     /// Blocks until the next cross-instance message. `PgListener::recv`
@@ -155,9 +169,37 @@ impl Listener {
     /// something that stops the loop over one bad message - the same
     /// "a gap self-heals, isn't fatal" principle every channel here
     /// already follows.
+    ///
+    /// A dropped connection is *not* reconnected transparently (as
+    /// `PgListener::recv` would): `try_recv` reports it, this reconnects
+    /// and re-`LISTEN`s first, and only then returns [`Message::Resync`] -
+    /// so whatever the caller re-reads in response can't miss a change
+    /// made after it. If reconnecting fails, the error is returned and
+    /// the next call tries again.
     pub async fn recv(&mut self) -> crate::error::Result<Message> {
         loop {
-            let notification = self.0.recv().await?;
+            let listener = match &mut self.inner {
+                Some(listener) => listener,
+                None => {
+                    self.inner = Some(Self::listen(&self.pool).await?);
+                    return Ok(Message::Resync);
+                }
+            };
+            let received = match listener.try_recv().await {
+                Ok(received) => received,
+                Err(err) => {
+                    // Whatever went wrong, the connection can't be trusted
+                    // not to have missed something: the next call
+                    // reconnects and reports `Resync`.
+                    self.inner = None;
+                    return Err(err.into());
+                }
+            };
+            let Some(notification) = received else {
+                tracing::warn!("cross-instance listener connection lost, reconnecting");
+                self.inner = None;
+                continue;
+            };
             match notification.channel() {
                 EVENTS_CHANNEL => {
                     match serde_json::from_str::<EventAppendedPayload>(notification.payload()) {

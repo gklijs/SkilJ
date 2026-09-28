@@ -193,6 +193,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression" check and the lower one land last - moving a manual-ack
   cursor backwards and redelivering events - and an ack could interleave
   with a consume's claim. Acks are now serialized with consume.
+- When an instance's cross-instance listener lost its Postgres
+  connection, it reconnected silently and every `NOTIFY` sent meanwhile
+  was lost unnoticed: a type or bounded context registered on another
+  instance stayed missing from this instance's GraphQL schema until some
+  later registration change, and live `allEvents`/`eventsByType`
+  subscriptions here silently skipped the events other instances
+  committed in the gap. The listener now reports the loss
+  (`cross_instance::Message::Resync`, after re-listening); the instance
+  rebuilds its schema and template cache, and live event subscriptions
+  end with `subscription_lagged` - as on a local lag - so clients resume
+  from their last sequence. `projectionUpdates` refetches instead. New
+  `EventBroadcaster::signal_gap`/`subscribe_gaps`.
 - No outbound HTTP request had a timeout. The GraphQL JWKS fetch runs
   under a single-flight lock, so an IdP endpoint that accepted the
   connection and then stalled held that lock forever: every later

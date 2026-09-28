@@ -97,6 +97,7 @@ pub fn projection_updates_field() -> SubscriptionField {
                 // already reflected in the snapshot read or delivered
                 // live, never neither.
                 let mut rx = state.event_broadcaster.subscribe();
+                let mut gap_rx = state.event_broadcaster.subscribe_gaps();
 
                 let (initial_value, type_name) = fetch_projection_result(
                     &state,
@@ -149,6 +150,9 @@ pub fn projection_updates_field() -> SubscriptionField {
                                     }
                                 }
                             }
+                            // A cross-instance gap (§83) is handled like
+                            // lagging: refetch current state.
+                            Ok(()) = gap_rx.changed() => Err(RecvError::Lagged(0)),
                             event = rx.recv() => event,
                         };
 

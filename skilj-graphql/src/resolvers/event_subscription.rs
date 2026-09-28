@@ -66,6 +66,18 @@ fn subscription_lagged_error(skipped: u64) -> async_graphql::Error {
     .extend_with(|_, ext| ext.set("code", "subscription_lagged"))
 }
 
+/// `EventBroadcaster::signal_gap`: events from another instance may have
+/// been missed (docs/architecture.md §83) - the same outcome as lagging,
+/// so the same code.
+fn subscription_gap_error() -> async_graphql::Error {
+    async_graphql::Error::new(
+        "this instance may have missed events committed by another instance \
+         (its cross-instance connection dropped) and cannot resume without a gap - \
+         reconnect and, if needed, catch up via queryEvents/countEvents first",
+    )
+    .extend_with(|_, ext| ext.set("code", "subscription_lagged"))
+}
+
 /// `RevocationClosesTheConnection`'s push half (drift audit finding #4,
 /// see project memory `skilj-drift-audit-2026-08-20`) - both subscription
 /// loops below `tokio::select!` against `state.revocation_broadcaster`
@@ -164,6 +176,7 @@ pub fn all_events_field() -> SubscriptionField {
             // that already existed at publish time, never delivered it
             // either) - silently missed, on both sides at once.
             let mut rx = state.event_broadcaster.subscribe();
+            let mut gap_rx = state.event_broadcaster.subscribe_gaps();
 
             // The rule's default starting point is the bounded context's
             // latest sequence - one `MAX(sequence)`, resolved here and
@@ -217,6 +230,10 @@ pub fn all_events_field() -> SubscriptionField {
                                 return Ok(());
                             }
                         }
+                    }
+                    Ok(()) = gap_rx.changed() => {
+                        yielder.yield_error(subscription_gap_error()).await;
+                        return Ok(());
                     }
                     event = rx.recv() => event,
                   };
@@ -360,6 +377,7 @@ pub fn events_by_type_field() -> SubscriptionField {
             // `all_events_field`'s own identical comment for why (drift
             // audit finding #7).
             let mut rx = state.event_broadcaster.subscribe();
+            let mut gap_rx = state.event_broadcaster.subscribe_gaps();
 
             // See `all_events_field`'s identical step.
             let from_sequence = resolve_from_sequence(
@@ -410,6 +428,10 @@ pub fn events_by_type_field() -> SubscriptionField {
                                 return Ok(());
                             }
                         }
+                    }
+                    Ok(()) = gap_rx.changed() => {
+                        yielder.yield_error(subscription_gap_error()).await;
+                        return Ok(());
                     }
                     event = rx.recv() => event,
                   };

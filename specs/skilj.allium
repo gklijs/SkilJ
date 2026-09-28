@@ -7168,8 +7168,12 @@ surface EventSubscription {
         -- live feed and nothing else: the event is committed, readable
         -- over FetchEvents, QueryEvents and QueryProjection, and picked
         -- up by the caller's own reconnect handoff from the last sequence
-        -- it received. For a revocation, delivery has already stopped
-        -- regardless - every delivery re-checks the grant's durable
+        -- it received. That handoff needs the caller to know: an
+        -- instance that can tell it may have missed a reach (its link to
+        -- the shared database dropped) ends its live subscriptions the
+        -- way a lagging one does (see DeliveryIsAtMostOnce), rather than
+        -- carry on past the gap. For a revocation, delivery has already
+        -- stopped regardless - every delivery re-checks the grant's durable
         -- status live rather than trusting a snapshot (see the note above
         -- DeliverToSubscriptions) - so what a lost reach delays is the
         -- reasoned close, leaving a revoked connection open and silent
@@ -7845,8 +7849,9 @@ surface TypeRegistration {
         -- that misses the notice is behind rather than wrong - it serves
         -- the types it already knows correctly, rejects the new one as
         -- unregistered rather than mishandling it, and comes into line as
-        -- soon as it reads registered state again, at its next startup
-        -- reconciliation pass at the latest.
+        -- soon as it reads registered state again: as soon as it notices
+        -- its link to the shared database dropped, and at its next
+        -- startup reconciliation pass at the latest.
 
     @guarantee SchemaEvolutionStaysCompatible
         -- Re-registering an EventType, CommandType or Projection with a

@@ -2595,7 +2595,8 @@ impl SkiljBuilder {
                             cross_instance_revocation_broadcaster.publish(revoked);
                         }
                     }
-                    skilj_core::cross_instance::Message::RegistrationChanged => {
+                    message @ (skilj_core::cross_instance::Message::RegistrationChanged
+                    | skilj_core::cross_instance::Message::Resync) => {
                         if let Err(err) = cross_instance_schema_registry
                             .rebuild(cross_instance_state.clone())
                             .await
@@ -2613,6 +2614,13 @@ impl SkiljBuilder {
                                 error = %err,
                                 "cross-instance template cache refresh failed"
                             );
+                        }
+                        // docs/architecture.md §83: notifications were lost
+                        // while the listener was reconnecting. Signalled
+                        // after the rebuild above, so a subscriber that
+                        // reconnects in response finds the fresh schema.
+                        if matches!(message, skilj_core::cross_instance::Message::Resync) {
+                            cross_instance_event_broadcaster.signal_gap();
                         }
                     }
                 }
