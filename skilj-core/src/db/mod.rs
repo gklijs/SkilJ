@@ -4961,6 +4961,26 @@ pub async fn next_sequence_batch<'e>(
 /// reload - `list_events_for_bounded_context_from` only ever runs once
 /// this comes back higher than everything that still needs catching up.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+/// The identity of `bounded_context`'s `events` table (its OID) together
+/// with [`latest_sequence`], in one round trip. Hard-deleting a bounded
+/// context drops its schema and frees the name for reuse, and recreating
+/// it creates a new table with a new OID - so anything keyed by the *name*
+/// (the event cache's windows) can tell a successor from its predecessor,
+/// which sequences alone can't (docs/architecture.md §95).
+pub async fn events_table_identity(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<(i64, Option<i64>)> {
+    let schema = schema_ident(bounded_context);
+    let (oid, max): (i64, Option<i64>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT '{schema}.events'::regclass::oid::bigint, \
+                (SELECT MAX(sequence) FROM {schema}.events)"
+    )))
+    .fetch_one(pool)
+    .await?;
+    Ok((oid, max))
+}
+
 pub async fn latest_sequence(
     pool: &Pool,
     bounded_context: &str,

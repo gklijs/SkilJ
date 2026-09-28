@@ -443,3 +443,66 @@ fn a_late_append_of_an_already_freshened_event_is_not_a_duplicate() {
         assert_eq!(served, vec![event.sequence]);
     });
 }
+
+/// docs/architecture.md §95: hard-deleting a bounded context frees its name
+/// for reuse, and the cache keys windows by name. A window left from the
+/// deleted context must never be served for its successor - neither while
+/// the new one has fewer events than the old window, nor once it passes it.
+#[test]
+fn a_recreated_bounded_context_never_sees_its_predecessors_cached_events() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        for _ in 0..3 {
+            insert_event_bypassing_cache(&pool, &bc, &et).await;
+        }
+        let cache = EventCache::new(1000);
+        cache.warm(&pool, &bc.name).await.unwrap();
+        assert_eq!(
+            cache
+                .try_events_after(&pool, &bc.name, -1)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        db::hard_delete_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        let et = seed_event_type(&pool, &bc).await;
+        let first = insert_event_bypassing_cache(&pool, &bc, &et).await;
+
+        let served = |cache: EventCache| {
+            let pool = pool.clone();
+            let name = bc.name.clone();
+            async move {
+                cache
+                    .try_events_after(&pool, &name, -1)
+                    .await
+                    .unwrap()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| (e.sequence, e.metadata.created_at))
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            served(cache.clone()).await,
+            vec![(first.sequence, first.metadata.created_at)],
+            "fewer events than the old window"
+        );
+
+        let mut expected = vec![(first.sequence, first.metadata.created_at)];
+        for _ in 0..4 {
+            let e = insert_event_bypassing_cache(&pool, &bc, &et).await;
+            expected.push((e.sequence, e.metadata.created_at));
+        }
+        assert_eq!(served(cache).await, expected, "past the old window");
+    });
+}

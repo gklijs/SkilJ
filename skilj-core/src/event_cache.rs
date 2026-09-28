@@ -69,6 +69,12 @@ use std::sync::Arc;
 struct ContextWindow {
     /// Ascending by `sequence`, length capped at `EventCache::capacity`.
     events: VecDeque<Event>,
+    /// The `events` table these came from (`db::events_table_identity`),
+    /// or `None` for a window only `append` has touched. A bounded context
+    /// hard-deleted and recreated under the same name has a new table, so
+    /// a mismatch means these events belong to its predecessor and the
+    /// window is refilled rather than served (docs/architecture.md §95).
+    table: Option<i64>,
 }
 
 impl ContextWindow {
@@ -164,6 +170,20 @@ impl EventCache {
         if self.is_disabled() {
             return Ok(());
         }
+        let (table, _) = crate::db::events_table_identity(pool, bounded_context).await?;
+        self.refill(pool, bounded_context, table).await
+    }
+
+    /// Replaces `bounded_context`'s window with its most recent `capacity`
+    /// events, stamped with `table` - read by the caller *before* the
+    /// events, so a delete-and-recreate racing this leaves a stale stamp
+    /// the next `freshen` notices, never a fresh stamp on old events.
+    async fn refill(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        table: i64,
+    ) -> crate::error::Result<()> {
         let recent =
             crate::db::list_recent_events_for_bounded_context(pool, bounded_context, self.capacity)
                 .await?;
@@ -172,6 +192,7 @@ impl EventCache {
             bounded_context.to_string(),
             ContextWindow {
                 events: recent.into(),
+                table: Some(table),
             },
         );
         Ok(())
@@ -194,6 +215,7 @@ impl EventCache {
             .entry(event.bounded_context.name.clone())
             .or_insert_with(|| ContextWindow {
                 events: VecDeque::new(),
+                table: None,
             });
         window.append_committed(event.clone(), self.capacity);
     }
@@ -202,13 +224,20 @@ impl EventCache {
     /// this module's own doc comment on why every call does this, not
     /// just a cold one) and returns whether it now covers `sequence`.
     async fn freshen(&self, pool: &Pool, bounded_context: &str) -> crate::error::Result<()> {
-        let known = {
+        let (known, known_table) = {
             let contexts = self.contexts.read().await;
-            contexts
-                .get(bounded_context)
-                .and_then(|w| w.highest_known_sequence())
+            match contexts.get(bounded_context) {
+                Some(w) => (w.highest_known_sequence(), w.table),
+                None => (None, None),
+            }
         };
-        let latest = crate::db::latest_sequence(pool, bounded_context).await?;
+        let (table, latest) = crate::db::events_table_identity(pool, bounded_context).await?;
+        // docs/architecture.md §95: a window from another incarnation of
+        // this name - or one only `append` has started, which can't vouch
+        // for its table - is replaced wholesale.
+        if known_table.is_some_and(|t| t != table) || (known_table.is_none() && known.is_some()) {
+            return self.refill(pool, bounded_context, table).await;
+        }
         if known == latest {
             return Ok(());
         }
@@ -219,20 +248,7 @@ impl EventCache {
         // the last `capacity` of them (docs/architecture.md §79).
         let behind_by = latest.map(|l| l - known.unwrap_or(-1)).unwrap_or(0);
         if known.is_none() || behind_by > i64::try_from(self.capacity).unwrap_or(i64::MAX) {
-            let recent = crate::db::list_recent_events_for_bounded_context(
-                pool,
-                bounded_context,
-                self.capacity,
-            )
-            .await?;
-            let mut contexts = self.contexts.write().await;
-            contexts.insert(
-                bounded_context.to_string(),
-                ContextWindow {
-                    events: recent.into(),
-                },
-            );
-            return Ok(());
+            return self.refill(pool, bounded_context, table).await;
         }
         let delta = crate::db::list_events_for_bounded_context_from(
             pool,
@@ -245,6 +261,7 @@ impl EventCache {
             .entry(bounded_context.to_string())
             .or_insert_with(|| ContextWindow {
                 events: VecDeque::new(),
+                table: Some(table),
             });
         for event in delta {
             window.push_from_database(event, self.capacity);
