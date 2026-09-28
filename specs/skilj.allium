@@ -98,8 +98,8 @@
 --     concrete GraphQL type, field and argument naming, paging and error
 --     shape are all still deferred to a later, more detailed pass
 --   - The external IdP trust configuration values themselves - JWKS
---     endpoint, issuer, signing algorithm, and which claim carries the
---     subject (default "sub"). Resolved as runtime/library
+--     endpoint, issuer, expected audience, signing algorithm, and which
+--     claim carries the subject (default "sub"). Resolved as runtime/library
 --     configuration for exactly one trusted IdP, in the same register
 --     as the event cache's startup warm-up count, rather than modelled
 --     as domain state; the additive path to trusting several IdPs later
@@ -1147,8 +1147,9 @@ entity BootstrapSecret {
 --
 -- What "the trusted IdP" resolves to concretely is runtime/library
 -- configuration, not domain state. A deployment trusts exactly one
--- external IdP, and that IdP's JWKS endpoint, issuer, expected signing
--- algorithm, and which claim carries the subject (defaulting to the
+-- external IdP, and that IdP's JWKS endpoint, issuer, the audience its
+-- tokens for this deployment carry, expected signing algorithm, and
+-- which claim carries the subject (defaulting to the
 -- standard "sub", but configurable) are all set when the process
 -- starts. None of them is a registered entity, a field on anything, or
 -- an admin-managed value - the same register as the in-memory event

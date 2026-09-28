@@ -96,7 +96,7 @@ let (skilj, report) = Skilj::builder(database_url)
     .bounded_context("banking")
     .auto_register()
     .reconciliation_role("banking-service@example.com") // step 3's externalSubject
-    .identity_provider(IdpConfig::new(jwks_url, issuer, SigningAlgorithm::Rs256))
+    .identity_provider(IdpConfig::new(jwks_url, issuer, audience, SigningAlgorithm::Rs256))
     .build()
     .await?;
 

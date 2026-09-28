@@ -80,7 +80,7 @@ what a rejected registration's error actually means.
 ## `.identity_provider(...)` is a separate axis, easy to conflate with the above
 
 Granting a Role `Admin` access via `RoleAccessMapping` is *authorization*
-- what that Role can do once identified. `.identity_provider(IdpConfig::new(jwks_url, issuer, algorithm))`
+- what that Role can do once identified. `.identity_provider(IdpConfig::new(jwks_url, issuer, audience, algorithm))`
 is *authentication* - how a GraphQL caller's bearer JWT gets verified
 into a `Role` at all. Omitting it entirely still lets `.build()` and
 `createSuperadmin` work (that one mutation has no Role-based actor
@@ -89,3 +89,10 @@ behind it), but no other GraphQL resolver can ever authenticate anyone
 without a configured IdP to verify it against. REST tokens
 (`CommandToken`/`EventReadToken`/etc.) are unaffected either way - they
 carry their own `id.secret` credential, not a JWT.
+
+`audience` is required: the `aud` value the IdP puts in tokens issued for
+this deployment (usually its client id there). A token without a matching
+`aud` - including one the same IdP issued to a different application - is
+rejected with `JwtVerificationFailed`. If users reach skilj through more
+than one client registration, add each with
+`.with_additional_audience(...)`.

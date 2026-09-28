@@ -73,6 +73,8 @@ const TEST_MODULUS_N: &str = "zx1RbFB4ll0mxv0wooNXE0BzU-hZ6GKGbTBI7w4kAK7Di_3RaD
 const TEST_EXPONENT_E: &str = "AQAB";
 const TEST_KID: &str = "test-key-1";
 const TEST_ISSUER: &str = "https://idp.example.test/";
+/// The `aud` this deployment's tokens carry - `IdpConfig` requires one.
+const TEST_AUDIENCE: &str = "skilj-test-client";
 
 // --- fixtures ---
 
@@ -396,6 +398,7 @@ fn sign_jwt(subject: &str) -> String {
     let claims = json!({
         "sub": subject,
         "iss": TEST_ISSUER,
+        "aud": TEST_AUDIENCE,
         "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
@@ -638,6 +641,7 @@ fn projection_updates_pushes_initial_state_then_each_change_then_closes_on_revoc
             .identity_provider(IdpConfig::new(
                 jwks_url.parse().unwrap(),
                 TEST_ISSUER,
+                TEST_AUDIENCE,
                 SigningAlgorithm::Rs256,
             ))
             .bounded_context(fixture.bc_name.clone())
@@ -788,6 +792,7 @@ fn projection_updates_only_fires_for_the_subscribed_key() {
             .identity_provider(IdpConfig::new(
                 jwks_url.parse().unwrap(),
                 TEST_ISSUER,
+                TEST_AUDIENCE,
                 SigningAlgorithm::Rs256,
             ))
             .bounded_context(fixture.bc_name.clone())
@@ -942,6 +947,7 @@ fn team_only_projection_rejects_subscription_before_any_push() {
             .identity_provider(IdpConfig::new(
                 jwks_url.parse().unwrap(),
                 TEST_ISSUER,
+                TEST_AUDIENCE,
                 SigningAlgorithm::Rs256,
             ))
             .bounded_context(fixture.bc_name.clone())
@@ -1042,6 +1048,7 @@ fn projection_updates_waits_for_async_projection_catch_up() {
             .identity_provider(IdpConfig::new(
                 jwks_url.parse().unwrap(),
                 TEST_ISSUER,
+                TEST_AUDIENCE,
                 SigningAlgorithm::Rs256,
             ))
             .bounded_context(fixture.bc_name.clone())

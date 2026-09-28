@@ -9489,3 +9489,15 @@ Checked and left alone:
 - **The Kafka/AMQP/NATS/Temporal bridges** run their own loops outside this crate and aren't covered here.
 
 Test: `a_panicking_projection_does_not_stop_catch_up_for_other_bounded_contexts` (`skilj/tests/background_task_panics.rs`): a panicking async projection in one bounded context, then an event in another. The healthy projection never updated before the fix; after it, the broken projection panics every tick and the healthy one catches up.
+
+## 81. JWT audience is required
+
+`verify_and_extract_subject` checked the signature, issuer, algorithm and expiry, but set `validate_aud = false`, and `IdpConfig` had no audience at all. The comment explained why: `jsonwebtoken::Validation::new` defaults to checking `aud` against an empty expected set, which rejected every real OIDC token (found against Dex in `skilj-helpdesk`), so the check was turned off rather than configured.
+
+That left an audience-confusion hole. An IdP issues tokens to every application registered with it, all under the same `iss` and the same JWKS. With `aud` unchecked, a token issued to any other application at that IdP - a third-party app a user signed into, an internal tool, a compromised client - was a valid skilj credential for that user, and resolved to their skilj `Role` (step 3 of the spec's identity resolution note matches on the subject alone). The spec's "trusts the subject claim of a *verified* JWT" assumed verification established that the token was meant for this deployment. Reproduced: a validly signed token with `aud: "some-other-app"` was accepted.
+
+Fix (breaking, chosen over an opt-in check so a deployment can't be left open by omission): `IdpConfig::new(jwks_endpoint, issuer, audience, signing_algorithm)`, plus `with_additional_audience` for a deployment reached through several client registrations. `IdpConfig::audiences` is never empty. Validation uses `set_audience(&audiences)` - a token passes if any of its `aud` values (string or array) matches any configured one - and adds `aud` to the required claims. Without that, `jsonwebtoken` skips the check for a token that has no `aud`, and such a token would still get through. The spec's two lists of IdP configuration values now include the expected audience (prose only; `allium check` unchanged).
+
+Tests (`skilj-core/tests/jwt_verification.rs`): `verify_and_extract_subject_rejects_a_token_for_another_audience` (another app's `aud`, an array of only other apps, and no `aud`; fails against the old validation) and `verify_and_extract_subject_accepts_any_configured_audience` (the primary, an additional one, and an array containing ours). Every other test that mints a JWT now carries `aud`.
+
+Also from this pass: `db::schema_ident` doubles an embedded `"` when quoting a bounded context name. No reachable path supplies one - names are validated at creation (`valid_bounded_context_name`), and resolvers check access, and so existence, before touching a per-context schema - but the function's doc comment calls the quoting defence in depth, and it wasn't without the escape. Unit test `schema_ident_quotes_and_escapes`.

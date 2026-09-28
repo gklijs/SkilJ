@@ -54,6 +54,8 @@ const TEST_MODULUS_N: &str = "zx1RbFB4ll0mxv0wooNXE0BzU-hZ6GKGbTBI7w4kAK7Di_3RaD
 const TEST_EXPONENT_E: &str = "AQAB";
 const TEST_KID: &str = "test-key-1";
 const TEST_ISSUER: &str = "https://idp.example.test/";
+/// The `aud` this deployment's tokens carry - `IdpConfig` requires one.
+const TEST_AUDIENCE: &str = "skilj-test-client";
 
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
 
@@ -152,6 +154,7 @@ fn sign_jwt(subject: &str) -> String {
     let claims = json!({
         "sub": subject,
         "iss": TEST_ISSUER,
+        "aud": TEST_AUDIENCE,
         "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
@@ -173,6 +176,7 @@ async fn setup() -> (Skilj, Pool) {
         .identity_provider(IdpConfig::new(
             jwks_url.parse().unwrap(),
             TEST_ISSUER,
+            TEST_AUDIENCE,
             SigningAlgorithm::Rs256,
         ))
         .build()

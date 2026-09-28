@@ -543,6 +543,13 @@ pub struct IdpConfig {
     pub jwks_endpoint: reqwest::Url,
     pub issuer: String,
     pub signing_algorithm: SigningAlgorithm,
+    /// The `aud` values a JWT must carry (at least one of) to be accepted:
+    /// this deployment's own client id(s) at the IdP. Required, never
+    /// empty. An IdP issues tokens to every application registered with
+    /// it, all under the same `issuer` and signing keys, so without this
+    /// check a token issued to any *other* application at the same IdP
+    /// would be accepted here as its user (docs/architecture.md §81).
+    pub audiences: Vec<String>,
     /// Defaults to `"sub"`, the standard JWT subject claim - the one
     /// degree of freedom the spec's own note leaves step 2 ("SkilJ
     /// trusts the subject claim of a verified JWT... configurable" per
@@ -551,17 +558,31 @@ pub struct IdpConfig {
 }
 
 impl IdpConfig {
+    /// `audience` is the `aud` value the IdP puts in tokens issued for
+    /// this deployment (usually its client id there); see
+    /// [`audiences`](Self::audiences). More can be accepted with
+    /// [`with_additional_audience`](Self::with_additional_audience).
     pub fn new(
         jwks_endpoint: reqwest::Url,
         issuer: impl Into<String>,
+        audience: impl Into<String>,
         signing_algorithm: SigningAlgorithm,
     ) -> Self {
         Self {
             jwks_endpoint,
             issuer: issuer.into(),
             signing_algorithm,
+            audiences: vec![audience.into()],
             subject_claim: "sub".to_string(),
         }
+    }
+
+    /// Also accept tokens whose `aud` is `audience` - for a deployment
+    /// reached through more than one client registration at the same IdP
+    /// (a web app and a CLI, say).
+    pub fn with_additional_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audiences.push(audience.into());
+        self
     }
 
     pub fn with_subject_claim(mut self, claim: impl Into<String>) -> Self {
@@ -701,7 +722,7 @@ impl JwksCache {
 /// JWKS via `cache` as needed), then step 2, pulling out - and trusting -
 /// only `config.subject_claim`. Everything else in the JWT's claims is
 /// read by nobody: `jsonwebtoken::decode` verifies the signature,
-/// `issuer` and algorithm, but claims are decoded into a generic JSON map
+/// `issuer`, audience and algorithm, but claims are decoded into a generic JSON map
 /// rather than a fixed struct, since `subject_claim` is configurable
 /// rather than always `"sub"`.
 ///
@@ -726,19 +747,16 @@ pub async fn verify_and_extract_subject(
 
     let mut validation = jsonwebtoken::Validation::new(config.signing_algorithm.to_jsonwebtoken());
     validation.set_issuer(&[&config.issuer]);
-    // `IdpConfig` has no audience field at all - deliberately, per this
-    // function's own doc comment above ("nothing else from it" but the
-    // subject claim). `jsonwebtoken::Validation::new`'s own default is
-    // `validate_aud: true` with no configured value, which rejects any
-    // token carrying an `aud` claim outright rather than skipping the
-    // check - and every spec-compliant OIDC ID token carries one. Found
-    // against a real external IdP (self-hosted Dex, skilj-helpdesk):
-    // signature and issuer verified correctly, then every real token
-    // rejected with InvalidAudience regardless of its actual audience
-    // value. The local JWKS/JWT test fixtures elsewhere in this
-    // workspace never carry an `aud` claim, so they never exercised
-    // this path.
-    validation.validate_aud = false;
+    // Audience is required, not optional: `IdpConfig::audiences` is
+    // never empty, and a token with no `aud` at all is refused rather
+    // than let through (`jsonwebtoken` otherwise only checks `aud` when
+    // the token carries one). This used to be `validate_aud = false`,
+    // after `Validation::new`'s own default (check against *no*
+    // configured audience, rejecting every real OIDC token) broke a real
+    // IdP - which accepted any token the same IdP issued to any other
+    // application (docs/architecture.md §81).
+    validation.set_audience(&config.audiences);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
 
     let token_data = jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
         jwt,

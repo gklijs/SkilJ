@@ -85,6 +85,8 @@ const TEST_MODULUS_N: &str = "zx1RbFB4ll0mxv0wooNXE0BzU-hZ6GKGbTBI7w4kAK7Di_3RaD
 const TEST_EXPONENT_E: &str = "AQAB";
 const TEST_KID: &str = "test-key-1";
 const TEST_ISSUER: &str = "https://idp.example.test/";
+/// The `aud` this deployment's tokens carry - `IdpConfig` requires one.
+const TEST_AUDIENCE: &str = "skilj-test-client";
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
@@ -151,6 +153,7 @@ fn idp_config(jwks_url: &str) -> IdpConfig {
             .parse()
             .expect("the test server's own URL is well-formed"),
         TEST_ISSUER,
+        TEST_AUDIENCE,
         SigningAlgorithm::Rs256,
     )
 }
@@ -178,6 +181,7 @@ fn sign_jwt(
     let claims = json!({
         subject_claim: subject_value,
         "iss": issuer,
+        "aud": TEST_AUDIENCE,
         "exp": exp.timestamp(),
     });
     let key = EncodingKey::from_rsa_pem(signing_key_pem.as_bytes())
@@ -294,6 +298,70 @@ fn verify_and_extract_subject_rejects_a_wrong_issuer() {
             .await
             .unwrap_err();
         assert_eq!(err.code(), "jwt_verification_failed");
+    });
+}
+
+/// Signs a valid-in-every-other-way JWT whose `aud` claim is `aud`
+/// verbatim (`None` leaves the claim out).
+fn sign_jwt_with_audience(aud: Option<serde_json::Value>) -> String {
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some(TEST_KID.to_string());
+    let mut claims = json!({
+        "sub": "user-123",
+        "iss": TEST_ISSUER,
+        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+    });
+    if let Some(aud) = aud {
+        claims["aud"] = aud;
+    }
+    let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
+        .expect("the test private key PEM is well-formed");
+    jsonwebtoken::encode(&header, &claims, &key).expect("signing a well-formed JWT never fails")
+}
+
+/// docs/architecture.md §81: the same IdP, issuer and signing key issue
+/// tokens to every application registered there. A token issued to a
+/// different application - or one with no audience at all - must not be
+/// accepted as this deployment's user.
+#[test]
+fn verify_and_extract_subject_rejects_a_token_for_another_audience() {
+    runtime().block_on(async {
+        let jwks_url = serve_jwks().await;
+        let config = idp_config(&jwks_url);
+        let cache = JwksCache::new(config.jwks_endpoint.clone());
+
+        for aud in [
+            Some(json!("some-other-app")),
+            Some(json!(["some-other-app", "yet-another-app"])),
+            None,
+        ] {
+            let jwt = sign_jwt_with_audience(aud.clone());
+            let err = verify_and_extract_subject(&jwt, &config, &cache)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), "jwt_verification_failed", "aud = {aud:?}");
+        }
+    });
+}
+
+#[test]
+fn verify_and_extract_subject_accepts_any_configured_audience() {
+    runtime().block_on(async {
+        let jwks_url = serve_jwks().await;
+        let config = idp_config(&jwks_url).with_additional_audience("skilj-cli");
+        let cache = JwksCache::new(config.jwks_endpoint.clone());
+
+        for aud in [
+            json!(TEST_AUDIENCE),
+            json!("skilj-cli"),
+            json!(["some-other-app", TEST_AUDIENCE]),
+        ] {
+            let jwt = sign_jwt_with_audience(Some(aud.clone()));
+            let subject = verify_and_extract_subject(&jwt, &config, &cache)
+                .await
+                .unwrap_or_else(|e| panic!("aud = {aud}: {e}"));
+            assert_eq!(subject, "user-123");
+        }
     });
 }
 

@@ -357,9 +357,11 @@ fn access_level_from_str(s: &str) -> AccessLevel {
 /// the only thing standing between this and SQL injection - `name` is
 /// only ever a value `AddBoundedContext`'s own `requires` already
 /// restricted to a safe identifier pattern (specs/skilj.allium) by the
-/// time it reaches here.
+/// time it reaches here. For the quoting to actually be that second line
+/// of defence, an embedded `"` is doubled (Postgres's own escape inside a
+/// quoted identifier) rather than left to close the identifier early.
 fn schema_ident(bounded_context: &str) -> String {
-    format!("\"bc_{bounded_context}\"")
+    format!("\"bc_{}\"", bounded_context.replace('"', "\"\""))
 }
 
 // --- per-bounded-context schema provisioning / hard deletion ---
@@ -11977,4 +11979,18 @@ pub async fn record_acknowledgement(
     .execute(executor)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schema_ident;
+
+    #[test]
+    fn schema_ident_quotes_and_escapes() {
+        assert_eq!(schema_ident("banking"), "\"bc_banking\"");
+        assert_eq!(
+            schema_ident("x\"; DROP SCHEMA public; --"),
+            "\"bc_x\"\"; DROP SCHEMA public; --\""
+        );
+    }
 }

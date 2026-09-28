@@ -205,6 +205,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Breaking (API):** GraphQL JWT verification ignored the `aud` claim
+  entirely (`validate_aud = false`), so a token the configured IdP
+  issued to *any other* application - same issuer, same signing keys,
+  same `sub` - was accepted as that user, with that user's skilj Role.
+  `IdpConfig::new` now takes the expected audience
+  (`new(jwks_endpoint, issuer, audience, signing_algorithm)`), more can
+  be added with `IdpConfig::with_additional_audience`, and a token
+  whose `aud` matches none of them, or that has no `aud`, is rejected
+  with `jwt_verification_failed`. Set it to the client id this
+  deployment has at the IdP.
+- `schema_ident` now escapes `"` in a bounded context name when quoting
+  it as a Postgres schema identifier. Not reachable today (every name is
+  validated at creation and looked up before use), but the quoting was
+  documented as a second line of defence and wasn't one.
 - `/graphql` had no per-request limits. The body was read whole, with no
   size cap, before authentication (an unauthenticated multi-megabyte
   request was read and executed; multipart parts were spilled to temp
