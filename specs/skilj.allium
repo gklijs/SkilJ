@@ -1553,12 +1553,16 @@ entity Subscription {
                                             -- latest committed sequence at that moment by
                                             -- default (see CreateAllEventsSubscription/
                                             -- CreateEventTypeSubscription), or an earlier
-                                            -- caller-supplied one. Never replayed - a
-                                            -- subscription answers with fresh events going
-                                            -- forward, not history. A caller wanting current
-                                            -- state first queries it separately (FetchEvents or
-                                            -- QueryProjection) and supplies the sequence it read
-                                            -- up to here for a gap-free handoff into the live feed.
+                                            -- caller-supplied one. A subscription is not a
+                                            -- history feed: the only past it delivers is the
+                                            -- span committed after a caller-supplied
+                                            -- from_sequence and before it was created - the
+                                            -- events the caller has not seen yet - first, in
+                                            -- order, then fresh ones (see FreshEventsOnly). A
+                                            -- caller wanting current state first queries it
+                                            -- separately (FetchEvents or QueryProjection) and
+                                            -- supplies the sequence it read up to here for a
+                                            -- gap-free handoff into the live feed.
                                             -- Reconnecting after a dropped connection is that
                                             -- same handoff, not a second mechanism: the old
                                             -- subscription is gone with its connection, and the
@@ -3183,7 +3187,10 @@ rule QueryProjection {
 -- from_sequence - typically the sequence it last read via FetchEvents or
 -- QueryProjection, or the point it last disconnected from a prior
 -- subscription - resumes from there with no gap and no replay of
--- anything earlier. Neither rule requires the bounded context to be
+-- anything earlier: the events committed after from_sequence but before
+-- the subscription existed are delivered first, then the live feed.
+-- That span is bounded like any read (config.max_events_per_read); a
+-- caller further behind reads the rest back first. Neither rule requires the bounded context to be
 -- active: unlike EventFetch and QueryProjection, this is deliberate the
 -- other way - an archived context accepts no new events, so a
 -- subscription against one would be created only to sit forever unfed.
@@ -3206,6 +3213,12 @@ rule CreateAllEventsSubscription {
         from_sequence
         ?? (Events where bounded_context = access_mapping.bounded_context).count - 1
 
+    -- The resume span, delivered before any live event (see the note
+    -- above): bounded like any read.
+    requires: (Events where bounded_context = access_mapping.bounded_context
+                  and sequence > starting_point).count
+              <= config.max_events_per_read
+
     ensures:
         AllEventsSubscription.created(
             bounded_context: access_mapping.bounded_context,
@@ -3226,6 +3239,13 @@ rule CreateEventTypeSubscription {
     let starting_point =
         from_sequence
         ?? (Events where bounded_context = event_type.bounded_context).count - 1
+
+    -- The resume span, over this event type only - see
+    -- CreateAllEventsSubscription.
+    requires: (Events where bounded_context = event_type.bounded_context
+                  and event_type = event_type
+                  and sequence > starting_point).count
+              <= config.max_events_per_read
 
     ensures:
         EventTypeSubscription.created(
@@ -3334,10 +3354,12 @@ rule CreateEventTypeSubscription {
 -- acknowledge back. Nothing is held for a connection that is not live -
 -- a subscription lasts exactly as long as its connection, so an event
 -- committed while that connection is down is delivered to no one and
--- kept for no one. A caller that wants what it missed reads it back
--- (FetchEvents or QueryProjection) and starts a fresh subscription from
--- the last sequence it actually received; see Subscription.from_sequence
--- and EventSubscription's DeliveryIsAtMostOnce.
+-- kept for no one. A caller that wants what it missed starts a fresh
+-- subscription from the last sequence it actually received, which
+-- delivers the missed span first (reading it back over FetchEvents or
+-- QueryProjection only when it is longer than one read); see
+-- Subscription.from_sequence and EventSubscription's
+-- DeliveryIsAtMostOnce.
 --
 -- The still-active check on the grant below is a live re-check on every
 -- delivery rather than a snapshot taken at creation (see the note on
@@ -7101,13 +7123,20 @@ surface EventSubscription {
         -- event_owner_scope_satisfied).
 
     @guarantee FreshEventsOnly
-        -- A subscription never replays history: delivery starts strictly
+        -- A subscription is not a history feed: delivery starts strictly
         -- after from_sequence, fixed once at creation time (see
         -- CreateAllEventsSubscription/CreateEventTypeSubscription and
-        -- DeliverToSubscriptions). A caller wanting current state first
-        -- queries it separately - FetchEvents or QueryProjection - and,
-        -- for a gap-free handoff into the live feed, supplies the
-        -- sequence it read up to as from_sequence here.
+        -- DeliverToSubscriptions). The only past it delivers is what the
+        -- caller has not seen yet: when from_sequence is earlier than the
+        -- latest committed event, the events in between come first, in
+        -- order, then the live feed, with none of them twice - at most
+        -- config.max_events_per_read of them, a longer span being
+        -- refused rather than loaded. A caller wanting current state
+        -- first queries it separately - FetchEvents or QueryProjection -
+        -- and, for a gap-free handoff into the live feed, supplies the
+        -- sequence it read up to as from_sequence here. Anything
+        -- committed between that read and the subscription arrives
+        -- through the resume span rather than being lost between them.
 
     @guarantee DeliveryIsAtMostOnce
         -- While the connection is live, every matching event arrives
@@ -7136,8 +7165,9 @@ surface EventSubscription {
         -- The two closes call for different responses, which is why they
         -- are told apart. An ordinary drop means "reconnect from the last
         -- sequence you received": the client-driven handoff described
-        -- under FreshEventsOnly, with a read-back over FetchEvents or
-        -- QueryProjection for the span committed while away. This one
+        -- under FreshEventsOnly, which delivers the span committed while
+        -- away (read back over FetchEvents or QueryProjection first only
+        -- when it is longer than one read). This one
         -- means the subscription is permanently over - the grant it
         -- delivered to no longer exists, so neither a fresh subscription
         -- nor a QueryProjection read-back under that same grant will be
@@ -7204,9 +7234,11 @@ surface EventSubscription {
         -- Reconnecting is therefore creating a subscription, not resuming
         -- one: the dropped subscription no longer exists to resume. The
         -- client supplies as from_sequence the last sequence it actually
-        -- received - each delivered event carries its own - and, if it
-        -- cares about what was committed while it was away, reads that
-        -- span back over FetchEvents or QueryProjection first. That is
+        -- received - each delivered event carries its own - and receives
+        -- what was committed while it was away as the fresh
+        -- subscription's resume span, reading it back over FetchEvents
+        -- or QueryProjection first only when it is longer than one read.
+        -- That is
         -- deliberately the same move as the initial handoff into the live
         -- feed described under FreshEventsOnly, driven entirely by the
         -- client, rather than a second resume mechanism owned by the

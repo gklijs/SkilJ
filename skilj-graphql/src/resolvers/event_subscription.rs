@@ -60,8 +60,9 @@ use tokio::sync::broadcast::error::RecvError;
 fn subscription_lagged_error(skipped: u64) -> async_graphql::Error {
     async_graphql::Error::new(format!(
         "this subscription fell {skipped} event(s) behind and cannot resume without a gap - \
-         DeliveryIsAtMostOnce forbids silently skipping ahead, so the connection is closed; \
-         reconnect and, if needed, catch up via queryEvents/countEvents first"
+         DeliveryIsAtMostOnce forbids silently skipping ahead, so the subscription is closed; \
+         resubscribe with fromSequence set to the last sequence received to get the missed \
+         events first"
     ))
     .extend_with(|_, ext| ext.set("code", "subscription_lagged"))
 }
@@ -73,7 +74,8 @@ fn subscription_gap_error() -> async_graphql::Error {
     async_graphql::Error::new(
         "this instance may have missed events committed by another instance \
          (its cross-instance connection dropped) and cannot resume without a gap - \
-         reconnect and, if needed, catch up via queryEvents/countEvents first",
+         resubscribe with fromSequence set to the last sequence received to get the missed \
+         events first",
     )
     .extend_with(|_, ext| ext.set("code", "subscription_lagged"))
 }
@@ -183,9 +185,10 @@ pub fn all_events_field() -> SubscriptionField {
             // passed as an explicit `from_sequence`, rather than loading
             // every event just to take their maximum (the pure function's
             // only use for its history argument).
-            let from_sequence = resolve_from_sequence(
-                &state.pool,
+            let (from_sequence, resume_span, delivered_up_to) = resolve_start(
+                &state,
                 &bounded_context_name,
+                None,
                 from_sequence,
             )
             .await?;
@@ -212,6 +215,25 @@ pub fn all_events_field() -> SubscriptionField {
                 let _slot = slot;
                 let mut current = Subscription::AllEventsSubscription(Box::new(initial));
                 let mut revocation_rx = state.revocation_broadcaster.subscribe();
+                // docs/architecture.md §84: the committed span between
+                // `fromSequence` and the latest sequence at subscribe
+                // time, delivered first, in order; live events at or
+                // below `delivered_up_to` are then skipped as duplicates.
+                for event in &resume_span {
+                    match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
+                        Ok(delivered) => {
+                            for (sequence, rendered) in delivered {
+                                yielder
+                                    .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                    .await;
+                            }
+                        }
+                        Err(err) => {
+                            yielder.yield_error(err).await;
+                            return Ok(());
+                        }
+                    }
+                }
                 loop {
                   let event = tokio::select! {
                     revoked = revocation_rx.recv() => {
@@ -239,84 +261,24 @@ pub fn all_events_field() -> SubscriptionField {
                   };
                     match event {
                         Ok(event) => {
-                            if event.bounded_context.name != bounded_context_name {
+                            // Already delivered from the resume span.
+                            if event.bounded_context.name != bounded_context_name
+                                || event.sequence <= delivered_up_to
+                            {
                                 continue;
                             }
-                            let fresh_mapping =
-                                match skilj_core::db::get_active_role_access_mapping(
-                                    &state.pool,
-                                    &role_id,
-                                    &bounded_context_name,
-                                )
-                                .await
-                                {
-                                    Ok(mapping) => mapping,
-                                    Err(err) => {
-                                        yielder.yield_error(to_graphql_error(err)).await;
-                                        return Ok(());
+                            match deliver_one(&state, &role_id, &bounded_context_name, &mut current, &event).await {
+                                Ok(delivered) => {
+                                    for (sequence, rendered) in delivered {
+                                        yielder
+                                            .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                            .await;
                                     }
-                                };
-                            let Some(fresh_mapping) = fresh_mapping else {
-                                yielder
-                                    .yield_error(to_graphql_error(
-                                        skilj_core::access_control::Error::GrantNotActive,
-                                    ))
-                                    .await;
-                                return Ok(());
-                            };
-
-                            // Decrypt-on-read's own pre-resolution step,
-                            // against the freshly-refetched mapping - the
-                            // same live, never-snapshot-at-subscribe-time
-                            // grant `RevocationClosesTheConnection` above
-                            // already relies on.
-                            let mut data_keys = std::collections::HashMap::new();
-                            if let Err(err) = resolve_read_data_keys(
-                                &state.pool,
-                                &bounded_context_name,
-                                &event.event_type.sensitive_fields,
-                                &event.payload,
-                                &fresh_mapping,
-                                state.encryption_master_key.as_ref(),
-                                &mut data_keys,
-                            )
-                            .await
-                            {
-                                yielder.yield_error(err).await;
-                                return Ok(());
-                            }
-
-                            if let Subscription::AllEventsSubscription(s) = &mut current {
-                                s.access_mapping = fresh_mapping;
-                            }
-                            // Same "live, never snapshot-at-subscribe-time"
-                            // treatment as `fresh_mapping` above - a grant
-                            // made or revoked after this connection opened
-                            // still takes effect on the very next delivery.
-                            let private_field_grants = match skilj_core::db::list_private_field_grants_for_context(
-                                &state.pool,
-                                &bounded_context_name,
-                            )
-                            .await
-                            {
-                                Ok(grants) => grants,
+                                }
                                 Err(err) => {
-                                    yielder.yield_error(to_graphql_error(err)).await;
+                                    yielder.yield_error(err).await;
                                     return Ok(());
                                 }
-                            };
-                            for delivered in event_store::deliver_to_subscriptions(
-                                &event,
-                                std::slice::from_ref(&current),
-                                |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
-                                &private_field_grants,
-                            ) {
-                                yielder
-                                    .yield_ok(FieldValue::owned_any((
-                                        delivered.event.sequence,
-                                        delivered.rendered_payload,
-                                    )))
-                                    .await;
                             }
                         }
                         Err(RecvError::Lagged(n)) => {
@@ -380,9 +342,10 @@ pub fn events_by_type_field() -> SubscriptionField {
             let mut gap_rx = state.event_broadcaster.subscribe_gaps();
 
             // See `all_events_field`'s identical step.
-            let from_sequence = resolve_from_sequence(
-                &state.pool,
+            let (from_sequence, resume_span, delivered_up_to) = resolve_start(
+                &state,
                 &bounded_context_name,
+                Some(&event_type_name),
                 from_sequence,
             )
             .await?;
@@ -410,6 +373,25 @@ pub fn events_by_type_field() -> SubscriptionField {
                 let _slot = slot;
                 let mut current = Subscription::EventTypeSubscription(Box::new(initial));
                 let mut revocation_rx = state.revocation_broadcaster.subscribe();
+                // docs/architecture.md §84: the committed span between
+                // `fromSequence` and the latest sequence at subscribe
+                // time, delivered first, in order; live events at or
+                // below `delivered_up_to` are then skipped as duplicates.
+                for event in &resume_span {
+                    match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
+                        Ok(delivered) => {
+                            for (sequence, rendered) in delivered {
+                                yielder
+                                    .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                    .await;
+                            }
+                        }
+                        Err(err) => {
+                            yielder.yield_error(err).await;
+                            return Ok(());
+                        }
+                    }
+                }
                 loop {
                   let event = tokio::select! {
                     revoked = revocation_rx.recv() => {
@@ -437,79 +419,24 @@ pub fn events_by_type_field() -> SubscriptionField {
                   };
                     match event {
                         Ok(event) => {
-                            if event.bounded_context.name != bounded_context_name {
+                            // Already delivered from the resume span.
+                            if event.bounded_context.name != bounded_context_name
+                                || event.sequence <= delivered_up_to
+                            {
                                 continue;
                             }
-                            let fresh_mapping =
-                                match skilj_core::db::get_active_role_access_mapping(
-                                    &state.pool,
-                                    &role_id,
-                                    &bounded_context_name,
-                                )
-                                .await
-                                {
-                                    Ok(mapping) => mapping,
-                                    Err(err) => {
-                                        yielder.yield_error(to_graphql_error(err)).await;
-                                        return Ok(());
+                            match deliver_one(&state, &role_id, &bounded_context_name, &mut current, &event).await {
+                                Ok(delivered) => {
+                                    for (sequence, rendered) in delivered {
+                                        yielder
+                                            .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                            .await;
                                     }
-                                };
-                            let Some(fresh_mapping) = fresh_mapping else {
-                                yielder
-                                    .yield_error(to_graphql_error(
-                                        skilj_core::access_control::Error::GrantNotActive,
-                                    ))
-                                    .await;
-                                return Ok(());
-                            };
-
-                            // Decrypt-on-read's own pre-resolution step,
-                            // against the freshly-refetched mapping - see
-                            // `all_events_field`'s own identical comment.
-                            let mut data_keys = std::collections::HashMap::new();
-                            if let Err(err) = resolve_read_data_keys(
-                                &state.pool,
-                                &bounded_context_name,
-                                &event.event_type.sensitive_fields,
-                                &event.payload,
-                                &fresh_mapping,
-                                state.encryption_master_key.as_ref(),
-                                &mut data_keys,
-                            )
-                            .await
-                            {
-                                yielder.yield_error(err).await;
-                                return Ok(());
-                            }
-
-                            if let Subscription::EventTypeSubscription(s) = &mut current {
-                                s.access_mapping = fresh_mapping;
-                            }
-                            // See `all_events_field`'s own identical comment.
-                            let private_field_grants = match skilj_core::db::list_private_field_grants_for_context(
-                                &state.pool,
-                                &bounded_context_name,
-                            )
-                            .await
-                            {
-                                Ok(grants) => grants,
+                                }
                                 Err(err) => {
-                                    yielder.yield_error(to_graphql_error(err)).await;
+                                    yielder.yield_error(err).await;
                                     return Ok(());
                                 }
-                            };
-                            for delivered in event_store::deliver_to_subscriptions(
-                                &event,
-                                std::slice::from_ref(&current),
-                                |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
-                                &private_field_grants,
-                            ) {
-                                yielder
-                                    .yield_ok(FieldValue::owned_any((
-                                        delivered.event.sequence,
-                                        delivered.rendered_payload,
-                                    )))
-                                    .await;
                             }
                         }
                         Err(RecvError::Lagged(n)) => {
@@ -540,19 +467,119 @@ pub fn events_by_type_field() -> SubscriptionField {
     ))
 }
 
-/// `from_sequence ?? <the bounded context's latest sequence, or -1>` -
-/// both subscription rules' `starting_point`. Must run after the
-/// broadcaster subscription, like the snapshot read it replaces.
-async fn resolve_from_sequence(
-    pool: &skilj_core::db::Pool,
+/// Where a subscription starts, and what it replays first (docs/
+/// architecture.md §84): `(from_sequence, resume_span, delivered_up_to)`.
+/// Without `fromSequence` it starts at the latest committed sequence and
+/// replays nothing. With one below the latest, the committed events in
+/// between (all of the bounded context's, or `event_type`'s only) are
+/// the resume span - delivered before any live event, so a caller that
+/// read up to `fromSequence` (or last received it before a disconnect)
+/// misses nothing committed before this subscription existed. At most
+/// `max_events_per_read` of them; a larger span is refused with
+/// `resume_span_too_large` rather than loaded, and the caller reads it
+/// back with `queryEvents` first. Must run after the broadcaster
+/// subscription: anything committed after the latest sequence read here
+/// arrives live, and anything at or below it is skipped when it does.
+async fn resolve_start(
+    state: &GraphqlState,
     bounded_context: &str,
+    event_type: Option<&str>,
     from_sequence: Option<i64>,
-) -> async_graphql::Result<i64> {
-    match from_sequence {
-        Some(sequence) => Ok(sequence),
-        None => Ok(skilj_core::db::latest_sequence(pool, bounded_context)
+) -> async_graphql::Result<(i64, Vec<skilj_core::event_store::Event>, i64)> {
+    let latest = skilj_core::db::latest_sequence(&state.pool, bounded_context)
+        .await
+        .map_err(to_graphql_error)?
+        .unwrap_or(-1);
+    let Some(from_sequence) = from_sequence.filter(|from| *from < latest) else {
+        let start = from_sequence.unwrap_or(latest);
+        return Ok((start, Vec::new(), start));
+    };
+    let cap = state.max_events_per_read.max(1);
+    let limit = i64::try_from(cap).unwrap_or(i64::MAX - 1) + 1;
+    let mut span = match event_type {
+        None => {
+            skilj_core::db::list_events_for_bounded_context_from_limited(
+                &state.pool,
+                bounded_context,
+                from_sequence,
+                limit,
+            )
+            .await
+        }
+        Some(event_type) => {
+            skilj_core::db::list_events_from_limited(
+                &state.pool,
+                bounded_context,
+                event_type,
+                from_sequence,
+                limit,
+            )
+            .await
+        }
+    }
+    .map_err(to_graphql_error)?;
+    span.retain(|event| event.sequence <= latest);
+    if span.len() > cap {
+        return Err(resume_span_too_large_error(cap));
+    }
+    Ok((from_sequence, span, latest))
+}
+
+fn resume_span_too_large_error(cap: usize) -> async_graphql::Error {
+    async_graphql::Error::new(format!(
+        "more than {cap} events were committed after fromSequence - read them back with \
+         queryEvents first, then subscribe from the last sequence read"
+    ))
+    .extend_with(|_, ext| ext.set("code", "resume_span_too_large"))
+}
+
+/// One committed event, delivered to one subscription: the grant
+/// re-checked live (never the subscribe-time snapshot -
+/// `RevocationClosesTheConnection`), decrypt-on-read keys resolved
+/// against it, private-field grants read fresh, then
+/// `deliver_to_subscriptions`. Returns each `(sequence, rendered
+/// payload)` to push; an `Err` ends the stream with it. Shared by the
+/// resume span and the live feed of both event subscriptions.
+async fn deliver_one(
+    state: &GraphqlState,
+    role_id: &str,
+    bounded_context_name: &str,
+    current: &mut Subscription,
+    event: &skilj_core::event_store::Event,
+) -> async_graphql::Result<Vec<(i64, String)>> {
+    let fresh_mapping =
+        skilj_core::db::get_active_role_access_mapping(&state.pool, role_id, bounded_context_name)
             .await
             .map_err(to_graphql_error)?
-            .unwrap_or(-1)),
+            .ok_or_else(|| to_graphql_error(skilj_core::access_control::Error::GrantNotActive))?;
+
+    let mut data_keys = std::collections::HashMap::new();
+    resolve_read_data_keys(
+        &state.pool,
+        bounded_context_name,
+        &event.event_type.sensitive_fields,
+        &event.payload,
+        &fresh_mapping,
+        state.encryption_master_key.as_ref(),
+        &mut data_keys,
+    )
+    .await?;
+
+    match current {
+        Subscription::AllEventsSubscription(s) => s.access_mapping = fresh_mapping,
+        Subscription::EventTypeSubscription(s) => s.access_mapping = fresh_mapping,
     }
+    let private_field_grants =
+        skilj_core::db::list_private_field_grants_for_context(&state.pool, bounded_context_name)
+            .await
+            .map_err(to_graphql_error)?;
+    Ok(event_store::deliver_to_subscriptions(
+        event,
+        std::slice::from_ref(current),
+        |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+        &private_field_grants,
+    )
+    .into_iter()
+    .map(|delivered| (delivered.event.sequence, delivered.rendered_payload))
+    .collect())
 }

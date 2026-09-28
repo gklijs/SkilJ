@@ -1380,3 +1380,192 @@ fn a_connection_holds_at_most_max_subscriptions_at_once() {
         );
     });
 }
+
+/// docs/architecture.md §84: resuming from `fromSequence` delivers the
+/// events committed since then - before this subscription existed - in
+/// order, then the live feed with no duplicate; a span over
+/// `max_events_per_read` is refused rather than loaded.
+#[test]
+fn resuming_from_a_sequence_replays_the_missed_span_then_goes_live() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: admin_role,
+                bounded_context: bc,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<DepositMoney>()
+            .reconciliation_role(admin_subject.clone())
+            .max_events_per_read(3)
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let serve_router = router.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, serve_router).await.unwrap();
+        });
+        let jwt = sign_jwt(&admin_subject);
+
+        let mut sequences = Vec::new();
+        for amount in [1, 2, 3, 4] {
+            let response = graphql_request(
+                &router,
+                Some(&jwt),
+                DEPOSIT_MONEY_MUTATION,
+                json!({ "bc": bc_name, "payload": format!(r#"{{"amount":{amount}}}"#) }),
+            )
+            .await;
+            assert!(response.get("errors").is_none(), "{response}");
+            sequences.push(
+                response["data"]["submitCommand"]["triggeredEventSequences"][0]
+                    .as_i64()
+                    .unwrap(),
+            );
+        }
+
+        let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
+        ws_send_json(
+            &mut ws,
+            json!({
+                "type": "connection_init",
+                "payload": { "Authorization": format!("Bearer {jwt}") },
+            }),
+        )
+        .await;
+        assert_eq!(ws_recv_json(&mut ws).await["type"], "connection_ack");
+        let subscribe = |id: &str, from: i64| {
+            json!({
+                "id": id,
+                "type": "subscribe",
+                "payload": {
+                    "query": "subscription($bc: String!, $from: Int) { \
+                        allEvents(boundedContext: $bc, fromSequence: $from) { sequence } }",
+                    "variables": { "bc": bc_name, "from": from },
+                },
+            })
+        };
+
+        // Read up to the first event, "away" for the other three: they
+        // were committed before this subscription existed.
+        ws_send_json(&mut ws, subscribe("1", sequences[0])).await;
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let message = ws_recv_json(&mut ws).await;
+            assert_eq!(message["type"], "next", "{message}");
+            received.push(
+                message["payload"]["data"]["allEvents"]["sequence"]
+                    .as_i64()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(received, sequences[1..].to_vec());
+
+        // Then live, with nothing replayed twice.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            DEPOSIT_MONEY_MUTATION,
+            json!({ "bc": bc_name, "payload": r#"{"amount":5}"# }),
+        )
+        .await;
+        let live = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+        let message = ws_recv_json(&mut ws).await;
+        assert_eq!(
+            message["payload"]["data"]["allEvents"]["sequence"], live,
+            "{message}"
+        );
+        assert_eq!(
+            ws_try_recv_json(&mut ws, Duration::from_millis(300)).await,
+            None
+        );
+
+        // eventsByType resumes the same way, over its own event type.
+        ws_send_json(
+            &mut ws,
+            json!({
+                "id": "3",
+                "type": "subscribe",
+                "payload": {
+                    "query": "subscription($bc: String!, $from: Int) { \
+                        eventsByType(boundedContext: $bc, eventType: \"MoneyDeposited\", \
+                        fromSequence: $from) { sequence } }",
+                    "variables": { "bc": bc_name, "from": sequences[2] },
+                },
+            }),
+        )
+        .await;
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let message = ws_recv_json(&mut ws).await;
+            assert_eq!(message["id"], "3", "{message}");
+            received.push(
+                message["payload"]["data"]["eventsByType"]["sequence"]
+                    .as_i64()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(received, vec![sequences[3], live]);
+
+        // Five committed events from the start is over the cap of 3.
+        ws_send_json(&mut ws, subscribe("2", -1)).await;
+        let refused = ws_recv_json(&mut ws).await;
+        assert_eq!(refused["id"], "2", "{refused}");
+        assert_eq!(
+            refused["payload"]["errors"][0]["extensions"]["code"], "resume_span_too_large",
+            "{refused}"
+        );
+    });
+}

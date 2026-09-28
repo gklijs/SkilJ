@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Wire:** `allEvents`/`eventsByType` with a `fromSequence` below the
+  latest committed event now deliver the events committed in between
+  first, in order, then the live feed, with none twice. Previously they
+  only filtered live events, so the documented handoff - read back up to
+  a sequence, then subscribe from it - lost every event committed
+  between the read and the subscribe, and a reconnect after
+  `subscription_lagged` lost the span it was meant to recover. The span
+  is capped at `max_events_per_read` (type-specific for `eventsByType`);
+  a longer one refuses the subscription with `resume_span_too_large`
+  (read back with `queryEvents` first). Without `fromSequence` nothing
+  changes.
 - **Breaking (wire):** `GET /v1/events`, `GET /v1/events/consume` and
   GraphQL `queryEvents` now return at most `max_events_per_read` events
   per call (default 1000), oldest first, instead of everything after the
