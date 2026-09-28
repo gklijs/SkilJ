@@ -814,6 +814,23 @@ impl Skilj {
 pub struct ReconciliationReport {
     pub registered: Vec<String>,
     pub skipped_no_access: Vec<String>,
+    /// `EventType`s/`CommandType`s this process declares in an *older*
+    /// shape than the one already stored - a newer version of the
+    /// application registered it (a rolling deploy in progress, or this
+    /// process rolled back to). The stored, newer registration is kept
+    /// untouched instead of failing startup (docs/architecture.md §101).
+    pub kept_newer: Vec<String>,
+}
+
+/// docs/architecture.md §101: the two rejections an *older* registration
+/// meets when a newer version of the same type is already stored - a
+/// field it doesn't declare yet, a tag mapping it doesn't have yet.
+fn is_older_than_stored_rejection(error: &skilj_core::Error) -> bool {
+    use skilj_core::error::SkiljRejection;
+    matches!(
+        error.code(),
+        "schema_incompatible" | "tag_mapping_key_dropped"
+    )
 }
 
 /// `Dispatcher`'s own `EventDispatcher::scheduled_payload` closure -
@@ -3149,24 +3166,65 @@ async fn reconcile_event_types(
         };
 
         let existing = skilj_core::db::get_event_type(pool, bounded_context_name, name).await?;
-        let registration = skilj_core::event_store::register_event_type(
-            &mapping,
-            &bc,
-            name.clone(),
-            registered.schema.clone(),
-            registered.tag_mappings.clone(),
-            registered.owner_tag_key.clone(),
-            registered.sensitive_fields.clone(),
-            registered.private_fields.clone(),
-            registered.external_creation_allowed,
-            registered.direct_creation_allowed,
-            registered.system_triggered_allowed,
-            registered.system_triggered_schedule.clone(),
-            registered.missed_occurrence_policy,
-            registered.event_read_allowed,
-            existing.as_ref(),
-            now,
-        )?;
+        let register = |existing: Option<&skilj_core::event_store::EventType>| {
+            skilj_core::event_store::register_event_type(
+                &mapping,
+                &bc,
+                name.clone(),
+                registered.schema.clone(),
+                registered.tag_mappings.clone(),
+                registered.owner_tag_key.clone(),
+                registered.sensitive_fields.clone(),
+                registered.private_fields.clone(),
+                registered.external_creation_allowed,
+                registered.direct_creation_allowed,
+                registered.system_triggered_allowed,
+                registered.system_triggered_schedule.clone(),
+                registered.missed_occurrence_policy,
+                registered.event_read_allowed,
+                existing,
+                now,
+            )
+        };
+        let registration = match (register(existing.as_ref()), existing.as_ref()) {
+            (Ok(registration), _) => registration,
+            // docs/architecture.md §101: refused as a narrowing - but if the
+            // stored registration is itself a valid evolution of this
+            // process's, this process is simply older. Keep the newer one.
+            (Err(e), Some(stored)) if is_older_than_stored_rejection(&e) => {
+                let ours = register(None)?;
+                let stored_evolves_ours = skilj_core::event_store::register_event_type(
+                    &mapping,
+                    &bc,
+                    name.clone(),
+                    stored.schema.clone(),
+                    stored.tag_mappings.clone(),
+                    stored.owner_tag_key.clone(),
+                    stored.sensitive_fields.clone(),
+                    stored.private_fields.clone(),
+                    stored.external_creation_allowed,
+                    stored.direct_creation_allowed,
+                    stored.system_triggered_allowed,
+                    stored.system_triggered_schedule.clone(),
+                    stored.missed_occurrence_policy,
+                    stored.event_read_allowed,
+                    Some(ours.event_type()),
+                    now,
+                )
+                .is_ok();
+                if !stored_evolves_ours {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    event_type = %key,
+                    "this process declares an older shape of this EventType than the stored one \
+                     (a newer version registered it) - keeping the stored registration"
+                );
+                report.kept_newer.push(key);
+                continue;
+            }
+            (Err(e), _) => return Err(e),
+        };
         skilj_core::db::upsert_event_type(pool, registration.event_type()).await?;
         report.registered.push(key);
     }
@@ -3189,18 +3247,51 @@ async fn reconcile_command_types(
         };
 
         let existing = skilj_core::db::get_command_type(pool, bounded_context_name, name).await?;
-        let registration = skilj_core::event_store::register_command_type(
-            &mapping,
-            &bc,
-            name.clone(),
-            registered.schema.clone(),
-            registered.tag_mappings.clone(),
-            registered.owner_tag_key.clone(),
-            registered.sensitive_fields.clone(),
-            registered.private_fields.clone(),
-            registered.rest_trigger_allowed,
-            existing.as_ref(),
-        )?;
+        let register = |existing: Option<&skilj_core::event_store::CommandType>| {
+            skilj_core::event_store::register_command_type(
+                &mapping,
+                &bc,
+                name.clone(),
+                registered.schema.clone(),
+                registered.tag_mappings.clone(),
+                registered.owner_tag_key.clone(),
+                registered.sensitive_fields.clone(),
+                registered.private_fields.clone(),
+                registered.rest_trigger_allowed,
+                existing,
+            )
+        };
+        let registration = match (register(existing.as_ref()), existing.as_ref()) {
+            (Ok(registration), _) => registration,
+            // docs/architecture.md §101 - see `reconcile_event_types`.
+            (Err(e), Some(stored)) if is_older_than_stored_rejection(&e) => {
+                let ours = register(None)?;
+                let stored_evolves_ours = skilj_core::event_store::register_command_type(
+                    &mapping,
+                    &bc,
+                    name.clone(),
+                    stored.schema.clone(),
+                    stored.tag_mappings.clone(),
+                    stored.owner_tag_key.clone(),
+                    stored.sensitive_fields.clone(),
+                    stored.private_fields.clone(),
+                    stored.rest_trigger_allowed,
+                    Some(ours.command_type()),
+                )
+                .is_ok();
+                if !stored_evolves_ours {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    command_type = %key,
+                    "this process declares an older shape of this CommandType than the stored \
+                     one (a newer version registered it) - keeping the stored registration"
+                );
+                report.kept_newer.push(key);
+                continue;
+            }
+            (Err(e), _) => return Err(e),
+        };
         skilj_core::db::upsert_command_type(pool, registration.command_type()).await?;
         report.registered.push(key);
     }

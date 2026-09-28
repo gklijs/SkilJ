@@ -98,6 +98,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An instance running an **older** version of the application couldn't
+  start once a newer version had registered a type with an added
+  optional field or tag mapping: its startup reconciliation re-registered
+  the older shape and `build()` failed with `schema_incompatible` (or
+  `tag_mapping_key_dropped`). That broke rollbacks across any additive
+  change, and restarts of not-yet-upgraded instances mid-rollout. When
+  the stored registration is itself a valid evolution of the one the
+  process declares, startup now keeps the stored (newer) registration,
+  logs a warning, and lists the type in the new
+  `ReconciliationReport::kept_newer`. A change neither side evolves into
+  still fails, and the explicit GraphQL registration mutations are
+  unchanged.
 - `skilj-nats`: retrying one inbound message for longer than the
   consumer's `ack_wait` (30 s by default; the default retry policy's
   backoff reaches minutes) had JetStream redeliver it underneath the

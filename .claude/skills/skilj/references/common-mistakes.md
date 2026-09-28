@@ -41,6 +41,13 @@ differently-named type; a custom serde `Deserialize`; reshaping inside
 hand-written `BoundedContextEvent::try_from_event` to interpret an old
 payload differently without a new registered type at all).
 
+Not this error: an *older* version of the application starting after a
+newer one registered the type (a restart mid-rollout, or a rollback).
+When the stored registration is a valid evolution of the one this
+process declares, startup keeps the stored one and lists the type in
+`ReconciliationReport::kept_newer` instead of failing. The explicit
+`registerEventType`/`registerCommandType` mutations still refuse it.
+
 **`TagMappingKeyDropped`** - re-registering with a `tag_mappings()` that
 drops a `key` an earlier registration already used. A tag key, once
 live, can't be un-mapped - if you need to stop tagging a field, that's

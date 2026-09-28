@@ -542,3 +542,99 @@ fn reconciliation_folds_pre_existing_history_into_a_first_time_sync_projection()
         assert!(projection.caught_up_to.is_some());
     });
 }
+
+/// `MoneyDeposited` as a newer version of the application declares it -
+/// one more, optional, field.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct MoneyDepositedV2Payload {
+    amount: i64,
+    note: Option<String>,
+}
+
+struct MoneyDepositedV2;
+
+impl EventType for MoneyDepositedV2 {
+    type Payload = MoneyDepositedV2Payload;
+    const NAME: &'static str = "MoneyDeposited";
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+    fn event_read_allowed() -> bool {
+        true
+    }
+}
+
+/// And a genuinely incompatible one - `amount` changes type.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct MoneyDepositedIncompatiblePayload {
+    amount: String,
+}
+
+struct MoneyDepositedIncompatible;
+
+impl EventType for MoneyDepositedIncompatible {
+    type Payload = MoneyDepositedIncompatiblePayload;
+    const NAME: &'static str = "MoneyDeposited";
+}
+
+/// docs/architecture.md §101: a process running an older version (a
+/// restart mid-rollout, or a rollback) declares an older shape than the
+/// one a newer version already registered. It starts, keeping the stored
+/// registration, rather than failing with `schema_incompatible` - which
+/// made rolling back across an added optional field impossible. A change
+/// neither direction can evolve into still fails.
+#[test]
+fn an_older_version_starts_and_keeps_the_newer_registration() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        let key = format!("{bc_name}/MoneyDeposited");
+
+        let (_newer, report) = Skilj::builder(database_url.clone())
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDepositedV2>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.registered, vec![key.clone()]);
+        let stored = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (_older, report) = Skilj::builder(database_url.clone())
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .expect("an older version must still start");
+        assert_eq!(report.kept_newer, vec![key]);
+        assert!(report.registered.is_empty());
+        let after = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.schema, stored.schema,
+            "the newer registration was downgraded"
+        );
+        assert_eq!(after.schema_version, stored.schema_version);
+
+        let err = Skilj::builder(database_url)
+            .bounded_context(bc_name)
+            .event_type::<MoneyDepositedIncompatible>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .err()
+            .expect("an incompatible schema must still fail startup");
+        assert_eq!(
+            skilj_core::error::SkiljRejection::code(&err),
+            "schema_incompatible"
+        );
+    });
+}
