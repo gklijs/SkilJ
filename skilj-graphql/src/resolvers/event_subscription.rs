@@ -547,6 +547,12 @@ async fn deliver_one(
     current: &mut Subscription,
     event: &skilj_core::event_store::Event,
 ) -> async_graphql::Result<Vec<(i64, String)>> {
+    // Everything below reads the database; an event this subscription
+    // can't select (another type, a failed filter) needs none of it
+    // (docs/architecture.md §85).
+    if !event_store::subscription_selects(current, event) {
+        return Ok(Vec::new());
+    }
     let fresh_mapping =
         skilj_core::db::get_active_role_access_mapping(&state.pool, role_id, bounded_context_name)
             .await

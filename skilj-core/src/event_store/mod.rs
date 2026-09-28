@@ -2909,19 +2909,8 @@ pub fn deliver_to_subscriptions(
 ) -> Vec<EventDelivered> {
     subscriptions
         .iter()
-        .filter(|s| {
-            s.bounded_context() == &event.bounded_context
-                && s.starting_sequence() < event.sequence
-                && s.access_mapping().status == RoleStatus::Active
-        })
-        .filter(|s| match s {
-            Subscription::AllEventsSubscription(a) => {
-                a.event_types.is_empty() || a.event_types.contains(&event.event_type)
-            }
-            Subscription::EventTypeSubscription(e) => {
-                e.event_type == event.event_type && matches_filters(event, &e.filters)
-            }
-        })
+        .filter(|s| subscription_selects(s, event))
+        .filter(|s| s.access_mapping().status == RoleStatus::Active)
         .filter(|s| event_owner_scope_satisfied(event, s.access_mapping().scope.as_deref()))
         .map(|s| EventDelivered {
             subscription: s.clone(),
@@ -2934,6 +2923,26 @@ pub fn deliver_to_subscriptions(
             ),
         })
         .collect()
+}
+
+/// The part of `deliver_to_subscriptions`' match that doesn't depend on
+/// the grant: same bounded context, past `from_sequence`, one of the
+/// subscription's event types, and its filters. A caller holding a live
+/// subscription checks this first, so an event the subscription could
+/// never deliver costs no grant re-check, key resolution or grant reads
+/// (docs/architecture.md §85); `deliver_to_subscriptions` still applies
+/// it together with the grant's status and owner scope.
+pub fn subscription_selects(subscription: &Subscription, event: &Event) -> bool {
+    subscription.bounded_context() == &event.bounded_context
+        && subscription.starting_sequence() < event.sequence
+        && match subscription {
+            Subscription::AllEventsSubscription(a) => {
+                a.event_types.is_empty() || a.event_types.contains(&event.event_type)
+            }
+            Subscription::EventTypeSubscription(e) => {
+                e.event_type == event.event_type && matches_filters(event, &e.filters)
+            }
+        }
 }
 
 /// The real-time delivery mechanism `DeliverToSubscriptions`/

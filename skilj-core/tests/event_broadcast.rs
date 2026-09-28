@@ -239,3 +239,57 @@ fn a_zero_capacity_broadcaster_is_still_usable() {
     let broadcaster = skilj_core::event_store::EventBroadcaster::new(0);
     let _receiver = broadcaster.subscribe();
 }
+
+/// docs/architecture.md §85: `subscription_selects` is the grant-free part
+/// of `deliver_to_subscriptions`' match - what a live subscription checks
+/// before any database work. Whatever it rejects, delivery rejects too.
+#[test]
+fn subscription_selects_is_the_grant_free_part_of_delivery() {
+    let mapping = access_mapping();
+    let subscription = Subscription::EventTypeSubscription(Box::new(
+        event_store::create_event_type_subscription(
+            &mapping,
+            &event_type(),
+            Vec::new(),
+            Some(5),
+            &[],
+            timestamp(0),
+        )
+        .unwrap(),
+    ));
+    let mut other_type = event(6);
+    other_type.event_type.name = "OrderShipped".into();
+
+    let deliver = |e: &Event| {
+        event_store::deliver_to_subscriptions(
+            e,
+            std::slice::from_ref(&subscription),
+            |_, _| None,
+            &[],
+        )
+    };
+    for (e, selected) in [(event(6), true), (event(5), false), (other_type, false)] {
+        assert_eq!(
+            event_store::subscription_selects(&subscription, &e),
+            selected,
+            "sequence {} of {}",
+            e.sequence,
+            e.event_type.name
+        );
+        assert_eq!(deliver(&e).len(), usize::from(selected));
+    }
+
+    // The grant is delivery's to check, not this: a revoked grant still
+    // selects, and delivers nothing.
+    let mut revoked = mapping.clone();
+    revoked.status = RoleStatus::Revoked;
+    let Subscription::EventTypeSubscription(mut inner) = subscription.clone() else {
+        unreachable!()
+    };
+    inner.access_mapping = revoked;
+    let revoked = Subscription::EventTypeSubscription(inner);
+    assert!(event_store::subscription_selects(&revoked, &event(6)));
+    assert!(
+        event_store::deliver_to_subscriptions(&event(6), &[revoked], |_, _| None, &[]).is_empty()
+    );
+}

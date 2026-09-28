@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Live `allEvents`/`eventsByType` subscriptions re-checked the caller's
+  grant, resolved decryption keys and read private-field grants - two
+  to three database round trips - for *every* event committed in the
+  bounded context, before discovering most weren't theirs (another event
+  type, a failed filter). They now check the event type, filters and
+  sequence first (new pure `event_store::subscription_selects`) and do
+  the database work only for events they deliver.
 - **Wire:** `allEvents`/`eventsByType` with a `fromSequence` below the
   latest committed event now deliver the events committed in between
   first, in order, then the live feed, with none twice. Previously they
