@@ -9609,3 +9609,20 @@ Fix, in `ContextWindow` itself so no caller can get it wrong:
 Sequence allocation is gapless per bounded context (the `sequence` row's `UPDATE` rolls back with its transaction), so contiguity is the right test for local appends. And since only local appends are held to it, even a gap in the database would just mean falling back to `freshen`, not a stuck window. No spec change: `LatestEventsAlwaysAvailable` already required this.
 
 Tests (`skilj-core/tests/event_cache.rs`): `appending_past_an_unseen_event_does_not_leave_a_hole` (another writer's event, then a local append past it: served `[b, a]`; before, `[a]`) and `a_late_append_of_an_already_freshened_event_is_not_a_duplicate` (freshen, then the committing path's append: served once; before, twice).
+
+## 90. Live subscriptions deliver in sequence order
+
+`DeliveryIsAtMostOnce` promises that while the connection is live "every matching event arrives once, in sequence order: no duplicates, no gaps". The live feed is the `EventBroadcaster`, which carries events in the order they were *published* on this instance, and that isn't commit order:
+
+- Two concurrent local commits each publish in their own post-commit step, in either order.
+- Another instance's event reaches this broadcaster only when its `NOTIFY` arrives and the listener has refetched it (§83). An event this instance commits *after* it is usually published here first. That's routine in any multi-instance deployment, not an edge case.
+
+A subscriber therefore saw 13 before 12, or 12 never (if its `NOTIFY` was lost). A client tracking "the last sequence I received" for the §84 resume handoff resumed from the wrong place.
+
+The same property the event cache relies on (§89) makes this cheap to fix without buffering or timers: within a bounded context, commits happen in sequence order (the sequence row's lock is held until commit, `SequenceIsGaplessPerBoundedContext`). So when event N is visible, every sequence below N is committed. `in_sequence_order` tracks `processed_up_to` - the highest sequence of the subscription's bounded context it has handled, delivered or filtered out, starting from where §84's resume span left off. On an event past `processed_up_to + 1`, it loads the missing range from Postgres (`list_events_for_bounded_context_from_limited`) and hands it to `deliver_one` first, in order. An event at or below `processed_up_to` - a late arrival already loaded that way, or one the resume span covered - is dropped. A jump over more than `max_events_per_read` ends the stream with `subscription_lagged` rather than loading an unbounded range, like a real lag.
+
+A side effect: an event whose `NOTIFY` was lost is now also recovered as soon as any later event of its bounded context arrives. §83's resync still covers a quiet bounded context, where no later event would come.
+
+Cost: one bounded read per subscription per out-of-order arrival - in a multi-instance deployment, roughly each time instances' writes interleave. No spec change; the guarantee already required this. `projectionUpdates` is unaffected: it pushes current state, and order doesn't change that.
+
+Test: `a_live_subscription_delivers_in_sequence_order_across_an_unpublished_event` (`skilj/tests/event_subscription.rs`): an event committed straight to Postgres and never published (standing in for another instance's, or a not-yet-published concurrent commit), then one committed through `submitCommand`. The subscriber receives both, in order, and nothing else. Without the gap fill it only ever receives the second.

@@ -1569,3 +1569,154 @@ fn resuming_from_a_sequence_replays_the_missed_span_then_goes_live() {
         );
     });
 }
+
+/// docs/architecture.md §90: the broadcaster sees events in publish order,
+/// not commit order - here an event committed but never published to this
+/// instance (standing in for another instance's event whose `NOTIFY` hasn't
+/// arrived, or a concurrent commit that hasn't published yet), followed by
+/// one committed and published normally. The subscriber must get both, in
+/// sequence order, not just the later one.
+#[test]
+fn a_live_subscription_delivers_in_sequence_order_across_an_unpublished_event() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: admin_role,
+                bounded_context: bc,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .command_type::<DepositMoney>()
+            .reconciliation_role(admin_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let serve_router = router.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, serve_router).await.unwrap();
+        });
+        let jwt = sign_jwt(&admin_subject);
+
+        let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
+        ws_send_json(
+            &mut ws,
+            json!({
+                "type": "connection_init",
+                "payload": { "Authorization": format!("Bearer {jwt}") },
+            }),
+        )
+        .await;
+        assert_eq!(ws_recv_json(&mut ws).await["type"], "connection_ack");
+        ws_send_json(
+            &mut ws,
+            json!({
+                "id": "1",
+                "type": "subscribe",
+                "payload": {
+                    "query": "subscription($bc: String!) { allEvents(boundedContext: $bc) { sequence } }",
+                    "variables": { "bc": bc_name },
+                },
+            }),
+        )
+        .await;
+        // Let the subscription start before anything is committed.
+        assert_eq!(ws_try_recv_json(&mut ws, Duration::from_millis(300)).await, None);
+
+        // Committed, never published here.
+        let event_type = skilj_core::db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        let unpublished = Event {
+            bounded_context: event_type.bounded_context.clone(),
+            event_type: event_type.clone(),
+            payload: r#"{"amount":1}"#.to_string(),
+            metadata: skilj_core::shared::Metadata {
+                r#type: event_type.name.clone(),
+                version: event_type.schema_version,
+                client_id: "another-instance".to_string(),
+                created_at: test_now(),
+                correlation_id: None,
+                causation_id: None,
+            },
+            sequence: skilj_core::db::next_sequence(&pool, &bc_name).await.unwrap(),
+            tags: Vec::new(),
+            encryption_keys: Vec::new(),
+            origin: skilj_core::event_store::EventOrigin::DirectlyCreated,
+        };
+        skilj_core::db::insert_event(&pool, &unpublished, None)
+            .await
+            .unwrap();
+
+        // Committed and published normally.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            DEPOSIT_MONEY_MUTATION,
+            json!({ "bc": bc_name, "payload": r#"{"amount":2}"# }),
+        )
+        .await;
+        let published = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let message = ws_recv_json(&mut ws).await;
+            assert_eq!(message["type"], "next", "{message}");
+            received.push(message["payload"]["data"]["allEvents"]["sequence"].as_i64().unwrap());
+        }
+        assert_eq!(received, vec![unpublished.sequence, published]);
+        assert_eq!(ws_try_recv_json(&mut ws, Duration::from_millis(300)).await, None);
+    });
+}

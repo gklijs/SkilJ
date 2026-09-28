@@ -94,6 +94,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Live `allEvents`/`eventsByType` subscriptions delivered events in the
+  order they were *published* to this instance, not commit order, and
+  could skip one entirely: two concurrent commits publish in either
+  order, and in a multi-instance deployment another instance's earlier
+  event routinely arrives (via `NOTIFY`) after this instance's own later
+  one. A subscription now tracks the bounded context's sequence: on a
+  jump, it loads the skipped events from Postgres and delivers them first
+  (they are already committed, since commits happen in sequence order),
+  and drops late arrivals it has already delivered. A jump over more than
+  `max_events_per_read` events ends the subscription with
+  `subscription_lagged`.
 - The in-memory event cache could **silently skip or duplicate events**.
   Each committed event was appended to its bounded context's window
   unconditionally, but commits don't arrive in order: another

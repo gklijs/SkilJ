@@ -219,6 +219,7 @@ pub fn all_events_field() -> SubscriptionField {
                 // `fromSequence` and the latest sequence at subscribe
                 // time, delivered first, in order; live events at or
                 // below `delivered_up_to` are then skipped as duplicates.
+                let mut processed_up_to = delivered_up_to;
                 for event in &resume_span {
                     match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
                         Ok(delivered) => {
@@ -261,23 +262,32 @@ pub fn all_events_field() -> SubscriptionField {
                   };
                     match event {
                         Ok(event) => {
-                            // Already delivered from the resume span.
-                            if event.bounded_context.name != bounded_context_name
-                                || event.sequence <= delivered_up_to
-                            {
+                            if event.bounded_context.name != bounded_context_name {
                                 continue;
                             }
-                            match deliver_one(&state, &role_id, &bounded_context_name, &mut current, &event).await {
-                                Ok(delivered) => {
-                                    for (sequence, rendered) in delivered {
-                                        yielder
-                                            .yield_ok(FieldValue::owned_any((sequence, rendered)))
-                                            .await;
-                                    }
-                                }
+                            // docs/architecture.md §90: in sequence order,
+                            // each once - anything skipped over is loaded,
+                            // anything already processed dropped.
+                            let ordered = match in_sequence_order(&state, &bounded_context_name, &mut processed_up_to, event).await {
+                                Ok(ordered) => ordered,
                                 Err(err) => {
                                     yielder.yield_error(err).await;
                                     return Ok(());
+                                }
+                            };
+                            for event in &ordered {
+                                match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
+                                    Ok(delivered) => {
+                                        for (sequence, rendered) in delivered {
+                                            yielder
+                                                .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                                .await;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        yielder.yield_error(err).await;
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
@@ -377,6 +387,7 @@ pub fn events_by_type_field() -> SubscriptionField {
                 // `fromSequence` and the latest sequence at subscribe
                 // time, delivered first, in order; live events at or
                 // below `delivered_up_to` are then skipped as duplicates.
+                let mut processed_up_to = delivered_up_to;
                 for event in &resume_span {
                     match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
                         Ok(delivered) => {
@@ -419,23 +430,32 @@ pub fn events_by_type_field() -> SubscriptionField {
                   };
                     match event {
                         Ok(event) => {
-                            // Already delivered from the resume span.
-                            if event.bounded_context.name != bounded_context_name
-                                || event.sequence <= delivered_up_to
-                            {
+                            if event.bounded_context.name != bounded_context_name {
                                 continue;
                             }
-                            match deliver_one(&state, &role_id, &bounded_context_name, &mut current, &event).await {
-                                Ok(delivered) => {
-                                    for (sequence, rendered) in delivered {
-                                        yielder
-                                            .yield_ok(FieldValue::owned_any((sequence, rendered)))
-                                            .await;
-                                    }
-                                }
+                            // docs/architecture.md §90: in sequence order,
+                            // each once - anything skipped over is loaded,
+                            // anything already processed dropped.
+                            let ordered = match in_sequence_order(&state, &bounded_context_name, &mut processed_up_to, event).await {
+                                Ok(ordered) => ordered,
                                 Err(err) => {
                                     yielder.yield_error(err).await;
                                     return Ok(());
+                                }
+                            };
+                            for event in &ordered {
+                                match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
+                                    Ok(delivered) => {
+                                        for (sequence, rendered) in delivered {
+                                            yielder
+                                                .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                                .await;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        yielder.yield_error(err).await;
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
@@ -523,6 +543,50 @@ async fn resolve_start(
         return Err(resume_span_too_large_error(cap));
     }
     Ok((from_sequence, span, latest))
+}
+
+/// The live feed's ordering (docs/architecture.md §90). Events reach the
+/// broadcaster in the order their commits *published*, not the order they
+/// committed: two concurrent local commits publish in either order, and
+/// another instance's event arrives later, via its `NOTIFY`, than one this
+/// instance committed after it. Commits happen in sequence order within a
+/// bounded context (the sequence row's lock is held to commit), so when
+/// `event` is visible every lower sequence is committed too: anything
+/// between `processed_up_to` and `event` is loaded from Postgres and
+/// returned first, and an event at or below `processed_up_to` (a late
+/// arrival already loaded, or one the resume span covered) is dropped.
+/// `processed_up_to` counts every event of the bounded context, delivered
+/// to this subscription or not. A jump over more than
+/// `max_events_per_read` events ends the stream like a lag, rather than
+/// loading an unbounded range.
+async fn in_sequence_order(
+    state: &GraphqlState,
+    bounded_context: &str,
+    processed_up_to: &mut i64,
+    event: skilj_core::event_store::Event,
+) -> async_graphql::Result<Vec<skilj_core::event_store::Event>> {
+    if event.sequence <= *processed_up_to {
+        return Ok(Vec::new());
+    }
+    let missing = event.sequence - *processed_up_to - 1;
+    let mut ordered = Vec::new();
+    if missing > 0 {
+        if u64::try_from(missing).unwrap_or(u64::MAX) > state.max_events_per_read.max(1) as u64 {
+            return Err(subscription_lagged_error(missing.unsigned_abs()));
+        }
+        let loaded = skilj_core::db::list_events_for_bounded_context_from_limited(
+            &state.pool,
+            bounded_context,
+            *processed_up_to,
+            missing,
+        )
+        .await
+        .map_err(to_graphql_error)?;
+        ordered.extend(loaded.into_iter().filter(|e| e.sequence < event.sequence));
+    }
+    *processed_up_to = event.sequence;
+    ordered.push(event);
+    Ok(ordered)
 }
 
 fn resume_span_too_large_error(cap: usize) -> async_graphql::Error {
