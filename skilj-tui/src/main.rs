@@ -17,13 +17,6 @@ use skilj_tui::{cli, ui};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-// `QueriedEvent` (`allEvents`'s own return type) only has `sequence`/
-// `payload` - no `eventType` field, confirmed against a real running
-// skilj-demo server, not assumed from the schema-builder source alone.
-const LIVE_EVENTS_QUERY: &str = "subscription($bc: String!) { \
-    allEvents(boundedContext: $bc) { sequence payload } \
-}";
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = cli::Args::parse();
@@ -77,11 +70,14 @@ fn spawn_terminal_input_reader(tx: mpsc::UnboundedSender<AppEvent>) {
 
 fn spawn_live_events_subscription(args: &cli::Args, tx: mpsc::UnboundedSender<AppEvent>) {
     let ws_endpoint = graphql::to_websocket_url(&args.endpoint);
-    let mut rx = graphql::spawn_subscription(
+    // Reconnects, resuming from the last sequence shown, whenever the
+    // server ends the subscription (docs/architecture.md §106).
+    let mut rx = graphql::spawn_live_events(
         ws_endpoint,
         args.token.clone(),
-        LIVE_EVENTS_QUERY.to_string(),
-        serde_json::json!({ "bc": args.bounded_context }),
+        args.bounded_context.clone(),
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(30),
     );
     tokio::spawn(async move {
         while let Some(result) = rx.recv().await {

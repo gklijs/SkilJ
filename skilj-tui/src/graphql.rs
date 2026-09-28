@@ -59,6 +59,12 @@ pub enum ClientError {
     /// workspace controls.
     MalformedResponse(String),
     WebSocket(tokio_tungstenite::tungstenite::Error),
+    /// [`spawn_live_events`]'s subscription ended - the server completed
+    /// it, or it failed - and is being re-established, resuming after
+    /// `resuming_after` when that's known.
+    SubscriptionEnded {
+        resuming_after: Option<i64>,
+    },
 }
 
 impl fmt::Display for ClientError {
@@ -71,6 +77,15 @@ impl fmt::Display for ClientError {
             }
             ClientError::MalformedResponse(msg) => write!(f, "malformed GraphQL response: {msg}"),
             ClientError::WebSocket(e) => write!(f, "websocket error: {e}"),
+            ClientError::SubscriptionEnded {
+                resuming_after: Some(sequence),
+            } => write!(
+                f,
+                "subscription ended - reconnecting from sequence {sequence}"
+            ),
+            ClientError::SubscriptionEnded {
+                resuming_after: None,
+            } => write!(f, "subscription ended - reconnecting"),
         }
     }
 }
@@ -183,6 +198,83 @@ pub fn spawn_subscription(
     rx
 }
 
+/// The live `allEvents` feed the TUI shows - resumable: `$from` is the
+/// last sequence already received (`null` on the first connection).
+/// `QueriedEvent` (`allEvents`'s return type) only has `sequence`/
+/// `payload` - no `eventType` field, confirmed against a real running
+/// skilj-demo server, not assumed from the schema-builder source alone.
+pub const LIVE_EVENTS_QUERY: &str = "subscription($bc: String!, $from: Int) { \
+    allEvents(boundedContext: $bc, fromSequence: $from) { sequence payload } \
+}";
+
+/// [`spawn_subscription`] for [`LIVE_EVENTS_QUERY`], kept alive
+/// (docs/architecture.md §106). The server ends a subscription on
+/// purpose - it fell behind (`subscription_lagged`), a missed
+/// cross-instance notification left a gap, the connection dropped - and
+/// expects the client to resubscribe from the last sequence it received,
+/// which then delivers everything since first. So this does exactly that:
+/// whenever the subscription ends it sends
+/// [`ClientError::SubscriptionEnded`] and resubscribes, with `fromSequence`
+/// set to the last `allEvents.sequence` delivered, backing off from
+/// `initial_delay` up to `max_delay` while connecting keeps failing. A
+/// `resume_span_too_large` refusal (too far behind to replay) resumes from
+/// now instead, after reporting it. Ends only when the receiver is dropped.
+pub fn spawn_live_events(
+    ws_endpoint: reqwest::Url,
+    token: String,
+    bounded_context: String,
+    initial_delay: std::time::Duration,
+    max_delay: std::time::Duration,
+) -> mpsc::UnboundedReceiver<Result<Value, ClientError>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut last_sequence: Option<i64> = None;
+        let mut delay = initial_delay;
+        loop {
+            let mut inner = spawn_subscription(
+                ws_endpoint.clone(),
+                token.clone(),
+                LIVE_EVENTS_QUERY.to_string(),
+                json!({ "bc": bounded_context, "from": last_sequence }),
+            );
+            while let Some(item) = inner.recv().await {
+                match &item {
+                    Ok(data) => {
+                        if let Some(sequence) =
+                            data.pointer("/allEvents/sequence").and_then(Value::as_i64)
+                        {
+                            last_sequence = Some(sequence);
+                        }
+                        delay = initial_delay;
+                    }
+                    Err(ClientError::Graphql(errors))
+                        if errors
+                            .iter()
+                            .any(|e| e.code.as_deref() == Some("resume_span_too_large")) =>
+                    {
+                        last_sequence = None;
+                    }
+                    Err(_) => {}
+                }
+                if tx.send(item).is_err() {
+                    return;
+                }
+            }
+            if tx
+                .send(Err(ClientError::SubscriptionEnded {
+                    resuming_after: last_sequence,
+                }))
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(max_delay);
+        }
+    });
+    rx
+}
+
 async fn run_subscription(
     ws_endpoint: reqwest::Url,
     token: String,
@@ -232,6 +324,23 @@ async fn run_subscription(
     loop {
         let message = recv_json(&mut ws).await?;
         match message.get("type").and_then(Value::as_str) {
+            // A resolver error arrives as a `next` carrying `errors` (and
+            // `data: null`), followed by the server's own `complete` -
+            // not as a protocol-level `error` message (docs/architecture.md
+            // §106).
+            Some("next")
+                if message
+                    .pointer("/payload/errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(|errors| !errors.is_empty()) =>
+            {
+                let errors = message
+                    .pointer("/payload/errors")
+                    .and_then(Value::as_array)
+                    .map(|errs| errs.iter().map(parse_error).collect())
+                    .unwrap_or_default();
+                return Err(ClientError::Graphql(errors));
+            }
             Some("next") => {
                 let data = message.pointer("/payload/data").cloned().ok_or_else(|| {
                     ClientError::MalformedResponse(format!(

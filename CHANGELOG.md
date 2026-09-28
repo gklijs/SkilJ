@@ -111,6 +111,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `skilj-tui`'s live events tab showed a bogus `null` event whenever the
+  server ended its subscription with an error (`subscription_lagged`, a
+  cross-instance gap, a revoked grant), then stopped updating while
+  still showing itself connected, and never reconnected - after any drop
+  the TUI had to be restarted. It now reports the error, marks the feed
+  disconnected, and resubscribes with backoff from the last sequence it
+  showed, so the server replays what it missed.
 - `templates/skilj-template` didn't compile: it pinned `schemars` 0.8
   while skilj uses `schemars` 1 (so no payload satisfied `JsonSchema`),
   called `create_command_token` without its `scope` argument, and still
