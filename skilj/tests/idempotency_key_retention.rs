@@ -139,7 +139,13 @@ fn test_now() -> chrono::DateTime<Utc> {
     Utc::now().trunc_subsecs(6)
 }
 
-async fn setup(retention: std::time::Duration) -> (Router, String, Pool, String) {
+/// With `stale_key_before_start`, a key recorded two hours ago is inserted
+/// before `build()` - one written just before an outage longer than the
+/// retention (docs/architecture.md §94).
+async fn setup(
+    retention: std::time::Duration,
+    stale_key_before_start: bool,
+) -> (Router, String, Pool, String) {
     let (database_url, pool) = test_db()
         .await
         .expect("test_db() must be Some - caller already checked");
@@ -179,6 +185,18 @@ async fn setup(retention: std::time::Duration) -> (Router, String, Pool, String)
     db::insert_role_access_mapping(&pool, &mapping)
         .await
         .unwrap();
+
+    if stale_key_before_start {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"bc_{bc_name}\".idempotency_keys \
+             (command_type_name, client_id, idempotency_key, triggered_event_sequences, created_at) \
+             VALUES ('WithdrawMoney', 'before-the-outage', 'order-1', '{{0}}', $1)"
+        )))
+        .bind(test_now() - chrono::Duration::hours(2))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
 
     let (skilj, report) = Skilj::builder(database_url)
         .bounded_context(bc_name.clone())
@@ -231,7 +249,31 @@ fn a_key_deduplicates_within_its_retention_and_is_new_after_it() {
         if test_db().await.is_none() {
             return;
         }
-        let (router, credential, pool, bc_name) = setup(std::time::Duration::from_secs(1)).await;
+        let (router, credential, pool, bc_name) =
+            setup(std::time::Duration::from_secs(2), true).await;
+        let count_before_the_outage = || {
+            let pool = pool.clone();
+            let bc_name = bc_name.clone();
+            async move {
+                let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT count(*) FROM \"bc_{bc_name}\".idempotency_keys \
+                     WHERE client_id = 'before-the-outage'"
+                )))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                count
+            }
+        };
+        // §94: already past the retention at startup, but the first sweep
+        // waits out the startup grace (here the 2 s retention), so a
+        // recovery path retrying under it right after startup still finds it.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            count_before_the_outage().await,
+            1,
+            "swept before the startup grace"
+        );
 
         let first = trigger(router.clone(), &credential, "order-17").await;
         assert_eq!(first["deduplicated"], false, "{first}");

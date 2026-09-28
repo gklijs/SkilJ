@@ -74,6 +74,10 @@ pub const DEFAULT_IDEMPOTENCY_KEY_RETENTION: std::time::Duration =
 /// second).
 const IDEMPOTENCY_KEY_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long an instance waits after startup before its first retention
+/// sweep, at most - `min(retention, this)` (docs/architecture.md §94).
+const IDEMPOTENCY_KEY_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Rows one retention `DELETE` removes at most; the task repeats until a
 /// batch comes back short.
 const IDEMPOTENCY_KEY_CLEANUP_BATCH: i64 = 10_000;
@@ -1651,7 +1655,9 @@ impl SkiljBuilder {
     /// processed as a new command. Defaults to
     /// [`DEFAULT_IDEMPOTENCY_KEY_RETENTION`] (one hour). A key is kept for
     /// *at least* this long - a background task deletes expired keys
-    /// about once a minute (or once per `retention`, if shorter).
+    /// about once a minute (or once per `retention`, if shorter), starting
+    /// `min(retention, 1 hour)` after the instance starts, so recovery
+    /// after an outage longer than the retention still finds its keys.
     ///
     /// Set it longer than the longest time anything may retry the same
     /// key, because a retry after the window lands twice. That includes:
@@ -2162,8 +2168,17 @@ impl SkiljBuilder {
             let cleanup_interval = retention
                 .min(IDEMPOTENCY_KEY_CLEANUP_INTERVAL)
                 .max(std::time::Duration::from_secs(1));
+            let startup_grace = retention.min(IDEMPOTENCY_KEY_STARTUP_GRACE);
             let retention = chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
             tokio::spawn(async move {
+                // docs/architecture.md §94: recovery paths that retry under
+                // a key (a reclaimed deadline, a route re-reading its
+                // source, a broker redelivering an uncommitted message)
+                // all run right after startup. After an outage longer
+                // than the retention they must find their keys, not race
+                // this task deleting them - so it waits before its first
+                // sweep.
+                tokio::time::sleep(startup_grace).await;
                 loop {
                     let start = std::time::Instant::now();
                     idempotency_key_retention_tick(&retention_pool, retention)

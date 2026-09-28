@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it afterwards is a new command. Keys used to be kept forever, so the
   table grew with every keyed submission - all three bridges key every
   message. `keep_idempotency_keys_forever()` restores the old behaviour.
+  Each instance starts sweeping `min(retention, 1 hour)` after it starts,
+  so recovery right after an outage longer than the retention (a
+  reclaimed deadline, a route re-reading its source, a broker
+  redelivering an uncommitted message) still finds its keys.
   Set the retention longer than anything may retry one key: a client or
   Temporal activity retry, a bridge re-reading old broker messages, a
   `CrossContextRoute` retry policy, or a `retryParkedDelivery` redrive of
@@ -299,6 +303,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- REST and GraphQL error responses carried raw database error text in
+  `message` - Postgres messages naming schemas (`bc_<bounded context>`,
+  i.e. tenant names), constraints and SQL fragments - including to a
+  caller whose token lookup failed before authentication completed. A
+  `database_error` (or `migration_error`) now answers with a generic
+  message (a vanished row and an exhausted connection pool keep their own
+  distinguishable wording), and the raw cause is logged at `error` in the
+  request's span, findable by the `trace_id`/`traceId` the response
+  carries. New `SkiljRejection::internal_detail`.
 - A **scoped** admin grant (one owner/tenant's view of a bounded context)
   could escape its scope through REST tokens: it could mint an
   unrestricted or another owner's `EventReadToken`/`ExternalEventToken`/
