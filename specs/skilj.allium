@@ -3601,10 +3601,11 @@ rule ProcessCommand {
     -- two Commands, two sets of events - out of what the caller meant as
     -- one action.
     --
-    -- recorded_acceptance(command_type, idempotency_key) is the outcome
-    -- this library remembers against that key: the events an earlier
-    -- submission bearing it actually triggered, or null when the key is
-    -- null or when nothing has been recorded against it yet. It is a black
+    -- recorded_acceptance(command_type, client_id, idempotency_key) is the
+    -- outcome this library remembers against that key from that caller:
+    -- the events an earlier submission by the same caller bearing it
+    -- actually triggered, or null when the key is null or when nothing has
+    -- been recorded against it yet. It is a black
     -- box in the same register as next_sequence - library-owned durable
     -- state whose storage shape this spec does not reach into - rather
     -- than a plugged-in decision like decide().
@@ -3646,17 +3647,29 @@ rule ProcessCommand {
     -- than replaying a stale "no" at a caller whose command might now
     -- succeed.
     --
-    -- A key is scoped to one bounded context and one command type, and to
-    -- nothing else. It is not global, and deliberately not scoped to the
-    -- calling identity either: two callers presenting the same key for the
-    -- same command type are answered as one. Resolved that way for
-    -- simplicity - it also makes the two tracks share one record rather
-    -- than keep two, which they could not do anyway, since one
-    -- authenticates a Role and the other a CommandToken and they have no
-    -- identity in common to scope by (see the note above
-    -- AuthoriseCommandSubmission). The obligation this puts on a caller is
-    -- to choose keys that are unique to an attempt - a fresh UUID per
-    -- submission, not a name like "retry-1" another caller could pick too.
+    -- A key is scoped to one bounded context, one command type and one
+    -- caller - the client_id the authorising surface derived, never
+    -- anything the caller supplies: the Role's id over CommandSubmission,
+    -- the CommandToken's id over CommandTrigger (see Command.metadata). Two
+    -- callers presenting the same key for the same command type are two
+    -- keys, not one. The caller has to be part of it: many callers - often
+    -- different tenants, told apart only by their grants' scope - submit
+    -- the same command type, and a key derived from business data (an
+    -- order id, an invoice number) is a common, even recommended,
+    -- convention, so the same key from unrelated callers is ordinary
+    -- rather than an attack. Scoped only by command type, the second
+    -- caller's real command would be swallowed as a duplicate of the
+    -- first's and answered with the first's events. Because client_id
+    -- comes from authentication, no caller can place a key under another
+    -- caller's identity.
+    --
+    -- What this gives up: the two tracks do not share records, since a
+    -- Role and a CommandToken are different callers (see the note above
+    -- AuthoriseCommandSubmission), and a retry deduplicates only when it
+    -- is made with the same credential as the original - a retry under a
+    -- different CommandToken, or a different Role, is a new command. The
+    -- obligation this puts on a caller is to retry with the credential it
+    -- first used, and to choose keys unique among its own attempts.
     --
     -- A key is remembered for a while, not forever. A recorded outcome is
     -- kept for at least config.idempotency_key_retention after it was
@@ -3670,7 +3683,7 @@ rule ProcessCommand {
     -- than anything may retry the same key, since a retry after it lands
     -- twice. The Command and its events are unaffected: only the memory of
     -- the key goes.
-    let prior_outcome = recorded_acceptance(command_type, idempotency_key)
+    let prior_outcome = recorded_acceptance(command_type, client_id, idempotency_key)
     requires: prior_outcome = null
 
     -- Both carried here untouched from whichever surface authorised the
@@ -7581,7 +7594,8 @@ surface CommandSubmission {
 
     @guarantee DuplicateAcceptanceReturnsTheOriginalOutcome
         -- A submission whose idempotency_key already produced an accepted
-        -- outcome for this command type in this bounded context is answered
+        -- outcome for this command type in this bounded context, submitted
+        -- by the same Role, is answered
         -- with that original outcome - the same triggered events - and
         -- decide() is not called again, no second Command is created and no
         -- second event is appended. It is the original answer even when
@@ -7682,17 +7696,18 @@ surface CommandTrigger {
 
     @guarantee DuplicateAcceptanceReturnsTheOriginalOutcome
         -- A trigger whose idempotency_key already produced an accepted
-        -- outcome for this command type in this bounded context is answered
-        -- with that original outcome, without decide() running again and
-        -- without a second Command or a second event - the same guarantee
-        -- CommandSubmission carries, backed by the same recorded outcome
-        -- (see rule ProcessCommand).
+        -- outcome for this command type in this bounded context, triggered
+        -- with the same CommandToken, is answered with that original
+        -- outcome, without decide() running again and without a second
+        -- Command or a second event - the same guarantee CommandSubmission
+        -- carries, backed by the same mechanism (see rule ProcessCommand).
         --
-        -- The same one, literally: a key is scoped to the bounded context
-        -- and command type and to nothing else, so a command triggered here
-        -- and one submitted over CommandSubmission under that same key for
-        -- that same command type are one key, not two. The two tracks share
-        -- the record exactly as they already share ProcessCommand.
+        -- The same mechanism, not the same records: a key is scoped to the
+        -- caller as well (see rule ProcessCommand), and a CommandToken is a
+        -- different caller from any Role, so a command triggered here and
+        -- one submitted over CommandSubmission under the same key are two
+        -- keys, not one. Likewise two tokens for the same command type
+        -- never deduplicate against each other.
 
     @guidance
         -- REST only, with the token presented as
