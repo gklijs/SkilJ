@@ -814,8 +814,8 @@ impl Skilj {
 pub struct ReconciliationReport {
     pub registered: Vec<String>,
     pub skipped_no_access: Vec<String>,
-    /// `EventType`s/`CommandType`s this process declares in an *older*
-    /// shape than the one already stored - a newer version of the
+    /// `EventType`s/`CommandType`s/`Projection`s this process declares in
+    /// an *older* shape than the one already stored - a newer version of the
     /// application registered it (a rolling deploy in progress, or this
     /// process rolled back to). The stored, newer registration is kept
     /// untouched instead of failing startup (docs/architecture.md §101).
@@ -3459,7 +3459,7 @@ async fn reconcile_projections(
         )
         .await?;
 
-        let registration = skilj_core::projections::register_projection(
+        let registration = match skilj_core::projections::register_projection(
             &mapping,
             &bc,
             name.clone(),
@@ -3469,7 +3469,32 @@ async fn reconcile_projections(
             existing.as_ref(),
             staged.as_ref(),
             &bounded_context_events,
-        )?;
+        ) {
+            Ok(registration) => registration,
+            // docs/architecture.md §103: §101 for projections - a newer
+            // version added a state field this process doesn't declare.
+            // When the stored state schema is a compatible evolution of
+            // ours, this process is older: keep the stored projection as
+            // it is (no rebuild staged back to the older shape).
+            Err(e)
+                if is_older_than_stored_rejection(&e)
+                    && existing.as_ref().is_some_and(|stored| {
+                        skilj_core::event_store::schema_is_backwards_compatible(
+                            &registered.schema,
+                            &stored.schema,
+                        )
+                    }) =>
+            {
+                tracing::warn!(
+                    projection = %key,
+                    "this process declares an older state schema for this Projection than the \
+                     stored one (a newer version registered it) - keeping the stored projection"
+                );
+                report.kept_newer.push(key);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         match registration {
             ProjectionRegistration::Created {
                 projection,

@@ -109,7 +109,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs a warning, and lists the type in the new
   `ReconciliationReport::kept_newer`. A change neither side evolves into
   still fails, and the explicit GraphQL registration mutations are
-  unchanged.
+  unchanged. The same holds for a `Projection` whose state schema a
+  newer version extended.
 - `skilj-nats`: retrying one inbound message for longer than the
   consumer's `ack_wait` (30 s by default; the default retry policy's
   backoff reaches minutes) had JetStream redeliver it underneath the

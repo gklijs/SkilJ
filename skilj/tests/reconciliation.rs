@@ -754,3 +754,78 @@ fn an_older_version_never_removes_a_newer_versions_protections() {
         assert_eq!(stored.owner_tag_key.as_deref(), Some("company"));
     });
 }
+
+/// `AccountBalance` as a newer version declares it - one more, optional,
+/// state field.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct AccountBalanceV2State {
+    balance: i64,
+    deposits: Option<i64>,
+}
+
+struct AccountBalanceV2;
+
+impl Projection for AccountBalanceV2 {
+    type State = AccountBalanceV2State;
+    type Event = BankingEvent;
+    const NAME: &'static str = "AccountBalance";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["MoneyDeposited"]
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        match event {
+            BankingEvent::MoneyDeposited(p) => {
+                state.balance += p.amount;
+                state.deposits = Some(state.deposits.unwrap_or(0) + 1);
+            }
+        }
+    }
+}
+
+/// docs/architecture.md §103: §101 for projections - an older version
+/// starts after a newer one added a state field, keeping the stored
+/// projection instead of failing with `schema_incompatible`.
+#[test]
+fn an_older_version_starts_and_keeps_the_newer_projection() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = seed_admin_context(&pool).await;
+        let key = format!("{bc_name}/AccountBalance");
+
+        Skilj::builder(database_url.clone())
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .projection::<AccountBalanceV2>()
+            .reconciliation_role(external_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        let stored = db::get_projection(&pool, &bc_name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (_older, report) = Skilj::builder(database_url)
+            .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
+            .bounded_context(bc_name.clone())
+            .event_type::<MoneyDeposited>()
+            .projection::<AccountBalance>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .expect("an older version must still start");
+        assert_eq!(report.kept_newer, vec![key]);
+        let after = db::get_projection(&pool, &bc_name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.schema, stored.schema,
+            "the newer projection was downgraded"
+        );
+        assert_eq!(after.schema_version, stored.schema_version);
+    });
+}
