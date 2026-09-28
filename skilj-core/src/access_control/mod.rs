@@ -304,6 +304,18 @@ impl AccessToken {
             AccessToken::EventReadToken(t) => &t.event_type.bounded_context,
         }
     }
+
+    /// The token's own owner scope (`None` = unrestricted) - not to be
+    /// confused with [`scope`](Self::scope) above, which is `RevokeToken`'s
+    /// bounded-context `token_scope`.
+    fn owner_scope(&self) -> Option<&str> {
+        match self {
+            AccessToken::ExternalEventToken(t) => t.scope.as_deref(),
+            AccessToken::DirectCreationToken(t) => t.scope.as_deref(),
+            AccessToken::CommandToken(t) => t.scope.as_deref(),
+            AccessToken::EventReadToken(t) => t.scope.as_deref(),
+        }
+    }
 }
 
 /// Library-level errors this module's own rules reject for - an
@@ -439,6 +451,15 @@ pub enum Error {
     /// comment).
     #[error("start_from = beginning or latest forbids both start_at_sequence and start_at_time")]
     StartAtValueNotAllowed,
+
+    /// The four token-minting rules and `RevokeToken`: a scoped admin grant
+    /// may only mint or revoke tokens within its own scope
+    /// (docs/architecture.md §92).
+    #[error(
+        "this admin grant is scoped, so a token it mints or revokes must have the same \
+         scope (a minted one may omit it to inherit that scope)"
+    )]
+    TokenScopeBeyondGrant,
 }
 
 impl SkiljRejection for Error {
@@ -449,6 +470,7 @@ impl SkiljRejection for Error {
             Error::InsufficientAccessLevel => "insufficient_access_level",
             Error::GrantBoundedContextMismatch => "grant_bounded_context_mismatch",
             Error::GrantScopeMismatch => "grant_scope_mismatch",
+            Error::TokenScopeBeyondGrant => "token_scope_beyond_grant",
             Error::NotOnRequiredTeam => "not_on_required_team",
             Error::NotDefaultPrivateReader => "not_default_private_reader",
             Error::NotGrantor => "not_grantor",
@@ -1181,6 +1203,24 @@ fn require_active_admin(access_mapping: &RoleAccessMapping) -> crate::error::Res
     Ok(())
 }
 
+/// The scope a token minted under `access_mapping` gets, for all four
+/// token-minting rules (docs/architecture.md §92). An unscoped grant mints
+/// whatever `requested` names, narrowing included - the ordinary staff
+/// case. A scoped grant is confined to its own scope and can't mint its
+/// way out of it: omitted, the token inherits the grant's scope; naming
+/// the same scope is fine; naming another, or none, is refused.
+fn scope_for_minted_token(
+    access_mapping: &RoleAccessMapping,
+    requested: Option<String>,
+) -> crate::error::Result<Option<String>> {
+    match (access_mapping.scope.as_deref(), requested) {
+        (None, requested) => Ok(requested),
+        (Some(own), None) => Ok(Some(own.to_string())),
+        (Some(own), Some(requested)) if requested == own => Ok(Some(requested)),
+        (Some(_), Some(_)) => Err(Error::TokenScopeBeyondGrant.into()),
+    }
+}
+
 /// See `rule CreateExternalEventToken`. `id`/`secret` are the caller's own
 /// `generate_token_id()`/`generate_token_secret()` output - not this
 /// function's to generate, the same treatment `create_role`'s `id` gets
@@ -1198,6 +1238,7 @@ pub fn create_external_event_token(
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<ExternalEventToken> {
     require_active_admin(access_mapping)?;
+    let scope = scope_for_minted_token(access_mapping, scope)?;
     if access_mapping.bounded_context != event_type.bounded_context {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
@@ -1224,6 +1265,7 @@ pub fn create_direct_creation_token(
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<DirectCreationToken> {
     require_active_admin(access_mapping)?;
+    let scope = scope_for_minted_token(access_mapping, scope)?;
     if access_mapping.bounded_context != event_type.bounded_context {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
@@ -1281,6 +1323,7 @@ pub fn create_event_read_token(
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<EventReadToken> {
     require_active_admin(access_mapping)?;
+    let scope = scope_for_minted_token(access_mapping, scope)?;
     if access_mapping.bounded_context != event_type.bounded_context {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
@@ -1330,6 +1373,7 @@ pub fn create_command_token(
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<CommandToken> {
     require_active_admin(access_mapping)?;
+    let scope = scope_for_minted_token(access_mapping, scope)?;
     if access_mapping.bounded_context != command_type.bounded_context {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
@@ -1357,6 +1401,16 @@ pub fn revoke_token(
     require_active_admin(access_mapping)?;
     if &access_mapping.bounded_context != token.scope() {
         return Err(Error::GrantBoundedContextMismatch.into());
+    }
+    // docs/architecture.md §92: a scoped admin's reach over tokens is its
+    // own scope, for revoking as for minting - it can't revoke (cut off)
+    // another owner's credentials, or an unrestricted staff one.
+    if access_mapping
+        .scope
+        .as_deref()
+        .is_some_and(|own| token.owner_scope() != Some(own))
+    {
+        return Err(Error::TokenScopeBeyondGrant.into());
     }
     if token.status() != TokenStatus::Active {
         return Err(Error::TokenNotActive.into());

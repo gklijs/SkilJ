@@ -299,6 +299,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A **scoped** admin grant (one owner/tenant's view of a bounded context)
+  could escape its scope through REST tokens: it could mint an
+  unrestricted or another owner's `EventReadToken`/`ExternalEventToken`/
+  `DirectCreationToken`/`CommandToken` and read or write every owner's
+  records with it, and revoke other owners' tokens. A scoped admin now
+  mints only tokens with its own scope - an omitted scope inherits it,
+  another is refused with `token_scope_beyond_grant` - and revokes only
+  tokens carrying its own scope. Unscoped (staff) admins are unaffected.
 - `forgetSubject` left the forgotten subject's data in plaintext in
   `parked_deliveries`: a parked row holds the request exactly as it was
   submitted (a bridge's event or command body, a route's target command

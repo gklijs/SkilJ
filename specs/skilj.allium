@@ -5689,17 +5689,23 @@ rule CreateExternalEventToken {
     requires: access_mapping.bounded_context = event_type.bounded_context
 
     -- scope is carried through unvalidated and is the minted token's own,
-    -- independent of the minting admin's - see rule CreateEventReadToken's
-    -- own note below, which states that reasoning once for all four of
-    -- these rules. What a scoped token here may then do with it is restrict
-    -- what it creates rather than what it reads (see variant
-    -- ExternalEventToken.scope).
+    -- within what the minting admin's own grant allows - see rule
+    -- CreateEventReadToken's own note below, which states that reasoning
+    -- once for all four of these rules. What a scoped token here may then
+    -- do with it is restrict what it creates rather than what it reads
+    -- (see variant ExternalEventToken.scope).
+    -- A scoped grant mints only within its own scope, and an omitted
+    -- scope inherits it - see rule CreateEventReadToken's own note below.
+    requires:
+        access_mapping.scope = null or scope = null or scope = access_mapping.scope
+    let minted_scope = scope ?? access_mapping.scope
+
     ensures:
         ExternalEventToken.created(
             id: generate_token_id(),
             event_type: event_type,
             secret: generate_token_secret(),
-            scope: scope,
+            scope: minted_scope,
             status: active,
             created_at: now
         )
@@ -5714,12 +5720,18 @@ rule CreateDirectCreationToken {
     -- scope on the same terms as the rule above - see rule
     -- CreateEventReadToken's own note below, and variant
     -- DirectCreationToken.scope.
+    -- A scoped grant mints only within its own scope, and an omitted
+    -- scope inherits it - see rule CreateEventReadToken's own note below.
+    requires:
+        access_mapping.scope = null or scope = null or scope = access_mapping.scope
+    let minted_scope = scope ?? access_mapping.scope
+
     ensures:
         DirectCreationToken.created(
             id: generate_token_id(),
             event_type: event_type,
             secret: generate_token_secret(),
-            scope: scope,
+            scope: minted_scope,
             status: active,
             created_at: now
         )
@@ -5734,12 +5746,18 @@ rule CreateCommandToken {
     -- scope on the same terms as the two rules above, restricting what may
     -- be triggered - see rule CreateEventReadToken's own note below, and
     -- variant CommandToken.scope.
+    -- A scoped grant mints only within its own scope, and an omitted
+    -- scope inherits it - see rule CreateEventReadToken's own note below.
+    requires:
+        access_mapping.scope = null or scope = null or scope = access_mapping.scope
+    let minted_scope = scope ?? access_mapping.scope
+
     ensures:
         CommandToken.created(
             id: generate_token_id(),
             command_type: command_type,
             secret: generate_token_secret(),
-            scope: scope,
+            scope: minted_scope,
             status: active,
             created_at: now
         )
@@ -5764,13 +5782,18 @@ rule CreateEventReadToken {
     -- minted unrestricted within its event type - which is what every
     -- token minted before this argument existed is.
     --
-    -- It is the minted token's own scope, and independent of the minting
-    -- admin's: the grant authorising this call is checked for level and
-    -- bounded context alone, and access_mapping.scope has no bearing on
-    -- what may be named here. An admin holding an unscoped staff grant may
+    -- It is the minted token's own scope, chosen freely by an admin whose
+    -- own grant is unscoped: an admin holding an unscoped staff grant may
     -- mint a company-scoped token, and that is the ordinary case rather
     -- than an oversight - narrowing a REST credential is an act of issuing
-    -- one, not an act of delegating the issuer's own reach.
+    -- one, not an act of delegating the issuer's own reach. An admin whose
+    -- grant is itself scoped is confined to that scope, here as on every
+    -- read it makes: it may name its own scope or none - in which case the
+    -- token inherits its scope rather than coming out unrestricted - and
+    -- naming any other is refused. Without that, a scoped admin could mint
+    -- an unrestricted token and read or write every owner's records over
+    -- REST, and a scoped grant would confine nothing an admin cared to
+    -- step around. The same confinement governs RevokeToken.
     --
     -- Both paragraphs above are stated here once and hold for all four
     -- token-minting rules, not for this one alone: the three above take a
@@ -5811,12 +5834,17 @@ rule CreateEventReadToken {
         (resolved_start_from = beginning or resolved_start_from = latest)
             implies (start_at_sequence = null and start_at_time = null)
 
+    -- A scoped grant mints only within its own scope - see the note above.
+    requires:
+        access_mapping.scope = null or scope = null or scope = access_mapping.scope
+    let minted_scope = scope ?? access_mapping.scope
+
     ensures:
         EventReadToken.created(
             id: generate_token_id(),
             event_type: event_type,
             secret: generate_token_secret(),
-            scope: scope,
+            scope: minted_scope,
             start_from: resolved_start_from,
             start_at_sequence: start_at_sequence,
             start_at_time: start_at_time,
@@ -5841,6 +5869,10 @@ rule RevokeToken {
     requires: access_mapping.status = active
     requires: access_mapping.level = admin
     requires: access_mapping.bounded_context = token_scope
+    -- A scoped admin revokes only tokens carrying its own scope - not
+    -- another owner's, nor an unrestricted one (see rule
+    -- CreateEventReadToken's note on minting, the same confinement).
+    requires: access_mapping.scope = null or token.scope = access_mapping.scope
     requires: token.status = active
     ensures:
         token.status = revoked

@@ -942,3 +942,118 @@ fn revoke_token_only_ever_produces_the_revoked_status() {
 // Same GraphQL-scaffolding gap as CommandSubmission's own deferred pair
 // (see command_processing.rs's header comment) - no resolver/schema
 // wiring in skilj-graphql yet.
+
+/// docs/architecture.md §92: what scope each of the four minting rules
+/// stamps, for a minting grant with scope `grant_scope` and a requested
+/// scope - `Err` carrying the rejection code when refused.
+fn minted_scopes(
+    grant_scope: Option<&str>,
+    requested: Option<&str>,
+) -> Vec<Result<Option<String>, String>> {
+    let mut mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    mapping.scope = grant_scope.map(str::to_string);
+    let requested = || requested.map(str::to_string);
+    let code = |e: skilj_core::Error| e.code().to_string();
+    vec![
+        access_control::create_external_event_token(
+            &mapping,
+            &event_type(),
+            "t1".into(),
+            "s".into(),
+            requested(),
+            timestamp(0),
+        )
+        .map(|t| t.scope)
+        .map_err(code),
+        access_control::create_direct_creation_token(
+            &mapping,
+            &event_type(),
+            "t2".into(),
+            "s".into(),
+            requested(),
+            timestamp(0),
+        )
+        .map(|t| t.scope)
+        .map_err(code),
+        access_control::create_event_read_token(
+            &mapping,
+            &event_type(),
+            "t3".into(),
+            "s".into(),
+            requested(),
+            None,
+            None,
+            None,
+            timestamp(0),
+        )
+        .map(|t| t.scope)
+        .map_err(code),
+        access_control::create_command_token(
+            &mapping,
+            &command_type(),
+            "t4".into(),
+            "s".into(),
+            requested(),
+            timestamp(0),
+        )
+        .map(|t| t.scope)
+        .map_err(code),
+    ]
+}
+
+#[test]
+fn an_unscoped_admin_mints_any_scope() {
+    for requested in [None, Some("acme")] {
+        for minted in minted_scopes(None, requested) {
+            assert_eq!(minted, Ok(requested.map(str::to_string)));
+        }
+    }
+}
+
+#[test]
+fn a_scoped_admin_mints_only_within_its_own_scope() {
+    // Omitted: inherits the grant's scope rather than minting an
+    // unrestricted token.
+    for minted in minted_scopes(Some("acme"), None) {
+        assert_eq!(minted, Ok(Some("acme".to_string())));
+    }
+    for minted in minted_scopes(Some("acme"), Some("acme")) {
+        assert_eq!(minted, Ok(Some("acme".to_string())));
+    }
+    for minted in minted_scopes(Some("acme"), Some("globex")) {
+        assert_eq!(minted, Err("token_scope_beyond_grant".to_string()));
+    }
+}
+
+/// §92: revoking is confined the same way - a scoped admin can revoke a
+/// token carrying its own scope, but not another owner's, nor an
+/// unrestricted one; an unscoped admin can revoke any.
+#[test]
+fn a_scoped_admin_revokes_only_within_its_own_scope() {
+    let command_token = |scope: Option<&str>| {
+        AccessToken::CommandToken(CommandToken {
+            id: "t".into(),
+            secret: "s".into(),
+            status: TokenStatus::Active,
+            created_at: timestamp(0),
+            revoked_at: None,
+            command_type: command_type(),
+            scope: scope.map(str::to_string),
+        })
+    };
+    let mut scoped = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    scoped.scope = Some("acme".to_string());
+    let unscoped = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+
+    assert!(
+        access_control::revoke_token(&scoped, &command_token(Some("acme")), timestamp(1)).is_ok()
+    );
+    for other in [Some("globex"), None] {
+        let err =
+            access_control::revoke_token(&scoped, &command_token(other), timestamp(1)).unwrap_err();
+        assert_eq!(err.code(), "token_scope_beyond_grant", "{other:?}");
+    }
+    for any in [Some("acme"), Some("globex"), None] {
+        assert!(access_control::revoke_token(&unscoped, &command_token(any), timestamp(1)).is_ok());
+    }
+}

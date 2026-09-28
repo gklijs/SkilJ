@@ -9641,3 +9641,18 @@ It runs *before* the key is destroyed. If it failed afterwards, `forgetSubject` 
 Checked for other plaintext copies: idempotency keys store only sequences, external-message cursors only positions, and no log line writes a payload value.
 
 Test: `subject_erasure_end_to_end` (`skilj/tests/subject_erasure.rs`) now parks three `ExternalEvent` rows before `forgetSubject` for subject `user/42`: one naming 42 through `AccountOpened`'s sensitive field, one naming 43, and one whose token doesn't exist but whose request mentions 42. Afterwards only 43's row remains. Without the cleanup, all three do.
+
+## 92. A scoped admin can't mint or revoke its way out of its scope
+
+A `RoleAccessMapping.scope` confines a grant to one owner's records wherever an owner dimension is declared (§23/§25/§30), for admin-level grants too: `inspectSnapshot` is admin-gated and fails closed on a scope mismatch. But the four token-minting rules took a token's `scope` "independent of the minting admin's", and checked the grant only for level and bounded context. So a tenant-scoped admin could mint an `EventReadToken` with no scope and read every owner's events over REST, or a `CommandToken`/`ExternalEventToken`/`DirectCreationToken` with another owner's scope and act as them. Likewise `RevokeToken` let it revoke any token in the bounded context, cutting off other owners' and staff credentials. The spec's own motivating example was only the narrowing case: an unscoped staff admin minting a company-scoped token.
+
+Fix, with the user's choice of confining scoped minters over forbidding scoped admin grants or documenting the escape:
+
+- **Minting** (`scope_for_minted_token`, used by all four `create_*_token` functions): an unscoped grant mints whatever scope it names, unchanged. A scoped grant may name its own scope or none - and then the token *inherits* the grant's scope rather than coming out unrestricted. Naming any other scope is refused with `token_scope_beyond_grant`.
+- **Revoking** (`revoke_token`): a scoped grant may revoke only a token whose own scope equals the grant's. Another owner's token, or an unrestricted one, is refused with the same code. `AccessToken::owner_scope` reads the variant's `scope`, separate from the existing `AccessToken::scope`, which is `RevokeToken`'s bounded-context `token_scope`.
+
+Spec: the four minting rules gain `requires: access_mapping.scope = null or scope = null or scope = access_mapping.scope` and stamp `minted_scope = scope ?? access_mapping.scope`. `RevokeToken` gains `requires: access_mapping.scope = null or token.scope = access_mapping.scope` (`scope` is declared on all four variants). `CreateEventReadToken`'s note, which states the reasoning for all four, now distinguishes unscoped minters (free, narrowing is ordinary) from scoped ones (confined). `allium check`/`analyse` unchanged.
+
+Not changed, and worth knowing: other admin surfaces stay bounded-context-wide for a scoped admin, because they aren't per-owner by nature. That covers type registration, `parkedDeliveries` (whose rows carry no owner), and `forgetSubject` (keyed by subject, not owner). A deployment that needs an admin fully confined to one tenant should give that tenant its own bounded context.
+
+Tests (`skilj-core/tests/token_lifecycle.rs`): `an_unscoped_admin_mints_any_scope`, `a_scoped_admin_mints_only_within_its_own_scope` (all four kinds: omitted inherits, the same scope passes, another is `token_scope_beyond_grant`) and `a_scoped_admin_revokes_only_within_its_own_scope` (own scope revoked; another owner's or an unrestricted token refused; an unscoped admin revokes any).
