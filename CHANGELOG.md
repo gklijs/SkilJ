@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Behaviour:** idempotency keys now expire. A recorded key
+  deduplicates for `SkiljBuilder::idempotency_key_retention` (default
+  one hour, `DEFAULT_IDEMPOTENCY_KEY_RETENTION`) and is then deleted by a
+  background task (about once a minute, in batches); a submission bearing
+  it afterwards is a new command. Keys used to be kept forever, so the
+  table grew with every keyed submission - all three bridges key every
+  message. `keep_idempotency_keys_forever()` restores the old behaviour.
+  Set the retention longer than anything may retry one key: a client or
+  Temporal activity retry, a bridge re-reading old broker messages, a
+  `CrossContextRoute` retry policy, or a `retryParkedDelivery` redrive of
+  an attempt that may have committed. Instances sharing a database are
+  governed by the shortest retention among them.
+- **Wire:** `parkedDeliveries` returns at most `max_events_per_read`
+  rows, newest parked first (`firstFailedAt` descending; it was
+  `lastFailedAt`, which moved rows on every failed retry), and pages with
+  a new `after` argument taking the last row's new `cursor` field. It
+  used to load the bounded context's whole parked backlog - one row per
+  message when a bridge hits a poison topic - with full request bodies,
+  in one response. It now also counts toward `max_expensive_fields`.
 - Live `allEvents`/`eventsByType` subscriptions re-checked the caller's
   grant, resolved decryption keys and read private-field grants - two
   to three database round trips - for *every* event committed in the

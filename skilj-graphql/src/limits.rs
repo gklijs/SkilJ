@@ -51,8 +51,13 @@ impl Default for GraphqlLimits {
 
 /// The fields whose cost scales with stored history rather than with the
 /// query itself.
-pub const EXPENSIVE_FIELDS: &[&str] =
-    &["queryEvents", "countEvents", "fetchCommands", "projection"];
+pub const EXPENSIVE_FIELDS: &[&str] = &[
+    "queryEvents",
+    "countEvents",
+    "fetchCommands",
+    "projection",
+    "parkedDeliveries",
+];
 
 /// Refuses an operation selecting more than `max` [`EXPENSIVE_FIELDS`].
 /// Checked on the parsed document, before validation and execution.

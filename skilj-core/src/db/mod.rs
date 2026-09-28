@@ -1183,7 +1183,9 @@ pub async fn ensure_idempotency_keys_table<'e>(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    // The `created_at` index serves `delete_expired_idempotency_keys`
+    // (docs/architecture.md §87).
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS {schema}.idempotency_keys (
             command_type_name TEXT NOT NULL,
             client_id TEXT NOT NULL,
@@ -1191,11 +1193,37 @@ pub async fn ensure_idempotency_keys_table<'e>(
             triggered_event_sequences BIGINT[] NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (command_type_name, client_id, idempotency_key)
-        )"
+        );
+        CREATE INDEX IF NOT EXISTS idempotency_keys_created_at
+            ON {schema}.idempotency_keys (created_at)"
     )))
     .execute(executor)
     .await?;
     Ok(())
+}
+
+/// Deletes up to `batch` idempotency keys recorded before `cutoff` in
+/// `bounded_context`, returning how many went. `SkiljBuilder`'s
+/// retention task calls it until a call deletes fewer than `batch`, so
+/// no single statement holds locks on an unbounded number of rows
+/// (docs/architecture.md §87). A key gone is simply unseen: a later
+/// submission bearing it is processed as new.
+pub async fn delete_expired_idempotency_keys(
+    pool: &Pool,
+    bounded_context: &str,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> crate::error::Result<u64> {
+    let schema = schema_ident(bounded_context);
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {schema}.idempotency_keys WHERE ctid IN ( \
+             SELECT ctid FROM {schema}.idempotency_keys WHERE created_at < $1 LIMIT $2)"
+    )))
+    .bind(cutoff)
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Patches an already-provisioned bounded context's `idempotency_keys`
@@ -8389,7 +8417,7 @@ pub async fn ensure_parked_deliveries_table<'e>(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS {schema}.parked_deliveries (
             id TEXT PRIMARY KEY,
             source TEXT NOT NULL,
@@ -8403,7 +8431,9 @@ pub async fn ensure_parked_deliveries_table<'e>(
             attempt_count INT NOT NULL,
             first_failed_at TIMESTAMPTZ NOT NULL,
             last_failed_at TIMESTAMPTZ NOT NULL
-        )"
+        );
+        CREATE INDEX IF NOT EXISTS parked_deliveries_page_order
+            ON {schema}.parked_deliveries (first_failed_at DESC, id DESC)"
     )))
     .execute(executor)
     .await?;
@@ -8581,21 +8611,72 @@ pub async fn insert_parked_delivery(
     Ok(row.into())
 }
 
-/// `AdminAccess`-gated `parkedDeliveries(boundedContext:)`'s own read -
-/// newest failure first, the order an operator triaging a growing list
-/// actually wants.
+/// Every parked delivery in `bounded_context`, in page order (see
+/// [`list_parked_deliveries_page`]). Unbounded - for tests and internal
+/// checks; `parkedDeliveries` pages.
 pub async fn list_parked_deliveries(
     pool: &Pool,
     bounded_context: &str,
 ) -> crate::error::Result<Vec<ParkedDelivery>> {
+    list_parked_deliveries_page(pool, bounded_context, None, i64::MAX).await
+}
+
+/// `AdminAccess`-gated `parkedDeliveries(boundedContext:, after:)`'s own
+/// read (docs/architecture.md §86): at most `limit` rows, newest parked
+/// first, strictly after `after` in that order. The order is
+/// `(first_failed_at DESC, id DESC)`, not `last_failed_at`: a retry
+/// that fails again updates `last_failed_at`, which would move the row
+/// across a page boundary mid-listing and skip or repeat it, while
+/// `first_failed_at` never changes for a row.
+pub async fn list_parked_deliveries_page(
+    pool: &Pool,
+    bounded_context: &str,
+    after: Option<&ParkedDeliveryCursor>,
+    limit: i64,
+) -> crate::error::Result<Vec<ParkedDelivery>> {
     let schema = schema_ident(bounded_context);
     let rows: Vec<ParkedDeliveryRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PARKED_DELIVERY_COLUMNS} FROM {schema}.parked_deliveries \
-         ORDER BY last_failed_at DESC"
+         WHERE $1::timestamptz IS NULL OR (first_failed_at, id) < ($1, $2) \
+         ORDER BY first_failed_at DESC, id DESC LIMIT $3"
     )))
+    .bind(after.map(|c| c.first_failed_at))
+    .bind(after.map(|c| c.id.clone()))
+    .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(ParkedDelivery::from).collect())
+}
+
+/// A position in [`list_parked_deliveries_page`]'s order. It carries the
+/// position itself rather than naming a row, so it stays valid when that
+/// row is retried or discarded between pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedDeliveryCursor {
+    pub first_failed_at: DateTime<Utc>,
+    pub id: String,
+}
+
+impl ParkedDeliveryCursor {
+    pub fn of(delivery: &ParkedDelivery) -> Self {
+        Self {
+            first_failed_at: delivery.first_failed_at,
+            id: delivery.id.clone(),
+        }
+    }
+
+    /// `{microseconds since the epoch}:{id}` - opaque to clients.
+    pub fn encode(&self) -> String {
+        format!("{}:{}", self.first_failed_at.timestamp_micros(), self.id)
+    }
+
+    pub fn decode(cursor: &str) -> Option<Self> {
+        let (micros, id) = cursor.split_once(':')?;
+        Some(Self {
+            first_failed_at: DateTime::from_timestamp_micros(micros.parse().ok()?)?,
+            id: id.to_string(),
+        })
+    }
 }
 
 pub async fn get_parked_delivery(

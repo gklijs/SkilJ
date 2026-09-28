@@ -2130,3 +2130,49 @@ fn re_registration_never_rewinds_what_the_scheduler_advanced() {
         assert_eq!(after.last_fired_at, Some(fired_at));
     });
 }
+
+/// docs/architecture.md §87: `delete_expired_idempotency_keys` removes
+/// only keys recorded before the cutoff, at most `batch` per call.
+#[test]
+fn expired_idempotency_keys_are_deleted_in_bounded_batches() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let now = test_now();
+        for (key, age_minutes) in [("a", 120), ("b", 90), ("c", 61), ("fresh", 5)] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO \"bc_{}\".idempotency_keys \
+                 (command_type_name, client_id, idempotency_key, triggered_event_sequences, created_at) \
+                 VALUES ('Withdraw', 'client', $1, '{{1}}', $2)",
+                bc.name
+            )))
+            .bind(key)
+            .bind(now - chrono::Duration::minutes(age_minutes))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let cutoff = now - chrono::Duration::hours(1);
+        let mut deleted = Vec::new();
+        for _ in 0..3 {
+            deleted.push(
+                db::delete_expired_idempotency_keys(&pool, &bc.name, cutoff, 2)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(deleted, vec![2, 1, 0]);
+
+        let remaining: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT idempotency_key FROM \"bc_{}\".idempotency_keys",
+            bc.name
+        )))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec!["fresh".to_string()]);
+    });
+}

@@ -1722,9 +1722,14 @@ entity PrivateFieldGrant {
 -- consumer always makes progress. CountEvents stays unbounded - it is an
 -- aggregate, not a page. FetchCommands is bounded by the same value (see
 -- first_by_recording), so despite the name it caps commands too.
+--
+-- idempotency_key_retention is how long a recorded idempotency key keeps
+-- deduplicating at least (see rule ProcessCommand); after it the record
+-- is removed. A deployment may also keep keys forever.
 config {
     read_cursor_checkout_lease: Duration = 5.minutes
     max_events_per_read: Integer = 1000
+    idempotency_key_retention: Duration = 1.hour
 }
 
 ------------------------------------------------------------
@@ -2237,9 +2242,10 @@ rule CreateExternalEvent {
     -- this puts on an adapter is to keep its own partition keys stable
     -- across restarts, since a fresh key starts a fresh watermark.
     --
-    -- Nothing expires, the same treatment a recorded idempotency key gets
-    -- and for the same reason (see rule ProcessCommand). A watermark is
-    -- also not the opaque source_context blob and never parsed out of it:
+    -- Nothing expires - unlike a recorded idempotency key (see rule
+    -- ProcessCommand), and because of the compactness above: one number
+    -- per pair does not grow with traffic, and forgetting it would
+    -- re-admit every redelivery of its partition. A watermark is also not the opaque source_context blob and never parsed out of it:
     -- an adapter that puts its Kafka topic/partition/offset in there for
     -- provenance has said nothing to this mechanism, which acts only on
     -- values named separately and explicitly (see variant
@@ -3652,11 +3658,18 @@ rule ProcessCommand {
     -- to choose keys that are unique to an attempt - a fresh UUID per
     -- submission, not a name like "retry-1" another caller could pick too.
     --
-    -- Nothing expires. Once recorded, a key's association with its outcome
-    -- is permanent, the same treatment every command and event here
-    -- already gets: nothing in this library is ever deleted except by
-    -- ForgetSubject, which shreds a subject's ciphertext without removing
-    -- anything, and by deleting the bounded context itself.
+    -- A key is remembered for a while, not forever. A recorded outcome is
+    -- kept for at least config.idempotency_key_retention after it was
+    -- recorded and removed some time after that; once removed,
+    -- recorded_acceptance is null for the key again, and a submission
+    -- bearing it is processed as new. The window exists for what keys are
+    -- for - a caller retrying a request it never heard back from - which
+    -- happens within seconds or minutes, while a record per keyed
+    -- submission kept forever grows with traffic without bound. The
+    -- obligation this puts on a deployment is to set the retention longer
+    -- than anything may retry the same key, since a retry after it lands
+    -- twice. The Command and its events are unaffected: only the memory of
+    -- the key goes.
     let prior_outcome = recorded_acceptance(command_type, idempotency_key)
     requires: prior_outcome = null
 

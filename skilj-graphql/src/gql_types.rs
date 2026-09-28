@@ -573,6 +573,10 @@ pub fn parked_delivery_object() -> Object {
         scalar "attemptCount": TypeRef::named_nn(TypeRef::INT) => |d| Value::from(d.attempt_count),
         scalar "firstFailedAt": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.first_failed_at.to_rfc3339()),
         scalar "lastFailedAt": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.last_failed_at.to_rfc3339()),
+        // Pass as `parkedDeliveries(after:)` for the next page.
+        scalar "cursor": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(
+            skilj_core::db::ParkedDeliveryCursor::of(d).encode()
+        ),
     })
 }
 

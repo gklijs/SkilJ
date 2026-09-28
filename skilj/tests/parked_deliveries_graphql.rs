@@ -185,21 +185,29 @@ fn sign_jwt(subject: &str) -> String {
 /// `ExternalEventToken` for it - what the `ExternalEvent`-kind retry test
 /// needs to redrive through.
 async fn setup() -> (Skilj, Pool, String, String, String) {
+    setup_with(|builder| builder).await
+}
+
+/// [`setup`], with `configure` applied to the builder before `build()`.
+async fn setup_with(
+    configure: impl FnOnce(skilj::SkiljBuilder) -> skilj::SkiljBuilder,
+) -> (Skilj, Pool, String, String, String) {
     let database_url = test_database_url()
         .await
         .expect("test_database_url() must be Some - caller already checked");
     let jwks_url = serve_jwks().await;
 
-    let (skilj, _report) = Skilj::builder(database_url.clone())
-        .identity_provider(IdpConfig::new(
+    let (skilj, _report) = configure(Skilj::builder(database_url.clone()).identity_provider(
+        IdpConfig::new(
             jwks_url.parse().unwrap(),
             TEST_ISSUER,
             TEST_AUDIENCE,
             SigningAlgorithm::Rs256,
-        ))
-        .build()
-        .await
-        .unwrap();
+        ),
+    ))
+    .build()
+    .await
+    .unwrap();
 
     let pool = skilj_core::db::connect(&database_url).await.unwrap();
 
@@ -1178,5 +1186,126 @@ fn retrying_a_parked_trigger_whose_original_attempt_committed_is_deduplicated() 
             .await
             .unwrap()
             .is_empty());
+    });
+}
+
+/// docs/architecture.md §86: `parkedDeliveries` is capped at
+/// `max_events_per_read` rows, newest parked first, and pages on with the
+/// last row's `cursor` - which stays valid when that row is discarded
+/// between pages. A retry that fails again (a new `lastFailedAt`) doesn't
+/// move a row across pages.
+#[test]
+fn parked_deliveries_are_served_in_bounded_stable_pages() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, access_token_id) =
+            setup_with(|builder| builder.max_events_per_read(2)).await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        // Five rows, parked a second apart; row 0 is the oldest.
+        let base = test_now() - chrono::Duration::minutes(10);
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let row = db::insert_parked_delivery(
+                &pool,
+                &bc_name,
+                "kafka-inbound",
+                db::ParkedDeliveryKind::ExternalEvent,
+                &format!("orders:0:{i}"),
+                Some(&access_token_id),
+                None,
+                None,
+                &json!({ "payload": { "amount": i } }),
+                "connection refused",
+                1,
+                base + chrono::Duration::seconds(i),
+                base + chrono::Duration::seconds(i),
+            )
+            .await
+            .unwrap();
+            ids.push(row.id);
+        }
+        let newest_first: Vec<String> = ids.iter().rev().cloned().collect();
+
+        let page = |after: Option<String>| {
+            let router = router.clone();
+            let jwt = jwt.clone();
+            let bc_name = bc_name.clone();
+            async move {
+                let response = graphql_request(
+                    &router,
+                    Some(&jwt),
+                    "query($bc: String!, $after: String) { \
+                        parkedDeliveries(boundedContext: $bc, after: $after) { id cursor } }",
+                    json!({ "bc": bc_name, "after": after }),
+                )
+                .await;
+                assert!(response.get("errors").is_none(), "{response}");
+                response["data"]["parkedDeliveries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| {
+                        (
+                            d["id"].as_str().unwrap().to_string(),
+                            d["cursor"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let first = page(None).await;
+        assert_eq!(
+            first.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            newest_first[..2]
+        );
+
+        // Between pages: the last row served is discarded, and the oldest
+        // row fails again (its lastFailedAt becomes the newest of all).
+        db::delete_parked_delivery(&pool, &bc_name, &first[1].0)
+            .await
+            .unwrap();
+        db::insert_parked_delivery(
+            &pool,
+            &bc_name,
+            "kafka-inbound",
+            db::ParkedDeliveryKind::ExternalEvent,
+            "orders:0:0",
+            Some(&access_token_id),
+            None,
+            None,
+            &json!({ "payload": { "amount": 0 } }),
+            "connection refused again",
+            2,
+            base,
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        let second = page(Some(first[1].1.clone())).await;
+        let third = page(Some(second[1].1.clone())).await;
+        let rest: Vec<String> = second
+            .iter()
+            .chain(&third)
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(rest, newest_first[2..]);
+        assert!(page(Some(third[0].1.clone())).await.is_empty());
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { parkedDeliveries(boundedContext: $bc, after: \"nope\") { id } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "invalid_cursor"
+        );
     });
 }

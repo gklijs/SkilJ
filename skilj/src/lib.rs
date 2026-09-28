@@ -64,6 +64,20 @@ static BACKGROUND_TASK_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// builder option later if a real need for tuning it ever comes up.
 const BACKGROUND_TASK_CONCURRENCY: usize = 16;
 
+/// [`SkiljBuilder::idempotency_key_retention`]'s default: one hour.
+pub const DEFAULT_IDEMPOTENCY_KEY_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+
+/// How often the idempotency-key retention task runs at most; a key
+/// outlives its retention by at most about this much. A shorter
+/// retention runs it that often instead (but not more than once a
+/// second).
+const IDEMPOTENCY_KEY_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Rows one retention `DELETE` removes at most; the task repeats until a
+/// batch comes back short.
+const IDEMPOTENCY_KEY_CLEANUP_BATCH: i64 = 10_000;
+
 /// Runs one unit of a background task's work (one bounded context's, one
 /// route's, one deadline schedule's), turning a panic into a logged error
 /// and a `reason = "panicked"` error count. The units run application
@@ -634,6 +648,9 @@ impl Skilj {
             event_broadcast_capacity: 1024,
             event_cache_warm_up_count: 1000,
             pool_options: None,
+            // docs/architecture.md §87 - matches
+            // `config.idempotency_key_retention` in specs/skilj.allium.
+            idempotency_key_retention: Some(DEFAULT_IDEMPOTENCY_KEY_RETENTION),
         }
     }
 
@@ -1278,6 +1295,7 @@ pub struct SkiljBuilder {
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
     pool_options: Option<skilj_core::db::PgPoolOptions>,
+    idempotency_key_retention: Option<std::time::Duration>,
 }
 
 impl SkiljBuilder {
@@ -1623,6 +1641,39 @@ impl SkiljBuilder {
     /// `0` turns the cache off: every read goes to Postgres.
     pub fn event_cache_warm_up_count(mut self, count: usize) -> Self {
         self.event_cache_warm_up_count = count;
+        self
+    }
+
+    /// How long a recorded idempotency key keeps deduplicating
+    /// (docs/architecture.md §87): a submission that repeats a key within
+    /// this window after it was first accepted gets the original outcome
+    /// back; after it, the key is deleted and a submission bearing it is
+    /// processed as a new command. Defaults to
+    /// [`DEFAULT_IDEMPOTENCY_KEY_RETENTION`] (one hour). A key is kept for
+    /// *at least* this long - a background task deletes expired keys
+    /// about once a minute (or once per `retention`, if shorter).
+    ///
+    /// Set it longer than the longest time anything may retry the same
+    /// key, because a retry after the window lands twice. That includes:
+    /// a client or workflow engine retrying a request it never heard back
+    /// from (a Temporal activity's retry policy, say); a Kafka/AMQP/NATS
+    /// bridge re-reading old broker messages (a consumer group reset to an
+    /// earlier offset); a `CrossContextRoute` whose retry policy
+    /// (`cross_context_route_retry_policy`) keeps retrying one delivery
+    /// past the window; and `retryParkedDelivery`, which redrives under
+    /// the original attempt's key so that an attempt which committed but
+    /// reported failure isn't applied twice - an operator redriving after
+    /// the window loses that protection.
+    pub fn idempotency_key_retention(mut self, retention: std::time::Duration) -> Self {
+        self.idempotency_key_retention = Some(retention);
+        self
+    }
+
+    /// Never delete recorded idempotency keys (the behaviour before
+    /// retention existed): a key deduplicates forever, and the
+    /// `idempotency_keys` table grows with every keyed submission.
+    pub fn keep_idempotency_keys_forever(mut self) -> Self {
+        self.idempotency_key_retention = None;
         self
     }
 
@@ -2103,6 +2154,30 @@ impl SkiljBuilder {
         // see `skilj_core::plugin::Snapshot`'s own doc comment for why
         // `Snapshot` stays structurally separate from `Projection`
         // throughout.
+        // docs/architecture.md §87: idempotency-key retention. One shared
+        // task like the others; not spawned at all when keys are kept
+        // forever.
+        if let Some(retention) = self.idempotency_key_retention {
+            let retention_pool = skilj.pool.clone();
+            let cleanup_interval = retention
+                .min(IDEMPOTENCY_KEY_CLEANUP_INTERVAL)
+                .max(std::time::Duration::from_secs(1));
+            let retention = chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
+            tokio::spawn(async move {
+                loop {
+                    let start = std::time::Instant::now();
+                    idempotency_key_retention_tick(&retention_pool, retention)
+                        .instrument(tracing::info_span!("idempotency_key_retention_tick"))
+                        .await;
+                    BACKGROUND_TASK_TICK_DURATION.record(
+                        start.elapsed().as_secs_f64(),
+                        &[KeyValue::new("task", "idempotency_key_retention")],
+                    );
+                    tokio::time::sleep(cleanup_interval).await;
+                }
+            });
+        }
+
         let snapshot_pool = skilj.pool.clone();
         let snapshot_dispatcher = skilj.snapshot_dispatcher();
         let snapshot_interval = self.snapshot_poll_interval;
@@ -2629,6 +2704,63 @@ impl SkiljBuilder {
 
         Ok((skilj, report))
     }
+}
+
+/// One pass of the idempotency-key retention task (docs/architecture.md
+/// §87): in every bounded context, delete keys recorded more than
+/// `retention` ago, a bounded batch at a time.
+async fn idempotency_key_retention_tick(pool: &Pool, retention: chrono::Duration) {
+    let cutoff = chrono::Utc::now()
+        .checked_sub_signed(retention)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+    let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
+        Ok(bcs) => bcs,
+        Err(e) => {
+            tracing::warn!(error = %e, "idempotency key retention failed to list bounded contexts");
+            BACKGROUND_TASK_ERRORS.add(
+                1,
+                &[
+                    KeyValue::new("task", "idempotency_key_retention"),
+                    KeyValue::new("reason", "list_bounded_contexts_failed"),
+                ],
+            );
+            return;
+        }
+    };
+    stream::iter(&bounded_contexts)
+        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
+            contain_panic("idempotency_key_retention", bc.name.clone(), async move {
+                loop {
+                    match skilj_core::db::delete_expired_idempotency_keys(
+                        pool,
+                        &bc.name,
+                        cutoff,
+                        IDEMPOTENCY_KEY_CLEANUP_BATCH,
+                    )
+                    .await
+                    {
+                        Ok(deleted) if deleted < IDEMPOTENCY_KEY_CLEANUP_BATCH as u64 => break,
+                        Ok(_) => continue,
+                        Err(e) => {
+                            tracing::warn!(
+                                bounded_context = %bc.name,
+                                error = %e,
+                                "idempotency key retention failed"
+                            );
+                            BACKGROUND_TASK_ERRORS.add(
+                                1,
+                                &[
+                                    KeyValue::new("task", "idempotency_key_retention"),
+                                    KeyValue::new("reason", "delete_failed"),
+                                ],
+                            );
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .await;
 }
 
 /// Codeberg issue #20's own firing half - not tied to any one

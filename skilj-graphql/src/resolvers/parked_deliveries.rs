@@ -256,7 +256,7 @@ async fn redrive_parked_delivery(
     Ok(())
 }
 
-/// `parkedDeliveries(boundedContext: String!): [ParkedDelivery!]!`
+/// `parkedDeliveries(boundedContext: String!, after: String): [ParkedDelivery!]!`
 pub fn parked_deliveries_field() -> Field {
     Field::new(
         "parkedDeliveries",
@@ -268,9 +268,30 @@ pub fn parked_deliveries_field() -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
 
-                let deliveries = db::list_parked_deliveries(&state.pool, &bounded_context_name)
-                    .await
-                    .map_err(to_graphql_error)?;
+                // Bounded like every other list read (docs/architecture.md
+                // §86): at most `max_events_per_read` rows, continued with
+                // the last row's `cursor` as `after`.
+                let after = match ctx.args.get("after").filter(|v| !v.is_null()) {
+                    Some(value) => {
+                        let raw = value.string()?;
+                        Some(db::ParkedDeliveryCursor::decode(raw).ok_or_else(|| {
+                            async_graphql::Error::new(format!(
+                                "{raw:?} is not a parkedDeliveries cursor"
+                            ))
+                            .extend_with(|_, ext| ext.set("code", "invalid_cursor"))
+                        })?)
+                    }
+                    None => None,
+                };
+                let limit = i64::try_from(state.max_events_per_read.max(1)).unwrap_or(i64::MAX);
+                let deliveries = db::list_parked_deliveries_page(
+                    &state.pool,
+                    &bounded_context_name,
+                    after.as_ref(),
+                    limit,
+                )
+                .await
+                .map_err(to_graphql_error)?;
 
                 Ok(Some(FieldValue::list(
                     deliveries.into_iter().map(FieldValue::owned_any),
@@ -282,6 +303,7 @@ pub fn parked_deliveries_field() -> Field {
         "boundedContext",
         TypeRef::named_nn(TypeRef::STRING),
     ))
+    .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
 }
 
 /// `retryParkedDelivery(boundedContext: String!, id: String!): ParkedDelivery!` -

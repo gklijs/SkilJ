@@ -32,7 +32,10 @@ No skilj-temporal dependency needed at all - just skilj's own existing
 triggering, keyed by `"{run_id}:{activity_id}"` (Temporal's own
 documented Activity-idempotency guidance). See
 `docs/temporal-integration.md` for the full pattern and why Run ID,
-not just Workflow ID, is part of the key.
+not just Workflow ID, is part of the key. A key deduplicates for
+`SkiljBuilder::idempotency_key_retention` (default one hour), so keep
+the Activity's retry policy (its schedule-to-close timeout) inside that
+window, or raise the retention - a retry after it lands twice.
 
 **2. Starting or signaling a Temporal workflow from a skilj event** -
 the `skilj-temporal` crate. One `EventTypeMapping` per `EventType` you

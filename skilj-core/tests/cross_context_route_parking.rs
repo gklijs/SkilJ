@@ -788,7 +788,13 @@ fn legacy_parked_delivery_index_migrates_to_the_token_scoped_one() {
         .unwrap();
         assert_eq!(
             indexes,
-            vec!["parked_deliveries_occurrence_key", "parked_deliveries_pkey"]
+            vec![
+                "parked_deliveries_occurrence_key",
+                // docs/architecture.md §86 - from provisioning, untouched
+                // by this migration.
+                "parked_deliveries_page_order",
+                "parked_deliveries_pkey"
+            ]
         );
 
         let park = |kind, token: Option<&'static str>| {
