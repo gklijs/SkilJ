@@ -456,7 +456,10 @@ pub enum Error {
     )]
     MissingScheduleOrPolicy,
 
-    #[error("this filter is invalid for its field's declared type")]
+    #[error(
+        "this filter is invalid: its field's declared type doesn't support the operator, \
+         or an IS_LIKE pattern is longer than 1024 characters"
+    )]
     InvalidFilter,
 
     /// Drift audit finding #16 (2026-08-20, see project memory
@@ -847,6 +850,8 @@ pub fn valid_filters(event_type: &EventType, filters: &[Filter]) -> bool {
     filters.iter().all(|f| {
         resolve_field_kind(&properties, definitions.as_ref(), &f.field)
             .is_some_and(|kind| filter_operator_is_valid(&kind, f.operator))
+            && (f.operator != FilterOperator::IsLike
+                || f.value.chars().count() <= MAX_LIKE_PATTERN_CHARS)
     })
 }
 
@@ -1275,33 +1280,83 @@ pub fn schema_is_backwards_compatible(existing_schema: &str, schema: &str) -> bo
     true
 }
 
+/// The longest `FilterOperator::IsLike` pattern [`valid_filters`]
+/// accepts, in characters (docs/architecture.md §121). Matching costs
+/// time proportional to pattern length times the matched string's, for
+/// every event a read examines.
+pub const MAX_LIKE_PATTERN_CHARS: usize = 1024;
+// `Error::InvalidFilter`'s message names the cap.
+const _: () = assert!(MAX_LIKE_PATTERN_CHARS == 1024);
+
 /// Classic SQL-LIKE matching for `FilterOperator::IsLike` - `%` matches
 /// any run of characters (including none), `_` matches exactly one
 /// character, everything else matches itself literally. Case-sensitive,
 /// whole-string anchored (no implicit substring search - that's what
-/// `Contains` is for). Standard DP wildcard-matching, operating on
-/// `Vec<char>` for UTF-8 safety rather than byte indexing; no `regex`
-/// dependency needed for this.
+/// `Contains` is for). Over `char`s, for UTF-8 safety.
+///
+/// Wildcard-matching DP, bit-parallel (docs/architecture.md §121): the
+/// row "the text read so far matches the pattern's first `j` characters"
+/// is a bitset, advanced one text character at a time with a few word
+/// operations per 64 pattern positions. The previous full-table DP
+/// allocated pattern x text booleans - a gigabyte for a 10k-character
+/// pattern against a 100k-character string - for every event a read
+/// examined. Runs of `%` are collapsed to one first (same meaning), which
+/// makes a `%` position depend only on the non-`%` position before it,
+/// so one shift settles it. Stops once no prefix of the pattern matches,
+/// since none can again.
 fn like_matches(text: &str, pattern: &str) -> bool {
-    let text: Vec<char> = text.chars().collect();
-    let pattern: Vec<char> = pattern.chars().collect();
-    let mut dp = vec![vec![false; pattern.len() + 1]; text.len() + 1];
-    dp[0][0] = true;
-    for j in 1..=pattern.len() {
-        if pattern[j - 1] == '%' {
-            dp[0][j] = dp[0][j - 1];
+    let mut p: Vec<char> = Vec::new();
+    for c in pattern.chars() {
+        if !(c == '%' && p.last() == Some(&'%')) {
+            p.push(c);
         }
     }
-    for i in 1..=text.len() {
-        for j in 1..=pattern.len() {
-            dp[i][j] = match pattern[j - 1] {
-                '%' => dp[i - 1][j] || dp[i][j - 1],
-                '_' => dp[i - 1][j - 1],
-                c => dp[i - 1][j - 1] && text[i - 1] == c,
-            };
+    // Bit j: the text read so far matches p[..j].
+    let words = (p.len() + 1).div_ceil(64);
+    let set = |bits: &mut [u64], j: usize| bits[j / 64] |= 1 << (j % 64);
+    let mut percent = vec![0u64; words];
+    let mut any_char = vec![0u64; words];
+    let mut literal: std::collections::HashMap<char, Vec<u64>> = std::collections::HashMap::new();
+    for (i, &c) in p.iter().enumerate() {
+        match c {
+            '%' => set(&mut percent, i + 1),
+            '_' => set(&mut any_char, i + 1),
+            c => set(literal.entry(c).or_insert_with(|| vec![0; words]), i + 1),
         }
     }
-    dp[text.len()][pattern.len()]
+    let mut row = vec![0u64; words];
+    set(&mut row, 0);
+    if p.first() == Some(&'%') {
+        set(&mut row, 1);
+    }
+    let mut next = vec![0u64; words];
+    for c in text.chars() {
+        let literal = literal.get(&c);
+        // A non-`%` position j advances from j - 1 when it matches `c`;
+        // a `%` position keeps what it had.
+        let mut carry = 0;
+        for w in 0..words {
+            let shifted = (row[w] << 1) | carry;
+            carry = row[w] >> 63;
+            let matches = any_char[w] | literal.map_or(0, |l| l[w]);
+            next[w] = (shifted & matches) | (row[w] & percent[w]);
+        }
+        // A `%` position also matches wherever the position before it
+        // now does - never itself a `%`, so already final above.
+        let mut carry = 0;
+        let mut any = 0;
+        for w in 0..words {
+            let shifted = (next[w] << 1) | carry;
+            carry = next[w] >> 63;
+            next[w] |= shifted & percent[w];
+            any |= next[w];
+        }
+        if any == 0 {
+            return false;
+        }
+        std::mem::swap(&mut row, &mut next);
+    }
+    row[p.len() / 64] >> (p.len() % 64) & 1 == 1
 }
 
 /// `GreaterThan`/`LessThan` for a string leaf. `matches_filters` has no

@@ -672,3 +672,126 @@ fn matches_filters_ordering_falls_through_to_false_on_a_malformed_date() {
         &[filter("when", FilterOperator::GreaterThan, "not-a-date")]
     ));
 }
+
+/// An `IS_LIKE` pattern costs pattern length x string length to match,
+/// for every event a read examines, so `valid_filters` caps it at
+/// `MAX_LIKE_PATTERN_CHARS` (docs/architecture.md §121).
+#[test]
+fn valid_filters_rejects_an_is_like_pattern_over_the_cap() {
+    let at_cap = "%".repeat(event_store::MAX_LIKE_PATTERN_CHARS);
+    let over_cap = "%".repeat(event_store::MAX_LIKE_PATTERN_CHARS + 1);
+    assert!(event_store::valid_filters(
+        &event_type(),
+        &[filter("name", FilterOperator::IsLike, &at_cap)]
+    ));
+    assert!(!event_store::valid_filters(
+        &event_type(),
+        &[filter("name", FilterOperator::IsLike, &over_cap)]
+    ));
+    // Only IS_LIKE is capped - Contains is a linear substring search.
+    assert!(event_store::valid_filters(
+        &event_type(),
+        &[filter("name", FilterOperator::Contains, &over_cap)]
+    ));
+}
+
+/// A pattern at the cap against a 2-million-character string. The old
+/// full-table DP allocated about 2 GB for this, per event, and a plain
+/// one-row DP took over a minute in a debug build; the bit-parallel one
+/// takes a fraction of a second. Wildcards, `_` and literals still match
+/// as before.
+#[test]
+fn is_like_matches_a_long_string_in_linear_memory() {
+    let long = format!("A{}e", "x".repeat(2_000_000));
+    let e = event(&serde_json::json!({ "name": long }).to_string());
+    let pattern = format!("A{}%e", "_".repeat(event_store::MAX_LIKE_PATTERN_CHARS - 3));
+    assert!(event_store::matches_filters(
+        &e,
+        &[filter("name", FilterOperator::IsLike, &pattern)]
+    ));
+    let pattern = format!("A{}%f", "_".repeat(event_store::MAX_LIKE_PATTERN_CHARS - 3));
+    assert!(!event_store::matches_filters(
+        &e,
+        &[filter("name", FilterOperator::IsLike, &pattern)]
+    ));
+    for (pattern, expected) in [
+        ("%", true),
+        ("%%", true),
+        ("A%", true),
+        ("%e", true),
+        ("%x%", true),
+        ("B%", false),
+        ("A_e", false),
+    ] {
+        assert_eq!(
+            event_store::matches_filters(&e, &[filter("name", FilterOperator::IsLike, pattern)]),
+            expected,
+            "{pattern}"
+        );
+    }
+}
+
+/// The bit-parallel matcher against the textbook full-table DP, over
+/// every pattern and text of a small alphabet up to a few characters,
+/// multi-byte characters and patterns wider than one 64-bit word
+/// included.
+#[test]
+fn is_like_agrees_with_the_reference_dp() {
+    fn reference(text: &str, pattern: &str) -> bool {
+        let (t, p): (Vec<char>, Vec<char>) = (text.chars().collect(), pattern.chars().collect());
+        let mut dp = vec![vec![false; p.len() + 1]; t.len() + 1];
+        dp[0][0] = true;
+        for j in 1..=p.len() {
+            dp[0][j] = dp[0][j - 1] && p[j - 1] == '%';
+        }
+        for i in 1..=t.len() {
+            for j in 1..=p.len() {
+                dp[i][j] = match p[j - 1] {
+                    '%' => dp[i - 1][j] || dp[i][j - 1],
+                    '_' => dp[i - 1][j - 1],
+                    c => dp[i - 1][j - 1] && t[i - 1] == c,
+                };
+            }
+        }
+        dp[t.len()][p.len()]
+    }
+    fn strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..max_len {
+            frontier = frontier
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            all.extend(frontier.iter().cloned());
+        }
+        all
+    }
+    let check = |text: &str, pattern: &str| {
+        let e = event(&serde_json::json!({ "name": text }).to_string());
+        assert_eq!(
+            event_store::matches_filters(&e, &[filter("name", FilterOperator::IsLike, pattern)]),
+            reference(text, pattern),
+            "text {text:?} pattern {pattern:?}"
+        );
+    };
+    let texts = strings(&['a', 'b', 'é'], 5);
+    for pattern in strings(&['a', 'é', '%', '_'], 4) {
+        for text in &texts {
+            check(text, &pattern);
+        }
+    }
+    // Across the 64-bit word boundary.
+    for n in [62, 63, 64, 65, 127, 128, 129] {
+        let text = "ab".repeat(n);
+        for pattern in [
+            "ab".repeat(n),
+            format!("{}%", "_".repeat(n)),
+            format!("%{}", "b_".repeat(n / 2)),
+            format!("{}%b", "a%".repeat(n)),
+            "_".repeat(2 * n + 1),
+        ] {
+            check(&text, &pattern);
+        }
+    }
+}

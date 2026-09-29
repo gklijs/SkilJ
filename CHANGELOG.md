@@ -156,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An `IS_LIKE` event filter allocated pattern-length x value-length
+  memory for every event it examined - a gigabyte for a 10k-character
+  pattern against a 100k-character value - reachable with a REST
+  `EventReadToken`. Matching now runs in linear memory (bit-parallel),
+  and patterns over 1024 characters are rejected as `invalid_filter`
+  (docs/architecture.md §121).
 - `inspectEvent`'s `origin.triggeringCommandPayload` returned the
   originating command's payload as stored - its private fields in
   plaintext to any Admin. It is now rendered as `fetchCommands` renders

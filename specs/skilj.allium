@@ -2606,7 +2606,11 @@ rule SkipMissedOccurrences {
 -- applies to which JSON Schema type. It checks two things per filter -
 -- that field names a field event_type.schema actually declares, and that
 -- operator is one that field's declared type supports (e.g. greater_than
--- against a string-typed field is invalid, not merely always-false).
+-- against a string-typed field is invalid, not merely always-false) -
+-- and one about its value: an is_like pattern longer than a fixed bound
+-- is invalid too, since matching one costs its length times the matched
+-- value's for every event examined. The bound itself belongs to the
+-- black box, like the matrix below.
 -- A Filter.field written as a two-segment dotted path is checked the same
 -- way, one level deeper: the path is resolved by walking into the named
 -- nested shape's own declared fields, and the leaf's declared type is
