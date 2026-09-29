@@ -67,6 +67,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{oneshot, RwLock, Semaphore};
+use tracing::Instrument;
 
 /// The default for [`CommandBatcher::with_max_batch_size`]. A hard ceiling on how many commands one lock acquisition processes,
 /// regardless of how many piled up while the leader waited for the
@@ -213,8 +214,8 @@ impl CommandBatcher {
     pub async fn submit(
         &self,
         pool: &Pool,
-        dispatcher: &dyn CommandDispatcher,
-        projection_dispatcher: &dyn ProjectionDispatcher,
+        dispatcher: &Arc<dyn CommandDispatcher>,
+        projection_dispatcher: &Arc<dyn ProjectionDispatcher>,
         broadcaster: &EventBroadcaster,
         event_cache: &EventCache,
         command_type: &CommandType,
@@ -292,17 +293,46 @@ impl CommandBatcher {
             });
         }
 
-        self.run_as_leader(
-            pool,
-            dispatcher,
-            projection_dispatcher,
-            broadcaster,
-            event_cache,
-            encryption_master_key,
-            &bounded_context_name,
-            &queue,
-        )
-        .await
+        // The batch runs on its own task, not on this caller's future: a
+        // leader whose client disconnects (axum drops the handler future)
+        // would otherwise drop the shared transaction mid-batch, failing
+        // every batch-mate's command - or, after the commit, leaving them
+        // told `BatchFailed` for a command that did commit, and its events
+        // unbroadcast (docs/architecture.md §114). Detached, the batch
+        // finishes and answers everyone; the leader's own command
+        // commits even if nobody is left to read its result, as any
+        // command already on its way into a transaction can.
+        let leader = self.clone();
+        let pool = pool.clone();
+        let dispatcher = dispatcher.clone();
+        let projection_dispatcher = projection_dispatcher.clone();
+        let broadcaster = broadcaster.clone();
+        let event_cache = event_cache.clone();
+        let encryption_master_key = encryption_master_key.cloned();
+        let batch = tokio::spawn(
+            async move {
+                leader
+                    .run_as_leader(
+                        &pool,
+                        dispatcher.as_ref(),
+                        projection_dispatcher.as_ref(),
+                        &broadcaster,
+                        &event_cache,
+                        encryption_master_key.as_ref(),
+                        &bounded_context_name,
+                        &queue,
+                    )
+                    .await
+            }
+            .instrument(tracing::Span::current()),
+        );
+        batch.await.unwrap_or_else(|_| {
+            // Only a panic gets here (the task is never aborted);
+            // `LeaderGuard` has already answered whoever was still queued.
+            Err(Error::batch_failed_msg(
+                "command batch leader task ended without producing a result",
+            ))
+        })
     }
 
     /// The batched drop-in replacement for `db::decide_and_submit_command` -
@@ -319,8 +349,8 @@ impl CommandBatcher {
     pub async fn decide_and_submit(
         &self,
         pool: &Pool,
-        dispatcher: &dyn CommandDispatcher,
-        projection_dispatcher: &dyn ProjectionDispatcher,
+        dispatcher: &Arc<dyn CommandDispatcher>,
+        projection_dispatcher: &Arc<dyn ProjectionDispatcher>,
         snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
         broadcaster: &EventBroadcaster,
         event_cache: &EventCache,
@@ -335,7 +365,7 @@ impl CommandBatcher {
     ) -> Result<SubmitCommandOutcome> {
         let resolved = crate::db::resolve_command_submission(
             pool,
-            dispatcher,
+            dispatcher.as_ref(),
             snapshot_dispatcher,
             event_cache,
             command_type,
@@ -396,13 +426,14 @@ impl CommandBatcher {
     ///   until a drain empties the queue, and only then returns its own
     ///   (already-known) result. No one else can become leader while the
     ///   queue is non-empty, so it must be this one.
-    /// - **Cancellation**: this future runs inside the caller's own
-    ///   request future, which the server may drop at any await point
-    ///   (client disconnect, timeout). A [`LeaderGuard`] stays armed
-    ///   until a drain empties the queue; if this future is dropped
-    ///   first, the guard fails everything still queued (a retryable
-    ///   `BatchFailed`) and empties the queue, so the next caller becomes
-    ///   a fresh leader instead of every later caller hanging forever.
+    /// - **Cancellation**: `submit` runs this on its own task, so a
+    ///   leader's caller being dropped (client disconnect, timeout) no
+    ///   longer stops it (docs/architecture.md §114). A panic still can:
+    ///   a [`LeaderGuard`] stays armed until a drain empties the queue,
+    ///   and if this future ends first it fails everything still queued
+    ///   (a retryable `BatchFailed`) and empties the queue, so the next
+    ///   caller becomes a fresh leader instead of every later caller
+    ///   hanging forever.
     #[allow(clippy::too_many_arguments)]
     async fn run_as_leader(
         &self,
@@ -548,8 +579,9 @@ fn drain_up_to(queue: &Queue, max: usize) -> (Vec<PendingCommand>, bool) {
 }
 
 /// Armed for as long as the current leader is the one responsible for
-/// eventually emptying the queue. If the leader's future is dropped
-/// while armed (cancellation), everything still queued is failed and the
+/// eventually emptying the queue. If the leader's future ends while
+/// armed (a panic - it runs on its own task, so a caller's disconnect
+/// no longer cancels it), everything still queued is failed and the
 /// queue emptied so leadership can be re-elected by the next push.
 struct LeaderGuard {
     queue: Queue,
@@ -564,7 +596,7 @@ impl Drop for LeaderGuard {
         let stranded = std::mem::take(&mut *lock_queue(&self.queue));
         for pending in stranded {
             let _ = pending.reply.send(Err(Error::batch_failed_msg(
-                "the command batch leader was cancelled before processing this command; retry",
+                "the command batch leader stopped before processing this command; retry",
             )));
         }
     }

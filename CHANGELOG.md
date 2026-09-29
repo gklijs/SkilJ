@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `CommandBatcher::submit` and `decide_and_submit` take the command
+  and projection dispatchers as `&Arc<dyn …>` instead of `&dyn …`, so
+  the batch can run on its own task (breaking for direct callers;
+  `Skilj`'s REST and GraphQL surfaces already hold them as `Arc`s)
+  (docs/architecture.md §114).
 - REST reads no longer re-walk events a filter or the token's scope
   excluded. On a page shorter than `max_events_per_read`, `GET
   /v1/events`' `nextCursor`, and an auto-advance `consume` cursor, now
@@ -136,6 +141,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A client disconnecting while its command led a batch
+  (`CommandBatcher`, the group commit behind REST
+  `/v1/commands/trigger`, GraphQL `submitCommand` and parked-delivery
+  redrive) took its batch-mates down with it. Its dropped request
+  rolled back the shared transaction, and up to 255 other callers got
+  `BatchFailed` for commands they never got to make. If the drop came
+  after the commit, they got `BatchFailed` for commands that *had*
+  committed - inviting a duplicate retry - and those events weren't
+  broadcast. The batch now runs on its own task and always finishes and
+  answers everyone (docs/architecture.md §114).
 - Registering a new sync projection while writes were committing could
   silently lose history. The projection was stored as sync and its
   history folded afterwards; a write landing first created a key's

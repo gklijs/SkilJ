@@ -1009,8 +1009,8 @@ async fn post_commands_trigger(
         .command_batcher
         .decide_and_submit(
             &state.pool,
-            state.dispatcher.as_ref(),
-            state.projection_dispatcher.as_ref(),
+            &state.dispatcher,
+            &state.projection_dispatcher,
             state.snapshot_dispatcher.as_ref(),
             &state.event_broadcaster,
             &state.event_cache,

@@ -278,11 +278,15 @@ async fn submit(
         .unwrap()
         .unwrap();
 
+    // Unit structs: the batcher takes shared handles it can move onto
+    // its leader task.
+    let command_dispatcher: Arc<dyn CommandDispatcher> = Arc::new(ShipOrderDispatcher);
+    let projection_dispatcher: Arc<dyn ProjectionDispatcher> = Arc::new(NoopProjectionDispatcher);
     batcher
         .submit(
             pool,
-            dispatcher,
-            &NoopProjectionDispatcher,
+            &command_dispatcher,
+            &projection_dispatcher,
             broadcaster,
             event_cache,
             command_type,
@@ -585,9 +589,10 @@ fn more_queued_commands_than_one_batch_holds_are_all_still_answered() {
 
 #[test]
 fn a_cancelled_batch_leader_does_not_strand_followers_or_wedge_the_queue() {
-    // The leader's future is dropped while waiting for the lock (a client
-    // disconnect). Followers already queued must get an answer, and a
-    // later submission must be able to become a fresh leader.
+    // The leader's caller is dropped while waiting for the lock (a client
+    // disconnect). The batch runs on its own task (docs/architecture.md
+    // §114), so followers already queued still get their command made,
+    // and a later submission still becomes a fresh leader.
     runtime().block_on(async {
         let Some(pool) = test_pool().await else {
             return;
@@ -640,11 +645,7 @@ fn a_cancelled_batch_leader_does_not_strand_followers_or_wedge_the_queue() {
             .expect("a follower must be answered when its leader is cancelled")
             .unwrap();
         assert!(
-            matches!(
-                follower_outcome,
-                Ok(SubmitCommandOutcome::Accepted { .. })
-                    | Err(skilj_core::error::Error::BatchFailed { .. })
-            ),
+            matches!(follower_outcome, Ok(SubmitCommandOutcome::Accepted { .. })),
             "unexpected follower outcome: {follower_outcome:?}"
         );
 
@@ -781,12 +782,10 @@ fn random_client_disconnects_under_load_never_wedge_the_queue() {
                 .await
                 .expect("a surviving submitter hung after other clients disconnected")
                 .unwrap();
+            // No disconnect takes another client's command down with it
+            // (docs/architecture.md §114).
             assert!(
-                matches!(
-                    outcome,
-                    Ok(SubmitCommandOutcome::Accepted { .. })
-                        | Err(skilj_core::error::Error::BatchFailed { .. })
-                ),
+                matches!(outcome, Ok(SubmitCommandOutcome::Accepted { .. })),
                 "unexpected outcome: {outcome:?}"
             );
         }
@@ -807,5 +806,98 @@ fn random_client_disconnects_under_load_never_wedge_the_queue() {
         .expect("the queue is wedged after client-disconnect churn")
         .unwrap();
         assert!(matches!(fresh, SubmitCommandOutcome::Accepted { .. }));
+    });
+}
+
+/// docs/architecture.md §114: a leader whose client disconnects *after*
+/// it drained the queue - while its shared transaction is running - must
+/// not take its batch-mates down with it. A trigger slows each event
+/// insert so the batch is still in flight when the leader's caller is
+/// dropped. The follower's command is committed and it gets its own
+/// result; before, the dropped leader rolled the whole batch back and
+/// the follower was told `BatchFailed` for a command it never got to make.
+#[test]
+fn a_leader_cancelled_mid_batch_still_commits_and_answers_its_followers() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+        let schema = format!("\"bc_{}\"", bc.name);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {schema}.slow_insert() RETURNS trigger AS $$ \
+             BEGIN PERFORM pg_sleep(0.4); RETURN NEW; END $$ LANGUAGE plpgsql; \
+             CREATE TRIGGER slow_insert BEFORE INSERT ON {schema}.events \
+             FOR EACH ROW EXECUTE FUNCTION {schema}.slow_insert();"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Held so the leader and the follower queue up into one batch.
+        let held = db::begin_command_batch_leader_tx(&pool, &bc.name, None)
+            .await
+            .unwrap();
+
+        let batcher = CommandBatcher::new();
+        let dispatcher = Arc::new(ShipOrderDispatcher);
+        let broadcaster = Arc::new(EventBroadcaster::new(64));
+        let event_cache = Arc::new(EventCache::new(1000));
+        let spawn_submit = |order: &'static str| {
+            let pool = pool.clone();
+            let batcher = batcher.clone();
+            let dispatcher = dispatcher.clone();
+            let broadcaster = broadcaster.clone();
+            let event_cache = event_cache.clone();
+            let ct = ct.clone();
+            tokio::spawn(async move {
+                submit(
+                    &pool,
+                    &batcher,
+                    &dispatcher,
+                    &broadcaster,
+                    &event_cache,
+                    &ct,
+                    &format!(r#"{{"order_id":"{order}"}}"#),
+                )
+                .await
+            })
+        };
+
+        let leader = spawn_submit("A");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let follower = spawn_submit("B");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        drop(held);
+        // The leader now holds the lock, has drained both, and is inside
+        // the first slow insert.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        leader.abort();
+        let _ = leader.await;
+
+        let follower_outcome = tokio::time::timeout(std::time::Duration::from_secs(10), follower)
+            .await
+            .expect("the follower must be answered")
+            .unwrap();
+        assert!(
+            matches!(follower_outcome, Ok(SubmitCommandOutcome::Accepted { .. })),
+            "expected the follower's command to be accepted, got {follower_outcome:?}"
+        );
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        let mut orders: Vec<String> = events
+            .iter()
+            .map(|e| {
+                serde_json::from_str::<serde_json::Value>(&e.payload).unwrap()["order_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        orders.sort();
+        assert_eq!(orders, vec!["A", "B"]);
     });
 }

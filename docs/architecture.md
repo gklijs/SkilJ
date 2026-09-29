@@ -9898,3 +9898,18 @@ Tests (`skilj-core/tests/async_projections.rs`):
 - `registering_a_sync_projection_with_no_history_misses_no_concurrent_event`: no history, 20 events committed during registration. The state is 20.
 
 Both passed 10 of 10 runs. With `create_projection` put back to the old upsert-then-fold, the first failed 5 of 5 runs (`50` or `51`) and the second 2 of 5 (`19`). There's no dedicated test for the monotonic `caught_up_to` writes on their own.
+
+## 114. A command batch outlives its leader's client
+
+`CommandBatcher` (§58) coalesces concurrent command submissions for one bounded context into one transaction, run by whichever caller found the queue empty - the *leader* - on that caller's own future. A leader's future is its HTTP handler's, and axum drops a handler future when the client disconnects. `LeaderGuard` handled a drop *before* the leader drained the queue: it failed everything still queued and emptied the queue, so leadership could be re-elected. A drop *after* the drain was a different case - the leader then held every batch-mate's command and reply channel:
+
+- Dropped during the batch, the shared transaction rolled back. Up to `MAX_BATCH_SIZE - 1` (255) other callers got `BatchFailed` ("leader task ended without producing a result") for commands that failed only because an unrelated client disconnected.
+- Dropped after the commit, while broadcasting or before replying, the batch-mates' commands *had* committed, but they were told `BatchFailed`, a retryable error - inviting a retry that makes the command twice unless the caller sent an idempotency key. The committed events were never broadcast to live subscribers either.
+
+The existing cancellation tests accepted `BatchFailed` for surviving callers, so the collateral failure was treated as expected.
+
+Fix: `submit` runs `run_as_leader` on a `tokio::spawn`ed task (instrumented with the caller's span) and awaits its handle. The leader's caller going away no longer stops the batch: it commits, broadcasts and answers every follower. The leader's own command commits even if nobody reads the result, as a command already inside a transaction could before, if the client left just after the commit. `LeaderGuard` stays, now for the one way the task can still end early, a panic. To move the dispatchers onto the task, `submit`/`decide_and_submit` take `&Arc<dyn CommandDispatcher>`/`&Arc<dyn ProjectionDispatcher>`. Every caller in the workspace already held `Arc`s (REST and GraphQL state).
+
+Tests (`skilj-core/tests/command_batcher.rs`):
+- `a_leader_cancelled_mid_batch_still_commits_and_answers_its_followers`: a trigger slows each event insert by 0.4 s. A leader and a follower queue behind a held lock, the lock is released, and the leader's caller is aborted while the batch is inside its first insert. The follower is accepted and both commands' events exist. Before, the follower got `BatchFailed` and neither event existed.
+- `a_cancelled_batch_leader_does_not_strand_followers_or_wedge_the_queue` and `random_client_disconnects_under_load_never_wedge_the_queue` no longer accept `BatchFailed`: every surviving caller's command is accepted. Those two were not re-run against the old code, since the old API doesn't take the new arguments; the new test is the before/after proof.
