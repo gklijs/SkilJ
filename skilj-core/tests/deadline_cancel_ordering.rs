@@ -128,11 +128,36 @@ impl ScheduleDeadlineDispatcher for Schedules {
         _schedule_name: &str,
         source_payload_json: &str,
     ) -> Option<Result<Option<ErasedDeadlineSpec>, serde_json::Error>> {
+        Schedules::at(Utc::now() + chrono::Duration::hours(1), source_payload_json)
+    }
+}
+
+impl Schedules {
+    fn at(
+        fire_at: chrono::DateTime<Utc>,
+        source_payload_json: &str,
+    ) -> Option<Result<Option<ErasedDeadlineSpec>, serde_json::Error>> {
         Some(Ok(Some(ErasedDeadlineSpec {
-            fire_at: Utc::now() + chrono::Duration::hours(1),
+            fire_at,
             tags: vec![order_tag(source_payload_json)],
             payload_json: "{}".to_string(),
         })))
+    }
+}
+
+/// Schedules every deadline at one fixed `fire_at`.
+struct SchedulesAt(ScheduleDeadlineInfo, chrono::DateTime<Utc>);
+
+impl ScheduleDeadlineDispatcher for SchedulesAt {
+    fn schedules(&self) -> Vec<ScheduleDeadlineInfo> {
+        vec![self.0]
+    }
+    fn schedule(
+        &self,
+        _schedule_name: &str,
+        source_payload_json: &str,
+    ) -> Option<Result<Option<ErasedDeadlineSpec>, serde_json::Error>> {
+        Schedules::at(self.1, source_payload_json)
     }
 }
 
@@ -237,5 +262,196 @@ fn a_cancel_processed_before_its_schedule_still_cancels_across_contexts() {
         let placed_bc = seed_bounded_context(&pool).await;
         let paid_bc = seed_bounded_context(&pool).await;
         cancel_before_schedule_still_cancels(&pool, &placed_bc, &paid_bc).await;
+    });
+}
+
+// --- a fire waits for its cancels (docs/architecture.md §131) ---
+
+struct NoCommands;
+
+impl skilj_core::plugin::CommandDispatcher for NoCommands {
+    fn dispatch(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[Event],
+    ) -> Option<skilj_core::error::Result<skilj_core::shared::CommandDecision>> {
+        None
+    }
+    fn required_role(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn snapshot_name(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn dispatch_from_snapshot(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[Event],
+    ) -> Option<skilj_core::error::Result<skilj_core::shared::CommandDecision>> {
+        None
+    }
+}
+
+struct NoProjections;
+
+impl skilj_core::plugin::ProjectionDispatcher for NoProjections {
+    fn keys(&self, _: &str, _: &str, _: &Event) -> Option<Vec<String>> {
+        None
+    }
+    fn project(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &Event,
+        _: &str,
+    ) -> Option<skilj_core::error::Result<String>> {
+        None
+    }
+    fn default_state(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+    fn owner_tag_key(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn team_only(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+}
+
+struct NoSnapshots;
+
+impl skilj_core::plugin::SnapshotDispatcher for NoSnapshots {
+    fn snapshot_names(&self, _: &str) -> Vec<&'static str> {
+        Vec::new()
+    }
+    fn tag_key(&self, _: &str, _: &str) -> Option<&'static str> {
+        None
+    }
+    fn owner_tag_key(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn version(&self, _: &str, _: &str) -> Option<u64> {
+        None
+    }
+    fn fold(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &Event,
+    ) -> Option<skilj_core::error::Result<String>> {
+        None
+    }
+    fn default_state(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+}
+
+/// An order's cancel deadline at `fire_at`, and a payment appended once
+/// `pay_after` has passed; the cancel loop hasn't run when the deadline
+/// comes due. Its target command type isn't registered, so a fire is just
+/// the row marked `fired`. Returns the row's status after one fire tick,
+/// then after the cancel catches up.
+async fn fire_with_a_lagging_cancel(
+    pool: &Pool,
+    fire_in: chrono::Duration,
+    pay_after: std::time::Duration,
+) -> (String, String) {
+    let bc = seed_bounded_context(pool).await;
+    let placed = seed_event_type(pool, &bc, "OrderPlaced").await;
+    let paid = seed_event_type(pool, &bc, "OrderPaid").await;
+    let name: &'static str = Box::leak(bc.name.clone().into_boxed_str());
+    let schedule = ScheduleDeadlineInfo {
+        name: "CancelUnpaid",
+        source_bounded_context: name,
+        source_event_type: "OrderPlaced",
+        target_bounded_context: name,
+        target_command_type: "NotRegistered",
+        start_from: DeadlinePollStartFrom::Beginning,
+    };
+    let cancel = CancelDeadlineInfo {
+        name: "CancelOnPaid",
+        source_bounded_context: name,
+        source_event_type: "OrderPaid",
+        deadline_schedule_name: "CancelUnpaid",
+        deadline_schedule_bounded_context: name,
+        deadline_schedule_source_event_type: "OrderPlaced",
+        start_from: DeadlinePollStartFrom::Beginning,
+    };
+    let cache = skilj_core::event_cache::EventCache::new(0);
+
+    append(pool, &placed, "o-1").await;
+    let fire_at = test_now() + fire_in;
+    db::catch_up_schedule_deadline(pool, &schedule, &SchedulesAt(schedule, fire_at), &cache)
+        .await
+        .unwrap();
+    tokio::time::sleep(pay_after).await;
+    append(pool, &paid, "o-1").await;
+    // Due now, whichever way the payment fell.
+    let until_due = (fire_at - Utc::now()).to_std().unwrap_or_default();
+    tokio::time::sleep(until_due + std::time::Duration::from_millis(20)).await;
+
+    db::fire_due_deadlines(
+        pool,
+        &NoCommands,
+        &NoProjections,
+        &NoSnapshots,
+        &skilj_core::event_store::EventBroadcaster::new(16),
+        &cache,
+        &bc.name,
+        Utc::now(),
+        None,
+        &skilj_retry::RetryPolicy::default(),
+        &[cancel],
+    )
+    .await
+    .unwrap();
+    let after_fire = deadline_statuses(pool, &bc).await.remove(0);
+    db::catch_up_cancel_deadline(pool, &cancel, &Cancels(cancel), &cache)
+        .await
+        .unwrap();
+    let after_cancel = deadline_statuses(pool, &bc).await.remove(0);
+    (after_fire, after_cancel)
+}
+
+/// Paid before the deadline came due, with the cancel loop behind: the
+/// fire waits, and the payment cancels the deadline.
+#[test]
+fn a_deadline_waits_for_a_cancel_committed_before_it_came_due() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let statuses = fire_with_a_lagging_cancel(
+            &pool,
+            chrono::Duration::milliseconds(300),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(statuses, ("pending".to_string(), "cancelled".to_string()));
+    });
+}
+
+/// Paid only after the deadline came due: that payment was too late, and
+/// the fire doesn't wait for it.
+#[test]
+fn a_deadline_does_not_wait_for_a_cancel_after_it_came_due() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let statuses = fire_with_a_lagging_cancel(
+            &pool,
+            chrono::Duration::milliseconds(50),
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(statuses, ("fired".to_string(), "fired".to_string()));
     });
 }

@@ -795,6 +795,7 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
             now,
             None,
             &retry_policy,
+            &[],
         );
         let cancel = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.deadlines SET status = 'cancelled', resolved_at = $1 \
@@ -943,6 +944,7 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
             now,
             None,
             &skilj_retry::RetryPolicy::default(),
+            &[],
         )
         .await
         .unwrap();
@@ -1101,6 +1103,7 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
                         max_attempts: Some(2),
                         max_elapsed: None,
                     },
+                    &[],
                 )
                 .await
             }

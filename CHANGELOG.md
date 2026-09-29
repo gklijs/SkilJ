@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `db::fire_due_deadlines` takes the registered cancels as a new
+  `cancels` argument (breaking for direct callers) (docs/architecture.md
+  §131).
 - `CancelDeadlineInfo` gains `deadline_schedule_source_event_type`
   (breaking for code constructing it directly) (docs/architecture.md
   §130).
@@ -174,6 +177,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A deadline could fire although its cancelling event was committed
+  before it came due - when the cancel loop hadn't processed it yet (a
+  paid order still cancelled). A due deadline now waits until every
+  cancel that can reach it has processed its source events up to the
+  deadline's `fire_at` (docs/architecture.md §131).
 - A `CancelDeadline` could lose to its own `ScheduleDeadline`: when the
   cancel loop reached the cancelling event before the schedule loop had
   created the deadline, the cancel matched nothing and the deadline fired

@@ -10197,3 +10197,20 @@ The fix is the user's choice: the cancel waits for scheduling, rather than remem
 Tests:
 - `a_cancel_processed_before_its_schedule_still_cancels_within_one_context` and `..._across_contexts` (`skilj-core/tests/deadline_cancel_ordering.rs`) drive the catch-ups by hand in the losing order: cancel, schedule, cancel. The deadline ends `cancelled`. Without the gate it stayed `pending`.
 - `skilj/tests/deadlines.rs` passed six runs out of six afterwards.
+
+## 131. A fire waits for its cancels
+
+§130's mirror image. A deadline "cancel this order unless it's paid within 30 minutes" is due at `fire_at`. When the payment is committed at 29:59 but the cancel loop hasn't processed it yet - it's lagging, or held back by its schedule (§130) - the fire loop reaches the due row first, claims it and submits `CancelOrder`. The order was paid in time and is cancelled anyway.
+
+The fix is the user's choice: firing waits for cancels, rather than firing on time and documenting it.
+
+- `fire_due_deadlines` takes the registered `CancelDeadlineInfo`s (a new `cancels` parameter, passed by `Skilj`'s fire tick). Before claiming a due row, it checks every cancel that can reach it, meaning its schedule in this bounded context. It uses `cancel_backlog_start`: when the first of that cancel's source events it hasn't processed was created. If that is at or before the row's `fire_at`, a cancelling event from before the deadline may still be on its way. So the row is left `pending` for a later tick, and the rest of the tick carries on.
+- The comparison is by creation time against `fire_at`, since `fire_at` is a time. A cancelling event created after `fire_at` doesn't hold the fire: it came too late to count.
+- Each cancel's backlog is looked up once per tick, on first need.
+- The cost, as the user accepted: a deadline can fire late while a cancel that could reach it lags - and through §130, while that cancel's schedule lags - but not wrongly. There's no cycle: a schedule waits on nothing, a cancel waits on its schedule, and a fire waits on its cancels.
+
+Breaking (`skilj-core`): `fire_due_deadlines` gains the `cancels` parameter. Its direct test callers in `skilj/tests/deadlines.rs` pass `&[]`.
+
+Tests (`skilj-core/tests/deadline_cancel_ordering.rs`). An order's deadline targets an unregistered command, so firing only marks it `fired`. The cancel loop hasn't run when the deadline comes due:
+- `a_deadline_waits_for_a_cancel_committed_before_it_came_due`: paid before `fire_at`, the fire tick leaves the row `pending`, and the cancel then cancels it. With the hold disabled the row ended `fired`.
+- `a_deadline_does_not_wait_for_a_cancel_after_it_came_due`: paid after `fire_at`, the deadline fires and stays fired.

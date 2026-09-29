@@ -2761,6 +2761,7 @@ impl SkiljBuilder {
                 cancels: Arc::new(self.cancel_deadlines),
             });
         let cancels = cancel_deadline_dispatcher.cancels();
+        let fire_cancels = cancels.clone();
         // docs/architecture.md §130: a cancel waits for its schedule to
         // have processed what precedes each cancelling event. Nothing in
         // this process runs a schedule that isn't registered here, so its
@@ -2841,6 +2842,7 @@ impl SkiljBuilder {
         let deadline_fire_encryption_master_key = skilj.encryption_master_key.clone();
         let deadline_retry_policy = self.deadline_retry_policy;
         background.spawn("fire_deadlines", move |mut stop| async move {
+            let fire_cancels = fire_cancels;
             loop {
                 let start = std::time::Instant::now();
                 deadline_fire_tick(
@@ -2853,6 +2855,7 @@ impl SkiljBuilder {
                     deadline_fire_encryption_master_key.as_ref(),
                     chrono::Utc::now(),
                     &deadline_retry_policy,
+                    &fire_cancels,
                 )
                 .instrument(tracing::info_span!("deadline_fire_tick"))
                 .await;
@@ -3169,6 +3172,7 @@ async fn deadline_fire_tick(
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: chrono::DateTime<chrono::Utc>,
     retry_policy: &skilj_retry::RetryPolicy,
+    cancels: &[skilj_core::plugin::CancelDeadlineInfo],
 ) {
     let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
         Ok(bcs) => bcs,
@@ -3201,6 +3205,7 @@ async fn deadline_fire_tick(
                     now,
                     encryption_master_key,
                     retry_policy,
+                    cancels,
                 )
                 .await
                 {

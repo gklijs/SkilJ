@@ -10028,6 +10028,28 @@ pub async fn catch_up_schedule_deadline(
     Ok(())
 }
 
+/// When the first of `cancel`'s source events it hasn't processed yet was
+/// created, or `None` when it has processed every one there is
+/// (docs/architecture.md §131). A cancel that has never run has processed
+/// nothing.
+async fn cancel_backlog_start(
+    pool: &Pool,
+    cancel: &crate::plugin::CancelDeadlineInfo,
+) -> crate::error::Result<Option<DateTime<Utc>>> {
+    let cursor = get_deadline_cursor(pool, cancel.source_bounded_context, cancel.name)
+        .await?
+        .unwrap_or(-1);
+    let schema = schema_ident(cancel.source_bounded_context);
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT metadata_created_at FROM {schema}.events \
+         WHERE event_type_name = $1 AND sequence > $2 ORDER BY sequence LIMIT 1"
+    )))
+    .bind(cancel.source_event_type)
+    .bind(cursor)
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// Where a `CancelDeadline`'s schedule still has work: the first of the
 /// schedule's source events it hasn't processed. Compared by sequence
 /// when the cancelling events share its bounded context - exact, since
@@ -10262,6 +10284,7 @@ fn deadline_firing_claim_stale_after() -> chrono::Duration {
 struct DueDeadlineRow {
     id: String,
     schedule_name: String,
+    fire_at: DateTime<Utc>,
     correlation_id: Option<String>,
     target_bounded_context: String,
     target_command_type: String,
@@ -10335,11 +10358,17 @@ pub async fn fire_due_deadlines(
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
     retry_policy: &skilj_retry::RetryPolicy,
+    cancels: &[crate::plugin::CancelDeadlineInfo],
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     let stale_cutoff = now - deadline_firing_claim_stale_after();
+    // docs/architecture.md §131: per cancel that can reach this bounded
+    // context's deadlines, when its first unprocessed source event was
+    // created - looked up once per tick, on first need.
+    let mut cancel_backlogs: std::collections::HashMap<&str, Option<DateTime<Utc>>> =
+        std::collections::HashMap::new();
     let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, schedule_name, correlation_id, target_bounded_context, \
+        "SELECT id, schedule_name, fire_at, correlation_id, target_bounded_context, \
          target_command_type, payload, attempt_count, first_failed_at \
          FROM {schema}.deadlines \
          WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \
@@ -10351,7 +10380,28 @@ pub async fn fire_due_deadlines(
     .fetch_all(pool)
     .await?;
 
-    for row in rows {
+    'rows: for row in rows {
+        // docs/architecture.md §131: a deadline only fires once every
+        // cancel that can reach it has processed its source events up to
+        // the deadline's `fire_at` - one committed before then, but not
+        // yet processed by a lagging cancel loop, would otherwise lose to
+        // the fire. Held rows stay `pending` for a later tick.
+        for cancel in cancels.iter().filter(|c| {
+            c.deadline_schedule_bounded_context == bounded_context
+                && c.deadline_schedule_name == row.schedule_name
+        }) {
+            let backlog = match cancel_backlogs.get(cancel.name) {
+                Some(backlog) => *backlog,
+                None => {
+                    let backlog = cancel_backlog_start(pool, cancel).await?;
+                    cancel_backlogs.insert(cancel.name, backlog);
+                    backlog
+                }
+            };
+            if backlog.is_some_and(|first_unprocessed| first_unprocessed <= row.fire_at) {
+                continue 'rows;
+            }
+        }
         let Some(target_command_type) =
             get_command_type(pool, &row.target_bounded_context, &row.target_command_type).await?
         else {
