@@ -46,6 +46,12 @@ static REQUEST_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
 #[derive(Clone)]
 pub struct GraphqlState {
     pub pool: Pool,
+    /// How many `retryParkedDelivery` redrives may run at once, shared by
+    /// every `GraphqlState` of one process. Each holds its per-row lock on
+    /// a connection of its own while the redrive needs more, so without a
+    /// bound, parallel retries could take every connection and wait on
+    /// each other for one more (docs/architecture.md §117).
+    pub parked_delivery_retry_permits: Arc<tokio::sync::Semaphore>,
     /// This process's bootstrap secret, shared with `skilj::Skilj` and every
     /// other `GraphqlState` built from it, so a claim through any of them
     /// consumes it for all (docs/architecture.md §109).

@@ -179,6 +179,9 @@ pub struct Skilj {
     /// (`ClosesPermanentlyOnFirstClaim`). Read only by
     /// `skilj-graphql`'s `createSuperadmin` mutation resolver.
     bootstrap: skilj_core::bootstrap::BootstrapGate,
+    /// Shared by every `GraphqlState` built from this `Skilj` - see
+    /// `skilj_graphql::GraphqlState::parked_delivery_retry_permits`.
+    parked_delivery_retry_permits: Arc<tokio::sync::Semaphore>,
     /// `None` when `.identity_provider(...)` was never called - every
     /// GraphQL resolver that needs a caller identity has no way to
     /// authenticate anyone in that case (not a silent bypass: there is
@@ -786,6 +789,7 @@ impl Skilj {
     fn graphql_state(&self) -> skilj_graphql::GraphqlState {
         skilj_graphql::GraphqlState {
             pool: self.pool.clone(),
+            parked_delivery_retry_permits: self.parked_delivery_retry_permits.clone(),
             bootstrap: self.bootstrap.clone(),
             identity: self
                 .identity_provider
@@ -1943,6 +1947,12 @@ impl SkiljBuilder {
         // Shared by `Skilj` and every `GraphqlState` built from it, so a
         // claim through any of them consumes it (docs/architecture.md §109).
         let bootstrap = skilj_core::bootstrap::BootstrapGate::new(bootstrap_secret.clone());
+        // Half the pool, at least one - the share `CommandBatcher` gives
+        // its leaders and the route task its ticks (docs/architecture.md
+        // §117).
+        let parked_delivery_retry_permits = Arc::new(tokio::sync::Semaphore::new(
+            (pool.options().get_max_connections() as usize / 2).max(1),
+        ));
         if let Some(secret) = &bootstrap_secret {
             eprintln!(
                 "skilj: no active superadmin Role exists yet - bootstrap secret (use once, via \
@@ -2210,6 +2220,7 @@ impl SkiljBuilder {
         let schema_registry = Arc::new(
             skilj_graphql::schema::SchemaRegistry::build(skilj_graphql::GraphqlState {
                 pool: pool.clone(),
+                parked_delivery_retry_permits: parked_delivery_retry_permits.clone(),
                 bootstrap: bootstrap.clone(),
                 identity: identity_provider
                     .as_ref()
@@ -2249,6 +2260,7 @@ impl SkiljBuilder {
             snapshots,
             event_types: Arc::new(self.event_types),
             bootstrap,
+            parked_delivery_retry_permits,
             identity_provider,
             projection_query_wait_timeout,
             read_cursor_checkout_lease,
@@ -2478,12 +2490,20 @@ impl SkiljBuilder {
         let routes = route_dispatcher.routes();
         let route_interval = self.cross_context_route_poll_interval;
         let route_retry_policy = self.cross_context_route_retry_policy;
+        // A route tick holds its advisory lock on a connection of its own
+        // for the whole tick, and its work needs further connections. At
+        // most half the pool (at least one) is ever held that way, the
+        // same share `CommandBatcher` gives its leaders, so ticks can't
+        // take every connection and then wait on each other for one more
+        // (docs/architecture.md §117).
+        let route_concurrency = (route_pool.options().get_max_connections() as usize / 2)
+            .clamp(1, BACKGROUND_TASK_CONCURRENCY);
         tokio::spawn(async move {
             loop {
                 let start = std::time::Instant::now();
                 async {
                     stream::iter(routes.clone())
-                        .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |route| {
+                        .for_each_concurrent(route_concurrency, |route| {
                             let route_pool = route_pool.clone();
                             let route_dispatcher = route_dispatcher.clone();
                             let route_command_dispatcher = route_command_dispatcher.clone();

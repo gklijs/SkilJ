@@ -2674,7 +2674,7 @@ pub async fn get_event_type(
 /// its own `created_by_role_id`'s `Role`) it never needed to ask for
 /// again.
 async fn get_event_type_with_bc(
-    pool: &Pool,
+    executor: impl sqlx::PgExecutor<'_>,
     bc: &BoundedContext,
     name: &str,
 ) -> crate::error::Result<Option<EventType>> {
@@ -2683,7 +2683,7 @@ async fn get_event_type_with_bc(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = $1"
     )))
     .bind(name)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row.map(|r| r.into_domain(bc.clone())))
 }
@@ -2693,7 +2693,7 @@ async fn get_event_type_with_bc(
 /// of names. `names` empty returns an empty map without touching
 /// Postgres.
 async fn get_event_types_by_names_with_bc(
-    pool: &Pool,
+    executor: impl sqlx::PgExecutor<'_>,
     bc: &BoundedContext,
     names: &[&str],
 ) -> crate::error::Result<std::collections::HashMap<String, EventType>> {
@@ -2705,7 +2705,7 @@ async fn get_event_types_by_names_with_bc(
         "SELECT {EVENT_TYPE_COLUMNS} FROM {schema}.event_types WHERE name = ANY($1)"
     )))
     .bind(names)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()
@@ -2891,7 +2891,7 @@ pub async fn fire_system_event(
     // bounded context's own lock - see `insert_event_and_update_sync_projections_in_tx`'s
     // own doc comment on why that ordering, not "as early as possible", is
     // what keeps this read race-free against `promote_projection_rebuild`.
-    let sync_projections = sync_projections_for_bounded_context(pool, bounded_context).await?;
+    let sync_projections = sync_projection_names(&mut tx, bounded_context).await?;
     insert_event_and_update_sync_projections_in_tx(
         &mut tx,
         &event,
@@ -3114,6 +3114,31 @@ pub async fn get_or_create_encryption_key(
     master_key: &EncryptionMasterKey,
 ) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
     let bc = require_bounded_context(pool, bounded_context).await?;
+    get_or_create_encryption_key_on(
+        &mut *pool.acquire().await?,
+        bc,
+        subject_key,
+        subject_value,
+        master_key,
+    )
+    .await
+}
+
+/// [`get_or_create_encryption_key`] on a connection the caller holds,
+/// with the bounded context already in hand. A command's own post-lock
+/// provisioning runs it on the transaction holding the bounded context's
+/// `sequence` lock, so it never needs a second pooled connection while
+/// holding that lock (docs/architecture.md §117). A key created there
+/// becomes durable with the command that needed it, or not at all.
+async fn get_or_create_encryption_key_on(
+    conn: &mut sqlx::PgConnection,
+    bc: BoundedContext,
+    subject_key: &str,
+    subject_value: &str,
+    master_key: &EncryptionMasterKey,
+) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
+    let bounded_context = bc.name.clone();
+    let bounded_context = bounded_context.as_str();
     let schema = schema_ident(bounded_context);
 
     // docs/architecture.md §107: normally one pass. Another pass only when
@@ -3126,7 +3151,8 @@ pub async fn get_or_create_encryption_key(
     const ATTEMPTS: usize = 5;
     for _ in 0..ATTEMPTS {
         if let Some(row) =
-            get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await?
+            get_active_encryption_key_row(&mut *conn, bounded_context, subject_key, subject_value)
+                .await?
         {
             let data_key = unwrap_row(master_key, &row)?;
             return Ok((row.to_domain(bc), row.id, data_key));
@@ -3146,7 +3172,7 @@ pub async fn get_or_create_encryption_key(
         .bind(now)
         .bind(&wrapped)
         .bind(&nonce)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         if let Some(row) = inserted {
@@ -3306,7 +3332,7 @@ pub fn encryption_key_ids(
 }
 
 async fn get_active_encryption_key_row(
-    pool: &Pool,
+    executor: impl sqlx::PgExecutor<'_>,
     bounded_context: &str,
     subject_key: &str,
     subject_value: &str,
@@ -3318,7 +3344,7 @@ async fn get_active_encryption_key_row(
     )))
     .bind(subject_key)
     .bind(subject_value)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row)
 }
@@ -3592,7 +3618,7 @@ pub async fn get_command_by_id(
 /// identical "caller already has this row, don't re-fetch it" reasoning
 /// `get_event_type_with_bc` gives.
 async fn get_commands_by_ids_with_bc(
-    pool: &Pool,
+    conn: &mut sqlx::PgConnection,
     bc: &BoundedContext,
     ids: &[i64],
 ) -> crate::error::Result<std::collections::HashMap<i64, Command>> {
@@ -3604,7 +3630,7 @@ async fn get_commands_by_ids_with_bc(
         "SELECT id, {COMMAND_COLUMNS} FROM {schema}.commands WHERE id = ANY($1)"
     )))
     .bind(ids)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut distinct_type_names: Vec<&str> = Vec::new();
@@ -3613,7 +3639,7 @@ async fn get_commands_by_ids_with_bc(
             distinct_type_names.push(&row.command_type_name);
         }
     }
-    let command_types = get_command_types_by_names_with_bc(pool, bc, &distinct_type_names).await?;
+    let command_types = get_command_types_by_names_with_bc(conn, bc, &distinct_type_names).await?;
 
     let mut commands = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
@@ -3680,7 +3706,7 @@ struct CommandRowWithId {
 /// ANY($1)` round trip. `names` empty returns an empty map without
 /// touching Postgres.
 async fn get_command_types_by_names_with_bc(
-    pool: &Pool,
+    executor: impl sqlx::PgExecutor<'_>,
     bc: &BoundedContext,
     names: &[&str],
 ) -> crate::error::Result<std::collections::HashMap<String, CommandType>> {
@@ -3692,7 +3718,7 @@ async fn get_command_types_by_names_with_bc(
         "SELECT {COMMAND_TYPE_COLUMNS} FROM {schema}.command_types WHERE name = ANY($1)"
     )))
     .bind(names)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()
@@ -4517,28 +4543,32 @@ pub async fn list_projections_for_bounded_context(
     Ok(projections)
 }
 
-/// The `sync`-only slice of `list_projections_for_bounded_context` that
-/// `insert_event_and_update_sync_projections_in_tx` actually needs -
-/// pulled out so every call site fetches it once, itself, before opening
-/// (or as part of preparing) its own transaction, instead of that
-/// function re-running the full metadata read once per event it inserts.
-/// A command that decides several events used to pay for this read again
-/// for every one of them, all of it while `submit_command`'s own
-/// bounded-context lock was held (Codeberg issue #32) - hoisting it here,
-/// to one call per commit, is pure round-trip reduction, not a behaviour
-/// change: it is still the same "small, admin-managed list, not worth
-/// locking" read via `pool`, not `tx`, that function's own doc comment
-/// already describes.
+/// The names of `bounded_context`'s `sync` projections - all
+/// `insert_event_and_update_sync_projections_in_tx` needs of them (the
+/// `ProjectionDispatcher` answers everything else by name). Every call
+/// site fetches it once per commit and passes the same slice to every
+/// event that commit inserts (Codeberg issue #32).
+///
+/// Read on the caller's own transaction, after it took this bounded
+/// context's `sequence` row lock: `promote_projection_rebuild` - the one
+/// place a projection's `sync` flag can flip mid-flight - takes that same
+/// lock before it promotes (drift audit finding #6), so the two can't
+/// interleave. It must not be a separate pooled read (docs/architecture.md
+/// §116): every other writer to this bounded context waits on that lock
+/// holding a connection, so with a pool's worth of them waiting the
+/// holder could never get a second one, and all of them failed at the
+/// acquire timeout.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
-pub async fn sync_projections_for_bounded_context(
-    pool: &Pool,
+pub async fn sync_projection_names(
+    conn: &mut sqlx::PgConnection,
     bounded_context: &str,
-) -> crate::error::Result<Vec<Projection>> {
-    Ok(list_projections_for_bounded_context(pool, bounded_context)
-        .await?
-        .into_iter()
-        .filter(|p| p.sync)
-        .collect())
+) -> crate::error::Result<Vec<String>> {
+    let schema = schema_ident(bounded_context);
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT name FROM {schema}.projections WHERE sync ORDER BY name"
+    )))
+    .fetch_all(conn)
+    .await?)
 }
 
 #[derive(sqlx::FromRow)]
@@ -5552,7 +5582,7 @@ pub async fn list_events_for_bounded_context_matching_tags(
 
     let bc = require_bounded_context(pool, bounded_context).await?;
     list_events_for_bounded_context_matching_tags_with_bc(
-        pool,
+        &mut *pool.acquire().await?,
         &bc,
         tags,
         after_sequence,
@@ -5574,7 +5604,7 @@ pub async fn list_events_for_bounded_context_matching_tags(
 /// command in a large, self-tuning batch was pure round-trip waste sitting
 /// inside the batch leader's own held lock.
 async fn list_events_for_bounded_context_matching_tags_with_bc(
-    pool: &Pool,
+    conn: &mut sqlx::PgConnection,
     bc: &BoundedContext,
     tags: &[Tag],
     after_sequence: Option<i64>,
@@ -5631,8 +5661,25 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
     if let Some(limit) = limit {
         query = query.bind(limit);
     }
-    let rows: Vec<EventRowAnyType> = query.fetch_all(pool).await?;
+    let rows: Vec<EventRowAnyType> = query.fetch_all(&mut *conn).await?;
 
+    events_from_rows(conn, bc, rows, known_event_types).await
+}
+
+/// Turns `events` rows of any type from `bc` into [`Event`]s on `conn`,
+/// batching the lookups they need: one query for every event type
+/// `known_event_types` doesn't already answer, and one (plus one for
+/// their command types) for every originating command a
+/// `command_triggered` row names. Shared by the DCB delta query and a new
+/// sync projection's locked tail read, both of which run it on the
+/// transaction holding the bounded context's `sequence` lock
+/// (docs/architecture.md §117).
+async fn events_from_rows(
+    conn: &mut sqlx::PgConnection,
+    bc: &BoundedContext,
+    rows: Vec<EventRowAnyType>,
+    known_event_types: Option<&std::collections::HashMap<String, EventType>>,
+) -> crate::error::Result<Vec<Event>> {
     let row_count = rows.len();
     let row_loop_started = std::time::Instant::now();
 
@@ -5664,7 +5711,8 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
         }
     }
     let event_type_lookup_started = std::time::Instant::now();
-    event_types.extend(get_event_types_by_names_with_bc(pool, bc, &missing_type_names).await?);
+    event_types
+        .extend(get_event_types_by_names_with_bc(&mut *conn, bc, &missing_type_names).await?);
     let event_type_lookup_elapsed = event_type_lookup_started.elapsed();
 
     // The real cost this whole investigation found (docs/architecture.md
@@ -5693,7 +5741,7 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
             }
         }
     }
-    let commands_by_id = get_commands_by_ids_with_bc(pool, bc, &command_ids).await?;
+    let commands_by_id = get_commands_by_ids_with_bc(conn, bc, &command_ids).await?;
     let mut origins = Vec::with_capacity(rows.len());
     for row in &rows {
         origins.push(match row.origin_kind.as_str() {
@@ -6223,7 +6271,7 @@ pub async fn for_each_tagged_event_chunk(
     let mut after = after_sequence;
     loop {
         let chunk = list_events_for_bounded_context_matching_tags_with_bc(
-            pool,
+            &mut *pool.acquire().await?,
             &bc,
             tags,
             Some(after),
@@ -6447,9 +6495,8 @@ pub async fn insert_event_and_update_sync_projections(
     broadcaster: &crate::event_store::EventBroadcaster,
     event_cache: &crate::event_cache::EventCache,
 ) -> crate::error::Result<()> {
-    let sync_projections =
-        sync_projections_for_bounded_context(pool, &event.bounded_context.name).await?;
     let mut tx = pool.begin().await?;
+    let sync_projections = sync_projection_names(&mut tx, &event.bounded_context.name).await?;
     insert_event_and_update_sync_projections_in_tx(
         &mut tx,
         event,
@@ -6486,26 +6533,11 @@ pub async fn insert_event_and_update_sync_projections(
 /// submission (a `ProcessCommand` call can trigger several) has been
 /// folded in.
 ///
-/// `sync_projections` is the caller's job too now (Codeberg issue #32) -
-/// this function used to re-run `list_projections_for_bounded_context`'s
-/// own metadata read itself, once per event, which meant a command that
-/// decided several events paid for it again and again while
-/// `submit_command`'s own bounded-context lock was held. Every real call
-/// site now fetches it exactly once via `sync_projections_for_bounded_context`
-/// and passes the same slice into every event this one submission
-/// inserts. That fetch is still a plain `pool` read, not `tx` - deliberately,
-/// the same "small, admin-managed list, not worth locking" treatment
-/// `list_projections_for_bounded_context`'s own callers already give it
-/// elsewhere - but it is only safe to run *after* the caller's own
-/// `next_sequence`/`SELECT ... FOR UPDATE` on this bounded context's
-/// `sequence` row has already been taken (every real call site fetches it
-/// no earlier than that point): `promote_projection_rebuild` - the one
-/// place a projection's own `sync` flag can flip mid-flight - takes that
-/// identical lock before it can promote (drift audit finding #6, see
-/// project memory `skilj-drift-audit-2026-08-20`, and that function's own
-/// doc comment), so the two can never interleave once this caller's own
-/// lock is held, and there is no possible half-visible state left to see.
-/// Fetching it before that lock would reopen exactly that race.
+/// `sync_projections` - the names of the bounded context's `sync`
+/// projections - is the caller's job (Codeberg issue #32): fetched once
+/// per commit via [`sync_projection_names`], on this same transaction
+/// after its `sequence` row lock is held - see that function's doc
+/// comment for why both halves of that matter.
 #[tracing::instrument(skip_all)]
 pub async fn insert_event_and_update_sync_projections_in_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -6513,7 +6545,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
     command_id: Option<i64>,
     dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     encryption_key_ids: &[i64],
-    sync_projections: &[Projection],
+    sync_projections: &[String],
 ) -> crate::error::Result<()> {
     let bounded_context = &event.bounded_context.name;
     let schema = schema_ident(bounded_context);
@@ -6541,7 +6573,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
         .await?;
     }
 
-    for projection in sync_projections {
+    for projection_name in sync_projections {
         // `Some(vec![])` (registered, but this event's type isn't
         // consumed) and `None` (dispatcher doesn't recognise this
         // projection at all) both fall through to an empty loop below -
@@ -6549,13 +6581,13 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
         // advances unconditionally after it (§9's "keyed / multi-row
         // Projections" pass).
         let keys = dispatcher
-            .keys(bounded_context, &projection.name, event)
+            .keys(bounded_context, projection_name, event)
             .unwrap_or_default();
         let default_state_json = dispatcher
-            .default_state(bounded_context, &projection.name)
+            .default_state(bounded_context, projection_name)
             .unwrap_or_default();
         let owner_tag_key = dispatcher
-            .owner_tag_key(bounded_context, &projection.name)
+            .owner_tag_key(bounded_context, projection_name)
             .flatten();
 
         for key in &keys {
@@ -6571,7 +6603,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
             let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
                 &mut **tx,
                 &schema,
-                &projection.name,
+                projection_name,
                 key,
                 &default_state_json,
             )
@@ -6582,7 +6614,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
 
             let new_state = match dispatcher.project(
                 bounded_context,
-                &projection.name,
+                projection_name,
                 &current_state,
                 event,
                 key,
@@ -6596,7 +6628,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
                 &schema,
                 "projection_state",
                 "",
-                &projection.name,
+                projection_name,
                 key,
                 &new_state,
                 owner_tag_key,
@@ -6609,7 +6641,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
             "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
         )))
         .bind(event.sequence)
-        .bind(&projection.name)
+        .bind(projection_name)
         .execute(&mut **tx)
         .await?;
     }
@@ -6836,8 +6868,7 @@ pub async fn create_and_insert_external_event(
     // bounded context's own lock - see `insert_event_and_update_sync_projections_in_tx`'s
     // own doc comment on why that ordering, not "as early as possible", is
     // what keeps this read race-free against `promote_projection_rebuild`.
-    let sync_projections =
-        sync_projections_for_bounded_context(pool, &bounded_context_name).await?;
+    let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?;
     insert_event_and_update_sync_projections_in_tx(
         &mut tx,
         &event,
@@ -6921,8 +6952,7 @@ pub async fn create_and_insert_direct_event(
     // bounded context's own lock - see `insert_event_and_update_sync_projections_in_tx`'s
     // own doc comment on why that ordering, not "as early as possible", is
     // what keeps this read race-free against `promote_projection_rebuild`.
-    let sync_projections =
-        sync_projections_for_bounded_context(pool, &bounded_context_name).await?;
+    let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?;
     insert_event_and_update_sync_projections_in_tx(
         &mut tx,
         &event,
@@ -7103,12 +7133,10 @@ pub async fn submit_command(
     // which is what keeps this read race-free against
     // `promote_projection_rebuild` (see
     // `insert_event_and_update_sync_projections_in_tx`'s own doc comment).
-    let sync_projections =
-        sync_projections_for_bounded_context(pool, &bounded_context_name).await?;
+    let sync_projections = sync_projection_names(&mut tx, &bounded_context_name).await?;
 
     let outcome = submit_one_command_in_tx(
         &mut tx,
-        pool,
         dispatcher,
         projection_dispatcher,
         command_type,
@@ -7288,15 +7316,14 @@ enum DecideOutcome {
 ///
 /// Never touches `next_sequence_batch`, `resolve_encryption_keys`,
 /// `process_command`, or any insert - everything here is either a pure
-/// function or a read (`lookup_idempotency_key` against `tx` itself,
-/// everything else against `pool`), so running it directly on a
-/// long-lived `tx` shared by many commands, rather than inside its own
-/// disposable transaction, changes nothing about what it can safely see
-/// or do; a genuine failure here (an idempotency-lookup DB error, a
-/// decider error) is returned as a real `Err` and, in `commit_command_batch`'s
-/// own caller, is still wrapped in its own tiny `SAVEPOINT` purely so
-/// that failure can't sour `tx` for the commands still to come - see
-/// that function's own comment.
+/// function or a read on `conn` - the lock holder's own connection, never
+/// a second pooled one (docs/architecture.md §117) - so running it
+/// directly on a long-lived `tx` shared by many commands, rather than
+/// inside its own disposable transaction, changes nothing about what it
+/// can safely see or do. A decider error is a Rust `Err` and stays
+/// per-command; a failing read means the connection itself is in
+/// trouble, which fails the batch - see `commit_command_batch`'s own
+/// comment.
 ///
 /// `event_types_by_name` arrives already warmed up (see
 /// `warm_up_event_types_and_encryption_keys`) and is grown in place for
@@ -7304,7 +7331,7 @@ enum DecideOutcome {
 /// itself used to do this inline.
 #[allow(clippy::too_many_arguments)]
 async fn decide_command_in_tx(
-    pool: &Pool,
+    conn: &mut sqlx::PgConnection,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     command_type: &CommandType,
     payload: &str,
@@ -7317,10 +7344,6 @@ async fn decide_command_in_tx(
     idempotency_key: Option<&str>,
     locked_highest: i64,
     extra_committed_events: &[Event],
-    extra_committed_idempotency_keys: &std::collections::HashMap<
-        (String, String, String),
-        Vec<i64>,
-    >,
     mut event_types_by_name: std::collections::HashMap<String, EventType>,
 ) -> crate::error::Result<DecideOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
@@ -7338,36 +7361,14 @@ async fn decide_command_in_tx(
     // nothing is written, and this command never reaches
     // `finish_accepted_command_in_tx` at all.
     //
-    // Same two-source shape `extra_committed_events` already uses for the
-    // DCB delta below it: `extra_committed_idempotency_keys` is this
-    // batch's own in-memory record of idempotency keys an *earlier*
-    // command in this same, still-uncommitted batch already claimed
-    // (`commit_command_batch`'s own accumulator, populated right after
-    // each accepted command's own persist succeeds) - the only case a
-    // plain `pool` read below can't see, since those rows live only on
-    // the leader's own connection until the whole batch commits. Anything
-    // genuinely already committed by an earlier, separate transaction *is*
-    // visible to a plain `pool` read, for the identical reason
-    // `lookup_idempotency_key`'s own doc comment gives the DCB delta query
-    // a few lines below: the bounded-context lock already fully
-    // serializes every writer, so nothing uncommitted from any *other*
-    // transaction can exist to miss. This is what lets `decide_command_in_tx`
-    // run without ever touching the leader's own `tx` at all - no
-    // per-command `SAVEPOINT` is needed to isolate a DB error here, since
-    // there is no `tx`-scoped statement left to isolate one from.
+    // Read on the lock holder's own connection (docs/architecture.md
+    // §117), so it also sees a key an earlier command in the same,
+    // still-uncommitted batch claimed: that command's savepoint was
+    // released into this same transaction.
     if let Some(key) = idempotency_key {
-        let cache_key = (
-            command_type.name.clone(),
-            client_id.to_string(),
-            key.to_string(),
-        );
-        let triggered_event_sequences = match extra_committed_idempotency_keys.get(&cache_key) {
-            Some(sequences) => Some(sequences.clone()),
-            None => {
-                lookup_idempotency_key(pool, &schema, &command_type.name, client_id, key).await?
-            }
-        };
-        if let Some(triggered_event_sequences) = triggered_event_sequences {
+        if let Some(triggered_event_sequences) =
+            lookup_idempotency_key(&mut *conn, &schema, &command_type.name, client_id, key).await?
+        {
             return Ok(DecideOutcome::Terminal(
                 SubmitCommandOutcome::Deduplicated {
                     triggered_event_sequences,
@@ -7386,14 +7387,13 @@ async fn decide_command_in_tx(
     let mut final_matching_events = matching_events.to_vec();
 
     // Something committed between the caller's own optimistic read and
-    // this lock - either genuinely committed (`locked_highest >
-    // original_highest`, fetched from `pool`) or, new in this pass, an
-    // earlier command in this same batch (`extra_committed_events`,
-    // already sitting in `tx` but invisible to a `pool` query since it
-    // isn't committed yet). Only a match on our own consistency_tags is
-    // an actual DCB conflict; see docs/architecture.md §19's "Problem 1"
-    // fix for why the `pool` half of this is already tag-indexed rather
-    // than an unfiltered range scan.
+    // this lock - either before the lock (`locked_highest >
+    // original_highest`, queried up to `locked_highest`) or by an earlier
+    // command in this same batch (`extra_committed_events`, kept in
+    // memory so a batch doesn't query once per command for it). Only a
+    // match on our own consistency_tags is an actual DCB conflict; see
+    // docs/architecture.md §19's "Problem 1" fix for why the query is
+    // tag-indexed rather than an unfiltered range scan.
     let mut delta = if locked_highest > original_highest {
         // `command_type.bounded_context` is already this exact row -
         // every command a `CommandBatcher` batch ever holds shares one
@@ -7412,8 +7412,8 @@ async fn decide_command_in_tx(
         // makes the common case, not the rare-conflict case this branch
         // was written for), is where that time actually goes.
         let delta_query_started = std::time::Instant::now();
-        let result = list_events_for_bounded_context_matching_tags_with_bc(
-            pool,
+        let mut result = list_events_for_bounded_context_matching_tags_with_bc(
+            &mut *conn,
             &command_type.bounded_context,
             consistency_tags,
             Some(original_highest),
@@ -7421,6 +7421,10 @@ async fn decide_command_in_tx(
             None,
         )
         .await?;
+        // On the lock holder's own connection this also returns what an
+        // earlier command in this batch inserted (above `locked_highest`);
+        // those come from `extra_committed_events` below instead.
+        result.retain(|e| e.sequence <= locked_highest);
         tracing::info!(
             bounded_context = %bounded_context_name,
             delta_query_us = delta_query_started.elapsed().as_micros(),
@@ -7514,7 +7518,10 @@ async fn decide_command_in_tx(
         if let std::collections::hash_map::Entry::Vacant(entry) =
             event_types_by_name.entry(spec.event_type.clone())
         {
-            if let Some(et) = get_event_type(pool, &bounded_context_name, &spec.event_type).await? {
+            if let Some(et) =
+                get_event_type_with_bc(&mut *conn, &command_type.bounded_context, &spec.event_type)
+                    .await?
+            {
                 entry.insert(et);
             }
         }
@@ -7537,7 +7544,6 @@ async fn decide_command_in_tx(
 #[allow(clippy::too_many_arguments)]
 async fn finish_accepted_command_in_tx(
     tx: &mut Transaction<'_, Postgres>,
-    pool: &Pool,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     command_type: &CommandType,
     payload: &str,
@@ -7547,7 +7553,7 @@ async fn finish_accepted_command_in_tx(
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
     idempotency_key: Option<&str>,
-    sync_projections: &[Projection],
+    sync_projections: &[String],
     sequences: Vec<i64>,
     decided: AcceptedDecision,
     mut resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
@@ -7563,29 +7569,17 @@ async fn finish_accepted_command_in_tx(
 
     // protect_sensitive_fields' own pre-resolution step, for the
     // command's own payload *and* every final event spec's - see
-    // `resolve_encryption_keys`'s own doc comment. Runs against `pool`,
-    // not `tx`, deliberately - EncryptionKey provisioning staying
-    // outside this transaction is exactly the same "don't hold the
-    // sequence row lock across a master-key wrap" reasoning
-    // `create_and_insert_external_event`'s own doc comment gives, doubly
-    // so here since this is the lock `submit_command`/`CommandBatcher`
-    // itself holds. `resolved` arrived already warmed up for
-    // `initial_decision`'s own payloads.
+    // `resolve_encryption_keys`'s own doc comment. `resolved` arrived
+    // already warmed up, before the lock, for `initial_decision`'s own
+    // payloads; what's left is only what a redispatch newly needs. That
+    // is provisioned here on `tx`, not the pool (docs/architecture.md
+    // §117): this transaction holds the bounded context's `sequence`
+    // lock, and every other writer to it waits on that lock holding a
+    // pooled connection.
     //
-    // Every distinct `(subject_key, subject_value)` subject the command's
-    // own payload and every accepted event's payload will need is
-    // gathered up front instead of resolved payload-by-payload -
-    // `sensitive_field_subjects` is pure and I/O-free, so collecting all
-    // of them first costs nothing. Deduped here (and against whatever
-    // `resolved` already carries) so the concurrent resolution below
-    // never double-provisions the same subject twice - the same
-    // guarantee `resolve_encryption_keys`'s own serial `contains_key`
-    // skip gave one payload at a time, just computed across every
-    // payload in this command in one pass instead of only within each
-    // call. Once deduped, every remaining subject is provably distinct,
-    // so - unlike resolving them one payload at a time - they're safe to
-    // resolve concurrently: what used to be N round trips serialized
-    // inside this same held lock becomes one concurrent batch of them.
+    // Every distinct `(subject_key, subject_value)` still needed is
+    // gathered up front and deduped (against itself and `resolved`), so
+    // no subject is provisioned twice.
     let mut needed_subjects: Vec<(String, String)> =
         crate::event_store::sensitive_field_subjects(&command_type.sensitive_fields, payload);
     for spec in &event_specs {
@@ -7602,19 +7596,15 @@ async fn finish_accepted_command_in_tx(
 
     if !needed_subjects.is_empty() {
         let master_key = encryption_master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
-        let provisioned = futures_util::future::try_join_all(needed_subjects.iter().map(
-            |(subject_key, subject_value)| {
-                get_or_create_encryption_key(
-                    pool,
-                    &bounded_context_name,
-                    subject_key,
-                    subject_value,
-                    master_key,
-                )
-            },
-        ))
-        .await?;
-        for (subject, provisioned) in needed_subjects.into_iter().zip(provisioned) {
+        for subject in needed_subjects {
+            let provisioned = get_or_create_encryption_key_on(
+                tx,
+                command_type.bounded_context.clone(),
+                &subject.0,
+                &subject.1,
+                master_key,
+            )
+            .await?;
             resolved.insert(subject, provisioned);
         }
     }
@@ -7711,7 +7701,6 @@ async fn finish_accepted_command_in_tx(
 #[allow(clippy::too_many_arguments)]
 async fn submit_one_command_in_tx(
     tx: &mut Transaction<'_, Postgres>,
-    pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     command_type: &CommandType,
@@ -7728,14 +7717,14 @@ async fn submit_one_command_in_tx(
     snapshot: Option<SnapshotContext<'_>>,
     idempotency_key: Option<&str>,
     locked_highest: i64,
-    sync_projections: &[Projection],
+    sync_projections: &[String],
     extra_committed_events: &[Event],
     event_types_by_name: std::collections::HashMap<String, EventType>,
     resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let decided = match decide_command_in_tx(
-        pool,
+        tx,
         dispatcher,
         command_type,
         payload,
@@ -7748,11 +7737,6 @@ async fn submit_one_command_in_tx(
         idempotency_key,
         locked_highest,
         extra_committed_events,
-        // This is `submit_command`'s own batch-of-one path - no other
-        // command shares `tx`'s lock hold, so there is never a same-batch
-        // idempotency key to find in memory; every real hit comes from
-        // `lookup_idempotency_key`'s own `pool` read.
-        &std::collections::HashMap::new(),
         event_types_by_name,
     )
     .await?
@@ -7778,7 +7762,6 @@ async fn submit_one_command_in_tx(
 
     finish_accepted_command_in_tx(
         tx,
-        pool,
         projection_dispatcher,
         command_type,
         payload,
@@ -7858,7 +7841,7 @@ pub struct CommandBatchLeaderTx {
     tx: Transaction<'static, Postgres>,
     bounded_context_name: String,
     locked_highest: i64,
-    sync_projections: Vec<Projection>,
+    sync_projections: Vec<String>,
 }
 
 /// The lock-acquiring half of [`submit_command_batch`], pulled out
@@ -7911,7 +7894,7 @@ pub async fn begin_command_batch_leader_tx(
         .await?;
     }
     let locked_highest = lock_bounded_context_sequence(&mut tx, bounded_context_name).await?;
-    let sync_projections = sync_projections_for_bounded_context(pool, bounded_context_name).await?;
+    let sync_projections = sync_projection_names(&mut tx, bounded_context_name).await?;
     Ok(CommandBatchLeaderTx {
         tx,
         bounded_context_name: bounded_context_name.to_string(),
@@ -8069,12 +8052,10 @@ impl SequencePool {
 ///
 /// `extra_committed_events` threading: `submit_one_command_in_tx`'s own
 /// DCB-conflict redispatch check needs to see events *this same batch*
-/// already produced, not just ones truly committed by some earlier,
-/// separate transaction - a plain `pool` query can't see them (they're
-/// uncommitted, on `tx`'s own connection, invisible to any other
-/// connection until `tx.commit()`), so this loop accumulates every
-/// accepted command's own `events` in memory as it goes and hands the
-/// running total to each subsequent command.
+/// already produced, not just ones committed before the lock. This loop
+/// accumulates every accepted command's own `events` in memory as it
+/// goes and hands the running total to each subsequent command, so the
+/// check needs no query of its own for them.
 ///
 /// Returns one [`BatchedCommandResult`] per input command, same order,
 /// only once `tx.commit()` has actually succeeded - nothing here is
@@ -8088,7 +8069,6 @@ impl SequencePool {
 #[tracing::instrument(skip_all, fields(batch_size = batch.len()))]
 pub async fn commit_command_batch(
     leader_tx: CommandBatchLeaderTx,
-    pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     encryption_master_key: Option<&EncryptionMasterKey>,
@@ -8134,28 +8114,18 @@ pub async fn commit_command_batch(
 
     let mut results = Vec::with_capacity(batch.len());
     let mut extra_committed_events: Vec<Event> = Vec::new();
-    // `decide_command_in_tx`'s own second in-memory accumulator, alongside
-    // `extra_committed_events` above - an earlier command in this same,
-    // still-uncommitted batch that claimed an idempotency key is only
-    // visible here, not to a `pool` read, until the whole batch commits.
-    // See `decide_command_in_tx`'s own doc comment for the full reasoning
-    // (mirrors `extra_committed_events` exactly). Keyed by
-    // `(command_type_name, client_id, idempotency_key)`.
-    let mut batch_idempotency_keys: std::collections::HashMap<(String, String, String), Vec<i64>> =
-        std::collections::HashMap::new();
     let mut sequence_pool = SequencePool::new();
     let batch_len = batch.len();
 
     for (idx, item) in batch.into_iter().enumerate() {
-        // `decide_command_in_tx` never touches `tx` at all - every read it
-        // does runs against `pool` or this loop's own in-memory
-        // accumulators (see its own doc comment) - so, unlike the sequence
-        // draw and `finish_accepted_command_in_tx` below, it needs no
-        // `SAVEPOINT` of its own: there is no `tx`-scoped statement here
-        // for one to isolate a DB error from.
+        // Not inside a `SAVEPOINT`: `decide_command_in_tx` only reads (on
+        // `tx`, since it runs under the batch's lock - docs/architecture.md
+        // §117), and a failing read means the connection itself is in
+        // trouble, which no savepoint would contain. A decider's own
+        // error is a Rust `Err`, not a statement, and stays per-command.
         let decide_started = std::time::Instant::now();
         let decide_result = decide_command_in_tx(
-            pool,
+            &mut tx,
             dispatcher,
             &item.command_type,
             &item.payload,
@@ -8171,7 +8141,6 @@ pub async fn commit_command_batch(
             item.idempotency_key.as_deref(),
             locked_highest,
             &extra_committed_events,
-            &batch_idempotency_keys,
             item.event_types_by_name,
         )
         .await;
@@ -8222,20 +8191,10 @@ pub async fn commit_command_batch(
             }
         };
 
-        // Captured before `finish_accepted_command_in_tx` below moves
-        // `item.resolved` out of `item` - needed afterward, once the
-        // command's own outcome is known, to record its idempotency key
-        // (if any) into `batch_idempotency_keys` for the next command's
-        // own `decide_command_in_tx` to see.
-        let command_type_name = item.command_type.name.clone();
-        let client_id = item.client_id.clone();
-        let idempotency_key = item.idempotency_key.clone();
-
         let persist_started = std::time::Instant::now();
         let mut nested = tx.begin().await?;
         let outcome = finish_accepted_command_in_tx(
             &mut nested,
-            pool,
             projection_dispatcher,
             &item.command_type,
             &item.payload,
@@ -8272,14 +8231,6 @@ pub async fn commit_command_batch(
                 sequence_pool.confirm_last_draw();
                 if let SubmitCommandOutcome::Accepted { ref events, .. } = outcome {
                     extra_committed_events.extend(events.iter().cloned());
-                    if let Some(key) = idempotency_key {
-                        let triggered_event_sequences: Vec<i64> =
-                            events.iter().map(|e| e.sequence).collect();
-                        batch_idempotency_keys.insert(
-                            (command_type_name, client_id, key),
-                            triggered_event_sequences,
-                        );
-                    }
                 }
                 results.push(Ok(outcome));
             }
@@ -8338,7 +8289,6 @@ pub async fn submit_command_batch(
     let leader_tx = begin_command_batch_leader_tx(pool, bounded_context_name, None).await?;
     commit_command_batch(
         leader_tx,
-        pool,
         dispatcher,
         projection_dispatcher,
         encryption_master_key,
@@ -11977,31 +11927,48 @@ pub async fn register_new_sync_projection(
 
     let mut tx = pool.begin().await?;
     let locked_highest = lock_bounded_context_sequence(&mut tx, bounded_context).await?;
-    // With the lock held no event can commit, so plain pool reads see
-    // the complete tail.
+    // With the lock held no event can commit, so this sees the complete
+    // tail. Read on `tx` itself: every writer to this bounded context now
+    // waits on the lock holding a pooled connection, so a second one might
+    // never come (docs/architecture.md §117).
+    let consumed_types: std::collections::HashMap<String, EventType> = projection
+        .consumed_event_types
+        .iter()
+        .map(|et| (et.name.clone(), et.clone()))
+        .collect();
+    let consumed_names: Vec<&str> = consumed_types.keys().map(String::as_str).collect();
+    let schema = schema_ident(bounded_context);
     let mut tail = Vec::new();
-    for event_type in &projection.consumed_event_types {
-        let mut after = folded_through.unwrap_or(-1);
-        loop {
-            let chunk = list_events_from_limited(
-                pool,
-                bounded_context,
-                &event_type.name,
-                after,
-                MAX_EVENTS_PER_CATCH_UP_TICK,
-            )
-            .await?;
-            let exhausted = (chunk.len() as i64) < MAX_EVENTS_PER_CATCH_UP_TICK;
-            if let Some(last) = chunk.last() {
-                after = last.sequence;
-            }
-            tail.extend(chunk);
-            if exhausted {
-                break;
-            }
+    let mut after = folded_through.unwrap_or(-1);
+    loop {
+        let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
+             metadata_client_id, metadata_created_at, metadata_correlation_id, \
+             metadata_causation_id, tags, origin_kind, origin_source_content, \
+             origin_source_context, origin_command_id FROM {schema}.events \
+             WHERE event_type_name = ANY($1) AND sequence > $2 ORDER BY sequence LIMIT $3"
+        )))
+        .bind(&consumed_names)
+        .bind(after)
+        .bind(MAX_EVENTS_PER_CATCH_UP_TICK)
+        .fetch_all(&mut *tx)
+        .await?;
+        let exhausted = (rows.len() as i64) < MAX_EVENTS_PER_CATCH_UP_TICK;
+        let chunk = events_from_rows(
+            &mut tx,
+            &projection.bounded_context,
+            rows,
+            Some(&consumed_types),
+        )
+        .await?;
+        if let Some(last) = chunk.last() {
+            after = last.sequence;
+        }
+        tail.extend(chunk);
+        if exhausted {
+            break;
         }
     }
-    tail.sort_by_key(|e| e.sequence);
 
     // Every event up to the locked sequence is accounted for once the
     // tail is folded. Left unset when nothing was ever folded, as a new

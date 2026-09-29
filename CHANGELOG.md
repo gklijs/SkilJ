@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `db::commit_command_batch` no longer takes a `pool` argument, and
+  `skilj_graphql::GraphqlState` gains `parked_delivery_retry_permits`
+  (breaking for direct callers) (docs/architecture.md §117).
+- `db::sync_projections_for_bounded_context` is replaced by
+  `db::sync_projection_names`, which runs on the caller's transaction and
+  returns names; `insert_event_and_update_sync_projections_in_tx` takes
+  `sync_projections: &[String]` (breaking for direct callers)
+  (docs/architecture.md §116).
 - `db::fire_due_deadlines` takes a `retry_policy` argument, and
   `ParkedDeliveryKind` (GraphQL `ParkedDeliveryKind`) gains `Deadline`
   (`DEADLINE`) - breaking for direct callers and for exhaustive matches
@@ -145,6 +153,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The rest of that stall (docs/architecture.md §117): a command's
+  idempotency-key lookup, DCB conflict check and newly needed
+  encryption keys, and a new sync projection's registration, now all run
+  on the transaction holding the lock. Cross-context route ticks, which
+  each hold a lock connection for the whole tick, are capped at half the
+  pool - with as many routes as connections, none used to fire.
+  Concurrent `retryParkedDelivery` calls wait for one of half the pool's
+  permits before taking their lock connection.
+- A lock holder no longer waits for a second pooled connection while
+  its competitors hold the rest. REST `consume` read events through the
+  pool while holding its per-token lock, and every event write read its
+  bounded context's sync projections through the pool while holding the
+  sequence lock; with as many concurrent consumers of a token, or writers
+  to a context, as the pool had connections, all of them stalled until
+  the acquire timeout and failed (docs/architecture.md §116).
 - A deadline whose command failed with an error - say a payload its
   command no longer accepts after a deploy - was re-fired every five
   minutes forever, never surfaced to an operator, and each failure

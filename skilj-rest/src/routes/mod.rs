@@ -833,82 +833,109 @@ async fn get_events_consume(
         }
     };
 
-    // Codeberg issue #25's investigation (docs/architecture.md §53) - the
-    // read and the write below share one transaction, guarded end to end
-    // by `lock_read_cursor_for_consume`'s own advisory lock, so a second
-    // concurrent request for the same token genuinely blocks here until
-    // the first commits, rather than both reading the same pre-claim
-    // snapshot the way a separate read-then-write each against a fresh
-    // pooled connection would let them - see that function's own doc
-    // comment for why a row lock alone wouldn't have closed this (a
-    // token's very first-ever call has no row yet to lock).
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(skilj_core::error::Error::from)?;
-    db::lock_read_cursor_for_consume(&mut tx, &token).await?;
-    let existing_cursor = db::get_read_cursor(&mut *tx, &token).await?;
+    // Codeberg issue #25's investigation (docs/architecture.md §53): the
+    // cursor is read and written in one transaction, guarded end to end by
+    // `lock_read_cursor_for_consume`'s advisory lock, so a second concurrent
+    // request for the same token blocks until the first commits rather than
+    // both claiming from the same snapshot - see that function's own doc
+    // comment for why a row lock alone wouldn't do (a token's very first
+    // call has no row yet to lock).
+    //
+    // The events themselves are read *before* that transaction begins,
+    // from where the cursor stood, and the cursor is checked again under
+    // the lock (docs/architecture.md §116). Reading them inside it would
+    // need a second pooled connection while holding the first, and every
+    // other consume of the token waits on the lock holding a connection of
+    // its own - so a pool's worth of consumers starved the holder until
+    // the acquire timeout failed them all. If the cursor moved meanwhile
+    // (another consume or ack committed), the read is redone from where it
+    // now stands.
     let bounded_context_name = &token.event_type.bounded_context.name;
-    // Where serving starts: the cursor, or for a new one its seed
-    // (`initial_consume_position`) - which for `Latest`/`AtTime` is the
-    // highest qualifying sequence in the whole history, found a chunk at
-    // a time rather than by loading all of it.
-    let position = match &existing_cursor {
-        Some(cursor) => cursor.sequence,
-        None => match token.start_from {
-            EventReadStartPosition::Latest | EventReadStartPosition::AtTime => {
-                let mut position = -1;
-                db::for_each_event_chunk(
-                    &state.pool,
-                    &state.event_cache,
-                    bounded_context_name,
-                    Some(&token.event_type.name),
-                    -1,
-                    state.max_events_per_read,
-                    |chunk| {
-                        position =
-                            position.max(event_store::initial_consume_position(&token, chunk));
-                        Ok(true)
-                    },
+    let mut expected = db::get_read_cursor(&state.pool, &token)
+        .await?
+        .map(|cursor| cursor.sequence);
+    let result = loop {
+        // Where serving starts: the cursor, or for a new one its seed
+        // (`initial_consume_position`) - which for `Latest`/`AtTime` is the
+        // highest qualifying sequence in the whole history, found a chunk
+        // at a time rather than by loading all of it.
+        let position = match expected {
+            Some(sequence) => sequence,
+            None => match token.start_from {
+                EventReadStartPosition::Latest | EventReadStartPosition::AtTime => {
+                    let mut position = -1;
+                    db::for_each_event_chunk(
+                        &state.pool,
+                        &state.event_cache,
+                        bounded_context_name,
+                        Some(&token.event_type.name),
+                        -1,
+                        state.max_events_per_read,
+                        |chunk| {
+                            position =
+                                position.max(event_store::initial_consume_position(&token, chunk));
+                            Ok(true)
+                        },
+                    )
+                    .await?;
+                    position
+                }
+                _ => event_store::initial_consume_position(&token, std::iter::empty()),
+            },
+        };
+        // The page after `position`: `fetch_events_page` applies exactly
+        // the filters `ConsumeEvents` serves by (type, `filters`, owner
+        // scope), and `consume_events_page` below re-applies them over this
+        // already bounded set along with the lease and cursor logic.
+        let candidates = db::collect_scanned_event_page(
+            &state.pool,
+            &state.event_cache,
+            bounded_context_name,
+            Some(&token.event_type.name),
+            position,
+            state.max_events_per_read,
+            |chunk, remaining| {
+                event_store::fetch_events_page(
+                    &token,
+                    chunk,
+                    &filters,
+                    Some(position),
+                    None,
+                    remaining,
                 )
-                .await?;
-                position
-            }
-            _ => event_store::initial_consume_position(&token, std::iter::empty()),
-        },
-    };
-    // The page after `position`: `fetch_events_page` applies exactly the
-    // filters `ConsumeEvents` serves by (type, `filters`, owner scope),
-    // and `consume_events_page` below re-applies them over this already
-    // bounded set along with the lease and cursor logic.
-    let candidates = db::collect_scanned_event_page(
-        &state.pool,
-        &state.event_cache,
-        bounded_context_name,
-        Some(&token.event_type.name),
-        position,
-        state.max_events_per_read,
-        |chunk, remaining| {
-            event_store::fetch_events_page(&token, chunk, &filters, Some(position), None, remaining)
-        },
-    )
-    .await?;
+            },
+        )
+        .await?;
 
-    let result = event_store::consume_events_page(
-        &token,
-        existing_cursor.as_ref(),
-        ack_mode,
-        position,
-        &candidates.events,
-        candidates.scanned_through,
-        &filters,
-        Utc::now(),
-        state.read_cursor_checkout_lease,
-        state.max_events_per_read,
-    )?;
-    db::apply_cursor_update(&mut *tx, &token, &result.cursor_update).await?;
-    tx.commit().await.map_err(skilj_core::error::Error::from)?;
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .map_err(skilj_core::error::Error::from)?;
+        db::lock_read_cursor_for_consume(&mut tx, &token).await?;
+        let existing_cursor = db::get_read_cursor(&mut *tx, &token).await?;
+        let current = existing_cursor.as_ref().map(|cursor| cursor.sequence);
+        if current != expected {
+            expected = current;
+            continue; // `tx` rolls back on drop, releasing the lock
+        }
+
+        let result = event_store::consume_events_page(
+            &token,
+            existing_cursor.as_ref(),
+            ack_mode,
+            position,
+            &candidates.events,
+            candidates.scanned_through,
+            &filters,
+            Utc::now(),
+            state.read_cursor_checkout_lease,
+            state.max_events_per_read,
+        )?;
+        db::apply_cursor_update(&mut *tx, &token, &result.cursor_update).await?;
+        tx.commit().await.map_err(skilj_core::error::Error::from)?;
+        break result;
+    };
 
     // See `get_events`' own identical comment above.
     let served: Vec<_> = result

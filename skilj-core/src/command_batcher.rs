@@ -157,11 +157,11 @@ impl CommandBatcher {
     }
 
     /// At most half the pool (minimum one) may be pinned by batch leaders
-    /// at once, so a leader's own further `pool` reads (and every other
-    /// caller's warm-up/optimistic resolve) can always still get a
-    /// connection - without this, enough concurrently-active bounded
-    /// contexts could leave every connection held by a leader that is
-    /// itself waiting on `pool.acquire()` (a pool-exhaustion stall).
+    /// at once, so every other caller's warm-up/optimistic resolve can
+    /// still get a connection while leaders hold theirs. A leader itself
+    /// needs no second connection under its lock - everything it reads
+    /// or provisions there runs on its own transaction
+    /// (docs/architecture.md §117).
     fn leader_permits(&self, pool: &Pool) -> Arc<Semaphore> {
         self.leader_permits
             .get_or_init(|| {
@@ -498,7 +498,6 @@ impl CommandBatcher {
                 Ok(leader_tx) => {
                     crate::db::commit_command_batch(
                         leader_tx,
-                        pool,
                         dispatcher,
                         projection_dispatcher,
                         encryption_master_key,

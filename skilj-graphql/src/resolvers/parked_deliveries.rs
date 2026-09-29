@@ -328,6 +328,13 @@ pub fn retry_parked_delivery_field() -> Field {
                 require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
                 let id = ctx.args.try_get("id")?.string()?.to_string();
 
+                // Taken before the lock's connection, and held until this
+                // resolver returns - see `parked_delivery_retry_permits`.
+                let _permit = state
+                    .parked_delivery_retry_permits
+                    .acquire()
+                    .await
+                    .expect("parked_delivery_retry_permits is never closed");
                 // Held until this resolver returns - see
                 // `try_lock_parked_delivery_for_retry`. The row is read
                 // only once the lock is ours, so a retry that lost a race

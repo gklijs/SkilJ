@@ -215,6 +215,20 @@ async fn setup() -> (
     RoleAccessMapping,
     skilj_core::event_store::CommandType,
 ) {
+    setup_with_pool(skilj_core::db::PgPoolOptions::new().max_connections(4)).await
+}
+
+/// [`setup`] with the `Skilj`'s own pool options chosen by the caller.
+async fn setup_with_pool(
+    pool_options: skilj_core::db::PgPoolOptions,
+) -> (
+    Skilj,
+    String,
+    Pool,
+    String,
+    RoleAccessMapping,
+    skilj_core::event_store::CommandType,
+) {
     let (database_url, pool) = test_db()
         .await
         .expect("test_db() must be Some - caller already checked");
@@ -260,7 +274,7 @@ async fn setup() -> (
     // 100 connections and the last `build()` fails with `PoolTimedOut`.
 
     let (skilj, report) = Skilj::builder(database_url)
-        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+        .pool_options(pool_options)
         .bounded_context(bc_name.clone())
         .event_type::<MoneyDeposited>()
         .command_type::<WithdrawMoney>()
@@ -288,6 +302,188 @@ async fn setup() -> (
 
     let credential = format!("{}.{}", token.id, token.secret);
     (skilj, credential, pool, bc_name, mapping, command_type)
+}
+
+/// Every write to a bounded context holds its `sequence` lock, and every
+/// other writer waits on that lock holding a pooled connection. A holder
+/// that then read through the pool - a write's sync projections (§116), a
+/// command batch leader's idempotency-key lookup (§117, forced here by
+/// giving every command a key) - could never get a connection once more
+/// writers waited than the pool had, and everything failed at the
+/// acquire timeout.
+#[test]
+fn commands_and_direct_writes_beyond_the_pool_size_all_complete() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, command_credential, pool, bc_name, mapping, _) = setup_with_pool(
+            skilj_core::db::PgPoolOptions::new()
+                .max_connections(3)
+                .acquire_timeout(std::time::Duration::from_secs(10)),
+        )
+        .await;
+        let event_type = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        let direct_token = access_control::create_direct_creation_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct_token)
+            .await
+            .unwrap();
+        let direct_credential = format!("{}.{}", direct_token.id, direct_token.secret);
+        let router = skilj.rest_router();
+
+        let requests = (0..48).map(|i| {
+            let router = router.clone();
+            let (uri, credential, status) = if i % 2 == 0 {
+                (
+                    "/v1/commands/trigger",
+                    command_credential.clone(),
+                    StatusCode::OK,
+                )
+            } else {
+                (
+                    "/v1/events/direct",
+                    direct_credential.clone(),
+                    StatusCode::CREATED,
+                )
+            };
+            async move {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json");
+                if status == StatusCode::OK {
+                    request = request.header("Idempotency-Key", format!("key-{i}"));
+                }
+                let request = request
+                    .body(Body::from(format!(r#"{{"payload":{{"amount":{i}}}}}"#)))
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                let actual = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(actual, status, "{uri}: {}", String::from_utf8_lossy(&body));
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            futures_util::future::join_all(requests),
+        )
+        .await
+        .expect("concurrent writes stalled on the connection pool");
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 48);
+    });
+}
+
+/// The deterministic form of the test above, for the command path. The
+/// bounded context's `sequence` lock is held from outside; a command with
+/// an idempotency key queues for it first, then two direct writes, each
+/// holding one of the pool's three connections. When the lock is released
+/// the command gets it and must look its key up. It used to do that
+/// through the pool - all three connections were taken, two of them by
+/// writers waiting behind it, so it waited out the acquire timeout and
+/// failed, and so did they (docs/architecture.md §117).
+#[test]
+fn a_command_holding_the_lock_needs_no_second_connection() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, command_credential, pool, bc_name, mapping, _) = setup_with_pool(
+            skilj_core::db::PgPoolOptions::new()
+                .max_connections(3)
+                .acquire_timeout(std::time::Duration::from_secs(5)),
+        )
+        .await;
+        let event_type = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        let direct_token = access_control::create_direct_creation_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct_token)
+            .await
+            .unwrap();
+        let direct_credential = format!("{}.{}", direct_token.id, direct_token.secret);
+        let router = skilj.rest_router();
+
+        let send = |uri: &'static str, credential: String, key: Option<&'static str>| {
+            let router = router.clone();
+            tokio::spawn(async move {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json");
+                if let Some(key) = key {
+                    request = request.header("Idempotency-Key", key);
+                }
+                let request = request
+                    .body(Body::from(r#"{"payload":{"amount":5}}"#))
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            })
+        };
+
+        // The test's own pool, not the `Skilj`'s.
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT next_value FROM \"bc_{bc_name}\".sequence FOR UPDATE"
+        )))
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+        let command = send(
+            "/v1/commands/trigger",
+            command_credential,
+            Some("only-once"),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let writes = [
+            send("/v1/events/direct", direct_credential.clone(), None),
+            send("/v1/events/direct", direct_credential, None),
+        ];
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        blocker.commit().await.unwrap();
+
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(4), command)
+            .await
+            .expect("the command stalled waiting for a second pooled connection")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for write in writes {
+            let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(4), write)
+                .await
+                .expect("a direct write stalled behind the command")
+                .unwrap();
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+    });
 }
 
 #[test]

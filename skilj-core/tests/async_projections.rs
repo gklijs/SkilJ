@@ -350,9 +350,7 @@ async fn insert_event_via_the_locked_path(
     let mut tx = pool.begin().await.unwrap();
     let seq = db::next_sequence(&mut *tx, &bc.name).await.unwrap();
     let e = event(bc, et, seq, amount);
-    let sync_projections = db::sync_projections_for_bounded_context(pool, &bc.name)
-        .await
-        .unwrap();
+    let sync_projections = db::sync_projection_names(&mut tx, &bc.name).await.unwrap();
     db::insert_event_and_update_sync_projections_in_tx(
         &mut tx,
         &e,
@@ -1363,5 +1361,87 @@ fn registering_a_sync_projection_with_no_history_misses_no_concurrent_event() {
             .await
             .unwrap();
         assert_eq!(state, Some("20".to_string()));
+    });
+}
+
+/// Registering a sync projection folds, under its bounded context's
+/// `sequence` lock, whatever landed since its history fold - here two
+/// events, since the caller found none. Every writer to the bounded
+/// context waits on that lock holding a pooled connection. With the lock
+/// held from outside, the registration queues first and two writers
+/// behind it, filling a 3-connection pool; once the lock is released the
+/// registration must read that tail on the connection it has. It used to
+/// read it through the pool, which had none left, and everything waited
+/// out the acquire timeout (docs/architecture.md §117).
+#[test]
+fn registering_a_sync_projection_needs_no_second_connection_under_the_lock() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        insert_event_via_the_locked_path(&pool, &bc, &et, 1).await;
+        insert_event_via_the_locked_path(&pool, &bc, &et, 1).await;
+        let small = db::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: "AccountBalance".to_string(),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: vec![et.clone()],
+            sync: true,
+            caught_up_to: None,
+        };
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT next_value FROM \"bc_{}\".sequence FOR UPDATE",
+            bc.name
+        )))
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+        let registration = tokio::spawn({
+            let small = small.clone();
+            let projection = projection.clone();
+            async move { db::create_projection(&small, &projection, false, &TestDispatcher).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let writers: Vec<_> = (0..2)
+            .map(|_| {
+                let small = small.clone();
+                let bc = bc.clone();
+                let et = et.clone();
+                tokio::spawn(async move {
+                    insert_event_via_the_locked_path(&small, &bc, &et, 1).await;
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        blocker.commit().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(4), registration)
+            .await
+            .expect("the registration stalled waiting for a second pooled connection")
+            .unwrap()
+            .unwrap();
+        for writer in writers {
+            tokio::time::timeout(std::time::Duration::from_secs(4), writer)
+                .await
+                .expect("a writer stalled behind the registration")
+                .unwrap();
+        }
+
+        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+            .await
+            .unwrap();
+        assert_eq!(state, Some("4".to_string()));
     });
 }

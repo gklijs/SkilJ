@@ -1458,3 +1458,123 @@ fn a_parked_deadline_is_listed_and_redriven_under_its_own_key() {
             .is_empty());
     });
 }
+
+/// Each `retryParkedDelivery` holds its per-row lock on a connection of
+/// its own while the redrive needs more. An operator retrying a backlog in
+/// parallel - six at once here, on a 3-connection pool - used to fill the
+/// pool with lock connections that each waited for one more, until the
+/// acquire timeout failed them all (docs/architecture.md §117).
+#[test]
+fn more_concurrent_retries_than_pool_connections_all_complete() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = db::connect(&database_url).await.unwrap();
+        let admin_subject = unique_name("admin");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let bc_name = unique_name("deposits");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role,
+                bounded_context: bc,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(
+                db::PgPoolOptions::new()
+                    .max_connections(3)
+                    .acquire_timeout(std::time::Duration::from_secs(5)),
+            )
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<Deposited>()
+            .command_type::<Deposit>()
+            .reconciliation_role(admin_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let jwt = sign_jwt(&admin_subject);
+
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let parked = db::insert_parked_delivery(
+                &pool,
+                &bc_name,
+                "deadline:settle",
+                db::ParkedDeliveryKind::Deadline,
+                &format!("deadline-{i}"),
+                None,
+                Some(&bc_name),
+                Some("Deposit"),
+                &json!({ "amount": i }),
+                "target unavailable",
+                5,
+                test_now(),
+                test_now(),
+            )
+            .await
+            .unwrap();
+            ids.push(parked.id);
+        }
+
+        let retries = ids.into_iter().map(|id| {
+            let (router, jwt, bc_name) = (router.clone(), jwt.clone(), bc_name.clone());
+            async move {
+                graphql_request(
+                    &router,
+                    Some(&jwt),
+                    "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+                    json!({ "bc": bc_name, "id": id }),
+                )
+                .await
+            }
+        });
+        let responses = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            futures_util::future::join_all(retries),
+        )
+        .await
+        .expect("concurrent retries stalled on the connection pool");
+        for response in &responses {
+            assert!(response.get("errors").is_none(), "{response:?}");
+        }
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 6);
+    });
+}

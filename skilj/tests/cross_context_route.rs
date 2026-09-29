@@ -1185,3 +1185,211 @@ fn at_sequence_and_at_time_routes_replay_from_their_own_chosen_cutoffs() {
         assert_eq!(at_time_state, Some(r#"{"total":112}"#.to_string()));
     });
 }
+
+// --- more routes than pool connections (docs/architecture.md §117) ---
+
+const POOL_SOURCE_BOUNDED_CONTEXT: &str = "skilj_cross_context_route_test_pool_source";
+const POOL_TARGET_BOUNDED_CONTEXT: &str = "skilj_cross_context_route_test_pool_target";
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct TicketSoldPayload {
+    ticket: String,
+}
+
+struct TicketSold;
+
+impl EventType for TicketSold {
+    type Payload = TicketSoldPayload;
+    const NAME: &'static str = "TicketSold";
+    const BOUNDED_CONTEXT: &'static str = POOL_SOURCE_BOUNDED_CONTEXT;
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct SeatHeldPayload {
+    route: String,
+}
+
+struct SeatHeld;
+
+impl EventType for SeatHeld {
+    type Payload = SeatHeldPayload;
+    const NAME: &'static str = "SeatHeld";
+    const BOUNDED_CONTEXT: &'static str = POOL_TARGET_BOUNDED_CONTEXT;
+}
+
+enum SeatEvent {}
+
+impl BoundedContextEvent for SeatEvent {
+    fn try_from_event(
+        _event: &skilj_core::event_store::Event,
+    ) -> Option<Result<Self, serde_json::Error>> {
+        None
+    }
+}
+
+struct HoldSeat;
+
+impl CommandType for HoldSeat {
+    type Payload = SeatHeldPayload;
+    type Event = SeatEvent;
+    const NAME: &'static str = "HoldSeat";
+    const BOUNDED_CONTEXT: &'static str = POOL_TARGET_BOUNDED_CONTEXT;
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "SeatHeld".to_string(),
+                payload: serde_json::json!({ "route": payload.route }),
+            }],
+        }
+    }
+}
+
+macro_rules! seat_routes {
+    ($($route:ident),*) => {$(
+        struct $route;
+
+        impl CrossContextRoute for $route {
+            type Source = TicketSold;
+            type Target = HoldSeat;
+            const NAME: &'static str = stringify!($route);
+            fn route(_source_payload: &TicketSoldPayload) -> Option<SeatHeldPayload> {
+                Some(SeatHeldPayload {
+                    route: stringify!($route).to_string(),
+                })
+            }
+        }
+    )*};
+}
+
+seat_routes!(SeatRouteA, SeatRouteB, SeatRouteC, SeatRouteD);
+
+/// Each route tick holds its advisory lock on a dedicated connection for
+/// the whole tick, and its work needs connections of its own. Up to 16
+/// ticks ran at once, so with as many routes as the pool had connections,
+/// every connection was a tick's lock waiting for a second one: no route
+/// ever fired, and the pool starved everything else too. Here four routes
+/// share a 3-connection pool and must all fire.
+#[test]
+fn more_routes_than_pool_connections_all_fire() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let mut source_mapping = None;
+        for name in [POOL_SOURCE_BOUNDED_CONTEXT, POOL_TARGET_BOUNDED_CONTEXT] {
+            let bc = BoundedContext {
+                name: name.to_string(),
+                status: BoundedContextStatus::Active,
+                created_at: test_now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            };
+            db::insert_bounded_context(&pool, &bc).await.unwrap();
+            let mapping = RoleAccessMapping {
+                role: role.clone(),
+                bounded_context: bc,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            };
+            db::insert_role_access_mapping(&pool, &mapping)
+                .await
+                .unwrap();
+            source_mapping.get_or_insert(mapping);
+        }
+
+        let (skilj, report) = Skilj::builder(database_url)
+            .pool_options(
+                skilj_core::db::PgPoolOptions::new()
+                    .max_connections(3)
+                    .acquire_timeout(std::time::Duration::from_secs(5)),
+            )
+            .bounded_context(POOL_SOURCE_BOUNDED_CONTEXT)
+            .event_type::<TicketSold>()
+            .bounded_context(POOL_TARGET_BOUNDED_CONTEXT)
+            .event_type::<SeatHeld>()
+            .command_type::<HoldSeat>()
+            .cross_context_route::<SeatRouteA>()
+            .cross_context_route::<SeatRouteB>()
+            .cross_context_route::<SeatRouteC>()
+            .cross_context_route::<SeatRouteD>()
+            .cross_context_route_poll_interval(std::time::Duration::from_millis(50))
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let event_type = db::get_event_type(&pool, POOL_SOURCE_BOUNDED_CONTEXT, "TicketSold")
+            .await
+            .unwrap()
+            .unwrap();
+        let direct_token = access_control::create_direct_creation_token(
+            source_mapping.as_ref().unwrap(),
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct_token)
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/direct")
+            .header(
+                "authorization",
+                format!("Bearer {}.{}", direct_token.id, direct_token.secret),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"payload":{"ticket":"t-1"}}"#))
+            .unwrap();
+        let response = skilj.rest_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let mut routed = Vec::new();
+        for _ in 0..120 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            routed = db::list_events_for_bounded_context(&pool, POOL_TARGET_BOUNDED_CONTEXT)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| {
+                    serde_json::from_str::<serde_json::Value>(&e.payload).unwrap()["route"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            if routed.len() == 4 {
+                break;
+            }
+        }
+        routed.sort();
+        assert_eq!(
+            routed,
+            ["SeatRouteA", "SeatRouteB", "SeatRouteC", "SeatRouteD"],
+            "every route must fire within 6 s"
+        );
+    });
+}

@@ -106,6 +106,11 @@ fn test_now() -> chrono::DateTime<Utc> {
 /// Builds a fully reconciled `Skilj` plus real, minted
 /// `DirectCreationToken`/`EventReadToken` credentials for `MoneyDeposited`.
 async fn setup() -> (Skilj, String, String) {
+    setup_with_pool(skilj_core::db::PgPoolOptions::new().max_connections(4)).await
+}
+
+/// [`setup`] with the `Skilj`'s own pool options chosen by the caller.
+async fn setup_with_pool(pool_options: skilj_core::db::PgPoolOptions) -> (Skilj, String, String) {
     let database_url = test_db()
         .await
         .expect("test_db() must be Some - caller already checked");
@@ -152,7 +157,7 @@ async fn setup() -> (Skilj, String, String) {
     // 100 connections and the last `build()` fails with `PoolTimedOut`.
 
     let (skilj, report) = Skilj::builder(database_url)
-        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+        .pool_options(pool_options)
         .bounded_context(bc_name.clone())
         .event_type::<MoneyDeposited>()
         .reconciliation_role(external_subject)
@@ -967,6 +972,107 @@ fn two_concurrent_manual_consumes_never_both_serve_the_same_batch() {
              deposit, never both (double-publish) and never neither (lost delivery): \
              a={count_a} b={count_b}"
         );
+    });
+}
+
+/// A consume holds its transaction's connection for the per-token lock.
+/// Every concurrent consume of the same token waits on that lock holding a
+/// connection too, so if the holder then needed a *second* pooled
+/// connection to read events, a pool's worth of consumers would starve it
+/// until the acquire timeout, and every one of them failed
+/// (docs/architecture.md §116). Here more consumers than the pool has
+/// connections all get an answer, well before the acquire timeout.
+#[test]
+fn more_concurrent_consumes_than_pool_connections_all_complete() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup_with_pool(
+            skilj_core::db::PgPoolOptions::new()
+                .max_connections(3)
+                .acquire_timeout(std::time::Duration::from_secs(10)),
+        )
+        .await;
+        let router = skilj.rest_router();
+        for amount in 1..=3 {
+            deposit(&router, &direct_credential, amount).await;
+        }
+
+        let consumes = (0..8).map(|_| {
+            let router = router.clone();
+            let credential = read_credential.clone();
+            async move {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri("/v1/events/consume?mode=auto")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        });
+        let started = std::time::Instant::now();
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            futures_util::future::join_all(consumes),
+        )
+        .await
+        .expect("concurrent consumes stalled on the connection pool");
+        for (status, body) in &results {
+            assert_eq!(*status, StatusCode::OK, "{body}");
+        }
+        let served: usize = results
+            .iter()
+            .map(|(_, body)| {
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["events"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert_eq!(served, 3, "auto mode serves each event exactly once");
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    });
+}
+
+/// The write side of the same starvation: every event write takes its
+/// bounded context's sequence lock inside a transaction, and each
+/// concurrent writer waits on that lock holding a connection. The holder
+/// must finish on the connection it has (docs/architecture.md §116).
+#[test]
+fn more_concurrent_writes_than_pool_connections_all_complete() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup_with_pool(
+            skilj_core::db::PgPoolOptions::new()
+                .max_connections(3)
+                .acquire_timeout(std::time::Duration::from_secs(10)),
+        )
+        .await;
+        let router = skilj.rest_router();
+
+        let writes = (1..=8).map(|amount| {
+            let router = router.clone();
+            let credential = direct_credential.clone();
+            async move { deposit(&router, &credential, amount).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            futures_util::future::join_all(writes),
+        )
+        .await
+        .expect("concurrent writes stalled on the connection pool");
+
+        let page = get_json(&router, &read_credential, "/v1/events").await;
+        let mut served = amounts(&page);
+        served.sort();
+        assert_eq!(served, (1..=8).collect::<Vec<_>>());
     });
 }
 
