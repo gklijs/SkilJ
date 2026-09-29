@@ -407,6 +407,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A JWT whose `nbf` (not before) claim is still in the future is now
+  refused. `jsonwebtoken` skips that check unless asked, so a token
+  issued to become valid later was accepted immediately. A token with no
+  `nbf` is unaffected; the check allows the same clock leeway as `exp`
+  (docs/architecture.md §111).
 - The superadmin bootstrap secret didn't end at its first claim: each
   process kept it in memory and only refused it while an active
   superadmin existed, so after every superadmin was revoked the

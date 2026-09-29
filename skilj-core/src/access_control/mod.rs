@@ -764,9 +764,9 @@ impl JwksCache {
 /// JWKS via `cache` as needed), then step 2, pulling out - and trusting -
 /// only `config.subject_claim`. Everything else in the JWT's claims is
 /// read by nobody: `jsonwebtoken::decode` verifies the signature,
-/// `issuer`, audience and algorithm, but claims are decoded into a generic JSON map
-/// rather than a fixed struct, since `subject_claim` is configurable
-/// rather than always `"sub"`.
+/// `issuer`, audience, algorithm, `exp` and `nbf`, but claims are
+/// decoded into a generic JSON map rather than a fixed struct, since
+/// `subject_claim` is configurable rather than always `"sub"`.
 ///
 /// Genuine I/O (JWKS fetch on a cache miss), so - unlike every function
 /// above in this module - not a pure function `skilj-core`'s own test
@@ -799,6 +799,10 @@ pub async fn verify_and_extract_subject(
     // application (docs/architecture.md §81).
     validation.set_audience(&config.audiences);
     validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    // `nbf` is optional, but when a token carries one it isn't valid
+    // before then (RFC 7519 §4.1.5). `jsonwebtoken` skips the check by
+    // default; it uses the same leeway as `exp` (docs/architecture.md §111).
+    validation.validate_nbf = true;
 
     let token_data = jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
         jwt,
