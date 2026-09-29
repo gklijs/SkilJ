@@ -1264,3 +1264,104 @@ fn a_cold_start_catch_up_over_a_long_history_spans_ticks() {
         );
     });
 }
+
+/// docs/architecture.md §113: registering a brand-new sync projection
+/// while live writes keep committing. It used to be stored as sync and
+/// then have its history folded: a write landing before the fold reached
+/// the key created the key's row at the new event's sequence, and the
+/// fold's `as_of_sequence` guard then skipped every earlier event - the
+/// history silently lost. Now it's stored async while its history is
+/// folded, and becomes sync under the sequence lock after the tail.
+/// However the writes interleave, every event is folded exactly once.
+#[test]
+fn registering_a_sync_projection_during_live_writes_folds_every_event_once() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        for _ in 0..300 {
+            insert_plain_event(&pool, &bc, &et, 1).await;
+        }
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: "AccountBalance".to_string(),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: vec![et.clone()],
+            sync: true,
+            caught_up_to: None,
+        };
+
+        let writes = async {
+            for _ in 0..50 {
+                insert_event_via_the_locked_path(&pool, &bc, &et, 1).await;
+                tokio::task::yield_now().await;
+            }
+        };
+        let (registered, ()) = tokio::join!(
+            db::create_projection(&pool, &projection, true, &TestDispatcher),
+            writes,
+        );
+        let registered = registered.unwrap();
+        assert!(registered.sync);
+        // Any write still to come folds live.
+        insert_event_via_the_locked_path(&pool, &bc, &et, 1).await;
+
+        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+            .await
+            .unwrap();
+        assert_eq!(state, Some("351".to_string()));
+        let stored = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.sync);
+        assert_eq!(
+            stored.caught_up_to,
+            db::latest_sequence(&pool, &bc.name).await.unwrap()
+        );
+    });
+}
+
+/// §113's other race: a brand-new sync projection with no history yet
+/// (nothing to fold) registered while matching events commit. A write
+/// that read the projection list before the row appeared used to commit
+/// an event the projection never saw.
+#[test]
+fn registering_a_sync_projection_with_no_history_misses_no_concurrent_event() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        let projection = Projection {
+            bounded_context: bc.clone(),
+            name: "AccountBalance".to_string(),
+            schema: r#"{"properties":{}}"#.to_string(),
+            schema_version: 1,
+            consumed_event_types: vec![et.clone()],
+            sync: true,
+            caught_up_to: None,
+        };
+        // As the caller found it: no matching event yet, so no fold.
+        let writes = async {
+            for _ in 0..20 {
+                insert_event_via_the_locked_path(&pool, &bc, &et, 1).await;
+                tokio::task::yield_now().await;
+            }
+        };
+        let (registered, ()) = tokio::join!(
+            db::create_projection(&pool, &projection, false, &TestDispatcher),
+            writes,
+        );
+        registered.unwrap();
+
+        let state = db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+            .await
+            .unwrap();
+        assert_eq!(state, Some("20".to_string()));
+    });
+}

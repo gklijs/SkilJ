@@ -3891,8 +3891,20 @@ const PROJECTION_COLUMNS: &str = "name, schema, schema_version, sync, caught_up_
 /// own `DELETE`/`INSERT` pair until the first has committed.
 #[tracing::instrument(skip_all)]
 pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::error::Result<()> {
-    let schema = schema_ident(&projection.bounded_context.name);
     let mut tx = pool.begin().await?;
+    upsert_projection_in_tx(&mut tx, projection).await?;
+    tx.commit().await?;
+    notify_registration_changed(pool).await;
+    Ok(())
+}
+
+/// [`upsert_projection`] inside the caller's transaction, without the
+/// commit or the registration-changed notification.
+async fn upsert_projection_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    projection: &Projection,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(&projection.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.projections ({PROJECTION_COLUMNS}) \
          VALUES ($1,$2,$3,$4,$5) \
@@ -3905,19 +3917,16 @@ pub async fn upsert_projection(pool: &Pool, projection: &Projection) -> crate::e
     .bind(projection.schema_version)
     .bind(projection.sync)
     .bind(projection.caught_up_to)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     replace_consumed_event_types(
-        &mut tx,
+        tx,
         &projection.bounded_context.name,
         "projection_consumed_event_types",
         &projection.name,
         &projection.consumed_event_types,
     )
-    .await?;
-    tx.commit().await?;
-    notify_registration_changed(pool).await;
-    Ok(())
+    .await
 }
 
 /// Get-or-create-with-lock for one projection instance's own
@@ -10660,8 +10669,11 @@ pub async fn catch_up_bounded_context(
                 .await?;
             }
 
+            // Never backwards: another instance's concurrent catch-up
+            // may already have moved it further (docs/architecture.md §113).
             sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
+                "UPDATE {schema}.projections SET caught_up_to = $1 \
+                 WHERE name = $2 AND (caught_up_to IS NULL OR caught_up_to < $1)"
             )))
             .bind(event.sequence)
             .bind(&projection.name)
@@ -10734,7 +10746,8 @@ pub async fn catch_up_bounded_context(
             // `None` until it is promoted or discarded.
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.projection_rebuilds SET caught_up_to = $1 \
-                 WHERE projection_name = $2 AND status = 'building'"
+                 WHERE projection_name = $2 AND status = 'building' \
+                 AND (caught_up_to IS NULL OR caught_up_to < $1)"
             )))
             .bind(event.sequence)
             .bind(&rebuild.projection.name)
@@ -11634,7 +11647,6 @@ pub async fn fold_history_into_new_sync_projection(
     dispatcher: &dyn crate::plugin::ProjectionDispatcher,
 ) -> crate::error::Result<Projection> {
     let bounded_context = &projection.bounded_context.name;
-    let schema = schema_ident(bounded_context);
     let default_state_json = dispatcher
         .default_state(bounded_context, &projection.name)
         .unwrap_or_default();
@@ -11660,66 +11672,15 @@ pub async fn fold_history_into_new_sync_projection(
         }
         for event in &events {
             let mut tx = pool.begin().await?;
-
-            let keys = dispatcher
-                .keys(bounded_context, &projection.name, event)
-                .unwrap_or_default();
-            for key in &keys {
-                // `as_of_sequence` guard - see `catch_up_bounded_context`'s
-                // identical comment. This function's own race is different in
-                // shape (two instances both reconciling the *same brand-new*
-                // registration concurrently - `register_projection`'s own
-                // `existing = None` read-then-decide has no claim mechanism,
-                // so both would call this function at once) but the same
-                // per-row fix closes it: whichever instance's transaction
-                // commits a key's row first, the other's own `RETURNING`
-                // here sees `as_of_sequence` already at `event.sequence` and
-                // skips instead of folding again.
-                let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
-                    &mut *tx,
-                    &schema,
-                    &projection.name,
-                    key,
-                    &default_state_json,
-                )
-                .await?;
-                if as_of_sequence >= event.sequence {
-                    continue;
-                }
-
-                let new_state = match dispatcher.project(
-                    bounded_context,
-                    &projection.name,
-                    &current_state,
-                    event,
-                    key,
-                ) {
-                    Some(result) => result?,
-                    None => current_state,
-                };
-
-                apply_projection_fold_update(
-                    &mut *tx,
-                    &schema,
-                    "projection_state",
-                    "",
-                    &projection.name,
-                    key,
-                    &new_state,
-                    owner_tag_key,
-                    event,
-                )
-                .await?;
-            }
-
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
-            )))
-            .bind(event.sequence)
-            .bind(&projection.name)
-            .execute(&mut *tx)
+            fold_event_into_new_projection(
+                &mut tx,
+                projection,
+                event,
+                dispatcher,
+                &default_state_json,
+                owner_tag_key,
+            )
             .await?;
-
             tx.commit().await?;
             caught_up_to = Some(event.sequence);
         }
@@ -11732,6 +11693,205 @@ pub async fn fold_history_into_new_sync_projection(
         caught_up_to,
         ..projection.clone()
     })
+}
+
+/// Folds one event into a projection being brought up to date by
+/// [`fold_history_into_new_sync_projection`] or
+/// [`register_new_sync_projection`]'s locked tail, inside the caller's
+/// transaction, and advances its `caught_up_to` (never backwards).
+async fn fold_event_into_new_projection(
+    tx: &mut Transaction<'_, Postgres>,
+    projection: &Projection,
+    event: &Event,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    default_state_json: &str,
+    owner_tag_key: Option<&str>,
+) -> crate::error::Result<()> {
+    let bounded_context = &projection.bounded_context.name;
+    let schema = schema_ident(bounded_context);
+    let keys = dispatcher
+        .keys(bounded_context, &projection.name, event)
+        .unwrap_or_default();
+    for key in &keys {
+        // `as_of_sequence` guard - see `catch_up_bounded_context`'s
+        // identical comment. Two instances both registering the same
+        // brand-new projection (`register_projection`'s `existing = None`
+        // read-then-decide has no claim mechanism) fold the same history
+        // at once: whichever commits a key's row first, the other's own
+        // `RETURNING` here sees `as_of_sequence` already at
+        // `event.sequence` and skips instead of folding again.
+        let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
+            &mut **tx,
+            &schema,
+            &projection.name,
+            key,
+            default_state_json,
+        )
+        .await?;
+        if as_of_sequence >= event.sequence {
+            continue;
+        }
+
+        let new_state = match dispatcher.project(
+            bounded_context,
+            &projection.name,
+            &current_state,
+            event,
+            key,
+        ) {
+            Some(result) => result?,
+            None => current_state,
+        };
+
+        apply_projection_fold_update(
+            &mut **tx,
+            &schema,
+            "projection_state",
+            "",
+            &projection.name,
+            key,
+            &new_state,
+            owner_tag_key,
+            event,
+        )
+        .await?;
+    }
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.projections SET caught_up_to = $1 \
+         WHERE name = $2 AND (caught_up_to IS NULL OR caught_up_to < $1)"
+    )))
+    .bind(event.sequence)
+    .bind(&projection.name)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Persists a `ProjectionRegistration::Created` - every caller's one
+/// entry point for it. An async projection is just stored:
+/// `catch_up_bounded_context` backfills it. A sync one goes through
+/// [`register_new_sync_projection`].
+pub async fn create_projection(
+    pool: &Pool,
+    projection: &Projection,
+    needs_history_fold: bool,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+) -> crate::error::Result<Projection> {
+    if !projection.sync {
+        upsert_projection(pool, projection).await?;
+        return Ok(projection.clone());
+    }
+    register_new_sync_projection(pool, projection, needs_history_fold, dispatcher).await
+}
+
+/// Registers a brand-new sync projection so that no event is folded out
+/// of order or missed (docs/architecture.md §113).
+///
+/// Live writes fold every event into each *sync* projection they find
+/// once they hold the bounded context's sequence lock. Storing the
+/// projection as sync and then folding its history left two races:
+///
+/// - a write landing before the history fold reached a key created that
+///   key's row at the new event's sequence, and the fold's
+///   `as_of_sequence` guard then skipped every earlier event for it - the
+///   key's history silently lost;
+/// - a write that had already read the projection list before the row
+///   appeared committed a matching event the projection never saw.
+///
+/// So when there is history to fold, the projection is first stored as
+/// *async* - which live writes ignore - and its history folded without
+/// holding any lock, one event per transaction as before. Then one
+/// transaction takes the sequence lock (the one `promote_projection_rebuild`
+/// takes for the same reason), folds the consumed-type events committed
+/// since, and stores the projection as sync. Every event at or below the
+/// locked sequence is folded by then, and every later write sees the
+/// projection. With no history to fold, only that locked step runs; its
+/// tail is whatever matching event slipped in after the caller's history
+/// check - normally nothing.
+pub async fn register_new_sync_projection(
+    pool: &Pool,
+    projection: &Projection,
+    needs_history_fold: bool,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+) -> crate::error::Result<Projection> {
+    let bounded_context = &projection.bounded_context.name;
+    let mut folded_through = None;
+    if needs_history_fold {
+        let hidden = Projection {
+            sync: false,
+            caught_up_to: None,
+            ..projection.clone()
+        };
+        upsert_projection(pool, &hidden).await?;
+        folded_through = fold_history_into_new_sync_projection(pool, &hidden, dispatcher)
+            .await?
+            .caught_up_to;
+    }
+
+    let default_state_json = dispatcher
+        .default_state(bounded_context, &projection.name)
+        .unwrap_or_default();
+    let owner_tag_key = dispatcher
+        .owner_tag_key(bounded_context, &projection.name)
+        .flatten();
+
+    let mut tx = pool.begin().await?;
+    let locked_highest = lock_bounded_context_sequence(&mut tx, bounded_context).await?;
+    // With the lock held no event can commit, so plain pool reads see
+    // the complete tail.
+    let mut tail = Vec::new();
+    for event_type in &projection.consumed_event_types {
+        let mut after = folded_through.unwrap_or(-1);
+        loop {
+            let chunk = list_events_from_limited(
+                pool,
+                bounded_context,
+                &event_type.name,
+                after,
+                MAX_EVENTS_PER_CATCH_UP_TICK,
+            )
+            .await?;
+            let exhausted = (chunk.len() as i64) < MAX_EVENTS_PER_CATCH_UP_TICK;
+            if let Some(last) = chunk.last() {
+                after = last.sequence;
+            }
+            tail.extend(chunk);
+            if exhausted {
+                break;
+            }
+        }
+    }
+    tail.sort_by_key(|e| e.sequence);
+
+    // Every event up to the locked sequence is accounted for once the
+    // tail is folded. Left unset when nothing was ever folded, as a new
+    // projection with no history always was.
+    let stored = Projection {
+        sync: true,
+        caught_up_to: (folded_through.is_some() || !tail.is_empty() || needs_history_fold)
+            .then_some(locked_highest),
+        ..projection.clone()
+    };
+    if !needs_history_fold {
+        // The row doesn't exist yet, and `projection_state` rows need it.
+        upsert_projection_in_tx(&mut tx, &stored).await?;
+    }
+    for event in &tail {
+        fold_event_into_new_projection(
+            &mut tx,
+            &stored,
+            event,
+            dispatcher,
+            &default_state_json,
+            owner_tag_key,
+        )
+        .await?;
+    }
+    upsert_projection_in_tx(&mut tx, &stored).await?;
+    tx.commit().await?;
+    notify_registration_changed(pool).await;
+    Ok(stored)
 }
 
 /// Promotes a `building` `ProjectionRebuild` that has caught up to its

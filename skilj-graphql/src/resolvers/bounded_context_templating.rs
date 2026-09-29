@@ -181,18 +181,15 @@ async fn apply_template_registrations(
                 projection,
                 needs_history_fold,
             } => {
-                skilj_core::db::upsert_projection(pool, &projection)
-                    .await
-                    .map_err(to_graphql_error)?;
-                if needs_history_fold {
-                    skilj_core::db::fold_history_into_new_sync_projection(
-                        pool,
-                        &projection,
-                        projection_dispatcher,
-                    )
-                    .await
-                    .map_err(to_graphql_error)?;
-                }
+                // docs/architecture.md §113.
+                skilj_core::db::create_projection(
+                    pool,
+                    &projection,
+                    needs_history_fold,
+                    projection_dispatcher,
+                )
+                .await
+                .map_err(to_graphql_error)?;
             }
             ProjectionRegistration::ReconciledTrivially(projection) => {
                 skilj_core::db::upsert_projection(pool, &projection)

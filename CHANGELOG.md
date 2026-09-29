@@ -136,6 +136,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Registering a new sync projection while writes were committing could
+  silently lose history. The projection was stored as sync and its
+  history folded afterwards; a write landing first created a key's
+  state at the new event, and the fold then skipped every earlier event
+  for that key. A projection with no history yet could likewise miss a
+  matching event committed as it was registered. New sync projections
+  are now backfilled while hidden from writers and made sync under the
+  bounded context's sequence lock, so every event is folded exactly
+  once. Affects startup reconciliation, the `registerProjection`
+  mutation and template instantiation (`db::create_projection`). Async
+  projections' `caught_up_to` also no longer moves backwards when two
+  instances catch up at once (docs/architecture.md §113).
 - A manual-ack `GET /v1/events/consume` that served nothing still
   claimed the checkout lease, so for the next `read_cursor_checkout_lease`
   (default 5 minutes) every poll on that token returned nothing - new

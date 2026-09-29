@@ -3682,27 +3682,20 @@ async fn reconcile_projections(
                 projection,
                 needs_history_fold,
             } => {
-                skilj_core::db::upsert_projection(pool, &projection).await?;
-                // No `projection_state` seeding here anymore (§9's
-                // "keyed / multi-row Projections" pass) - a projection's
-                // own instances aren't known until events actually name
-                // them, so every instance's own row is created lazily,
-                // on first touch, the same uniform path whether this
-                // projection ever uses a real key or stays on the
-                // implicit single one. `needs_history_fold` (drift audit
-                // finding #3) is the one exception: a first-time sync
-                // projection with pre-existing matching history is
-                // folded immediately, right here, rather than waiting on
-                // any lazy touch that will never come for events already
-                // committed before this registration.
-                if needs_history_fold {
-                    skilj_core::db::fold_history_into_new_sync_projection(
-                        pool,
-                        &projection,
-                        dispatcher,
-                    )
-                    .await?;
-                }
+                // No `projection_state` seeding here (§9's "keyed /
+                // multi-row Projections" pass) - instances are created
+                // lazily, on first touch. `needs_history_fold` (drift
+                // audit finding #3) is the one exception: a first-time
+                // sync projection with pre-existing matching history is
+                // folded right here, in a way no concurrent write can
+                // interleave with (docs/architecture.md §113).
+                skilj_core::db::create_projection(
+                    pool,
+                    &projection,
+                    needs_history_fold,
+                    dispatcher,
+                )
+                .await?;
             }
             ProjectionRegistration::ReconciledTrivially(projection) => {
                 skilj_core::db::upsert_projection(pool, &projection).await?;

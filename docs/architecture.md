@@ -9875,3 +9875,26 @@ Test: `reads_serve_bounded_pages_and_continue_where_they_stopped` (`skilj/tests/
 - A manual-ack consumer whose first poll serves nothing gets an event deposited right after on its next poll. Before: nothing, since the empty poll held the lease.
 
 Each check fails with its part of the fix reverted.
+
+## 113. A new sync projection is registered without losing history
+
+A sync projection is folded inline by every write, which after taking the bounded context's sequence lock loads the sync projections and folds its event into each (§51, drift audit finding #6). A brand-new one with existing matching history also needs that history folded (`needs_history_fold`, drift audit finding #3). All three registration paths - startup reconciliation, the `registerProjection` mutation, template instantiation - did it as `upsert_projection` (stored as sync), then `fold_history_into_new_sync_projection` (one transaction per event, no lock). `promote_projection_rebuild`, the other place a projection becomes sync, takes the sequence lock precisely so writes can't interleave. Registration didn't, and two races followed:
+
+- **History lost.** Once the row was stored as sync, a write committed before the fold reached key K folded its event into K, creating K's state row with `as_of_sequence` at that new event. The fold's per-row guard (`as_of_sequence >= event.sequence`, there against two instances double-folding) then skipped every earlier event for K. K's state held only what came after registration, permanently, until a rebuild. The mutation and template paths run inside a serving process, and a rolling deploy's second instance serves writes while the first folds, so this needs no unusual timing: in the new test, every run of the old sequence ended at `50` instead of `351` - all 300 history events lost.
+- **Event missed.** With no history to fold, a write that had read the projection list just before the row appeared committed a matching event the projection never saw (2 of 5 runs in the test).
+
+Fix: `db::create_projection` is now every path's one call for `ProjectionRegistration::Created`. An async projection is stored as before; `catch_up_bounded_context` backfills it. A sync one goes through `db::register_new_sync_projection`:
+1. With history to fold, the row is stored as *async* first. Writes only fold into sync projections, so they leave it alone, and the history is folded as before, one event per transaction, holding no lock. (The foreign key from `projection_state` needs the row to exist before any state does.)
+2. Then one transaction takes the sequence lock, folds the consumed-type events committed after the fold's position (with no history: after the caller's history check, normally none), and stores the row as sync with `caught_up_to` at the locked sequence.
+
+Under the lock no event can commit, so every event up to that sequence is folded when the row turns sync, and every later write sees it and folds live. Writes are blocked only for the tail, not the history.
+
+While hidden, the row looks like an async projection, so another instance's catch-up may fold it too. That's safe - the same per-row guard that stops double folds - but it meant `caught_up_to` could be moved backwards by whichever instance wrote last. The per-event `caught_up_to` writes in `catch_up_bounded_context` (projections and building rebuilds) and the history fold are now monotonic (`... AND (caught_up_to IS NULL OR caught_up_to < $1)`), as the partitioned rollup's already was. That also stops two instances' ordinary catch-up from moving the `caughtUpTo` that `waitForSequence` polls backwards. The per-event fold is factored into `fold_event_into_new_projection`, shared by the history fold and the locked tail.
+
+No spec change: `rule RegisterProjection` is atomic - a first-time sync projection with history exists already caught up (`first_time_sync_has_history`) - and this restores that atomicity.
+
+Tests (`skilj-core/tests/async_projections.rs`):
+- `registering_a_sync_projection_during_live_writes_folds_every_event_once`: 300 events of history, a sync projection registered while 50 more commit concurrently, then one more. The state is 351 and `caught_up_to` is the latest sequence.
+- `registering_a_sync_projection_with_no_history_misses_no_concurrent_event`: no history, 20 events committed during registration. The state is 20.
+
+Both passed 10 of 10 runs. With `create_projection` put back to the old upsert-then-fold, the first failed 5 of 5 runs (`50` or `51`) and the second 2 of 5 (`19`). There's no dedicated test for the monotonic `caught_up_to` writes on their own.

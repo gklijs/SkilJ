@@ -331,20 +331,17 @@ pub fn register_projection_field() -> Field {
                         projection,
                         needs_history_fold,
                     } => {
-                        skilj_core::db::upsert_projection(&state.pool, &projection)
-                            .await
-                            .map_err(to_graphql_error)?;
-                        let projection = if needs_history_fold {
-                            skilj_core::db::fold_history_into_new_sync_projection(
-                                &state.pool,
-                                &projection,
-                                state.projection_dispatcher.as_ref(),
-                            )
-                            .await
-                            .map_err(to_graphql_error)?
-                        } else {
-                            projection
-                        };
+                        // docs/architecture.md §113: stored and backfilled
+                        // so no concurrent write is folded out of order or
+                        // missed.
+                        let projection = skilj_core::db::create_projection(
+                            &state.pool,
+                            &projection,
+                            needs_history_fold,
+                            state.projection_dispatcher.as_ref(),
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
                         ProjectionRegistrationResult {
                             outcome: "CREATED",
                             projection: Some(ProjectionWithRebuild {
