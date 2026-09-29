@@ -1193,6 +1193,11 @@ pub struct CancelDeadlineInfo {
     /// context, the same generality `CrossContextRoute::Source`/`Target`
     /// already has.
     pub deadline_schedule_bounded_context: &'static str,
+    /// `Self::Deadline::Source::NAME` - the event type the paired
+    /// `ScheduleDeadline` schedules from. A cancel waits until that
+    /// schedule has processed every such event that precedes the
+    /// cancelling one (docs/architecture.md §130).
+    pub deadline_schedule_source_event_type: &'static str,
     pub start_from: DeadlinePollStartFrom,
 }
 

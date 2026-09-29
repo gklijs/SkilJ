@@ -585,3 +585,69 @@ fn run_retries_a_failed_dispatch_without_consuming_it_again() {
         let _ = temporal_server;
     });
 }
+
+/// `run_until` returns once asked (docs/architecture.md §129): it starts
+/// the workflow for the event it was served and acks it, then - idle, a
+/// 60 s poll interval ahead - stops at once.
+#[test]
+fn run_until_stops_when_asked() {
+    runtime().block_on(async {
+        let Some(temporal_server) = start_temporal().await else {
+            return;
+        };
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        enqueue(
+            &mock_state,
+            "start-token",
+            "OrderPlaced",
+            [json!({
+                "sequence": 1,
+                "eventType": "OrderPlaced",
+                "payload": { "orderId": "o-stop" },
+                "tags": [{ "key": "order", "value": "o-stop" }],
+            })],
+        );
+        let mappings = vec![EventTypeMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: "start-token".to_string(),
+            correlation_tag_key: "order".to_string(),
+            action: MappingAction::Start {
+                workflow_type: "OrderFulfillment".to_string(),
+                task_queue: "orders".to_string(),
+            },
+        }];
+        let target = temporal_server.target.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(async move {
+            let temporal = connect_temporal(&format!("http://{target}")).await;
+            skilj_temporal::run_until(
+                &skilj_base_url,
+                &temporal,
+                "stopping",
+                &mappings,
+                Duration::from_secs(60),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await;
+        });
+        for _ in 0..150 {
+            if !mock_state.acked.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            mock_state.acked.lock().unwrap().as_slice(),
+            &[("start-token".to_string(), 1)]
+        );
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_until must return once asked")
+            .unwrap();
+        let _ = temporal_server;
+    });
+}

@@ -473,6 +473,34 @@ pub async fn run_outbound(
     poll_interval: std::time::Duration,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
+    run_outbound_until(
+        skilj_base_url,
+        sender,
+        mappings,
+        poll_interval,
+        retry_policy,
+        std::future::pending(),
+    )
+    .await;
+    unreachable!("run_outbound_until only returns once `stop` resolves, and `pending()` never does")
+}
+
+/// [`run_outbound`] until `stop` resolves (docs/architecture.md §129):
+/// the cycle in progress - an event being sent and acknowledged -
+/// completes, then this returns. Aborting the task instead can land
+/// between sending and acknowledging, and the event is sent again on the
+/// next start: a duplicate for the address's consumers. `stop` is raced
+/// only against the idle sleep between cycles and checked after each
+/// cycle.
+pub async fn run_outbound_until(
+    skilj_base_url: &str,
+    sender: &mut AmqpSender,
+    mappings: &[OutboundMapping],
+    poll_interval: std::time::Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut stop = std::pin::pin!(stop);
     let http = http_client();
     let mut retry_states: Vec<Option<OutboundRetryState>> = vec![None; mappings.len()];
     loop {
@@ -497,8 +525,15 @@ pub async fn run_outbound(
                 }
             }
         }
-        if !served_any {
-            tokio::time::sleep(poll_interval).await;
+        let idle = if served_any {
+            std::time::Duration::ZERO
+        } else {
+            poll_interval
+        };
+        tokio::select! {
+            biased;
+            () = &mut stop => return,
+            () = tokio::time::sleep(idle) => {}
         }
     }
 }
@@ -808,8 +843,43 @@ pub async fn run_inbound(
     mappings: &HashMap<String, InboundMapping>,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
+    run_inbound_until(
+        receiver,
+        http,
+        skilj_base_url,
+        address,
+        mappings,
+        retry_policy,
+        std::future::pending(),
+    )
+    .await;
+    unreachable!("run_inbound_until only returns once `stop` resolves, and `pending()` never does")
+}
+
+/// [`run_inbound`] until `stop` resolves (docs/architecture.md §129).
+/// `stop` is raced against the wait for the next delivery and against the
+/// backoff between a failing delivery's retries - never against a
+/// dispatch, report or settlement in flight. A delivery it stops during is
+/// released first (not left unsettled, which would hold it with this link
+/// until the connection closes - §98), so the broker redelivers it, and
+/// skilj's own dedupe and `Idempotency-Key` make that harmless.
+pub async fn run_inbound_until(
+    receiver: &mut AmqpReceiver,
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    address: &str,
+    mappings: &HashMap<String, InboundMapping>,
+    retry_policy: &skilj_retry::RetryPolicy,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut stop = std::pin::pin!(stop);
     loop {
-        let delivery = match receiver.recv::<Data>().await {
+        let received = tokio::select! {
+            biased;
+            () = &mut stop => return,
+            received = receiver.recv::<Data>() => received,
+        };
+        let delivery = match received {
             Ok(delivery) => delivery,
             Err(e) => {
                 tracing::error!(address, "AMQP receive error: {e}");
@@ -910,7 +980,17 @@ pub async fn run_inbound(
                         error = %e,
                         "dispatch failed - retrying after backoff"
                     );
-                    tokio::time::sleep(backoff).await;
+                    let stopping = tokio::select! {
+                        biased;
+                        () = &mut stop => true,
+                        () = tokio::time::sleep(backoff) => false,
+                    };
+                    if stopping {
+                        if let Err(release_err) = receiver.release(&delivery).await {
+                            tracing::error!("releasing an AMQP delivery failed: {release_err}");
+                        }
+                        return;
+                    }
                 }
             }
         }

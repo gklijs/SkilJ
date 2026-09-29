@@ -10163,3 +10163,37 @@ Every authenticated REST request resolves its bearer token with `resolve_token::
 - a token that vanished between the two reads (a concurrent `DeleteBoundedContext`) is 401, as before.
 
 Test: `token_resolution_answers_each_outcome` (`skilj/tests/event_fetch_rest.rs`). A read token is served; the same id with the wrong secret gets 401, an unknown id 401, and a direct-creation token 403.
+
+## 129. The bridges' run loops can be stopped
+
+The bridge crates' loops - `skilj_kafka::run_outbound`/`run_inbound`, `skilj_amqp`'s and `skilj_nats`' same pair, `skilj_temporal::run` - return `!`. A caller could only stop them by aborting the task. For an outbound loop that can land between delivering an event and acknowledging it to skilj, and the event is delivered again on the next start: a duplicate for the topic's, address's or subject's consumers (NATS' `Nats-Msg-Id` only dedupes within the stream's window). §123 gave `Skilj` a graceful stop; this does the same for the bridges, without changing the existing functions.
+
+Each loop gains a `*_until(…, stop: impl Future<Output = ()>)` variant: `run_outbound_until`, `run_inbound_until` and `skilj_temporal::run_until`. The original functions call it with `std::future::pending()`, so they behave exactly as before. `stop` is raced only at idle points, never against a delivery, dispatch, report, ack or settlement in flight:
+
+- **Outbound and Temporal:** the sleep between cycles. Every cycle ends in a `biased` select that checks `stop` first. A busy cycle sleeps zero, so a steady stream still notices `stop` after its current cycle.
+- **Inbound:** the wait for the next message, and the backoff between a failing message's retries. NATS also races the wait for its subscription and the retry sleep after a failed subscribe.
+- **A message stopped during its backoff** isn't acknowledged, so it comes back and skilj's own dedupe and `Idempotency-Key` absorb the redelivery:
+  - **Kafka:** stays uncommitted and is redelivered on the next start.
+  - **AMQP:** is *released* first. Left unsettled it would stay with this link until the connection closed (§98); released, the broker redelivers it at once.
+  - **NATS:** is left unacknowledged and redelivered after `ack_wait`. A NAK was tried and dropped. Measured against the real server, the stopped loop's pull request stays registered until it expires. JetStream sends the NAK's immediate redelivery - or the redelivery to the next pull - into that dead inbox first, so it came back after `ack_wait` either way. Consumer info showed it both ways (`delivered` 2 at once, or 1 with no waiting pulls), and redelivery took the full `ack_wait` in every run.
+
+Tests, one per bridge (`the_run_loops_stop_when_asked` in `skilj-kafka`/`skilj-amqp`/`skilj-nats`, `run_until_stops_when_asked` in `skilj-temporal`), each against its real broker or ephemeral Temporal server and a mock skilj:
+- The outbound loop delivers and acks the one event it's served. Then, idle with a 60 s poll interval ahead, it returns within 5 s of being asked.
+- Kafka's inbound loop, waiting for a message, returns within 5 s.
+- AMQP's inbound loop is stopped while a delivery waits out a 60 s backoff. That delivery then arrives again on the same link within 10 s, which an unsettled delivery never does - the test fails with the release removed.
+- NATS' inbound loop is stopped the same way, on a consumer with a 3 s `ack_wait`. The message is redelivered within 20 s, so nothing is lost.
+
+## 130. A cancel waits for its schedule
+
+A `ScheduleDeadline` turns its source events into pending `deadlines` rows (`catch_up_schedule_deadline`). A `CancelDeadline` cancels pending rows whose tags match its source events (`catch_up_cancel_deadline`). They run as separate background loops with separate cursors. When the cancel loop reached a cancelling event - `OrderPaid` - before the schedule loop had turned the scheduling event - `OrderPlaced` - into a deadline, the cancel matched nothing and its cursor moved on. The deadline was created a moment later and fired regardless: the order was cancelled although it had been paid. That's likely whenever the schedule loop lags - catch-up after an outage or a restart, a slow or failing schedule - and it's what made `a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag` fail in 3 of 5 runs on its own.
+
+The fix is the user's choice: the cancel waits for scheduling, rather than remembering early cancels or documenting the gap.
+
+- `catch_up_cancel_deadline` first finds where its schedule's unprocessed backlog starts, with `deadline_schedule_backlog_start`: the first of the schedule's source events after its cursor (`None` when there's none; a schedule that has never run has processed nothing). The cancel then only processes events before that point and stops the tick there. Its cursor stays on the last event handled, and a later tick resumes once the schedule has caught up. It costs one query per tick.
+- **Within one bounded context**, "before" is by sequence - exact, since events become visible in sequence order. **Across bounded contexts** (a cancel's source context may differ from its schedule's, §46), sequences aren't comparable, so it's by creation time. A scheduling event still uncommitted at that instant with an earlier creation time can slip past.
+- A cancel is held back by exactly the schedule it cancels (`deadline_schedule_name` in `deadline_schedule_bounded_context`). `CancelDeadlineInfo` gains `deadline_schedule_source_event_type`, filled from `Self::Deadline::Source::NAME`.
+- The cost is the one the user accepted: a lagging or failing schedule holds its cancels back until it catches up. A cancel whose schedule isn't registered in the same process would wait on another process running it - or forever - so `SkiljBuilder::build` logs a warning for that.
+
+Tests:
+- `a_cancel_processed_before_its_schedule_still_cancels_within_one_context` and `..._across_contexts` (`skilj-core/tests/deadline_cancel_ordering.rs`) drive the catch-ups by hand in the losing order: cancel, schedule, cancel. The deadline ends `cancelled`. Without the gate it stayed `pending`.
+- `skilj/tests/deadlines.rs` passed six runs out of six afterwards.

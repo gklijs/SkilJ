@@ -10028,6 +10028,48 @@ pub async fn catch_up_schedule_deadline(
     Ok(())
 }
 
+/// Where a `CancelDeadline`'s schedule still has work: the first of the
+/// schedule's source events it hasn't processed. Compared by sequence
+/// when the cancelling events share its bounded context - exact, since
+/// events become visible in sequence order - and by creation time across
+/// bounded contexts, where sequences aren't comparable.
+enum ScheduleBacklogStart {
+    Sequence(i64),
+    Time(DateTime<Utc>),
+}
+
+/// The start of `cancel`'s schedule's unprocessed backlog, or `None` when
+/// it has processed every source event there is (docs/architecture.md
+/// §130). A schedule that has never run has processed nothing.
+async fn deadline_schedule_backlog_start(
+    pool: &Pool,
+    cancel: &crate::plugin::CancelDeadlineInfo,
+) -> crate::error::Result<Option<ScheduleBacklogStart>> {
+    let cursor = get_deadline_cursor(
+        pool,
+        cancel.deadline_schedule_bounded_context,
+        cancel.deadline_schedule_name,
+    )
+    .await?
+    .unwrap_or(-1);
+    let schema = schema_ident(cancel.deadline_schedule_bounded_context);
+    let first: Option<(i64, DateTime<Utc>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT sequence, metadata_created_at FROM {schema}.events \
+         WHERE event_type_name = $1 AND sequence > $2 ORDER BY sequence LIMIT 1"
+    )))
+    .bind(cancel.deadline_schedule_source_event_type)
+    .bind(cursor)
+    .fetch_optional(pool)
+    .await?;
+    Ok(first.map(|(sequence, created_at)| {
+        if cancel.deadline_schedule_bounded_context == cancel.source_bounded_context {
+            ScheduleBacklogStart::Sequence(sequence)
+        } else {
+            ScheduleBacklogStart::Time(created_at)
+        }
+    }))
+}
+
 /// One registered `CancelDeadline`'s own catch-up tick - same shape as
 /// `catch_up_schedule_deadline` just above, reacting by cancelling
 /// pending rows instead of inserting one. Writes into
@@ -10098,8 +10140,28 @@ pub async fn catch_up_cancel_deadline(
     )
     .await?;
 
+    // docs/architecture.md §130: a cancel only applies to deadlines its
+    // schedule has already created. The two run independently, so a
+    // cancelling event is held back until the schedule has processed
+    // every source event that precedes it - otherwise it matches nothing,
+    // the deadline is created a moment later, and fires regardless.
+    let before = deadline_schedule_backlog_start(pool, cancel).await?;
     let target_schema = schema_ident(cancel.deadline_schedule_bounded_context);
     for event in &events {
+        let scheduled_past = match &before {
+            None => true,
+            Some(ScheduleBacklogStart::Sequence(first_unscheduled)) => {
+                event.sequence < *first_unscheduled
+            }
+            Some(ScheduleBacklogStart::Time(first_unscheduled)) => {
+                event.metadata.created_at < *first_unscheduled
+            }
+        };
+        if !scheduled_past {
+            // The rest waits for the schedule; the cursor stays on the
+            // last event handled, and a later tick resumes from there.
+            break;
+        }
         match dispatcher.cancel_tags(cancel.name, &event.payload) {
             None => {
                 tracing::warn!(

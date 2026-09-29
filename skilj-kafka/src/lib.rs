@@ -484,6 +484,34 @@ pub async fn run_outbound(
     poll_interval: Duration,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
+    run_outbound_until(
+        skilj_base_url,
+        producer,
+        mappings,
+        poll_interval,
+        retry_policy,
+        std::future::pending(),
+    )
+    .await;
+    unreachable!("run_outbound_until only returns once `stop` resolves, and `pending()` never does")
+}
+
+/// [`run_outbound`] until `stop` resolves (docs/architecture.md §129):
+/// the cycle in progress - an event being produced and acknowledged -
+/// completes, then this returns. Aborting the task instead can land
+/// between producing and acknowledging, and the event is produced again
+/// on the next start: a duplicate for the topic's consumers. `stop` is
+/// raced only against the idle sleep between cycles and checked after
+/// each cycle.
+pub async fn run_outbound_until(
+    skilj_base_url: &str,
+    producer: &FutureProducer,
+    mappings: &[OutboundMapping],
+    poll_interval: Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut stop = std::pin::pin!(stop);
     let http = http_client();
     let mut retry_states: Vec<Option<OutboundRetryState>> = vec![None; mappings.len()];
     loop {
@@ -508,8 +536,15 @@ pub async fn run_outbound(
                 }
             }
         }
-        if !served_any {
-            tokio::time::sleep(poll_interval).await;
+        let idle = if served_any {
+            Duration::ZERO
+        } else {
+            poll_interval
+        };
+        tokio::select! {
+            biased;
+            () = &mut stop => return,
+            () = tokio::time::sleep(idle) => {}
         }
     }
 }
@@ -784,8 +819,40 @@ pub async fn run_inbound(
     mappings: &HashMap<String, InboundMapping>,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
+    run_inbound_until(
+        consumer,
+        http,
+        skilj_base_url,
+        mappings,
+        retry_policy,
+        std::future::pending(),
+    )
+    .await;
+    unreachable!("run_inbound_until only returns once `stop` resolves, and `pending()` never does")
+}
+
+/// [`run_inbound`] until `stop` resolves (docs/architecture.md §129).
+/// `stop` is raced against the wait for the next message and against the
+/// backoff between a failing message's retries - never against a dispatch
+/// or report in flight. A message it stops during is left uncommitted and
+/// comes back on the next start, where skilj's own dedupe and
+/// `Idempotency-Key` make the redelivery harmless.
+pub async fn run_inbound_until(
+    consumer: &StreamConsumer,
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mappings: &HashMap<String, InboundMapping>,
+    retry_policy: &skilj_retry::RetryPolicy,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut stop = std::pin::pin!(stop);
     loop {
-        match consumer.recv().await {
+        let received = tokio::select! {
+            biased;
+            () = &mut stop => return,
+            received = consumer.recv() => received,
+        };
+        match received {
             Ok(msg) => {
                 let topic = msg.topic();
                 let Some(mapping) = mappings.get(topic) else {
@@ -890,8 +957,13 @@ pub async fn run_inbound(
                                         "reporting this parked delivery failed - retrying; \
                                          this partition waits until it succeeds: {report_err}"
                                     );
-                                    tokio::time::sleep(retry_policy.next_backoff(report_attempt))
-                                        .await;
+                                    tokio::select! {
+                                        biased;
+                                        () = &mut stop => return,
+                                        () = tokio::time::sleep(
+                                            retry_policy.next_backoff(report_attempt),
+                                        ) => {}
+                                    }
                                 }
                                 if let Err(commit_err) =
                                     consumer.commit_message(&msg, CommitMode::Async)
@@ -911,7 +983,11 @@ pub async fn run_inbound(
                                 error = %e,
                                 "dispatch failed - retrying after backoff"
                             );
-                            tokio::time::sleep(backoff).await;
+                            tokio::select! {
+                                biased;
+                                () = &mut stop => return,
+                                () = tokio::time::sleep(backoff) => {}
+                            }
                         }
                     }
                 }

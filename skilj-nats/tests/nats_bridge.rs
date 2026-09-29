@@ -28,8 +28,8 @@ use axum::{Json, Router};
 use futures_util::TryStreamExt;
 use serde_json::{json, Value};
 use skilj_nats::{
-    dispatch_inbound_message, produce_once, run_inbound, InboundAction, InboundMapping,
-    InboundMessageMeta, OutboundMapping, PullConsumer,
+    dispatch_inbound_message, produce_once, run_inbound, run_inbound_until, run_outbound_until,
+    InboundAction, InboundMapping, InboundMessageMeta, OutboundMapping, PullConsumer,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -940,5 +940,141 @@ fn a_message_retried_past_ack_wait_is_not_redelivered_meanwhile() {
             1,
             "the message was redelivered while still being retried"
         );
+    });
+}
+
+/// `run_outbound_until`/`run_inbound_until` return once asked
+/// (docs/architecture.md §129). The outbound loop publishes and acks the
+/// event it was served, then - idle, a 60 s poll interval ahead - stops at
+/// once. The inbound loop, stopped while a failing message waits out a
+/// 60 s backoff, stops at once too, leaving the message unacknowledged -
+/// JetStream redelivers it after the consumer's `ack_wait` (3 s here), so
+/// nothing is lost.
+#[test]
+fn the_run_loops_stop_when_asked() {
+    runtime().block_on(async {
+        let Some(url) = test_nats().await else {
+            return;
+        };
+        let stream_name = unique_name("ORDERSSTOP");
+        let jetstream = jetstream_with_stream(url, &stream_name).await;
+        let consumer: PullConsumer = jetstream
+            .get_stream(&stream_name)
+            .await
+            .unwrap()
+            .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some("stop-consumer".to_string()),
+                ack_wait: Duration::from_secs(3),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        enqueue(
+            &mock_state,
+            "read-token",
+            "OrderPlaced",
+            [json!({
+                "sequence": 9,
+                "eventType": "OrderPlaced",
+                "payload": { "orderId": "o-9" },
+                "tags": [],
+                "metadata": { "correlationId": null, "causationId": null },
+            })],
+        );
+        let mappings = vec![OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: "read-token".to_string(),
+            subject: format!("{stream_name}.out"),
+            correlation_tag_key: None,
+            partition: None,
+        }];
+        let (stop_outbound, stopped) = tokio::sync::oneshot::channel::<()>();
+        let outbound = tokio::spawn({
+            let (skilj_base_url, jetstream) = (skilj_base_url.clone(), jetstream.clone());
+            async move {
+                run_outbound_until(
+                    &skilj_base_url,
+                    &jetstream,
+                    "orders",
+                    &mappings,
+                    Duration::from_secs(60),
+                    &skilj_retry::RetryPolicy::default(),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await;
+            }
+        });
+        for _ in 0..150 {
+            if !mock_state.acked.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(mock_state.acked.lock().unwrap().as_slice(), &[9]);
+        stop_outbound.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), outbound)
+            .await
+            .expect("run_outbound_until must return once asked")
+            .unwrap();
+
+        // The published message waits in the stream; every dispatch of it fails.
+        *mock_state.fail_external_requests.lock().unwrap() = 1000;
+        let mapping = InboundMapping {
+            credential: "external-token".to_string(),
+            action: InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        };
+        let (stop_inbound, stopped) = tokio::sync::oneshot::channel::<()>();
+        let inbound = tokio::spawn({
+            let (consumer, skilj_base_url) = (consumer.clone(), skilj_base_url.clone());
+            async move {
+                run_inbound_until(
+                    &consumer,
+                    &skilj_nats::http_client(),
+                    &skilj_base_url,
+                    &mapping,
+                    &skilj_retry::RetryPolicy::bounded(
+                        Duration::from_secs(60),
+                        1.0,
+                        Duration::from_secs(60),
+                        10,
+                    ),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await;
+            }
+        });
+        for _ in 0..150 {
+            if *mock_state.fail_external_requests.lock().unwrap() < 1000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            *mock_state.fail_external_requests.lock().unwrap() < 1000,
+            "the inbound loop must have tried the message"
+        );
+        stop_inbound.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), inbound)
+            .await
+            .expect("run_inbound_until must return once asked")
+            .unwrap();
+
+        let mut messages = consumer.messages().await.unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(20), messages.try_next())
+            .await
+            .expect("the unacknowledged message must be redelivered after ack_wait")
+            .unwrap()
+            .expect("stream must not have ended");
+        let payload: Value = serde_json::from_slice(&message.payload).unwrap();
+        assert_eq!(payload, json!({ "orderId": "o-9" }));
+        message.ack().await.unwrap();
     });
 }

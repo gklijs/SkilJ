@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `run_outbound_until`/`run_inbound_until` in `skilj-kafka`,
+  `skilj-amqp` and `skilj-nats`, and `skilj_temporal::run_until`: the run
+  loops, stopping once a given future resolves - after the message or
+  cycle in flight, instead of the task being aborted mid-delivery (which
+  can duplicate an outbound event). The existing `run_*` functions are
+  unchanged (docs/architecture.md §129).
 - `Skilj::shutdown(timeout) -> ShutdownReport`: stops the background
   loops (projection/snapshot catch-up, routes, deadlines, scheduled
   events, key retention, the cross-instance listener) after the tick each
@@ -33,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `CancelDeadlineInfo` gains `deadline_schedule_source_event_type`
+  (breaking for code constructing it directly) (docs/architecture.md
+  §130).
 - `skilj_graphql::resolvers::load_private_field_grants` takes the
   reader's `Role` (docs/architecture.md §124).
 - `db::commit_command_batch` no longer takes a `pool` argument, and
@@ -165,6 +174,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `CancelDeadline` could lose to its own `ScheduleDeadline`: when the
+  cancel loop reached the cancelling event before the schedule loop had
+  created the deadline, the cancel matched nothing and the deadline fired
+  anyway (a paid order still cancelled). Cancels now wait for their
+  schedule to have processed every source event that precedes them
+  (docs/architecture.md §130).
 - Every authenticated REST request read its bearer token twice - once
   for its kind, once for the token. The token is now read once, and the
   kind only looked up to tell 401 from 403 when that read finds nothing

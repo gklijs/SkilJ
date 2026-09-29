@@ -33,8 +33,8 @@ use fe2o3_amqp::types::messaging::{Data, Message, MessageId, Properties};
 use fe2o3_amqp::{Connection, Receiver, Sender, Session};
 use serde_json::{json, Value};
 use skilj_amqp::{
-    dispatch_inbound_message, produce_once, run_inbound, InboundAction, InboundMapping,
-    InboundMessageMeta, OutboundMapping,
+    dispatch_inbound_message, produce_once, run_inbound, run_inbound_until, run_outbound_until,
+    InboundAction, InboundMapping, InboundMessageMeta, OutboundMapping,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1080,5 +1080,145 @@ fn a_message_whose_park_report_fails_is_released_and_parked_on_redelivery() {
             parked[0]["request"]["payload"],
             json!({ "orderId": "o-released" })
         );
+    });
+}
+
+/// `run_outbound_until`/`run_inbound_until` return once asked
+/// (docs/architecture.md §129). The outbound loop sends and acks the event
+/// it was served, then - idle, a 60 s poll interval ahead - stops at once.
+/// The inbound loop, stopped while a failing delivery waits out a 60 s
+/// backoff, releases that delivery rather than leaving it unsettled with
+/// its link, so the broker redelivers it straight away - on that same
+/// link here, which an unsettled delivery never would be.
+#[test]
+fn the_run_loops_stop_when_asked() {
+    runtime().block_on(async {
+        let Some(url) = test_broker().await else {
+            return;
+        };
+        let address = unique_address("orders-stop");
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        enqueue(
+            &mock_state,
+            "read-token",
+            "OrderPlaced",
+            [json!({
+                "sequence": 9,
+                "eventType": "OrderPlaced",
+                "payload": { "orderId": "o-9" },
+                "tags": [],
+                "metadata": { "correlationId": null, "causationId": null },
+            })],
+        );
+
+        // Attached before anything is sent, so the broker keeps the message
+        // for it, as every other test in this file does.
+        let (_in_conn, mut in_session) = connect(url, "stop-in-conn").await;
+        let mut receiver = Receiver::attach(&mut in_session, "stop-in-link", address.as_str())
+            .await
+            .unwrap();
+        let (_out_conn, mut out_session) = connect(url, "stop-out-conn").await;
+        let mut sender = Sender::attach(&mut out_session, "stop-out-link", address.as_str())
+            .await
+            .unwrap();
+        let mappings = vec![OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: "read-token".to_string(),
+            address: address.clone(),
+            key_tag_key: None,
+            partition: None,
+        }];
+        let (stop_outbound, stopped) = tokio::sync::oneshot::channel::<()>();
+        let outbound = tokio::spawn({
+            let skilj_base_url = skilj_base_url.clone();
+            async move {
+                run_outbound_until(
+                    &skilj_base_url,
+                    &mut sender,
+                    &mappings,
+                    Duration::from_secs(60),
+                    &skilj_retry::RetryPolicy::default(),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await;
+            }
+        });
+        for _ in 0..150 {
+            if !mock_state.acked.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(mock_state.acked.lock().unwrap().as_slice(), &[9]);
+        stop_outbound.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), outbound)
+            .await
+            .expect("run_outbound_until must return once asked")
+            .unwrap();
+
+        // The sent message waits at `address`; every dispatch of it fails.
+        *mock_state.fail_external_requests.lock().unwrap() = 1000;
+        let mut inbound_mappings = std::collections::HashMap::new();
+        inbound_mappings.insert(
+            address.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let (stop_inbound, stopped) = tokio::sync::oneshot::channel::<()>();
+        let inbound = tokio::spawn({
+            let (skilj_base_url, address) = (skilj_base_url.clone(), address.clone());
+            async move {
+                run_inbound_until(
+                    &mut receiver,
+                    &skilj_amqp::http_client(),
+                    &skilj_base_url,
+                    &address,
+                    &inbound_mappings,
+                    &skilj_retry::RetryPolicy::bounded(
+                        Duration::from_secs(60),
+                        1.0,
+                        Duration::from_secs(60),
+                        10,
+                    ),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await;
+                receiver
+            }
+        });
+        for _ in 0..150 {
+            if *mock_state.fail_external_requests.lock().unwrap() < 1000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            *mock_state.fail_external_requests.lock().unwrap() < 1000,
+            "the inbound loop must have tried the message"
+        );
+        stop_inbound.send(()).unwrap();
+        let mut receiver = tokio::time::timeout(Duration::from_secs(5), inbound)
+            .await
+            .expect("run_inbound_until must return once asked")
+            .unwrap();
+
+        // Released, the broker redelivers it on this same link; left
+        // unsettled, it never would while the link lives.
+        let delivery = tokio::time::timeout(Duration::from_secs(10), receiver.recv::<Data>())
+            .await
+            .expect("the released delivery must be redelivered at once")
+            .unwrap();
+        receiver.accept(&delivery).await.unwrap();
+        let payload: Value = serde_json::from_slice(delivery.body().0.as_ref()).unwrap();
+        assert_eq!(payload, json!({ "orderId": "o-9" }));
     });
 }

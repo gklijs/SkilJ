@@ -483,6 +483,35 @@ pub async fn run_outbound(
     poll_interval: std::time::Duration,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
+    run_outbound_until(
+        skilj_base_url,
+        jetstream,
+        bounded_context,
+        mappings,
+        poll_interval,
+        retry_policy,
+        std::future::pending(),
+    )
+    .await;
+    unreachable!("run_outbound_until only returns once `stop` resolves, and `pending()` never does")
+}
+
+/// [`run_outbound`] until `stop` resolves (docs/architecture.md §129):
+/// the cycle in progress - an event being published and acknowledged -
+/// completes, then this returns. Aborting the task instead can land
+/// between publishing and acknowledging; `Nats-Msg-Id` dedupes a republish
+/// only within the stream's duplicate window. `stop` is raced only against
+/// the idle sleep between cycles and checked after each cycle.
+pub async fn run_outbound_until(
+    skilj_base_url: &str,
+    jetstream: &Jetstream,
+    bounded_context: &str,
+    mappings: &[OutboundMapping],
+    poll_interval: std::time::Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut stop = std::pin::pin!(stop);
     let http = http_client();
     let mut retry_states: Vec<Option<OutboundRetryState>> = vec![None; mappings.len()];
     loop {
@@ -508,8 +537,15 @@ pub async fn run_outbound(
                 }
             }
         }
-        if !served_any {
-            tokio::time::sleep(poll_interval).await;
+        let idle = if served_any {
+            std::time::Duration::ZERO
+        } else {
+            poll_interval
+        };
+        tokio::select! {
+            biased;
+            () = &mut stop => return,
+            () = tokio::time::sleep(idle) => {}
         }
     }
 }
@@ -811,21 +847,69 @@ pub async fn run_inbound(
     mapping: &InboundMapping,
     retry_policy: &skilj_retry::RetryPolicy,
 ) -> ! {
+    run_inbound_until(
+        consumer,
+        http,
+        skilj_base_url,
+        mapping,
+        retry_policy,
+        std::future::pending(),
+    )
+    .await;
+    unreachable!("run_inbound_until only returns once `stop` resolves, and `pending()` never does")
+}
+
+/// [`run_inbound`] until `stop` resolves (docs/architecture.md §129).
+/// `stop` is raced against the wait for the next message (and for the
+/// subscription itself) and against the backoff between a failing
+/// message's retries - never against a dispatch, report or ack in flight.
+/// A message it stops during is left unacknowledged, and JetStream
+/// redelivers it after `ack_wait`, where skilj's own dedupe and
+/// `Idempotency-Key` make it harmless. Not negatively acknowledged: the
+/// stopped loop's own pull request stays registered with the server until
+/// it expires, and a NAK's immediate redelivery went into it - a dead
+/// inbox - so it came back after `ack_wait` all the same.
+pub async fn run_inbound_until(
+    consumer: &PullConsumer,
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut stop = std::pin::pin!(stop);
     // docs/architecture.md §100: how often a message being retried is
     // re-claimed - half the consumer's own `ack_wait`, so JetStream never
     // sees it go unacknowledged long enough to redeliver it underneath us.
     let claim_heartbeat =
         (consumer.cached_info().config.ack_wait / 2).max(std::time::Duration::from_millis(100));
     loop {
-        let mut messages = match consumer.messages().await {
+        let subscribed = tokio::select! {
+            biased;
+            () = &mut stop => return,
+            subscribed = consumer.messages() => subscribed,
+        };
+        let mut messages = match subscribed {
             Ok(messages) => messages,
             Err(e) => {
                 tracing::error!("subscribing to JetStream messages failed, retrying: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::select! {
+                    biased;
+                    () = &mut stop => return,
+                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
                 continue;
             }
         };
-        while let Ok(Some(message)) = messages.try_next().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = &mut stop => return,
+                next = messages.try_next() => next,
+            };
+            let Ok(Some(message)) = next else {
+                break;
+            };
             let meta = match InboundMessageMeta::from_message(&message) {
                 Ok(meta) => meta,
                 Err(e) => {
@@ -905,7 +989,14 @@ pub async fn run_inbound(
                             error = %e,
                             "dispatch failed - retrying after backoff"
                         );
-                        wait_keeping_claim(&message, backoff, claim_heartbeat).await;
+                        // Stopping here leaves the message unacknowledged:
+                        // JetStream redelivers it after `ack_wait`, as after
+                        // a crash (docs/architecture.md §129).
+                        tokio::select! {
+                            biased;
+                            () = &mut stop => return,
+                            () = wait_keeping_claim(&message, backoff, claim_heartbeat) => {}
+                        }
                     }
                 }
             }

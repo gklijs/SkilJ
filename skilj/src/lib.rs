@@ -1486,6 +1486,8 @@ fn registered_cancel_deadline<C: CancelDeadline + 'static>() -> RegisteredCancel
             deadline_schedule_name: C::Deadline::NAME,
             deadline_schedule_bounded_context:
                 <<C::Deadline as ScheduleDeadline>::Source as EventType>::BOUNDED_CONTEXT,
+            deadline_schedule_source_event_type:
+                <<C::Deadline as ScheduleDeadline>::Source as EventType>::NAME,
             start_from: C::START_FROM,
         },
         cancel_tags: |payload_json| {
@@ -2696,6 +2698,10 @@ impl SkiljBuilder {
                 schedules: Arc::new(self.schedule_deadlines),
             });
         let schedules = schedule_deadline_dispatcher.schedules();
+        let scheduled: Vec<(&'static str, &'static str)> = schedules
+            .iter()
+            .map(|schedule| (schedule.name, schedule.source_bounded_context))
+            .collect();
         background.spawn("schedule_deadlines", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();
@@ -2755,6 +2761,24 @@ impl SkiljBuilder {
                 cancels: Arc::new(self.cancel_deadlines),
             });
         let cancels = cancel_deadline_dispatcher.cancels();
+        // docs/architecture.md §130: a cancel waits for its schedule to
+        // have processed what precedes each cancelling event. Nothing in
+        // this process runs a schedule that isn't registered here, so its
+        // cancels would wait on another process doing it - or forever.
+        for cancel in &cancels {
+            let scheduled_here = scheduled.contains(&(
+                cancel.deadline_schedule_name,
+                cancel.deadline_schedule_bounded_context,
+            ));
+            if !scheduled_here {
+                tracing::warn!(
+                    cancel = cancel.name,
+                    schedule = cancel.deadline_schedule_name,
+                    "a cancel deadline's schedule isn't registered in this process - its \
+                     cancels wait until something runs that schedule"
+                );
+            }
+        }
         background.spawn("cancel_deadlines", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();

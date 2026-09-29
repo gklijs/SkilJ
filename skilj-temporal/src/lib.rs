@@ -396,6 +396,33 @@ pub async fn run(
     mappings: &[EventTypeMapping],
     poll_interval: Duration,
 ) -> ! {
+    run_until(
+        skilj_base_url,
+        temporal,
+        bounded_context,
+        mappings,
+        poll_interval,
+        std::future::pending(),
+    )
+    .await;
+    unreachable!("run_until only returns once `stop` resolves, and `pending()` never does")
+}
+
+/// [`run`] until `stop` resolves (docs/architecture.md §129): the cycle in
+/// progress - an event being started or signaled - completes, then this
+/// returns, instead of the task being aborted mid-dispatch. `stop` is
+/// raced only against the idle sleep between cycles and checked after
+/// each cycle. Events served but not yet acknowledged when it returns come
+/// back after the consume lease, as they would after a crash.
+pub async fn run_until(
+    skilj_base_url: &str,
+    temporal: &Client,
+    bounded_context: &str,
+    mappings: &[EventTypeMapping],
+    poll_interval: Duration,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    let mut stop = std::pin::pin!(stop);
     let http = http_client();
     // Per mapping, what it was served but hasn't acknowledged yet - kept
     // across cycles so a failed dispatch is retried next cycle rather
@@ -424,8 +451,15 @@ pub async fn run(
                 }
             }
         }
-        if !served_any {
-            tokio::time::sleep(poll_interval).await;
+        let idle = if served_any {
+            Duration::ZERO
+        } else {
+            poll_interval
+        };
+        tokio::select! {
+            biased;
+            () = &mut stop => return,
+            () = tokio::time::sleep(idle) => {}
         }
     }
 }

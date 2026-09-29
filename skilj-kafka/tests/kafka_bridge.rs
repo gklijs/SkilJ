@@ -29,8 +29,8 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{ClientConfig, Message};
 use serde_json::{json, Value};
 use skilj_kafka::{
-    dispatch_inbound_message, header_str, produce_once, run_inbound, InboundAction, InboundMapping,
-    OutboundMapping,
+    dispatch_inbound_message, header_str, produce_once, run_inbound, run_inbound_until,
+    run_outbound_until, InboundAction, InboundMapping, OutboundMapping,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -1220,5 +1220,105 @@ fn a_message_whose_park_report_fails_is_never_committed_past() {
             parked[0]["request"]["payload"],
             json!({ "orderId": "o-first" })
         );
+    });
+}
+
+/// `run_outbound_until`/`run_inbound_until` return once asked
+/// (docs/architecture.md §129): the outbound loop produces and acks the
+/// event it was served, then - idle, with a 60 s poll interval ahead of it
+/// - stops at once; the inbound loop, waiting for a message, stops too.
+#[test]
+fn the_run_loops_stop_when_asked() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-stop");
+        create_topic(bootstrap_servers, &topic).await;
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        enqueue(
+            &mock_state,
+            "read-token",
+            "OrderPlaced",
+            [json!({
+                "sequence": 9,
+                "eventType": "OrderPlaced",
+                "payload": { "orderId": "o-9" },
+                "tags": [],
+                "metadata": { "correlationId": null, "causationId": null },
+            })],
+        );
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let mappings = vec![OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: "read-token".to_string(),
+            topic: topic.clone(),
+            key_tag_key: None,
+            partition: None,
+        }];
+        let (stop_outbound, stopped) = tokio::sync::oneshot::channel::<()>();
+        let outbound = tokio::spawn({
+            let skilj_base_url = skilj_base_url.clone();
+            async move {
+                run_outbound_until(
+                    &skilj_base_url,
+                    &producer,
+                    &mappings,
+                    Duration::from_secs(60),
+                    &skilj_retry::RetryPolicy::default(),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await;
+            }
+        });
+        for _ in 0..150 {
+            if !mock_state.acked.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(mock_state.acked.lock().unwrap().as_slice(), &[9]);
+        stop_outbound.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), outbound)
+            .await
+            .expect("run_outbound_until must return once asked")
+            .unwrap();
+
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-stop")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "latest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+        let (stop_inbound, stopped) = tokio::sync::oneshot::channel::<()>();
+        let inbound = tokio::spawn(async move {
+            run_inbound_until(
+                &consumer,
+                &skilj_kafka::http_client(),
+                &skilj_base_url,
+                &HashMap::new(),
+                &skilj_retry::RetryPolicy::default(),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stop_inbound.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), inbound)
+            .await
+            .expect("run_inbound_until must return once asked")
+            .unwrap();
     });
 }
