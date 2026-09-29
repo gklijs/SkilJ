@@ -1415,3 +1415,41 @@ fn concurrent_acknowledgements_never_move_the_cursor_backwards() {
         assert_eq!(cursor.sequence, 10, "the cursor regressed");
     });
 }
+
+/// Every outcome of resolving a bearer token, now that the right kind is
+/// looked up first and the kind only on a miss (docs/architecture.md
+/// §128): the right token serves, a wrong secret or an unknown id is 401,
+/// and a real token of another kind is 403.
+#[test]
+fn token_resolution_answers_each_outcome() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+        let status = |credential: String| {
+            let router = router.clone();
+            async move {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri("/v1/events")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap();
+                router.oneshot(request).await.unwrap().status()
+            }
+        };
+        let (read_id, _) = read_credential.split_once('.').unwrap();
+        assert_eq!(status(read_credential.clone()).await, StatusCode::OK);
+        assert_eq!(
+            status(format!("{read_id}.not-the-secret")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(format!("{}.whatever", generate_token_id())).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(status(direct_credential).await, StatusCode::FORBIDDEN);
+    });
+}

@@ -10151,3 +10151,15 @@ Also checked while here, and fine as is:
 - `pattern` uses `fancy-regex` with its default 1,000,000-step backtrack limit. Patterns without look-around or back-references go to the linear `regex` crate, so a catastrophic pattern is bounded.
 
 Test: `valid_payload_caches_compiled_schemas_by_content` (`skilj-core/tests/type_registration.rs`). A payload valid under `minimum: 0` isn't valid under `minimum: 10`, even between repeated calls under the first. 600 distinct schemas (past the cap) each answer correctly. A malformed schema, a malformed payload, and a schema that doesn't compile never validate.
+
+## 128. REST token resolution reads the token once
+
+Every authenticated REST request resolves its bearer token with `resolve_token::<T>`. It asked `access_token_kind` first, to tell 401 (no such token) from 403 (a token of another kind), and then `T::get` for the token itself. Both go through `fetch_access_token_row` - the global `access_token_index` lookup, then the row from its bounded context's schema. So every request read the token twice before the typed getter's own event- or command-type lookup.
+
+`T::get` already answers `None` for a token of any other kind, as well as for no token. So `resolve_token` now calls it first, and only on a miss asks `access_token_kind` to choose 401 or 403. A request with a valid token - nearly all of them, and a bridge polls on every tick - makes two fewer queries. Error responses are unchanged:
+- a wrong secret is 401;
+- an unknown id is 401;
+- a token of another kind is 403;
+- a token that vanished between the two reads (a concurrent `DeleteBoundedContext`) is 401, as before.
+
+Test: `token_resolution_answers_each_outcome` (`skilj/tests/event_fetch_rest.rs`). A read token is served; the same id with the wrong secret gets 401, an unknown id 401, and a direct-creation token 403.

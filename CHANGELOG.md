@@ -165,6 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every authenticated REST request read its bearer token twice - once
+  for its kind, once for the token. The token is now read once, and the
+  kind only looked up to tell 401 from 403 when that read finds nothing
+  (docs/architecture.md §128).
 - Every event and command write compiled its type's JSON Schema anew
   (about 60 µs for an ordinary schema, against 0.2 µs to validate).
   Compiled validators are now cached by schema text, at most 256

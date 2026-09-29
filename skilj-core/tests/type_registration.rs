@@ -1487,7 +1487,10 @@ fn valid_payload_caches_compiled_schemas_by_content() {
     }
 
     assert!(!skilj_core::event_store::valid_payload("not json", five));
-    assert!(!skilj_core::event_store::valid_payload(&schema(0), "not json"));
+    assert!(!skilj_core::event_store::valid_payload(
+        &schema(0),
+        "not json"
+    ));
     assert!(!skilj_core::event_store::valid_payload(
         r#"{"type":"no-such-type"}"#,
         five

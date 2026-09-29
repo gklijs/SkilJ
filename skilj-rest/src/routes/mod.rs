@@ -313,31 +313,25 @@ async fn resolve_token<T: TokenLookup>(
     state: &AppState,
     credential: &BearerCredential,
 ) -> Result<T, RestError> {
+    // The token of the kind this route needs, in one lookup - `T::get` is
+    // `None` for any other kind as well as for no token at all. Only then
+    // is the kind looked up, to tell 401 from 403; it used to be looked up
+    // first on every request, reading the token row twice
+    // (docs/architecture.md §128).
+    if let Some(token) = T::get(&state.pool, &credential.id).await? {
+        return if secret_matches(&hash_secret(&credential.secret), token.secret()) {
+            Ok(token)
+        } else {
+            Err(RestError::UnrecognisedCredential)
+        };
+    }
     match db::access_token_kind(&state.pool, &credential.id).await? {
+        // No such token - or, `Some(T::KIND)`, one that vanished between
+        // the two reads with a concurrent `DeleteBoundedContext`: from the
+        // caller's point of view, a token that's gone looks exactly like
+        // one that was never recognised, not a 500.
         None => Err(RestError::UnrecognisedCredential),
-        Some(kind) if kind == T::KIND => {
-            // `access_token_kind` and `T::get` each independently re-resolve
-            // this token's own bounded context (`fetch_access_token_row`'s
-            // own `access_token_index` lookup, then a per-schema row fetch) -
-            // two full round trips, not one shared read. A concurrent
-            // `DeleteBoundedContext` landing in the gap between them makes
-            // this `None`, the identical race `skilj_core::db`'s own
-            // `require_event_type`/`require_command_type` and
-            // `skilj-graphql`'s `redrive_parked_delivery` already treat as
-            // an ordinary outcome rather than "a real bug" - and on this
-            // code path, every authenticated REST request runs it, not just
-            // an occasional admin retry. From the caller's own point of
-            // view a token that's vanished out from under it should look
-            // exactly like one that was never recognised, not a 500.
-            let Some(token) = T::get(&state.pool, &credential.id).await? else {
-                return Err(RestError::UnrecognisedCredential);
-            };
-            if secret_matches(&hash_secret(&credential.secret), token.secret()) {
-                Ok(token)
-            } else {
-                Err(RestError::UnrecognisedCredential)
-            }
-        }
+        Some(kind) if kind == T::KIND => Err(RestError::UnrecognisedCredential),
         Some(_) => Err(RestError::WrongTokenVariant),
     }
 }
