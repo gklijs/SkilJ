@@ -5466,8 +5466,15 @@ pub async fn list_events_for_bounded_context_matching_tags(
     }
 
     let bc = require_bounded_context(pool, bounded_context).await?;
-    list_events_for_bounded_context_matching_tags_with_bc(pool, &bc, tags, after_sequence, None)
-        .await
+    list_events_for_bounded_context_matching_tags_with_bc(
+        pool,
+        &bc,
+        tags,
+        after_sequence,
+        None,
+        None,
+    )
+    .await
 }
 
 /// The same query [`list_events_for_bounded_context_matching_tags`] runs,
@@ -5487,6 +5494,7 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
     tags: &[Tag],
     after_sequence: Option<i64>,
     known_event_types: Option<&std::collections::HashMap<String, EventType>>,
+    limit: Option<i64>,
 ) -> crate::error::Result<Vec<Event>> {
     if tags.is_empty() {
         return Ok(Vec::new());
@@ -5513,13 +5521,20 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
         Some(_) => format!("({tag_clause}) AND sequence > ${sequence_param}"),
         None => tag_clause,
     };
+    let limit_clause = match limit {
+        Some(_) => format!(
+            " LIMIT ${}",
+            sequence_param + usize::from(after_sequence.is_some())
+        ),
+        None => String::new(),
+    };
 
     let sql = format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
          metadata_client_id, metadata_created_at, metadata_correlation_id, \
          metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
-         WHERE {where_clause} ORDER BY sequence"
+         WHERE {where_clause} ORDER BY sequence{limit_clause}"
     );
     let mut query = sqlx::query_as::<_, EventRowAnyType>(sqlx::AssertSqlSafe(sql));
     for literal in tag_literals {
@@ -5527,6 +5542,9 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
     }
     if let Some(after_sequence) = after_sequence {
         query = query.bind(after_sequence);
+    }
+    if let Some(limit) = limit {
+        query = query.bind(limit);
     }
     let rows: Vec<EventRowAnyType> = query.fetch_all(pool).await?;
 
@@ -6041,6 +6059,69 @@ pub async fn collect_event_page(
         cache,
         bounded_context,
         event_type_name,
+        after_sequence,
+        max_events,
+        |chunk| {
+            page.extend(select(chunk, max_events - page.len())?);
+            Ok(page.len() < max_events)
+        },
+    )
+    .await?;
+    Ok(page)
+}
+
+/// The tag-filtered counterpart of [`for_each_event_chunk`]
+/// (docs/architecture.md §108): walks the events carrying any of `tags`,
+/// after `after_sequence`, in sequence order, `chunk_size` at a time
+/// through the tag index, calling `f` per chunk until it returns `false`
+/// or the matches run out. So a tag shared by a large part of a bounded
+/// context's history is never loaded whole. `f` runs at least once, even
+/// with no matches, so the caller's own validation still happens.
+pub async fn for_each_tagged_event_chunk(
+    pool: &Pool,
+    bounded_context: &str,
+    tags: &[Tag],
+    after_sequence: i64,
+    chunk_size: usize,
+    mut f: impl FnMut(&[Event]) -> crate::error::Result<bool>,
+) -> crate::error::Result<()> {
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    let chunk_size = chunk_size.max(1);
+    let limit = i64::try_from(chunk_size).unwrap_or(i64::MAX);
+    let mut after = after_sequence;
+    loop {
+        let chunk = list_events_for_bounded_context_matching_tags_with_bc(
+            pool,
+            &bc,
+            tags,
+            Some(after),
+            None,
+            Some(limit),
+        )
+        .await?;
+        if !f(&chunk)? || chunk.len() < chunk_size {
+            return Ok(());
+        }
+        after = chunk.last().map_or(after, |e| e.sequence);
+    }
+}
+
+/// [`collect_event_page`] over [`for_each_tagged_event_chunk`]: the first
+/// `max_events` events `select` serves out of those carrying any of
+/// `tags` after `after_sequence`, read a chunk at a time.
+pub async fn collect_tagged_event_page(
+    pool: &Pool,
+    bounded_context: &str,
+    tags: &[Tag],
+    after_sequence: i64,
+    max_events: usize,
+    mut select: impl FnMut(&[Event], usize) -> crate::error::Result<Vec<Event>>,
+) -> crate::error::Result<Vec<Event>> {
+    let mut page = Vec::new();
+    for_each_tagged_event_chunk(
+        pool,
+        bounded_context,
+        tags,
         after_sequence,
         max_events,
         |chunk| {
@@ -7205,6 +7286,7 @@ async fn decide_command_in_tx(
             consistency_tags,
             Some(original_highest),
             Some(&event_types_by_name),
+            None,
         )
         .await?;
         tracing::info!(

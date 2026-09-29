@@ -88,18 +88,19 @@ pub fn query_events_field() -> Field {
                     )
                 };
                 let page = match tags.as_deref() {
+                    // docs/architecture.md §108: through the tag index a
+                    // chunk at a time, like the untagged path below -
+                    // never every match of a widely shared tag at once.
                     Some(wanted) if !wanted.is_empty() => {
-                        let tagged =
-                            skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
-                                &state.pool,
-                                &state.event_cache,
-                                &bounded_context_name,
-                                wanted,
-                                after_sequence,
-                            )
-                            .await
-                            .map_err(to_graphql_error)?;
-                        select(&tagged, state.max_events_per_read)
+                        skilj_core::db::collect_tagged_event_page(
+                            &state.pool,
+                            &bounded_context_name,
+                            wanted,
+                            after_sequence.unwrap_or(-1),
+                            state.max_events_per_read,
+                            select,
+                        )
+                        .await
                     }
                     _ => {
                         skilj_core::db::collect_event_page(
@@ -217,17 +218,21 @@ pub fn count_events_field() -> Field {
             };
             let count = match tags.as_deref() {
                 Some(wanted) if !wanted.is_empty() => {
-                    let tagged =
-                        skilj_core::db::list_events_for_bounded_context_matching_tags_cached(
-                            &state.pool,
-                            &state.event_cache,
-                            &bounded_context_name,
-                            wanted,
-                            None,
-                        )
-                        .await
-                        .map_err(to_graphql_error)?;
-                    count_in(&tagged).map_err(to_graphql_error)?
+                    let mut total = 0;
+                    skilj_core::db::for_each_tagged_event_chunk(
+                        &state.pool,
+                        &bounded_context_name,
+                        wanted,
+                        -1,
+                        state.max_events_per_read,
+                        |chunk| {
+                            total += count_in(chunk)?;
+                            Ok(true)
+                        },
+                    )
+                    .await
+                    .map_err(to_graphql_error)?;
+                    total
                 }
                 _ => {
                     let mut total = 0;

@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A tag-filtered `queryEvents` or `countEvents` no longer loads every
+  event carrying the tag before paging or counting: both now walk the tag
+  index a chunk (`max_events_per_read`) at a time, like their untagged
+  forms. A broad tag - a customer or tenant touched by most of a bounded
+  context's history - used to be loaded whole on every such call.
 - **Wire:** `projection(..., waitForSequence:)` with a sequence past the
   bounded context's latest committed event is now refused at once with
   `wait_for_sequence_not_committed`, instead of polling until

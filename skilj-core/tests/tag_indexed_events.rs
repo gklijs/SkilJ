@@ -343,3 +343,77 @@ fn an_empty_tags_slice_returns_nothing_without_a_bounded_context_row() {
         assert_eq!(events, Vec::<Event>::new());
     });
 }
+
+/// docs/architecture.md §108: a tag-filtered read walks the tag index a
+/// chunk at a time - never more than `chunk_size` events in hand, other
+/// tags' events never included, every match visited exactly once in
+/// sequence order, and an empty result still calls back once.
+#[test]
+fn a_tagged_read_walks_matches_in_bounded_chunks() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let mut expected = Vec::new();
+        for i in 0..7 {
+            expected.push(insert_tagged_event(&pool, &bc, &et, vec![tag("customer", "c1")]).await);
+            if i % 2 == 0 {
+                insert_tagged_event(&pool, &bc, &et, vec![tag("customer", "c2")]).await;
+            }
+        }
+
+        let mut chunk_sizes = Vec::new();
+        let mut seen = Vec::new();
+        db::for_each_tagged_event_chunk(
+            &pool,
+            &bc.name,
+            &[tag("customer", "c1")],
+            -1,
+            3,
+            |chunk| {
+                chunk_sizes.push(chunk.len());
+                seen.extend(chunk.iter().map(|e| e.sequence));
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(chunk_sizes, vec![3, 3, 1]);
+        assert_eq!(seen, expected);
+
+        let mut calls = 0;
+        db::for_each_tagged_event_chunk(
+            &pool,
+            &bc.name,
+            &[tag("customer", "nobody")],
+            -1,
+            3,
+            |chunk| {
+                calls += 1;
+                assert!(chunk.is_empty());
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 1);
+
+        // `collect_tagged_event_page` stops as soon as the page is full.
+        let page = db::collect_tagged_event_page(
+            &pool,
+            &bc.name,
+            &[tag("customer", "c1")],
+            expected[1],
+            3,
+            |chunk, room| Ok(chunk.iter().take(room).cloned().collect()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            expected[2..5].to_vec()
+        );
+    });
+}

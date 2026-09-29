@@ -1688,6 +1688,81 @@ fn query_events_serves_bounded_pages_over_graphql() {
     });
 }
 
+/// docs/architecture.md §108: a tag-filtered `queryEvents` pages the same
+/// way, reading through the tag index a chunk at a time, and a
+/// tag-filtered `countEvents` sums over every chunk. Another tag's events,
+/// interleaved, are never served or counted.
+#[test]
+fn tagged_query_events_serves_bounded_pages_over_graphql() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt, _role) =
+            setup_with(|builder| builder.max_events_per_read(3)).await;
+        let router = skilj.graphql_router().await.unwrap();
+        for amount in 1..=7 {
+            for thing in ["t1", "t2"] {
+                let response = graphql_request(
+                    &router,
+                    Some(&jwt),
+                    SUBMIT_COMMAND_MUTATION,
+                    json!({
+                        "bc": bc_name,
+                        "name": "DoThingFast",
+                        "payload": format!(r#"{{"thing_id":"{thing}","amount":{amount}}}"#),
+                    }),
+                )
+                .await;
+                assert_eq!(response["data"]["submitCommand"]["accepted"], true, "{response:?}");
+            }
+        }
+
+        let mut after: Option<i64> = None;
+        let mut pages = Vec::new();
+        loop {
+            let response = graphql_request(
+                &router,
+                Some(&jwt),
+                "query($bc: String!, $after: Int) { \
+                    queryEvents(boundedContext: $bc, eventTypes: [\"ThingHappened\"], \
+                    tags: [{ key: \"thing\", value: \"t1\" }], afterSequence: $after) \
+                    { sequence payload } }",
+                json!({ "bc": bc_name, "after": after }),
+            )
+            .await;
+            assert!(response.get("errors").is_none(), "{response:?}");
+            let events = response["data"]["queryEvents"].as_array().unwrap().clone();
+            if events.is_empty() {
+                break;
+            }
+            after = events.last().unwrap()["sequence"].as_i64();
+            pages.push(
+                events
+                    .iter()
+                    .map(|e| {
+                        let payload: serde_json::Value =
+                            serde_json::from_str(e["payload"].as_str().unwrap()).unwrap();
+                        assert_eq!(payload["thing_id"], "t1");
+                        payload["amount"].as_i64().unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(pages, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { countEvents(boundedContext: $bc, eventTypes: [\"ThingHappened\"], \
+                tags: [{ key: \"thing\", value: \"t1\" }]) }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(response["data"]["countEvents"], 7, "{response:?}");
+    });
+}
+
 /// `fetchCommands` serves at most `max_events_per_read` commands (3
 /// here) in the order they were recorded, and a caller pages on with
 /// `afterCommandId` = the last one's `id`. An unknown `afterCommandId` is
