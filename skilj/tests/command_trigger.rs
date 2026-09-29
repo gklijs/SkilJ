@@ -910,3 +910,120 @@ fn command_dispatcher_required_role_reflects_the_requires_role_attribute() {
         assert_eq!(dispatcher.required_role(&bc_name, "NoSuchCommand"), None);
     });
 }
+
+/// Every read of many events resolves their origins in one batch - a
+/// command-triggered event embeds its whole originating command - where it
+/// used to resolve each row's command one at a time, several queries each
+/// (docs/architecture.md §125). Each such read must still give exactly
+/// what the unchanged single-row read gives for every event, over a mix of
+/// command-triggered and directly created ones.
+#[test]
+fn batched_event_reads_match_the_single_row_read() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, command_credential, pool, bc_name, mapping, _) = setup().await;
+        let event_type = db::get_event_type(&pool, &bc_name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        let direct_token = access_control::create_direct_creation_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &direct_token)
+            .await
+            .unwrap();
+        let direct_credential = format!("{}.{}", direct_token.id, direct_token.secret);
+        let router = skilj.rest_router();
+        for i in 0..12 {
+            let (uri, credential) = if i % 3 == 2 {
+                ("/v1/events/direct", &direct_credential)
+            } else {
+                ("/v1/commands/trigger", &command_credential)
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"payload":{{"amount":{i}}}}}"#)))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert!(
+                response.status().is_success(),
+                "{uri}: {}",
+                response.status()
+            );
+        }
+
+        let mut expected = Vec::new();
+        for sequence in 0..12 {
+            expected.push(
+                db::get_event_by_sequence(&pool, &bc_name, sequence)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|e| matches!(
+                    e.origin,
+                    skilj_core::event_store::EventOrigin::CommandTriggered { .. }
+                ))
+                .count(),
+            8
+        );
+
+        assert_eq!(
+            db::list_events_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            db::list_events_for_bounded_context_from(&pool, &bc_name, 3)
+                .await
+                .unwrap(),
+            expected[4..]
+        );
+        assert_eq!(
+            db::list_events_for_bounded_context_from_limited(&pool, &bc_name, 3, 5)
+                .await
+                .unwrap(),
+            expected[4..9]
+        );
+        assert_eq!(
+            db::list_recent_events_for_bounded_context(&pool, &bc_name, 4)
+                .await
+                .unwrap(),
+            expected[8..]
+        );
+        assert_eq!(
+            db::list_events(&pool, &bc_name, "MoneyDeposited")
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            db::list_events_from(&pool, &bc_name, "MoneyDeposited", 5)
+                .await
+                .unwrap(),
+            expected[6..]
+        );
+        assert_eq!(
+            db::list_events_from_limited(&pool, &bc_name, "MoneyDeposited", 5, 3)
+                .await
+                .unwrap(),
+            expected[6..9]
+        );
+    });
+}

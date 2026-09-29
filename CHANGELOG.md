@@ -165,6 +165,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reading many events resolved each command-triggered event's
+  originating command row by row, several queries each - a few thousand
+  queries for a 1000-event page. All multi-event reads (REST reads,
+  `queryEvents`/`countEvents` beyond the cache, projection catch-up,
+  cache warm-up) now resolve them in one batch (docs/architecture.md
+  §125).
 - Every event or command read - and every event a subscription
   delivers - loaded all private-field grants in the bounded context, with
   two or more queries per grant. Reads now load only the reader's own

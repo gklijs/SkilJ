@@ -10108,3 +10108,19 @@ Rendering an event or command for a reader - `queryEvents`, `inspectEvent`, `fet
 What a reader sees is unchanged: the same grants decide, just without the ones that could never apply to it.
 
 Test: `a_readers_grants_are_its_own_active_ones_with_their_records_resolved` (`skilj/tests/graphql_business_surfaces.rs`). It creates four grants from one author: to the reader for an event, to the reader for a command, a revoked one to the reader, and one to another Role. The grantee query returns exactly the first two, with the command's external id resolved. The full listing returns all four, equal to what was inserted. The existing private-field tests, which render through these paths, pass unchanged.
+
+## 125. Event reads resolve origins in one batch
+
+A command-triggered `Event` embeds its whole originating `Command` (`EventOrigin::CommandTriggered`), with the command's type and bounded context. Seven listing functions built each event row by row. Each command-triggered row ran `require_command`: a command query, then its type, then its bounded context, then that context's creator Role. The functions were:
+
+- `list_events_for_bounded_context`, `list_events_for_bounded_context_from` and `list_events_for_bounded_context_from_limited`, where the last is the chunked walk behind REST reads, `queryEvents` and `countEvents` when the event cache doesn't cover the range;
+- `list_recent_events_for_bounded_context`, the event cache's warm-up;
+- `list_events`, `list_events_from` and `list_events_from_limited`, which serve projection catch-up and type-filtered reads.
+
+A 1000-event page of command-triggered events was a few thousand queries.
+
+The DCB delta query already did this in a batch (§61), and §117 pulled that out as `events_from_rows`. All seven now use it: one query for any event types not already known, and one for all the originating commands plus one for their command types. That's a fixed handful per call instead of several per row. The three single-type functions select `event_type_name` too and pass their one type as already known, so the separate `EventRow` shape is gone. `event_origin_from_row` stays for `get_event_by_sequence`'s single-row read. `events_from_rows`' timing line moved from INFO to DEBUG, since it now runs on every read, not just a batch's delta query.
+
+The rewrite at first dropped `list_recent_events_for_bounded_context`'s `reverse()`. That function queries newest-first to make `LIMIT` cheap, and the reverse turns the result back to sequence order. The new test caught it.
+
+Test: `batched_event_reads_match_the_single_row_read` (`skilj/tests/command_trigger.rs`). Twelve events are written, eight command-triggered and four directly created. Each of the seven functions, over a full range, a range from a point, a limited range or the most recent few, returns exactly what `get_event_by_sequence` returns for each event - origins, embedded commands and command types included.

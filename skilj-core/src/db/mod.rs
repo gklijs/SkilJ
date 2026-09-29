@@ -5305,29 +5305,9 @@ pub async fn latest_sequence(
 
 // --- Event ---
 
-#[derive(sqlx::FromRow)]
-struct EventRow {
-    sequence: i64,
-    payload: String,
-    metadata_type: String,
-    metadata_version: i64,
-    metadata_client_id: String,
-    metadata_created_at: DateTime<Utc>,
-    // Codeberg issue #18 - `None` only for a row written before these
-    // columns existed.
-    metadata_correlation_id: Option<String>,
-    metadata_causation_id: Option<String>,
-    tags: Json<Vec<Tag>>,
-    origin_kind: String,
-    origin_source_content: Option<String>,
-    origin_source_context: Option<String>,
-    origin_command_id: Option<i64>,
-}
-
-/// Shared by `EventRow::into_domain` and `list_events_for_bounded_context`'s
-/// own row type below - identical origin columns, different row shapes
-/// (the latter also selects `event_type_name`, which doesn't fit
-/// `EventRow`'s single-event-type-at-a-time contract). Async, unlike
+/// One row's origin, for `get_event_by_sequence`'s single-row read -
+/// reads of many rows resolve origins in one batch through
+/// `events_from_rows` instead (docs/architecture.md §125). Async, unlike
 /// every other `*_from_row`/`*_to_str` helper in this module, because
 /// `command_triggered` needs a second query - `EventOrigin::CommandTriggered`
 /// embeds a whole `Command` by value (see the migration's own doc
@@ -5360,42 +5340,6 @@ async fn event_origin_from_row(
     })
 }
 
-impl EventRow {
-    async fn into_domain(
-        self,
-        pool: &Pool,
-        bounded_context: BoundedContext,
-        event_type: EventType,
-    ) -> crate::error::Result<Event> {
-        let origin = event_origin_from_row(
-            pool,
-            &bounded_context.name,
-            &self.origin_kind,
-            self.origin_source_content,
-            self.origin_source_context,
-            self.origin_command_id,
-        )
-        .await?;
-        Ok(Event {
-            bounded_context,
-            event_type,
-            payload: self.payload,
-            metadata: Metadata {
-                r#type: self.metadata_type,
-                version: self.metadata_version,
-                client_id: self.metadata_client_id,
-                created_at: self.metadata_created_at,
-                correlation_id: self.metadata_correlation_id,
-                causation_id: self.metadata_causation_id,
-            },
-            sequence: self.sequence,
-            tags: self.tags.0,
-            encryption_keys: Vec::new(),
-            origin,
-        })
-    }
-}
-
 /// Every `Event` currently stored for one `(bounded_context, event_type)`
 /// pair, ordered by `sequence` - the full-snapshot parameter
 /// `fetch_events`/`consume_events` each expect (see their own doc
@@ -5414,8 +5358,8 @@ pub async fn list_events(
     let et = require_event_type(pool, bounded_context, event_type_name).await?;
 
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
+    let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \
          metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \
          origin_kind, origin_source_content, origin_source_context, \
          origin_command_id FROM {schema}.events WHERE event_type_name = $1 ORDER BY sequence"
@@ -5424,11 +5368,8 @@ pub async fn list_events(
     .fetch_all(pool)
     .await?;
 
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        events.push(row.into_domain(pool, bc.clone(), et.clone()).await?);
-    }
-    Ok(events)
+    let known = std::collections::HashMap::from([(et.name.clone(), et)]);
+    events_from_rows(&mut *pool.acquire().await?, &bc, rows, Some(&known)).await
 }
 
 #[derive(sqlx::FromRow)]
@@ -5476,42 +5417,7 @@ pub async fn list_events_for_bounded_context(
     .fetch_all(pool)
     .await?;
 
-    let mut event_types: std::collections::HashMap<String, EventType> =
-        std::collections::HashMap::new();
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        if !event_types.contains_key(&row.event_type_name) {
-            let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
-            event_types.insert(row.event_type_name.clone(), et);
-        }
-        let origin = event_origin_from_row(
-            pool,
-            bounded_context,
-            &row.origin_kind,
-            row.origin_source_content,
-            row.origin_source_context,
-            row.origin_command_id,
-        )
-        .await?;
-        events.push(Event {
-            bounded_context: bc.clone(),
-            event_type: event_types[&row.event_type_name].clone(),
-            payload: row.payload,
-            metadata: Metadata {
-                r#type: row.metadata_type,
-                version: row.metadata_version,
-                client_id: row.metadata_client_id,
-                created_at: row.metadata_created_at,
-                correlation_id: row.metadata_correlation_id,
-                causation_id: row.metadata_causation_id,
-            },
-            sequence: row.sequence,
-            tags: row.tags.0,
-            encryption_keys: Vec::new(),
-            origin,
-        });
-    }
-    Ok(events)
+    events_from_rows(&mut *pool.acquire().await?, &bc, rows, None).await
 }
 
 /// Every `Event` committed after `after_sequence`, ordered by `sequence`.
@@ -5539,42 +5445,7 @@ pub async fn list_events_for_bounded_context_from(
     .fetch_all(pool)
     .await?;
 
-    let mut event_types: std::collections::HashMap<String, EventType> =
-        std::collections::HashMap::new();
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        if !event_types.contains_key(&row.event_type_name) {
-            let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
-            event_types.insert(row.event_type_name.clone(), et);
-        }
-        let origin = event_origin_from_row(
-            pool,
-            bounded_context,
-            &row.origin_kind,
-            row.origin_source_content,
-            row.origin_source_context,
-            row.origin_command_id,
-        )
-        .await?;
-        events.push(Event {
-            bounded_context: bc.clone(),
-            event_type: event_types[&row.event_type_name].clone(),
-            payload: row.payload,
-            metadata: Metadata {
-                r#type: row.metadata_type,
-                version: row.metadata_version,
-                client_id: row.metadata_client_id,
-                created_at: row.metadata_created_at,
-                correlation_id: row.metadata_correlation_id,
-                causation_id: row.metadata_causation_id,
-            },
-            sequence: row.sequence,
-            tags: row.tags.0,
-            encryption_keys: Vec::new(),
-            origin,
-        });
-    }
-    Ok(events)
+    events_from_rows(&mut *pool.acquire().await?, &bc, rows, None).await
 }
 
 /// `list_events_for_bounded_context_from`'s own capped sibling -
@@ -5605,42 +5476,7 @@ pub async fn list_events_for_bounded_context_from_limited(
     .fetch_all(pool)
     .await?;
 
-    let mut event_types: std::collections::HashMap<String, EventType> =
-        std::collections::HashMap::new();
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        if !event_types.contains_key(&row.event_type_name) {
-            let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
-            event_types.insert(row.event_type_name.clone(), et);
-        }
-        let origin = event_origin_from_row(
-            pool,
-            bounded_context,
-            &row.origin_kind,
-            row.origin_source_content,
-            row.origin_source_context,
-            row.origin_command_id,
-        )
-        .await?;
-        events.push(Event {
-            bounded_context: bc.clone(),
-            event_type: event_types[&row.event_type_name].clone(),
-            payload: row.payload,
-            metadata: Metadata {
-                r#type: row.metadata_type,
-                version: row.metadata_version,
-                client_id: row.metadata_client_id,
-                created_at: row.metadata_created_at,
-                correlation_id: row.metadata_correlation_id,
-                causation_id: row.metadata_causation_id,
-            },
-            sequence: row.sequence,
-            tags: row.tags.0,
-            encryption_keys: Vec::new(),
-            origin,
-        });
-    }
-    Ok(events)
+    events_from_rows(&mut *pool.acquire().await?, &bc, rows, None).await
 }
 
 /// Tag-indexed sibling of `list_events_for_bounded_context`/`_from` -
@@ -5763,10 +5599,12 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
 /// batching the lookups they need: one query for every event type
 /// `known_event_types` doesn't already answer, and one (plus one for
 /// their command types) for every originating command a
-/// `command_triggered` row names. Shared by the DCB delta query and a new
-/// sync projection's locked tail read, both of which run it on the
+/// `command_triggered` row names. Every read of many events goes through
+/// it (docs/architecture.md §125) - they used to resolve each row's
+/// originating command one at a time, several queries each. The DCB
+/// delta query and a new sync projection's locked tail read run it on the
 /// transaction holding the bounded context's `sequence` lock
-/// (docs/architecture.md §117).
+/// (docs/architecture.md §117); the others on a connection of their own.
 async fn events_from_rows(
     conn: &mut sqlx::PgConnection,
     bc: &BoundedContext,
@@ -5890,12 +5728,12 @@ async fn events_from_rows(
             origin,
         });
     }
-    tracing::info!(
+    tracing::debug!(
         row_count,
         row_loop_us = row_loop_started.elapsed().as_micros(),
         event_type_lookup_us = event_type_lookup_elapsed.as_micros(),
         origin_lookup_us = origin_lookup_elapsed.as_micros(),
-        "delta query row-processing loop"
+        "event rows resolved"
     );
     Ok(events)
 }
@@ -5981,44 +5819,9 @@ pub async fn list_recent_events_for_bounded_context(
     .fetch_all(pool)
     .await?;
 
-    let mut event_types: std::collections::HashMap<String, EventType> =
-        std::collections::HashMap::new();
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        if !event_types.contains_key(&row.event_type_name) {
-            let et = require_event_type(pool, bounded_context, &row.event_type_name).await?;
-            event_types.insert(row.event_type_name.clone(), et);
-        }
-        let origin = event_origin_from_row(
-            pool,
-            bounded_context,
-            &row.origin_kind,
-            row.origin_source_content,
-            row.origin_source_context,
-            row.origin_command_id,
-        )
-        .await?;
-        events.push(Event {
-            bounded_context: bc.clone(),
-            event_type: event_types[&row.event_type_name].clone(),
-            payload: row.payload,
-            metadata: Metadata {
-                r#type: row.metadata_type,
-                version: row.metadata_version,
-                client_id: row.metadata_client_id,
-                created_at: row.metadata_created_at,
-                correlation_id: row.metadata_correlation_id,
-                causation_id: row.metadata_causation_id,
-            },
-            sequence: row.sequence,
-            tags: row.tags.0,
-            encryption_keys: Vec::new(),
-            origin,
-        });
-    }
+    let mut events = events_from_rows(&mut *pool.acquire().await?, &bc, rows, None).await?;
     // The query above fetched newest-first to make LIMIT cheap - reverse
-    // back to the ascending order every other listing function, and
-    // EventCache's own window, expects.
+    // back to sequence order.
     events.reverse();
     Ok(events)
 }
@@ -6037,8 +5840,8 @@ pub async fn list_events_from(
     let et = require_event_type(pool, bounded_context, event_type_name).await?;
 
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
+    let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \
          metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \
          origin_kind, origin_source_content, origin_source_context, \
          origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \
@@ -6049,11 +5852,8 @@ pub async fn list_events_from(
     .fetch_all(pool)
     .await?;
 
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        events.push(row.into_domain(pool, bc.clone(), et.clone()).await?);
-    }
-    Ok(events)
+    let known = std::collections::HashMap::from([(et.name.clone(), et)]);
+    events_from_rows(&mut *pool.acquire().await?, &bc, rows, Some(&known)).await
 }
 
 /// At most one event of each of `event_types`, in `bounded_context` -
@@ -6150,8 +5950,8 @@ pub async fn list_events_from_limited(
     let et = require_event_type(pool, bounded_context, event_type_name).await?;
 
     let schema = schema_ident(bounded_context);
-    let rows: Vec<EventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT sequence, payload, metadata_type, metadata_version, metadata_client_id, \
+    let rows: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, metadata_client_id, \
          metadata_created_at, metadata_correlation_id, metadata_causation_id, tags, \
          origin_kind, origin_source_content, origin_source_context, \
          origin_command_id FROM {schema}.events WHERE event_type_name = $1 AND sequence > $2 \
@@ -6163,11 +5963,8 @@ pub async fn list_events_from_limited(
     .fetch_all(pool)
     .await?;
 
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        events.push(row.into_domain(pool, bc.clone(), et.clone()).await?);
-    }
-    Ok(events)
+    let known = std::collections::HashMap::from([(et.name.clone(), et)]);
+    events_from_rows(&mut *pool.acquire().await?, &bc, rows, Some(&known)).await
 }
 
 /// `FetchEvents`/`ConsumeEvents`'s own real read path - see
