@@ -9844,3 +9844,34 @@ Test: `active_roles_by_external_subject_returns_only_the_active_claimant` (`skil
 Fix: `validation.validate_nbf = true`. `nbf` stays optional (it isn't added to the required claims), since most IdPs omit it, and when it's there it gets the same default 60-second leeway as `exp`, so ordinary clock skew between the IdP and this host doesn't refuse fresh tokens. This is the only place that validates JWTs: GraphQL over HTTP and WebSocket `connection_init` both go through it (REST authenticates with its own `<id>.<secret>` tokens, not JWTs).
 
 Test: `verify_and_extract_subject_rejects_a_token_not_yet_valid` (`skilj-core/tests/jwt_verification.rs`). A token with `nbf` an hour ahead is refused as `jwt_verification_failed`; one with `nbf` a minute in the past verifies. Before the fix, the future one verified.
+
+## 112. REST read cursors pass over what they examined
+
+§69 bounded each REST read to `max_events_per_read` *served* events and deliberately didn't cap what a read *examines*: capping examined candidates would leave a filtered consumer whose next N candidates all missed with an empty page and an unmoved cursor forever. That kept every read making progress, but the cursor still only moved to the last event *served*:
+
+- `GET /v1/events`' `nextCursor` was the last served event's sequence (or the request's own `after` when nothing was served).
+- An auto-advance `consume` cursor moved to `highest_sequence(served)`, and not at all when nothing matched. `rule ConsumeEvents` said so on purpose: an excluded event was "passed over without being served and without moving the position past it".
+
+So a reader whose filter or owner scope matched rarely examined everything after its last match on every poll. Memory stayed at one chunk plus the page, but database work grew with history. The realistic case is a tenant-scoped `EventReadToken` in a multi-tenant context: a tenant with no recent events polled by re-reading every other tenant's events since its own last one, and a tenant that never had any re-read the whole event type every time.
+
+A second problem sat in the same lines. A manual-ack poll that served nothing still claimed the checkout lease (`CursorUpdate::Claimed`, or `checked_out_at: now` on a new cursor). For the next `read_cursor_checkout_lease` (5 minutes by default) every poll on that token saw `is_leased` and got an empty page, new events included. The only way out was to acknowledge the current position - a batch the client was never given, and not something any client would think to do. Polling an idle stream therefore delayed the next event by up to the lease.
+
+**Fix.** User's choice (over also capping each request's scan and adding a `caughtUp` flag to the wire, or documenting the cost): advance to the scanned position, with no wire change.
+
+- `db::collect_scanned_event_page` is `collect_event_page` that also reports `scanned_through`, the highest sequence it examined. The walk covers every event of the token's type in sequence order, so on a page short of the cap everything up to `scanned_through` was offered to the rule and whatever wasn't served was excluded.
+- `event_store::consume_events_page` takes `scanned_through`. On a short page, auto-advance moves to it (never backwards) rather than to the last served event. A full page stops at its last served event, since what follows wasn't examined. Manual-ack moves to it only on a call that serves nothing and holds no live claim: with nothing served there is nothing to acknowledge or redeliver. With events served, only `AcknowledgeEvents` moves it, as before, and at-least-once is untouched.
+- A manual-ack call that serves nothing no longer claims the lease, on a new cursor or an existing one.
+- `GET /v1/events` computes `nextCursor` the same way.
+
+It's sound because events become visible in sequence order: `next_sequence`'s `UPDATE` holds the bounded context's sequence row lock until its transaction commits, so no event can later appear below a sequence a read already examined (§89 relies on the same property).
+
+A cursor was already filter-relative - auto-advance passes over non-matching events between two matches - and now passes over trailing ones too. `docs/rest-event-reading.md` says to keep one `filter` for a whole walk, and that `nextCursor` can be ahead of the last event served. A first catch-up over a long history with a narrow filter still walks it once; only repeating that walk on every poll is gone. GraphQL `queryEvents` returns a bare list with no cursor (a caller continues from the last `sequence` it got), so it's unchanged.
+
+**Spec.** `rule ConsumeEvents`: `next_position` is `highest_sequence(candidates) ?? position` when fewer than `config.max_events_per_read` are served (auto-advance, or manual-ack with nothing served and no live claim). `checked_out_at` is set only when `served.count > 0`, and a manual-ack call that serves nothing updates `cursor.sequence` instead of claiming. `ReadCursor.sequence`, `ReadCursor.checked_out_at` and `DeliveryFollowsAckMode` are reworded to match. `allium check`/`analyse` output is unchanged (22 diagnostics, as before).
+
+Test: `reads_serve_bounded_pages_and_continue_where_they_stopped` (`skilj/tests/event_fetch_rest.rs`, page size 3, eight events) gains three checks:
+- A filter matching only the first event, or nothing, gets `nextCursor` = the newest event's sequence; a full filtered page's `nextCursor` stays at its third event. Before: `0` and absent.
+- An auto-advance consumer whose first poll matches nothing has nothing left on an unfiltered poll. Before: `[1, 2, 3]`.
+- A manual-ack consumer whose first poll serves nothing gets an event deposited right after on its next poll. Before: nothing, since the empty poll held the lease.
+
+Each check fails with its part of the fix reverted.

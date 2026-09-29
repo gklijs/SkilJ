@@ -761,7 +761,7 @@ async fn get_events(
     let token = resolve_token::<EventReadToken>(&state, &credential).await?;
     // At most `max_events_per_read`, loaded a chunk at a time - a caller
     // pages on with `after` = this response's `nextCursor`.
-    let matched = db::collect_event_page(
+    let page = db::collect_scanned_event_page(
         &state.pool,
         &state.event_cache,
         &token.event_type.bounded_context.name,
@@ -780,10 +780,21 @@ async fn get_events(
         },
     )
     .await?;
-    let next_cursor = matched
-        .last()
-        .map(|e| e.sequence.to_string())
-        .or_else(|| query.after.map(|a| a.to_string()));
+    let matched = page.events;
+    // A short page walked to the end of history, and nothing it passed
+    // over matched - so the cursor moves past all of it, not just to the
+    // last event served, and the next poll starts after what this one
+    // already examined (docs/architecture.md §112). A full page stops at
+    // its last event.
+    let last_served = matched.last().map(|e| e.sequence);
+    let next_position = if matched.len() < state.max_events_per_read {
+        last_served.max(page.scanned_through)
+    } else {
+        last_served
+    };
+    let next_cursor = next_position
+        .or(query.after)
+        .map(|sequence| sequence.to_string());
 
     // `redact_private_fields` - unconditional, no `Role`/`access_mapping`
     // to condition it on (see that function's own doc comment, and
@@ -871,7 +882,7 @@ async fn get_events_consume(
     // filters `ConsumeEvents` serves by (type, `filters`, owner scope),
     // and `consume_events_page` below re-applies them over this already
     // bounded set along with the lease and cursor logic.
-    let candidates = db::collect_event_page(
+    let candidates = db::collect_scanned_event_page(
         &state.pool,
         &state.event_cache,
         bounded_context_name,
@@ -889,7 +900,8 @@ async fn get_events_consume(
         existing_cursor.as_ref(),
         ack_mode,
         position,
-        &candidates,
+        &candidates.events,
+        candidates.scanned_through,
         &filters,
         Utc::now(),
         state.read_cursor_checkout_lease,

@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- REST reads no longer re-walk events a filter or the token's scope
+  excluded. On a page shorter than `max_events_per_read`, `GET
+  /v1/events`' `nextCursor`, and an auto-advance `consume` cursor, now
+  move to the highest sequence the read examined, not the last event
+  served - so a narrow filter or a tenant-scoped token in a busy
+  context no longer re-reads everything after its last match on every
+  poll. A manual-ack cursor does the same on a call that serves
+  nothing. A full page still stops at its last event. `nextCursor` can
+  therefore be ahead of the last event a page contains; keep one
+  `filter` for a whole walk (docs/architecture.md §112). Breaking for
+  direct callers of `event_store::consume_events_page`, which takes a
+  new `scanned_through` argument (`db::collect_scanned_event_page`
+  supplies it).
 - Authenticating a GraphQL request (HTTP, or a WebSocket's
   `connection_init`) no longer loads the whole `roles` table: it looks up
   the one active Role claiming the verified subject, through the unique
@@ -123,6 +136,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A manual-ack `GET /v1/events/consume` that served nothing still
+  claimed the checkout lease, so for the next `read_cursor_checkout_lease`
+  (default 5 minutes) every poll on that token returned nothing - new
+  events included - unless the client acknowledged a batch it was never
+  given. An empty page now claims nothing (docs/architecture.md §112).
 - Writing an event or command with a sensitive field for a *new*
   subject could panic if, at that moment, another write provisioned the
   subject's key and a `forgetSubject` destroyed it before this one read

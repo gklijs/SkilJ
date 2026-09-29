@@ -20,6 +20,12 @@ A few things that trip people up:
   continues from its own cursor). With manual-ack, acknowledge the last event you handled before
   asking for the next page - the next page starts after the acknowledged one. A replay of a long
   history (below) arrives this way too, a page per call.
+- **`nextCursor` marks how far the server looked, not just the last event you got.** On a short
+  page it can be past the last event served - past events your `filter` or the token's scope
+  left out - so keep polling from it and a narrow filter doesn't make the server re-read the
+  same excluded events every time. A `consume` cursor moves the same way (for manual-ack, only
+  on a call that serves nothing). Use the same `filter` for the whole walk: a cursor reached under
+  one filter has passed over events a different filter would have matched.
 - **One token = one read position.** If you want two independent places in the stream (say, two
   worker instances), mint two `EventReadToken`s rather than trying to share one — there's no
   separate "consumer name" to pass.
@@ -50,7 +56,8 @@ A few things that trip people up:
   event's own `sequence`).
 - **A served, unacknowledged batch is claimed for a while.** A manual-ack fetch claims what it
   serves for `read_cursor_checkout_lease` (default 5 minutes, set on the server's `SkiljBuilder`),
-  so that two workers sharing a token never both get the same events. Until you acknowledge or
+  so that two workers sharing a token never both get the same events. A fetch that serves nothing
+  claims nothing, so polling an idle stream never delays the next event. Until you acknowledge or
   the claim lapses, the *same token's* next fetch returns nothing. So if handling an event fails
   and you want to retry, keep the batch you were served and retry it in memory - don't fetch
   again expecting it back, or you'll wait out the whole lease (see

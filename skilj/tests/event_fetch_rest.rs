@@ -1139,6 +1139,55 @@ fn reads_serve_bounded_pages_and_continue_where_they_stopped() {
         deposit(&router, &direct, 8).await;
         let next = get_json(&router, &latest, "/v1/events/consume").await;
         assert_eq!(amounts(&next), vec![8]);
+
+        // docs/architecture.md §112: a short page walked to the end of
+        // history, so its cursor passes over the non-matching events it
+        // examined instead of stopping at the last event served - a
+        // narrow filter no longer re-walks them on every poll.
+        let newest = get_json(&router, &reader, "/v1/events?filter=amount:in:8").await;
+        let newest = newest["events"][0]["sequence"]
+            .as_i64()
+            .unwrap()
+            .to_string();
+        let page = get_json(&router, &reader, "/v1/events?filter=amount:in:1").await;
+        assert_eq!(amounts(&page), vec![1]);
+        assert_eq!(page["nextCursor"].as_str(), Some(newest.as_str()));
+        let page = get_json(&router, &reader, "/v1/events?filter=amount:in:99").await;
+        assert_eq!(amounts(&page), Vec::<i64>::new());
+        assert_eq!(page["nextCursor"].as_str(), Some(newest.as_str()));
+        // A full page stops at its last event: what follows wasn't examined.
+        let page = get_json(&router, &reader, "/v1/events?filter=amount:in:1,2,3,4").await;
+        assert_eq!(amounts(&page), vec![1, 2, 3]);
+        let third = page["events"][2]["sequence"].as_i64().unwrap().to_string();
+        assert_eq!(page["nextCursor"].as_str(), Some(third.as_str()));
+
+        // An auto-advance consumer's cursor passes over them too: after a
+        // poll matching nothing, an unfiltered poll has nothing left.
+        let consumer = mint_read(None).await;
+        let first = get_json(
+            &router,
+            &consumer,
+            "/v1/events/consume?mode=auto&filter=amount:in:99",
+        )
+        .await;
+        assert_eq!(amounts(&first), Vec::<i64>::new());
+        let next = get_json(&router, &consumer, "/v1/events/consume").await;
+        assert_eq!(amounts(&next), Vec::<i64>::new());
+
+        // A manual-ack poll that serves nothing claims nothing: the next
+        // poll gets a new event at once, not after the checkout lease
+        // lapses - and it's the new event, the examined ones passed over.
+        let manual = mint_read(None).await;
+        let first = get_json(
+            &router,
+            &manual,
+            "/v1/events/consume?mode=manual&filter=amount:in:99",
+        )
+        .await;
+        assert_eq!(amounts(&first), Vec::<i64>::new());
+        deposit(&router, &direct, 9).await;
+        let next = get_json(&router, &manual, "/v1/events/consume").await;
+        assert_eq!(amounts(&next), vec![9]);
     });
 }
 

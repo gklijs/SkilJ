@@ -3171,12 +3171,26 @@ pub fn consume_events(
     now: chrono::DateTime<chrono::Utc>,
     checkout_lease: chrono::Duration,
 ) -> crate::error::Result<ConsumeEventsResult> {
+    let position = existing_cursor.map_or_else(
+        || initial_consume_position(token, events),
+        |cursor| cursor.sequence,
+    );
+    // `events` is the whole history, so every event of the token's type
+    // after `position` was examined.
+    let scanned_through = events
+        .iter()
+        .filter(|e| e.bounded_context == token.event_type.bounded_context)
+        .filter(|e| e.event_type == token.event_type)
+        .filter(|e| e.sequence > position)
+        .map(|e| e.sequence)
+        .max();
     consume_events_page(
         token,
         existing_cursor,
         ack_mode,
-        initial_consume_position(token, events),
+        position,
         events,
+        scanned_through,
         filters,
         now,
         checkout_lease,
@@ -3231,6 +3245,13 @@ pub fn initial_consume_position<'a>(
 /// `config.max_events_per_read`. `events` then only needs to hold the
 /// candidates after that position - which is what lets `skilj-rest` load
 /// them a chunk at a time.
+///
+/// `scanned_through` is the highest sequence of the token's event type
+/// after the cursor's position that the caller examined, every such
+/// event up to it being in `events` (`None` if it examined none). When
+/// fewer than `max_events` are served, nothing up to it was left
+/// unserved that this call could serve, so the cursor moves there rather
+/// than stopping at the last event served (docs/architecture.md §112).
 #[allow(clippy::too_many_arguments)]
 pub fn consume_events_page(
     token: &EventReadToken,
@@ -3238,6 +3259,7 @@ pub fn consume_events_page(
     ack_mode: Option<AckMode>,
     new_cursor_position: i64,
     events: &[Event],
+    scanned_through: Option<i64>,
     filters: &[Filter],
     now: chrono::DateTime<chrono::Utc>,
     checkout_lease: chrono::Duration,
@@ -3303,8 +3325,24 @@ pub fn consume_events_page(
             .collect()
     };
 
+    // docs/architecture.md §112: a short page means every examined event
+    // this call didn't serve failed its filters or scope, so the cursor
+    // passes over them to `scanned_through` - otherwise a narrow filter
+    // or scope walked the same non-matching events again on every poll.
+    // A full page stops at its last event: what follows wasn't looked at.
+    let caught_up = (served.len() < max_events).then(|| {
+        position
+            .max(highest_sequence(&served).unwrap_or(position))
+            .max(scanned_through.unwrap_or(position))
+    });
     let next_position = match mode {
-        AckMode::AutoAdvance => highest_sequence(&served).unwrap_or(position),
+        AckMode::AutoAdvance => {
+            caught_up.unwrap_or_else(|| highest_sequence(&served).unwrap_or(position))
+        }
+        // Nothing served means nothing to acknowledge or redeliver, so a
+        // manual cursor passes over the examined events too. With events
+        // served, only an acknowledgement moves it.
+        AckMode::ManualAck if !is_leased && served.is_empty() => caught_up.unwrap_or(position),
         AckMode::ManualAck => position,
     };
 
@@ -3313,13 +3351,25 @@ pub fn consume_events_page(
             token: token.clone(),
             ack_mode: mode,
             sequence: next_position,
-            checked_out_at: (mode == AckMode::ManualAck).then_some(now),
+            // A claim protects a served batch; an empty page has none, and
+            // claiming it would leave the next polls empty - new events
+            // included - until the lease lapsed (§112).
+            checked_out_at: (mode == AckMode::ManualAck && !served.is_empty()).then_some(now),
             updated_at: now,
         }))
     } else if mode == AckMode::AutoAdvance {
         CursorUpdate::Advanced {
             sequence: next_position,
             updated_at: now,
+        }
+    } else if !is_leased && served.is_empty() {
+        if next_position == position {
+            CursorUpdate::Unchanged
+        } else {
+            CursorUpdate::Advanced {
+                sequence: next_position,
+                updated_at: now,
+            }
         }
     } else if !is_leased {
         // manual_ack, and either never claimed or a stale claim just

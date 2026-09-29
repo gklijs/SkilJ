@@ -1611,7 +1611,9 @@ entity ReadCursor {
                                             -- ConsumeEvents itself advances it on every call.
                                             -- manual_ack: the highest sequence acknowledged so far.
                                             -- Serving events never moves it - only
-                                            -- AcknowledgeEvents does - so consuming again before
+                                            -- AcknowledgeEvents does, or a ConsumeEvents call that
+                                            -- serves nothing at all passing over the events it
+                                            -- examined - so consuming again before
                                             -- acknowledging re-serves the same events. That
                                             -- re-service is the mechanism rather than a special
                                             -- case, and it is exactly what makes manual_ack
@@ -1628,8 +1630,9 @@ entity ReadCursor {
     -- manual_ack only - always null for an auto_advance cursor, which has
     -- no equivalent gap to close (serving already advances it in the same
     -- moment, so there is nothing left unacknowledged for a second caller
-    -- to race). Set by ConsumeEvents when it serves a manual_ack cursor
-    -- whose own claim was not already held (see that rule's own manual_ack
+    -- to race). Set by ConsumeEvents when it serves a non-empty batch from
+    -- a manual_ack cursor whose own claim was not already held - an empty
+    -- page protects nothing, so it claims nothing (see that rule's own manual_ack
     -- branch), and cleared by AcknowledgeEvents - so it marks exactly the
     -- span between "served" and "acknowledged", never anything wider.
     -- While set and not yet older than config.read_cursor_checkout_lease,
@@ -2928,11 +2931,11 @@ rule ConsumeEvents {
     -- are two ways to read one stream under one permission model, so what
     -- either serves is the same set (see the note above). An event this
     -- token is not scoped to is not served here either - see rule
-    -- QueryEvents' guidance on event_owner_scope_satisfied. What that
-    -- composition does not change is the cursor: an event excluded because
-    -- of scope is treated exactly as one excluded by a filter already is,
-    -- passed over without being served and without moving the position
-    -- past it. is_leased overrides all of that to the empty set - a
+    -- QueryEvents' guidance on event_owner_scope_satisfied. An event
+    -- excluded because of scope is treated exactly as one excluded by a
+    -- filter already is: passed over without being served (see
+    -- next_position below for where that leaves the cursor). is_leased
+    -- overrides all of that to the empty set - a
     -- second caller racing a live claim sees no candidates at all, not a
     -- filtered or scope-narrowed view of them.
     let served =
@@ -2942,11 +2945,27 @@ rule ConsumeEvents {
                 matches_filters(e, filters) and event_owner_scope_satisfied(e, token.scope)),
             config.max_events_per_read)
 
-    -- Unchanged when nothing matched, in either mode: an auto_advance
-    -- cursor has nothing new to advance past, and a manual_ack one never
-    -- moves here at all.
+    -- A page short of config.max_events_per_read examined every candidate,
+    -- and every one it did not serve was excluded by filters or scope, so
+    -- the position passes over all of them to the highest candidate -
+    -- otherwise a narrow filter or scope examined the same excluded events
+    -- again on every call. A full page stops at its last served event,
+    -- since candidates after it were not examined. That is only sound
+    -- because events become visible in sequence order: nothing can later
+    -- appear below a sequence already examined.
+    --
+    -- auto_advance moves there whenever it serves. manual_ack moves only
+    -- when it serves nothing and holds no live claim: with nothing served
+    -- there is nothing to acknowledge or redeliver, and passing over the
+    -- excluded events is all that happens; with events served, only
+    -- AcknowledgeEvents moves it, as before.
+    -- Every candidate is after position, so this never moves backwards.
+    let caught_up_position = highest_sequence(candidates) ?? position
     let next_position =
-        if mode = auto_advance: highest_sequence(served) ?? position
+        if mode = auto_advance:
+            if served.count < config.max_events_per_read: caught_up_position
+            else: highest_sequence(served) ?? position
+        else if not is_leased and served.count = 0: caught_up_position
         else: position
 
     -- Redacted on the way out, unconditionally and by the very same black
@@ -2969,10 +2988,16 @@ rule ConsumeEvents {
                 token: token,
                 ack_mode: mode,
                 sequence: next_position,
-                checked_out_at: if mode = manual_ack: now else: null,
+                checked_out_at: if mode = manual_ack and served.count > 0: now else: null,
                 updated_at: now
             )
         else if mode = auto_advance:
+            cursor.sequence = next_position
+            cursor.updated_at = now
+        else if not is_leased and served.count = 0:
+            -- manual_ack with nothing served: no batch to claim - a claim
+            -- here would leave the next calls empty, new events included,
+            -- until the lease lapsed - only the examined events passed over.
             cursor.sequence = next_position
             cursor.updated_at = now
         else if not is_leased:
@@ -6955,8 +6980,10 @@ surface EventFetch {
         -- rather than by a live connection.
         --
         -- manual_ack is at-least-once, and the one place in this
-        -- specification that guarantee exists: nothing is passed over
-        -- unacknowledged, and the price is that a caller consuming twice
+        -- specification that guarantee exists: nothing that call could
+        -- serve is passed over unacknowledged (an empty call passes over
+        -- only events its filters or scope excluded - see ConsumeEvents'
+        -- next_position), and the price is that a caller consuming twice
         -- without acknowledging in between is served the same events
         -- twice. Handling those duplicates is the caller's own
         -- responsibility - idempotent processing, say - and never

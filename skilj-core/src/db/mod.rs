@@ -6112,9 +6112,50 @@ pub async fn collect_event_page(
     event_type_name: Option<&str>,
     after_sequence: i64,
     max_events: usize,
-    mut select: impl FnMut(&[Event], usize) -> crate::error::Result<Vec<Event>>,
+    select: impl FnMut(&[Event], usize) -> crate::error::Result<Vec<Event>>,
 ) -> crate::error::Result<Vec<Event>> {
+    Ok(collect_scanned_event_page(
+        pool,
+        cache,
+        bounded_context,
+        event_type_name,
+        after_sequence,
+        max_events,
+        select,
+    )
+    .await?
+    .events)
+}
+
+/// A page from [`collect_scanned_event_page`]: the events served, and the
+/// highest sequence the walk examined (`None` if it examined nothing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScannedEventPage {
+    pub events: Vec<Event>,
+    pub scanned_through: Option<i64>,
+}
+
+/// [`collect_event_page`], also reporting how far it walked. When the
+/// page came back short of `max_events`, the walk reached the end of
+/// history, and `select` passed over every examined event it didn't
+/// serve - so a reader's cursor can move to `scanned_through` rather than
+/// the last event served, and the next poll doesn't walk the same
+/// non-matching events again (docs/architecture.md §112). Safe because
+/// events become visible in sequence order: `next_sequence`'s row lock
+/// is held until its transaction commits, so nothing can later appear
+/// below a sequence already read.
+#[allow(clippy::too_many_arguments)]
+pub async fn collect_scanned_event_page(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    event_type_name: Option<&str>,
+    after_sequence: i64,
+    max_events: usize,
+    mut select: impl FnMut(&[Event], usize) -> crate::error::Result<Vec<Event>>,
+) -> crate::error::Result<ScannedEventPage> {
     let mut page = Vec::new();
+    let mut scanned_through = None;
     for_each_event_chunk(
         pool,
         cache,
@@ -6123,12 +6164,18 @@ pub async fn collect_event_page(
         after_sequence,
         max_events,
         |chunk| {
+            if let Some(last) = chunk.last() {
+                scanned_through = Some(last.sequence);
+            }
             page.extend(select(chunk, max_events - page.len())?);
             Ok(page.len() < max_events)
         },
     )
     .await?;
-    Ok(page)
+    Ok(ScannedEventPage {
+        events: page,
+        scanned_through,
+    })
 }
 
 /// The tag-filtered counterpart of [`for_each_event_chunk`]
