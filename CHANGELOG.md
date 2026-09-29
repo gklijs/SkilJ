@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SubmitCommandPayload.matchingEventsTruncated: Boolean` - whether a
+  rejection's `matchingEvents` left out events for the
+  `max_events_per_read` cap (docs/architecture.md §118).
 - `SkiljBuilder::application_version(u64)`: an ever-increasing version
   stamped on every `EventType`/`CommandType`/`Projection` registration
   this process makes at startup. A process older than a registration's
@@ -153,6 +156,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `inspectEvent`'s `origin.triggeringCommandPayload` returned the
+  originating command's payload as stored - its private fields in
+  plaintext to any Admin. It is now rendered as `fetchCommands` renders
+  it (docs/architecture.md §120).
+- `parkedDeliveries`, `retryParkedDelivery` and `discardParkedDelivery`
+  returned parked requests raw - never-encrypted sensitive fields and
+  private fields in plaintext - and let a scope-restricted Admin see and
+  act on every owner's rows. Requests are now masked per caller, and a
+  scoped Admin handles only its own owner's rows (docs/architecture.md
+  §119).
+- A rejected `submitCommand`'s `matchingEvents` returned events as
+  stored: private fields in plaintext to any Admin, events owned by
+  others to a scope-restricted Admin, and no limit on how many. They are
+  now scoped, rendered and capped as `queryEvents` serves them - at most
+  `max_events_per_read`, the most recent (docs/architecture.md §118).
 - The rest of that stall (docs/architecture.md §117): a command's
   idempotency-key lookup, DCB conflict check and newly needed
   encryption keys, and a new sync projection's registration, now all run

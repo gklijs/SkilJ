@@ -927,7 +927,7 @@ fn resolve_field<'a>(
 /// data has no `$ref`s, so a dotted path is simply nested `get` calls -
 /// absence at either segment falls through to `None`, the same as the
 /// bare-name case already does.
-fn payload_field_value<'a>(
+pub(crate) fn payload_field_value<'a>(
     payload: &'a serde_json::Value,
     field: &str,
 ) -> Option<&'a serde_json::Value> {
@@ -939,7 +939,7 @@ fn payload_field_value<'a>(
 
 /// The mutable counterpart to `payload_field_value` - `protect_sensitive_fields`'s
 /// own substitution step needs a place to write ciphertext back into.
-fn payload_field_value_mut<'a>(
+pub(crate) fn payload_field_value_mut<'a>(
     payload: &'a mut serde_json::Value,
     field: &str,
 ) -> Option<&'a mut serde_json::Value> {
@@ -955,7 +955,7 @@ fn payload_field_value_mut<'a>(
 /// other scalar (number, boolean) is rendered via its own JSON literal
 /// text. `None` for anything structured (object/array/null), which has no
 /// sound single-string reading.
-fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(_) | serde_json::Value::Bool(_) => Some(value.to_string()),
@@ -2590,6 +2590,32 @@ pub fn query_events_select(
         .collect())
 }
 
+/// What a rejected command's submitter is shown of the events its
+/// decision was made against (`submitCommand`'s `matchingEvents`, docs/
+/// architecture.md §118): only those inside the caller's own owner scope,
+/// as `query_events_select` serves, and at most `max_events` of them - the
+/// most recent, nearest the conflict. `true` alongside when events within
+/// scope were left out for the cap. The decision itself still saw every
+/// matching event; this narrows only what is shown. Rendering (decrypting
+/// granted sensitive fields, redacting unentitled private ones) is still
+/// the caller's, per event, via [`render_event`].
+pub fn visible_matching_events(
+    access_mapping: &RoleAccessMapping,
+    matching_events: &[Event],
+    max_events: usize,
+) -> (Vec<Event>, bool) {
+    let in_scope: Vec<&Event> = matching_events
+        .iter()
+        .filter(|e| event_owner_scope_satisfied(e, access_mapping.scope.as_deref()))
+        .collect();
+    let truncated = in_scope.len() > max_events;
+    let visible = in_scope[in_scope.len().saturating_sub(max_events)..]
+        .iter()
+        .map(|e| (*e).clone())
+        .collect();
+    (visible, truncated)
+}
+
 /// See `rule CountEvents`. Same shape and narrowing as `query_events`
 /// above, minus the `after_sequence` cursor - a count is a live aggregate
 /// over everything matching, not a page of it (see the note above the
@@ -2662,8 +2688,20 @@ pub fn inspect_event(
         return Err(crate::access_control::Error::GrantScopeMismatch.into());
     }
 
+    // The originating command's payload is rendered as `fetchCommands`
+    // renders it (docs/architecture.md §120) - it used to go out as
+    // stored, private fields in plaintext.
+    let mut shown = event.clone();
+    if let EventOrigin::CommandTriggered { command } = &mut shown.origin {
+        command.payload = render_command(
+            command,
+            access_mapping,
+            &resolve_data_key,
+            private_field_grants,
+        );
+    }
     Ok(EventInspected {
-        event: event.clone(),
+        event: shown,
         rendered_payload: render_event(
             event,
             access_mapping,

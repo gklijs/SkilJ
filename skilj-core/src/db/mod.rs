@@ -9221,50 +9221,163 @@ async fn parked_delivery_references_subject(
     subject_key: &str,
     subject_value: &str,
 ) -> crate::error::Result<bool> {
-    let resolved: Option<(
-        Vec<crate::shared::SensitiveField>,
-        Option<&serde_json::Value>,
-    )> = match delivery.kind {
-        ParkedDeliveryKind::CrossContextRoute | ParkedDeliveryKind::Deadline => {
-            match (
-                &delivery.target_bounded_context,
-                &delivery.target_command_type,
-            ) {
-                (Some(bc), Some(name)) => get_command_type(pool, bc, name)
-                    .await?
-                    .map(|ct| (ct.sensitive_fields, Some(&delivery.request_json))),
-                _ => None,
-            }
-        }
-        ParkedDeliveryKind::ExternalEvent => match &delivery.access_token_id {
-            Some(id) => get_external_event_token(pool, id).await?.map(|token| {
-                (
-                    token.event_type.sensitive_fields,
-                    delivery.request_json.get("payload"),
-                )
-            }),
-            None => None,
-        },
-        ParkedDeliveryKind::CommandTrigger => match &delivery.access_token_id {
-            Some(id) => get_command_token(pool, id).await?.map(|token| {
-                (
-                    token.command_type.sensitive_fields,
-                    delivery.request_json.get("payload"),
-                )
-            }),
-            None => None,
-        },
-    };
-    Ok(match resolved {
-        Some((sensitive_fields, Some(payload))) => {
+    let rules = parked_delivery_payload_rules(pool, delivery).await?;
+    Ok(match (rules, parked_delivery_payload(delivery)) {
+        (Some(rules), Some(payload)) => {
             let payload = serde_json::to_string(payload)
                 .expect("serde_json::Value serialization is infallible");
-            crate::event_store::sensitive_field_subjects(&sensitive_fields, &payload)
+            crate::event_store::sensitive_field_subjects(&rules.sensitive_fields, &payload)
                 .iter()
                 .any(|(key, value)| key == subject_key && value == subject_value)
         }
         _ => json_mentions(&delivery.request_json, subject_value),
     })
+}
+
+/// What governs a parked delivery's payload: the declarations of the type
+/// its redrive would submit it as - the target `CommandType` of a route
+/// or deadline, the token's `EventType` for an external event, the
+/// token's `CommandType` for a trigger.
+#[derive(Debug, Clone)]
+pub struct ParkedPayloadRules {
+    pub sensitive_fields: Vec<SensitiveField>,
+    pub private_fields: Vec<PrivateField>,
+    pub tag_mappings: Vec<TagMapping>,
+    pub owner_tag_key: Option<String>,
+}
+
+/// [`ParkedPayloadRules`] for `delivery`, or `None` when its type can't be
+/// resolved any more (its token, bounded context or type is gone) - such
+/// a row can't be redriven either.
+pub async fn parked_delivery_payload_rules(
+    pool: &Pool,
+    delivery: &ParkedDelivery,
+) -> crate::error::Result<Option<ParkedPayloadRules>> {
+    let from_command = |ct: CommandType| ParkedPayloadRules {
+        sensitive_fields: ct.sensitive_fields,
+        private_fields: ct.private_fields,
+        tag_mappings: ct.tag_mappings,
+        owner_tag_key: ct.owner_tag_key,
+    };
+    Ok(match delivery.kind {
+        ParkedDeliveryKind::CrossContextRoute | ParkedDeliveryKind::Deadline => match (
+            &delivery.target_bounded_context,
+            &delivery.target_command_type,
+        ) {
+            (Some(bc), Some(name)) => get_command_type(pool, bc, name).await?.map(from_command),
+            _ => None,
+        },
+        ParkedDeliveryKind::ExternalEvent => match &delivery.access_token_id {
+            Some(id) => get_external_event_token(pool, id).await?.map(|token| {
+                let et = token.event_type;
+                ParkedPayloadRules {
+                    sensitive_fields: et.sensitive_fields,
+                    private_fields: et.private_fields,
+                    tag_mappings: et.tag_mappings,
+                    owner_tag_key: et.owner_tag_key,
+                }
+            }),
+            None => None,
+        },
+        ParkedDeliveryKind::CommandTrigger => match &delivery.access_token_id {
+            Some(id) => get_command_token(pool, id)
+                .await?
+                .map(|token| from_command(token.command_type)),
+            None => None,
+        },
+    })
+}
+
+/// The payload inside a parked delivery's request: the request itself for
+/// a route or deadline, its `payload` field for an external event or a
+/// trigger.
+pub fn parked_delivery_payload(delivery: &ParkedDelivery) -> Option<&serde_json::Value> {
+    match delivery.kind {
+        ParkedDeliveryKind::CrossContextRoute | ParkedDeliveryKind::Deadline => {
+            Some(&delivery.request_json)
+        }
+        ParkedDeliveryKind::ExternalEvent | ParkedDeliveryKind::CommandTrigger => {
+            delivery.request_json.get("payload")
+        }
+    }
+}
+
+/// Whether `access_mapping` may see and handle `delivery`
+/// (docs/architecture.md §119): always for an unscoped grant; for a
+/// scoped one, only when the payload's owner - its owner tag, derived as
+/// a stored record's would be - is the grant's scope. A type declaring no
+/// owner tag is unowned and visible, as its events are to `queryEvents`.
+/// A row whose type can't be resolved (`rules` is `None`) or whose payload
+/// is missing fails closed.
+pub fn parked_delivery_visible_to(
+    delivery: &ParkedDelivery,
+    rules: Option<&ParkedPayloadRules>,
+    access_mapping: &RoleAccessMapping,
+) -> bool {
+    if access_mapping.scope.is_none() {
+        return true;
+    }
+    let (Some(rules), Some(payload)) = (rules, parked_delivery_payload(delivery)) else {
+        return false;
+    };
+    let payload =
+        serde_json::to_string(payload).expect("serde_json::Value serialization is infallible");
+    crate::event_store::tag_owner_scope_satisfied(
+        &crate::event_store::derive_tags(&rules.tag_mappings, &payload),
+        rules.owner_tag_key.as_deref(),
+        access_mapping.scope.as_deref(),
+    )
+}
+
+/// `delivery` as `access_mapping` is shown it (docs/architecture.md
+/// §119). The stored request is never encrypted - the write it carries
+/// failed - so its protected leaves are masked here instead: a sensitive
+/// field is `null` unless `sensitive_field_is_granted` for its subject,
+/// and a private field is always `null`, since a parked request has no
+/// author Role to be entitled to it (REST's fail-closed
+/// `redact_private_fields` treatment). With its type unresolvable, the
+/// whole payload is `null`: nothing says which leaves are protected. The
+/// stored row itself is untouched; a redrive submits it in full.
+pub fn render_parked_delivery(
+    delivery: &ParkedDelivery,
+    rules: Option<&ParkedPayloadRules>,
+    access_mapping: &RoleAccessMapping,
+) -> ParkedDelivery {
+    let mut rendered = delivery.clone();
+    let payload = match rendered.kind {
+        ParkedDeliveryKind::CrossContextRoute | ParkedDeliveryKind::Deadline => {
+            Some(&mut rendered.request_json)
+        }
+        ParkedDeliveryKind::ExternalEvent | ParkedDeliveryKind::CommandTrigger => {
+            rendered.request_json.get_mut("payload")
+        }
+    };
+    let Some(payload) = payload else {
+        return rendered;
+    };
+    let Some(rules) = rules else {
+        *payload = serde_json::Value::Null;
+        return rendered;
+    };
+    let original = payload.clone();
+    for sf in &rules.sensitive_fields {
+        let subject = crate::event_store::payload_field_value(&original, &sf.subject_field)
+            .and_then(crate::event_store::json_scalar_to_string);
+        let granted = subject.is_some_and(|subject| {
+            crate::event_store::sensitive_field_is_granted(access_mapping, &subject)
+        });
+        if !granted {
+            if let Some(leaf) = crate::event_store::payload_field_value_mut(payload, &sf.field) {
+                *leaf = serde_json::Value::Null;
+            }
+        }
+    }
+    for pf in &rules.private_fields {
+        if let Some(leaf) = crate::event_store::payload_field_value_mut(payload, &pf.field) {
+            *leaf = serde_json::Value::Null;
+        }
+    }
+    rendered
 }
 
 /// Whether `value` appears as a string leaf, or a number/bool rendered as

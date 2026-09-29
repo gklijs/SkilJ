@@ -303,6 +303,21 @@ pub fn inspect_event_field() -> Field {
                 &mut data_keys,
             )
             .await?;
+            // And for the originating command's payload, rendered too.
+            if let skilj_core::event_store::EventOrigin::CommandTriggered { command } =
+                &event.origin
+            {
+                resolve_read_data_keys(
+                    &state.pool,
+                    &bounded_context_name,
+                    &command.command_type.sensitive_fields,
+                    &command.payload,
+                    &access_mapping,
+                    state.encryption_master_key.as_ref(),
+                    &mut data_keys,
+                )
+                .await?;
+            }
 
             let private_field_grants =
                 super::load_private_field_grants(&state.pool, &bounded_context_name).await?;

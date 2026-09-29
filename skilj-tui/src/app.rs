@@ -830,7 +830,7 @@ impl App {
                     "mutation($bc: String!, $type: String!, $payload: String!) { \
                         submitCommand(boundedContext: $bc, commandTypeName: $type, payload: $payload) { \
                             accepted rejectionReason rejectionKind triggeredEventSequences \
-                            matchingEvents { sequence eventTypeName payload } \
+                            matchingEvents { sequence eventTypeName payload } matchingEventsTruncated \
                         } \
                     }",
                     serde_json::json!({ "bc": bounded_context, "type": type_name, "payload": payload_str }),

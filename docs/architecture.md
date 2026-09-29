@@ -9993,3 +9993,56 @@ Tests (3-connection pools; the "before" runs used the pre-§117 code):
 - `more_routes_than_pool_connections_all_fire` (`skilj/tests/cross_context_route.rs`). Four routes on one source event, all four fire. Before: none did in 6 s.
 - `more_concurrent_retries_than_pool_connections_all_complete` (`skilj/tests/parked_deliveries_graphql.rs`). Six parked deadlines retried at once all succeed. Before: they failed with "the server's database connections are all busy".
 - The existing same-batch tests - `submit_command_batch_deduplicates_a_repeated_idempotency_key_shared_by_two_commands_in_the_same_batch` and `..._detects_a_dcb_conflict_between_two_commands_in_the_same_batch` - cover the in-memory map's removal and the delta cut.
+
+## 118. A rejection's `matchingEvents` is served like `queryEvents`
+
+A rejected `submitCommand` gives an Admin-level caller `matchingEvents`: the events the decision was made against, for debugging a conflict (Codeberg issue #7). A Write-level caller never gets them (`MatchingEventsRequiresAdminLevel`). For an Admin, though, they were returned exactly as stored, skipping everything `queryEvents` applies to the same Admin:
+
+- **Private fields in plaintext.** A private field is stored in plaintext, and `render_event` hides it unless the Role is entitled (the author, a grant, the team). Any Admin read them all here.
+- **No owner scope.** A command's consistency tags can match events owned by others - a note on a shared case, tagged `case` and `company`, matches a command for the same case from another company. An Admin scoped to one company read the other company's events.
+- **No cap.** Every matching event, however many.
+- Sensitive fields came back as stored ciphertext even when the caller was granted them - not a leak, but not what `queryEvents` shows either.
+
+Now `event_store::visible_matching_events` keeps the events inside the caller's owner scope (`event_owner_scope_satisfied`, as `query_events_select` does), and at most `max_events_per_read` of them: the most recent, nearest the conflict (the user's choice, over the earliest or no cap). The resolver renders each with `render_event`, resolving data keys and loading private-field grants as `queryEvents` does. A new nullable `matchingEventsTruncated: Boolean` on `SubmitCommandPayload` says whether in-scope events were left out; it's `null` whenever `matchingEvents` is. `skilj-tui` requests it and shows it with the result. `decide()` still sees every matching event - only what's shown narrows - and REST's `CommandTrigger` still doesn't return them. The spec's `MatchingEventsRequiresAdminLevel` now says this.
+
+Test: `matching_events_are_scoped_redacted_and_capped` (`skilj/tests/graphql_business_surfaces.rs`). There are three notes (an `own` private field) on one case - globex, acme, globex - and `max_events_per_read` is 2. Closing the case is rejected while it has notes.
+- The notes' author sees the latest two in full, truncated.
+- An unscoped Admin without a grant sees the same two with `note: null`, truncated.
+- An Admin scoped to acme sees only acme's note, `null`, not truncated.
+
+Before the fix, the colleague and the acme-scoped Admin both got all three notes in plaintext.
+
+## 119. Parked requests are masked and owner-scoped
+
+A `ParkedDelivery` stores the request its redrive will resubmit (`request_json`), as the bridge or route sent it. The write it carried failed, so nothing in it was ever encrypted or redacted. `parkedDeliveries` returned it raw to any Admin of the bounded context. `retryParkedDelivery` and `discardParkedDelivery` returned the row the same way, and all three acted on every row:
+
+- **Sensitive fields in plaintext**, to an Admin without `can_read_sensitive`. A stored record encrypts them; a parked request never got that far.
+- **Private fields in plaintext.** A stored record shows them only to an entitled Role; a parked request has no author Role at all.
+- **Every owner's rows** to a scope-restricted Admin, who could also retry or discard them.
+
+`forgetSubject` already treated these rows as personal data (§91). The fix follows the user's two choices: mask per caller, and show a scoped Admin only its own owner's rows.
+
+- **`db::parked_delivery_payload_rules`** resolves what governs a row's payload - the target `CommandType` of a route or deadline, the token's `EventType` or `CommandType` for an external event or a trigger - as `ParkedPayloadRules` (sensitive fields, private fields, tag mappings, owner tag). `forgetSubject`'s own lookup now uses it. `db::parked_delivery_payload` finds the payload inside the request: the request itself, or its `payload` field.
+- **`db::render_parked_delivery`** masks a copy for the caller:
+  - a sensitive field is `null` unless `sensitive_field_is_granted` for its subject (`can_read_sensitive`, or the subject being the caller);
+  - a private field is always `null` - REST's fail-closed `redact_private_fields` treatment, since no Role can be entitled to a record that has none;
+  - a payload whose type can't be resolved is `null` whole, because nothing says which of its leaves are protected.
+
+  The stored row is untouched, and a redrive submits it in full.
+- **`db::parked_delivery_visible_to`**: an unscoped grant sees every row. A scoped one sees a row when the payload's owner tag, derived with the type's own tag mappings as a stored record's would be, equals its scope. A type that declares no owner tag is unowned and visible, as its events are to `queryEvents`. A row whose type can't be resolved fails closed.
+- **`parkedDeliveries`** fills its page from as many stored pages as that takes, skipping rows the grant can't see, so a short page still means the end. `retryParkedDelivery` and `discardParkedDelivery` answer `ParkedDelivery_not_found` for a row the grant can't see, before any lock, redrive or delete. All three render what they return.
+
+Test: `parked_requests_are_masked_and_scoped_per_caller` (`skilj/tests/parked_deliveries_graphql.rs`). The command `Admit` has a sensitive `ssn` (subject `patient_id`), a private `notes` and owner tag `company`. Three rows are parked: acme and globex rows for `Admit`, and an acme row for a command type that no longer exists.
+- A plain Admin sees all three, with `ssn` and `notes` `null` and the third row's payload `null`.
+- An Admin with `can_read_sensitive` sees the `ssn` too.
+- An Admin scoped to acme lists only acme's `Admit` row. Retrying or discarding either of the other two gives `ParkedDelivery_not_found`, and discarding its own row works and returns it masked.
+
+Before the fix, every caller got every row in plaintext.
+
+## 120. `inspectEvent` renders the originating command too
+
+`inspectEvent` returns an event's `renderedPayload` - sensitive fields decrypted only where granted, private fields redacted unless entitled - and its `origin`. For a command-triggered event, `origin.triggeringCommandPayload` is the command that produced it, and that went out as stored. A command's private fields are stored in plaintext, and `fetchCommands` redacts them with `render_command`, so any Admin could read them through the event instead. Its sensitive fields came back as ciphertext even to a caller granted them.
+
+`event_store::inspect_event` now renders the origin command's payload with `render_command`, with the same data-key resolver and private-field grants as the event. The resolver resolves the command's sensitive-field keys alongside the event's. Nothing else about the event changes.
+
+Test: `an_inspected_events_originating_command_is_rendered_for_the_caller` (`skilj/tests/graphql_business_surfaces.rs`). `AddCaseNote` now declares its `note` private on the command as well. The note's author sees `"secret"` in both the payload and the origin. A colleague Admin without a grant sees `null` in both. Before the fix, the colleague got `null` in the payload but `"secret"` in the origin.

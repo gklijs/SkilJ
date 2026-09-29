@@ -270,7 +270,8 @@ pub fn parked_deliveries_field() -> Field {
                 let state = ctx.data::<GraphqlState>()?;
                 let bounded_context_name =
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                let access_mapping =
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
 
                 // Bounded like every other list read (docs/architecture.md
                 // §86): at most `max_events_per_read` rows, continued with
@@ -288,14 +289,44 @@ pub fn parked_deliveries_field() -> Field {
                     None => None,
                 };
                 let limit = i64::try_from(state.max_events_per_read.max(1)).unwrap_or(i64::MAX);
-                let deliveries = db::list_parked_deliveries_page(
-                    &state.pool,
-                    &bounded_context_name,
-                    after.as_ref(),
-                    limit,
-                )
-                .await
-                .map_err(to_graphql_error)?;
+                // Only the rows this grant may see, each masked for it
+                // (docs/architecture.md §119). Rows a scoped grant can't
+                // see are skipped, so the page is filled from as many
+                // stored pages as that takes - a short page still means
+                // the end.
+                let mut deliveries = Vec::new();
+                let mut after = after;
+                'pages: loop {
+                    let page = db::list_parked_deliveries_page(
+                        &state.pool,
+                        &bounded_context_name,
+                        after.as_ref(),
+                        limit,
+                    )
+                    .await
+                    .map_err(to_graphql_error)?;
+                    let exhausted = (page.len() as i64) < limit;
+                    for delivery in &page {
+                        after = Some(db::ParkedDeliveryCursor::of(delivery));
+                        let rules = db::parked_delivery_payload_rules(&state.pool, delivery)
+                            .await
+                            .map_err(to_graphql_error)?;
+                        if db::parked_delivery_visible_to(delivery, rules.as_ref(), &access_mapping)
+                        {
+                            deliveries.push(db::render_parked_delivery(
+                                delivery,
+                                rules.as_ref(),
+                                &access_mapping,
+                            ));
+                            if deliveries.len() as i64 == limit {
+                                break 'pages;
+                            }
+                        }
+                    }
+                    if exhausted {
+                        break;
+                    }
+                }
 
                 Ok(Some(FieldValue::list(
                     deliveries.into_iter().map(FieldValue::owned_any),
@@ -325,7 +356,8 @@ pub fn retry_parked_delivery_field() -> Field {
                 let state = ctx.data::<GraphqlState>()?;
                 let bounded_context_name =
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                let access_mapping =
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
                 let id = ctx.args.try_get("id")?.string()?.to_string();
 
                 // Taken before the lock's connection, and held until this
@@ -355,6 +387,14 @@ pub fn retry_parked_delivery_field() -> Field {
                     .await
                     .map_err(to_graphql_error)?
                     .ok_or_else(|| not_found("ParkedDelivery", &id))?;
+                // A row outside a scoped grant's owner is as absent to it
+                // as a missing one (docs/architecture.md §119).
+                let rules = db::parked_delivery_payload_rules(&state.pool, &delivery)
+                    .await
+                    .map_err(to_graphql_error)?;
+                if !db::parked_delivery_visible_to(&delivery, rules.as_ref(), &access_mapping) {
+                    return Err(not_found("ParkedDelivery", &id));
+                }
 
                 match redrive_parked_delivery(state, &delivery).await {
                     Ok(()) => {
@@ -363,7 +403,11 @@ pub fn retry_parked_delivery_field() -> Field {
                                 .await
                                 .map_err(to_graphql_error)?
                                 .unwrap_or(delivery);
-                        Ok(Some(FieldValue::owned_any(removed)))
+                        Ok(Some(FieldValue::owned_any(db::render_parked_delivery(
+                            &removed,
+                            rules.as_ref(),
+                            &access_mapping,
+                        ))))
                     }
                     Err(e) => {
                         let message = skilj_core::error::SkiljRejection::message(&e);
@@ -401,15 +445,32 @@ pub fn discard_parked_delivery_field() -> Field {
                 let state = ctx.data::<GraphqlState>()?;
                 let bounded_context_name =
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                let access_mapping =
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
                 let id = ctx.args.try_get("id")?.string()?.to_string();
 
+                // Checked against the row before it's deleted - see
+                // `retryParkedDelivery`.
+                let delivery = db::get_parked_delivery(&state.pool, &bounded_context_name, &id)
+                    .await
+                    .map_err(to_graphql_error)?
+                    .ok_or_else(|| not_found("ParkedDelivery", &id))?;
+                let rules = db::parked_delivery_payload_rules(&state.pool, &delivery)
+                    .await
+                    .map_err(to_graphql_error)?;
+                if !db::parked_delivery_visible_to(&delivery, rules.as_ref(), &access_mapping) {
+                    return Err(not_found("ParkedDelivery", &id));
+                }
                 let discarded = db::delete_parked_delivery(&state.pool, &bounded_context_name, &id)
                     .await
                     .map_err(to_graphql_error)?
                     .ok_or_else(|| not_found("ParkedDelivery", &id))?;
 
-                Ok(Some(FieldValue::owned_any(discarded)))
+                Ok(Some(FieldValue::owned_any(db::render_parked_delivery(
+                    &discarded,
+                    rules.as_ref(),
+                    &access_mapping,
+                ))))
             })
         },
     )

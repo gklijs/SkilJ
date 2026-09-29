@@ -734,6 +734,9 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
             .unwrap();
 
         let (skilj, report) = Skilj::builder(database_url)
+            // Only this test's own ticks fire deadlines: the background one
+            // scans every bounded context and would race them.
+            .deadline_poll_interval(std::time::Duration::from_secs(3600))
             .bounded_context(DEADLINE_RACE_BOUNDED_CONTEXT)
             .event_type::<RaceFired>()
             .command_type::<RaceCommand>()
@@ -895,6 +898,9 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
         let (source, target) = (contexts[0].clone(), contexts[1].clone());
 
         let (skilj, report) = Skilj::builder(database_url)
+            // Only this test's own ticks fire deadlines: the background one
+            // scans every bounded context and would race them.
+            .deadline_poll_interval(std::time::Duration::from_secs(3600))
             .bounded_context(target.clone())
             .event_type::<RaceFired>()
             .command_type::<RaceCommand>()
@@ -1008,6 +1014,9 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
         }
         let (source, target) = (contexts[0].clone(), contexts[1].clone());
         let (skilj, _) = Skilj::builder(database_url)
+            // Only this test's own ticks fire deadlines: the background one
+            // scans every bounded context and would race them.
+            .deadline_poll_interval(std::time::Duration::from_secs(3600))
             .bounded_context(target.clone())
             .event_type::<RaceFired>()
             .command_type::<RaceCommand>()

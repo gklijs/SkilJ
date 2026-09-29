@@ -7702,6 +7702,17 @@ surface CommandSubmission {
         -- to browse the event history submission reads from. A
         -- write-level caller's rejection still carries rejection_reason
         -- and rejection_kind as usual, with matching_events withheld.
+        --
+        -- For an admin-level caller it is served as EventQuery serves
+        -- events, not as stored: only events within access_mapping.scope
+        -- (the same owner narrowing EventQuery applies), each rendered -
+        -- sensitive fields decrypted only where granted, private fields
+        -- redacted unless this Role is entitled to them (see
+        -- PrivateFieldsStayRedacted) - and at most
+        -- config.max_events_per_read of them, the most recent, with an
+        -- indication when events within scope were left out. decide()
+        -- itself still saw every matching event; this narrows only what
+        -- is shown.
 
     @guidance
         -- GraphQL only: a mutation, qualified by bounded context per the

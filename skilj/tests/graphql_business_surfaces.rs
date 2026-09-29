@@ -417,6 +417,129 @@ impl CommandType for OpenTicket {
     }
 }
 
+// --- a fixture for `matchingEvents`' own scoping, redaction and cap
+// (docs/architecture.md §118): notes on a support case, owned by the
+// company the case is for, each note an `own`-kind private field. Closing
+// a case is rejected while it has notes - so the notes are the matching
+// events a rejection shows.
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct CaseNotePayload {
+    case_id: String,
+    company_id: String,
+    note: String,
+}
+
+fn case_tag_mappings() -> Vec<TagMapping> {
+    vec![
+        TagMapping {
+            key: "case".to_string(),
+            field: "case_id".to_string(),
+        },
+        TagMapping {
+            key: "company".to_string(),
+            field: "company_id".to_string(),
+        },
+    ]
+}
+
+struct CaseNoteAdded;
+
+impl EventType for CaseNoteAdded {
+    type Payload = CaseNotePayload;
+    const NAME: &'static str = "CaseNoteAdded";
+    fn tag_mappings() -> Vec<TagMapping> {
+        case_tag_mappings()
+    }
+    fn owner_tag_key() -> Option<&'static str> {
+        Some("company")
+    }
+    fn private_fields() -> Vec<skilj_core::shared::PrivateField> {
+        vec![skilj_core::shared::PrivateField {
+            field: "note".to_string(),
+            kind: skilj_core::shared::PrivateFieldKind::Own,
+            team: None,
+            addressee_field: None,
+        }]
+    }
+}
+
+enum CaseEvent {
+    #[allow(dead_code)]
+    CaseNoteAdded(CaseNotePayload),
+}
+
+impl BoundedContextEvent for CaseEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "CaseNoteAdded" => {
+                Some(serde_json::from_str(&event.payload).map(CaseEvent::CaseNoteAdded))
+            }
+            _ => None,
+        }
+    }
+}
+
+struct AddCaseNote;
+
+impl CommandType for AddCaseNote {
+    type Payload = CaseNotePayload;
+    type Event = CaseEvent;
+    const NAME: &'static str = "AddCaseNote";
+    fn tag_mappings() -> Vec<TagMapping> {
+        case_tag_mappings()
+    }
+    fn private_fields() -> Vec<skilj_core::shared::PrivateField> {
+        vec![skilj_core::shared::PrivateField {
+            field: "note".to_string(),
+            kind: skilj_core::shared::PrivateFieldKind::Own,
+            team: None,
+            addressee_field: None,
+        }]
+    }
+    fn owner_tag_key() -> Option<&'static str> {
+        Some("company")
+    }
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "CaseNoteAdded".to_string(),
+                payload: serde_json::to_value(payload).unwrap(),
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct CloseCasePayload {
+    case_id: String,
+    company_id: String,
+}
+
+struct CloseCase;
+
+impl CommandType for CloseCase {
+    type Payload = CloseCasePayload;
+    type Event = CaseEvent;
+    const NAME: &'static str = "CloseCase";
+    fn tag_mappings() -> Vec<TagMapping> {
+        case_tag_mappings()
+    }
+    fn owner_tag_key() -> Option<&'static str> {
+        Some("company")
+    }
+    fn decide(_payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
+        if matching_events.is_empty() {
+            CommandDecision::Accepted { events: vec![] }
+        } else {
+            CommandDecision::Rejected {
+                reason: "the case still has notes".to_string(),
+                kind: "case_has_notes".to_string(),
+            }
+        }
+    }
+}
+
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
 
 struct TestDb {
@@ -1930,6 +2053,221 @@ fn graphql_requests_are_bounded_in_size_depth_and_expensive_fields() {
                 .unwrap()
                 .len()
                 > 10
+        );
+    });
+}
+
+/// `matchingEvents` is served the way `queryEvents` serves events
+/// (docs/architecture.md §118). It used to return every matching event
+/// raw: private fields in plaintext to any Admin, events of other owners
+/// to a scope-restricted one, and no bound on how many. Three notes on one
+/// case - two for globex, one for acme - and a cap of 2:
+/// - their author sees the latest two in full, marked truncated;
+/// - an unscoped Admin without a grant sees the same two, notes redacted;
+/// - an Admin scoped to acme sees only acme's note, redacted, untruncated,
+///   though the decision itself was made against all three.
+#[test]
+fn matching_events_are_scoped_redacted_and_capped() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, author_jwt, _author_role) = setup_with(|builder| {
+            builder
+                .max_events_per_read(2)
+                .event_type::<CaseNoteAdded>()
+                .command_type::<AddCaseNote>()
+                .command_type::<CloseCase>()
+        })
+        .await;
+        let router = skilj.graphql_router().await.unwrap();
+        let bc = skilj_core::db::get_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let admin_jwt = |name: &str, scope: Option<&str>| {
+            let (pool, bc) = (pool.clone(), bc.clone());
+            let subject = unique_name(name);
+            let scope = scope.map(str::to_string);
+            async move {
+                let role = Role {
+                    id: generate_token_id(),
+                    external_subject: subject.clone(),
+                    name: "Colleague".to_string(),
+                    superadmin: false,
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                };
+                skilj_core::db::insert_role(&pool, &role).await.unwrap();
+                skilj_core::db::insert_role_access_mapping(
+                    &pool,
+                    &RoleAccessMapping {
+                        role,
+                        bounded_context: bc,
+                        level: AccessLevel::Admin,
+                        can_read_sensitive: false,
+                        scope,
+                        status: RoleStatus::Active,
+                        created_at: test_now(),
+                        revoked_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+                sign_jwt(&subject)
+            }
+        };
+        let colleague_jwt = admin_jwt("colleague", None).await;
+        let acme_jwt = admin_jwt("acme-admin", Some("acme")).await;
+
+        for (company, note) in [("globex", "g1"), ("acme", "a1"), ("globex", "g2")] {
+            let payload = json!({ "case_id": "c1", "company_id": company, "note": note });
+            let response = graphql_request(
+                &router,
+                Some(&author_jwt),
+                SUBMIT_COMMAND_MUTATION,
+                json!({ "bc": bc_name, "name": "AddCaseNote", "payload": payload.to_string() }),
+            )
+            .await;
+            assert_eq!(response["data"]["submitCommand"]["accepted"], true, "{response:?}");
+        }
+
+        let close = |jwt: String, company: &'static str| {
+            let (router, bc_name) = (router.clone(), bc_name.clone());
+            async move {
+                let payload = json!({ "case_id": "c1", "company_id": company });
+                let response = graphql_request(
+                    &router,
+                    Some(&jwt),
+                    "mutation($bc: String!, $payload: String!) { \
+                        submitCommand(boundedContext: $bc, commandTypeName: \"CloseCase\", payload: $payload) { \
+                            accepted rejectionKind matchingEventsTruncated \
+                            matchingEvents { eventTypeName payload } \
+                        } \
+                    }",
+                    json!({ "bc": bc_name, "payload": payload.to_string() }),
+                )
+                .await;
+                assert!(response.get("errors").is_none(), "{response:?}");
+                let result = &response["data"]["submitCommand"];
+                assert_eq!(result["rejectionKind"], "case_has_notes", "{response:?}");
+                let payloads: Vec<serde_json::Value> = result["matchingEvents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| serde_json::from_str(e["payload"].as_str().unwrap()).unwrap())
+                    .collect();
+                (payloads, result["matchingEventsTruncated"].clone())
+            }
+        };
+        let note = |company: &str, note: serde_json::Value| {
+            json!({ "case_id": "c1", "company_id": company, "note": note })
+        };
+
+        let (seen, truncated) = close(author_jwt.clone(), "globex").await;
+        assert_eq!(seen, [note("acme", json!("a1")), note("globex", json!("g2"))]);
+        assert_eq!(truncated, true);
+
+        let (seen, truncated) = close(colleague_jwt, "globex").await;
+        assert_eq!(seen, [note("acme", json!(null)), note("globex", json!(null))]);
+        assert_eq!(truncated, true);
+
+        let (seen, truncated) = close(acme_jwt, "acme").await;
+        assert_eq!(seen, [note("acme", json!(null))]);
+        assert_eq!(truncated, false);
+    });
+}
+
+/// `inspectEvent` renders an event's payload for the caller, but its
+/// `origin.triggeringCommandPayload` - the command that produced it - went
+/// out as stored, so a private field on the command was plaintext to any
+/// Admin. It is rendered as `fetchCommands` renders it
+/// (docs/architecture.md §120).
+#[test]
+fn an_inspected_events_originating_command_is_rendered_for_the_caller() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, author_jwt, _author_role) = setup_with(|builder| {
+            builder
+                .event_type::<CaseNoteAdded>()
+                .command_type::<AddCaseNote>()
+        })
+        .await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let colleague_subject = unique_name("colleague");
+        let colleague = Role {
+            id: generate_token_id(),
+            external_subject: colleague_subject.clone(),
+            name: "Colleague".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &colleague).await.unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: colleague,
+                bounded_context: skilj_core::db::get_bounded_context(&pool, &bc_name)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let payload = json!({ "case_id": "c1", "company_id": "acme", "note": "secret" });
+        let response = graphql_request(
+            &router,
+            Some(&author_jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "name": "AddCaseNote", "payload": payload.to_string() }),
+        )
+        .await;
+        let sequence = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+
+        let origin_payload = |jwt: String| {
+            let (router, bc_name) = (router.clone(), bc_name.clone());
+            async move {
+                let response = graphql_request(
+                    &router,
+                    Some(&jwt),
+                    "query($bc: String!, $seq: Int!) { inspectEvent(boundedContext: $bc, sequence: $seq) { \
+                        renderedPayload event { origin { triggeringCommandPayload } } } }",
+                    json!({ "bc": bc_name, "seq": sequence }),
+                )
+                .await;
+                assert!(response.get("errors").is_none(), "{response:?}");
+                let inspected = &response["data"]["inspectEvent"];
+                let parse = |v: &serde_json::Value| {
+                    serde_json::from_str::<serde_json::Value>(v.as_str().unwrap()).unwrap()
+                };
+                (
+                    parse(&inspected["renderedPayload"])["note"].clone(),
+                    parse(&inspected["event"]["origin"]["triggeringCommandPayload"])["note"]
+                        .clone(),
+                )
+            }
+        };
+        assert_eq!(origin_payload(author_jwt).await, (json!("secret"), json!("secret")));
+        assert_eq!(
+            origin_payload(sign_jwt(&colleague_subject)).await,
+            (json!(null), json!(null))
         );
     });
 }

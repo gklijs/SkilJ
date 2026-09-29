@@ -1578,3 +1578,251 @@ fn more_concurrent_retries_than_pool_connections_all_complete() {
         assert_eq!(events.len(), 6);
     });
 }
+
+// --- a CommandType with protected fields and an owner, for masking and
+// scoping parked requests (docs/architecture.md §119) ---
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+struct AdmitPayload {
+    patient_id: String,
+    company_id: String,
+    ssn: String,
+    notes: String,
+}
+
+struct Admit;
+
+impl skilj::CommandType for Admit {
+    type Payload = AdmitPayload;
+    type Event = DepositEvent;
+    const NAME: &'static str = "Admit";
+    fn tag_mappings() -> Vec<skilj_core::shared::TagMapping> {
+        vec![skilj_core::shared::TagMapping {
+            key: "company".to_string(),
+            field: "company_id".to_string(),
+        }]
+    }
+    fn owner_tag_key() -> Option<&'static str> {
+        Some("company")
+    }
+    fn sensitive_fields() -> Vec<skilj_core::shared::SensitiveField> {
+        vec![skilj_core::shared::SensitiveField {
+            field: "ssn".to_string(),
+            subject_key: "patient".to_string(),
+            subject_field: "patient_id".to_string(),
+        }]
+    }
+    fn private_fields() -> Vec<skilj_core::shared::PrivateField> {
+        vec![skilj_core::shared::PrivateField {
+            field: "notes".to_string(),
+            kind: skilj_core::shared::PrivateFieldKind::Own,
+            team: None,
+            addressee_field: None,
+        }]
+    }
+    fn decide(
+        _payload: &Self::Payload,
+        _matching_events: &[Self::Event],
+    ) -> skilj_core::shared::CommandDecision {
+        skilj_core::shared::CommandDecision::Accepted { events: vec![] }
+    }
+}
+
+/// A parked request was never written, so its sensitive fields were never
+/// encrypted, and it has no author Role to be entitled to its private
+/// ones. `parkedDeliveries` used to hand every Admin of the context all of
+/// it raw, for every owner. Now (docs/architecture.md §119):
+/// - a sensitive field is shown only to a grant that may read it, a
+///   private field to nobody, and a payload whose type is gone not at all;
+/// - a scoped Admin lists, retries and discards only its own owner's rows,
+///   and never one whose type can't be resolved.
+#[test]
+fn parked_requests_are_masked_and_scoped_per_caller() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = db::connect(&database_url).await.unwrap();
+        let bc_name = unique_name("clinic");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        let admin = |name: &str, can_read_sensitive: bool, scope: Option<&str>| {
+            let (pool, bc) = (pool.clone(), bc.clone());
+            let subject = unique_name(name);
+            let scope = scope.map(str::to_string);
+            async move {
+                let role = Role {
+                    id: generate_token_id(),
+                    external_subject: subject.clone(),
+                    name: "Admin".to_string(),
+                    superadmin: false,
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                };
+                db::insert_role(&pool, &role).await.unwrap();
+                db::insert_role_access_mapping(
+                    &pool,
+                    &RoleAccessMapping {
+                        role,
+                        bounded_context: bc,
+                        level: AccessLevel::Admin,
+                        can_read_sensitive,
+                        scope,
+                        status: RoleStatus::Active,
+                        created_at: test_now(),
+                        revoked_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+                subject
+            }
+        };
+        let plain = admin("plain", false, None).await;
+        let reader = admin("reader", true, None).await;
+        let acme = admin("acme", false, Some("acme")).await;
+
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(db::PgPoolOptions::new().max_connections(4))
+            .encryption_master_key(skilj_core::encryption::EncryptionMasterKey::from_bytes(
+                [7; 32],
+            ))
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<Deposited>()
+            .command_type::<Admit>()
+            .reconciliation_role(plain.clone())
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+
+        let mut ids = std::collections::HashMap::new();
+        for (company, command_type) in [("acme", "Admit"), ("globex", "Admit"), ("acme", "Gone")] {
+            let parked = db::insert_parked_delivery(
+                &pool,
+                &bc_name,
+                "deadline:admission",
+                db::ParkedDeliveryKind::Deadline,
+                &format!("{company}-{command_type}"),
+                None,
+                Some(&bc_name),
+                Some(command_type),
+                &json!({
+                    "patient_id": "p1", "company_id": company, "ssn": "123-45", "notes": "fragile"
+                }),
+                "target unavailable",
+                5,
+                test_now(),
+                test_now(),
+            )
+            .await
+            .unwrap();
+            ids.insert(format!("{company}-{command_type}"), parked.id);
+        }
+
+        let list = |subject: String| {
+            let (router, bc_name) = (router.clone(), bc_name.clone());
+            async move {
+                let response = graphql_request(
+                    &router,
+                    Some(&sign_jwt(&subject)),
+                    "query($bc: String!) { parkedDeliveries(boundedContext: $bc) { identifier requestJson } }",
+                    json!({ "bc": bc_name }),
+                )
+                .await;
+                assert!(response.get("errors").is_none(), "{response:?}");
+                let mut rows: Vec<(String, serde_json::Value)> = response["data"]
+                    ["parkedDeliveries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["identifier"].as_str().unwrap().to_string(),
+                            serde_json::from_str(row["requestJson"].as_str().unwrap()).unwrap(),
+                        )
+                    })
+                    .collect();
+                rows.sort_by(|a, b| a.0.cmp(&b.0));
+                rows
+            }
+        };
+        let request = |company: &str, ssn: serde_json::Value| {
+            json!({ "patient_id": "p1", "company_id": company, "ssn": ssn, "notes": null })
+        };
+
+        assert_eq!(
+            list(plain.clone()).await,
+            [
+                ("acme-Admit".to_string(), request("acme", json!(null))),
+                ("acme-Gone".to_string(), json!(null)),
+                ("globex-Admit".to_string(), request("globex", json!(null))),
+            ]
+        );
+        assert_eq!(
+            list(reader).await,
+            [
+                ("acme-Admit".to_string(), request("acme", json!("123-45"))),
+                ("acme-Gone".to_string(), json!(null)),
+                ("globex-Admit".to_string(), request("globex", json!("123-45"))),
+            ]
+        );
+        assert_eq!(
+            list(acme.clone()).await,
+            [("acme-Admit".to_string(), request("acme", json!(null)))]
+        );
+
+        let mutate = |subject: String, field: &'static str, id: String| {
+            let (router, bc_name) = (router.clone(), bc_name.clone());
+            async move {
+                graphql_request(
+                    &router,
+                    Some(&sign_jwt(&subject)),
+                    &format!(
+                        "mutation($bc: String!, $id: String!) {{ {field}(boundedContext: $bc, id: $id) {{ requestJson }} }}"
+                    ),
+                    json!({ "bc": bc_name, "id": id }),
+                )
+                .await
+            }
+        };
+        for field in ["retryParkedDelivery", "discardParkedDelivery"] {
+            for hidden in ["globex-Admit", "acme-Gone"] {
+                let response = mutate(acme.clone(), field, ids[hidden].clone()).await;
+                assert_eq!(
+                    response["errors"][0]["extensions"]["code"],
+                    "ParkedDelivery_not_found",
+                    "{field} {hidden}: {response:?}"
+                );
+            }
+        }
+        let response = mutate(acme, "discardParkedDelivery", ids["acme-Admit"].clone()).await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                response["data"]["discardParkedDelivery"]["requestJson"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            request("acme", json!(null))
+        );
+
+        let remaining: Vec<String> = list(plain).await.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(remaining, ["acme-Gone", "globex-Admit"]);
+    });
+}

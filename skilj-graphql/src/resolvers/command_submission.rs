@@ -183,42 +183,85 @@ pub fn submit_command_field() -> Field {
                     .await
                     .map_err(to_graphql_error)?;
 
+                // Codeberg issue #7's DCB conflict visualizer, for an
+                // Admin-level caller only: this WriteAccess-gated resolver
+                // lets any Write-level caller submit commands, but the
+                // matching events are event content - what queryEvents/
+                // countEvents/inspectEvent require Admin for. Without the
+                // gate a Write-only caller could force a rejection whose
+                // tags scope any account and read its history back here
+                // (`MatchingEventsRequiresAdminLevel`). And served the way
+                // queryEvents serves them (docs/architecture.md §118):
+                // only within the caller's owner scope, at most
+                // `max_events_per_read` (the latest), each rendered -
+                // sensitive fields decrypted only where granted, private
+                // fields redacted unless entitled. They used to be
+                // returned raw, whole and unscoped.
+                let (matching_events, matching_events_truncated) = match &outcome {
+                    skilj_core::db::SubmitCommandOutcome::Rejected {
+                        matching_events, ..
+                    } if access_mapping.level == skilj_core::access_control::AccessLevel::Admin => {
+                        let (visible, truncated) = skilj_core::event_store::visible_matching_events(
+                            &access_mapping,
+                            matching_events,
+                            state.max_events_per_read,
+                        );
+                        let mut data_keys = std::collections::HashMap::new();
+                        for e in &visible {
+                            super::resolve_read_data_keys(
+                                &state.pool,
+                                &bounded_context_name,
+                                &e.event_type.sensitive_fields,
+                                &e.payload,
+                                &access_mapping,
+                                state.encryption_master_key.as_ref(),
+                                &mut data_keys,
+                            )
+                            .await?;
+                        }
+                        let grants =
+                            super::load_private_field_grants(&state.pool, &bounded_context_name)
+                                .await?;
+                        let resolve = |sk: &str, sv: &str| {
+                            data_keys.get(&(sk.to_string(), sv.to_string())).cloned()
+                        };
+                        let rendered = visible
+                            .into_iter()
+                            .map(|e| skilj_core::event_store::Event {
+                                payload: skilj_core::event_store::render_event(
+                                    &e,
+                                    &access_mapping,
+                                    &resolve,
+                                    &grants,
+                                ),
+                                ..e
+                            })
+                            .collect();
+                        (Some(rendered), Some(truncated))
+                    }
+                    _ => (None, None),
+                };
+
                 Ok(Some(FieldValue::owned_any(match outcome {
                     // §5.4/§7.3: a legitimate business outcome, not a
                     // GraphQL error - whether this was the first
                     // decision or a DCB-conflict retry inside
                     // submit_command, a rejection renders identically
                     // either way.
-                    skilj_core::db::SubmitCommandOutcome::Rejected {
-                        reason,
-                        kind,
-                        matching_events,
-                    } => {
+                    skilj_core::db::SubmitCommandOutcome::Rejected { reason, kind, .. } => {
                         SubmitCommandResult {
                             accepted: false,
                             triggered_event_sequences: None,
                             rejection_reason: Some(reason),
                             rejection_kind: Some(kind),
-                            // Codeberg issue #7's DCB conflict visualizer -
                             // Some even when empty (a rejection whose
                             // decider didn't reject *because* of a
                             // conflict still had a real, if empty, set to
                             // decide from) - None is reserved for
-                            // "accepted, not applicable" below. Gated on
-                            // Admin: this WriteAccess-gated resolver lets
-                            // any Write-level caller submit commands, but
-                            // matching_events is full raw event content -
-                            // the same thing queryEvents/countEvents/
-                            // inspectEvent require Admin for. Without this
-                            // gate a Write-only caller could construct a
-                            // command whose tags scope any account they
-                            // like, force a rejection, and read that
-                            // account's whole matching-event history back
-                            // through this field - a read side channel
-                            // around the Admin-only query surface.
-                            matching_events: (access_mapping.level
-                                == skilj_core::access_control::AccessLevel::Admin)
-                                .then_some(matching_events),
+                            // "accepted, not applicable" below, and for a
+                            // caller below Admin (see above).
+                            matching_events,
+                            matching_events_truncated,
                             deduplicated: false,
                             correlation_id: None,
                         }
@@ -232,6 +275,7 @@ pub fn submit_command_field() -> Field {
                             rejection_reason: None,
                             rejection_kind: None,
                             matching_events: None,
+                            matching_events_truncated: None,
                             deduplicated: false,
                             correlation_id: command.metadata.correlation_id,
                         }
@@ -249,6 +293,7 @@ pub fn submit_command_field() -> Field {
                         rejection_reason: None,
                         rejection_kind: None,
                         matching_events: None,
+                        matching_events_truncated: None,
                         deduplicated: true,
                         correlation_id: None,
                     },

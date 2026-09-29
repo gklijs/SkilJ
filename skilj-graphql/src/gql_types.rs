@@ -884,6 +884,10 @@ pub struct SubmitCommandResult {
     // why `Accepted` gets `None`), the tag-scoped set `decide()`
     // actually evaluated against for the rejection that governed.
     pub matching_events: Option<Vec<skilj_core::event_store::Event>>,
+    /// Alongside `matching_events`: whether events the caller may see
+    /// were left out for `max_events_per_read` (docs/architecture.md
+    /// §118). `None` whenever `matching_events` is.
+    pub matching_events_truncated: Option<bool>,
     // Codeberg issue #12: `true` only when an `idempotencyKey` was given
     // and it matched a prior `Accepted` outcome - `triggered_event_sequences`
     // is that prior outcome's, not a fresh decision. Always `false` when
@@ -911,6 +915,9 @@ pub fn submit_command_payload_object() -> Object {
         scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
         scalar "deduplicated": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.deduplicated),
         scalar "correlationId": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.correlation_id.clone()),
+        scalar "matchingEventsTruncated": TypeRef::named(TypeRef::BOOLEAN) => |r| {
+            r.matching_events_truncated.map(Value::from).unwrap_or(Value::Null)
+        },
     })
     .field(Field::new(
         "triggeredEventSequences",
