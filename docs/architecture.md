@@ -10095,3 +10095,16 @@ Test: `shutdown_finishes_ticks_aborts_at_the_timeout_and_drop_stops_nothing` (`s
 1. A tick waits on the lock during a 20 s shutdown. Shutdown doesn't return until the lock is released, then the label is printed, all nine loops report `stopped` and the pool closes.
 2. The same with a 1 s timeout: `aborted` is `["cross_context_routes"]`, and nothing is written.
 3. A new `Skilj` is dropped while its router is kept. Its route loop still picks up the parcel the aborted tick left behind.
+
+## 124. Reads load only the reader's own grants
+
+Rendering an event or command for a reader - `queryEvents`, `inspectEvent`, `fetchCommands`, a rejection's `matchingEvents`, and every event a subscription delivers - needs the private-field grants that could entitle that reader. Each of these called `list_private_field_grants_for_context`, which loaded **every** grant in the bounded context. Then, per row, it looked up the grantor Role, the grantee Role and, for a command grant, the whole command (itself several queries). With per-record grants a context can hold many thousands, and a subscription paid this for every event it delivered, per subscriber.
+
+`entitled_to_read_private_field` only ever counts an **active** grant whose **grantee is the reader's own Role**. So:
+
+- **`db::list_active_private_field_grants_for_grantee(pool, bc, &Role)`** reads `WHERE grantee_role_id = $1 AND status = 'active'`. The `private_field_grants_by_grantee (grantee_role_id, status)` index was already there, unused. Every rendering path now loads grants through it, via `resolvers::load_private_field_grants(pool, bc, reader)`. A subscription uses the reader of the grant it just re-checked.
+- **`grants_from_rows`** converts rows in batches: one `roles WHERE id = ANY` for every grantor and grantee, and one `commands WHERE id = ANY` for every command grant's external id. That makes it three queries for any number of rows, instead of two or more per row. It skips a row naming a Role or command that's gone, as `PrivateFieldGrantRow::into_domain` does, and that one stays for the single-row lookup. `list_private_field_grants_for_context`, still used by the admin listing `listPrivateFieldGrants`, uses the batched conversion too.
+
+What a reader sees is unchanged: the same grants decide, just without the ones that could never apply to it.
+
+Test: `a_readers_grants_are_its_own_active_ones_with_their_records_resolved` (`skilj/tests/graphql_business_surfaces.rs`). It creates four grants from one author: to the reader for an event, to the reader for a command, a revoked one to the reader, and one to another Role. The grantee query returns exactly the first two, with the command's external id resolved. The full listing returns all four, equal to what was inserted. The existing private-field tests, which render through these paths, pass unchanged.

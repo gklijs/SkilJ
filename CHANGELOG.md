@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `skilj_graphql::resolvers::load_private_field_grants` takes the
+  reader's `Role` (docs/architecture.md §124).
 - `db::commit_command_batch` no longer takes a `pool` argument, and
   `skilj_graphql::GraphqlState` gains `parked_delivery_retry_permits`
   (breaking for direct callers) (docs/architecture.md §117).
@@ -163,6 +165,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every event or command read - and every event a subscription
+  delivers - loaded all private-field grants in the bounded context, with
+  two or more queries per grant. Reads now load only the reader's own
+  active grants, through the existing grantee index, in three queries
+  however many there are (docs/architecture.md §124).
 - Event filters and query tags are bounded: at most 32 filters per read
   or subscription, each value at most 4096 characters (`invalid_filter`),
   and at most 32 tags per `queryEvents`/`countEvents` (new

@@ -1070,13 +1070,106 @@ pub async fn list_private_field_grants_for_context(
     )))
     .fetch_all(pool)
     .await?;
-    let mut grants = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(grant) = row.into_domain(pool, &bc).await? {
-            grants.push(grant);
-        }
+    grants_from_rows(pool, &bc, rows).await
+}
+
+/// The active grants naming `grantee` in `bounded_context` - all that
+/// rendering a record for `grantee` ever consults (`entitled_to_read_private_field`
+/// only counts an active grant whose grantee is the reader's own Role).
+/// Every event and command read renders with these, a subscription for
+/// every event it delivers, so this reads through the
+/// `private_field_grants_by_grantee` index rather than the whole table,
+/// which is what those reads used to load, a few queries per row
+/// (docs/architecture.md §124).
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_active_private_field_grants_for_grantee(
+    pool: &Pool,
+    bounded_context: &str,
+    grantee: &Role,
+) -> crate::error::Result<Vec<PrivateFieldGrant>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(Vec::new());
+    };
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<PrivateFieldGrantRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {PRIVATE_FIELD_GRANT_COLUMNS} FROM {schema}.private_field_grants \
+         WHERE grantee_role_id = $1 AND status = 'active'"
+    )))
+    .bind(&grantee.id)
+    .fetch_all(pool)
+    .await?;
+    grants_from_rows(pool, &bc, rows).await
+}
+
+/// `PrivateFieldGrantRow::into_domain` for many rows at once: every Role
+/// they name in one query, every command they name in one more, instead
+/// of two or more queries per row. Rows naming a Role or command that's
+/// gone are skipped, as `into_domain` skips them.
+async fn grants_from_rows(
+    pool: &Pool,
+    bc: &BoundedContext,
+    rows: Vec<PrivateFieldGrantRow>,
+) -> crate::error::Result<Vec<PrivateFieldGrant>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(grants)
+    let mut role_ids: Vec<&str> = rows
+        .iter()
+        .flat_map(|r| [r.grantor_role_id.as_str(), r.grantee_role_id.as_str()])
+        .collect();
+    role_ids.sort_unstable();
+    role_ids.dedup();
+    let roles: std::collections::HashMap<String, Role> =
+        sqlx::query_as::<_, RoleRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {ROLE_COLUMNS} FROM roles WHERE id = ANY($1)"
+        )))
+        .bind(&role_ids)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let role = row.into_domain();
+            (role.id.clone(), role)
+        })
+        .collect();
+
+    let mut command_ids: Vec<i64> = rows.iter().filter_map(|r| r.command_id).collect();
+    command_ids.sort_unstable();
+    command_ids.dedup();
+    let command_external_ids: std::collections::HashMap<i64, String> = if command_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let schema = schema_ident(&bc.name);
+        sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(format!(
+            "SELECT id, external_id FROM {schema}.commands WHERE id = ANY($1)"
+        )))
+        .bind(&command_ids)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .collect()
+    };
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let command_id = match row.command_id {
+                Some(internal_id) => Some(command_external_ids.get(&internal_id)?.clone()),
+                None => None,
+            };
+            Some(PrivateFieldGrant {
+                id: row.id,
+                bounded_context: bc.clone(),
+                grantor: roles.get(&row.grantor_role_id)?.clone(),
+                grantee: roles.get(&row.grantee_role_id)?.clone(),
+                event_sequence: row.event_sequence,
+                command_id,
+                status: token_status_from_str(&row.status),
+                created_at: row.created_at,
+                revoked_at: row.revoked_at,
+            })
+        })
+        .collect())
 }
 
 #[tracing::instrument(skip_all)]

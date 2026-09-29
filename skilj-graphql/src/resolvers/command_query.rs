@@ -152,8 +152,12 @@ pub fn fetch_commands_field() -> Field {
                     .await?;
                 }
 
-                let private_field_grants =
-                    super::load_private_field_grants(&state.pool, &bounded_context_name).await?;
+                let private_field_grants = super::load_private_field_grants(
+                    &state.pool,
+                    &bounded_context_name,
+                    &access_mapping.role,
+                )
+                .await?;
                 Ok(Some(FieldValue::list(page.iter().map(|c| {
                     FieldValue::owned_any((
                         c.id.clone(),

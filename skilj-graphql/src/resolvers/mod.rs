@@ -274,17 +274,19 @@ pub fn parse_private_fields(value: &ValueAccessor) -> async_graphql::Result<Vec<
     Ok(fields)
 }
 
-/// Every active `PrivateFieldGrant` in `bounded_context_name` - the
-/// shared snapshot `query_events`/`inspect_event`/`fetch_commands`/
-/// `deliver_to_subscriptions`'s own callers all pre-load once per request
-/// and pass straight through to `render_event`/`render_command` (see
-/// those functions' own doc comments for why one list serves every
-/// caller/subscriber alike, filtered internally by grantee).
+/// The active `PrivateFieldGrant`s in `bounded_context_name` naming
+/// `reader` - all `render_event`/`render_command` consult when rendering
+/// for it, since entitlement only counts the reader's own active grants.
+/// `query_events`/`inspect_event`/`fetch_commands`/`deliver_to_subscriptions`'
+/// callers pre-load them once per request (per delivered event, for a
+/// subscription). Read through the grantee index, not the whole table
+/// (docs/architecture.md §124).
 pub async fn load_private_field_grants(
     pool: &Pool,
     bounded_context_name: &str,
+    reader: &skilj_core::access_control::Role,
 ) -> async_graphql::Result<Vec<PrivateFieldGrant>> {
-    skilj_core::db::list_private_field_grants_for_context(pool, bounded_context_name)
+    skilj_core::db::list_active_private_field_grants_for_grantee(pool, bounded_context_name, reader)
         .await
         .map_err(to_graphql_error)
 }

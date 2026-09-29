@@ -219,9 +219,12 @@ pub fn submit_command_field() -> Field {
                             )
                             .await?;
                         }
-                        let grants =
-                            super::load_private_field_grants(&state.pool, &bounded_context_name)
-                                .await?;
+                        let grants = super::load_private_field_grants(
+                            &state.pool,
+                            &bounded_context_name,
+                            &access_mapping.role,
+                        )
+                        .await?;
                         let resolve = |sk: &str, sv: &str| {
                             data_keys.get(&(sk.to_string(), sv.to_string())).cloned()
                         };

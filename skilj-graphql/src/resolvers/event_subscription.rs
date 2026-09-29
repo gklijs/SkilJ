@@ -635,14 +635,18 @@ async fn deliver_one(
     )
     .await?;
 
+    let reader = fresh_mapping.role.clone();
     match current {
         Subscription::AllEventsSubscription(s) => s.access_mapping = fresh_mapping,
         Subscription::EventTypeSubscription(s) => s.access_mapping = fresh_mapping,
     }
-    let private_field_grants =
-        skilj_core::db::list_private_field_grants_for_context(&state.pool, bounded_context_name)
-            .await
-            .map_err(to_graphql_error)?;
+    let private_field_grants = skilj_core::db::list_active_private_field_grants_for_grantee(
+        &state.pool,
+        bounded_context_name,
+        &reader,
+    )
+    .await
+    .map_err(to_graphql_error)?;
     Ok(event_store::deliver_to_subscriptions(
         event,
         std::slice::from_ref(current),

@@ -2312,3 +2312,101 @@ fn query_events_refuses_more_than_32_tags() {
         );
     });
 }
+
+/// Rendering for a reader consults only that reader's active grants, so
+/// reads load just those, through the grantee index, in a fixed handful
+/// of queries - not every grant in the context at two-plus queries each
+/// (docs/architecture.md §124). The batched conversion keeps what the
+/// per-row one did: grantor and grantee Roles, a command grant's external
+/// command id.
+#[test]
+fn a_readers_grants_are_its_own_active_ones_with_their_records_resolved() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, author_jwt, author) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let bc = skilj_core::db::get_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = graphql_request(
+            &router,
+            Some(&author_jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "name": "AddTicketNote", "payload": r#"{"note":"n"}"# }),
+        )
+        .await;
+        let sequence = response["data"]["submitCommand"]["triggeredEventSequences"][0]
+            .as_i64()
+            .unwrap();
+        let command_id = skilj_core::db::list_commands_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.command_type.name == "AddTicketNote")
+            .unwrap()
+            .id;
+
+        let role = |name: &str| Role {
+            id: generate_token_id(),
+            external_subject: unique_name(name),
+            name: name.to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        let (reader, other) = (role("reader"), role("other"));
+        for r in [&reader, &other] {
+            skilj_core::db::insert_role(&pool, r).await.unwrap();
+        }
+        let grant = |grantee: &Role,
+                     event_sequence: Option<i64>,
+                     command_id: Option<String>,
+                     revoked: bool| {
+            skilj_core::access_control::PrivateFieldGrant {
+                id: generate_token_id(),
+                bounded_context: bc.clone(),
+                grantor: author.clone(),
+                grantee: grantee.clone(),
+                event_sequence,
+                command_id,
+                status: if revoked {
+                    skilj_core::access_control::TokenStatus::Revoked
+                } else {
+                    skilj_core::access_control::TokenStatus::Active
+                },
+                created_at: test_now(),
+                revoked_at: revoked.then(test_now),
+            }
+        };
+        let grants = [
+            grant(&reader, Some(sequence), None, false),
+            grant(&reader, None, Some(command_id.clone()), false),
+            grant(&reader, None, None, true),
+            grant(&other, Some(sequence), None, false),
+        ];
+        for g in &grants {
+            skilj_core::db::insert_private_field_grant(&pool, g)
+                .await
+                .unwrap();
+        }
+
+        let mut readers =
+            skilj_core::db::list_active_private_field_grants_for_grantee(&pool, &bc_name, &reader)
+                .await
+                .unwrap();
+        readers.sort_by_key(|g| g.command_id.is_some());
+        assert_eq!(readers, grants[..2]);
+
+        let mut all = skilj_core::db::list_private_field_grants_for_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        let mut expected = grants.to_vec();
+        all.sort_by(|a, b| a.id.cmp(&b.id));
+        expected.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(all, expected);
+    });
+}

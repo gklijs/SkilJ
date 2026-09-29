@@ -135,8 +135,12 @@ pub fn query_events_field() -> Field {
                     .await?;
                 }
 
-                let private_field_grants =
-                    super::load_private_field_grants(&state.pool, &bounded_context_name).await?;
+                let private_field_grants = super::load_private_field_grants(
+                    &state.pool,
+                    &bounded_context_name,
+                    &access_mapping.role,
+                )
+                .await?;
                 let results = skilj_core::event_store::query_events_page(
                     &access_mapping,
                     &event_types,
@@ -322,8 +326,12 @@ pub fn inspect_event_field() -> Field {
                 .await?;
             }
 
-            let private_field_grants =
-                super::load_private_field_grants(&state.pool, &bounded_context_name).await?;
+            let private_field_grants = super::load_private_field_grants(
+                &state.pool,
+                &bounded_context_name,
+                &access_mapping.role,
+            )
+            .await?;
             let inspected = skilj_core::event_store::inspect_event(
                 &access_mapping,
                 &event,
