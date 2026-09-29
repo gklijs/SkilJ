@@ -1161,16 +1161,49 @@ pub fn valid_private_fields(schema: &str, private_fields: &[PrivateField]) -> bo
 /// surfaced here as an outright rejection rather than an absent
 /// `properties`/`definitions` map.
 pub fn valid_payload(schema: &str, payload: &str) -> bool {
-    let Ok(schema_value) = serde_json::from_str::<serde_json::Value>(schema) else {
-        return false;
-    };
     let Ok(payload_value) = serde_json::from_str::<serde_json::Value>(payload) else {
         return false;
     };
-    let Ok(validator) = jsonschema::validator_for(&schema_value) else {
+    let Some(validator) = compiled_schema(schema) else {
         return false;
     };
     validator.is_valid(&payload_value)
+}
+
+/// The most distinct schemas [`compiled_schema`] keeps compiled; past
+/// this it starts over. Registered types' current schemas are all that is
+/// normally in play, so this is only reached by schema churn.
+const MAX_COMPILED_SCHEMAS: usize = 256;
+
+/// `schema` compiled, from a process-wide cache keyed by the schema text
+/// itself (docs/architecture.md §127): compiling cost about 60 µs for an
+/// ordinary schema, against 0.2 µs to validate with the result, and ran
+/// for every event and command a caller wrote. Keyed by content, so a
+/// changed schema is simply another entry and a stale validator is never
+/// served. `None` for a schema that doesn't parse or compile - not cached,
+/// since registration refuses such schemas and they don't recur.
+fn compiled_schema(schema: &str) -> Option<std::sync::Arc<jsonschema::Validator>> {
+    static CACHE: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<jsonschema::Validator>>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    if let Some(validator) = CACHE
+        .lock()
+        .expect("the compiled-schema cache is never poisoned")
+        .get(schema)
+    {
+        return Some(validator.clone());
+    }
+    let schema_value = serde_json::from_str::<serde_json::Value>(schema).ok()?;
+    let validator = std::sync::Arc::new(jsonschema::validator_for(&schema_value).ok()?);
+    let mut cache = CACHE
+        .lock()
+        .expect("the compiled-schema cache is never poisoned");
+    if cache.len() >= MAX_COMPILED_SCHEMAS {
+        cache.clear();
+    }
+    cache.insert(schema.to_string(), validator.clone());
+    Some(validator)
 }
 
 /// The idempotency-key namespace `CrossContextRoute`'s own background

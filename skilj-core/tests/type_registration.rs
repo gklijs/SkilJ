@@ -1460,3 +1460,36 @@ fn register_command_type_rejects_dropping_an_existing_tag_mapping_key() {
 
     assert_eq!(err.code(), event_store::Error::TagMappingKeyDropped.code());
 }
+
+/// Compiled schemas are cached by their text (docs/architecture.md §127):
+/// a changed schema is another entry and never answered by the old one's
+/// validator, more distinct schemas than the cache holds stay correct, and
+/// a schema or payload that doesn't parse still never validates.
+#[test]
+fn valid_payload_caches_compiled_schemas_by_content() {
+    let schema = |minimum: i64| {
+        format!(
+            r#"{{"type":"object","properties":{{"n":{{"type":"integer","minimum":{minimum}}}}},"required":["n"]}}"#
+        )
+    };
+    let five = r#"{"n":5}"#;
+    assert!(skilj_core::event_store::valid_payload(&schema(0), five));
+    assert!(skilj_core::event_store::valid_payload(&schema(0), five));
+    assert!(!skilj_core::event_store::valid_payload(&schema(10), five));
+    assert!(skilj_core::event_store::valid_payload(&schema(0), five));
+
+    for minimum in 0..600 {
+        assert_eq!(
+            skilj_core::event_store::valid_payload(&schema(minimum), five),
+            minimum <= 5,
+            "minimum {minimum}"
+        );
+    }
+
+    assert!(!skilj_core::event_store::valid_payload("not json", five));
+    assert!(!skilj_core::event_store::valid_payload(&schema(0), "not json"));
+    assert!(!skilj_core::event_store::valid_payload(
+        r#"{"type":"no-such-type"}"#,
+        five
+    ));
+}

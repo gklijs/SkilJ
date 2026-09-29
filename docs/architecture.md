@@ -10139,3 +10139,15 @@ Test: `batched_event_reads_match_the_single_row_read` (`skilj/tests/command_trig
 Tests:
 - `batched_command_reads_match_the_single_row_read` (`skilj/tests/command_trigger.rs`): eight commands. The listing matches `get_command_by_external_id` for each, in recording order. A `fetchCommands` page walked in chunks of 3 serves the first three, and a single-chunk walk sees all eight.
 - `a_contexts_grants_are_read_for_that_context_alone` (`skilj/tests/graphql_business_surfaces.rs`): grants for several Roles across two contexts, one revoked, one scoped and one able to read sensitive fields. The context-scoped read equals the old list-everything-and-filter result. A superadmin's `boundedContexts` shows the context's three active grants.
+
+## 127. Compiled payload schemas are cached
+
+`event_store::valid_payload` checks every caller-supplied payload against its type's JSON Schema - external and direct events, command triggers and submissions. It parsed the schema text and compiled a `jsonschema` validator on every call. Measured in a release build on an ordinary schema (a nested `$defs` line item, a `pattern`, formats), compiling and validating cost about 61 µs, and validating with an already-compiled validator about 0.2 µs. The compile was nearly all of it, on every write, and it grows with the schema: codegen'd schemas with many definitions cost more.
+
+`compiled_schema` keeps compiled validators in a process-wide cache keyed by the schema text itself. A registration that changes a schema changes the key, so a stale validator can't be served and nothing needs invalidating. The cache holds at most `MAX_COMPILED_SCHEMAS` (256) and starts over past that - registered types' current schemas are normally all that's in play, so only schema churn reaches it. A schema that doesn't parse or compile isn't cached; registration refuses those, so they don't recur.
+
+Also checked while here, and fine as is:
+- `jsonschema` is built with `default-features = false`, so no HTTP or file `$ref` resolution. A registered schema can't make the server fetch URLs on write.
+- `pattern` uses `fancy-regex` with its default 1,000,000-step backtrack limit. Patterns without look-around or back-references go to the linear `regex` crate, so a catastrophic pattern is bounded.
+
+Test: `valid_payload_caches_compiled_schemas_by_content` (`skilj-core/tests/type_registration.rs`). A payload valid under `minimum: 0` isn't valid under `minimum: 10`, even between repeated calls under the first. 600 distinct schemas (past the cap) each answer correctly. A malformed schema, a malformed payload, and a schema that doesn't compile never validate.

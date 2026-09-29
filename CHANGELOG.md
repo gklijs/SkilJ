@@ -165,6 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every event and command write compiled its type's JSON Schema anew
+  (about 60 µs for an ordinary schema, against 0.2 µs to validate).
+  Compiled validators are now cached by schema text, at most 256
+  (docs/architecture.md §127).
 - `fetchCommands` and command listings looked up each command's type
   row by row, and every GraphQL resolver returning a bounded context
   listed every role access mapping in the deployment (two lookups each)
