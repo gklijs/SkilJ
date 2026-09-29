@@ -52,6 +52,18 @@ pub fn field() -> Field {
             )
             .await
             .map_err(to_graphql_error)?;
+            // docs/architecture.md §132: pending deadlines hold their target
+            // command's plaintext payload too, and would submit it again
+            // once due. Also before the key goes.
+            skilj_core::db::forget_subject_in_deadlines(
+                &state.pool,
+                &bounded_context_name,
+                &subject_key,
+                &subject_value,
+                now,
+            )
+            .await
+            .map_err(to_graphql_error)?;
             skilj_core::db::destroy_encryption_key(
                 &state.pool,
                 &bounded_context_name,

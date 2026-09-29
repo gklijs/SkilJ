@@ -177,6 +177,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `forgetSubject` left pending deadlines alone, though they hold their
+  target command's payload in plaintext - so one naming the forgotten
+  subject still fired later, re-creating its data under a fresh key.
+  Such deadlines, in every bounded context that targets the erased one,
+  are now resolved with a new `forgotten` status and their payload
+  cleared (docs/architecture.md §132).
 - A deadline could fire although its cancelling event was committed
   before it came due - when the cancel loop hadn't processed it yet (a
   paid order still cancelled). A due deadline now waits until every

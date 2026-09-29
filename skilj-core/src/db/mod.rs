@@ -9369,6 +9369,89 @@ pub fn render_parked_delivery(
     rendered
 }
 
+/// `forgetSubject`'s deadline half (docs/architecture.md §132): every
+/// still-`pending` deadline targeting `bounded_context` whose payload
+/// names the subject is resolved as `forgotten`, its payload cleared. A
+/// deadline stores its target command's payload in plaintext until it
+/// fires - outside any key's reach - and firing after the subject was
+/// forgotten would submit that data again under a fresh key. Deadlines
+/// live with their schedule's source bounded context, not their target,
+/// so every bounded context's `deadlines` table is walked, a page at a
+/// time. A row names the subject when its payload does through the
+/// target command type's sensitive fields (`sensitive_field_subjects`),
+/// or - when that type is gone, or the payload doesn't parse - when the
+/// subject value appears anywhere in it, erring toward erasure as
+/// [`delete_parked_deliveries_for_subject`] does. A row already `firing`
+/// is past stopping and left alone. The resolved row stays, as a trace
+/// that a deadline was forgotten rather than fired or cancelled. Returns
+/// how many were resolved.
+pub async fn forget_subject_in_deadlines(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<u64> {
+    const PAGE: i64 = 1000;
+    let mut forgotten = 0;
+    let mut sensitive_fields: std::collections::HashMap<String, Option<Vec<SensitiveField>>> =
+        std::collections::HashMap::new();
+    for holder in list_bounded_contexts(pool).await? {
+        let schema = schema_ident(&holder.name);
+        let mut after = String::new();
+        loop {
+            let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT id, target_command_type, payload FROM {schema}.deadlines \
+                     WHERE target_bounded_context = $1 AND status = 'pending' AND id > $2 \
+                     ORDER BY id LIMIT $3"
+            )))
+            .bind(bounded_context)
+            .bind(&after)
+            .bind(PAGE)
+            .fetch_all(pool)
+            .await?;
+            let Some((last_id, _, _)) = rows.last() else {
+                break;
+            };
+            after = last_id.clone();
+            for (id, command_type, payload) in &rows {
+                if !sensitive_fields.contains_key(command_type) {
+                    let fields = get_command_type(pool, bounded_context, command_type)
+                        .await?
+                        .map(|ct| ct.sensitive_fields);
+                    sensitive_fields.insert(command_type.clone(), fields);
+                }
+                let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
+                let names_subject = match (&sensitive_fields[command_type], &parsed) {
+                    (Some(fields), Some(_)) => {
+                        crate::event_store::sensitive_field_subjects(fields, payload)
+                            .iter()
+                            .any(|(key, value)| key == subject_key && value == subject_value)
+                    }
+                    (_, Some(json)) => json_mentions(json, subject_value),
+                    (_, None) => payload.contains(subject_value),
+                };
+                if names_subject {
+                    forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "UPDATE {schema}.deadlines \
+                         SET status = 'forgotten', payload = '{{}}', resolved_at = $1 \
+                         WHERE id = $2 AND status = 'pending'"
+                    )))
+                    .bind(now)
+                    .bind(id)
+                    .execute(pool)
+                    .await?
+                    .rows_affected();
+                }
+            }
+            if (rows.len() as i64) < PAGE {
+                break;
+            }
+        }
+    }
+    Ok(forgotten)
+}
+
 /// Whether `value` appears as a string leaf, or a number/bool rendered as
 /// a string, anywhere in `json`.
 fn json_mentions(json: &serde_json::Value, value: &str) -> bool {

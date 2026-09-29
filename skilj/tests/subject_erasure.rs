@@ -93,6 +93,35 @@ impl EventType for AccountOpened {
     }
 }
 
+/// For the deadline half of forgetSubject (docs/architecture.md §132): a
+/// deadline's target command, with the same sensitive field.
+struct EmailUser;
+
+enum NoEvent {}
+
+impl skilj_core::plugin::BoundedContextEvent for NoEvent {
+    fn try_from_event(
+        _event: &skilj_core::event_store::Event,
+    ) -> Option<Result<Self, serde_json::Error>> {
+        None
+    }
+}
+
+impl skilj::CommandType for EmailUser {
+    type Payload = AccountOpenedPayload;
+    type Event = NoEvent;
+    const NAME: &'static str = "EmailUser";
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        AccountOpened::sensitive_fields()
+    }
+    fn decide(
+        _payload: &Self::Payload,
+        _matching_events: &[Self::Event],
+    ) -> skilj_core::shared::CommandDecision {
+        skilj_core::shared::CommandDecision::Accepted { events: vec![] }
+    }
+}
+
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
 
 struct TestDb {
@@ -290,6 +319,7 @@ fn subject_erasure_end_to_end() {
             ))
             .bounded_context(bc_name.clone())
             .event_type::<AccountOpened>()
+            .command_type::<EmailUser>()
             .reconciliation_role(admin_subject)
             .encryption_master_key(EncryptionMasterKey::from_bytes([42u8; 32]))
             .build()
@@ -404,6 +434,62 @@ fn subject_erasure_end_to_end() {
         )
         .await;
 
+        // docs/architecture.md §132: pending deadlines hold their target
+        // command's plaintext payload. A deadline lives with its schedule's
+        // source context, so some are held by another one.
+        let holder = BoundedContext {
+            name: unique_name("scheduling"),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &holder)
+            .await
+            .unwrap();
+        let deadline =
+            |held_by: String, target: String, command: &'static str, user_id: &'static str| {
+                let pool = pool.clone();
+                async move {
+                    let id = unique_name("deadline");
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "INSERT INTO \"bc_{held_by}\".deadlines \
+                     (id, schedule_name, fire_at, tags, target_bounded_context, \
+                      target_command_type, payload, status, created_at) \
+                     VALUES ($1, 'EmailLater', $2, '[]'::jsonb, $3, $4, $5, 'pending', $6)"
+                    )))
+                    .bind(&id)
+                    .bind(test_now() + chrono::Duration::hours(1))
+                    .bind(&target)
+                    .bind(command)
+                    .bind(json!({ "email": "person@example.com", "user_id": user_id }).to_string())
+                    .bind(test_now())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    (held_by, id)
+                }
+            };
+        let naming_42_here = deadline(bc_name.clone(), bc_name.clone(), "EmailUser", "42").await;
+        let naming_42_elsewhere =
+            deadline(holder.name.clone(), bc_name.clone(), "EmailUser", "42").await;
+        let naming_43 = deadline(bc_name.clone(), bc_name.clone(), "EmailUser", "43").await;
+        let unresolvable_42 = deadline(bc_name.clone(), bc_name.clone(), "Gone", "42").await;
+        let other_target = deadline(bc_name.clone(), holder.name.clone(), "EmailUser", "42").await;
+        let deadline_row = |(held_by, id): (String, String)| {
+            let pool = pool.clone();
+            async move {
+                let (status, payload): (String, String) = sqlx::query_as(sqlx::AssertSqlSafe(
+                    format!("SELECT status, payload FROM \"bc_{held_by}\".deadlines WHERE id = $1"),
+                ))
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                (status, payload)
+            }
+        };
+
         let graphql_router = skilj.graphql_router().await.unwrap();
         let admin_jwt = sign_jwt(&admin_role.external_subject);
 
@@ -435,6 +521,19 @@ fn subject_erasure_end_to_end() {
             .map(|d| d.id)
             .collect();
         assert_eq!(parked, vec![kept]);
+        // ...and resolves the pending deadlines naming 42 that target this
+        // context, wherever they're held, clearing their payload - the
+        // unresolvable one too. 43's stays, as does one targeting another
+        // context.
+        for forgotten in [naming_42_here, naming_42_elsewhere, unresolvable_42] {
+            assert_eq!(
+                deadline_row(forgotten).await,
+                ("forgotten".to_string(), "{}".to_string())
+            );
+        }
+        for kept in [naming_43, other_target] {
+            assert_eq!(deadline_row(kept).await.0, "pending");
+        }
 
         // A second forgetSubject on the same, now-destroyed subject is
         // rejected - there is nothing active left to find.

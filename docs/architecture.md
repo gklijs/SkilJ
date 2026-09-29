@@ -10214,3 +10214,19 @@ Breaking (`skilj-core`): `fire_due_deadlines` gains the `cancels` parameter. Its
 Tests (`skilj-core/tests/deadline_cancel_ordering.rs`). An order's deadline targets an unregistered command, so firing only marks it `fired`. The cancel loop hasn't run when the deadline comes due:
 - `a_deadline_waits_for_a_cancel_committed_before_it_came_due`: paid before `fire_at`, the fire tick leaves the row `pending`, and the cancel then cancels it. With the hold disabled the row ended `fired`.
 - `a_deadline_does_not_wait_for_a_cancel_after_it_came_due`: paid after `fire_at`, the deadline fires and stays fired.
+
+## 132. `forgetSubject` resolves pending deadlines too
+
+A deadline stores its target command's payload - `ErasedDeadlineSpec.payload_json` - in plaintext on the `deadlines` row until it fires. It sits outside any key's reach, like a parked request (§91). `forgetSubject` destroyed the subject's key and deleted its parked deliveries, but left pending deadlines alone. So a deadline naming the forgotten subject still fired later: it submitted the subject's data again, and a fresh key was provisioned for it. Its plaintext also stayed readable in the table until then.
+
+The fix is the user's choice: resolve them as forgotten, rather than delete them or let them fire. `db::forget_subject_in_deadlines` runs from `forgetSubject` before the key is destroyed, so a failure leaves the call retryable:
+
+- **Where it looks:** a deadline is held by its schedule's source bounded context, not its target, so every bounded context's `deadlines` table is walked, 1000 rows at a time. It looks at `pending` rows whose `target_bounded_context` is the erased context. A row already `firing` is past stopping and left alone.
+- **When a row names the subject:** when its payload does through the target command type's sensitive fields (`sensitive_field_subjects`), the same test encryption keys by. When that type is gone, or the payload doesn't parse, it counts if the subject value appears anywhere in the payload - erring toward erasure, as `delete_parked_deliveries_for_subject` does.
+- **What happens to it:** status `forgotten` (a new terminal status, which nothing needs to parse), payload `{}`, `resolved_at` set. It never fires, the fire and cancel paths only touch `pending`/`firing` rows, and the row stays as a trace without the personal data.
+
+Test: `subject_erasure_end_to_end` (`skilj/tests/subject_erasure.rs`) gains five pending deadlines, with the target command `EmailUser` sharing the event's sensitive `email`/`user_id`. They're held both by the erased context and by another one:
+- naming user 42 held here, naming 42 held elsewhere, and naming 42 with a gone command type all end `forgotten` with payload `{}`;
+- naming 43, and naming 42 but targeting another context, stay `pending`.
+
+Without the call, the first stayed `pending` with the plaintext email.
