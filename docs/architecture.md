@@ -10230,3 +10230,11 @@ Test: `subject_erasure_end_to_end` (`skilj/tests/subject_erasure.rs`) gains five
 - naming 43, and naming 42 but targeting another context, stay `pending`.
 
 Without the call, the first stayed `pending` with the plaintext email.
+
+## 133. A gone cancel source doesn't stop deadlines firing
+
+§131 made `fire_due_deadlines` ask each cancel that can reach a due deadline where its unprocessed backlog starts (`cancel_backlog_start`), reading the cancel's source bounded context's `events` and `deadline_cursors`. When that context has been hard-deleted while the cancel is still registered in the running process, those tables no longer exist. The query failed and the whole fire tick returned the error, for the bounded context holding the deadlines, which may be a different, healthy one. It would fail again every tick, so none of that context's deadlines fired.
+
+A cancel whose source is gone can never cancel anything again, so there's nothing for a fire to wait for. `cancel_backlog_start` now checks `bounded_contexts` first and answers `None` (no backlog) when the source is gone. A delete landing between that check and the query can still fail one tick, but can't wedge the loop.
+
+Test: `a_cancel_whose_source_is_gone_does_not_stop_deadlines_firing` (`skilj-core/tests/deadline_cancel_ordering.rs`). A due deadline, with a registered cancel whose source bounded context doesn't exist, fires. Without the check the tick failed.

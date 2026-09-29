@@ -177,6 +177,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Unreleased regression from the fire-waits-for-cancels change: a
+  registered cancel whose source bounded context had been hard-deleted
+  failed every fire tick of the bounded context holding its deadlines,
+  so none of them fired. A gone cancel source now holds nothing
+  (docs/architecture.md §133).
 - `forgetSubject` left pending deadlines alone, though they hold their
   target command's payload in plaintext - so one naming the forgotten
   subject still fired later, re-creating its data under a fresh key.

@@ -455,3 +455,64 @@ fn a_deadline_does_not_wait_for_a_cancel_after_it_came_due() {
         assert_eq!(statuses, ("fired".to_string(), "fired".to_string()));
     });
 }
+
+/// A cancel whose source bounded context is gone - hard-deleted while
+/// still registered - can never cancel anything, so it doesn't hold a
+/// fire. Asking its dropped schema used to fail every fire tick of the
+/// deadlines' own bounded context, so none of them fired
+/// (docs/architecture.md §133).
+#[test]
+fn a_cancel_whose_source_is_gone_does_not_stop_deadlines_firing() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let placed = seed_event_type(&pool, &bc, "OrderPlaced").await;
+        let name: &'static str = Box::leak(bc.name.clone().into_boxed_str());
+        let schedule = ScheduleDeadlineInfo {
+            name: "CancelUnpaid",
+            source_bounded_context: name,
+            source_event_type: "OrderPlaced",
+            target_bounded_context: name,
+            target_command_type: "NotRegistered",
+            start_from: DeadlinePollStartFrom::Beginning,
+        };
+        let cancel = CancelDeadlineInfo {
+            name: "CancelOnPaid",
+            source_bounded_context: "a_bounded_context_that_was_deleted",
+            source_event_type: "OrderPaid",
+            deadline_schedule_name: "CancelUnpaid",
+            deadline_schedule_bounded_context: name,
+            deadline_schedule_source_event_type: "OrderPlaced",
+            start_from: DeadlinePollStartFrom::Beginning,
+        };
+        let cache = skilj_core::event_cache::EventCache::new(0);
+        append(&pool, &placed, "o-1").await;
+        db::catch_up_schedule_deadline(
+            &pool,
+            &schedule,
+            &SchedulesAt(schedule, test_now() - chrono::Duration::seconds(1)),
+            &cache,
+        )
+        .await
+        .unwrap();
+
+        db::fire_due_deadlines(
+            &pool,
+            &NoCommands,
+            &NoProjections,
+            &NoSnapshots,
+            &skilj_core::event_store::EventBroadcaster::new(16),
+            &cache,
+            &bc.name,
+            Utc::now(),
+            None,
+            &skilj_retry::RetryPolicy::default(),
+            &[cancel],
+        )
+        .await
+        .expect("a gone cancel source must not fail the fire tick");
+        assert_eq!(deadline_statuses(&pool, &bc).await, ["fired"]);
+    });
+}

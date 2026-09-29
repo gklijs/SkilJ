@@ -10119,6 +10119,18 @@ async fn cancel_backlog_start(
     pool: &Pool,
     cancel: &crate::plugin::CancelDeadlineInfo,
 ) -> crate::error::Result<Option<DateTime<Utc>>> {
+    // A cancel whose source bounded context was hard-deleted can never
+    // cancel anything again, so there is nothing to wait for. Querying its
+    // dropped schema instead failed every fire tick of the bounded context
+    // holding the deadlines - none of them fired (docs/architecture.md §133).
+    let source_exists: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM bounded_contexts WHERE name = $1")
+            .bind(cancel.source_bounded_context)
+            .fetch_optional(pool)
+            .await?;
+    if source_exists.is_none() {
+        return Ok(None);
+    }
     let cursor = get_deadline_cursor(pool, cancel.source_bounded_context, cancel.name)
         .await?
         .unwrap_or(-1);
