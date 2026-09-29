@@ -251,7 +251,9 @@ fn full_admin_console_lifecycle_end_to_end() {
             .to_string();
 
         // ClosesPermanentlyOnFirstClaim - a second attempt, even with the
-        // same secret, fails now that an active superadmin exists.
+        // same secret, fails: the first claim consumed this process's
+        // secret (docs/architecture.md §109), so it is refused as
+        // unavailable before the "a superadmin exists" check is reached.
         let response = graphql_request(
             &router,
             None,
@@ -263,7 +265,7 @@ fn full_admin_console_lifecycle_end_to_end() {
         .await;
         assert_eq!(
             response["errors"][0]["extensions"]["code"],
-            "superadmin_already_exists"
+            "bootstrap_secret_unavailable"
         );
 
         // 2. Every gated mutation needs a caller - no Authorization header

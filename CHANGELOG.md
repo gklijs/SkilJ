@@ -400,6 +400,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The superadmin bootstrap secret didn't end at its first claim: each
+  process kept it in memory and only refused it while an active
+  superadmin existed, so after every superadmin was revoked the
+  originally printed secret - possibly days old in shipped logs - worked
+  again on every process that hadn't restarted. It is now consumed by the
+  first claim (and by any claim once a superadmin exists); a restart while
+  no active superadmin exists prints a new one, as the spec intends.
+  Separately, two concurrent claims (e.g. on two instances, each with its
+  own secret) could both succeed; the "no active superadmin" check now
+  runs atomically with the insert. `Skilj::bootstrap_secret()` now returns
+  `Option<String>`.
 - Startup re-registration could silently **remove** a type's
   protections for every instance: an older version of the application
   (restarting mid-rollout, or rolled back to) that didn't declare a

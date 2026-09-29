@@ -137,6 +137,41 @@ impl SkiljRejection for Error {
 /// black box, the same register as `generate_token_secret`" per the
 /// entity's own doc comment, so this reuses that black box rather than
 /// inventing a second one.
+/// This process's bootstrap secret, shared by everything that serves
+/// `createSuperadmin` (docs/architecture.md §109). `entity BootstrapSecret`:
+/// held in this process's memory only, and it "ends either at the next
+/// restart or at the moment the first superadmin exists" - so a claim
+/// consumes it (`take`) rather than leaving it to be refused only while an
+/// active superadmin exists. Otherwise revoking every superadmin later made
+/// the originally printed secret, perhaps days old in shipped logs, valid
+/// again on every process that hadn't restarted since. A restart while no
+/// active superadmin exists generates a fresh one - the spec's recovery
+/// path. The lock is held for a whole claim, so two claims on one process
+/// can't both use the secret.
+#[derive(Clone, Default)]
+pub struct BootstrapGate(std::sync::Arc<tokio::sync::Mutex<Option<BootstrapSecret>>>);
+
+impl BootstrapGate {
+    pub fn new(secret: Option<BootstrapSecret>) -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Mutex::new(secret)))
+    }
+
+    /// Held for a whole `createSuperadmin` claim; set it to `None` once
+    /// the claim has succeeded.
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, Option<BootstrapSecret>> {
+        self.0.lock().await
+    }
+
+    /// The secret, if this process still holds one and no claim is in
+    /// progress right now.
+    pub fn current(&self) -> Option<String> {
+        self.0
+            .try_lock()
+            .ok()
+            .and_then(|secret| secret.as_ref().map(|s| s.secret.clone()))
+    }
+}
+
 pub fn generate_bootstrap_secret(existing_roles: &[Role]) -> Option<BootstrapSecret> {
     if existing_roles
         .iter()

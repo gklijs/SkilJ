@@ -11,7 +11,9 @@ instead).
 bootstrap secret the first time it ever runs against a fresh database
 (`bootstrap_secret`, `ClosesPermanentlyOnFirstClaim`) - it's gone for
 good the moment a superadmin is created, not reprintable, not
-recoverable. Whoever is going to administer this deployment claims it:
+recoverable. (Should every superadmin later be revoked, the old secret
+still doesn't work again: restarting the process then prints a new one.)
+Whoever is going to administer this deployment claims it:
 
 ```graphql
 mutation {

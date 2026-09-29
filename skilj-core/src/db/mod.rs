@@ -2088,6 +2088,46 @@ pub async fn insert_role(pool: &Pool, role: &Role) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// `rule CreateSuperadmin`'s `requires: not exists Role{superadmin: true,
+/// status: active}` and its `ensures`, as one atomic step
+/// (docs/architecture.md §109): under a transaction-scoped advisory lock,
+/// re-checks that no active superadmin exists and only then inserts
+/// `role`. Returns `false`, inserting nothing, when one does - including one
+/// a concurrent claim (another instance, with its own bootstrap secret)
+/// committed after the caller's own check. Without the lock and re-check,
+/// two concurrent claims both passed and both became superadmins.
+pub async fn insert_superadmin_if_none_active(
+    pool: &Pool,
+    role: &Role,
+) -> crate::error::Result<bool> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('skilj_create_superadmin')::bigint)")
+        .execute(&mut *tx)
+        .await?;
+    let (exists,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM roles WHERE superadmin AND status = 'active')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if exists {
+        return Ok(false);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO roles ({ROLE_COLUMNS}) VALUES ($1,$2,$3,$4,$5,$6,$7)"
+    )))
+    .bind(&role.id)
+    .bind(&role.external_subject)
+    .bind(&role.name)
+    .bind(role.superadmin)
+    .bind(role_status_to_str(role.status))
+    .bind(role.created_at)
+    .bind(role.revoked_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 #[tracing::instrument(skip_all)]
 pub async fn get_role(pool: &Pool, id: &str) -> crate::error::Result<Option<Role>> {
     let row: Option<RoleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(

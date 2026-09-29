@@ -21,7 +21,6 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::KeyValue;
 use skilj_core::access_control::{AccessLevel, JwksCache, RevocationBroadcaster, Role};
-use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{Error as EventStoreError, Event, EventBroadcaster};
@@ -179,7 +178,7 @@ pub struct Skilj {
     /// `None` once an active superadmin already exists
     /// (`ClosesPermanentlyOnFirstClaim`). Read only by
     /// `skilj-graphql`'s `createSuperadmin` mutation resolver.
-    bootstrap_secret: Option<BootstrapSecret>,
+    bootstrap: skilj_core::bootstrap::BootstrapGate,
     /// `None` when `.identity_provider(...)` was never called - every
     /// GraphQL resolver that needs a caller identity has no way to
     /// authenticate anyone in that case (not a silent bypass: there is
@@ -718,8 +717,12 @@ impl Skilj {
     /// scraped from the startup log. `None` once an active superadmin
     /// already exists (`ClosesPermanentlyOnFirstClaim`) - the same case
     /// `bootstrap::generate_bootstrap_secret` itself returns `None` for.
-    pub fn bootstrap_secret(&self) -> Option<&str> {
-        self.bootstrap_secret.as_ref().map(|s| s.secret.as_str())
+    ///
+    /// Also `None` once a `createSuperadmin` claim has used it - the secret
+    /// ends at the first claim, not only while a superadmin is active
+    /// (docs/architecture.md §109) - and while a claim is in progress.
+    pub fn bootstrap_secret(&self) -> Option<String> {
+        self.bootstrap.current()
     }
 
     /// `skilj-rest`'s routes, mounted onto a fresh `axum::Router` - see
@@ -782,7 +785,7 @@ impl Skilj {
     fn graphql_state(&self) -> skilj_graphql::GraphqlState {
         skilj_graphql::GraphqlState {
             pool: self.pool.clone(),
-            bootstrap_secret: self.bootstrap_secret.clone(),
+            bootstrap: self.bootstrap.clone(),
             identity: self
                 .identity_provider
                 .as_ref()
@@ -1921,6 +1924,9 @@ impl SkiljBuilder {
         let roles = skilj_core::db::list_roles(&pool).await?;
 
         let bootstrap_secret = skilj_core::bootstrap::generate_bootstrap_secret(&roles);
+        // Shared by `Skilj` and every `GraphqlState` built from it, so a
+        // claim through any of them consumes it (docs/architecture.md §109).
+        let bootstrap = skilj_core::bootstrap::BootstrapGate::new(bootstrap_secret.clone());
         if let Some(secret) = &bootstrap_secret {
             eprintln!(
                 "skilj: no active superadmin Role exists yet - bootstrap secret (use once, via \
@@ -2188,7 +2194,7 @@ impl SkiljBuilder {
         let schema_registry = Arc::new(
             skilj_graphql::schema::SchemaRegistry::build(skilj_graphql::GraphqlState {
                 pool: pool.clone(),
-                bootstrap_secret: bootstrap_secret.clone(),
+                bootstrap: bootstrap.clone(),
                 identity: identity_provider
                     .as_ref()
                     .map(|ip| skilj_graphql::auth::Identity {
@@ -2226,7 +2232,7 @@ impl SkiljBuilder {
             projections,
             snapshots,
             event_types: Arc::new(self.event_types),
-            bootstrap_secret,
+            bootstrap,
             identity_provider,
             projection_query_wait_timeout,
             read_cursor_checkout_lease,

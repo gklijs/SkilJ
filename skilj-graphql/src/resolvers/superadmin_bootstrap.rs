@@ -6,6 +6,7 @@
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
+use async_graphql::ErrorExtensions;
 use skilj_core::shared::generate_token_id;
 
 /// `createSuperadmin(bootstrapSecret: String!, name: String!, externalSubject: String!): CreatedSuperadmin!`,
@@ -22,17 +23,22 @@ pub fn field() -> Field {
                 let name = ctx.args.try_get("name")?.string()?.to_string();
                 let external_subject = ctx.args.try_get("externalSubject")?.string()?.to_string();
 
-                let Some(bootstrap_secret) = &state.bootstrap_secret else {
+                // docs/architecture.md §109: held for the whole claim, and
+                // the secret consumed once it succeeds.
+                let mut gate = state.bootstrap.lock().await;
+                let Some(bootstrap_secret) = gate.as_ref() else {
                     return Err(async_graphql::Error::new(
-                        "an active superadmin Role already exists; the bootstrap secret can \
-                         never be used again",
-                    ));
+                        "this process holds no bootstrap secret: it was already used, or an \
+                         active superadmin existed when the process started. If every superadmin \
+                         has since been revoked, restart to generate a new one.",
+                    )
+                    .extend_with(|_, ext| ext.set("code", "bootstrap_secret_unavailable")));
                 };
                 let existing_roles = skilj_core::db::list_roles(&state.pool)
                     .await
                     .map_err(to_graphql_error)?;
 
-                let role = skilj_core::bootstrap::create_superadmin(
+                let role = match skilj_core::bootstrap::create_superadmin(
                     bootstrap_secret,
                     &presented_secret,
                     name,
@@ -40,11 +46,32 @@ pub fn field() -> Field {
                     &existing_roles,
                     generate_token_id(),
                     chrono::Utc::now(),
-                )
-                .map_err(to_graphql_error)?;
-                skilj_core::db::insert_role(&state.pool, &role)
+                ) {
+                    Ok(role) => role,
+                    Err(e) => {
+                        // A superadmin exists (made through another
+                        // instance's secret): this one has ended too.
+                        if skilj_core::error::SkiljRejection::code(&e)
+                            == "superadmin_already_exists"
+                        {
+                            *gate = None;
+                        }
+                        return Err(to_graphql_error(e));
+                    }
+                };
+                // The rule's "no active superadmin" guard again, atomically
+                // with the insert - another instance may have claimed with
+                // its own secret since `existing_roles` was read.
+                if !skilj_core::db::insert_superadmin_if_none_active(&state.pool, &role)
                     .await
-                    .map_err(to_graphql_error)?;
+                    .map_err(to_graphql_error)?
+                {
+                    *gate = None;
+                    return Err(to_graphql_error(
+                        skilj_core::bootstrap::Error::SuperadminAlreadyExists,
+                    ));
+                }
+                *gate = None;
 
                 Ok(Some(FieldValue::owned_any(role)))
             })

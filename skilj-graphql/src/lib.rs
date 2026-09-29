@@ -16,7 +16,6 @@ pub mod schema;
 
 use opentelemetry::metrics::Histogram;
 use skilj_core::access_control::RevocationBroadcaster;
-use skilj_core::bootstrap::BootstrapSecret;
 use skilj_core::db::Pool;
 use skilj_core::encryption::EncryptionMasterKey;
 use skilj_core::event_cache::EventCache;
@@ -47,7 +46,10 @@ static REQUEST_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
 #[derive(Clone)]
 pub struct GraphqlState {
     pub pool: Pool,
-    pub bootstrap_secret: Option<BootstrapSecret>,
+    /// This process's bootstrap secret, shared with `skilj::Skilj` and every
+    /// other `GraphqlState` built from it, so a claim through any of them
+    /// consumes it for all (docs/architecture.md §109).
+    pub bootstrap: skilj_core::bootstrap::BootstrapGate,
     pub identity: Option<auth::Identity>,
     /// `submitCommand`'s own bridge into the right bounded context's
     /// typed `decide()` - the identical `Arc<dyn CommandDispatcher>`
