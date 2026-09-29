@@ -2176,3 +2176,44 @@ fn expired_idempotency_keys_are_deleted_in_bounded_batches() {
         assert_eq!(remaining, vec!["fresh".to_string()]);
     });
 }
+
+/// docs/architecture.md §107: `get_or_create_encryption_key`'s insert can
+/// lose to a concurrent provisioner whose key a concurrent `forgetSubject`
+/// then destroys before the loser re-reads it - no active key at all. That
+/// used to `expect` and panic; it provisions again instead. Reproduced with
+/// a trigger that skips the first insert (so it neither inserts nor
+/// conflicts) while no active key exists.
+#[test]
+fn get_or_create_encryption_key_survives_a_key_vanishing_mid_provision() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let schema = format!("\"bc_{}\"", bc.name);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SEQUENCE {schema}.skip_once;
+             CREATE FUNCTION {schema}.skip_first_insert() RETURNS trigger AS $$
+             BEGIN
+                 IF nextval('{schema}.skip_once') = 1 THEN RETURN NULL; END IF;
+                 RETURN NEW;
+             END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER skip_first_insert BEFORE INSERT ON {schema}.encryption_keys
+                 FOR EACH ROW EXECUTE FUNCTION {schema}.skip_first_insert();"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let master = EncryptionMasterKey::from_bytes([4u8; 32]);
+        let (key, _id, _data_key) =
+            db::get_or_create_encryption_key(&pool, &bc.name, "user", "7", &master)
+                .await
+                .expect("provisioning must not fail (or panic) when the key vanished");
+        assert_eq!(key.status, EncryptionKeyStatus::Active);
+        assert!(db::get_active_encryption_key(&pool, &bc.name, "user", "7")
+            .await
+            .unwrap()
+            .is_some());
+    });
+}

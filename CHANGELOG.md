@@ -111,6 +111,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Writing an event or command with a sensitive field for a *new*
+  subject could panic if, at that moment, another write provisioned the
+  subject's key and a `forgetSubject` destroyed it before this one read
+  it back (`get_or_create_encryption_key`'s "vanishingly unlikely"
+  `expect`). It now provisions again - a fresh key, as for any data
+  written after an erasure.
 - `skilj-tui`'s live events tab showed a bogus `null` event whenever the
   server ended its subscription with an error (`subscription_lagged`, a
   cross-instance gap, a revoked grant), then stopped updating while

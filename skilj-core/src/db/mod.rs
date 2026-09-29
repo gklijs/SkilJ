@@ -3040,47 +3040,47 @@ pub async fn get_or_create_encryption_key(
     let bc = require_bounded_context(pool, bounded_context).await?;
     let schema = schema_ident(bounded_context);
 
-    if let Some(row) =
-        get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await?
-    {
-        let data_key = unwrap_row(master_key, &row)?;
-        return Ok((row.to_domain(bc), row.id, data_key));
+    // docs/architecture.md §107: normally one pass. Another pass only when
+    // the insert lost to a concurrent provisioner *and* that key was
+    // destroyed (a concurrent `forgetSubject`) before this re-read it -
+    // no active key at all, so provisioning again is the right outcome
+    // (new data about a subject after its erasure gets a new key). This
+    // used to `expect` and panic. Bounded, so a pathological churn is an
+    // error, not a hang.
+    const ATTEMPTS: usize = 5;
+    for _ in 0..ATTEMPTS {
+        if let Some(row) =
+            get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value).await?
+        {
+            let data_key = unwrap_row(master_key, &row)?;
+            return Ok((row.to_domain(bc), row.id, data_key));
+        }
+
+        let (data_key, wrapped, nonce) = encryption::generate_and_wrap_data_key(master_key);
+        let now = Utc::now();
+        let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.encryption_keys \
+             (subject_key, subject_value, status, created_at, wrapped_key, wrap_nonce) \
+             VALUES ($1, $2, 'active', $3, $4, $5) \
+             ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
+             RETURNING {ENCRYPTION_KEY_COLUMNS}"
+        )))
+        .bind(subject_key)
+        .bind(subject_value)
+        .bind(now)
+        .bind(&wrapped)
+        .bind(&nonce)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(row) = inserted {
+            return Ok((row.to_domain(bc), row.id, data_key));
+        }
+        // Lost the race to a concurrent provisioner - the next pass reads
+        // the row it created (never the key just generated here, which
+        // was never persisted and would silently disagree with it).
     }
-
-    let (data_key, wrapped, nonce) = encryption::generate_and_wrap_data_key(master_key);
-    let now = Utc::now();
-    let inserted: Option<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO {schema}.encryption_keys \
-         (subject_key, subject_value, status, created_at, wrapped_key, wrap_nonce) \
-         VALUES ($1, $2, 'active', $3, $4, $5) \
-         ON CONFLICT (subject_key, subject_value) WHERE status = 'active' DO NOTHING \
-         RETURNING {ENCRYPTION_KEY_COLUMNS}"
-    )))
-    .bind(subject_key)
-    .bind(subject_value)
-    .bind(now)
-    .bind(&wrapped)
-    .bind(&nonce)
-    .fetch_optional(pool)
-    .await?;
-
-    if let Some(row) = inserted {
-        return Ok((row.to_domain(bc), row.id, data_key));
-    }
-
-    // Lost the race to a concurrent provisioner - the row it created is
-    // now the active one; re-fetch and unwrap that instead of the key
-    // just generated above (which was never persisted, so it must not be
-    // used - the two would silently disagree on later re-reads).
-    let row = get_active_encryption_key_row(pool, bounded_context, subject_key, subject_value)
-        .await?
-        .expect(
-            "get_or_create_encryption_key: INSERT lost the race but no active row was found \
-             immediately after - a concurrent provisioner must have destroyed it in between, \
-             which the active-only unique index makes vanishingly unlikely within one call",
-        );
-    let data_key = unwrap_row(master_key, &row)?;
-    Ok((row.to_domain(bc), row.id, data_key))
+    Err(crate::error::Error::row_not_found())
 }
 
 fn unwrap_row(
