@@ -3581,7 +3581,11 @@ impl CommandRow {
     ) -> crate::error::Result<Command> {
         let command_type =
             require_command_type(pool, bounded_context, &self.command_type_name).await?;
-        Ok(Command {
+        Ok(self.with_type(command_type))
+    }
+
+    fn with_type(self, command_type: CommandType) -> Command {
+        Command {
             id: self.external_id,
             bounded_context: command_type.bounded_context.clone(),
             command_type,
@@ -3597,8 +3601,37 @@ impl CommandRow {
             encryption_keys: Vec::new(),
             consistency_tags: self.consistency_tags.0,
             consistency_boundary: self.consistency_boundary,
-        })
+        }
     }
+}
+
+/// `CommandRow::into_domain` for many rows at once: the bounded context
+/// once and every command type the rows name in one query, instead of a
+/// command type, its bounded context and that context's creator Role per
+/// row (docs/architecture.md §126). A row naming a type that's gone is
+/// the same `row_not_found` `into_domain` gives.
+async fn commands_from_rows(
+    pool: &Pool,
+    bounded_context: &str,
+    rows: Vec<CommandRow>,
+) -> crate::error::Result<Vec<Command>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    let mut names: Vec<&str> = rows.iter().map(|r| r.command_type_name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let command_types = get_command_types_by_names_with_bc(pool, &bc, &names).await?;
+    rows.into_iter()
+        .map(|row| {
+            let command_type = command_types
+                .get(&row.command_type_name)
+                .cloned()
+                .ok_or_else(crate::error::Error::row_not_found)?;
+            Ok(row.with_type(command_type))
+        })
+        .collect()
 }
 
 // `external_id` - not `id`, this table's own internal `BIGSERIAL` primary
@@ -3898,11 +3931,15 @@ pub async fn collect_command_page(
         .fetch_all(pool)
         .await?;
         let exhausted = rows.len() < chunk_size;
-        let mut chunk = Vec::with_capacity(rows.len());
-        for positioned in rows {
-            after_position = positioned.id;
-            chunk.push(positioned.row.into_domain(pool, bounded_context).await?);
+        if let Some(last) = rows.last() {
+            after_position = last.id;
         }
+        let chunk = commands_from_rows(
+            pool,
+            bounded_context,
+            rows.into_iter().map(|p| p.row).collect(),
+        )
+        .await?;
         page.extend(select(&chunk, chunk_size - page.len())?);
         if page.len() >= chunk_size || exhausted {
             return Ok(page);
@@ -3922,16 +3959,12 @@ pub async fn list_commands_for_bounded_context(
 ) -> crate::error::Result<Vec<Command>> {
     let schema = schema_ident(bounded_context);
     let rows: Vec<CommandRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COMMAND_COLUMNS} FROM {schema}.commands"
+        "SELECT {COMMAND_COLUMNS} FROM {schema}.commands ORDER BY id"
     )))
     .fetch_all(pool)
     .await?;
 
-    let mut commands = Vec::with_capacity(rows.len());
-    for row in rows {
-        commands.push(row.into_domain(pool, bounded_context).await?);
-    }
-    Ok(commands)
+    commands_from_rows(pool, bounded_context, rows).await
 }
 
 // --- Projection / ProjectionRebuild ---
@@ -4994,11 +5027,10 @@ struct RoleAccessMappingRow {
 impl RoleAccessMappingRow {
     /// Needs `pool` (unlike every other row type's `into_domain`) since
     /// `RoleAccessMapping` embeds a whole `Role` and a whole
-    /// `BoundedContext`, not just their ids - two more queries per row,
-    /// the same N+1 trade-off `get_event_type`'s own `BoundedContext`
-    /// lookup already makes for a simpler implementation over a joined
-    /// query. Worth revisiting if this ever shows up in a profile; a
-    /// small admin-managed table is an unlikely place for that to matter.
+    /// `BoundedContext`, not just their ids - two more queries per row.
+    /// Fine for the single-row reads that use it; listings go through
+    /// `mappings_from_rows` instead, which batches both
+    /// (docs/architecture.md §126).
     ///
     /// `Ok(None)`, not a panic, when the role or bounded context this
     /// row points to is gone by the time the follow-up query runs:
@@ -5102,13 +5134,86 @@ pub async fn list_role_access_mappings(
     )))
     .fetch_all(pool)
     .await?;
-    let mut mappings = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(mapping) = row.into_domain(pool).await? {
-            mappings.push(mapping);
+    mappings_from_rows(pool, rows, None).await
+}
+
+/// Every active `RoleAccessMapping` on `bounded_context` - what every
+/// GraphQL resolver returning a `BoundedContext` shows with it
+/// (`boundedContexts` for every context). It used to list every mapping
+/// in the deployment and filter, at two queries per mapping
+/// (docs/architecture.md §126).
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context.name))]
+pub async fn list_active_role_access_mappings_for_bounded_context(
+    pool: &Pool,
+    bounded_context: &BoundedContext,
+) -> crate::error::Result<Vec<RoleAccessMapping>> {
+    let rows: Vec<RoleAccessMappingRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {ROLE_ACCESS_MAPPING_COLUMNS} FROM role_access_mappings \
+         WHERE bounded_context = $1 AND status = 'active' ORDER BY id"
+    )))
+    .bind(&bounded_context.name)
+    .fetch_all(pool)
+    .await?;
+    mappings_from_rows(pool, rows, Some(bounded_context)).await
+}
+
+/// `RoleAccessMappingRow::into_domain` for many rows at once: every Role
+/// they name in one query, and each distinct bounded context once
+/// (`known`, when the caller already has it, not at all), instead of both
+/// per row. A row naming a Role or bounded context that's gone is skipped,
+/// as `into_domain` skips it.
+async fn mappings_from_rows(
+    pool: &Pool,
+    rows: Vec<RoleAccessMappingRow>,
+    known: Option<&BoundedContext>,
+) -> crate::error::Result<Vec<RoleAccessMapping>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut role_ids: Vec<&str> = rows.iter().map(|r| r.role_id.as_str()).collect();
+    role_ids.sort_unstable();
+    role_ids.dedup();
+    let roles: std::collections::HashMap<String, Role> =
+        sqlx::query_as::<_, RoleRow>(sqlx::AssertSqlSafe(format!(
+            "SELECT {ROLE_COLUMNS} FROM roles WHERE id = ANY($1)"
+        )))
+        .bind(&role_ids)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let role = row.into_domain();
+            (role.id.clone(), role)
+        })
+        .collect();
+
+    let mut contexts: std::collections::HashMap<String, Option<BoundedContext>> =
+        std::collections::HashMap::new();
+    if let Some(bc) = known {
+        contexts.insert(bc.name.clone(), Some(bc.clone()));
+    }
+    for row in &rows {
+        if !contexts.contains_key(&row.bounded_context) {
+            let bc = get_bounded_context(pool, &row.bounded_context).await?;
+            contexts.insert(row.bounded_context.clone(), bc);
         }
     }
-    Ok(mappings)
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(RoleAccessMapping {
+                role: roles.get(&row.role_id)?.clone(),
+                bounded_context: contexts.get(&row.bounded_context)?.clone()?,
+                level: access_level_from_str(&row.level),
+                can_read_sensitive: row.can_read_sensitive,
+                scope: row.scope,
+                status: role_status_from_str(&row.status),
+                created_at: row.created_at,
+                revoked_at: row.revoked_at,
+            })
+        })
+        .collect())
 }
 
 /// Every currently-*active* `RoleAccessMapping` for one `Role` - the
@@ -5126,13 +5231,7 @@ pub async fn list_active_role_access_mappings_for_role(
     .bind(role_id)
     .fetch_all(pool)
     .await?;
-    let mut mappings = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(mapping) = row.into_domain(pool).await? {
-            mappings.push(mapping);
-        }
-    }
-    Ok(mappings)
+    mappings_from_rows(pool, rows, None).await
 }
 
 /// Persists a `revoke_role_access_mapping` (or `revoke_role`'s own

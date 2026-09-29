@@ -165,6 +165,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `fetchCommands` and command listings looked up each command's type
+  row by row, and every GraphQL resolver returning a bounded context
+  listed every role access mapping in the deployment (two lookups each)
+  to show one context's grants - `boundedContexts` did that per context.
+  Both now batch their lookups, and a context's grants are read for that
+  context alone through a new index (migration `0005`)
+  (docs/architecture.md §126).
 - Reading many events resolved each command-triggered event's
   originating command row by row, several queries each - a few thousand
   queries for a 1000-event page. All multi-event reads (REST reads,

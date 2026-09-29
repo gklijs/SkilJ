@@ -80,7 +80,7 @@ use crate::gql_types::BoundedContextWithMappings;
 use async_graphql::dynamic::{ResolverContext, ValueAccessor};
 use async_graphql::ErrorExtensions;
 use skilj_core::access_control::{
-    AccessLevel, EventReadStartPosition, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus,
+    AccessLevel, EventReadStartPosition, PrivateFieldGrant, Role, RoleAccessMapping,
 };
 use skilj_core::db::Pool;
 use skilj_core::encryption::{DataKey, EncryptionMasterKey};
@@ -147,11 +147,9 @@ pub async fn load_bounded_context_with_mappings(
     let Some(context) = skilj_core::db::get_bounded_context(pool, name).await? else {
         return Ok(None);
     };
-    let access_mappings = skilj_core::db::list_role_access_mappings(pool)
-        .await?
-        .into_iter()
-        .filter(|m| m.bounded_context.name == name && m.status == RoleStatus::Active)
-        .collect();
+    let access_mappings =
+        skilj_core::db::list_active_role_access_mappings_for_bounded_context(pool, &context)
+            .await?;
     Ok(Some(BoundedContextWithMappings {
         context,
         access_mappings,

@@ -10124,3 +10124,18 @@ The DCB delta query already did this in a batch (§61), and §117 pulled that ou
 The rewrite at first dropped `list_recent_events_for_bounded_context`'s `reverse()`. That function queries newest-first to make `LIMIT` cheap, and the reverse turns the result back to sequence order. The new test caught it.
 
 Test: `batched_event_reads_match_the_single_row_read` (`skilj/tests/command_trigger.rs`). Twelve events are written, eight command-triggered and four directly created. Each of the seven functions, over a full range, a range from a point, a limited range or the most recent few, returns exactly what `get_event_by_sequence` returns for each event - origins, embedded commands and command types included.
+
+## 126. Command and grant listings batch their lookups too
+
+§124 and §125 batched grant and event-origin resolution. The same per-row pattern remained in two more listings.
+
+**Commands.** `CommandRow::into_domain` looked up the command's type for every row - the type, then its bounded context, then that context's creator Role. `collect_command_page` (behind `fetchCommands`) and `list_commands_for_bounded_context` both ran it per row. `commands_from_rows` resolves the bounded context once and every distinct command type in one `name = ANY` query (`get_command_types_by_names_with_bc`), then builds each command through a shared `CommandRow::with_type`. A row naming a type that's gone is `row_not_found`, as before. `list_commands_for_bounded_context` also gained `ORDER BY id` - it had no order, and callers and tests assumed recording order.
+
+**Role access mappings.** Every GraphQL resolver that returns a `BoundedContext` shows it with its active grants (`load_bounded_context_with_mappings`). That listed every `RoleAccessMapping` in the deployment - at a Role and a bounded-context lookup per row - and then kept one context's active ones. `boundedContexts` does that for every context, so one directory request was about contexts x mappings x 3 queries.
+
+- `list_active_role_access_mappings_for_bounded_context(pool, &bc)` reads `WHERE bounded_context = $1 AND status = 'active'`. The new migration `0005` adds a partial index for it, since the existing indexes lead with `role_id`.
+- `mappings_from_rows` converts in batches: every Role in one `id = ANY` query, and each distinct bounded context once (not at all when the caller has it). It skips rows naming a Role or context that's gone, as `into_domain` does. `list_role_access_mappings` and `list_active_role_access_mappings_for_role` use it too. `into_domain` stays for single-row reads.
+
+Tests:
+- `batched_command_reads_match_the_single_row_read` (`skilj/tests/command_trigger.rs`): eight commands. The listing matches `get_command_by_external_id` for each, in recording order. A `fetchCommands` page walked in chunks of 3 serves the first three, and a single-chunk walk sees all eight.
+- `a_contexts_grants_are_read_for_that_context_alone` (`skilj/tests/graphql_business_surfaces.rs`): grants for several Roles across two contexts, one revoked, one scoped and one able to read sensitive fields. The context-scoped read equals the old list-everything-and-filter result. A superadmin's `boundedContexts` shows the context's three active grants.

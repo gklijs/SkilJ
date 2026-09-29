@@ -1027,3 +1027,62 @@ fn batched_event_reads_match_the_single_row_read() {
         );
     });
 }
+
+/// Listing commands resolves their command types in one batch, where it
+/// used to resolve each row's type (and that type's bounded context and
+/// creator Role) one at a time (docs/architecture.md §126). The listing
+/// and a `fetchCommands` page walked in chunks of 3 must each give exactly
+/// what the single-row read gives, in recording order.
+#[test]
+fn batched_command_reads_match_the_single_row_read() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let router = skilj.rest_router();
+        for i in 0..8 {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/commands/trigger")
+                .header("authorization", format!("Bearer {credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"payload":{{"amount":{i}}}}}"#)))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let listed = db::list_commands_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 8);
+        for command in &listed {
+            assert_eq!(
+                Some(command),
+                db::get_command_by_external_id(&pool, &bc_name, &command.id)
+                    .await
+                    .unwrap()
+                    .as_ref()
+            );
+        }
+
+        let mut walked = Vec::new();
+        let page = db::collect_command_page(&pool, &bc_name, -1, 3, |chunk, remaining| {
+            walked.extend(chunk.iter().cloned());
+            Ok(chunk.iter().take(remaining).cloned().collect())
+        })
+        .await
+        .unwrap();
+        assert_eq!(page, listed[..3]);
+        assert_eq!(walked, listed[..3]);
+        let mut all = Vec::new();
+        db::collect_command_page(&pool, &bc_name, -1, 100, |chunk, _| {
+            all.extend(chunk.iter().cloned());
+            Ok(Vec::new())
+        })
+        .await
+        .unwrap();
+        assert_eq!(all, listed);
+    });
+}

@@ -2410,3 +2410,122 @@ fn a_readers_grants_are_its_own_active_ones_with_their_records_resolved() {
         assert_eq!(all, expected);
     });
 }
+
+/// A bounded context's active grants - shown with every context GraphQL
+/// returns, `boundedContexts` included - are read for that context alone,
+/// not by listing every grant in the deployment and filtering at two
+/// queries per grant (docs/architecture.md §126). They must be exactly
+/// what that filter gave, across several Roles and contexts and with a
+/// revoked grant in the mix, and the full listing must be unchanged.
+#[test]
+fn a_contexts_grants_are_read_for_that_context_alone() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, _admin_jwt, _admin) = setup().await;
+        let bc = skilj_core::db::get_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let other = BoundedContext {
+            name: unique_name("other"),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &other)
+            .await
+            .unwrap();
+        for (i, context) in [&bc, &bc, &other, &bc].into_iter().enumerate() {
+            let role = Role {
+                id: generate_token_id(),
+                external_subject: unique_name("grantee"),
+                name: format!("grantee-{i}"),
+                superadmin: false,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            };
+            skilj_core::db::insert_role(&pool, &role).await.unwrap();
+            skilj_core::db::insert_role_access_mapping(
+                &pool,
+                &RoleAccessMapping {
+                    role: role.clone(),
+                    bounded_context: context.clone(),
+                    level: AccessLevel::Read,
+                    can_read_sensitive: i == 1,
+                    scope: (i == 0).then(|| "acme".to_string()),
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            if i == 3 {
+                skilj_core::db::revoke_active_role_access_mapping(
+                    &pool,
+                    &role.id,
+                    &bc.name,
+                    test_now(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let all = skilj_core::db::list_role_access_mappings(&pool)
+            .await
+            .unwrap();
+        let filtered: Vec<_> = all
+            .iter()
+            .filter(|m| m.bounded_context.name == bc.name && m.status == RoleStatus::Active)
+            .cloned()
+            .collect();
+        assert_eq!(filtered.len(), 3, "the admin plus two grantees");
+        let mut scoped =
+            skilj_core::db::list_active_role_access_mappings_for_bounded_context(&pool, &bc)
+                .await
+                .unwrap();
+        let key = |m: &RoleAccessMapping| m.role.id.clone();
+        let mut filtered = filtered;
+        scoped.sort_by_key(key);
+        filtered.sort_by_key(key);
+        assert_eq!(scoped, filtered);
+
+        // The directory is a superadmin's.
+        let superadmin = Role {
+            id: generate_token_id(),
+            external_subject: unique_name("superadmin"),
+            name: "Superadmin".to_string(),
+            superadmin: true,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &superadmin)
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let response = graphql_request(
+            &router,
+            Some(&sign_jwt(&superadmin.external_subject)),
+            "query { boundedContexts { name accessMappings { role { name } } } }",
+            json!({}),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        let listed = response["data"]["boundedContexts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == bc.name.as_str())
+            .unwrap()["accessMappings"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(listed, 3);
+    });
+}
