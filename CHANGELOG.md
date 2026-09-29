@@ -177,6 +177,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Caller-supplied idempotency keys had no length bound, though one is
+  stored per accepted command; keys over 255 characters are now refused
+  as `idempotency_key_too_long` (400 on REST) (docs/architecture.md §134).
 - Unreleased regression from the fire-waits-for-cancels change: a
   registered cancel whose source bounded context had been hard-deleted
   failed every fire tick of the bounded context holding its deadlines,

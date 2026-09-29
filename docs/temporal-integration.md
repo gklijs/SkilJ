@@ -130,8 +130,10 @@ not something you configure per mapping - reusing the identical id for the `Star
 correlation and redelivery-safety for free.
 
 `skilj_temporal::run(...)` drives a list of mappings forever, polling and sleeping between empty
-cycles; `poll_once(...)` runs a single fetch-dispatch-ack cycle and is what you'd call directly in a
-test or a custom scheduling loop. See `skilj-temporal/src/lib.rs`'s own doc comment for the full
+cycles; `run_until(..., stop)` does the same until `stop` (any future - a shutdown signal, a
+channel) resolves, finishing the cycle in flight first rather than being aborted mid-dispatch
+([§129](architecture.md)); `poll_once(...)` runs a single fetch-dispatch-ack cycle and is what you'd
+call directly in a test or a custom scheduling loop. See `skilj-temporal/src/lib.rs`'s own doc comment for the full
 idempotency story (`Signal`'s own `request_id`, derived from the event's `(bounded_context,
 event_type, sequence)` - the identical `"{run_id}:{activity_id}"` reasoning above, one level
 further out) and `skilj-temporal/tests/temporal_bridge.rs` for a real, passing end-to-end proof

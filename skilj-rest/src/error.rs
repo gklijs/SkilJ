@@ -141,6 +141,7 @@ fn status_for(err: &CoreError) -> StatusCode {
             EventStoreError::InvalidSensitiveField => StatusCode::BAD_REQUEST,
             EventStoreError::PayloadDoesNotMatchSchema => StatusCode::BAD_REQUEST,
             EventStoreError::ReservedIdempotencyKeyPrefix => StatusCode::BAD_REQUEST,
+            EventStoreError::IdempotencyKeyTooLong => StatusCode::BAD_REQUEST,
             EventStoreError::InvalidParkedDeliveryRequest(_) => StatusCode::BAD_REQUEST,
             // Not reachable over REST today - RegisterEventType is
             // GraphQL-only (TypeRegistration) - but matched explicitly

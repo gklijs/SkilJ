@@ -1086,3 +1086,32 @@ fn batched_command_reads_match_the_single_row_read() {
         assert_eq!(all, listed);
     });
 }
+
+/// An `Idempotency-Key` longer than 255 characters is a 400 before
+/// anything runs (docs/architecture.md §134).
+#[test]
+fn command_trigger_refuses_an_overlong_idempotency_key() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/commands/trigger")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .header("Idempotency-Key", "k".repeat(256))
+            .body(Body::from(r#"{"payload":{"amount":20}}"#))
+            .unwrap();
+        let response = skilj.rest_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "idempotency_key_too_long");
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 0);
+    });
+}

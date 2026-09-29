@@ -3642,7 +3642,10 @@ rule ProcessCommand {
     -- none. It exists because a caller whose request times out cannot tell
     -- whether the command landed, and resubmitting blind applies it twice -
     -- two Commands, two sets of events - out of what the caller meant as
-    -- one action.
+    -- one action. It is opaque but bounded: a key longer than 255
+    -- characters is a malformed-request rejection, on the same footing as
+    -- an over-long correlation_id (see valid_correlation_id), since one is
+    -- remembered with every accepted command that carries it.
     --
     -- recorded_acceptance(command_type, client_id, idempotency_key) is the
     -- outcome this library remembers against that key from that caller:

@@ -2529,3 +2529,37 @@ fn a_contexts_grants_are_read_for_that_context_alone() {
         assert_eq!(listed, 3);
     });
 }
+
+/// An idempotency key longer than 255 characters is refused before
+/// anything runs (docs/architecture.md §134): one is stored per accepted
+/// command.
+#[test]
+fn submit_command_refuses_an_overlong_idempotency_key() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _admin_role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_WITH_IDEMPOTENCY_KEY_MUTATION,
+            json!({
+                "bc": bc_name,
+                "name": "WithdrawMoney",
+                "payload": r#"{"amount":20}"#,
+                "key": "k".repeat(256),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "idempotency_key_too_long",
+            "{response:?}"
+        );
+        let events = skilj_core::db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 0);
+    });
+}

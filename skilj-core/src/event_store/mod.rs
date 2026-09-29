@@ -591,6 +591,11 @@ pub enum Error {
     )]
     ReservedIdempotencyKeyPrefix,
 
+    /// An idempotency key longer than `MAX_IDEMPOTENCY_KEY_CHARS` - one is
+    /// stored per accepted command (docs/architecture.md §134).
+    #[error("an idempotency key may be at most 255 characters")]
+    IdempotencyKeyTooLong,
+
     /// Not spec-modeled: the spec's own `ProcessCommand` assumes `decide()`
     /// only ever names an `EventType` its bounded context actually
     /// registered - a plugin-author responsibility, not a case the spec
@@ -674,6 +679,7 @@ impl SkiljRejection for Error {
             Error::RestTriggerNotAllowed => "rest_trigger_not_allowed",
             Error::PayloadDoesNotMatchSchema => "payload_does_not_match_schema",
             Error::ReservedIdempotencyKeyPrefix => "reserved_idempotency_key_prefix",
+            Error::IdempotencyKeyTooLong => "idempotency_key_too_long",
             Error::UnregisteredEventType(_) => "unregistered_event_type",
             Error::PayloadDecodeFailed(_) => "payload_decode_failed",
             Error::CorrelationIdTooLong => "correlation_id_too_long",
@@ -1256,6 +1262,12 @@ pub const RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-deadline:";
 /// redrives - `idempotency_keys` is `client_id`-scoped).
 pub const RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-parked-delivery:";
 
+/// The longest caller-supplied idempotency key accepted, in characters -
+/// see [`reject_reserved_idempotency_key`] (docs/architecture.md §134).
+pub const MAX_IDEMPOTENCY_KEY_CHARS: usize = 255;
+// `Error::IdempotencyKeyTooLong`'s message names it.
+const _: () = assert!(MAX_IDEMPOTENCY_KEY_CHARS == 255);
+
 /// Checked by `authorise_command_trigger`/`authorise_command_submission`'s
 /// own two REST/GraphQL callers, immediately after either reads a
 /// caller-supplied `idempotencyKey`/`Idempotency-Key` value - never
@@ -1271,7 +1283,15 @@ pub const RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-parked-
 /// idempotency-key caller already gets. See `RESERVED_IDEMPOTENCY_KEY_PREFIX`'s
 /// own doc comment for why this check is no longer this mechanism's
 /// real defense, just a harmless second layer on top of it.
+///
+/// Also refuses a key longer than [`MAX_IDEMPOTENCY_KEY_CHARS`]
+/// (docs/architecture.md §134): one is stored with every accepted command
+/// that carries it, and on a parked delivery, and nothing else bounded it
+/// short of the request size - megabytes per command.
 pub fn reject_reserved_idempotency_key(idempotency_key: Option<&str>) -> crate::error::Result<()> {
+    if idempotency_key.is_some_and(|key| key.chars().count() > MAX_IDEMPOTENCY_KEY_CHARS) {
+        return Err(Error::IdempotencyKeyTooLong.into());
+    }
     match idempotency_key {
         Some(key)
             if key.starts_with(RESERVED_IDEMPOTENCY_KEY_PREFIX)

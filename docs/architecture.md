@@ -10238,3 +10238,13 @@ Without the call, the first stayed `pending` with the plaintext email.
 A cancel whose source is gone can never cancel anything again, so there's nothing for a fire to wait for. `cancel_backlog_start` now checks `bounded_contexts` first and answers `None` (no backlog) when the source is gone. A delete landing between that check and the query can still fail one tick, but can't wedge the loop.
 
 Test: `a_cancel_whose_source_is_gone_does_not_stop_deadlines_firing` (`skilj-core/tests/deadline_cancel_ordering.rs`). A due deadline, with a registered cancel whose source bounded context doesn't exist, fires. Without the check the tick failed.
+
+## 134. Idempotency keys are bounded
+
+A caller-supplied idempotency key - GraphQL `submitCommand(idempotencyKey:)`, REST `Idempotency-Key`, or the one a bridge reports with a parked delivery - was checked only for skilj's reserved prefixes. It's stored with every accepted command that carries it (`idempotency_keys`) and on a parked delivery, so nothing but the request size bounded it: a GraphQL body could carry a two-megabyte key, stored per command, by any caller allowed to submit.
+
+`reject_reserved_idempotency_key`, which all four entry points already call before anything runs, now also refuses a key longer than `MAX_IDEMPOTENCY_KEY_CHARS` (255 characters - the common convention, Stripe's among them) with `Error::IdempotencyKeyTooLong` (`idempotency_key_too_long`, 400 on REST). skilj's own internally derived keys (routes, deadlines, redrives) don't pass through it. The spec's `ProcessCommand` idempotency note states the bound, on the same footing as the correlation id's 200.
+
+Tests:
+- `an_idempotency_key_over_the_bound_is_refused` (`skilj-core/tests/idempotency_key_bounds.rs`): 255 characters is accepted, 256 refused, 255 multi-byte characters accepted, and the reserved prefixes still refused.
+- `submit_command_refuses_an_overlong_idempotency_key` (GraphQL) and `command_trigger_refuses_an_overlong_idempotency_key` (REST): a 256-character key is refused with the code, and nothing is written.
