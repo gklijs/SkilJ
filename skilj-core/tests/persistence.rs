@@ -929,6 +929,45 @@ fn list_roles_includes_every_inserted_role() {
     });
 }
 
+/// `db::active_roles_by_external_subject` (docs/architecture.md §110):
+/// authentication's lookup returns the one active Role claiming a
+/// subject - not a revoked Role that once claimed it, not anyone else.
+#[test]
+fn active_roles_by_external_subject_returns_only_the_active_claimant() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let former = seed_role(&pool, false).await;
+        db::update_role(
+            &pool,
+            &Role {
+                status: RoleStatus::Revoked,
+                revoked_at: Some(test_now()),
+                ..former.clone()
+            },
+        )
+        .await
+        .unwrap();
+        let current = Role {
+            id: generate_token_id(),
+            ..former.clone()
+        };
+        db::insert_role(&pool, &current).await.unwrap();
+        seed_role(&pool, false).await;
+
+        let found = db::active_roles_by_external_subject(&pool, &former.external_subject)
+            .await
+            .unwrap();
+        assert_eq!(found, vec![current]);
+
+        let none = db::active_roles_by_external_subject(&pool, &unique_name("subject"))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    });
+}
+
 #[test]
 fn update_role_persists_a_revocation() {
     runtime().block_on(async {

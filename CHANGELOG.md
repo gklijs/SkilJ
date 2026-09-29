@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Authenticating a GraphQL request (HTTP, or a WebSocket's
+  `connection_init`) no longer loads the whole `roles` table: it looks up
+  the one active Role claiming the verified subject, through the unique
+  index that already existed for it (`db::active_roles_by_external_subject`).
+  The table grows with every user a deployment registers, so this was a
+  per-request cost growing with it (docs/architecture.md §110).
+
 - A tag-filtered `queryEvents` or `countEvents` no longer loads every
   event carrying the tag before paging or counting: both now walk the tag
   index a chunk (`max_events_per_read`) at a time, like their untagged

@@ -116,7 +116,9 @@ async fn verify_jwt_to_role(
     .await
     .map_err(crate::error::to_graphql_error)?;
 
-    let roles = skilj_core::db::list_roles(pool)
+    // Only the row that can match, not the whole roles table on every
+    // request (docs/architecture.md §110).
+    let roles = skilj_core::db::active_roles_by_external_subject(pool, &verified_subject)
         .await
         .map_err(crate::error::to_graphql_error)?;
     let role =

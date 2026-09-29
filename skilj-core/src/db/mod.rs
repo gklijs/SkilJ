@@ -2141,15 +2141,36 @@ pub async fn get_role(pool: &Pool, id: &str) -> crate::error::Result<Option<Role
 
 /// Every `Role` this engine currently knows of - the full-snapshot
 /// parameter `create_role`/`resolve_role_by_external_subject` each
-/// expect as their own `existing_roles` (see their doc comments). Small
-/// and admin-managed, unlike `Event`/`Command`, so an unscoped list is
-/// the right shape here - no per-bounded-context narrowing to do, since
-/// a `Role` isn't scoped to one.
+/// expect as their own `existing_roles` (see their doc comments). An
+/// unscoped list, since a `Role` isn't scoped to a bounded context - but
+/// not for per-request paths: every user a deployment registers is a
+/// row, so authentication uses `active_roles_by_external_subject`
+/// instead (docs/architecture.md §110).
 #[tracing::instrument(skip_all)]
 pub async fn list_roles(pool: &Pool) -> crate::error::Result<Vec<Role>> {
     let rows: Vec<RoleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ROLE_COLUMNS} FROM roles"
     )))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(RoleRow::into_domain).collect())
+}
+
+/// The active `Role` claiming `external_subject`, as the one-element
+/// `existing_roles` slice `resolve_role_by_external_subject` takes - what
+/// authenticating a request needs, instead of `list_roles`' whole table.
+/// At most one row: `roles_unique_active_external_subject` is a unique
+/// index on exactly this predicate, and serves the lookup
+/// (docs/architecture.md §110).
+#[tracing::instrument(skip_all)]
+pub async fn active_roles_by_external_subject(
+    pool: &Pool,
+    external_subject: &str,
+) -> crate::error::Result<Vec<Role>> {
+    let rows: Vec<RoleRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {ROLE_COLUMNS} FROM roles WHERE external_subject = $1 AND status = 'active'"
+    )))
+    .bind(external_subject)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(RoleRow::into_domain).collect())
