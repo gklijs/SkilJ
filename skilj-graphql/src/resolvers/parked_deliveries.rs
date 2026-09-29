@@ -86,14 +86,18 @@ async fn redrive_parked_delivery(
     delivery: &ParkedDelivery,
 ) -> skilj_core::error::Result<()> {
     match delivery.kind {
-        ParkedDeliveryKind::CrossContextRoute => {
+        // docs/architecture.md §115: a parked deadline redrives exactly
+        // like a parked route delivery - its command, under the identity
+        // `parked_delivery_redrive_identity` gives it.
+        ParkedDeliveryKind::CrossContextRoute | ParkedDeliveryKind::Deadline => {
             let target_bounded_context = delivery.target_bounded_context.as_deref().expect(
-                "CrossContextRoute-kind ParkedDelivery always carries target_bounded_context",
+                "CrossContextRoute/Deadline-kind ParkedDelivery always carries \
+                 target_bounded_context",
             );
-            let target_command_type_name = delivery
-                .target_command_type
-                .as_deref()
-                .expect("CrossContextRoute-kind ParkedDelivery always carries target_command_type");
+            let target_command_type_name = delivery.target_command_type.as_deref().expect(
+                "CrossContextRoute/Deadline-kind ParkedDelivery always carries \
+                 target_command_type",
+            );
             // `CommandType` rows are never hard-deleted individually
             // (only ever added to - see docs/architecture.md's own
             // additive-only-schema-evolution write-up) - but the *whole*
@@ -119,7 +123,7 @@ async fn redrive_parked_delivery(
                 db::CROSS_CONTEXT_ROUTE_CLIENT_ID,
                 None,
             )
-            .expect("CrossContextRoute-kind redrives always carry an idempotency key");
+            .expect("CrossContextRoute/Deadline-kind redrives always carry an idempotency key");
             // Codeberg issue #32 (round two): routed through
             // `state.command_batcher` rather than calling
             // `db::decide_and_submit_command` directly - a redrive is

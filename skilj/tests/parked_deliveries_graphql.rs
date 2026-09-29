@@ -1309,3 +1309,152 @@ fn parked_deliveries_are_served_in_bounded_stable_pages() {
         );
     });
 }
+
+/// docs/architecture.md §115: a parked deadline is listed as `DEADLINE`,
+/// and `retryParkedDelivery` submits its command under the deadline's
+/// own reserved idempotency key - so a second redrive for the same
+/// deadline (or one racing an original attempt that did commit) doesn't
+/// run it twice.
+#[test]
+fn a_parked_deadline_is_listed_and_redriven_under_its_own_key() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = db::connect(&database_url).await.unwrap();
+        let admin_subject = unique_name("admin");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let bc_name = unique_name("deposits");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role,
+                bounded_context: bc,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (skilj, _) = Skilj::builder(database_url)
+            .pool_options(db::PgPoolOptions::new().max_connections(4))
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<Deposited>()
+            .command_type::<Deposit>()
+            .reconciliation_role(admin_subject.clone())
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let jwt = sign_jwt(&admin_subject);
+
+        let park = || {
+            let (pool, bc_name) = (pool.clone(), bc_name.clone());
+            async move {
+                db::insert_parked_delivery(
+                    &pool,
+                    &bc_name,
+                    "deadline:settle",
+                    db::ParkedDeliveryKind::Deadline,
+                    "deadline-1",
+                    None,
+                    Some(&bc_name),
+                    Some("Deposit"),
+                    &json!({ "amount": 7 }),
+                    "target unavailable",
+                    5,
+                    test_now(),
+                    test_now(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let retry = |id: String| {
+            let (router, jwt, bc_name) = (router.clone(), jwt.clone(), bc_name.clone());
+            async move {
+                graphql_request(
+                    &router,
+                    Some(&jwt),
+                    "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+                    json!({ "bc": bc_name, "id": id }),
+                )
+                .await
+            }
+        };
+
+        let parked = park().await;
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { parkedDeliveries(boundedContext: $bc) { \
+                kind source identifier targetBoundedContext targetCommandType \
+            } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        let row = &response["data"]["parkedDeliveries"][0];
+        assert_eq!(row["kind"], json!("DEADLINE"));
+        assert_eq!(row["source"], json!("deadline:settle"));
+        assert_eq!(row["identifier"], json!("deadline-1"));
+        assert_eq!(row["targetBoundedContext"], json!(bc_name));
+        assert_eq!(row["targetCommandType"], json!("Deposit"));
+
+        let response = retry(parked.id).await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[0].payload).unwrap(),
+            json!({ "amount": 7 })
+        );
+
+        // The same deadline parked again and redriven: deduplicated.
+        let again = park().await;
+        let response = retry(again.id).await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+        assert_eq!(
+            db::list_commands_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a second redrive of one deadline must dedupe"
+        );
+        assert!(db::list_parked_deliveries(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}

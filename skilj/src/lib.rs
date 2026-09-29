@@ -633,6 +633,7 @@ impl Skilj {
             snapshot_poll_interval: std::time::Duration::from_millis(500),
             cross_context_route_poll_interval: std::time::Duration::from_millis(500),
             cross_context_route_retry_policy: skilj_retry::RetryPolicy::default(),
+            deadline_retry_policy: skilj_retry::RetryPolicy::default(),
             deadline_poll_interval: std::time::Duration::from_millis(500),
             scheduler_poll_interval: std::time::Duration::from_secs(1),
             projection_query_wait_timeout: std::time::Duration::from_secs(5),
@@ -1434,6 +1435,8 @@ pub struct SkiljBuilder {
     /// blocked head-of-line occurrence before parking it. See
     /// `cross_context_route_retry_policy`'s own builder doc comment.
     cross_context_route_retry_policy: skilj_retry::RetryPolicy,
+    /// See `deadline_retry_policy`'s builder doc comment.
+    deadline_retry_policy: skilj_retry::RetryPolicy,
     deadline_poll_interval: std::time::Duration,
     scheduler_poll_interval: std::time::Duration,
     projection_query_wait_timeout: std::time::Duration,
@@ -1626,6 +1629,19 @@ impl SkiljBuilder {
     /// docs/architecture.md's parked-deliveries section.
     pub fn cross_context_route_retry_policy(mut self, policy: skilj_retry::RetryPolicy) -> Self {
         self.cross_context_route_retry_policy = policy;
+        self
+    }
+
+    /// How a deadline whose command fails with an error (not a business
+    /// rejection) is retried before it's recorded as a `ParkedDelivery`
+    /// (kind `DEADLINE`) in the target bounded context, where
+    /// `retryParkedDelivery`/`discardParkedDelivery` handle it.
+    /// Defaults to `skilj_retry::RetryPolicy::default()` - 1s initial
+    /// backoff, doubling, capped at 5 minutes, 5 attempts; a retry also
+    /// waits for the next fire tick (`deadline_poll_interval`).
+    /// docs/architecture.md §115.
+    pub fn deadline_retry_policy(mut self, policy: skilj_retry::RetryPolicy) -> Self {
+        self.deadline_retry_policy = policy;
         self
     }
 
@@ -2655,6 +2671,7 @@ impl SkiljBuilder {
         let deadline_fire_broadcaster = skilj.event_broadcaster.clone();
         let deadline_fire_event_cache = skilj.event_cache.clone();
         let deadline_fire_encryption_master_key = skilj.encryption_master_key.clone();
+        let deadline_retry_policy = self.deadline_retry_policy;
         tokio::spawn(async move {
             loop {
                 let start = std::time::Instant::now();
@@ -2667,6 +2684,7 @@ impl SkiljBuilder {
                     &deadline_fire_event_cache,
                     deadline_fire_encryption_master_key.as_ref(),
                     chrono::Utc::now(),
+                    &deadline_retry_policy,
                 )
                 .instrument(tracing::info_span!("deadline_fire_tick"))
                 .await;
@@ -2971,6 +2989,7 @@ async fn deadline_fire_tick(
     event_cache: &EventCache,
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: chrono::DateTime<chrono::Utc>,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) {
     let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
         Ok(bcs) => bcs,
@@ -3002,6 +3021,7 @@ async fn deadline_fire_tick(
                     &bc.name,
                     now,
                     encryption_master_key,
+                    retry_policy,
                 )
                 .await
                 {

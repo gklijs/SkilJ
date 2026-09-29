@@ -780,6 +780,7 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
         // doc comment) - this isn't a race the test is trying to land
         // inside a narrow window, it's an invariant that must survive
         // either ordering.
+        let retry_policy = skilj_retry::RetryPolicy::default();
         let fire = db::fire_due_deadlines(
             &pool,
             &*command_dispatcher,
@@ -790,6 +791,7 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
             DEADLINE_RACE_BOUNDED_CONTEXT,
             now,
             None,
+            &retry_policy,
         );
         let cancel = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.deadlines SET status = 'cancelled', resolved_at = $1 \
@@ -934,6 +936,7 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
             &source,
             now,
             None,
+            &skilj_retry::RetryPolicy::default(),
         )
         .await
         .unwrap();
@@ -951,5 +954,200 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
             .await
             .unwrap()
             .is_empty());
+    });
+}
+
+/// docs/architecture.md §115: a deadline whose command fails with an
+/// error (here a payload its command can't deserialize) is retried with
+/// backoff and then parked - not re-fired every few minutes forever
+/// behind a stale `firing` claim, and not allowed to stop the rest of
+/// the tick. A valid deadline due right after it still fires.
+#[test]
+fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let mut contexts = Vec::new();
+        for prefix in ["source", "target"] {
+            let bc = BoundedContext {
+                name: unique_name(prefix),
+                status: BoundedContextStatus::Active,
+                created_at: test_now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            };
+            db::insert_bounded_context(&pool, &bc).await.unwrap();
+            db::insert_role_access_mapping(
+                &pool,
+                &RoleAccessMapping {
+                    role: role.clone(),
+                    bounded_context: bc.clone(),
+                    level: AccessLevel::Admin,
+                    can_read_sensitive: false,
+                    scope: None,
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            contexts.push(bc.name);
+        }
+        let (source, target) = (contexts[0].clone(), contexts[1].clone());
+        let (skilj, _) = Skilj::builder(database_url)
+            .bounded_context(target.clone())
+            .event_type::<RaceFired>()
+            .command_type::<RaceCommand>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+
+        let now = test_now();
+        let insert = |id: String, fire_at: chrono::DateTime<Utc>, payload: serde_json::Value| {
+            let (pool, source, target) = (pool.clone(), source.clone(), target.clone());
+            async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO {}.deadlines \
+                     (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+                      target_command_type, payload, status, created_at) \
+                     VALUES ($1, 'schedule', $2, '[]'::jsonb, NULL, $3, $4, $5, 'pending', $6)",
+                    race_schema(&source)
+                )))
+                .bind(&id)
+                .bind(fire_at)
+                .bind(&target)
+                .bind(RaceCommand::NAME)
+                .bind(payload.to_string())
+                .bind(now)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let failing = unique_name("failing");
+        let valid = unique_name("valid");
+        insert(
+            failing.clone(),
+            now - chrono::Duration::seconds(2),
+            serde_json::json!({ "not_an_order_id": 1 }),
+        )
+        .await;
+        insert(
+            valid.clone(),
+            now - chrono::Duration::seconds(1),
+            serde_json::json!({ "order_id": "order-1" }),
+        )
+        .await;
+        let status = |id: String| {
+            let (pool, source) = (pool.clone(), source.clone());
+            async move {
+                let (status,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT status FROM {}.deadlines WHERE id = $1",
+                    race_schema(&source)
+                )))
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                status
+            }
+        };
+
+        let tick = |at: chrono::DateTime<Utc>| {
+            let (pool, source) = (pool.clone(), source.clone());
+            let (c, p, s) = (
+                skilj.command_dispatcher(),
+                skilj.projection_dispatcher(),
+                skilj.snapshot_dispatcher(),
+            );
+            async move {
+                db::fire_due_deadlines(
+                    &pool,
+                    &*c,
+                    &*p,
+                    &*s,
+                    &skilj_core::event_store::EventBroadcaster::new(16),
+                    &skilj_core::event_cache::EventCache::new(0),
+                    &source,
+                    at,
+                    None,
+                    &skilj_retry::RetryPolicy {
+                        initial_backoff: std::time::Duration::from_secs(60),
+                        multiplier: 1.0,
+                        max_backoff: std::time::Duration::from_secs(60),
+                        max_attempts: Some(2),
+                        max_elapsed: None,
+                    },
+                )
+                .await
+            }
+        };
+
+        // First attempt fails: the tick still succeeds, the valid deadline
+        // behind it fires, and the failing one waits for its retry.
+        tick(now).await.unwrap();
+        assert_eq!(status(valid.clone()).await, "fired");
+        assert_eq!(status(failing.clone()).await, "pending");
+
+        // Not before its backoff has passed.
+        tick(now + chrono::Duration::seconds(30)).await.unwrap();
+        assert_eq!(status(failing.clone()).await, "pending");
+        assert!(db::list_parked_deliveries(&pool, &target)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The second attempt exhausts the policy: parked in the target
+        // context, redrivable under the deadline's own idempotency key.
+        tick(now + chrono::Duration::seconds(61)).await.unwrap();
+        assert_eq!(status(failing.clone()).await, "parked");
+        let parked = db::list_parked_deliveries(&pool, &target).await.unwrap();
+        assert_eq!(parked.len(), 1);
+        let parked = &parked[0];
+        assert_eq!(parked.kind, db::ParkedDeliveryKind::Deadline);
+        assert_eq!(parked.identifier, failing);
+        assert_eq!(parked.source, "deadline:schedule");
+        assert_eq!(parked.attempt_count, 2);
+        assert_eq!(
+            parked.target_bounded_context.as_deref(),
+            Some(target.as_str())
+        );
+        assert_eq!(
+            parked.target_command_type.as_deref(),
+            Some(RaceCommand::NAME)
+        );
+        assert!(parked.error.contains("order_id"), "{}", parked.error);
+        assert_eq!(
+            db::parked_delivery_redrive_identity(parked, "unused", None),
+            Some((
+                db::DEADLINE_CLIENT_ID.to_string(),
+                format!("skilj-deadline:{failing}")
+            ))
+        );
+
+        // Parked is final for the deadline: later ticks leave it alone.
+        tick(now + chrono::Duration::hours(1)).await.unwrap();
+        assert_eq!(status(failing.clone()).await, "parked");
+        assert_eq!(
+            db::list_parked_deliveries(&pool, &target)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     });
 }

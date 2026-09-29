@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `db::fire_due_deadlines` takes a `retry_policy` argument, and
+  `ParkedDeliveryKind` (GraphQL `ParkedDeliveryKind`) gains `Deadline`
+  (`DEADLINE`) - breaking for direct callers and for exhaustive matches
+  on the kind (docs/architecture.md §115).
 - `CommandBatcher::submit` and `decide_and_submit` take the command
   and projection dispatchers as `&Arc<dyn …>` instead of `&dyn …`, so
   the batch can run on its own task (breaking for direct callers;
@@ -141,6 +145,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A deadline whose command failed with an error - say a payload its
+  command no longer accepts after a deploy - was re-fired every five
+  minutes forever, never surfaced to an operator, and each failure
+  aborted the rest of that tick's due deadlines. Failing deadlines are
+  now retried with backoff (`SkiljBuilder::deadline_retry_policy`,
+  default as for routes: 5 attempts) and then parked in the target
+  bounded context as a new `DEADLINE` parked-delivery kind, which
+  `retryParkedDelivery`/`discardParkedDelivery` handle like a parked
+  route delivery; a redrive reuses the deadline's reserved idempotency
+  key, so it never runs the command twice. A cancel while a retry is
+  pending still wins. Other due deadlines keep firing
+  (docs/architecture.md §115).
 - A client disconnecting while its command led a batch
   (`CommandBatcher`, the group commit behind REST
   `/v1/commands/trigger`, GraphQL `submitCommand` and parked-delivery

@@ -9913,3 +9913,32 @@ Fix: `submit` runs `run_as_leader` on a `tokio::spawn`ed task (instrumented with
 Tests (`skilj-core/tests/command_batcher.rs`):
 - `a_leader_cancelled_mid_batch_still_commits_and_answers_its_followers`: a trigger slows each event insert by 0.4 s. A leader and a follower queue behind a held lock, the lock is released, and the leader's caller is aborted while the batch is inside its first insert. The follower is accepted and both commands' events exist. Before, the follower got `BatchFailed` and neither event existed.
 - `a_cancelled_batch_leader_does_not_strand_followers_or_wedge_the_queue` and `random_client_disconnects_under_load_never_wedge_the_queue` no longer accept `BatchFailed`: every surviving caller's command is accepted. Those two were not re-run against the old code, since the old API doesn't take the new arguments; the new test is the before/after proof.
+
+## 115. A failing deadline is retried, then parked
+
+`fire_due_deadlines` claims each due deadline (`pending` -> `firing`, §55), submits its command under the reserved key `skilj-deadline:{id}`, and marks it `fired` - also when `decide()` rejects it, a business outcome. A submission that failed with an *error* went through `?`:
+
+- The tick returned early. The rest of that tick's due deadlines weren't looked at. Up to `MAX_DUE_DEADLINES_PER_TICK` deadlines were delayed per failure, and since it's ordered by `fire_at`, the failing one was usually first when its turn came round again.
+- The deadline stayed `firing`. After the 5-minute stale-claim window it was reclaimed and fired again, failed again - forever, every five minutes, logged as a tick warning and nothing else.
+
+A permanent failure isn't exotic. A deadline stores its command payload when it's scheduled and fires it later, possibly after a deploy changed the command: a payload that no longer deserialises fails with `PayloadDecodeFailed` every time - the test's case. So does a command handler that errors on the stored input.
+
+Routes had the answer to the same problem since Codeberg issue #21: retry with backoff per a `RetryPolicy`, then record a `ParkedDelivery` an operator can retry or discard. Deadlines now do the same (the user's choice, over marking the deadline `failed` with no operator surface, or only keeping the tick going):
+
+- **Retry state on the row:** new `deadlines` columns `attempt_count`, `first_failed_at`, `next_attempt_at` and `last_error`. They're in the DDL for new contexts and patched into existing ones by `ensure_deadlines_table` with `ADD COLUMN IF NOT EXISTS`; the defaults mean "never failed".
+- **On a failed submission** (`record_deadline_failure`): the attempt is counted against `SkiljBuilder::deadline_retry_policy` (default `RetryPolicy::default()`, the same as routes: 1 s doubling to 5 min, 5 attempts).
+  - Not exhausted: the row goes back to `pending` with `next_attempt_at` set. The due scan and the claim both skip it until then. Going back to `pending`, rather than holding the `firing` claim, lets a `CancelDeadline` that lands during the backoff cancel it - it hasn't fired.
+  - Exhausted: a `ParkedDelivery` of the new kind `Deadline` is recorded in the *target* bounded context, as a route's is (`source` `deadline:{schedule_name}`, `identifier` the deadline id, the target context and command type, the stored payload as `request_json`). The deadline is marked `parked`, a final status: later ticks leave it alone.
+  - Only this instance's own claim is updated (`WHERE status = 'firing'`).
+- **The tick carries on** to the next due deadline either way. Other errors - the database itself failing - still end the tick as before.
+- **Redrive:** `retryParkedDelivery` handles `Deadline` exactly like `CrossContextRoute` - resubmit the stored payload to the target command type. `parked_delivery_redrive_identity` gives it the deadline's client id (`DEADLINE_CLIENT_ID`) and its own reserved key, `skilj-deadline:{id}`. So an attempt that failed on this side but committed anyway, or a second redrive, is `Deduplicated` rather than running the command twice. `forgetSubject` checks a parked deadline's payload against the target command type's sensitive fields, as for a route.
+
+Breaking: `fire_due_deadlines` takes the retry policy, and `ParkedDeliveryKind`/GraphQL `ParkedDeliveryKind` gain `Deadline`/`DEADLINE`. Deadlines and parked deliveries aren't in the Allium spec, so it's unchanged.
+
+Tests:
+- `a_failing_deadline_is_retried_then_parked_without_blocking_others` (`skilj/tests/deadlines.rs`). A deadline whose payload can't deserialise is due just before a valid one, with a policy of 2 attempts and 60 s backoff.
+  - The first tick succeeds: the valid deadline fires and the failing one is `pending`. Before the fix, the tick itself failed with `PayloadDecodeFailed` and the valid deadline didn't fire.
+  - 30 s later nothing happens.
+  - At 61 s the second attempt parks it. The parked row has kind `Deadline`, `source` `deadline:schedule`, 2 attempts, the target and command type, the decode error, and the redrive identity `("deadline", "skilj-deadline:{id}")`.
+  - An hour later it's still `parked`, with one row.
+- `a_parked_deadline_is_listed_and_redriven_under_its_own_key` (`skilj/tests/parked_deliveries_graphql.rs`). A parked `Deadline` row lists as `DEADLINE`, and `retryParkedDelivery` makes the command's event. The same deadline parked and redriven again is deduplicated: one command.

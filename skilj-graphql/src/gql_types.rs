@@ -537,6 +537,7 @@ pub fn parked_delivery_kind_name(kind: skilj_core::db::ParkedDeliveryKind) -> &'
         skilj_core::db::ParkedDeliveryKind::CrossContextRoute => "CROSS_CONTEXT_ROUTE",
         skilj_core::db::ParkedDeliveryKind::ExternalEvent => "EXTERNAL_EVENT",
         skilj_core::db::ParkedDeliveryKind::CommandTrigger => "COMMAND_TRIGGER",
+        skilj_core::db::ParkedDeliveryKind::Deadline => "DEADLINE",
     }
 }
 
@@ -545,6 +546,7 @@ pub fn parked_delivery_kind_enum() -> Enum {
         .item("CROSS_CONTEXT_ROUTE")
         .item("EXTERNAL_EVENT")
         .item("COMMAND_TRIGGER")
+        .item("DEADLINE")
 }
 
 /// `entity ParkedDelivery` (no spec entity backs this - see
@@ -554,7 +556,7 @@ pub fn parked_delivery_kind_enum() -> Enum {
 /// `EventDto.payload`/`CommandDto.payload` already use, rather than a
 /// native GraphQL JSON scalar this schema has never needed elsewhere.
 /// `targetBoundedContext`/`targetCommandType` are populated only for
-/// `kind: CROSS_CONTEXT_ROUTE`; `accessTokenId` only for `EXTERNAL_EVENT`/
+/// `kind: CROSS_CONTEXT_ROUTE`/`DEADLINE`; `accessTokenId` only for `EXTERNAL_EVENT`/
 /// `COMMAND_TRIGGER` - see `ParkedDeliveryKind`'s own doc comment for the
 /// full split.
 pub fn parked_delivery_object() -> Object {

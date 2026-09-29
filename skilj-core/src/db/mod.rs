@@ -1575,7 +1575,11 @@ fn deadlines_table_ddl(schema: &str) -> String {
             status TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
             resolved_at TIMESTAMPTZ,
-            firing_at TIMESTAMPTZ
+            firing_at TIMESTAMPTZ,
+            attempt_count INT NOT NULL DEFAULT 0,
+            first_failed_at TIMESTAMPTZ,
+            next_attempt_at TIMESTAMPTZ,
+            last_error TEXT
         )"
     )
 }
@@ -1604,6 +1608,17 @@ pub async fn ensure_deadlines_table(
     // already means exactly "not currently claimed."
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {schema}.deadlines ADD COLUMN IF NOT EXISTS firing_at TIMESTAMPTZ"
+    )))
+    .execute(pool)
+    .await?;
+    // A failed fire's retry state (docs/architecture.md §115). The
+    // defaults mean "never failed", which every existing row is.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {schema}.deadlines \
+            ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0, \
+            ADD COLUMN IF NOT EXISTS first_failed_at TIMESTAMPTZ, \
+            ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ, \
+            ADD COLUMN IF NOT EXISTS last_error TEXT"
     )))
     .execute(pool)
     .await?;
@@ -8637,8 +8652,8 @@ async fn record_cross_context_route_retry_failure(
 
 /// Codeberg issue #21 - which family of thing a [`ParkedDelivery`]
 /// originally was, and therefore how `retryParkedDelivery` redrives it.
-/// `CrossContextRoute`'s own `target_bounded_context`/`target_command_type`
-/// columns are populated only for this variant; `ExternalEvent`/
+/// `target_bounded_context`/`target_command_type` are populated only for
+/// `CrossContextRoute` and `Deadline`; `ExternalEvent`/
 /// `CommandTrigger` populate `access_token_id` instead (see
 /// `ParkedDelivery`'s own doc comment for the full column-by-kind story).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8646,6 +8661,8 @@ pub enum ParkedDeliveryKind {
     CrossContextRoute,
     ExternalEvent,
     CommandTrigger,
+    /// A deadline whose command kept failing (docs/architecture.md §115).
+    Deadline,
 }
 
 impl ParkedDeliveryKind {
@@ -8654,6 +8671,7 @@ impl ParkedDeliveryKind {
             ParkedDeliveryKind::CrossContextRoute => "cross_context_route",
             ParkedDeliveryKind::ExternalEvent => "external_event",
             ParkedDeliveryKind::CommandTrigger => "command_trigger",
+            ParkedDeliveryKind::Deadline => "deadline",
         }
     }
 }
@@ -8662,6 +8680,7 @@ fn parked_delivery_kind_from_str(s: &str) -> ParkedDeliveryKind {
     match s {
         "external_event" => ParkedDeliveryKind::ExternalEvent,
         "command_trigger" => ParkedDeliveryKind::CommandTrigger,
+        "deadline" => ParkedDeliveryKind::Deadline,
         _ => ParkedDeliveryKind::CrossContextRoute,
     }
 }
@@ -9070,6 +9089,9 @@ fn cross_context_route_idempotency_key(route_name: &str, source_sequence: &str) 
 ///   reserved to this row (`RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX`),
 ///   which only dedupes across redrives.
 ///
+/// - `Deadline`: the deadline's own client id and reserved key, exactly
+///   as `fire_due_deadlines` submitted it (docs/architecture.md §115).
+///
 /// `None` for `ExternalEvent`, which has no idempotency key - see
 /// [`parked_delivery_redrive_dedupe_partition_key`] for its equivalent.
 pub fn parked_delivery_redrive_identity(
@@ -9110,6 +9132,16 @@ pub fn parked_delivery_redrive_identity(
                     delivery.id
                 ),
             },
+        )),
+        // The deadline's own reserved key: an attempt that failed on this
+        // side but committed anyway dedupes, and so do repeated redrives.
+        ParkedDeliveryKind::Deadline => Some((
+            DEADLINE_CLIENT_ID.to_string(),
+            format!(
+                "{}{}",
+                crate::event_store::RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX,
+                delivery.identifier
+            ),
         )),
         ParkedDeliveryKind::ExternalEvent => None,
     }
@@ -9243,7 +9275,7 @@ async fn parked_delivery_references_subject(
         Vec<crate::shared::SensitiveField>,
         Option<&serde_json::Value>,
     )> = match delivery.kind {
-        ParkedDeliveryKind::CrossContextRoute => {
+        ParkedDeliveryKind::CrossContextRoute | ParkedDeliveryKind::Deadline => {
             match (
                 &delivery.target_bounded_context,
                 &delivery.target_command_type,
@@ -10115,11 +10147,22 @@ fn deadline_firing_claim_stale_after() -> chrono::Duration {
 #[derive(sqlx::FromRow)]
 struct DueDeadlineRow {
     id: String,
+    schedule_name: String,
     correlation_id: Option<String>,
     target_bounded_context: String,
     target_command_type: String,
     payload: String,
+    attempt_count: i32,
+    first_failed_at: Option<DateTime<Utc>>,
 }
+
+/// A `Deadline`-kind parked row's `source` is this prefix plus the
+/// `ScheduleDeadline` that created it; its `identifier` is the deadline's
+/// id (docs/architecture.md §115).
+pub const DEADLINE_PARKED_SOURCE_PREFIX: &str = "deadline:";
+
+/// The `client_id` every deadline's command is submitted under.
+pub const DEADLINE_CLIENT_ID: &str = "deadline";
 
 /// One bounded context's own share of the firing scan - **not** tied to
 /// any one registered `ScheduleDeadline`, unlike the two catch-up
@@ -10158,6 +10201,14 @@ struct DueDeadlineRow {
 /// *is* submitted but gets rejected by its own `decide()` is marked
 /// `fired` too - a legitimate business outcome (`ScheduleDeadline`'s own
 /// doc comment), not a reason to retry.
+///
+/// A submission that fails with an *error* is retried per
+/// `retry_policy` - the row goes back to `pending` with `next_attempt_at`
+/// set, so a cancel in the meantime still wins - and once the policy is
+/// exhausted, parked as a `Deadline`-kind [`ParkedDelivery`] in the
+/// target bounded context and marked `parked`, where an operator can
+/// retry or discard it like a parked route delivery. Either way the rest
+/// of the tick carries on (docs/architecture.md §115).
 #[allow(clippy::too_many_arguments)]
 pub async fn fire_due_deadlines(
     pool: &Pool,
@@ -10169,13 +10220,16 @@ pub async fn fire_due_deadlines(
     bounded_context: &str,
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
+    retry_policy: &skilj_retry::RetryPolicy,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
     let stale_cutoff = now - deadline_firing_claim_stale_after();
     let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, correlation_id, target_bounded_context, target_command_type, payload \
+        "SELECT id, schedule_name, correlation_id, target_bounded_context, \
+         target_command_type, payload, attempt_count, first_failed_at \
          FROM {schema}.deadlines \
          WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \
+         AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \
          ORDER BY fire_at LIMIT {MAX_DUE_DEADLINES_PER_TICK}"
     )))
     .bind(stale_cutoff)
@@ -10223,6 +10277,7 @@ pub async fn fire_due_deadlines(
         let claimed: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.deadlines SET status = 'firing', firing_at = $1 \
              WHERE id = $2 AND (status = 'pending' OR (status = 'firing' AND firing_at <= $3)) \
+             AND (next_attempt_at IS NULL OR next_attempt_at <= $1) \
              RETURNING id"
         )))
         .bind(now)
@@ -10263,14 +10318,21 @@ pub async fn fire_due_deadlines(
             event_cache,
             &target_command_type,
             &row.payload,
-            "deadline",
+            DEADLINE_CLIENT_ID,
             row.correlation_id.as_deref(),
             None,
             encryption_master_key,
             now,
             Some(&idempotency_key),
         )
-        .await?;
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                record_deadline_failure(pool, &schema, &row, &e, retry_policy, now).await?;
+                continue;
+            }
+        };
         if matches!(outcome, SubmitCommandOutcome::Deduplicated { .. }) {
             tracing::warn!(
                 deadline_id = %row.id,
@@ -10290,6 +10352,83 @@ pub async fn fire_due_deadlines(
 /// already claimed into `'firing'` (the normal fire path) - either way
 /// idempotent: a status that's already terminal (`'fired'`/`'cancelled'`)
 /// never matches, so a redelivered/duplicate call is a safe no-op.
+/// A deadline whose command submission failed with an error: back to
+/// `pending` until its next attempt, or - once `retry_policy` is
+/// exhausted - parked in the target bounded context and marked `parked`
+/// (docs/architecture.md §115). Only this instance's own claim is
+/// updated (`status = 'firing'`): a reclaim racing it leaves it alone.
+async fn record_deadline_failure(
+    pool: &Pool,
+    schema: &str,
+    row: &DueDeadlineRow,
+    error: &crate::error::Error,
+    retry_policy: &skilj_retry::RetryPolicy,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let attempt_count = row.attempt_count + 1;
+    let first_failed_at = row.first_failed_at.unwrap_or(now);
+    let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
+    let message = error.to_string();
+    if retry_policy.is_exhausted(attempt_count as u32, elapsed) {
+        tracing::error!(
+            deadline_id = %row.id,
+            error = %message,
+            attempt = attempt_count,
+            "deadline: target command submission failed repeatedly - parking it"
+        );
+        let request_json = serde_json::from_str(&row.payload)
+            .unwrap_or_else(|_| serde_json::Value::String(row.payload.clone()));
+        insert_parked_delivery(
+            pool,
+            &row.target_bounded_context,
+            &format!("{DEADLINE_PARKED_SOURCE_PREFIX}{}", row.schedule_name),
+            ParkedDeliveryKind::Deadline,
+            &row.id,
+            None,
+            Some(&row.target_bounded_context),
+            Some(&row.target_command_type),
+            &request_json,
+            &message,
+            attempt_count,
+            first_failed_at,
+            now,
+        )
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.deadlines SET status = 'parked', resolved_at = $1, \
+             attempt_count = $2, last_error = $3 WHERE id = $4 AND status = 'firing'"
+        )))
+        .bind(now)
+        .bind(attempt_count)
+        .bind(&message)
+        .bind(&row.id)
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
+    let next_attempt_at = retry_policy.next_attempt_at(now, attempt_count as u32);
+    tracing::warn!(
+        deadline_id = %row.id,
+        error = %message,
+        attempt = attempt_count,
+        next_attempt_at = %next_attempt_at,
+        "deadline: target command submission failed - will retry"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.deadlines SET status = 'pending', firing_at = NULL, \
+         attempt_count = $1, first_failed_at = $2, next_attempt_at = $3, last_error = $4 \
+         WHERE id = $5 AND status = 'firing'"
+    )))
+    .bind(attempt_count)
+    .bind(first_failed_at)
+    .bind(next_attempt_at)
+    .bind(&message)
+    .bind(&row.id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn mark_deadline_resolved(
     pool: &Pool,
     schema: &str,
