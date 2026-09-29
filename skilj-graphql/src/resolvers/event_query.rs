@@ -54,6 +54,8 @@ pub fn query_events_field() -> Field {
                     event_types.push(et);
                 }
                 let tags = parse_tags(ctx.args.get("tags"))?;
+                skilj_core::event_store::valid_query_tags(tags.as_deref())
+                    .map_err(to_graphql_error)?;
                 let after_sequence = ctx
                     .args
                     .get("afterSequence")
@@ -192,6 +194,7 @@ pub fn count_events_field() -> Field {
                 event_types.push(et);
             }
             let tags = parse_tags(ctx.args.get("tags"))?;
+            skilj_core::event_store::valid_query_tags(tags.as_deref()).map_err(to_graphql_error)?;
             let correlation_id = ctx
                 .args
                 .get("correlationId")

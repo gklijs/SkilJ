@@ -2271,3 +2271,44 @@ fn an_inspected_events_originating_command_is_rendered_for_the_caller() {
         );
     });
 }
+
+/// More than 32 tags in one `queryEvents` is refused before the
+/// tag-index query runs (docs/architecture.md §122).
+#[test]
+fn query_events_refuses_more_than_32_tags() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt, _role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let tags = |n: usize| {
+            (0..n)
+                .map(|i| json!({ "key": "thing", "value": i.to_string() }))
+                .collect::<Vec<_>>()
+        };
+        let query = "query($bc: String!, $tags: [TagInput!]) { \
+            queryEvents(boundedContext: $bc, eventTypes: [], tags: $tags) { sequence } }";
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            query,
+            json!({ "bc": bc_name, "tags": tags(32) }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response:?}");
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            query,
+            json!({ "bc": bc_name, "tags": tags(33) }),
+        )
+        .await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "too_many_tags",
+            "{response:?}"
+        );
+    });
+}

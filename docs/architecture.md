@@ -10058,3 +10058,15 @@ Tests (`skilj-core/tests/event_filtering.rs`):
 - `valid_filters_rejects_an_is_like_pattern_over_the_cap`: 1024 characters is accepted, 1025 is rejected, and `Contains` is uncapped.
 - `is_like_matches_a_long_string_in_linear_memory`: a pattern at the cap against a 2,000,000-character value, matching and not, plus the wildcard cases. The old DP would allocate about 2 GB here. A one-row DP took 70 s in a debug build; this one is well under a second.
 - `is_like_agrees_with_the_reference_dp`: every pattern up to 4 characters over `a é % _` against every text up to 5 over `a b é`, and patterns across the 64-bit word boundary, all agree with the full-table DP.
+
+## 122. Bounded filter counts, filter values and query tags
+
+§121 bounded one `IS_LIKE` pattern. A request could still carry any number of filters, and each is evaluated against every event examined - for an `eventsByType` subscription, against every event committed for as long as the connection lives. A 2 MiB GraphQL body holds tens of thousands of them, and a REST URL thousands. Non-`IS_LIKE` values were unbounded as well: an `IN` list is split for every event, and `CONTAINS` scans for its value. On the Admin side, `queryEvents`/`countEvents` took any number of `tags`, and each became its own `tags @> $n` condition and bind parameter in the tag-index query.
+
+- **`valid_filters`** rejects more than `MAX_FILTERS` (32) filters, or any value longer than `MAX_FILTER_VALUE_CHARS` (4096) characters, as `invalid_filter`. `IS_LIKE` keeps its tighter 1024. That covers REST reads and consumes and `eventsByType` alike, at the point filters are supplied.
+- **`valid_query_tags`** refuses more than `MAX_QUERY_TAGS` (32) tags with the new `Error::TooManyTags` (`too_many_tags`). The two resolvers call it before the tag-index query runs, and `query_events_select`/`count_events` check it again.
+- The limits are constants, and the error messages name them; a compile-time assert keeps the two in step. The spec gains `config.max_query_tags = 32` with a `requires` on `QueryEvents` and `CountEvents`, and its `valid_filters` prose names the size bounds, leaving the numbers to the implementation as it does its type matrix.
+
+Tests:
+- `valid_filters_bounds_the_filter_count_and_value_length` and `valid_query_tags_bounds_the_tag_count` (`skilj-core/tests/event_filtering.rs`) check both sides of each bound.
+- `query_events_refuses_more_than_32_tags` (`skilj/tests/graphql_business_surfaces.rs`): 32 tags answer over GraphQL, and 33 give `too_many_tags`.

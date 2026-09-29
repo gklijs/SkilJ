@@ -156,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Event filters and query tags are bounded: at most 32 filters per read
+  or subscription, each value at most 4096 characters (`invalid_filter`),
+  and at most 32 tags per `queryEvents`/`countEvents` (new
+  `too_many_tags`). Every filter runs against every event examined, and
+  every tag was its own condition in the tag-index query
+  (docs/architecture.md §122).
 - An `IS_LIKE` event filter allocated pattern-length x value-length
   memory for every event it examined - a gigabyte for a 10k-character
   pattern against a 100k-character value - reachable with a REST

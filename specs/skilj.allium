@@ -1733,6 +1733,7 @@ config {
     read_cursor_checkout_lease: Duration = 5.minutes
     max_events_per_read: Integer = 1000
     idempotency_key_retention: Duration = 1.hour
+    max_query_tags: Integer = 32
 }
 
 ------------------------------------------------------------
@@ -2607,10 +2608,11 @@ rule SkipMissedOccurrences {
 -- that field names a field event_type.schema actually declares, and that
 -- operator is one that field's declared type supports (e.g. greater_than
 -- against a string-typed field is invalid, not merely always-false) -
--- and one about its value: an is_like pattern longer than a fixed bound
--- is invalid too, since matching one costs its length times the matched
--- value's for every event examined. The bound itself belongs to the
--- black box, like the matrix below.
+-- and bounds on size: more filters than a fixed number, or a value
+-- longer than a fixed length (an is_like pattern's, a tighter one), are
+-- invalid too, since every filter runs against every event examined -
+-- for a subscription, every event committed while it lives. The bounds
+-- themselves belong to the black box, like the matrix below.
 -- A Filter.field written as a two-segment dotted path is checked the same
 -- way, one level deeper: the path is resolved by walking into the named
 -- nested shape's own declared fields, and the leaf's declared type is
@@ -4083,6 +4085,10 @@ rule QueryEvents {
     -- nameable inside it, where tags is each event's own field.
     let wanted_tags = tags
 
+    -- Each wanted tag is its own condition in the tag-index read, so how
+    -- many one query may name is bounded.
+    requires: wanted_tags = null or wanted_tags.count <= config.max_query_tags
+
     let matched =
         Events where bounded_context = access_mapping.bounded_context
             and (event_types.count = 0 or event_type in event_types)
@@ -4196,6 +4202,7 @@ rule CountEvents {
     requires: event_types.all(et => et.bounded_context = access_mapping.bounded_context)
 
     let wanted_tags = tags
+    requires: wanted_tags = null or wanted_tags.count <= config.max_query_tags
 
     -- The same narrowing as QueryEvents minus the cursor: a count is a
     -- live aggregate over everything matching, not a page of it, so a

@@ -795,3 +795,60 @@ fn is_like_agrees_with_the_reference_dp() {
         }
     }
 }
+
+/// Every filter runs against every event a read examines - for a
+/// subscription, every event committed while it lives - so how many a
+/// request may carry, and how long each value may be, are bounded
+/// (docs/architecture.md §122).
+#[test]
+fn valid_filters_bounds_the_filter_count_and_value_length() {
+    let many = |n: usize| vec![filter("name", FilterOperator::Equals, "Alice"); n];
+    assert!(event_store::valid_filters(
+        &event_type(),
+        &many(event_store::MAX_FILTERS)
+    ));
+    assert!(!event_store::valid_filters(
+        &event_type(),
+        &many(event_store::MAX_FILTERS + 1)
+    ));
+
+    let value = |n: usize| "x".repeat(n);
+    for operator in [FilterOperator::Equals, FilterOperator::Contains] {
+        assert!(event_store::valid_filters(
+            &event_type(),
+            &[filter(
+                "name",
+                operator,
+                &value(event_store::MAX_FILTER_VALUE_CHARS)
+            )]
+        ));
+        assert!(!event_store::valid_filters(
+            &event_type(),
+            &[filter(
+                "name",
+                operator,
+                &value(event_store::MAX_FILTER_VALUE_CHARS + 1)
+            )]
+        ));
+    }
+}
+
+/// Each tag in `queryEvents`/`countEvents` becomes its own condition in
+/// the tag-index query, so at most `MAX_QUERY_TAGS` are accepted
+/// (docs/architecture.md §122).
+#[test]
+fn valid_query_tags_bounds_the_tag_count() {
+    let tags = |n: usize| {
+        (0..n)
+            .map(|i| skilj_core::shared::Tag {
+                key: "k".into(),
+                value: Some(i.to_string()),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(event_store::valid_query_tags(None).is_ok());
+    assert!(event_store::valid_query_tags(Some(&tags(event_store::MAX_QUERY_TAGS))).is_ok());
+    let err =
+        event_store::valid_query_tags(Some(&tags(event_store::MAX_QUERY_TAGS + 1))).unwrap_err();
+    assert!(err.to_string().contains("at most 32 tags"), "{err}");
+}

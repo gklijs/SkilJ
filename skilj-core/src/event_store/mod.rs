@@ -458,9 +458,15 @@ pub enum Error {
 
     #[error(
         "this filter is invalid: its field's declared type doesn't support the operator, \
-         or an IS_LIKE pattern is longer than 1024 characters"
+         its value is longer than 4096 characters (an IS_LIKE pattern, 1024), or more \
+         than 32 filters were given"
     )]
     InvalidFilter,
+
+    /// More tags than `MAX_QUERY_TAGS` in one `queryEvents`/`countEvents`
+    /// (docs/architecture.md §122).
+    #[error("at most 32 tags may be given in one query")]
+    TooManyTags,
 
     /// Drift audit finding #16 (2026-08-20, see project memory
     /// `skilj-drift-audit-2026-08-20`): a registered `schema` used to go
@@ -644,6 +650,7 @@ impl SkiljRejection for Error {
             Error::SchemaIncompatible => "schema_incompatible",
             Error::MissingScheduleOrPolicy => "missing_schedule_or_policy",
             Error::InvalidFilter => "invalid_filter",
+            Error::TooManyTags => "too_many_tags",
             Error::InvalidSchema => "invalid_schema",
             Error::InvalidTagMapping => "invalid_tag_mapping",
             Error::InvalidOwnerTagKey => "invalid_owner_tag_key",
@@ -842,6 +849,13 @@ fn filter_operator_is_valid(kind: &FieldKind, operator: FilterOperator) -> bool 
 pub fn valid_filters(event_type: &EventType, filters: &[Filter]) -> bool {
     if filters.is_empty() {
         return true;
+    }
+    if filters.len() > MAX_FILTERS
+        || filters
+            .iter()
+            .any(|f| f.value.chars().count() > MAX_FILTER_VALUE_CHARS)
+    {
+        return false;
     }
     let Some(properties) = schema_properties(&event_type.schema) else {
         return false;
@@ -1285,8 +1299,34 @@ pub fn schema_is_backwards_compatible(existing_schema: &str, schema: &str) -> bo
 /// time proportional to pattern length times the matched string's, for
 /// every event a read examines.
 pub const MAX_LIKE_PATTERN_CHARS: usize = 1024;
-// `Error::InvalidFilter`'s message names the cap.
-const _: () = assert!(MAX_LIKE_PATTERN_CHARS == 1024);
+/// The most filters one read or subscription may carry, and the longest
+/// value any of them may have, in characters (docs/architecture.md §122).
+/// Every filter is evaluated against every event examined - for a
+/// subscription, every event committed for as long as it lives.
+pub const MAX_FILTERS: usize = 32;
+pub const MAX_FILTER_VALUE_CHARS: usize = 4096;
+
+/// The most tags one `queryEvents`/`countEvents` may give; each becomes
+/// its own condition in the tag-index query (docs/architecture.md §122).
+pub const MAX_QUERY_TAGS: usize = 32;
+
+// `Error::InvalidFilter`'s and `Error::TooManyTags`' messages name these.
+const _: () = assert!(
+    MAX_LIKE_PATTERN_CHARS == 1024
+        && MAX_FILTERS == 32
+        && MAX_FILTER_VALUE_CHARS == 4096
+        && MAX_QUERY_TAGS == 32
+);
+
+/// `Err(TooManyTags)` for more than [`MAX_QUERY_TAGS`] tags - checked by
+/// `queryEvents`/`countEvents` before their tag-index query, and again by
+/// the rules themselves.
+pub fn valid_query_tags(tags: Option<&[Tag]>) -> crate::error::Result<()> {
+    if tags.is_some_and(|tags| tags.len() > MAX_QUERY_TAGS) {
+        return Err(Error::TooManyTags.into());
+    }
+    Ok(())
+}
 
 /// Classic SQL-LIKE matching for `FilterOperator::IsLike` - `%` matches
 /// any run of characters (including none), `_` matches exactly one
@@ -2623,6 +2663,7 @@ pub fn query_events_select(
     {
         return Err(Error::EventTypeNotInBoundedContext.into());
     }
+    valid_query_tags(tags)?;
 
     let after = after_sequence.unwrap_or(-1);
     Ok(bounded_context_events
@@ -2694,6 +2735,7 @@ pub fn count_events(
     {
         return Err(Error::EventTypeNotInBoundedContext.into());
     }
+    valid_query_tags(tags)?;
 
     Ok(bounded_context_events
         .iter()
