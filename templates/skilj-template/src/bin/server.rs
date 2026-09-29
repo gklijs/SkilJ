@@ -126,6 +126,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("       -d '{}' \\", example_payload);
     println!("       http://localhost:{port}/v1/commands/trigger");
 
-    axum::serve(listener, app).await?;
+    // On Ctrl-C or SIGTERM (what `docker stop` sends): stop taking
+    // requests and finish the ones in flight, then let skilj's background
+    // work finish what it's doing and close its connections.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    let report = skilj.shutdown(std::time::Duration::from_secs(10)).await;
+    if !report.aborted.is_empty() {
+        println!("shutdown: aborted after the timeout: {:?}", report.aborted);
+    }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl-C");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to listen for SIGTERM")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }

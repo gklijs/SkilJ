@@ -148,6 +148,75 @@ struct IdentityProvider {
     cache: Arc<JwksCache>,
 }
 
+/// What [`Skilj::shutdown`] did (docs/architecture.md §123).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// Background loops that finished their tick in progress and stopped.
+    pub stopped: Vec<&'static str>,
+    /// Background loops still busy when the timeout ran out, aborted.
+    pub aborted: Vec<&'static str>,
+    /// Whether the connection pool finished closing within the timeout -
+    /// `false` when requests still held connections at that point.
+    pub pool_closed: bool,
+}
+
+/// The background loops `SkiljBuilder::build` starts, and the signal that
+/// stops them (docs/architecture.md §123). The loops watch the signal only
+/// between ticks: a tick in progress - a route submitting a command, a
+/// deadline firing - always completes.
+#[derive(Clone)]
+struct Background {
+    stop: Arc<tokio::sync::watch::Sender<bool>>,
+    tasks: Arc<std::sync::Mutex<Vec<NamedTask>>>,
+}
+
+/// A background loop's name and handle.
+type NamedTask = (&'static str, tokio::task::JoinHandle<()>);
+
+impl Background {
+    fn new() -> Self {
+        Self {
+            stop: Arc::new(tokio::sync::watch::channel(false).0),
+            tasks: Arc::default(),
+        }
+    }
+
+    /// Spawns a background loop, handing it the stop signal.
+    fn spawn<F, Fut>(&self, name: &'static str, task: F)
+    where
+        F: FnOnce(StopSignal) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(task(StopSignal(self.stop.subscribe())));
+        self.tasks
+            .lock()
+            .expect("the background task list is never poisoned")
+            .push((name, handle));
+    }
+}
+
+/// A background loop's view of [`Skilj::shutdown`]'s stop request.
+struct StopSignal(tokio::sync::watch::Receiver<bool>);
+
+impl StopSignal {
+    /// Resolves once a stop is requested. Never, if the `Skilj` that owns
+    /// the signal was dropped rather than shut down: dropping it has never
+    /// stopped anything, and the routers it handed out may still be serving.
+    async fn stopped(&mut self) {
+        if self.0.wait_for(|stop| *stop).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Sleeps for `duration`, cut short by a stop request - `true` then.
+    async fn sleep(&mut self, duration: std::time::Duration) -> bool {
+        tokio::select! {
+            () = self.stopped() => true,
+            () = tokio::time::sleep(duration) => false,
+        }
+    }
+}
+
 /// Entry point - see docs/architecture.md §1.5 for the full worked
 /// example and the reasoning behind every choice below.
 pub struct Skilj {
@@ -165,13 +234,13 @@ pub struct Skilj {
     /// `Arc`-wrapped for the identical reason `command_types`/`projections`
     /// are - `event_dispatcher()` hands out a cheap `Arc<dyn
     /// EventDispatcher>`, and the background scheduler task spawned in
-    /// `.build()` holds its own clone for the process's lifetime.
+    /// `.build()` holds its own clone until `Skilj::shutdown`.
     event_types: Arc<HashMap<(String, String), RegisteredEventType>>,
     /// `Arc`-wrapped for the identical reason `command_types`/
     /// `projections`/`event_types` are - `snapshot_dispatcher()` hands
     /// out a cheap `Arc<dyn SnapshotDispatcher>`, and the background
     /// snapshot catch-up task spawned in `.build()` holds its own clone
-    /// for the process's lifetime ([docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)).
+    /// until `Skilj::shutdown` ([docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)).
     snapshots: Arc<HashMap<(String, String), RegisteredSnapshot>>,
     /// `bootstrap::generate_bootstrap_secret`'s output, computed once at
     /// `.build()` time and printed then too (see `SkiljBuilder::build`) -
@@ -270,6 +339,8 @@ pub struct Skilj {
     /// which surface (REST trigger, GraphQL `submitCommand`, parked-
     /// delivery redrive) produced it.
     command_batcher: skilj_core::command_batcher::CommandBatcher,
+    /// The background loops `.build()` started, for [`Skilj::shutdown`].
+    background: Background,
 }
 
 /// `CommandDispatcher`'s own implementer - a thin wrapper around the
@@ -619,6 +690,47 @@ impl skilj_core::plugin::CancelDeadlineDispatcher for CancelDeadlineDispatcherIm
 }
 
 impl Skilj {
+    /// Stops this `Skilj` (docs/architecture.md §123): its background
+    /// loops - projection and snapshot catch-up, routes, deadlines,
+    /// scheduled events, key retention, the cross-instance listener - each
+    /// finish the tick they are in and stop, then the connection pool
+    /// closes. Whatever is still running when `timeout` runs out is
+    /// aborted, and the pool is left to close on its own; the report says
+    /// which. An aborted tick is recovered like a crash would be - routes,
+    /// deadlines and bridges resume under their idempotency keys on the
+    /// next start.
+    ///
+    /// Stop serving the routers from [`Skilj::rest_router`] and
+    /// [`Skilj::graphql_router`] first: they share the pool, so requests
+    /// after this fail, and the pool can't finish closing while requests
+    /// still hold connections. Dropping a `Skilj` without calling this
+    /// stops nothing, as before - the routers may still be in use.
+    pub async fn shutdown(self, timeout: std::time::Duration) -> ShutdownReport {
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.background.stop.send_replace(true);
+        let tasks = std::mem::take(
+            &mut *self
+                .background
+                .tasks
+                .lock()
+                .expect("the background task list is never poisoned"),
+        );
+        let mut report = ShutdownReport::default();
+        for (name, mut handle) in tasks {
+            if tokio::time::timeout_at(deadline, &mut handle).await.is_ok() {
+                report.stopped.push(name);
+            } else {
+                handle.abort();
+                let _ = handle.await;
+                report.aborted.push(name);
+            }
+        }
+        report.pool_closed = tokio::time::timeout_at(deadline, self.pool.close())
+            .await
+            .is_ok();
+        report
+    }
+
     pub fn builder(database_url: impl Into<String>) -> SkiljBuilder {
         SkiljBuilder {
             database_url: database_url.into(),
@@ -2253,6 +2365,7 @@ impl SkiljBuilder {
             .await?,
         );
 
+        let background = Background::new();
         let skilj = Skilj {
             pool,
             command_types,
@@ -2273,22 +2386,20 @@ impl SkiljBuilder {
             schema_registry,
             template_cache,
             command_batcher,
+            background: background.clone(),
         };
 
         // The single shared background task backing §8 item 6's async
         // case - one task, not one per bounded context, since a bounded
         // context can gain its first async Projection/ProjectionRebuild
         // at any point after this returns (via GraphQL `registerProjection`),
-        // not only at build time. Detached, no shutdown API this pass -
-        // it runs for the process's lifetime, the same "don't build ahead
-        // of what's wired" call this crate has made before (nothing today
-        // needs to gracefully stop a running `Skilj`). Runs its first
+        // not only at build time. Runs until `Skilj::shutdown` (§123). Runs its first
         // catch-up immediately, before the first sleep, so a caller
         // creating an event right after `.build()` returns doesn't also
         // pay for a full idle poll interval on top of processing time.
         let poll_pool = skilj.pool.clone();
         let poll_dispatcher = skilj.projection_dispatcher();
-        tokio::spawn(async move {
+        background.spawn("async_projections", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();
                 // One span per tick, a trace root - there's no HTTP
@@ -2351,14 +2462,16 @@ impl SkiljBuilder {
                     start.elapsed().as_secs_f64(),
                     &[KeyValue::new("task", "async_projection")],
                 );
-                tokio::time::sleep(poll_interval).await;
+                if stop.sleep(poll_interval).await {
+                    return;
+                }
             }
         });
 
         // docs/architecture.md §19's own background task - one shared
         // task, not one per bounded context, for the identical reasons
-        // the async projection task above is. Detached, runs for the
-        // process's lifetime, same as every other background task here.
+        // the async projection task above is. Runs until `Skilj::shutdown`,
+        // same as every other background task here.
         // Deliberately its own task, not folded into the async
         // projection one above even though the shape rhymes closely -
         // see `skilj_core::plugin::Snapshot`'s own doc comment for why
@@ -2374,7 +2487,7 @@ impl SkiljBuilder {
                 .max(std::time::Duration::from_secs(1));
             let startup_grace = retention.min(IDEMPOTENCY_KEY_STARTUP_GRACE);
             let retention = chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
-            tokio::spawn(async move {
+            background.spawn("idempotency_key_retention", move |mut stop| async move {
                 // docs/architecture.md §94: recovery paths that retry under
                 // a key (a reclaimed deadline, a route re-reading its
                 // source, a broker redelivering an uncommitted message)
@@ -2382,7 +2495,9 @@ impl SkiljBuilder {
                 // than the retention they must find their keys, not race
                 // this task deleting them - so it waits before its first
                 // sweep.
-                tokio::time::sleep(startup_grace).await;
+                if stop.sleep(startup_grace).await {
+                    return;
+                }
                 loop {
                     let start = std::time::Instant::now();
                     idempotency_key_retention_tick(&retention_pool, retention)
@@ -2392,7 +2507,9 @@ impl SkiljBuilder {
                         start.elapsed().as_secs_f64(),
                         &[KeyValue::new("task", "idempotency_key_retention")],
                     );
-                    tokio::time::sleep(cleanup_interval).await;
+                    if stop.sleep(cleanup_interval).await {
+                        return;
+                    }
                 }
             });
         }
@@ -2400,7 +2517,7 @@ impl SkiljBuilder {
         let snapshot_pool = skilj.pool.clone();
         let snapshot_dispatcher = skilj.snapshot_dispatcher();
         let snapshot_interval = self.snapshot_poll_interval;
-        tokio::spawn(async move {
+        background.spawn("snapshots", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();
                 async {
@@ -2459,7 +2576,9 @@ impl SkiljBuilder {
                     start.elapsed().as_secs_f64(),
                     &[KeyValue::new("task", "snapshot")],
                 );
-                tokio::time::sleep(snapshot_interval).await;
+                if stop.sleep(snapshot_interval).await {
+                    return;
+                }
             }
         });
 
@@ -2469,9 +2588,8 @@ impl SkiljBuilder {
         // `skilj_core::plugin::CrossContextRoute`'s own doc comment for
         // why this stays a single-hop reaction, not a Saga/process
         // manager). One shared task, not one per route, for the same
-        // reasons the async projection task above is; detached, runs
-        // for the process's lifetime, same as every other background
-        // task here. The route list itself is fixed at `.build()` time
+        // reasons the async projection task above is; runs until
+        // `Skilj::shutdown`, same as every other background task here. The route list itself is fixed at `.build()` time
         // (registered via `SkiljBuilder::cross_context_route`, no
         // runtime registration surface, matching every other plugin
         // trait), so it's read once here rather than re-listed every
@@ -2498,7 +2616,7 @@ impl SkiljBuilder {
         // (docs/architecture.md §117).
         let route_concurrency = (route_pool.options().get_max_connections() as usize / 2)
             .clamp(1, BACKGROUND_TASK_CONCURRENCY);
-        tokio::spawn(async move {
+        background.spawn("cross_context_routes", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();
                 async {
@@ -2554,7 +2672,9 @@ impl SkiljBuilder {
                     start.elapsed().as_secs_f64(),
                     &[KeyValue::new("task", "cross_context_route")],
                 );
-                tokio::time::sleep(route_interval).await;
+                if stop.sleep(route_interval).await {
+                    return;
+                }
             }
         });
 
@@ -2576,7 +2696,7 @@ impl SkiljBuilder {
                 schedules: Arc::new(self.schedule_deadlines),
             });
         let schedules = schedule_deadline_dispatcher.schedules();
-        tokio::spawn(async move {
+        background.spawn("schedule_deadlines", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();
                 async {
@@ -2622,7 +2742,9 @@ impl SkiljBuilder {
                     start.elapsed().as_secs_f64(),
                     &[KeyValue::new("task", "schedule_deadline")],
                 );
-                tokio::time::sleep(deadline_interval).await;
+                if stop.sleep(deadline_interval).await {
+                    return;
+                }
             }
         });
 
@@ -2633,7 +2755,7 @@ impl SkiljBuilder {
                 cancels: Arc::new(self.cancel_deadlines),
             });
         let cancels = cancel_deadline_dispatcher.cancels();
-        tokio::spawn(async move {
+        background.spawn("cancel_deadlines", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();
                 async {
@@ -2674,7 +2796,9 @@ impl SkiljBuilder {
                     start.elapsed().as_secs_f64(),
                     &[KeyValue::new("task", "cancel_deadline")],
                 );
-                tokio::time::sleep(deadline_interval).await;
+                if stop.sleep(deadline_interval).await {
+                    return;
+                }
             }
         });
 
@@ -2692,7 +2816,7 @@ impl SkiljBuilder {
         let deadline_fire_event_cache = skilj.event_cache.clone();
         let deadline_fire_encryption_master_key = skilj.encryption_master_key.clone();
         let deadline_retry_policy = self.deadline_retry_policy;
-        tokio::spawn(async move {
+        background.spawn("fire_deadlines", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();
                 deadline_fire_tick(
@@ -2712,7 +2836,9 @@ impl SkiljBuilder {
                     start.elapsed().as_secs_f64(),
                     &[KeyValue::new("task", "deadline_fire")],
                 );
-                tokio::time::sleep(deadline_interval).await;
+                if stop.sleep(deadline_interval).await {
+                    return;
+                }
             }
         });
 
@@ -2735,7 +2861,7 @@ impl SkiljBuilder {
         let scheduler_event_cache = skilj.event_cache.clone();
         let scheduler_encryption_master_key = skilj.encryption_master_key.clone();
         let scheduler_interval = self.scheduler_poll_interval;
-        tokio::spawn(async move {
+        background.spawn("system_event_scheduler", move |mut stop| async move {
             loop {
                 let start = std::time::Instant::now();
                 scheduler_tick(
@@ -2755,7 +2881,9 @@ impl SkiljBuilder {
                     start.elapsed().as_secs_f64(),
                     &[KeyValue::new("task", "scheduler")],
                 );
-                tokio::time::sleep(scheduler_interval).await;
+                if stop.sleep(scheduler_interval).await {
+                    return;
+                }
             }
         });
 
@@ -2793,7 +2921,7 @@ impl SkiljBuilder {
         let cross_instance_schema_registry = Arc::clone(&skilj.schema_registry);
         let cross_instance_template_cache = skilj.template_cache.clone();
         let cross_instance_state = skilj.graphql_state();
-        tokio::spawn(async move {
+        background.spawn("cross_instance", move |mut stop| async move {
             let mut listener = loop {
                 match skilj_core::cross_instance::Listener::connect(&cross_instance_pool).await {
                     Ok(listener) => break listener,
@@ -2809,16 +2937,21 @@ impl SkiljBuilder {
                                 KeyValue::new("reason", "connect_failed"),
                             ],
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        if stop.sleep(std::time::Duration::from_secs(5)).await {
+                            return;
+                        }
                     }
                 }
             };
             loop {
-                let message = match listener
-                    .recv()
-                    .instrument(tracing::info_span!("cross_instance_recv"))
-                    .await
-                {
+                // Waiting for a notification is this loop's idle point.
+                let received = tokio::select! {
+                    () = stop.stopped() => return,
+                    received = listener
+                        .recv()
+                        .instrument(tracing::info_span!("cross_instance_recv")) => received,
+                };
+                let message = match received {
                     Ok(message) => message,
                     Err(err) => {
                         tracing::warn!(error = %err, "cross-instance listener error, retrying");
@@ -2829,7 +2962,9 @@ impl SkiljBuilder {
                                 KeyValue::new("reason", "recv_failed"),
                             ],
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if stop.sleep(std::time::Duration::from_secs(1)).await {
+                            return;
+                        }
                         continue;
                     }
                 };

@@ -507,6 +507,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    // Then skilj's own background work (docs/architecture.md §123), before
+    // telemetry, so what it does while stopping is still exported.
+    let report = skilj.shutdown(std::time::Duration::from_secs(10)).await;
+    if !report.aborted.is_empty() {
+        println!("shutdown: aborted after the timeout: {:?}", report.aborted);
+    }
 
     if let Some(telemetry) = telemetry {
         telemetry.shutdown();

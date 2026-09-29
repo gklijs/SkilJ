@@ -26,6 +26,10 @@ A few things that trip people up:
   same excluded events every time. A `consume` cursor moves the same way (for manual-ack, only
   on a call that serves nothing). Use the same `filter` for the whole walk: a cursor reached under
   one filter has passed over events a different filter would have matched.
+- **Filters are bounded.** A read takes at most 32 `filter` parameters, each value at most 4096
+  characters, and an `is_like` pattern at most 1024. Past that the call is refused with `400`
+  `invalid_filter` rather than answered - every filter runs against every event the read walks
+  ([§121](architecture.md), [§122](architecture.md)).
 - **One token = one read position.** If you want two independent places in the stream (say, two
   worker instances), mint two `EventReadToken`s rather than trying to share one — there's no
   separate "consumer name" to pass.

@@ -10070,3 +10070,28 @@ Tests (`skilj-core/tests/event_filtering.rs`):
 Tests:
 - `valid_filters_bounds_the_filter_count_and_value_length` and `valid_query_tags_bounds_the_tag_count` (`skilj-core/tests/event_filtering.rs`) check both sides of each bound.
 - `query_events_refuses_more_than_32_tags` (`skilj/tests/graphql_business_surfaces.rs`): 32 tags answer over GraphQL, and 33 give `too_many_tags`.
+
+## 123. `Skilj::shutdown`
+
+`SkiljBuilder::build` starts nine background loops:
+- `async_projections`
+- `snapshots`
+- `cross_context_routes`
+- `schedule_deadlines`, `cancel_deadlines` and `fire_deadlines`
+- `system_event_scheduler`
+- `idempotency_key_retention`
+- `cross_instance`
+
+They were detached `tokio::spawn`s, described as running for the process's lifetime. Nothing could stop them, and dropping the `Skilj` didn't either. An application couldn't stop SkilJ cleanly on SIGTERM - the runtime just dropped whatever tick was mid-flight - and couldn't tear one down in tests. This repository's own tests needed a watchdog crate (§66) partly because of it.
+
+`Skilj::shutdown(timeout) -> ShutdownReport`, graceful with a timeout (the user's choice, over aborting at once or leaving it out):
+
+- Each loop is spawned through `Background::spawn`, which keeps its `JoinHandle` under a name and gives it a `StopSignal`, a `watch` receiver. Every idle point in a loop - the sleep between ticks, the startup grace before the first retention sweep, the cross-instance listener's connect-retry sleep and its wait for a notification - is raced against the signal. A tick itself never is, so a route submitting a command or a deadline firing always completes.
+- `shutdown` sets the signal and awaits each loop until `timeout`. A loop still busy then is aborted - recovered like a crash, since routes, deadlines and bridges resume under their idempotency keys on the next start. Then the pool closes, in whatever time is left. `ShutdownReport` lists `stopped` and `aborted` loops, and `pool_closed`.
+- Dropping a `Skilj` still stops nothing. If the signal's sender is dropped without a stop, a loop waits forever rather than reading that as a stop, because routers handed out by `rest_router`/`graphql_router` can outlive the `Skilj` and still be serving.
+- The routers share the pool, so stop serving them first. The template's `server` and `skilj-demo`'s now do: axum's `with_graceful_shutdown` on Ctrl-C or SIGTERM, then `skilj.shutdown(10 s)`.
+
+Test: `shutdown_finishes_ticks_aborts_at_the_timeout_and_drop_stops_nothing` (`skilj/tests/cross_context_route.rs`). A route's command is held up by holding its target's `sequence` lock from outside.
+1. A tick waits on the lock during a 20 s shutdown. Shutdown doesn't return until the lock is released, then the label is printed, all nine loops report `stopped` and the pool closes.
+2. The same with a 1 s timeout: `aborted` is `["cross_context_routes"]`, and nothing is written.
+3. A new `Skilj` is dropped while its router is kept. Its route loop still picks up the parcel the aborted tick left behind.

@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Skilj::shutdown(timeout) -> ShutdownReport`: stops the background
+  loops (projection/snapshot catch-up, routes, deadlines, scheduled
+  events, key retention, the cross-instance listener) after the tick each
+  is in, aborts any still busy at the timeout, then closes the connection
+  pool. Dropping a `Skilj` still stops nothing. The template's server
+  now shuts down gracefully on Ctrl-C/SIGTERM (docs/architecture.md
+  §123).
 - `SubmitCommandPayload.matchingEventsTruncated: Boolean` - whether a
   rejection's `matchingEvents` left out events for the
   `max_events_per_read` cap (docs/architecture.md §118).

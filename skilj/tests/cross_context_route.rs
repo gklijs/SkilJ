@@ -1393,3 +1393,247 @@ fn more_routes_than_pool_connections_all_fire() {
         );
     });
 }
+
+// --- Skilj::shutdown (docs/architecture.md §123) ---
+
+const SHUTDOWN_SOURCE_BOUNDED_CONTEXT: &str = "skilj_cross_context_route_test_shutdown_source";
+const SHUTDOWN_TARGET_BOUNDED_CONTEXT: &str = "skilj_cross_context_route_test_shutdown_target";
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct ParcelPayload {
+    parcel: String,
+}
+
+struct ParcelSent;
+
+impl EventType for ParcelSent {
+    type Payload = ParcelPayload;
+    const NAME: &'static str = "ParcelSent";
+    const BOUNDED_CONTEXT: &'static str = SHUTDOWN_SOURCE_BOUNDED_CONTEXT;
+    fn direct_creation_allowed() -> bool {
+        true
+    }
+}
+
+struct LabelPrinted;
+
+impl EventType for LabelPrinted {
+    type Payload = ParcelPayload;
+    const NAME: &'static str = "LabelPrinted";
+    const BOUNDED_CONTEXT: &'static str = SHUTDOWN_TARGET_BOUNDED_CONTEXT;
+}
+
+struct PrintLabel;
+
+impl CommandType for PrintLabel {
+    type Payload = ParcelPayload;
+    type Event = SeatEvent;
+    const NAME: &'static str = "PrintLabel";
+    const BOUNDED_CONTEXT: &'static str = SHUTDOWN_TARGET_BOUNDED_CONTEXT;
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "LabelPrinted".to_string(),
+                payload: serde_json::json!({ "parcel": payload.parcel }),
+            }],
+        }
+    }
+}
+
+struct ParcelsToLabels;
+
+impl CrossContextRoute for ParcelsToLabels {
+    type Source = ParcelSent;
+    type Target = PrintLabel;
+    const NAME: &'static str = "ParcelsToLabels";
+    fn route(source_payload: &ParcelPayload) -> Option<ParcelPayload> {
+        Some(ParcelPayload {
+            parcel: source_payload.parcel.clone(),
+        })
+    }
+}
+
+/// `Skilj::shutdown` stops every background loop after the tick it is
+/// in, aborts what is still busy at the timeout, and dropping a `Skilj`
+/// stops nothing (docs/architecture.md §123). A route's command is held
+/// up by holding its target's sequence lock from outside:
+/// 1. shut down while a tick waits on it, then released: the tick
+///    completes - the label is printed - and every loop reports stopped;
+/// 2. shut down with a short timeout while it waits: the route loop is
+///    aborted and nothing is written;
+/// 3. a `Skilj` dropped (its router kept) still routes - the parcel the
+///    aborted tick left behind is picked up.
+#[test]
+fn shutdown_finishes_ticks_aborts_at_the_timeout_and_drop_stops_nothing() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let mut source_mapping = None;
+        for name in [SHUTDOWN_SOURCE_BOUNDED_CONTEXT, SHUTDOWN_TARGET_BOUNDED_CONTEXT] {
+            let bc = BoundedContext {
+                name: name.to_string(),
+                status: BoundedContextStatus::Active,
+                created_at: test_now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            };
+            db::insert_bounded_context(&pool, &bc).await.unwrap();
+            let mapping = RoleAccessMapping {
+                role: role.clone(),
+                bounded_context: bc,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            };
+            db::insert_role_access_mapping(&pool, &mapping)
+                .await
+                .unwrap();
+            source_mapping.get_or_insert(mapping);
+        }
+
+        let build = || {
+            let (database_url, external_subject) = (database_url.clone(), external_subject.clone());
+            async move {
+                Skilj::builder(database_url)
+                    .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+                    .bounded_context(SHUTDOWN_SOURCE_BOUNDED_CONTEXT)
+                    .event_type::<ParcelSent>()
+                    .bounded_context(SHUTDOWN_TARGET_BOUNDED_CONTEXT)
+                    .event_type::<LabelPrinted>()
+                    .command_type::<PrintLabel>()
+                    .cross_context_route::<ParcelsToLabels>()
+                    .cross_context_route_poll_interval(std::time::Duration::from_millis(50))
+                    .reconciliation_role(external_subject)
+                    .build()
+                    .await
+                    .unwrap()
+                    .0
+            }
+        };
+        let skilj = build().await;
+        let event_type = db::get_event_type(&pool, SHUTDOWN_SOURCE_BOUNDED_CONTEXT, "ParcelSent")
+            .await
+            .unwrap()
+            .unwrap();
+        let token = access_control::create_direct_creation_token(
+            source_mapping.as_ref().unwrap(),
+            &event_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_direct_creation_token(&pool, &token)
+            .await
+            .unwrap();
+        let credential = format!("{}.{}", token.id, token.secret);
+        let send = |router: axum::Router, parcel: &'static str| {
+            let credential = credential.clone();
+            async move {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/v1/events/direct")
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"payload":{{"parcel":"{parcel}"}}}}"#)))
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::CREATED);
+            }
+        };
+        let labels = || {
+            let pool = pool.clone();
+            async move {
+                db::list_events_for_bounded_context(&pool, SHUTDOWN_TARGET_BOUNDED_CONTEXT)
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        let hold_target_lock = || {
+            let pool = pool.clone();
+            async move {
+                let mut blocker = pool.begin().await.unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SELECT next_value FROM \"bc_{SHUTDOWN_TARGET_BOUNDED_CONTEXT}\".sequence FOR UPDATE"
+                )))
+                .execute(&mut *blocker)
+                .await
+                .unwrap();
+                blocker
+            }
+        };
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(500));
+
+        // 1. A tick in progress completes.
+        let blocker = hold_target_lock().await;
+        send(skilj.rest_router(), "p1").await;
+        settle().await;
+        let shutdown = tokio::spawn(skilj.shutdown(std::time::Duration::from_secs(20)));
+        settle().await;
+        assert!(!shutdown.is_finished(), "shutdown must wait for the route's tick");
+        blocker.commit().await.unwrap();
+        let report = shutdown.await.unwrap();
+        assert_eq!(labels().await, 1, "the tick in progress must complete");
+        let mut stopped = report.stopped.clone();
+        stopped.sort();
+        assert_eq!(
+            stopped,
+            [
+                "async_projections",
+                "cancel_deadlines",
+                "cross_context_routes",
+                "cross_instance",
+                "fire_deadlines",
+                "idempotency_key_retention",
+                "schedule_deadlines",
+                "snapshots",
+                "system_event_scheduler",
+            ],
+            "{report:?}"
+        );
+        assert!(report.aborted.is_empty(), "{report:?}");
+        assert!(report.pool_closed, "{report:?}");
+
+        // 2. A tick still busy at the timeout is aborted.
+        let skilj = build().await;
+        let blocker = hold_target_lock().await;
+        send(skilj.rest_router(), "p2").await;
+        settle().await;
+        let report = skilj.shutdown(std::time::Duration::from_secs(1)).await;
+        assert_eq!(report.aborted, ["cross_context_routes"], "{report:?}");
+        blocker.commit().await.unwrap();
+        settle().await;
+        assert_eq!(labels().await, 1, "the aborted tick must not have written");
+
+        // 3. Dropping stops nothing: the route picks up p2.
+        let skilj = build().await;
+        let _router = skilj.rest_router();
+        drop(skilj);
+        let mut printed = 0;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            printed = labels().await;
+            if printed == 2 {
+                break;
+            }
+        }
+        assert_eq!(printed, 2, "a dropped Skilj's route loop must keep running");
+    });
+}
