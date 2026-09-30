@@ -364,6 +364,45 @@ fn schema_ident(bounded_context: &str) -> String {
     format!("\"bc_{}\"", bounded_context.replace('"', "\"\""))
 }
 
+/// `value` as a SQL string literal.
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// `ddl`, adding `columns` to `table` in the bounded context's `schema`,
+/// run only when one of them is missing (docs/architecture.md §158).
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes its `ACCESS
+/// EXCLUSIVE` lock before finding there's nothing to add, so run bare on
+/// every startup it queued behind any open read of the table, and every
+/// later query queued behind it. The catalog check takes no table lock.
+/// A missing table still runs `ddl`, and fails as before.
+fn add_columns_patch(schema: &str, table: &str, columns: &[&str], ddl: String) -> String {
+    let table = sql_literal(&format!("{schema}.{table}"));
+    let missing = columns
+        .iter()
+        .map(|column| {
+            format!(
+                "NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass({table}) \
+                 AND attname = {} AND attnum > 0 AND NOT attisdropped)",
+                sql_literal(column)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!("DO $patch$ BEGIN IF {missing} THEN {ddl}; END IF; END $patch$")
+}
+
+/// `ddl`, creating `index` in the bounded context's `schema`, run only
+/// when no relation of that name exists: `CREATE INDEX IF NOT EXISTS`
+/// takes its `SHARE` lock, which blocks writes, before finding the index
+/// already there (docs/architecture.md §158).
+fn create_index_patch(schema: &str, index: &str, ddl: String) -> String {
+    format!(
+        "DO $patch$ BEGIN IF to_regclass({}) IS NULL THEN {ddl}; END IF; END $patch$",
+        sql_literal(&format!("{schema}.{index}"))
+    )
+}
+
 // --- per-bounded-context schema provisioning / hard deletion ---
 
 /// Every `CREATE TABLE` a bounded context's own schema needs, in
@@ -927,9 +966,7 @@ pub async fn ensure_private_field_grants_table(
     sqlx::query(sqlx::AssertSqlSafe(private_field_grants_table_ddl(&schema)))
         .execute(pool)
         .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE INDEX IF NOT EXISTS private_field_grants_by_grantee ON {schema}.private_field_grants (grantee_role_id, status)"
-    )))
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(&schema, "private_field_grants_by_grantee", format!("CREATE INDEX IF NOT EXISTS private_field_grants_by_grantee ON {schema}.private_field_grants (grantee_role_id, status)"))))
     .execute(pool)
     .await?;
     Ok(())
@@ -1280,6 +1317,14 @@ pub async fn ensure_idempotency_keys_table<'e>(
     let schema = schema_ident(bounded_context);
     // The `created_at` index serves `delete_expired_idempotency_keys`
     // (docs/architecture.md §87).
+    let index = create_index_patch(
+        &schema,
+        "idempotency_keys_created_at",
+        format!(
+            "CREATE INDEX IF NOT EXISTS idempotency_keys_created_at \
+             ON {schema}.idempotency_keys (created_at)"
+        ),
+    );
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS {schema}.idempotency_keys (
             command_type_name TEXT NOT NULL,
@@ -1289,8 +1334,7 @@ pub async fn ensure_idempotency_keys_table<'e>(
             created_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (command_type_name, client_id, idempotency_key)
         );
-        CREATE INDEX IF NOT EXISTS idempotency_keys_created_at
-            ON {schema}.idempotency_keys (created_at)"
+        {index}"
     )))
     .execute(executor)
     .await?;
@@ -1511,21 +1555,36 @@ pub async fn ensure_cross_context_route_retry_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.cross_context_route_cursors \
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "cross_context_route_cursors",
+        &["retry_attempt_count"],
+        format!(
+            "ALTER TABLE {schema}.cross_context_route_cursors \
          ADD COLUMN IF NOT EXISTS retry_attempt_count INT NOT NULL DEFAULT 0"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.cross_context_route_cursors \
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "cross_context_route_cursors",
+        &["retry_first_failed_at"],
+        format!(
+            "ALTER TABLE {schema}.cross_context_route_cursors \
          ADD COLUMN IF NOT EXISTS retry_first_failed_at TIMESTAMPTZ"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.cross_context_route_cursors \
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "cross_context_route_cursors",
+        &["retry_next_attempt_at"],
+        format!(
+            "ALTER TABLE {schema}.cross_context_route_cursors \
          ADD COLUMN IF NOT EXISTS retry_next_attempt_at TIMESTAMPTZ"
+        ),
     )))
     .execute(pool)
     .await?;
@@ -1699,30 +1758,51 @@ pub async fn ensure_deadlines_table(
     // nullable, no `DEFAULT`, same treatment `ensure_read_cursors_checkout_column`
     // already gives `checked_out_at` for the identical reason: `NULL`
     // already means exactly "not currently claimed."
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.deadlines ADD COLUMN IF NOT EXISTS firing_at TIMESTAMPTZ"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "deadlines",
+        &["firing_at"],
+        format!("ALTER TABLE {schema}.deadlines ADD COLUMN IF NOT EXISTS firing_at TIMESTAMPTZ"),
     )))
     .execute(pool)
     .await?;
     // A failed fire's retry state (docs/architecture.md §115). The
     // defaults mean "never failed", which every existing row is.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.deadlines \
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "deadlines",
+        &[
+            "attempt_count",
+            "first_failed_at",
+            "next_attempt_at",
+            "last_error",
+        ],
+        format!(
+            "ALTER TABLE {schema}.deadlines \
             ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0, \
             ADD COLUMN IF NOT EXISTS first_failed_at TIMESTAMPTZ, \
             ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ, \
             ADD COLUMN IF NOT EXISTS last_error TEXT"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "deadlines_due",
+        format!(
+            "CREATE INDEX IF NOT EXISTS deadlines_due ON {schema}.deadlines (fire_at) \
          WHERE status = 'pending'"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE INDEX IF NOT EXISTS deadlines_tags_gin ON {schema}.deadlines USING GIN (tags)"
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "deadlines_tags_gin",
+        format!(
+            "CREATE INDEX IF NOT EXISTS deadlines_tags_gin ON {schema}.deadlines USING GIN (tags)"
+        ),
     )))
     .execute(pool)
     .await?;
@@ -1891,13 +1971,21 @@ pub async fn ensure_projection_state_owner_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.projection_state ADD COLUMN IF NOT EXISTS owner TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "projection_state",
+        &["owner"],
+        format!("ALTER TABLE {schema}.projection_state ADD COLUMN IF NOT EXISTS owner TEXT"),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.projection_rebuild_state ADD COLUMN IF NOT EXISTS owner TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "projection_rebuild_state",
+        &["owner"],
+        format!(
+            "ALTER TABLE {schema}.projection_rebuild_state ADD COLUMN IF NOT EXISTS owner TEXT"
+        ),
     )))
     .execute(pool)
     .await?;
@@ -1929,15 +2017,25 @@ pub async fn ensure_projection_state_as_of_sequence_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.projection_state \
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "projection_state",
+        &["as_of_sequence"],
+        format!(
+            "ALTER TABLE {schema}.projection_state \
          ADD COLUMN IF NOT EXISTS as_of_sequence BIGINT NOT NULL DEFAULT -1"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.projection_rebuild_state \
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "projection_rebuild_state",
+        &["as_of_sequence"],
+        format!(
+            "ALTER TABLE {schema}.projection_rebuild_state \
          ADD COLUMN IF NOT EXISTS as_of_sequence BIGINT NOT NULL DEFAULT -1"
+        ),
     )))
     .execute(pool)
     .await?;
@@ -1957,8 +2055,13 @@ pub async fn ensure_read_cursors_checkout_column(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.read_cursors ADD COLUMN IF NOT EXISTS checked_out_at TIMESTAMPTZ"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "read_cursors",
+        &["checked_out_at"],
+        format!(
+            "ALTER TABLE {schema}.read_cursors ADD COLUMN IF NOT EXISTS checked_out_at TIMESTAMPTZ"
+        ),
     )))
     .execute(pool)
     .await?;
@@ -1980,23 +2083,35 @@ pub async fn ensure_event_scoping_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "event_types",
+        &["owner_tag_key"],
+        format!("ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS scope TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "access_tokens",
+        &["scope"],
+        format!("ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS scope TEXT"),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "command_types",
+        &["owner_tag_key"],
+        format!("ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS owner_tag_key TEXT"),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.snapshots ADD COLUMN IF NOT EXISTS owner TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "snapshots",
+        &["owner"],
+        format!("ALTER TABLE {schema}.snapshots ADD COLUMN IF NOT EXISTS owner TEXT"),
     )))
     .execute(pool)
     .await?;
@@ -2013,13 +2128,19 @@ pub async fn ensure_private_field_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "event_types",
+        &["private_fields"],
+        format!("ALTER TABLE {schema}.event_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "command_types",
+        &["private_fields"],
+        format!("ALTER TABLE {schema}.command_types ADD COLUMN IF NOT EXISTS private_fields JSONB NOT NULL DEFAULT '[]'"),
     )))
     .execute(pool)
     .await?;
@@ -2042,35 +2163,61 @@ pub async fn ensure_correlation_causation_columns(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.events ADD COLUMN IF NOT EXISTS metadata_correlation_id TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "events",
+        &["metadata_correlation_id"],
+        format!(
+            "ALTER TABLE {schema}.events ADD COLUMN IF NOT EXISTS metadata_correlation_id TEXT"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.events ADD COLUMN IF NOT EXISTS metadata_causation_id TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "events",
+        &["metadata_causation_id"],
+        format!("ALTER TABLE {schema}.events ADD COLUMN IF NOT EXISTS metadata_causation_id TEXT"),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS metadata_correlation_id TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "commands",
+        &["metadata_correlation_id"],
+        format!(
+            "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS metadata_correlation_id TEXT"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS metadata_causation_id TEXT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "commands",
+        &["metadata_causation_id"],
+        format!(
+            "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS metadata_causation_id TEXT"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE INDEX IF NOT EXISTS events_by_correlation_id ON {schema}.events \
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "events_by_correlation_id",
+        format!(
+            "CREATE INDEX IF NOT EXISTS events_by_correlation_id ON {schema}.events \
          (metadata_correlation_id) WHERE metadata_correlation_id IS NOT NULL"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE INDEX IF NOT EXISTS commands_by_correlation_id ON {schema}.commands \
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "commands_by_correlation_id",
+        format!(
+            "CREATE INDEX IF NOT EXISTS commands_by_correlation_id ON {schema}.commands \
          (metadata_correlation_id) WHERE metadata_correlation_id IS NOT NULL"
+        ),
     )))
     .execute(pool)
     .await?;
@@ -2106,19 +2253,34 @@ pub async fn ensure_event_read_token_start_from_column(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.access_tokens \
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "access_tokens",
+        &["start_from"],
+        format!(
+            "ALTER TABLE {schema}.access_tokens \
          ADD COLUMN IF NOT EXISTS start_from TEXT NOT NULL DEFAULT 'beginning'"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS start_at_sequence BIGINT"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "access_tokens",
+        &["start_at_sequence"],
+        format!(
+            "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS start_at_sequence BIGINT"
+        ),
     )))
     .execute(pool)
     .await?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS start_at_time TIMESTAMPTZ"
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "access_tokens",
+        &["start_at_time"],
+        format!(
+            "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS start_at_time TIMESTAMPTZ"
+        ),
     )))
     .execute(pool)
     .await?;
@@ -8748,6 +8910,14 @@ pub async fn ensure_parked_deliveries_table<'e>(
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
+    let index = create_index_patch(
+        &schema,
+        "parked_deliveries_page_order",
+        format!(
+            "CREATE INDEX IF NOT EXISTS parked_deliveries_page_order \
+             ON {schema}.parked_deliveries (first_failed_at DESC, id DESC)"
+        ),
+    );
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS {schema}.parked_deliveries (
             id TEXT PRIMARY KEY,
@@ -8763,8 +8933,7 @@ pub async fn ensure_parked_deliveries_table<'e>(
             first_failed_at TIMESTAMPTZ NOT NULL,
             last_failed_at TIMESTAMPTZ NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS parked_deliveries_page_order
-            ON {schema}.parked_deliveries (first_failed_at DESC, id DESC)"
+        {index}"
     )))
     .execute(executor)
     .await?;

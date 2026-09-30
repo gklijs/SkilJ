@@ -2180,7 +2180,6 @@ impl SkiljBuilder {
                 let event_cache = &event_cache;
                 async move {
                     let prepared = async {
-                        event_cache.warm(pool, &bc.name).await?;
                         // Codeberg issue #12: `idempotency_keys` patched into
                         // every bounded context, every startup - including
                         // ones provisioned before this feature existed, since
@@ -2324,6 +2323,12 @@ impl SkiljBuilder {
                             pool, &bc.name,
                         )
                         .await?;
+                        // Last: it reads `events` as the patches above
+                        // leave it - a bounded context from before
+                        // `metadata_correlation_id`/`metadata_causation_id`
+                        // failed here first, and never got them
+                        // (docs/architecture.md §158).
+                        event_cache.warm(pool, &bc.name).await?;
                         Ok::<(), skilj_core::Error>(())
                     }
                     .await;

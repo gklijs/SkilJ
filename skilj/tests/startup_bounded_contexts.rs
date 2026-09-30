@@ -1,10 +1,15 @@
+//! How `Skilj::build()` and its kin treat the bounded contexts already in
+//! the database. Its own test binary and database: each test holds locks
+//! on one bounded context's tables, which any other test's `build()`
+//! would meet. Tests are serialized for the same reason.
+//!
 //! docs/architecture.md §157: `Skilj::build()`, the GraphQL schema build
 //! and `forgetSubject`'s deadline sweep each list every bounded context,
 //! then query each one's tables. A bounded context another instance
-//! hard-deletes in between is skipped rather than failing the whole
-//! walk. Its own test binary and database: each test holds a lock on one
-//! bounded context's table, which any other test's `build()` would wait
-//! on.
+//! hard-deletes in between is skipped rather than failing the whole walk.
+//!
+//! docs/architecture.md §158: startup's schema patches take no table lock
+//! on a bounded context that already has what they add.
 use chrono::{SubsecRound, Utc};
 use skilj::Skilj;
 use skilj_core::bootstrap::ContextCreator;
@@ -19,8 +24,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 async fn test_database() -> Option<(String, Pool)> {
     let url =
-        skilj_test_support::embedded_database_url("skilj_startup_deleted_bounded_context_test")
-            .await?;
+        skilj_test_support::embedded_database_url("skilj_startup_bounded_contexts_test").await?;
     let pool = match db::connect(&url).await {
         Ok(pool) => pool,
         Err(e) => {
@@ -178,5 +182,96 @@ fn a_bounded_context_deleted_while_forgetting_a_subject_is_skipped() {
             Ok(n) => assert_eq!(n, 0),
             Err(err) => panic!("forgetting failed on the deleted bounded context: {err}"),
         }
+    });
+}
+
+/// docs/architecture.md §158: every table of an existing bounded context
+/// has a write in flight (`ROW EXCLUSIVE`), as it would on a live
+/// deployment; restarting an instance must not wait for them. Each schema
+/// patch used to take its lock - `ACCESS EXCLUSIVE` for a column,
+/// `SHARE` for an index - before finding nothing to add.
+#[test]
+fn startup_takes_no_lock_on_an_up_to_date_bounded_context() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let name = seed_bounded_context(&pool).await;
+
+        let tables: Vec<(String,)> =
+            sqlx::query_as("SELECT tablename FROM pg_tables WHERE schemaname = $1")
+                .bind(format!("bc_{name}"))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let mut writes = pool.begin().await.unwrap();
+        for (table,) in &tables {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE \"bc_{name}\".{table} IN ROW EXCLUSIVE MODE"
+            )))
+            .execute(&mut *writes)
+            .await
+            .unwrap();
+        }
+
+        let started = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            Skilj::builder(database_url)
+                .pool_options(db::PgPoolOptions::new().max_connections(2))
+                .build(),
+        )
+        .await;
+        writes.rollback().await.unwrap();
+        match started {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => panic!("startup failed: {err}"),
+            Err(_) => panic!("startup waited on the in-flight writes"),
+        }
+    });
+}
+
+/// The other half of §158: a bounded context provisioned before a column
+/// existed still gets it. A dropped column stays in the catalog, marked
+/// dropped, so this also checks that it isn't taken as present.
+#[test]
+fn startup_still_adds_a_missing_column_and_index() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let name = seed_bounded_context(&pool).await;
+        let schema = format!("\"bc_{name}\"");
+        for ddl in [
+            format!("DROP INDEX {schema}.events_by_correlation_id"),
+            format!("ALTER TABLE {schema}.events DROP COLUMN metadata_causation_id"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(ddl))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        Skilj::builder(database_url)
+            .pool_options(db::PgPoolOptions::new().max_connections(2))
+            .build()
+            .await
+            .unwrap();
+
+        let (column, index): (bool, bool) = sqlx::query_as(
+            "SELECT \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                    WHERE table_schema = $1 AND table_name = 'events' \
+                    AND column_name = 'metadata_causation_id'), \
+                EXISTS (SELECT 1 FROM pg_indexes \
+                    WHERE schemaname = $1 AND indexname = 'events_by_correlation_id')",
+        )
+        .bind(format!("bc_{name}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(column, "the dropped column wasn't added back");
+        assert!(index, "the dropped index wasn't created again");
     });
 }

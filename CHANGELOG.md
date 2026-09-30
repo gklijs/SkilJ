@@ -215,6 +215,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restarting an instance took an `ACCESS EXCLUSIVE` lock on about twenty
+  tables of every bounded context (among them `events`), and a `SHARE`
+  lock on several more, even when there was nothing to change: Postgres
+  takes the lock for `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` and
+  `CREATE INDEX IF NOT EXISTS` before checking. Queued behind any
+  long-running read, each lock held up every query after it on that
+  table. The startup schema patches now check the catalog first and
+  run only when something is missing (docs/architecture.md §158).
+- Startup warmed a bounded context's event cache before patching its
+  schema. The warm-up reads `metadata_correlation_id`/
+  `metadata_causation_id`, so a bounded context from before those columns
+  existed failed startup before the patch adding them ran. The warm-up
+  now runs last (docs/architecture.md §158).
 - A bounded context hard-deleted by another instance while this one was
   starting failed `Skilj::build()`. Startup lists every bounded context
   and then warms and patches each, and the deleted one's tables were
