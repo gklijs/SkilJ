@@ -10322,3 +10322,17 @@ Test: `a_non_superadmin_cannot_tell_existing_bounded_contexts_from_missing_ones`
 Fix: the event-independent checks are their own functions in `event_store` - `check_fetch_events` (token active, type open to reads, filters valid) and `check_consume_events` (those plus the cursor/`mode` agreement) - which `fetch_events_page`/`consume_events_page` call in turn, so there's one copy of each rule. Both REST handlers call them straight after resolving the token, before any event is loaded; `consume_events_page` still checks again under the cursor lock, against the cursor as it then stands.
 
 Test: `a_refused_read_loads_no_events` (`skilj/tests/event_fetch_rest.rs`): with the bounded context's `events` table renamed away, a consume without a `mode`, reads with an invalid filter, and reads with a revoked token still get their own 400/403 - before the fix, the scan's failure (a 500) came first.
+
+## 141. Event creation checks its `requires` before touching the database
+
+`rule CreateExternalEvent` lists every `requires` - token active, external creation allowed, bounded context active, payload valid, correlation ids valid, owner scope satisfied - ahead of the redelivery case. `db::create_and_insert_external_event` ran them last, inside the pure `create_external_event`, after three things that need the database:
+
+- `resolve_encryption_keys` get-or-creates an `EncryptionKey` for every subject value the payload names under a sensitive field. A revoked token, a payload failing the schema, or a scoped token naming another owner's subject could create key rows for any subject values it liked, repeatably - persistent writes from a request that was about to be refused.
+- `next_sequence` takes the bounded context's sequence lock, so every such request queued behind (and held up) that bounded context's real writers.
+- The dedupe watermark check. A revoked adapter's redelivery was answered `redelivered` (a 201) rather than refused - the spec's order has the `requires` first.
+
+`db::create_and_insert_direct_event` did the first two for `rule CreateDirectEvent`. The command path was already right: `authorise_command_trigger` runs before `decide()` and the key warm-up.
+
+Fix: the `requires` are `event_store::check_create_external_event`/`check_create_direct_event` (a shared `check_event_creation` for the common part), returning the tags they derive for the scope check. The two `db` functions call them first; `create_external_event`/`create_direct_event` call them too and use those tags, so there's one copy of each rule. `retryParkedDelivery` goes through `create_and_insert_external_event`, so a parked delivery whose token has since been revoked now stays parked with `TokenNotActive` rather than being cleared as a redelivery.
+
+Tests (`skilj-core/tests/external_event_dedup.rs`): `a_revoked_adapters_redelivery_is_refused_not_recognised`, and `a_refused_submission_provisions_no_encryption_key` - a revoked external token, a payload failing the schema and a revoked direct token each create no key, while an accepted submission (the control) does.

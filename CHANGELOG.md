@@ -606,6 +606,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `POST /v1/events/external` and `POST /v1/events/direct` now check the
+  token and payload before touching the database. A revoked token, or
+  any payload failing its schema, could create an encryption key for
+  every subject value it named, and took the bounded context's sequence
+  lock; a revoked adapter's redelivery was answered `redelivered`
+  instead of refused (docs/architecture.md §141).
 - `GET /v1/events/consume` and `GET /v1/events` now refuse a revoked
   token, an invalid filter or a type closed to reads before loading any
   events. A new `Latest`/`AtTime` consumer's start position is found by

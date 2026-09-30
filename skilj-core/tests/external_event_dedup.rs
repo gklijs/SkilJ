@@ -11,15 +11,17 @@
 //! the details, not repeated a third time here.
 
 use chrono::Utc;
-use skilj_core::access_control::{ExternalEventToken, TokenStatus};
+use skilj_core::access_control::{self, DirectCreationToken, ExternalEventToken, TokenStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, CreateExternalEventOutcome, DedupeCursor, Pool};
+use skilj_core::encryption::EncryptionMasterKey;
+use skilj_core::error::SkiljRejection;
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{
     BoundedContext, BoundedContextStatus, Event, EventBroadcaster, EventType,
 };
 use skilj_core::plugin::ProjectionDispatcher;
-use skilj_core::shared::{generate_token_id, TagMapping};
+use skilj_core::shared::{generate_token_id, SensitiveField, TagMapping};
 
 /// Nothing in this file registers a projection - every method reports
 /// "pair isn't registered at all", the same convention every other
@@ -473,5 +475,177 @@ fn different_partitions_from_the_same_adapter_have_independent_watermarks() {
             "partition 1's own low sequence must not be judged against partition 0's \
              watermark, got {partition_1:?}"
         );
+    });
+}
+
+/// docs/architecture.md §141: every `requires` of `rule
+/// CreateExternalEvent` comes before the redelivery case, so a revoked
+/// adapter's redelivery is refused, not answered `Redelivered`.
+#[test]
+fn a_revoked_adapters_redelivery_is_refused_not_recognised() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_order_placed_event_type(&pool, &bc).await;
+        let mut token = adapter(et, "adapter-1");
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+        let dedupe = || DedupeCursor {
+            partition_key: "orders-topic:0",
+            sequence: 10,
+        };
+        let first = create(
+            &pool,
+            &broadcaster,
+            &event_cache,
+            &token,
+            "A",
+            Some(dedupe()),
+        )
+        .await;
+        assert!(matches!(first, CreateExternalEventOutcome::Created(_)));
+
+        token.status = TokenStatus::Revoked;
+        let err = db::create_and_insert_external_event(
+            &pool,
+            &NoopProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &token,
+            r#"{"order_id":"A"}"#.to_string(),
+            "kafka".to_string(),
+            None,
+            None,
+            None,
+            Some(dedupe()),
+            test_now(),
+            None,
+        )
+        .await
+        .expect_err("a revoked adapter's submission must be refused");
+        assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
+    });
+}
+
+/// docs/architecture.md §141: a submission its rule refuses provisions no
+/// `EncryptionKey` - it used to get-or-create one for every subject its
+/// payload named before any `requires` ran, so a revoked token, or any
+/// payload failing the schema, could create keys at will. External and
+/// direct creation alike.
+#[test]
+fn a_refused_submission_provisions_no_encryption_key() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = EventType {
+            name: "CardCharged".to_string(),
+            schema: r#"{"properties":{"customer_id":{"type":"string"},"card":{"type":"string"}}}"#
+                .to_string(),
+            tag_mappings: Vec::new(),
+            direct_creation_allowed: true,
+            sensitive_fields: vec![SensitiveField {
+                field: "card".into(),
+                subject_key: "customer".into(),
+                subject_field: "customer_id".into(),
+            }],
+            ..seed_order_placed_event_type(&pool, &bc).await
+        };
+        db::upsert_event_type(&pool, &et).await.unwrap();
+        let master_key = EncryptionMasterKey::from_bytes([7u8; 32]);
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+        let active = adapter(et, "adapter-1");
+        let revoked = ExternalEventToken {
+            status: TokenStatus::Revoked,
+            ..active.clone()
+        };
+
+        let (pool_ref, broadcaster, event_cache, master_key) =
+            (&pool, &broadcaster, &event_cache, &master_key);
+        let submit = move |token: ExternalEventToken, payload: &'static str| async move {
+            db::create_and_insert_external_event(
+                pool_ref,
+                &NoopProjectionDispatcher,
+                broadcaster,
+                event_cache,
+                &token,
+                payload.to_string(),
+                "kafka".to_string(),
+                None,
+                None,
+                None,
+                None,
+                test_now(),
+                Some(master_key),
+            )
+            .await
+        };
+        let key_exists = |customer: &'static str| {
+            let pool = pool.clone();
+            let bc = bc.name.clone();
+            async move {
+                db::get_active_encryption_key(&pool, &bc, "customer", customer)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+
+        let err = submit(revoked, r#"{"customer_id":"c1","card":"4111"}"#)
+            .await
+            .expect_err("a revoked token's submission must be refused");
+        assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
+        assert!(!key_exists("c1").await, "a revoked token provisioned a key");
+
+        let err = submit(active.clone(), r#"{"customer_id":"c2","card":4111}"#)
+            .await
+            .expect_err("a payload failing the schema must be refused");
+        assert_eq!(
+            err.code(),
+            skilj_core::event_store::Error::PayloadDoesNotMatchSchema.code()
+        );
+        assert!(
+            !key_exists("c2").await,
+            "an invalid payload provisioned a key"
+        );
+
+        // `CreateDirectEvent` alike.
+        let err = db::create_and_insert_direct_event(
+            pool_ref,
+            &NoopProjectionDispatcher,
+            broadcaster,
+            event_cache,
+            &DirectCreationToken {
+                id: "direct-1".to_string(),
+                secret: "s3cr3t".to_string(),
+                status: TokenStatus::Revoked,
+                created_at: test_now(),
+                revoked_at: Some(test_now()),
+                event_type: active.event_type.clone(),
+                scope: None,
+            },
+            r#"{"customer_id":"c4","card":"4111"}"#.to_string(),
+            None,
+            None,
+            test_now(),
+            Some(master_key),
+        )
+        .await
+        .expect_err("a revoked direct token's submission must be refused");
+        assert_eq!(err.code(), access_control::Error::TokenNotActive.code());
+        assert!(
+            !key_exists("c4").await,
+            "a revoked direct token provisioned a key"
+        );
+
+        // The control: an accepted submission does provision one.
+        submit(active, r#"{"customer_id":"c3","card":"4111"}"#)
+            .await
+            .unwrap();
+        assert!(key_exists("c3").await);
     });
 }

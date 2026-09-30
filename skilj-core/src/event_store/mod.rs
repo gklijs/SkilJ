@@ -3616,6 +3616,96 @@ pub fn acknowledge_events(
     Ok((sequence, now))
 }
 
+/// Every `requires` of `rule CreateExternalEvent`, returning the event's
+/// tags (derived for the scope check). None needs the database, so
+/// `db::create_and_insert_external_event` checks them before it
+/// provisions encryption keys, takes the sequence lock or consults the
+/// dedupe watermark: checked only inside [`create_external_event`], a
+/// revoked token or an invalid payload could create an `EncryptionKey`
+/// for any subject value it named, and a revoked token's redelivery was
+/// answered `redelivered` (docs/architecture.md §141).
+pub fn check_create_external_event(
+    adapter: &ExternalEventToken,
+    payload: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+) -> crate::error::Result<Vec<Tag>> {
+    if adapter.status != TokenStatus::Active {
+        return Err(crate::access_control::Error::TokenNotActive.into());
+    }
+    if !adapter.event_type.external_creation_allowed {
+        return Err(Error::ExternalCreationNotAllowed.into());
+    }
+    check_event_creation(
+        &adapter.event_type,
+        adapter.scope.as_deref(),
+        payload,
+        correlation_id,
+        causation_id,
+    )
+}
+
+/// [`check_create_external_event`]'s counterpart for `rule
+/// CreateDirectEvent`.
+pub fn check_create_direct_event(
+    adapter: &DirectCreationToken,
+    payload: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+) -> crate::error::Result<Vec<Tag>> {
+    if adapter.status != TokenStatus::Active {
+        return Err(crate::access_control::Error::TokenNotActive.into());
+    }
+    if !adapter.event_type.direct_creation_allowed {
+        return Err(Error::DirectCreationNotAllowed.into());
+    }
+    check_event_creation(
+        &adapter.event_type,
+        adapter.scope.as_deref(),
+        payload,
+        correlation_id,
+        causation_id,
+    )
+}
+
+/// The `requires` `CreateExternalEvent` and `CreateDirectEvent` share,
+/// after each one's own token status and opt-in checks.
+fn check_event_creation(
+    event_type: &EventType,
+    scope: Option<&str>,
+    payload: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+) -> crate::error::Result<Vec<Tag>> {
+    if event_type.bounded_context.status != BoundedContextStatus::Active {
+        return Err(Error::BoundedContextArchived.into());
+    }
+    if !valid_payload(&event_type.schema, payload) {
+        return Err(Error::PayloadDoesNotMatchSchema.into());
+    }
+    // Codeberg issue #18 - see `valid_correlation_id`'s own doc comment.
+    // Neither field takes any part in the adjacent dedup mechanism
+    // (`dedupe_partition_key`/`dedupe_sequence`, docs/architecture.md
+    // §39): a redelivery with a fresh correlation_id is still the same
+    // redelivery.
+    if !valid_correlation_id(correlation_id) || !valid_correlation_id(causation_id) {
+        return Err(Error::CorrelationIdTooLong.into());
+    }
+    // Cross-tenant write fix (docs/architecture.md's own write-up of
+    // these passes) - the write-side counterpart to EventFetch's own
+    // EventsScopedToOwnerWhenDeclared read guarantee: a token that names
+    // a scope may create events only for the owner it names. Single-
+    // record, so this rejects outright rather than filtering, the same
+    // reasoning authorise_command_submission's own note gives. Vacuously
+    // true for a token naming no scope or an event type declaring no
+    // owner dimension.
+    let tags = derive_tags(&event_type.tag_mappings, payload);
+    if !tag_owner_scope_satisfied(&tags, event_type.owner_tag_key.as_deref(), scope) {
+        return Err(crate::access_control::Error::GrantScopeMismatch.into());
+    }
+    Ok(tags)
+}
+
 /// See `rule CreateExternalEvent`. `next_sequence` is the value the
 /// caller's own `next_sequence(bounded_context)` already allocated under
 /// its Postgres row lock (see the note above the rules) - not this
@@ -3635,45 +3725,13 @@ pub fn create_external_event(
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> crate::error::Result<Event> {
-    if adapter.status != TokenStatus::Active {
-        return Err(crate::access_control::Error::TokenNotActive.into());
-    }
+    let tags = check_create_external_event(
+        adapter,
+        &payload,
+        correlation_id.as_deref(),
+        causation_id.as_deref(),
+    )?;
     let event_type = &adapter.event_type;
-    if !event_type.external_creation_allowed {
-        return Err(Error::ExternalCreationNotAllowed.into());
-    }
-    if event_type.bounded_context.status != BoundedContextStatus::Active {
-        return Err(Error::BoundedContextArchived.into());
-    }
-    if !valid_payload(&event_type.schema, &payload) {
-        return Err(Error::PayloadDoesNotMatchSchema.into());
-    }
-    // Codeberg issue #18 - see `valid_correlation_id`'s own doc comment.
-    // Neither field takes any part in the adjacent dedup mechanism
-    // (`dedupe_partition_key`/`dedupe_sequence`, docs/architecture.md
-    // §39): a redelivery with a fresh correlation_id is still the same
-    // redelivery, caught upstream of this function entirely.
-    if !valid_correlation_id(correlation_id.as_deref())
-        || !valid_correlation_id(causation_id.as_deref())
-    {
-        return Err(Error::CorrelationIdTooLong.into());
-    }
-    // Cross-tenant write fix (docs/architecture.md's own write-up of
-    // these passes) - the write-side counterpart to EventFetch's own
-    // EventsScopedToOwnerWhenDeclared read guarantee: a token that names
-    // a scope may create events only for the owner it names. Single-
-    // record, so this rejects outright rather than filtering, the same
-    // reasoning authorise_command_submission's own note gives. Vacuously
-    // true for a token naming no scope or an event type declaring no
-    // owner dimension.
-    let tags = derive_tags(&event_type.tag_mappings, &payload);
-    if !tag_owner_scope_satisfied(
-        &tags,
-        event_type.owner_tag_key.as_deref(),
-        adapter.scope.as_deref(),
-    ) {
-        return Err(crate::access_control::Error::GrantScopeMismatch.into());
-    }
 
     let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
     Ok(Event {
@@ -3716,34 +3774,13 @@ pub fn create_direct_event(
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
 ) -> crate::error::Result<Event> {
-    if adapter.status != TokenStatus::Active {
-        return Err(crate::access_control::Error::TokenNotActive.into());
-    }
+    let tags = check_create_direct_event(
+        adapter,
+        &payload,
+        correlation_id.as_deref(),
+        causation_id.as_deref(),
+    )?;
     let event_type = &adapter.event_type;
-    if !event_type.direct_creation_allowed {
-        return Err(Error::DirectCreationNotAllowed.into());
-    }
-    if event_type.bounded_context.status != BoundedContextStatus::Active {
-        return Err(Error::BoundedContextArchived.into());
-    }
-    if !valid_payload(&event_type.schema, &payload) {
-        return Err(Error::PayloadDoesNotMatchSchema.into());
-    }
-    // See create_external_event's own identical note above.
-    if !valid_correlation_id(correlation_id.as_deref())
-        || !valid_correlation_id(causation_id.as_deref())
-    {
-        return Err(Error::CorrelationIdTooLong.into());
-    }
-    // See create_external_event's own identical note above.
-    let tags = derive_tags(&event_type.tag_mappings, &payload);
-    if !tag_owner_scope_satisfied(
-        &tags,
-        event_type.owner_tag_key.as_deref(),
-        adapter.scope.as_deref(),
-    ) {
-        return Err(crate::access_control::Error::GrantScopeMismatch.into());
-    }
 
     let protected = protect_sensitive_fields(&event_type.sensitive_fields, &payload, resolve_key);
     Ok(Event {

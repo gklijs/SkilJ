@@ -6821,6 +6821,15 @@ pub async fn create_and_insert_external_event(
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
 ) -> crate::error::Result<CreateExternalEventOutcome> {
+    // Every `requires` first, as the spec orders them: before any key is
+    // provisioned, the sequence lock taken, or a redelivery recognised
+    // (docs/architecture.md §141).
+    crate::event_store::check_create_external_event(
+        adapter,
+        &payload,
+        correlation_id.as_deref(),
+        causation_id.as_deref(),
+    )?;
     let bounded_context_name = adapter.event_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
 
@@ -6921,6 +6930,13 @@ pub async fn create_and_insert_direct_event(
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
 ) -> crate::error::Result<Event> {
+    // See `create_and_insert_external_event`'s identical check.
+    crate::event_store::check_create_direct_event(
+        adapter,
+        &payload,
+        correlation_id.as_deref(),
+        causation_id.as_deref(),
+    )?;
     let bounded_context_name = adapter.event_type.bounded_context.name.clone();
 
     let mut resolved = std::collections::HashMap::new();
