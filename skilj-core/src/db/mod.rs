@@ -10921,14 +10921,20 @@ async fn list_building_projection_rebuilds_for_bounded_context(
 /// == -1`) and promotes immediately, with no separate "nothing committed
 /// yet" special case needed.
 ///
-/// A rebuild whose `caught_up_to` is `None` - freshly staged, or just
-/// restaged while `building` (`upsert_projection_rebuild`'s own doc
-/// comment) - has its `projection_rebuild_state` row deleted up front,
-/// before folding anything: `ProjectionDispatcher::default_state`
-/// resolved fresh, right before the first event actually gets folded, is
-/// the only correct starting point once that reset has happened; a row
-/// left over from a build attempt this same reset just invalidated would
-/// otherwise be silently reused as if it were still current. A rebuild
+/// A rebuild whose `caught_up_to` is `None` - freshly staged, or
+/// restarted while `building` (a `rebuildProjection` arriving mid-build,
+/// see `transition_projection_rebuild_to_building`) - has its
+/// `projection_rebuild_state` rows deleted in the transaction that folds
+/// its first event, under the rebuild row's lock: `ProjectionDispatcher::
+/// default_state` resolved fresh, right before the first event actually
+/// gets folded, is the only correct starting point once that reset has
+/// happened; a row left over from a build attempt this same reset just
+/// invalidated would otherwise be silently reused as if it were still
+/// current. Each fold re-reads the rebuild's `caught_up_to` under that
+/// lock and goes ahead only if it's exactly the previous event's
+/// sequence, so an instance working from a stale snapshot never folds a
+/// restarted rebuild, and never deletes what another instance just folded
+/// (docs/architecture.md §151). A rebuild
 /// this dispatcher can't resolve at all (no compiled type registered in
 /// this process for that name) still advances - `state` frozen at `"{}"`,
 /// a neutral placeholder never actually deserialised by anything, since
@@ -10991,18 +10997,6 @@ pub async fn catch_up_bounded_context(
         return Ok(());
     }
 
-    for rebuild in &building_rebuilds {
-        if rebuild.caught_up_to.is_none() {
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DELETE FROM {schema}.projection_rebuild_state \
-                 WHERE projection_name = $1 AND status = 'building'"
-            )))
-            .bind(&rebuild.projection.name)
-            .execute(pool)
-            .await?;
-        }
-    }
-
     let min_caught_up = unpartitioned_async_projections
         .iter()
         .map(|p| p.caught_up_to.unwrap_or(-1))
@@ -11029,6 +11023,11 @@ pub async fn catch_up_bounded_context(
         .await?
     };
 
+    // The sequence of the bounded context's event just before the one
+    // being folded: `events` is every event after `min_caught_up`, in
+    // order, so a rebuild may fold `event` only if it has processed
+    // exactly up to here (docs/architecture.md §151).
+    let mut previous = min_caught_up;
     for event in &events {
         let mut tx = pool.begin().await?;
 
@@ -11117,6 +11116,46 @@ pub async fn catch_up_bounded_context(
                 continue;
             }
 
+            // docs/architecture.md §151: the snapshot above may be stale -
+            // another instance may have folded since, or a
+            // `rebuildProjection` arriving mid-build may have restarted
+            // this rebuild (`caught_up_to` back to NULL, a new
+            // definition). Locked and re-read here, the rebuild is folded
+            // only if it has processed exactly up to `previous`; anything
+            // else waits for the next tick's fresh snapshot. Folding
+            // anyway, a stale instance set a restarted rebuild's
+            // `caught_up_to` past everything before `event` - promoting,
+            // later, state that never saw those events.
+            let current: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT caught_up_to FROM {schema}.projection_rebuilds \
+                 WHERE projection_name = $1 AND status = 'building' FOR UPDATE"
+            )))
+            .bind(&rebuild.projection.name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((current,)) = current else {
+                // Promoted or gone since the snapshot.
+                continue;
+            };
+            if current.unwrap_or(-1) != previous {
+                continue;
+            }
+            if current.is_none() {
+                // The first fold of this build: state left by a build it
+                // restarted is discarded - under the lock, so no instance
+                // can be folding into it meanwhile. It used to be deleted
+                // at the top of every tick whose (unlocked) snapshot showed
+                // NULL, which could wipe what another instance had just
+                // folded and committed.
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM {schema}.projection_rebuild_state \
+                     WHERE projection_name = $1 AND status = 'building'"
+                )))
+                .bind(&rebuild.projection.name)
+                .execute(&mut *tx)
+                .await?;
+            }
+
             let keys = dispatcher
                 .keys(bounded_context, &rebuild.projection.name, event)
                 .unwrap_or_default();
@@ -11187,6 +11226,7 @@ pub async fn catch_up_bounded_context(
         }
 
         tx.commit().await?;
+        previous = event.sequence;
     }
 
     for rebuild in &building_rebuilds {

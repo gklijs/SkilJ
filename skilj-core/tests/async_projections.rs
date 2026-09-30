@@ -1445,3 +1445,106 @@ fn registering_a_sync_projection_needs_no_second_connection_under_the_lock() {
         assert_eq!(state, Some("4".to_string()));
     });
 }
+
+/// docs/architecture.md §151: a catch-up working from a stale snapshot
+/// must not carry on folding a rebuild that was restarted under it (a
+/// `rebuildProjection` arriving mid-build resets `caught_up_to` to NULL
+/// with a new definition). Here the rebuild had folded event 0 into state
+/// the old definition produced (`1000`, deliberately wrong for the new
+/// one); a catch-up reaches event 1 while the test holds the rebuild
+/// row's lock, and the test restarts the rebuild before letting go. The
+/// stale catch-up used to fold on from `1000`, set `caught_up_to` itself
+/// and promote `1012`; the restarted rebuild must instead be replayed from
+/// nothing and promote `20 + 5 + 7`.
+#[test]
+fn a_rebuild_restarted_under_a_stale_catch_up_is_replayed_from_nothing() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        let existing = seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        let first = insert_plain_event(&pool, &bc, &et, 20).await;
+        insert_plain_event(&pool, &bc, &et, 5).await;
+        insert_plain_event(&pool, &bc, &et, 7).await;
+
+        let rebuild = ProjectionRebuild {
+            projection: existing.clone(),
+            schema: r#"{"properties":{"total":{"type":"integer"}}}"#.to_string(),
+            schema_version: 2,
+            consumed_event_types: vec![et.clone()],
+            sync: false,
+            caught_up_to: Some(first),
+            status: ProjectionRebuildStatus::Building,
+        };
+        db::upsert_projection_rebuild(&pool, &rebuild)
+            .await
+            .unwrap();
+        let schema = format!("\"bc_{}\"", bc.name);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.projection_rebuild_state \
+             (projection_name, status, key, state, as_of_sequence, updated_at) \
+             VALUES ('AccountBalance', 'building', '', '1000', $1, now())"
+        )))
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut restart = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT 1 FROM {schema}.projection_rebuilds \
+             WHERE projection_name = 'AccountBalance' AND status = 'building' FOR UPDATE"
+        )))
+        .execute(&mut *restart)
+        .await
+        .unwrap();
+
+        let stale = tokio::spawn({
+            let (pool, name) = (pool.clone(), bc.name.clone());
+            async move { db::catch_up_bounded_context(&pool, &name, &TestDispatcher).await }
+        });
+        // Long enough for the catch-up to take its snapshot and reach the
+        // rebuild at event 1.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.projection_rebuilds SET caught_up_to = NULL, schema_version = 3 \
+             WHERE projection_name = 'AccountBalance' AND status = 'building'"
+        )))
+        .execute(&mut *restart)
+        .await
+        .unwrap();
+        restart.commit().await.unwrap();
+        stale.await.unwrap().unwrap();
+
+        for _ in 0..5 {
+            db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+                .await
+                .unwrap();
+        }
+        assert!(
+            db::get_projection_rebuild(
+                &pool,
+                &bc.name,
+                "AccountBalance",
+                ProjectionRebuildStatus::Building
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the restarted rebuild must have been promoted"
+        );
+        let promoted = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.schema_version, 3);
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                .await
+                .unwrap(),
+            Some("32".to_string())
+        );
+    });
+}

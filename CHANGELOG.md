@@ -206,6 +206,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A projection rebuild could be promoted with the wrong state when more
+  than one instance catches up: an instance working from a stale snapshot
+  could delete state another instance had just folded, or - after a
+  `rebuildProjection` restarted a running build - keep folding the old
+  state and mark the restarted rebuild caught up. Each fold now re-checks
+  the rebuild's position under a lock (docs/architecture.md §151).
 - A `fire_once` scheduled event type more than 1000 occurrences behind
   (a per-second schedule after ~17 minutes of downtime) never fired
   again: each scheduler tick walked 1000 occurrences from the same
