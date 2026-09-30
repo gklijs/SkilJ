@@ -10356,7 +10356,7 @@ Tests: `full_type_registration_lifecycle_end_to_end` (`skilj/tests/graphql_type_
 
 `queryEvents`, `countEvents`, `allEvents` and `fetchCommands` take a list of type names (`eventTypes`/`commandTypes`) and looked each one up in turn - one `get_event_type`/`get_command_type` query per list entry, and one entry in the type filter every event is then compared against. The lookup stops at the first unknown name, but nothing stopped a caller repeating a real one: a request body has room (§72's 2 MiB, websocket messages included per §73) for some 200,000 copies of a short name, each its own query, from any Role with a grant on the bounded context - `allEvents` needs only read access.
 
-Fix: `resolvers::distinct_names` reads such a list keeping each name once, in first-seen order; the four resolvers look up and filter by that. Which events match is unchanged - a type named twice was never matched twice. `registerProjection`'s `consumedEventTypes` is left as it was: it's admin-only, and whether a repeated name there should be an error or ignored is its own question.
+Fix: `resolvers::distinct_names` reads such a list keeping each name once, in first-seen order; the four resolvers look up and filter by that. Which events match is unchanged - a type named twice was never matched twice. `registerProjection`'s `consumedEventTypes` is the exception: a repeat there is refused (§145).
 
 Test: `distinct_names_keeps_each_name_once_in_order` (`skilj-graphql/src/resolvers/mod.rs`), through a real `async_graphql` argument.
 
@@ -10371,3 +10371,11 @@ Three problems with an inbound message the bridges couldn't read:
 Fix: a `MalformedPayload` counts as exhausted on its first failure, so it's parked straight away (and committed/accepted/acked as any parked message is). The parked request's payload is `parked_payload`: the message as JSON when it is JSON, otherwise its content as a JSON string (lossy UTF-8) - visible to the operator, and refused by any schema if retried, so it stays parked until discarded. The AMQP bridge `reject`s a delivery it can't decode (`RecvError::MessageDecode` carries its `DeliveryInfo`), settling it and freeing its credit; the broker's dead-lettering takes it from there. Reading `amqp-value` bodies as JSON text is a feature, not part of this fix.
 
 Tests: `a_non_json_message_is_parked_at_once_with_its_raw_content` in each bridge's suite (real Kafka, Artemis and NATS brokers) - a policy that would take five attempts and 20 s parks it after one, payload `"not json {"`. `an_undecodable_message_is_rejected_and_does_not_stall_the_receiver` (`skilj-amqp`) - with a link credit of one, an `amqp-value` message followed by a valid one: the valid one is dispatched. Each fails against the unfixed bridge.
+
+## 145. A projection can't consume one event type twice
+
+`registerProjection`'s `consumedEventTypes` looked each name up in turn, repeats included, and handed the list on; nothing refused a type named twice. The spec types `Projection.consumed_event_types` as a `Set<EventType>`, so a list with a repeat isn't a set at all - it's a malformed registration. Collapsing it quietly (as §143 does for the query lists, where a repeat can't change the answer) would accept something the caller probably didn't mean, so it's refused: decided with the user.
+
+Fix: `projections::check_consumed_event_type_names`, refusing the first repeated name with `DuplicateConsumedEventType` (`duplicate_consumed_event_type`). `register_projection` calls it, which covers a Rust `Projection::consumed_event_types()` reconciled at startup too; the GraphQL resolver calls it on the raw names before looking any up, so a padded list costs no queries.
+
+Tests: `register_projection_rejects_a_repeated_consumed_event_type` in `skilj-core/tests/projection_registration.rs` (the rule) and `skilj/tests/graphql_type_registration.rs` (the resolver - a repeated name that doesn't exist, which a lookup would have answered `EventType_not_found`). Each fails with its own check removed.

@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `registerProjection` (and a Rust `Projection::consumed_event_types()`)
+  refuses a consumed event type named more than once, with
+  `duplicate_consumed_event_type` - consumed event types are a set
+  (docs/architecture.md §145).
 - `GraphqlLimits` gains `websocket_init_timeout` and
   `websocket_ping_interval` (breaking for code building it without
   `..Default::default()`) (docs/architecture.md §136).

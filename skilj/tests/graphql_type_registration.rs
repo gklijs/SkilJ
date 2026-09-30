@@ -836,6 +836,37 @@ fn register_projection_rejects_a_malformed_schema() {
     });
 }
 
+/// docs/architecture.md §145: a `consumedEventTypes` list naming a type
+/// twice is refused before any name is looked up - here a name that
+/// doesn't exist, which a lookup would have answered `not_found`.
+#[test]
+fn register_projection_rejects_a_repeated_consumed_event_type() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!) { \
+                registerProjection(boundedContext: $bc, name: $name, schema: \"{}\", \
+                    consumedEventTypes: [\"NoSuchType\", \"NoSuchType\"], sync: false) \
+                    { outcome } \
+            }",
+            json!({ "bc": bc_name, "name": "AccountBalance" }),
+        )
+        .await;
+
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "duplicate_consumed_event_type",
+            "{response}"
+        );
+    });
+}
+
 /// Codeberg issue #6's "5a" - the self-describing GraphQL surface a real
 /// command/event type picker needs, closing the gap `scheduledEventTypes`
 /// alone left (only the scheduled subset was ever listable). `eventTypes`/

@@ -274,9 +274,21 @@ pub fn register_projection_field() -> Field {
                 let schema = ctx.args.try_get("schema")?.string()?.to_string();
                 let sync = ctx.args.try_get("sync")?.boolean()?;
 
+                // A repeated name is refused before any is looked up
+                // (docs/architecture.md §145).
+                let consumed_names = ctx
+                    .args
+                    .try_get("consumedEventTypes")?
+                    .list()?
+                    .iter()
+                    .map(|item| item.string().map(str::to_string))
+                    .collect::<async_graphql::Result<Vec<_>>>()?;
+                skilj_core::projections::check_consumed_event_type_names(
+                    consumed_names.iter().map(String::as_str),
+                )
+                .map_err(to_graphql_error)?;
                 let mut consumed_event_types = Vec::new();
-                for item in ctx.args.try_get("consumedEventTypes")?.list()?.iter() {
-                    let event_type_name = item.string()?.to_string();
+                for event_type_name in consumed_names {
                     let event_type = skilj_core::db::get_event_type(
                         &state.pool,
                         &bounded_context_name,

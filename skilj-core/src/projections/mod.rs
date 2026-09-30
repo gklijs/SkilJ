@@ -48,6 +48,12 @@ pub enum Error {
     #[error("a projection may only consume EventTypes from its own bounded context")]
     ConsumedEventTypeNotInBoundedContext,
 
+    /// `consumed_event_types` is a set (`entity Projection`): a list
+    /// naming one twice is a malformed registration, refused rather than
+    /// quietly collapsed (docs/architecture.md §145).
+    #[error("consumedEventTypes names the EventType {0:?} more than once")]
+    DuplicateConsumedEventType(String),
+
     #[error("no pending ProjectionRebuild is staged for this projection")]
     NoProjectionRebuildStaged,
 
@@ -66,6 +72,7 @@ impl SkiljRejection for Error {
             Error::ConsumedEventTypeNotInBoundedContext => {
                 "consumed_event_type_not_in_bounded_context"
             }
+            Error::DuplicateConsumedEventType(_) => "duplicate_consumed_event_type",
             Error::NoProjectionRebuildStaged => "no_projection_rebuild_staged",
             Error::ProjectionCaughtUpTimedOut => "projection_caught_up_timed_out",
         }
@@ -154,6 +161,23 @@ pub enum ProjectionRegistration {
     ReconciledTrivially(Projection),
 }
 
+/// Refuses a `consumed_event_types` list naming any `EventType` twice -
+/// the spec's `Set<EventType>` has no room for a repeat. Separate from
+/// [`register_projection`] so a caller holding only the names (the
+/// GraphQL resolver, before it looks any of them up) can refuse the same
+/// way, with the same error, before doing any work per name.
+pub fn check_consumed_event_type_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> crate::error::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(Error::DuplicateConsumedEventType(name.to_string()).into());
+        }
+    }
+    Ok(())
+}
+
 /// See `rule RegisterProjection`. `existing` is `Projection{bounded_context,
 /// name}` and `staged` is `ProjectionRebuild{projection: existing, status:
 /// pending}`, both as already looked up by the caller - the same get-or-
@@ -210,6 +234,7 @@ pub fn register_projection(
     {
         return Err(Error::ConsumedEventTypeNotInBoundedContext.into());
     }
+    check_consumed_event_type_names(consumed_event_types.iter().map(|et| et.name.as_str()))?;
 
     let Some(existing) = existing else {
         let needs_history_fold = sync

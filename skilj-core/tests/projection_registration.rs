@@ -446,6 +446,33 @@ fn register_projection_rejects_a_consumed_event_type_from_another_bounded_contex
     );
 }
 
+/// docs/architecture.md §145: `consumed_event_types` is a set, so a list
+/// naming one `EventType` twice is refused, not collapsed.
+#[test]
+fn register_projection_rejects_a_repeated_consumed_event_type() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+
+    let err = projections::register_projection(
+        &mapping,
+        &bc,
+        "OrderSummary".into(),
+        "{}".into(),
+        vec![
+            event_type("OrderPlaced"),
+            event_type("InvoiceIssued"),
+            event_type("OrderPlaced"),
+        ],
+        false,
+        None,
+        None,
+        &[],
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), "duplicate_consumed_event_type");
+}
+
 // ---------------------------------------------------------------------
 // rule-success.RegisterProjection (trivial reconciliation path)
 // ---------------------------------------------------------------------
