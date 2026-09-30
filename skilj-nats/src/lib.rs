@@ -104,7 +104,13 @@ use chrono::{DateTime, Utc};
 /// `skilj_kafka::run_inbound` does.
 pub type PullConsumer = Consumer<PullConfig>;
 use futures_util::TryStreamExt;
-use serde::Deserialize;
+
+// docs/architecture.md §165: the skilj side every bridge shares.
+use skilj_bridge::parked_payload;
+pub use skilj_bridge::{
+    correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
+    InboundMapping, Tag, HTTP_REQUEST_TIMEOUT,
+};
 
 /// Header names for the two Codeberg-issue-#18 ids this bridge carries,
 /// both directions. **Deliberately not `Skilj-Correlation-Key`** -
@@ -148,80 +154,10 @@ pub struct OutboundMapping {
     pub partition: Option<(u32, u32)>,
 }
 
-/// `skilj_kafka::partition_for_key`'s own identical vendored copy - see
-/// that function's own doc comment for why it's vendored rather than
-/// shared via a dependency, and why not `DefaultHasher`.
-fn partition_for_key(key: &str, partition_count: u32) -> u32 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in key.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    (hash % u64::from(partition_count.max(1))) as u32
-}
-
 /// `skilj_kafka::owns_partition_for`'s own identical twin, for
 /// `OutboundMapping::partition` here.
 fn owns_partition_for(mapping: &OutboundMapping, key: Option<&str>) -> bool {
-    match mapping.partition {
-        None => true,
-        Some((partition_index, partition_count)) => {
-            partition_for_key(key.unwrap_or(""), partition_count) == partition_index
-        }
-    }
-}
-
-/// One event served by skilj's own `GET /v1/events/consume` - the
-/// identical shape `skilj_kafka::ConsumedEvent`/`skilj_amqp::ConsumedEvent`
-/// already use.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConsumedEvent {
-    pub sequence: i64,
-    pub event_type: String,
-    pub payload: serde_json::Value,
-    pub tags: Vec<Tag>,
-    pub metadata: ConsumedEventMetadata,
-}
-
-/// The subset of `MetadataDto`'s wire shape (`skilj-rest/src/routes/mod.rs`)
-/// this bridge actually needs - the identical shape
-/// `skilj_kafka::ConsumedEventMetadata`/`skilj_amqp::ConsumedEventMetadata`
-/// already have.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConsumedEventMetadata {
-    pub correlation_id: Option<String>,
-    pub causation_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Tag {
-    pub key: String,
-    pub value: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConsumeResponse {
-    events: Vec<ConsumedEvent>,
-    event_type_name: String,
-}
-
-/// The `Skilj-Correlation-Key` header value for a mapped event - `None`
-/// when `correlation_tag_key` is `None`, or when the named tag is
-/// absent entirely or present with a `null` value. Never an error, the
-/// same "an uncorrelated message is still perfectly valid" register
-/// `skilj_kafka::correlation_key`/`skilj_amqp::correlation_key` already
-/// use.
-pub fn correlation_key(correlation_tag_key: Option<&str>, tags: &[Tag]) -> Option<String> {
-    let correlation_tag_key = correlation_tag_key?;
-    tags.iter()
-        .find(|t| t.key == correlation_tag_key)?
-        .value
-        .clone()
+    skilj_bridge::owns_partition(mapping.partition, key)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -259,6 +195,20 @@ pub enum BridgeError {
     MessageInfo(#[source] async_nats::Error),
 }
 
+impl From<skilj_bridge::SkiljError> for BridgeError {
+    fn from(error: skilj_bridge::SkiljError) -> Self {
+        match error {
+            skilj_bridge::SkiljError::Http(e) => BridgeError::Skilj(e),
+            skilj_bridge::SkiljError::SkiljStatus { status, body } => {
+                BridgeError::SkiljStatus { status, body }
+            }
+            skilj_bridge::SkiljError::EventTypeMismatch { declared, actual } => {
+                BridgeError::EventTypeMismatch { declared, actual }
+            }
+        }
+    }
+}
+
 impl BridgeError {
     /// Whether skilj refused this with one of
     /// [`skilj_retry::ANOTHER_INSTANCE_CODES`]: the instance that took the
@@ -267,16 +217,7 @@ impl BridgeError {
     /// attempt, and never parked (docs/architecture.md §161).
     fn another_instance_can_do_it(&self) -> bool {
         match self {
-            BridgeError::SkiljStatus { body, .. } => {
-                serde_json::from_str::<serde_json::Value>(body)
-                    .ok()
-                    .and_then(|body| {
-                        body["code"]
-                            .as_str()
-                            .map(skilj_retry::another_instance_can_do_it)
-                    })
-                    .unwrap_or(false)
-            }
+            BridgeError::SkiljStatus { body, .. } => skilj_bridge::another_instance_refusal(body),
             _ => false,
         }
     }
@@ -305,18 +246,7 @@ async fn ack_event(
     mapping: &OutboundMapping,
     sequence: i64,
 ) -> Result<(), BridgeError> {
-    let ack = http
-        .post(format!("{skilj_base_url}/v1/events/consume/ack"))
-        .bearer_auth(&mapping.credential)
-        .json(&serde_json::json!({ "sequence": sequence }))
-        .send()
-        .await?;
-    if !ack.status().is_success() {
-        let status = ack.status();
-        let body = ack.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
-    Ok(())
+    Ok(skilj_bridge::ack(http, skilj_base_url, &mapping.credential, sequence).await?)
 }
 
 /// Publishes one event to JetStream, then acknowledges it to skilj -
@@ -394,23 +324,13 @@ pub async fn produce_once(
         }
     }
 
-    let response = http
-        .get(format!("{skilj_base_url}/v1/events/consume?mode=manual"))
-        .bearer_auth(&mapping.credential)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
-    let consumed: ConsumeResponse = response.json().await?;
-    if consumed.event_type_name != mapping.event_type {
-        return Err(BridgeError::EventTypeMismatch {
-            declared: mapping.event_type.clone(),
-            actual: consumed.event_type_name,
-        });
-    }
+    let consumed = skilj_bridge::consume(
+        http,
+        skilj_base_url,
+        &mapping.credential,
+        &mapping.event_type,
+    )
+    .await?;
 
     let mut served = 0;
     for event in &consumed.events {
@@ -575,53 +495,6 @@ pub async fn run_outbound_until(
 
 // --- inbound: NATS JetStream -> skilj ---
 
-/// One NATS subject's own mapping to a skilj action - the inbound half,
-/// the identical shape `skilj_kafka::InboundMapping`/
-/// `skilj_amqp::InboundMapping` already have. Which *subject* this
-/// applies to is implicit in whichever [`PullConsumer`] [`run_inbound`]
-/// is given - a JetStream consumer is already bound to its own stream
-/// and subject filter at creation, unlike an `rdkafka` consumer that
-/// can subscribe to several topics at once, so there's no
-/// per-address lookup table to keep here the way `skilj_kafka::run_inbound`
-/// needs one.
-pub struct InboundMapping {
-    /// A credential scoped to whichever `action` needs it -
-    /// `ExternalEventToken` for `Record`, `CommandToken` for `Trigger`.
-    pub credential: String,
-    pub action: InboundAction,
-}
-
-/// Which skilj call a mapped subject's own messages become - neither
-/// variant's own `event_type`/`command_type` field is sent on the wire,
-/// the identical "derived from the credential, not a body field"
-/// reasoning every other bridge in this workspace already documents.
-pub enum InboundAction {
-    /// `POST /v1/events/external` - record the message verbatim as a
-    /// fact. Always redelivery-safe via the `dedupe` mechanism
-    /// ([docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)) - JetStream's own `(stream,
-    /// stream_sequence)` is broker-assigned on every message, never
-    /// optional the way AMQP's `group-id`/`group-sequence` are.
-    Record { event_type: String },
-    /// `POST /v1/commands/trigger` - decide on the message via a real
-    /// `decide()`. Redelivery-safe via `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission), itself
-    /// `client_id`-scoped since [§37](../../docs/architecture.md#idempotency-keys-client-id-scoping)) *only when* the message carries a
-    /// `Nats-Msg-Id` - see [`InboundMessageMeta`]'s own doc comment.
-    Trigger { command_type: String },
-}
-
-impl InboundAction {
-    /// The `kind` `POST /v1/parked-deliveries` expects - see
-    /// `skilj-rest::routes::ParkedDeliveryKindRequest`'s own identical
-    /// two variants, and `skilj_kafka::InboundAction::parked_delivery_kind`/
-    /// `skilj_amqp::InboundAction::parked_delivery_kind`.
-    fn parked_delivery_kind(&self) -> &'static str {
-        match self {
-            InboundAction::Record { .. } => "external_event",
-            InboundAction::Trigger { .. } => "command_trigger",
-        }
-    }
-}
-
 /// The subset of a consumed JetStream message's own metadata this
 /// bridge actually uses for redelivery safety. Unlike `skilj_amqp::InboundMessageMeta`,
 /// `stream`/`stream_sequence` are never optional here - every message a
@@ -678,18 +551,6 @@ impl InboundMessageMeta {
             causation_id,
         })
     }
-}
-
-/// The `payload` a parked delivery's stored request carries: the message
-/// as JSON, or - when it isn't JSON at all - its raw content as a JSON
-/// string, so an operator can see what arrived rather than a `null`
-/// (docs/architecture.md §144). A retry of such a row sends that string,
-/// which no event or command schema accepts, so it stays parked until
-/// discarded.
-fn parked_payload(payload: &[u8]) -> serde_json::Value {
-    serde_json::from_slice(payload).unwrap_or_else(|_| {
-        serde_json::Value::String(String::from_utf8_lossy(payload).into_owned())
-    })
 }
 
 /// Dispatches one JetStream message to skilj - the one place
@@ -775,30 +636,14 @@ pub async fn dispatch_inbound_message(
     let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
     let body = inbound_request_body(mapping, meta, &payload_json);
 
-    let response = match &mapping.action {
-        InboundAction::Record { .. } => {
-            http.post(format!("{skilj_base_url}/v1/events/external"))
-                .bearer_auth(&mapping.credential)
-                .json(&body)
-                .send()
-                .await?
-        }
-        InboundAction::Trigger { .. } => {
-            let mut request = http
-                .post(format!("{skilj_base_url}/v1/commands/trigger"))
-                .bearer_auth(&mapping.credential)
-                .json(&body);
-            if let Some(key) = inbound_idempotency_key(mapping, meta) {
-                request = request.header("Idempotency-Key", key);
-            }
-            request.send().await?
-        }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
+    skilj_bridge::post_inbound(
+        http,
+        skilj_base_url,
+        mapping,
+        &body,
+        inbound_idempotency_key(mapping, meta).as_deref(),
+    )
+    .await?;
     // A `Trigger` rejection is reported as a `200 { accepted: false, ... }`
     // per §5.4/§7.3, not an HTTP error - not inspected here, the
     // identical reasoning every other bridge in this workspace already
@@ -832,27 +677,19 @@ async fn report_parked_delivery(
     attempt_count: u32,
     first_failed_at: DateTime<Utc>,
 ) -> Result<(), BridgeError> {
-    let response = http
-        .post(format!("{skilj_base_url}/v1/parked-deliveries"))
-        .bearer_auth(&mapping.credential)
-        .json(&serde_json::json!({
-            "source": "nats-inbound",
-            "kind": mapping.action.parked_delivery_kind(),
-            "identifier": identifier,
-            "error": error,
-            "attemptCount": attempt_count,
-            "firstFailedAt": first_failed_at.to_rfc3339(),
-            "request": request,
-            "idempotencyKey": idempotency_key,
-        }))
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
-    Ok(())
+    Ok(skilj_bridge::report_parked_delivery(
+        http,
+        skilj_base_url,
+        mapping,
+        "nats-inbound",
+        identifier,
+        request,
+        idempotency_key,
+        error,
+        attempt_count,
+        first_failed_at,
+    )
+    .await?)
 }
 
 /// Runs forever: for every message this `consumer` pulls, dispatches it
@@ -1186,57 +1023,5 @@ mod tests {
                  got {owners:?}"
             );
         }
-    }
-}
-
-/// How long one HTTP request to skilj may take, end to end, before it
-/// fails and the loop's own retry handling takes over. Without a bound, a
-/// request stuck on a half-open connection (a network partition, a
-/// stalled proxy) stalled the loop forever with nothing logged
-/// (docs/architecture.md §82). Retrying after a timeout is safe: inbound
-/// requests carry an idempotency key or dedupe cursor, and an outbound
-/// consume's checkout lease covers one that was served but never answered.
-pub const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The `reqwest::Client` this crate's own loops use: bounded by
-/// [`HTTP_REQUEST_TIMEOUT`] and a 10-second connect timeout. Pass it to
-/// `run_inbound` too, unless the caller's own client is bounded already.
-pub fn http_client() -> reqwest::Client {
-    http_client_with_timeout(HTTP_REQUEST_TIMEOUT)
-}
-
-fn http_client_with_timeout(timeout: std::time::Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(std::time::Duration::from_secs(10).min(timeout))
-        .build()
-        .expect("a client with only timeouts configured always builds")
-}
-
-#[cfg(test)]
-mod http_client_tests {
-    /// A server that accepts the connection and never answers must fail
-    /// the request within the timeout, not hang the loop (§82).
-    #[tokio::test]
-    async fn a_stalled_skilj_fails_the_request_instead_of_hanging() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                held.push(socket);
-            }
-        });
-        let client = super::http_client_with_timeout(std::time::Duration::from_millis(200));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client
-                .get(format!("http://{addr}/v1/events/consume"))
-                .send(),
-        )
-        .await
-        .expect("the request hung past its own timeout");
-        assert!(result.unwrap_err().is_timeout());
     }
 }

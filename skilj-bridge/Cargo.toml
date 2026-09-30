@@ -1,0 +1,23 @@
+[package]
+name = "skilj-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "The skilj REST client side the message-broker bridges (skilj-kafka/skilj-amqp/skilj-nats) share: consuming and acknowledging events, recording or triggering from inbound messages, reporting parked deliveries, and partition ownership. Speaks skilj's wire protocol only, no dependency on skilj-core."
+
+[lib]
+name = "skilj_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+skilj-retry.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

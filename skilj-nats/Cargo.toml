@@ -22,6 +22,8 @@ chrono.workspace = true
 # (skip-on-exhaustion, if a cap is configured at all) outbound. See
 # docs/architecture.md's parked-deliveries section.
 skilj-retry.workspace = true
+# The skilj REST client side every bridge shares (docs/architecture.md §165).
+skilj-bridge.workspace = true
 
 [lib]
 name = "skilj_nats"

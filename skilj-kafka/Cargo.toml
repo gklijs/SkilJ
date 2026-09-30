@@ -20,6 +20,8 @@ chrono.workspace = true
 # (skip-on-exhaustion, if a cap is configured at all) outbound. See
 # docs/architecture.md's parked-deliveries section.
 skilj-retry.workspace = true
+# The skilj REST client side every bridge shares (docs/architecture.md §165).
+skilj-bridge.workspace = true
 # cmake-build: vendors and compiles librdkafka from source rather than
 # needing it (and its -dev headers) present on the system - see
 # CONTRIBUTING.md's own note on the one real build-time snag this hits

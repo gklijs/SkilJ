@@ -11,6 +11,7 @@ members = [
     "skilj-inspector",
     "skilj-codegen",
     "skilj-retry",
+    "skilj-bridge",
     "skilj-temporal",
     "skilj-kafka",
     "skilj-amqp",
@@ -84,6 +85,12 @@ members = [
 #                 independently hand-rolled poll-sleep-retry shapes with
 #                 one. Zero dependency on any other skilj crate, no
 #                 async, no I/O.
+# skilj-bridge  - the skilj REST client side skilj-kafka/skilj-amqp/
+#                 skilj-nats share (§165): consume/ack, recording or
+#                 triggering from an inbound message, parked-delivery
+#                 reports, partition ownership, and the wire DTOs. Each
+#                 bridge keeps only its broker-specific half. Wire
+#                 protocol only, no dependency on skilj-core.
 # skilj-test-fixture - a given/when/then test harness for a plugin
 #                 author's own CommandType::decide()/Projection::project()
 #                 (§45, Codeberg issue #19): no database, no HTTP, just the
@@ -194,3 +201,4 @@ skilj = { path = "skilj", version = "0.0.8" }
 skilj-codegen = { path = "skilj-codegen", version = "0.0.8" }
 skilj-test-fixture = { path = "skilj-test-fixture", version = "0.0.8" }
 skilj-retry = { path = "skilj-retry", version = "0.0.8" }
+skilj-bridge = { path = "skilj-bridge", version = "0.0.8" }

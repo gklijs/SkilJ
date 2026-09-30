@@ -20,6 +20,8 @@ chrono.workspace = true
 # (skip-on-exhaustion, if a cap is configured at all) outbound. See
 # docs/architecture.md's parked-deliveries section.
 skilj-retry.workspace = true
+# The skilj REST client side every bridge shares (docs/architecture.md §165).
+skilj-bridge.workspace = true
 # rustls, not native-tls: the same TLS backend choice this workspace's
 # own `reqwest`/`jsonwebtoken` dependencies already make - Solace/Azure
 # Service Bus both require TLS (`amqps://`) in any real deployment.

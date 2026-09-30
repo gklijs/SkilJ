@@ -79,9 +79,15 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Header, Headers, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::Message;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
+
+// docs/architecture.md §165: the skilj side every bridge shares.
+use skilj_bridge::parked_payload;
+pub use skilj_bridge::{
+    correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
+    InboundMapping, Tag, HTTP_REQUEST_TIMEOUT,
+};
 
 /// Header names for the two Codeberg-issue-#18 ids this bridge carries
 /// across the Kafka boundary, both directions. Kafka's own message
@@ -143,85 +149,13 @@ pub struct OutboundMapping {
     pub partition: Option<(u32, u32)>,
 }
 
-/// `skilj_core::db::partition_for_key`'s own hand-written 64-bit FNV-1a,
-/// vendored rather than pulled in via a `skilj-core` dependency (this
-/// crate is deliberately skilj-core-free - see the module doc comment).
-/// Not `std::collections::hash_map::DefaultHasher`, which is explicitly
-/// not guaranteed stable across Rust versions/std/build flags - unsuitable
-/// for a scheme that must agree across every bridge instance in a fleet,
-/// possibly running slightly different builds mid rolling-deploy.
-fn partition_for_key(key: &str, partition_count: u32) -> u32 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in key.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    (hash % u64::from(partition_count.max(1))) as u32
-}
-
 /// Whether `mapping` (partitioned or not) is responsible for an event
 /// whose own [`correlation_key`] output is `key` - `true` unconditionally
 /// for an unpartitioned mapping (`partition: None`), matching
 /// [`partition_for_key`] against this mapping's own `partition_index`
 /// otherwise.
 fn owns_partition_for(mapping: &OutboundMapping, key: Option<&str>) -> bool {
-    match mapping.partition {
-        None => true,
-        Some((partition_index, partition_count)) => {
-            partition_for_key(key.unwrap_or(""), partition_count) == partition_index
-        }
-    }
-}
-
-/// One event served by skilj's own `GET /v1/events/consume` - the subset
-/// of `EventDto`'s wire shape (`skilj-rest/src/routes/mod.rs`) this
-/// bridge actually needs, the identical shape `skilj_temporal::ConsumedEvent`
-/// already uses.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConsumedEvent {
-    pub sequence: i64,
-    pub event_type: String,
-    pub payload: serde_json::Value,
-    pub tags: Vec<Tag>,
-    pub metadata: ConsumedEventMetadata,
-}
-
-/// The subset of `MetadataDto`'s wire shape (`skilj-rest/src/routes/mod.rs`)
-/// this bridge actually needs - just the two Codeberg-issue-#18 ids,
-/// forwarded onto the outbound Kafka message as headers by [`produce_once`].
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConsumedEventMetadata {
-    pub correlation_id: Option<String>,
-    pub causation_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Tag {
-    pub key: String,
-    pub value: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConsumeResponse {
-    events: Vec<ConsumedEvent>,
-    event_type_name: String,
-}
-
-/// The Kafka message key for a mapped event - `None` when
-/// `key_tag_key` is `None`, or when the named tag is absent entirely or
-/// present with a `null` value (the payload field it was mapped from was
-/// itself absent at write time). Unlike `skilj_temporal::correlation_workflow_id`'s
-/// own identically-shaped "nothing to correlate on" case, this is never
-/// an error here - an unkeyed message is still a perfectly valid Kafka
-/// message, Kafka itself just gets to place it.
-pub fn correlation_key(key_tag_key: Option<&str>, tags: &[Tag]) -> Option<String> {
-    let key_tag_key = key_tag_key?;
-    tags.iter().find(|t| t.key == key_tag_key)?.value.clone()
+    skilj_bridge::owns_partition(mapping.partition, key)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -253,6 +187,20 @@ pub enum BridgeError {
     MalformedPayload(#[from] serde_json::Error),
 }
 
+impl From<skilj_bridge::SkiljError> for BridgeError {
+    fn from(error: skilj_bridge::SkiljError) -> Self {
+        match error {
+            skilj_bridge::SkiljError::Http(e) => BridgeError::Skilj(e),
+            skilj_bridge::SkiljError::SkiljStatus { status, body } => {
+                BridgeError::SkiljStatus { status, body }
+            }
+            skilj_bridge::SkiljError::EventTypeMismatch { declared, actual } => {
+                BridgeError::EventTypeMismatch { declared, actual }
+            }
+        }
+    }
+}
+
 impl BridgeError {
     /// Whether skilj refused this with one of
     /// [`skilj_retry::ANOTHER_INSTANCE_CODES`]: the instance that took the
@@ -261,16 +209,7 @@ impl BridgeError {
     /// attempt, and never parked (docs/architecture.md §161).
     fn another_instance_can_do_it(&self) -> bool {
         match self {
-            BridgeError::SkiljStatus { body, .. } => {
-                serde_json::from_str::<serde_json::Value>(body)
-                    .ok()
-                    .and_then(|body| {
-                        body["code"]
-                            .as_str()
-                            .map(skilj_retry::another_instance_can_do_it)
-                    })
-                    .unwrap_or(false)
-            }
+            BridgeError::SkiljStatus { body, .. } => skilj_bridge::another_instance_refusal(body),
             _ => false,
         }
     }
@@ -302,18 +241,7 @@ async fn ack_event(
     mapping: &OutboundMapping,
     sequence: i64,
 ) -> Result<(), BridgeError> {
-    let ack = http
-        .post(format!("{skilj_base_url}/v1/events/consume/ack"))
-        .bearer_auth(&mapping.credential)
-        .json(&serde_json::json!({ "sequence": sequence }))
-        .send()
-        .await?;
-    if !ack.status().is_success() {
-        let status = ack.status();
-        let body = ack.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
-    Ok(())
+    Ok(skilj_bridge::ack(http, skilj_base_url, &mapping.credential, sequence).await?)
 }
 
 /// Produces one event to Kafka, then acknowledges it to skilj - never
@@ -395,23 +323,13 @@ pub async fn produce_once(
         }
     }
 
-    let response = http
-        .get(format!("{skilj_base_url}/v1/events/consume?mode=manual"))
-        .bearer_auth(&mapping.credential)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
-    let consumed: ConsumeResponse = response.json().await?;
-    if consumed.event_type_name != mapping.event_type {
-        return Err(BridgeError::EventTypeMismatch {
-            declared: mapping.event_type.clone(),
-            actual: consumed.event_type_name,
-        });
-    }
+    let consumed = skilj_bridge::consume(
+        http,
+        skilj_base_url,
+        &mapping.credential,
+        &mapping.event_type,
+    )
+    .await?;
 
     let mut served = 0;
     for event in &consumed.events {
@@ -574,50 +492,6 @@ pub async fn run_outbound_until(
 
 // --- inbound: Kafka -> skilj ---
 
-/// One Kafka topic's own mapping to a skilj action - the inbound half,
-/// with no equivalent in `skilj-temporal` (which only ever reacts to
-/// skilj's own events; a message broker genuinely needs both
-/// directions).
-pub struct InboundMapping {
-    /// A credential scoped to whichever `action` needs it -
-    /// `ExternalEventToken` for `Record`, `CommandToken` for `Trigger`.
-    pub credential: String,
-    pub action: InboundAction,
-}
-
-/// Which skilj call a mapped Kafka topic's own messages become. Neither
-/// variant's own `event_type`/`command_type` field is sent on the wire -
-/// each token is already scoped to exactly one type, the identical
-/// "derived from the credential, not a body field" shape `POST
-/// /v1/commands/trigger`/`POST /v1/events/external` already have for
-/// every other caller - they exist purely so a mapping list reads
-/// clearly, not because either call needs them.
-pub enum InboundAction {
-    /// `POST /v1/events/external` - record the message verbatim as a
-    /// fact. Redelivery-safe via the `dedupe` mechanism
-    /// ([docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)) - not `ExternalEventIngestion`'s own
-    /// responsibility to invent, since that mechanism already exists for
-    /// exactly this.
-    Record { event_type: String },
-    /// `POST /v1/commands/trigger` - decide on the message via a real
-    /// `decide()`. Redelivery-safe via `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission)), now
-    /// itself `client_id`-scoped ([§37](../../docs/architecture.md#idempotency-keys-client-id-scoping)) so this mapping's own inbound
-    /// traffic can never collide with an unrelated caller's.
-    Trigger { command_type: String },
-}
-
-impl InboundAction {
-    /// The `kind` `POST /v1/parked-deliveries` expects - see
-    /// `skilj-rest::routes::ParkedDeliveryKindRequest`'s own identical
-    /// two variants.
-    fn parked_delivery_kind(&self) -> &'static str {
-        match self {
-            InboundAction::Record { .. } => "external_event",
-            InboundAction::Trigger { .. } => "command_trigger",
-        }
-    }
-}
-
 /// Reads a header's value as UTF-8 text - `None` for a missing header, a
 /// header present with no value (Kafka allows this), or one whose bytes
 /// aren't valid UTF-8. [`run_inbound`]'s own extraction step for
@@ -634,18 +508,6 @@ pub fn header_str<'a, H: Headers>(headers: Option<&'a H>, key: &str) -> Option<&
         .find(|h| h.key == key)
         .and_then(|h| h.value)
         .and_then(|v| std::str::from_utf8(v).ok())
-}
-
-/// The `payload` a parked delivery's stored request carries: the message
-/// as JSON, or - when it isn't JSON at all - its raw content as a JSON
-/// string, so an operator can see what arrived rather than a `null`
-/// (docs/architecture.md §144). A retry of such a row sends that string,
-/// which no event or command schema accepts, so it stays parked until
-/// discarded.
-fn parked_payload(payload: &[u8]) -> serde_json::Value {
-    serde_json::from_slice(payload).unwrap_or_else(|_| {
-        serde_json::Value::String(String::from_utf8_lossy(payload).into_owned())
-    })
 }
 
 /// Dispatches one Kafka message to skilj - the one place [`InboundAction`]
@@ -736,32 +598,14 @@ pub async fn dispatch_inbound_message(
         causation_id,
     );
 
-    let response = match &mapping.action {
-        InboundAction::Record { .. } => {
-            http.post(format!("{skilj_base_url}/v1/events/external"))
-                .bearer_auth(&mapping.credential)
-                .json(&body)
-                .send()
-                .await?
-        }
-        InboundAction::Trigger { .. } => {
-            http.post(format!("{skilj_base_url}/v1/commands/trigger"))
-                .bearer_auth(&mapping.credential)
-                .header(
-                    "Idempotency-Key",
-                    inbound_idempotency_key(mapping, &partition_key, offset)
-                        .expect("a Trigger mapping always has an idempotency key"),
-                )
-                .json(&body)
-                .send()
-                .await?
-        }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
+    skilj_bridge::post_inbound(
+        http,
+        skilj_base_url,
+        mapping,
+        &body,
+        inbound_idempotency_key(mapping, &partition_key, offset).as_deref(),
+    )
+    .await?;
     // A `Trigger` rejection is reported as a `200 { accepted: false, ... }`
     // per §5.4/§7.3, not an HTTP error - deliberately not inspected
     // here: the message itself was successfully delivered and decided
@@ -793,27 +637,19 @@ async fn report_parked_delivery(
     attempt_count: u32,
     first_failed_at: DateTime<Utc>,
 ) -> Result<(), BridgeError> {
-    let response = http
-        .post(format!("{skilj_base_url}/v1/parked-deliveries"))
-        .bearer_auth(&mapping.credential)
-        .json(&serde_json::json!({
-            "source": "kafka-inbound",
-            "kind": mapping.action.parked_delivery_kind(),
-            "identifier": identifier,
-            "error": error,
-            "attemptCount": attempt_count,
-            "firstFailedAt": first_failed_at.to_rfc3339(),
-            "request": request,
-            "idempotencyKey": idempotency_key,
-        }))
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(BridgeError::SkiljStatus { status, body });
-    }
-    Ok(())
+    Ok(skilj_bridge::report_parked_delivery(
+        http,
+        skilj_base_url,
+        mapping,
+        "kafka-inbound",
+        identifier,
+        request,
+        idempotency_key,
+        error,
+        attempt_count,
+        first_failed_at,
+    )
+    .await?)
 }
 
 /// Runs forever: for every message this `consumer` receives (already
@@ -1161,63 +997,5 @@ mod tests {
                  got {owners:?}"
             );
         }
-    }
-
-    #[test]
-    fn partition_for_key_is_deterministic_across_calls() {
-        assert_eq!(partition_for_key("o-1", 4), partition_for_key("o-1", 4));
-        assert_eq!(partition_for_key("", 4), partition_for_key("", 4));
-    }
-}
-
-/// How long one HTTP request to skilj may take, end to end, before it
-/// fails and the loop's own retry handling takes over. Without a bound, a
-/// request stuck on a half-open connection (a network partition, a
-/// stalled proxy) stalled the loop forever with nothing logged
-/// (docs/architecture.md §82). Retrying after a timeout is safe: inbound
-/// requests carry an idempotency key or dedupe cursor, and an outbound
-/// consume's checkout lease covers one that was served but never answered.
-pub const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The `reqwest::Client` this crate's own loops use: bounded by
-/// [`HTTP_REQUEST_TIMEOUT`] and a 10-second connect timeout. Pass it to
-/// `run_inbound` too, unless the caller's own client is bounded already.
-pub fn http_client() -> reqwest::Client {
-    http_client_with_timeout(HTTP_REQUEST_TIMEOUT)
-}
-
-fn http_client_with_timeout(timeout: std::time::Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(std::time::Duration::from_secs(10).min(timeout))
-        .build()
-        .expect("a client with only timeouts configured always builds")
-}
-
-#[cfg(test)]
-mod http_client_tests {
-    /// A server that accepts the connection and never answers must fail
-    /// the request within the timeout, not hang the loop (§82).
-    #[tokio::test]
-    async fn a_stalled_skilj_fails_the_request_instead_of_hanging() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                held.push(socket);
-            }
-        });
-        let client = super::http_client_with_timeout(std::time::Duration::from_millis(200));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client
-                .get(format!("http://{addr}/v1/events/consume"))
-                .send(),
-        )
-        .await
-        .expect("the request hung past its own timeout");
-        assert!(result.unwrap_err().is_timeout());
     }
 }

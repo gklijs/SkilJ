@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `skilj-bridge`: the skilj side `skilj-kafka`, `skilj-amqp` and
+  `skilj-nats` share - consuming and acknowledging events, sending an
+  inbound message as an external event or command trigger, reporting a
+  parked delivery, partition ownership, the HTTP client and the wire
+  DTOs. The bridges now depend on it instead of each carrying its own
+  copy; their public APIs are unchanged (the moved types are re-exported
+  under the same names). A new crate to publish, after `skilj-retry`
+  (docs/architecture.md §165).
 - `skilj_retry::MessageRetry`/`RetryDecision`: one message's retry state
   and the park-or-wait decision after each failure, including §161's
   "another instance can" refusals. The Kafka, AMQP and NATS inbound loops
