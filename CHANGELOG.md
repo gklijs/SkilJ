@@ -215,6 +215,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A bounded context hard-deleted by another instance while this one was
+  starting failed `Skilj::build()`. Startup lists every bounded context
+  and then warms and patches each, and the deleted one's tables were
+  gone. Building the GraphQL schema's projection types had the same
+  race: at startup, after a registration change, and for each caller's
+  scoped schema, where it failed the request. So did `forgetSubject`'s
+  sweep of every bounded context's deadlines. A bounded context that no
+  longer exists is now skipped (docs/architecture.md §157).
 - Catching up an async projection could deadlock against another
   instance promoting that projection's rebuild: the fold locked a state
   row and then the projection row, promotion the other way round.

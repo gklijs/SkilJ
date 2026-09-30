@@ -2179,146 +2179,173 @@ impl SkiljBuilder {
                 let pool = &pool;
                 let event_cache = &event_cache;
                 async move {
-                    event_cache.warm(pool, &bc.name).await?;
-                    // Codeberg issue #12: `idempotency_keys` patched into
-                    // every bounded context, every startup - including
-                    // ones provisioned before this feature existed, since
-                    // `provision_bounded_context_schema` itself only ever
-                    // runs once, at creation, and there's no general
-                    // per-bounded-context migration mechanism in this
-                    // codebase. `CREATE TABLE IF NOT EXISTS` makes this
-                    // free once the table already exists - see
-                    // `ensure_idempotency_keys_table`'s own doc comment.
-                    skilj_core::db::ensure_idempotency_keys_table(pool, &bc.name).await?;
-                    // docs/architecture.md §37: patches an already-
-                    // provisioned bounded context's `idempotency_keys`
-                    // (a real table since 0.0.2) onto the `client_id`-
-                    // scoped shape `ensure_idempotency_keys_table` above
-                    // already gives a brand-new one directly - a no-op
-                    // for one that already has it, migrated or fresh.
-                    // See `migrate_idempotency_keys_client_id_scoping`'s
-                    // own doc comment.
-                    skilj_core::db::migrate_idempotency_keys_client_id_scoping(pool, &bc.name)
+                    let prepared = async {
+                        event_cache.warm(pool, &bc.name).await?;
+                        // Codeberg issue #12: `idempotency_keys` patched into
+                        // every bounded context, every startup - including
+                        // ones provisioned before this feature existed, since
+                        // `provision_bounded_context_schema` itself only ever
+                        // runs once, at creation, and there's no general
+                        // per-bounded-context migration mechanism in this
+                        // codebase. `CREATE TABLE IF NOT EXISTS` makes this
+                        // free once the table already exists - see
+                        // `ensure_idempotency_keys_table`'s own doc comment.
+                        skilj_core::db::ensure_idempotency_keys_table(pool, &bc.name).await?;
+                        // docs/architecture.md §37: patches an already-
+                        // provisioned bounded context's `idempotency_keys`
+                        // (a real table since 0.0.2) onto the `client_id`-
+                        // scoped shape `ensure_idempotency_keys_table` above
+                        // already gives a brand-new one directly - a no-op
+                        // for one that already has it, migrated or fresh.
+                        // See `migrate_idempotency_keys_client_id_scoping`'s
+                        // own doc comment.
+                        skilj_core::db::migrate_idempotency_keys_client_id_scoping(pool, &bc.name)
+                            .await?;
+                        // Cross-tenant projection read fix
+                        // (docs/architecture.md's own write-up of this pass):
+                        // same "patched into every bounded context, every
+                        // startup" treatment, for `projection_state.owner`/
+                        // `projection_rebuild_state.owner` instead - see
+                        // `ensure_projection_state_owner_columns`'s own doc
+                        // comment.
+                        skilj_core::db::ensure_projection_state_owner_columns(pool, &bc.name)
+                            .await?;
+                        // Codeberg issue #25: `projection_state.as_of_sequence`/
+                        // `projection_rebuild_state.as_of_sequence`, the real
+                        // fix for a genuine cross-instance double-fold race
+                        // found while investigating that issue - see
+                        // `ensure_projection_state_as_of_sequence_columns`'s
+                        // own doc comment.
+                        skilj_core::db::ensure_projection_state_as_of_sequence_columns(
+                            pool, &bc.name,
+                        )
                         .await?;
-                    // Cross-tenant projection read fix
-                    // (docs/architecture.md's own write-up of this pass):
-                    // same "patched into every bounded context, every
-                    // startup" treatment, for `projection_state.owner`/
-                    // `projection_rebuild_state.owner` instead - see
-                    // `ensure_projection_state_owner_columns`'s own doc
-                    // comment.
-                    skilj_core::db::ensure_projection_state_owner_columns(pool, &bc.name).await?;
-                    // Codeberg issue #25: `projection_state.as_of_sequence`/
-                    // `projection_rebuild_state.as_of_sequence`, the real
-                    // fix for a genuine cross-instance double-fold race
-                    // found while investigating that issue - see
-                    // `ensure_projection_state_as_of_sequence_columns`'s
-                    // own doc comment.
-                    skilj_core::db::ensure_projection_state_as_of_sequence_columns(pool, &bc.name)
+                        // Same pass's own raw-event half - `event_types.owner_tag_key`/
+                        // `access_tokens.scope` - see
+                        // `ensure_event_scoping_columns`'s own doc comment.
+                        skilj_core::db::ensure_event_scoping_columns(pool, &bc.name).await?;
+                        // Private-field mechanism (docs/architecture.md's own
+                        // write-up of this pass) - `event_types.private_fields`/
+                        // `command_types.private_fields` columns, and the new
+                        // `private_field_grants` table - same "patched into
+                        // every bounded context, every startup" treatment. See
+                        // `ensure_private_field_columns`/
+                        // `ensure_private_field_grants_table`'s own doc
+                        // comments.
+                        skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
+                        skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
+                        // Cross-context event router (docs/architecture.md's
+                        // own write-up of this pass) - same "patched into
+                        // every bounded context, every startup" treatment.
+                        // See `ensure_cross_context_route_cursors_table`'s
+                        // own doc comment.
+                        skilj_core::db::ensure_cross_context_route_cursors_table(pool, &bc.name)
+                            .await?;
+                        // Codeberg issue #20: native one-shot, per-entity
+                        // deadlines - same "patched into every bounded
+                        // context, every startup" treatment, for the new
+                        // `deadline_cursors`/`deadlines` tables. See
+                        // `ensure_deadline_cursors_table`/`ensure_deadlines_table`'s
+                        // own doc comments.
+                        skilj_core::db::ensure_deadline_cursors_table(pool, &bc.name).await?;
+                        skilj_core::db::ensure_deadlines_table(pool, &bc.name).await?;
+                        // Codeberg issue #25: partitioned async Projection
+                        // catch-up - same "patched into every bounded
+                        // context, every startup" treatment, for a brand-new
+                        // table that needs no migration dance. See
+                        // `ensure_projection_partition_progress_table`'s own
+                        // doc comment.
+                        skilj_core::db::ensure_projection_partition_progress_table(pool, &bc.name)
+                            .await?;
+                        // Codeberg issue #25 (docs/architecture.md §52):
+                        // partitioned Snapshot catch-up - same treatment,
+                        // for `Snapshot`'s own twin table. See
+                        // `ensure_snapshot_partition_progress_table`'s own
+                        // doc comment.
+                        skilj_core::db::ensure_snapshot_partition_progress_table(pool, &bc.name)
+                            .await?;
+                        // Codeberg issue #25 (docs/architecture.md §53): the
+                        // read_cursors checkout mechanism closing the
+                        // Kafka/AMQP/NATS outbound bridges' double-publish
+                        // gap. See `ensure_read_cursors_checkout_column`'s
+                        // own doc comment.
+                        skilj_core::db::ensure_read_cursors_checkout_column(pool, &bc.name).await?;
+                        // External-message dedup (docs/architecture.md §39,
+                        // specs/skilj.allium's own rule CreateExternalEvent) -
+                        // same "patched into every bounded context, every
+                        // startup" treatment, for a brand-new table that needs
+                        // no migration dance. See
+                        // `ensure_external_message_cursors_table`'s own doc
+                        // comment.
+                        skilj_core::db::ensure_external_message_cursors_table(pool, &bc.name)
+                            .await?;
+                        // "New subscriber replays all history" fix
+                        // (docs/architecture.md's own write-up of this pass) -
+                        // `access_tokens.start_from`, same "patched into every
+                        // bounded context, every startup" treatment. See
+                        // `ensure_event_read_token_start_from_column`'s own
+                        // doc comment.
+                        skilj_core::db::ensure_event_read_token_start_from_column(pool, &bc.name)
+                            .await?;
+                        // Correlation/causation ids (Codeberg issue #18) -
+                        // same "patched into every bounded context, every
+                        // startup" treatment. See
+                        // `ensure_correlation_causation_columns`'s own doc
+                        // comment.
+                        skilj_core::db::ensure_correlation_causation_columns(pool, &bc.name)
+                            .await?;
+                        // Codeberg issue #21 (dead-letter/parking for failed
+                        // event/message handler delivery) - `cross_context_route_cursors`'
+                        // own three new retry-backoff columns, same "patched
+                        // into every bounded context, every startup"
+                        // treatment. See
+                        // `ensure_cross_context_route_retry_columns`'s own
+                        // doc comment for why this is a separate `ALTER
+                        // TABLE` patch rather than folded into
+                        // `ensure_cross_context_route_cursors_table` above.
+                        skilj_core::db::ensure_cross_context_route_retry_columns(pool, &bc.name)
+                            .await?;
+                        // Same pass's own `parked_deliveries` table - a
+                        // brand-new table, so (unlike the retry columns just
+                        // above) this needs no `ALTER TABLE` patch, only the
+                        // identical `CREATE TABLE IF NOT EXISTS` every other
+                        // brand-new per-bounded-context table already gets
+                        // here.
+                        skilj_core::db::ensure_parked_deliveries_table(pool, &bc.name).await?;
+                        // Codeberg issue #25 review (docs/architecture.md
+                        // §56): the concurrent-instance parked-delivery
+                        // duplication fix's own belt-and-suspenders unique
+                        // index, plus the one-time dedup a bounded context
+                        // that already hit the race needs before that index
+                        // can even be created. See
+                        // `migrate_parked_deliveries_dedup_and_unique_index`'s
+                        // own doc comment.
+                        skilj_core::db::migrate_parked_deliveries_dedup_and_unique_index(
+                            pool, &bc.name,
+                        )
                         .await?;
-                    // Same pass's own raw-event half - `event_types.owner_tag_key`/
-                    // `access_tokens.scope` - see
-                    // `ensure_event_scoping_columns`'s own doc comment.
-                    skilj_core::db::ensure_event_scoping_columns(pool, &bc.name).await?;
-                    // Private-field mechanism (docs/architecture.md's own
-                    // write-up of this pass) - `event_types.private_fields`/
-                    // `command_types.private_fields` columns, and the new
-                    // `private_field_grants` table - same "patched into
-                    // every bounded context, every startup" treatment. See
-                    // `ensure_private_field_columns`/
-                    // `ensure_private_field_grants_table`'s own doc
-                    // comments.
-                    skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
-                    skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
-                    // Cross-context event router (docs/architecture.md's
-                    // own write-up of this pass) - same "patched into
-                    // every bounded context, every startup" treatment.
-                    // See `ensure_cross_context_route_cursors_table`'s
-                    // own doc comment.
-                    skilj_core::db::ensure_cross_context_route_cursors_table(pool, &bc.name)
-                        .await?;
-                    // Codeberg issue #20: native one-shot, per-entity
-                    // deadlines - same "patched into every bounded
-                    // context, every startup" treatment, for the new
-                    // `deadline_cursors`/`deadlines` tables. See
-                    // `ensure_deadline_cursors_table`/`ensure_deadlines_table`'s
-                    // own doc comments.
-                    skilj_core::db::ensure_deadline_cursors_table(pool, &bc.name).await?;
-                    skilj_core::db::ensure_deadlines_table(pool, &bc.name).await?;
-                    // Codeberg issue #25: partitioned async Projection
-                    // catch-up - same "patched into every bounded
-                    // context, every startup" treatment, for a brand-new
-                    // table that needs no migration dance. See
-                    // `ensure_projection_partition_progress_table`'s own
-                    // doc comment.
-                    skilj_core::db::ensure_projection_partition_progress_table(pool, &bc.name)
-                        .await?;
-                    // Codeberg issue #25 (docs/architecture.md §52):
-                    // partitioned Snapshot catch-up - same treatment,
-                    // for `Snapshot`'s own twin table. See
-                    // `ensure_snapshot_partition_progress_table`'s own
-                    // doc comment.
-                    skilj_core::db::ensure_snapshot_partition_progress_table(pool, &bc.name)
-                        .await?;
-                    // Codeberg issue #25 (docs/architecture.md §53): the
-                    // read_cursors checkout mechanism closing the
-                    // Kafka/AMQP/NATS outbound bridges' double-publish
-                    // gap. See `ensure_read_cursors_checkout_column`'s
-                    // own doc comment.
-                    skilj_core::db::ensure_read_cursors_checkout_column(pool, &bc.name).await?;
-                    // External-message dedup (docs/architecture.md §39,
-                    // specs/skilj.allium's own rule CreateExternalEvent) -
-                    // same "patched into every bounded context, every
-                    // startup" treatment, for a brand-new table that needs
-                    // no migration dance. See
-                    // `ensure_external_message_cursors_table`'s own doc
-                    // comment.
-                    skilj_core::db::ensure_external_message_cursors_table(pool, &bc.name).await?;
-                    // "New subscriber replays all history" fix
-                    // (docs/architecture.md's own write-up of this pass) -
-                    // `access_tokens.start_from`, same "patched into every
-                    // bounded context, every startup" treatment. See
-                    // `ensure_event_read_token_start_from_column`'s own
-                    // doc comment.
-                    skilj_core::db::ensure_event_read_token_start_from_column(pool, &bc.name)
-                        .await?;
-                    // Correlation/causation ids (Codeberg issue #18) -
-                    // same "patched into every bounded context, every
-                    // startup" treatment. See
-                    // `ensure_correlation_causation_columns`'s own doc
-                    // comment.
-                    skilj_core::db::ensure_correlation_causation_columns(pool, &bc.name).await?;
-                    // Codeberg issue #21 (dead-letter/parking for failed
-                    // event/message handler delivery) - `cross_context_route_cursors`'
-                    // own three new retry-backoff columns, same "patched
-                    // into every bounded context, every startup"
-                    // treatment. See
-                    // `ensure_cross_context_route_retry_columns`'s own
-                    // doc comment for why this is a separate `ALTER
-                    // TABLE` patch rather than folded into
-                    // `ensure_cross_context_route_cursors_table` above.
-                    skilj_core::db::ensure_cross_context_route_retry_columns(pool, &bc.name)
-                        .await?;
-                    // Same pass's own `parked_deliveries` table - a
-                    // brand-new table, so (unlike the retry columns just
-                    // above) this needs no `ALTER TABLE` patch, only the
-                    // identical `CREATE TABLE IF NOT EXISTS` every other
-                    // brand-new per-bounded-context table already gets
-                    // here.
-                    skilj_core::db::ensure_parked_deliveries_table(pool, &bc.name).await?;
-                    // Codeberg issue #25 review (docs/architecture.md
-                    // §56): the concurrent-instance parked-delivery
-                    // duplication fix's own belt-and-suspenders unique
-                    // index, plus the one-time dedup a bounded context
-                    // that already hit the race needs before that index
-                    // can even be created. See
-                    // `migrate_parked_deliveries_dedup_and_unique_index`'s
-                    // own doc comment.
-                    skilj_core::db::migrate_parked_deliveries_dedup_and_unique_index(
-                        pool, &bc.name,
-                    )
-                    .await?;
-                    Ok::<(), skilj_core::Error>(())
+                        Ok::<(), skilj_core::Error>(())
+                    }
+                    .await;
+                    // docs/architecture.md §157: `bounded_contexts_for_warm_up`
+                    // was read before any of this. Another instance may
+                    // have hard-deleted the bounded context since, and
+                    // this instance's startup is no reason to fail.
+                    match prepared {
+                        Err(err)
+                            if skilj_core::db::get_bounded_context(pool, &bc.name)
+                                .await?
+                                .is_none() =>
+                        {
+                            tracing::info!(
+                                bounded_context = %bc.name,
+                                error = %err,
+                                "bounded context deleted during startup, skipped"
+                            );
+                            Ok(())
+                        }
+                        other => other,
+                    }
                 }
             })
             .buffer_unordered(BACKGROUND_TASK_CONCURRENCY)

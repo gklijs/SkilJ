@@ -125,7 +125,13 @@ pub async fn build(
         if visible.is_some_and(|visible| !visible.contains(&bc.name)) {
             continue;
         }
-        for projection in db::list_projections_for_bounded_context(pool, &bc.name).await? {
+        let projections = match db::list_projections_for_bounded_context(pool, &bc.name).await {
+            Ok(projections) => projections,
+            // docs/architecture.md §157: deleted since the listing above.
+            Err(_) if db::get_bounded_context(pool, &bc.name).await?.is_none() => continue,
+            Err(err) => return Err(err),
+        };
+        for projection in projections {
             let type_name = graphql_type_name(&bc.name, &projection.name);
             let Some(root): Option<serde_json::Value> =
                 serde_json::from_str(&projection.schema).ok()

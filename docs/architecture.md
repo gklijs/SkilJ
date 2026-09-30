@@ -10486,3 +10486,13 @@ The fold now takes `SELECT caught_up_to, sync FROM projections WHERE name = $1 F
 The partitioned path (Codeberg issue #25) advances `caught_up_to` from a separate statement after its partition transactions commit, so it never holds a state row while waiting on the projection row. `create_projection` writes the projection row before folding history into state. Neither needed a change.
 
 `skilj-core/tests/async_projections.rs` `an_async_fold_never_deadlocks_against_a_promotion` holds the projection row in a transaction the way promotion does, waits (via `pg_stat_activity`) until the fold is blocked, then deletes the state rows. With the old order this fails with `40P01 deadlock detected`.
+
+## 157. A bounded context deleted mid-walk is skipped
+
+`Skilj::build()` reads `list_bounded_contexts` once, then for each bounded context warms the event cache and runs the `ensure_*`/`migrate_*` schema patches. If another instance's `deleteBoundedContext` (`hard_delete_bounded_context`: `DROP SCHEMA ... CASCADE` and the registry row, in one transaction) committed in between, the first query against the dropped schema failed with `42P01`, and that error failed the whole startup. `projection_types::build`, which lists bounded contexts and then reads each one's `projections`, had the same window. It runs at startup, on every registration change, and for each caller's scoped schema (§138), where the failure became the caller's request error. `forget_subject_in_deadlines` (`forgetSubject`) walks every bounded context's `deadlines` table the same way, and a deletion during the sweep failed the erasure.
+
+All three now handle a failure for one bounded context by re-reading its registry row. If the row is gone, the bounded context is skipped (startup logs it at `info`); otherwise the original error stands, so a real fault in an existing bounded context still fails loudly. The background loops (catch-up, routes, deadlines, scheduling) already log a per-bounded-context failure and go on to the next one, so a deletion costs them one logged error for one tick. They are unchanged.
+
+Found through a test flake (§140): a test renaming a bounded context's `events` table failed other tests' `build()` the same way.
+
+`skilj/tests/startup_deleted_bounded_context.rs` (a binary and database of its own, tests serialized) holds a lock on the bounded context's `events` table, its `projections` table for the schema build, or its `deadlines` table for the sweep. It waits via `pg_stat_activity` until the task under test blocks on it, then drops the bounded context in that transaction. Each test fails with `42P01` without its fix.

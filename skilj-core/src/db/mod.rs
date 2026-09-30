@@ -9473,61 +9473,92 @@ pub async fn forget_subject_in_deadlines(
     subject_value: &str,
     now: DateTime<Utc>,
 ) -> crate::error::Result<u64> {
-    const PAGE: i64 = 1000;
     let mut forgotten = 0;
-    let mut sensitive_fields: std::collections::HashMap<String, Option<Vec<SensitiveField>>> =
-        std::collections::HashMap::new();
+    let mut sensitive_fields = std::collections::HashMap::new();
     for holder in list_bounded_contexts(pool).await? {
-        let schema = schema_ident(&holder.name);
-        let mut after = String::new();
-        loop {
-            let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT id, target_command_type, payload FROM {schema}.deadlines \
-                     WHERE target_bounded_context = $1 AND status = 'pending' AND id > $2 \
-                     ORDER BY id LIMIT $3"
-            )))
-            .bind(bounded_context)
-            .bind(&after)
-            .bind(PAGE)
-            .fetch_all(pool)
-            .await?;
-            let Some((last_id, _, _)) = rows.last() else {
-                break;
-            };
-            after = last_id.clone();
-            for (id, command_type, payload) in &rows {
-                if !sensitive_fields.contains_key(command_type) {
-                    let fields = get_command_type(pool, bounded_context, command_type)
-                        .await?
-                        .map(|ct| ct.sensitive_fields);
-                    sensitive_fields.insert(command_type.clone(), fields);
-                }
-                let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
-                let names_subject = match (&sensitive_fields[command_type], &parsed) {
-                    (Some(fields), Some(_)) => {
-                        crate::event_store::sensitive_field_subjects(fields, payload)
-                            .iter()
-                            .any(|(key, value)| key == subject_key && value == subject_value)
-                    }
-                    (_, Some(json)) => json_mentions(json, subject_value),
-                    (_, None) => payload.contains(subject_value),
-                };
-                if names_subject {
-                    forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {schema}.deadlines \
-                         SET status = 'forgotten', payload = '{{}}', resolved_at = $1 \
-                         WHERE id = $2 AND status = 'pending'"
-                    )))
-                    .bind(now)
-                    .bind(id)
-                    .execute(pool)
+        match forget_subject_in_holder_deadlines(
+            pool,
+            &holder.name,
+            bounded_context,
+            subject_key,
+            subject_value,
+            now,
+            &mut sensitive_fields,
+        )
+        .await
+        {
+            Ok(n) => forgotten += n,
+            // docs/architecture.md §157: deleted since the listing - its
+            // deadlines went with it.
+            Err(_) if get_bounded_context(pool, &holder.name).await?.is_none() => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(forgotten)
+}
+
+/// [`forget_subject_in_deadlines`] for the deadlines one bounded context,
+/// `holder`, stores.
+async fn forget_subject_in_holder_deadlines(
+    pool: &Pool,
+    holder: &str,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+    now: DateTime<Utc>,
+    sensitive_fields: &mut std::collections::HashMap<String, Option<Vec<SensitiveField>>>,
+) -> crate::error::Result<u64> {
+    const PAGE: i64 = 1000;
+    let schema = schema_ident(holder);
+    let mut forgotten = 0;
+    let mut after = String::new();
+    loop {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT id, target_command_type, payload FROM {schema}.deadlines \
+                 WHERE target_bounded_context = $1 AND status = 'pending' AND id > $2 \
+                 ORDER BY id LIMIT $3"
+        )))
+        .bind(bounded_context)
+        .bind(&after)
+        .bind(PAGE)
+        .fetch_all(pool)
+        .await?;
+        let Some((last_id, _, _)) = rows.last() else {
+            break;
+        };
+        after = last_id.clone();
+        for (id, command_type, payload) in &rows {
+            if !sensitive_fields.contains_key(command_type) {
+                let fields = get_command_type(pool, bounded_context, command_type)
                     .await?
-                    .rows_affected();
+                    .map(|ct| ct.sensitive_fields);
+                sensitive_fields.insert(command_type.clone(), fields);
+            }
+            let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
+            let names_subject = match (&sensitive_fields[command_type], &parsed) {
+                (Some(fields), Some(_)) => {
+                    crate::event_store::sensitive_field_subjects(fields, payload)
+                        .iter()
+                        .any(|(key, value)| key == subject_key && value == subject_value)
                 }
+                (_, Some(json)) => json_mentions(json, subject_value),
+                (_, None) => payload.contains(subject_value),
+            };
+            if names_subject {
+                forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {schema}.deadlines \
+                     SET status = 'forgotten', payload = '{{}}', resolved_at = $1 \
+                     WHERE id = $2 AND status = 'pending'"
+                )))
+                .bind(now)
+                .bind(id)
+                .execute(pool)
+                .await?
+                .rows_affected();
             }
-            if (rows.len() as i64) < PAGE {
-                break;
-            }
+        }
+        if (rows.len() as i64) < PAGE {
+            break;
         }
     }
     Ok(forgotten)
