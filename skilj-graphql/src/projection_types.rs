@@ -107,8 +107,12 @@ impl AdmittedProjections {
     }
 }
 
+/// `visible`: only these bounded contexts' projections, for a caller who
+/// may not learn that the others exist (docs/architecture.md §138);
+/// `None` for all of them.
 pub async fn build(
     pool: &Pool,
+    visible: Option<&std::collections::BTreeSet<String>>,
 ) -> skilj_core::error::Result<Option<(Vec<Object>, Vec<Enum>, Union, AdmittedProjections)>> {
     let mut objects = Vec::new();
     let mut enums: Vec<Enum> = Vec::new();
@@ -118,6 +122,9 @@ pub async fn build(
     let mut admitted = AdmittedProjections::default();
 
     for bc in db::list_bounded_contexts(pool).await? {
+        if visible.is_some_and(|visible| !visible.contains(&bc.name)) {
+            continue;
+        }
         for projection in db::list_projections_for_bounded_context(pool, &bc.name).await? {
             let type_name = graphql_type_name(&bc.name, &projection.name);
             let Some(root): Option<serde_json::Value> =

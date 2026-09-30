@@ -227,13 +227,20 @@ async fn serve_jwks() -> String {
 }
 
 fn sign_jwt(subject: &str) -> String {
+    sign_jwt_expiring(
+        subject,
+        (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+    )
+}
+
+fn sign_jwt_expiring(subject: &str, exp: i64) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some(TEST_KID.to_string());
     let claims = json!({
         "sub": subject,
         "iss": TEST_ISSUER,
         "aud": TEST_AUDIENCE,
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+        "exp": exp,
     });
     let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes())
         .expect("the test private key PEM is well-formed");
@@ -306,7 +313,17 @@ async fn ws_send_json(ws: &mut WsStream, value: serde_json::Value) {
 /// different bounded context never arrives" negative assertion's own
 /// mechanism, since there's no positive signal to wait for instead.
 async fn ws_try_recv_json(ws: &mut WsStream, timeout: Duration) -> Option<serde_json::Value> {
-    match tokio::time::timeout(timeout, ws.next()).await {
+    // Server pings (docs/architecture.md §136) are answered by
+    // tungstenite itself; skip past them.
+    let next = async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                other => return other,
+            }
+        }
+    };
+    match tokio::time::timeout(timeout, next).await {
         Err(_) => None,
         Ok(None) => panic!("websocket stream ended unexpectedly"),
         Ok(Some(Err(e))) => panic!("websocket error: {e}"),
@@ -1377,6 +1394,229 @@ fn a_connection_holds_at_most_max_subscriptions_at_once() {
             ws_try_recv_json(&mut ws, Duration::from_millis(500)).await,
             None,
             "completing one freed its slot"
+        );
+    });
+}
+
+/// A reader Role with Read access to a fresh bounded context, and a
+/// `graphql_router()` serving on an ephemeral port under `limits`.
+/// Returns (address, the reader's JWT subject, the bounded context name).
+async fn serve_reader_graphql(
+    database_url: String,
+    limits: skilj::GraphqlLimits,
+) -> (std::net::SocketAddr, String, String) {
+    let jwks_url = serve_jwks().await;
+    let pool = skilj_core::db::connect(&database_url).await.unwrap();
+    let reader_subject = unique_name("reader");
+    let reader_role = Role {
+        id: generate_token_id(),
+        external_subject: reader_subject.clone(),
+        name: "Reader".to_string(),
+        superadmin: false,
+        status: RoleStatus::Active,
+        created_at: test_now(),
+        revoked_at: None,
+    };
+    skilj_core::db::insert_role(&pool, &reader_role)
+        .await
+        .unwrap();
+    let bc_name = unique_name("banking");
+    let bc = BoundedContext {
+        name: bc_name.clone(),
+        status: BoundedContextStatus::Active,
+        created_at: test_now(),
+        created_by: ContextCreator::SystemCreator,
+        template: None,
+    };
+    skilj_core::db::insert_bounded_context(&pool, &bc)
+        .await
+        .unwrap();
+    skilj_core::db::insert_role_access_mapping(
+        &pool,
+        &RoleAccessMapping {
+            role: reader_role,
+            bounded_context: bc,
+            level: AccessLevel::Read,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (skilj, _) = Skilj::builder(database_url)
+        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+        .identity_provider(IdpConfig::new(
+            jwks_url.parse().unwrap(),
+            TEST_ISSUER,
+            TEST_AUDIENCE,
+            SigningAlgorithm::Rs256,
+        ))
+        .graphql_limits(limits)
+        .build()
+        .await
+        .unwrap();
+    let router = skilj.graphql_router().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (addr, reader_subject, bc_name)
+}
+
+/// `connection_init` with `jwt`, then one `allEvents` subscription.
+async fn init_and_subscribe(ws: &mut WsStream, jwt: &str, bc_name: &str) {
+    ws_send_json(
+        ws,
+        json!({
+            "type": "connection_init",
+            "payload": { "Authorization": format!("Bearer {jwt}") },
+        }),
+    )
+    .await;
+    assert_eq!(ws_recv_json(ws).await["type"], "connection_ack");
+    ws_send_json(
+        ws,
+        json!({
+            "id": "1",
+            "type": "subscribe",
+            "payload": {
+                "query": "subscription($bc: String!) { allEvents(boundedContext: $bc) { sequence } }",
+                "variables": { "bc": bc_name },
+            },
+        }),
+    )
+    .await;
+}
+
+/// The next frame that isn't a ping or pong, within `timeout`.
+async fn next_non_ping(
+    ws: &mut WsStream,
+    timeout: Duration,
+) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for a websocket frame")
+}
+
+fn assert_closed_with(
+    frame: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    code: u16,
+    reason: &str,
+) {
+    match frame {
+        Some(Ok(Message::Close(Some(frame)))) => {
+            assert_eq!(u16::from(frame.code), code, "{frame:?}");
+            assert_eq!(frame.reason.as_str(), reason);
+        }
+        other => panic!("expected a {code} close frame, got {other:?}"),
+    }
+}
+
+/// docs/architecture.md §135: the JWT from `connection_init` is only
+/// checked then, so the connection - and a subscription running on it -
+/// used to outlive it indefinitely. Now the server closes it with 4403
+/// once the token's `exp` (plus the 60s verification leeway) passes.
+#[test]
+fn a_websocket_is_closed_when_its_credential_expires() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let (addr, reader_subject, bc_name) =
+            serve_reader_graphql(database_url, Default::default()).await;
+
+        // Past `exp`, but still inside the leeway for another ~3s.
+        let exp = chrono::Utc::now().timestamp() - 57;
+        let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
+        init_and_subscribe(&mut ws, &sign_jwt_expiring(&reader_subject, exp), &bc_name).await;
+        assert_eq!(
+            ws_try_recv_json(&mut ws, Duration::from_millis(500)).await,
+            None,
+            "the subscription runs while the credential is valid"
+        );
+
+        assert_closed_with(
+            next_non_ping(&mut ws, Duration::from_secs(10)).await,
+            4403,
+            "credential expired",
+        );
+    });
+}
+
+/// docs/architecture.md §136: a websocket that never sends
+/// `connection_init` used to be held open indefinitely.
+#[test]
+fn a_websocket_that_never_initialises_is_closed() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let (addr, _, _) = serve_reader_graphql(
+            database_url,
+            skilj::GraphqlLimits {
+                websocket_init_timeout: Duration::from_millis(300),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let mut ws = ws_connect(&format!("ws://{addr}/graphql")).await;
+        assert_closed_with(
+            next_non_ping(&mut ws, Duration::from_secs(5)).await,
+            4408,
+            "connection initialisation timeout",
+        );
+    });
+}
+
+/// docs/architecture.md §136: the server pings, a client that answers
+/// (tungstenite does, whenever it reads) stays connected well past the
+/// dead-peer window, and one that has stopped answering is dropped -
+/// before, a vanished peer held its connection and subscriptions forever.
+#[test]
+fn a_peer_answering_pings_is_kept_and_a_silent_one_dropped() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let (addr, reader_subject, bc_name) = serve_reader_graphql(
+            database_url,
+            skilj::GraphqlLimits {
+                websocket_ping_interval: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+        )
+        .await;
+        let jwt = sign_jwt(&reader_subject);
+
+        let mut live = ws_connect(&format!("ws://{addr}/graphql")).await;
+        init_and_subscribe(&mut live, &jwt, &bc_name).await;
+        let mut silent = ws_connect(&format!("ws://{addr}/graphql")).await;
+        init_and_subscribe(&mut silent, &jwt, &bc_name).await;
+
+        // Reading answers pings; five dead-peer windows pass. Not reading
+        // `silent` meanwhile leaves its pings unanswered.
+        assert_eq!(
+            ws_try_recv_json(&mut live, Duration::from_secs(2)).await,
+            None,
+            "a peer answering pings stays connected"
+        );
+
+        let ended = next_non_ping(&mut silent, Duration::from_secs(5)).await;
+        assert!(
+            matches!(ended, None | Some(Err(_))),
+            "a silent peer's connection is dropped, got {ended:?}"
         );
     });
 }

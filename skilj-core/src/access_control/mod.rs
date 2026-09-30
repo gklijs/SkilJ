@@ -780,6 +780,27 @@ pub async fn verify_and_extract_subject(
     config: &IdpConfig,
     cache: &JwksCache,
 ) -> crate::error::Result<String> {
+    verify_jwt(jwt, config, cache).await.map(|v| v.subject)
+}
+
+/// What [`verify_jwt`] trusts from a verified JWT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedJwt {
+    /// `config.subject_claim`'s value.
+    pub subject: String,
+    /// The last moment this token is still accepted: its `exp` plus the
+    /// same leeway verification allows. A connection authenticated once
+    /// and kept open (a GraphQL websocket) must stop being served by then
+    /// (docs/architecture.md §135).
+    pub valid_until: std::time::SystemTime,
+}
+
+/// [`verify_and_extract_subject`], also returning when the token expires.
+pub async fn verify_jwt(
+    jwt: &str,
+    config: &IdpConfig,
+    cache: &JwksCache,
+) -> crate::error::Result<VerifiedJwt> {
     let header =
         jsonwebtoken::decode_header(jwt).map_err(|e| Error::MalformedJwt(e.to_string()))?;
     let kid = header.kid.ok_or(Error::JwtMissingKeyId)?;
@@ -811,12 +832,28 @@ pub async fn verify_and_extract_subject(
     )
     .map_err(|e| Error::JwtVerificationFailed(e.to_string()))?;
 
-    token_data
+    let subject = token_data
         .claims
         .get(&config.subject_claim)
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .ok_or_else(|| Error::MissingSubjectClaim(config.subject_claim.clone()).into())
+        .ok_or_else(|| Error::MissingSubjectClaim(config.subject_claim.clone()))?;
+    // `exp` is a required claim and `decode` has already checked it is a
+    // number in the future (within leeway), so this only reads it back.
+    let exp = token_data
+        .claims
+        .get("exp")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| Error::JwtVerificationFailed("exp is not a number".to_string()))?;
+    // Clamped so an absurd `exp` can't overflow `SystemTime` (year 2106
+    // is as good as never for a connection).
+    let valid_until = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(exp.clamp(0.0, u32::MAX as f64) as u64)
+        + std::time::Duration::from_secs(validation.leeway);
+    Ok(VerifiedJwt {
+        subject,
+        valid_until,
+    })
 }
 
 /// See the GraphQL identity resolution note above `entity Role`, step 3:

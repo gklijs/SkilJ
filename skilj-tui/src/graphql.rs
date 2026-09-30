@@ -23,6 +23,8 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
+pub use crate::token::TokenSource;
+
 /// One entry of a GraphQL response's `errors[]` array, kept structured
 /// rather than a plain string - `code`/`trace_id` are both extensions
 /// every rejection in this codebase's own error shape carries (§4.2, and
@@ -65,6 +67,19 @@ pub enum ClientError {
     SubscriptionEnded {
         resuming_after: Option<i64>,
     },
+    /// The server closed the websocket because the token it was opened
+    /// with expired (close code 4403, docs/architecture.md §135).
+    CredentialExpired,
+    /// The server refused `connection_init` - closed the websocket
+    /// instead of acknowledging it; `reason` is the server's.
+    InitRefused(String),
+    /// The server closed the websocket for another reason.
+    Closed {
+        code: u16,
+        reason: String,
+    },
+    /// `--token-command` failed (docs/architecture.md §137).
+    TokenCommand(String),
 }
 
 impl fmt::Display for ClientError {
@@ -86,6 +101,12 @@ impl fmt::Display for ClientError {
             ClientError::SubscriptionEnded {
                 resuming_after: None,
             } => write!(f, "subscription ended - reconnecting"),
+            ClientError::CredentialExpired => write!(f, "the token expired"),
+            ClientError::InitRefused(reason) => write!(f, "connection refused: {reason}"),
+            ClientError::Closed { code, reason } => {
+                write!(f, "connection closed by the server ({code}): {reason}")
+            }
+            ClientError::TokenCommand(msg) => write!(f, "token command failed: {msg}"),
         }
     }
 }
@@ -99,11 +120,18 @@ impl std::error::Error for ClientError {}
 pub struct Client {
     http: reqwest::Client,
     endpoint: reqwest::Url,
-    token: String,
+    token: TokenSource,
 }
 
 impl Client {
+    /// A client for a token that is never replaced.
     pub fn new(endpoint: reqwest::Url, token: String) -> Self {
+        Self::with_token_source(endpoint, TokenSource::fixed(token))
+    }
+
+    /// A client whose token is refreshed when the server refuses it as
+    /// no longer valid (docs/architecture.md §137).
+    pub fn with_token_source(endpoint: reqwest::Url, token: TokenSource) -> Self {
         Self {
             http: reqwest::Client::new(),
             endpoint,
@@ -113,19 +141,44 @@ impl Client {
 
     /// Runs one query or mutation, returning the response's `data` on
     /// success. `variables` is `Value::Null` for an operation with none.
+    /// A refusal of the token itself (`jwt_verification_failed` - an
+    /// expired token among others) is retried once with a refreshed
+    /// token, when the token source can refresh.
     pub async fn request(&self, query: &str, variables: Value) -> Result<Value, ClientError> {
         let body = json!({ "query": query, "variables": variables });
+        let token = self.token.current().await;
+        let result = self.send(&body, &token).await;
+        match result {
+            Err(ClientError::Graphql(ref errors)) if is_token_refused(errors) => {
+                match self.token.refresh(&token).await? {
+                    Some(fresh) => self.send(&body, &fresh).await,
+                    None => result,
+                }
+            }
+            other => other,
+        }
+    }
+
+    async fn send(&self, body: &Value, token: &str) -> Result<Value, ClientError> {
         let response = self
             .http
             .post(self.endpoint.clone())
-            .bearer_auth(&self.token)
-            .json(&body)
+            .bearer_auth(token)
+            .json(body)
             .send()
             .await
             .map_err(ClientError::Http)?;
         let parsed: Value = response.json().await.map_err(ClientError::Http)?;
         extract_data(parsed)
     }
+}
+
+/// Whether the server refused the token itself, rather than the
+/// operation.
+fn is_token_refused(errors: &[GraphQlError]) -> bool {
+    errors
+        .iter()
+        .any(|e| e.code.as_deref() == Some("jwt_verification_failed"))
 }
 
 fn extract_data(response: Value) -> Result<Value, ClientError> {
@@ -219,26 +272,37 @@ pub const LIVE_EVENTS_QUERY: &str = "subscription($bc: String!, $from: Int) { \
 /// `initial_delay` up to `max_delay` while connecting keeps failing. A
 /// `resume_span_too_large` refusal (too far behind to replay) resumes from
 /// now instead, after reporting it. Ends only when the receiver is dropped.
+///
+/// When the server closes the connection because the token expired, or
+/// refuses `connection_init`, the token is refreshed first if `token`
+/// can be (docs/architecture.md §137); after an expiry the reconnect is
+/// immediate.
 pub fn spawn_live_events(
     ws_endpoint: reqwest::Url,
-    token: String,
+    token: impl Into<TokenSource>,
     bounded_context: String,
     initial_delay: std::time::Duration,
     max_delay: std::time::Duration,
 ) -> mpsc::UnboundedReceiver<Result<Value, ClientError>> {
+    let token = token.into();
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut last_sequence: Option<i64> = None;
         let mut delay = initial_delay;
         loop {
+            let used_token = token.current().await;
             let mut inner = spawn_subscription(
                 ws_endpoint.clone(),
-                token.clone(),
+                used_token.clone(),
                 LIVE_EVENTS_QUERY.to_string(),
                 json!({ "bc": bounded_context, "from": last_sequence }),
             );
+            let mut expired = false;
+            let mut refused = false;
             while let Some(item) = inner.recv().await {
                 match &item {
+                    Err(ClientError::CredentialExpired) => expired = true,
+                    Err(ClientError::InitRefused(_)) => refused = true,
                     Ok(data) => {
                         if let Some(sequence) =
                             data.pointer("/allEvents/sequence").and_then(Value::as_i64)
@@ -267,6 +331,24 @@ pub fn spawn_live_events(
                 .is_err()
             {
                 return;
+            }
+            let refreshed = if (expired || refused) && token.can_refresh() {
+                match token.refresh(&used_token).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        if tx.send(Err(e)).is_err() {
+                            return;
+                        }
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if expired && refreshed {
+                // An expiry is routine, not a failure to back off from.
+                delay = initial_delay;
+                continue;
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(max_delay);
@@ -304,7 +386,10 @@ async fn run_subscription(
         }),
     )
     .await?;
-    let ack = recv_json(&mut ws).await?;
+    let ack = match recv_json(&mut ws).await {
+        Err(ClientError::Closed { reason, .. }) => return Err(ClientError::InitRefused(reason)),
+        other => other?,
+    };
     if ack.get("type").and_then(Value::as_str) != Some("connection_ack") {
         return Err(ClientError::MalformedResponse(format!(
             "expected connection_ack, got {ack:?}"
@@ -382,15 +467,30 @@ async fn send_json(ws: &mut WsStream, value: Value) -> Result<(), ClientError> {
 }
 
 async fn recv_json(ws: &mut WsStream) -> Result<Value, ClientError> {
-    match ws.next().await {
-        None => Err(ClientError::WebSocket(
-            tokio_tungstenite::tungstenite::Error::ConnectionClosed,
-        )),
-        Some(Err(e)) => Err(ClientError::WebSocket(e)),
-        Some(Ok(Message::Text(text))) => serde_json::from_str(&text)
-            .map_err(|e| ClientError::MalformedResponse(format!("invalid JSON: {e}"))),
-        Some(Ok(other)) => Err(ClientError::MalformedResponse(format!(
-            "unexpected websocket message: {other:?}"
-        ))),
+    loop {
+        return match ws.next().await {
+            None => Err(ClientError::WebSocket(
+                tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+            )),
+            Some(Err(e)) => Err(ClientError::WebSocket(e)),
+            Some(Ok(Message::Text(text))) => serde_json::from_str(&text)
+                .map_err(|e| ClientError::MalformedResponse(format!("invalid JSON: {e}"))),
+            // The server pings to find dead connections; tungstenite
+            // answers on its own (docs/architecture.md §136).
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(Message::Close(frame))) => Err(match frame {
+                Some(frame) if u16::from(frame.code) == 4403 => ClientError::CredentialExpired,
+                Some(frame) => ClientError::Closed {
+                    code: frame.code.into(),
+                    reason: frame.reason.to_string(),
+                },
+                None => {
+                    ClientError::WebSocket(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+                }
+            }),
+            Some(Ok(other)) => Err(ClientError::MalformedResponse(format!(
+                "unexpected websocket message: {other:?}"
+            ))),
+        };
     }
 }

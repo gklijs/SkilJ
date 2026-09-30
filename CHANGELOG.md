@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `skilj-tui --token-command` (`SKILJ_TOKEN_COMMAND`): a shell command
+  printing a JWT, run at startup and again whenever the server refuses
+  the token as expired - the live feed reconnects with the fresh one,
+  and a refused query is retried once - so a session outlives any one
+  token. `--token` is no longer required when it's given
+  (docs/architecture.md §137).
 - `run_outbound_until`/`run_inbound_until` in `skilj-kafka`,
   `skilj-amqp` and `skilj-nats`, and `skilj_temporal::run_until`: the run
   loops, stopping once a given future resolves - after the message or
@@ -39,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `GraphqlLimits` gains `websocket_init_timeout` and
+  `websocket_ping_interval` (breaking for code building it without
+  `..Default::default()`) (docs/architecture.md §136).
+- `skilj_graphql::auth::resolve_role_from_connection_init` also returns
+  the credential's expiry, `Option<(Role, SystemTime)>` (breaking for
+  direct callers). New `skilj_core::access_control::verify_jwt` returns
+  a `VerifiedJwt { subject, valid_until }` (docs/architecture.md §135).
 - `db::fire_due_deadlines` takes the registered cancels as a new
   `cancels` argument (breaking for direct callers) (docs/architecture.md
   §131).
@@ -593,6 +606,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- GraphQL introspection no longer lists other tenants' bounded contexts.
+  The schema names a type after every bounded context with a projection
+  and introspection needed no credential, so anyone could enumerate the
+  bounded contexts `boundedContexts` keeps to superadmins, with their
+  projections' shapes. Now a superadmin is served the full schema, any
+  other Role one with only the bounded contexts it has access to, and a
+  caller with no credential one with none and no introspection. Querying
+  another bounded context's projection type now fails validation, the
+  same as for one that doesn't exist (docs/architecture.md §138).
+- A GraphQL websocket that never sends `connection_init` is closed after
+  `GraphqlLimits::websocket_init_timeout` (default 10s, close code 4408),
+  and the server pings every `websocket_ping_interval` (default 30s),
+  dropping a connection that has sent nothing - not even the automatic
+  pong - for two intervals. Both kinds used to be held open forever, a
+  vanished client's subscriptions with them. Clients that treat any
+  non-text frame as an error must skip ping frames; skilj-tui does
+  (docs/architecture.md §136).
+- A GraphQL websocket now closes (code 4403, "credential expired") when
+  the JWT from its `connection_init` expires, `exp` plus the usual
+  leeway. The token was only checked when the connection opened, so the
+  connection and every subscription started on it later kept serving its
+  role indefinitely. Clients reconnect with a fresh token
+  (docs/architecture.md §135).
 - A JWT whose `nbf` (not before) claim is still in the future is now
   refused. `jsonwebtoken` skips that check unless asked, so a token
   issued to become valid later was accepted immediately. A token with no

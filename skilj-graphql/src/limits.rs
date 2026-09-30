@@ -35,6 +35,18 @@ pub struct GraphqlLimits {
     /// ends. Each holds its own event-broadcast receiver and filters
     /// every committed event. Default 100.
     pub max_subscriptions_per_connection: usize,
+    /// How long a websocket may stay open without sending
+    /// `connection_init`; after that it is closed with 4408, graphql-ws's
+    /// "Connection initialisation timeout". Default 10 seconds
+    /// (docs/architecture.md §136).
+    pub websocket_init_timeout: std::time::Duration,
+    /// How often the server sends a websocket ping frame. A connection
+    /// from which nothing - not even the pong every websocket client
+    /// answers a ping with automatically - has arrived for two intervals
+    /// is treated as dead and dropped, freeing its subscriptions. `None`
+    /// sends no pings and never drops a quiet connection. Default 30
+    /// seconds (docs/architecture.md §136).
+    pub websocket_ping_interval: Option<std::time::Duration>,
 }
 
 impl Default for GraphqlLimits {
@@ -45,6 +57,8 @@ impl Default for GraphqlLimits {
             max_complexity: 2000,
             max_expensive_fields: 10,
             max_subscriptions_per_connection: 100,
+            websocket_init_timeout: std::time::Duration::from_secs(10),
+            websocket_ping_interval: Some(std::time::Duration::from_secs(30)),
         }
     }
 }

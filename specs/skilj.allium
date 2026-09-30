@@ -1145,6 +1145,11 @@ entity BootstrapSecret {
 -- how much validity the external JWT itself has left, and no denylist
 -- of outstanding JWTs is needed.
 --
+-- A websocket connection presents its JWT once, when it opens, and every
+-- subscription started on it relies on that verification. The connection
+-- therefore lasts no longer than the JWT is valid: once it expires, the
+-- connection is closed, and the caller reconnects with a fresh one.
+--
 -- What "the trusted IdP" resolves to concretely is runtime/library
 -- configuration, not domain state. A deployment trusts exactly one
 -- external IdP, and that IdP's JWKS endpoint, issuer, the audience its

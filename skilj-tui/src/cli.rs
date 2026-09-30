@@ -1,6 +1,7 @@
-//! v1 config: endpoint + token + bounded context, all supplied up front
-//! (flag or env var), no in-app login flow - see this crate's own doc
-//! comment on why it never talks to an IdP itself.
+//! v1 config: endpoint + token (or a command producing one) + bounded
+//! context, all supplied up front (flag or env var), no in-app login
+//! flow - see this crate's own doc comment on why it never talks to an
+//! IdP itself.
 
 use clap::Parser;
 
@@ -17,8 +18,17 @@ pub struct Args {
     /// A bearer JWT for a Role with (at least) Admin access to
     /// `--bounded-context` - obtained however this deployment's own IdP
     /// issues one. `skilj-demo`'s own server prints one ready to use.
-    #[arg(long, env = "SKILJ_TOKEN")]
-    pub token: String,
+    /// Used until it expires; for longer sessions use `--token-command`.
+    #[arg(long, env = "SKILJ_TOKEN", required_unless_present = "token_command")]
+    pub token: Option<String>,
+
+    /// A shell command printing such a JWT on stdout, e.g. an IdP's own
+    /// CLI (`gcloud auth print-identity-token`, `oidc-token <account>`).
+    /// Run at startup, and again whenever the server says the token has
+    /// expired, so a session outlives any one token. Takes precedence
+    /// over `--token`.
+    #[arg(long, env = "SKILJ_TOKEN_COMMAND")]
+    pub token_command: Option<String>,
 
     /// The bounded context to operate on. Superadmin-only operations
     /// (the cross-context directory, admin console) aren't in v1 - see

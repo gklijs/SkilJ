@@ -2726,7 +2726,8 @@ the wire protocol - the same "independently usable" spirit §3.1 gives
 `skilj-graphql`/`skilj-rest`, from the client side this time. It never
 talks to an IdP itself either: endpoint, bearer token, and bounded
 context are all supplied up front (flag or env var -
-`SKILJ_GRAPHQL_URL`/`SKILJ_TOKEN`/`SKILJ_BOUNDED_CONTEXT`), the same
+`SKILJ_GRAPHQL_URL`/`SKILJ_TOKEN`/`SKILJ_BOUNDED_CONTEXT`, or
+`SKILJ_TOKEN_COMMAND` for a command that prints the token, §137), the same
 credential presented however `curl -H 'authorization: Bearer <jwt>'`
 already would be. Two real gaps this surfaced, both closed rather than
 silently worked around:
@@ -10248,3 +10249,58 @@ A caller-supplied idempotency key - GraphQL `submitCommand(idempotencyKey:)`, RE
 Tests:
 - `an_idempotency_key_over_the_bound_is_refused` (`skilj-core/tests/idempotency_key_bounds.rs`): 255 characters is accepted, 256 refused, 255 multi-byte characters accepted, and the reserved prefixes still refused.
 - `submit_command_refuses_an_overlong_idempotency_key` (GraphQL) and `command_trigger_refuses_an_overlong_idempotency_key` (REST): a 256-character key is refused with the code, and nothing is written.
+
+## 135. A websocket closes when its credential expires
+
+A GraphQL websocket authenticates once, in `connection_init`. The JWT was verified there - signature, audience, `exp`, `nbf` - and the resolved `Role` stored as connection data. Nothing looked at the token again: the connection, and any subscription a client started on it hours later, kept serving that role for as long as the socket stayed open. Revoking the skilj `Role` already closes its subscriptions (the revocation broadcaster), but an expiring token is how an IdP ends a session - a user disabled or logged out at the IdP simply stops getting fresh tokens - and that never reached an open socket.
+
+Fix: `access_control::verify_jwt` returns a `VerifiedJwt { subject, valid_until }`, where `valid_until` is `exp` plus the same leeway verification allows (`verify_and_extract_subject` is now a thin wrapper over it). `resolve_role_from_connection_init` passes the expiry on, and `serve_websocket` closes the connection at that moment with close code 4403 (graphql-ws's "Forbidden") and reason `credential expired`. A client reconnects with a fresh token, as graphql-ws clients do for a closed socket. An anonymous connection (no credential; only `createSuperadmin` needs none) has no expiry.
+
+`GraphQLWebSocket::serve` owns the socket's sink, so the handler gives it a channel-backed sink instead and forwards its output itself; that forwarding loop is what can send the close frame. Plain `POST /graphql` needs nothing: every request is verified on its own.
+
+Tests:
+- `a_websocket_is_closed_when_its_credential_expires` (`skilj/tests/event_subscription.rs`): a token past `exp` but inside the leeway connects and runs a subscription, then the server closes the socket with 4403 once the leeway runs out. Fails (times out) with the close disabled.
+- `verify_jwt_reports_when_the_token_stops_being_valid` (`skilj-core/tests/jwt_verification.rs`): `valid_until` is `exp` + 60s.
+
+## 136. Websockets that never authenticate, or whose peer is gone, are closed
+
+Two more ways a GraphQL websocket stayed open forever, next to §135's expired credential:
+
+- **No `connection_init`.** async-graphql has no initialisation timeout, so a client could upgrade and then say nothing, holding a connection and a task without ever presenting a credential. The graphql-ws protocol expects the server to close such a connection with 4408 ("Connection initialisation timeout"). It now does, after `GraphqlLimits::websocket_init_timeout` (default 10 seconds, measured to the arrival of `connection_init`, not to the end of its JWT verification, which has its own JWKS fetch timeout).
+- **A peer that vanished without closing** - a laptop lid, a NAT dropping state, a crashed process behind a proxy. Nothing detects this unless something is written to the socket, and a quiet subscription writes nothing. So the connection, its subscriptions and each one's event-broadcast receiver lived on. async-graphql's own `keepalive_timeout` doesn't help here: it closes when the *client* has sent nothing, and the common clients (graphql-ws's `keepAlive` defaults to off) send nothing while idle, so it would drop healthy subscribers. Instead the server sends a websocket ping frame every `websocket_ping_interval` (default 30 seconds). Every websocket client answers a ping with a pong by itself - browsers, `ws`, tungstenite (on its next read). A connection from which no frame at all has arrived for two intervals is dropped without a close frame, since nobody is reading. Each send is bounded by the same two intervals, so a dead peer whose socket buffers have filled can't stall the connection's loop until TCP gives up. `None` turns pings, and the dead-peer drop, off.
+
+Both are enforced in `serve_websocket`, the same forwarding loop §135 added: incoming frames pass through an `inspect` that records when the last one arrived, before async-graphql filters out control frames. skilj-tui's websocket reader, which treated any non-text frame as an error (and so would have reconnected on every ping), now skips ping and pong frames.
+
+Tests (`skilj/tests/event_subscription.rs`), each failing with its mechanism disabled:
+- `a_websocket_that_never_initialises_is_closed`: with a 300ms init timeout, a silent connection gets 4408.
+- `a_peer_answering_pings_is_kept_and_a_silent_one_dropped`: with a 200ms ping interval, a client that keeps reading stays connected for two seconds, and one that stops reading is dropped.
+
+## 137. skilj-tui refreshes an expired token with `--token-command`
+
+§135 closes a websocket when its JWT expires, and a query with an expired JWT has always been refused (`jwt_verification_failed`). skilj-tui took one token at startup (`--token`/`SKILJ_TOKEN`) and reconnected with it forever, so an operator's session ended with the token's lifetime - typically minutes to an hour - in a reconnect loop the operator could only fix by restarting.
+
+skilj-tui still never talks to an IdP itself (§11). Instead it takes `--token-command` (`SKILJ_TOKEN_COMMAND`): a shell command printing a JWT on stdout - an IdP's own CLI, `gcloud auth print-identity-token`, an `oidc-token` agent - the same pattern as kubectl's credential plugins. It is run at startup (a failure there is reported as plain output before the terminal is taken over) and again when the server refuses the current token:
+
+- **Live feed:** a 4403 close (`ClientError::CredentialExpired`) refreshes and reconnects at once, resuming from the last sequence (§106), with no backoff - an expiry is routine. A refused `connection_init` (`InitRefused`) also refreshes, but keeps the backoff, since it may be a token the command will keep printing.
+- **Queries and mutations:** a `jwt_verification_failed` refusal is retried once with a refreshed token. A second refusal is the answer; nothing loops.
+
+The token lives in one shared `TokenSource`, so a refresh from either side serves both. `refresh(stale)` runs the command only if the token is still the one that was refused, under a lock: several requests refused at once run it once. The command runs with stdin closed and stderr captured (the TUI owns the terminal), with a two-minute timeout for a helper that opens a browser. `--token` alone behaves as before; given both, the command wins, so an exported `SKILJ_TOKEN` doesn't get in the way.
+
+Tests (`skilj-tui/tests/token_refresh.rs`, against mock servers shaped like skilj's responses): the live feed reconnects with the fresh token after a 4403 without waiting out a 30-second backoff, resuming from sequence 5; a refused query is retried once with the fresh token, and only once when the command keeps printing a refused one; a fixed token isn't retried; eight concurrent refreshes run the command once.
+
+## 138. Each caller is served only its own bounded contexts' schema
+
+`ProjectionQuery` gives every registered projection a GraphQL type named `{bounded_context}_{projection}`, with its state's fields (§5.1). There was one schema for everyone, and introspection needs no credential - GraphQL-over-HTTP runs it without resolvers, so `require_caller` never saw it. Anyone who could reach `/graphql` could list every bounded context that has a projection, and each projection's shape. That is what `boundedContexts` keeps to superadmins (`surface BoundedContextDirectory`), and with templated bounded contexts (one per tenant) it's the tenant list. Any authenticated Role - one tenant's reader - saw every other tenant's too. Blocking introspection alone wouldn't have closed it: a query using `... on acme_Orders` passed or failed *validation* depending on whether that type existed, an existence oracle no resolver check can reach.
+
+async-graphql's dynamic schema has no per-caller type visibility, so each caller gets a schema of its own. `SchemaRegistry::for_caller`:
+- a superadmin gets the full schema, as before;
+- any other Role gets one built with only the projection types of bounded contexts it has an active mapping to (`db::list_accessible_bounded_context_names`, one indexed query per request, so a new grant or a revocation takes effect on the next request);
+- a caller with no credential gets the one with none, and introspection disabled on top (only `createSuperadmin` works without a credential anyway).
+
+Scoped schemas are cached per set of bounded contexts, with the registry's generation, which every `rebuild` bumps and which also clears the cache; one built while a rebuild ran is served but not kept. At most 1024 are kept before the cache starts over. A bounded context the caller can't see now looks exactly like one that doesn't exist, in validation errors too; resolvers already answered both with `grant_not_active`.
+
+The websocket needed the same, and couldn't pick a schema at upgrade time any more: the caller is only known after `connection_init`. `CallerExecutor` sits in front of the schema; `on_connection_init` records the caller, and each operation on the connection runs against `for_caller`'s schema. A side effect: a subscription started on a long-lived connection now sees projections registered since it opened, where it used to see the schema as of connection time.
+
+Tests (`skilj/tests/projection_query.rs`):
+- `each_caller_sees_only_its_own_bounded_contexts_in_the_schema`: two bounded contexts with a projection each. No credential: `__schema` is `null`. A reader of one: its type, and no type naming the other. A superadmin: both. After granting the reader the other: both. Fails with every caller served the full schema.
+- `projection_query_end_to_end`'s stranger case used to expect `grant_not_active`; the stranger's query now fails validation, and the test asserts it fails with the same message as a query naming a bounded context that doesn't exist.

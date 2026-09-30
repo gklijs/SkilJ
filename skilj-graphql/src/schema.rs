@@ -23,14 +23,37 @@ use crate::resolvers;
 use crate::GraphqlState;
 use arc_swap::ArcSwap;
 use async_graphql::dynamic::{Object, Schema, Subscription};
+use skilj_core::access_control::Role;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Most per-caller schemas kept at once (one per distinct set of
+/// accessible bounded contexts); past it the cache starts over.
+const MAX_SCOPED_SCHEMAS: usize = 1024;
+
+/// Per-caller schemas by the bounded contexts they include, each with
+/// the generation it was built under.
+type ScopedSchemas = HashMap<BTreeSet<String>, (u64, Arc<Schema>)>;
 
 /// Holds the live schema behind an `ArcSwap`, so a request in flight
 /// keeps using whichever `Arc<Schema>` it already loaded even if
 /// [`rebuild`](SchemaRegistry::rebuild) swaps in a new one concurrently -
 /// no lock a request has to wait on, no torn reads.
+///
+/// The live schema holds every bounded context's projection types, named
+/// after the bounded context. Only a superadmin is served it: anyone else
+/// gets a schema built from just the bounded contexts they have access
+/// to - none, for a caller with no credential - so neither introspection
+/// nor a query's validation errors reveal which other bounded contexts
+/// (tenants) exist (docs/architecture.md §138). Those are built on
+/// demand and cached per set of bounded contexts until the next rebuild.
 pub struct SchemaRegistry {
     current: ArcSwap<Schema>,
+    /// Bumped by every [`rebuild`](SchemaRegistry::rebuild); a scoped
+    /// schema built under an older one is stale.
+    generation: AtomicU64,
+    scoped: std::sync::Mutex<ScopedSchemas>,
 }
 
 impl SchemaRegistry {
@@ -40,16 +63,53 @@ impl SchemaRegistry {
     /// `event_broadcaster`/`revocation_broadcaster`/`event_cache`
     /// already live in.
     pub async fn build(state: GraphqlState) -> skilj_core::error::Result<Self> {
-        let schema = build(state).await?;
+        let schema = build(state, None).await?;
         Ok(Self {
             current: ArcSwap::from_pointee(schema),
+            generation: AtomicU64::new(0),
+            scoped: Default::default(),
         })
     }
 
-    /// The live schema - `graphql_handler`/`graphql_ws_handler`'s own
-    /// per-request read, never cached beyond one request.
+    /// The live schema, with every bounded context's projection types -
+    /// what a superadmin is served. Requests go through
+    /// [`for_caller`](SchemaRegistry::for_caller).
     pub fn current(&self) -> Arc<Schema> {
         self.current.load_full()
+    }
+
+    /// The schema `caller` is served: the full one for a superadmin,
+    /// otherwise one with only the projection types of bounded contexts
+    /// `caller` has an active mapping to (docs/architecture.md §138).
+    pub async fn for_caller(
+        &self,
+        state: &GraphqlState,
+        caller: Option<&Role>,
+    ) -> skilj_core::error::Result<Arc<Schema>> {
+        let visible = match caller {
+            Some(role) if role.superadmin => return Ok(self.current()),
+            Some(role) => {
+                skilj_core::db::list_accessible_bounded_context_names(&state.pool, &role.id).await?
+            }
+            None => BTreeSet::new(),
+        };
+        let generation = self.generation.load(Ordering::Acquire);
+        if let Some((built_at, schema)) = self.scoped.lock().unwrap().get(&visible) {
+            if *built_at == generation {
+                return Ok(schema.clone());
+            }
+        }
+        let schema = Arc::new(build(state.clone(), Some(&visible)).await?);
+        let mut scoped = self.scoped.lock().unwrap();
+        // Built from what the database held before a concurrent rebuild
+        // perhaps changed it: served to this caller, but not kept.
+        if self.generation.load(Ordering::Acquire) == generation {
+            if scoped.len() >= MAX_SCOPED_SCHEMAS && !scoped.contains_key(&visible) {
+                scoped.clear();
+            }
+            scoped.insert(visible, (generation, schema.clone()));
+        }
+        Ok(schema)
     }
 
     /// Rebuilds from scratch and atomically swaps in the result. `state`
@@ -59,8 +119,10 @@ impl SchemaRegistry {
     /// already holds (`Skilj` itself, via `skilj::cross_instance`'s
     /// dispatch loop).
     pub async fn rebuild(&self, state: GraphqlState) -> skilj_core::error::Result<()> {
-        let schema = build(state).await?;
+        let schema = build(state, None).await?;
         self.current.store(Arc::new(schema));
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.scoped.lock().unwrap().clear();
         Ok(())
     }
 }
@@ -83,8 +145,14 @@ impl SchemaRegistry {
 /// `None` (nothing registered anywhere yet) omits the `projection` field
 /// and the `ProjectionResult` union entirely, rather than registering an
 /// invalid zero-member union.
-async fn build(state: GraphqlState) -> skilj_core::error::Result<Schema> {
-    let projection_types = projection_types::build(&state.pool).await?;
+///
+/// `visible` limits the projection types to those bounded contexts'
+/// (docs/architecture.md §138); `None` includes all of them.
+async fn build(
+    state: GraphqlState,
+    visible: Option<&BTreeSet<String>>,
+) -> skilj_core::error::Result<Schema> {
+    let projection_types = projection_types::build(&state.pool, visible).await?;
 
     let mut query = Object::new("Query")
         .field(resolvers::bounded_context_directory::field())

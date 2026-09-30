@@ -55,7 +55,9 @@ pub async fn resolve_role(
             "Authorization header is not a well-formed \"Bearer <jwt>\" credential",
         ));
     };
-    verify_jwt_to_role(jwt, identity, pool).await.map(Some)
+    verify_jwt_to_role(jwt, identity, pool)
+        .await
+        .map(|(role, _)| Some(role))
 }
 
 /// `resolve_role`'s own counterpart for a GraphQL-over-websocket
@@ -68,11 +70,15 @@ pub async fn resolve_role(
 /// same "some callers need none" case `resolve_role` itself allows;
 /// `Err` (rejecting the whole connection before any subscription starts)
 /// for anything present but invalid, mirroring `resolve_role` exactly.
+///
+/// Also returns when the credential expires: unlike a single request, a
+/// websocket outlives its JWT, so the caller closes it then
+/// (docs/architecture.md §135).
 pub async fn resolve_role_from_connection_init(
     payload: &serde_json::Value,
     identity: Option<&Identity>,
     pool: &Pool,
-) -> Result<Option<Role>, async_graphql::Error> {
+) -> Result<Option<(Role, std::time::SystemTime)>, async_graphql::Error> {
     let Some(header_value) = payload
         .get("Authorization")
         .or_else(|| payload.get("authorization"))
@@ -100,7 +106,7 @@ async fn verify_jwt_to_role(
     jwt: &str,
     identity: Option<&Identity>,
     pool: &Pool,
-) -> Result<Role, async_graphql::Error> {
+) -> Result<(Role, std::time::SystemTime), async_graphql::Error> {
     let Some(identity) = identity else {
         return Err(async_graphql::Error::new(
             "this deployment has no identity_provider configured - no bearer JWT can ever verify",
@@ -108,13 +114,12 @@ async fn verify_jwt_to_role(
         .extend_with(|_, ext| ext.set("code", "no_identity_provider_configured")));
     };
 
-    let verified_subject = skilj_core::access_control::verify_and_extract_subject(
-        jwt,
-        &identity.config,
-        &identity.cache,
-    )
-    .await
-    .map_err(crate::error::to_graphql_error)?;
+    let skilj_core::access_control::VerifiedJwt {
+        subject: verified_subject,
+        valid_until,
+    } = skilj_core::access_control::verify_jwt(jwt, &identity.config, &identity.cache)
+        .await
+        .map_err(crate::error::to_graphql_error)?;
 
     // Only the row that can match, not the whole roles table on every
     // request (docs/architecture.md §110).
@@ -125,7 +130,7 @@ async fn verify_jwt_to_role(
         skilj_core::access_control::resolve_role_by_external_subject(&verified_subject, &roles)
             .map_err(crate::error::to_graphql_error)?
             .clone();
-    Ok(role)
+    Ok((role, valid_until))
 }
 
 fn malformed_credential(message: &str) -> async_graphql::Error {

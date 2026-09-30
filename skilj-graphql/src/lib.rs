@@ -255,18 +255,88 @@ async fn graphql_handler(
     headers: axum::http::HeaderMap,
     req: async_graphql_axum::GraphQLRequest,
 ) -> async_graphql_axum::GraphQLResponse {
-    // The live schema, read fresh for this one request - a concurrent
-    // `SchemaRegistry::rebuild` (another registration change, on this
-    // instance or another) never affects a request already in flight,
-    // since this is an `Arc` snapshot, not a lock.
-    let schema = registry.current();
     let response = match auth::resolve_role(&headers, state.identity.as_ref(), &state.pool).await {
-        Ok(role) => schema.execute(req.into_inner().data(role)).await,
+        Ok(role) => execute_as(&registry, &state, role, req.into_inner()).await,
         Err(err) => async_graphql::Response::from_errors(vec![
             err.into_server_error(async_graphql::Pos::default())
         ]),
     };
     response.into()
+}
+
+/// Runs `request` against the schema `caller` is served
+/// (`SchemaRegistry::for_caller`, docs/architecture.md §138), read fresh
+/// for this one request - a concurrent `SchemaRegistry::rebuild` never
+/// affects a request already in flight, since it's an `Arc` snapshot,
+/// not a lock. A caller with no credential gets no introspection at all.
+async fn execute_as(
+    registry: &schema::SchemaRegistry,
+    state: &GraphqlState,
+    caller: Option<skilj_core::access_control::Role>,
+    mut request: async_graphql::Request,
+) -> async_graphql::Response {
+    let schema = match registry.for_caller(state, caller.as_ref()).await {
+        Ok(schema) => schema,
+        Err(e) => {
+            return async_graphql::Response::from_errors(vec![
+                error::to_graphql_error(e).into_server_error(async_graphql::Pos::default())
+            ])
+        }
+    };
+    if caller.is_none() {
+        request = request.disable_introspection();
+    }
+    schema.execute(request.data(caller)).await
+}
+
+/// The websocket's executor: each operation runs against the schema its
+/// connection's caller is served (docs/architecture.md §138). The caller
+/// is only known once `connection_init` has been handled, after the
+/// websocket is set up, so it's filled in then; choosing per operation
+/// also means a subscription started later on a long-lived connection
+/// sees the schema as it is by then.
+#[derive(Clone)]
+struct CallerExecutor {
+    registry: Arc<schema::SchemaRegistry>,
+    state: GraphqlState,
+    caller: Arc<std::sync::OnceLock<Option<skilj_core::access_control::Role>>>,
+}
+
+impl async_graphql::Executor for CallerExecutor {
+    async fn execute(&self, request: async_graphql::Request) -> async_graphql::Response {
+        let caller = self.caller.get().cloned().flatten();
+        execute_as(&self.registry, &self.state, caller, request).await
+    }
+
+    fn execute_stream(
+        &self,
+        request: async_graphql::Request,
+        session_data: Option<Arc<async_graphql::Data>>,
+    ) -> async_graphql::futures_util::stream::BoxStream<'static, async_graphql::Response> {
+        use async_graphql::futures_util::{stream, StreamExt};
+        let this = self.clone();
+        stream::once(async move {
+            let caller = this.caller.get().cloned().flatten();
+            match this.registry.for_caller(&this.state, caller.as_ref()).await {
+                Ok(schema) => {
+                    let request = if caller.is_none() {
+                        request.disable_introspection()
+                    } else {
+                        request
+                    };
+                    async_graphql::Executor::execute_stream(&*schema, request, session_data)
+                }
+                Err(e) => stream::once(async move {
+                    async_graphql::Response::from_errors(vec![
+                        error::to_graphql_error(e).into_server_error(async_graphql::Pos::default())
+                    ])
+                })
+                .boxed(),
+            }
+        })
+        .flatten()
+        .boxed()
+    }
 }
 
 /// Upgrades to a GraphQL-over-websocket connection for `EventSubscription`.
@@ -291,12 +361,6 @@ async fn graphql_ws_handler(
     protocol: async_graphql_axum::GraphQLProtocol,
     upgrade: axum::extract::WebSocketUpgrade,
 ) -> impl axum::response::IntoResponse {
-    // `Schema` is `Clone`-cheap (its own doc comment: internally
-    // `Arc`-wrapped) - a subscription's whole lifetime uses whichever
-    // schema was live at connection time, the same "one snapshot, no
-    // torn reads" treatment `graphql_handler` gets, just held for
-    // longer.
-    let schema = (*registry.current()).clone();
     // The same cap `POST /graphql` bodies get (docs/architecture.md §73):
     // each websocket message is a GraphQL document too, and it arrives
     // before (or without) any credential - axum's own default would
@@ -306,25 +370,209 @@ async fn graphql_ws_handler(
         .max_message_size(max_message)
         .max_frame_size(max_message)
         .protocols(async_graphql::http::ALL_WEBSOCKET_PROTOCOLS)
-        .on_upgrade(move |socket| {
-            async_graphql_axum::GraphQLWebSocket::new(socket, schema, protocol)
-                .on_connection_init(move |payload| {
-                    let state = state.clone();
-                    async move {
-                        let role = auth::resolve_role_from_connection_init(
-                            &payload,
-                            state.identity.as_ref(),
-                            &state.pool,
-                        )
-                        .await?;
-                        let mut data = async_graphql::Data::default();
-                        data.insert(role);
-                        // docs/architecture.md §74 - this connection's
-                        // own running-subscription count.
-                        data.insert(limits::ConnectionSubscriptions::default());
-                        Ok(data)
+        .on_upgrade(move |socket| serve_websocket(socket, registry, protocol, state))
+}
+
+/// Close code sent when the connection's credential expires
+/// (docs/architecture.md §135) - graphql-ws's own "Forbidden".
+pub const CREDENTIAL_EXPIRED_CLOSE_CODE: u16 = 4403;
+
+/// Close code sent when no `connection_init` arrives within
+/// `GraphqlLimits::websocket_init_timeout` (docs/architecture.md §136) -
+/// graphql-ws's own "Connection initialisation timeout".
+pub const INIT_TIMEOUT_CLOSE_CODE: u16 = 4408;
+
+/// Why [`serve_websocket`] closes a connection itself.
+enum ServerClose {
+    InitTimeout,
+    CredentialExpired,
+}
+
+/// One GraphQL websocket connection. On top of what
+/// `GraphQLWebSocket::serve` does, this bounds its lifetime:
+///
+/// - The JWT presented in `connection_init` is only verified then, but
+///   the connection - and every subscription started on it later - can
+///   outlive it by hours. It is closed with
+///   [`CREDENTIAL_EXPIRED_CLOSE_CODE`] once the token's `exp` (plus
+///   verification leeway) passes; a client reconnects with a fresh token
+///   (docs/architecture.md §135).
+/// - A connection that never sends `connection_init` is closed with
+///   [`INIT_TIMEOUT_CLOSE_CODE`], and one whose peer has gone away
+///   without closing (answering no pings) is dropped, instead of either
+///   being held open forever (docs/architecture.md §136).
+///
+/// `GraphQLWebSocket::serve` owns the socket's sink, so its output goes
+/// through a channel and is forwarded here, which leaves this loop able
+/// to send pings and close frames itself.
+async fn serve_websocket(
+    socket: axum::extract::ws::WebSocket,
+    registry: Arc<schema::SchemaRegistry>,
+    protocol: async_graphql_axum::GraphQLProtocol,
+    state: GraphqlState,
+) {
+    use async_graphql::futures_util::{sink, StreamExt};
+    use axum::extract::ws::{CloseFrame, Message};
+
+    let limits = state.limits;
+    let opened_at = tokio::time::Instant::now();
+    // Milliseconds after `opened_at` that the last frame of any kind -
+    // pongs included - arrived from the peer.
+    let last_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (mut ws_sink, ws_stream) = socket.split();
+    let ws_stream = ws_stream.inspect({
+        let last_received = last_received.clone();
+        move |_| {
+            last_received.store(
+                opened_at.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    });
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(16);
+    let out_sink = sink::unfold(out_tx, |out_tx, message: Message| async move {
+        out_tx.send(message).await.map(|()| out_tx)
+    });
+    // Sent the moment `connection_init` arrives.
+    let (init_received_tx, init_received_rx) = tokio::sync::oneshot::channel::<()>();
+    // Sent once `connection_init` authenticates with a JWT; dropped
+    // unsent for an anonymous or refused connection, which never expires.
+    let (valid_until_tx, valid_until_rx) = tokio::sync::oneshot::channel::<std::time::SystemTime>();
+
+    let executor = CallerExecutor {
+        registry,
+        state: state.clone(),
+        caller: Default::default(),
+    };
+    let caller = executor.caller.clone();
+
+    let serve = async_graphql_axum::GraphQLWebSocket::new_with_pair(
+        out_sink, ws_stream, executor, protocol,
+    )
+    .on_connection_init(move |payload| {
+        let _ = init_received_tx.send(());
+        async move {
+            let credential = auth::resolve_role_from_connection_init(
+                &payload,
+                state.identity.as_ref(),
+                &state.pool,
+            )
+            .await?;
+            let mut data = async_graphql::Data::default();
+            let role = credential.map(|(role, valid_until)| {
+                let _ = valid_until_tx.send(valid_until);
+                role
+            });
+            let _ = caller.set(role.clone());
+            data.insert(role);
+            // docs/architecture.md §74 - this connection's own
+            // running-subscription count.
+            data.insert(limits::ConnectionSubscriptions::default());
+            Ok(data)
+        }
+    })
+    .serve();
+    let server_close = async move {
+        if tokio::time::timeout(limits.websocket_init_timeout, init_received_rx)
+            .await
+            .is_err()
+        {
+            return ServerClose::InitTimeout;
+        }
+        match valid_until_rx.await {
+            Ok(valid_until) => {
+                let remaining = valid_until
+                    .duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default();
+                tokio::time::sleep(remaining).await;
+                ServerClose::CredentialExpired
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::pin!(serve, server_close);
+    let mut ping = limits.websocket_ping_interval.map(|interval| {
+        let mut ping = tokio::time::interval_at(opened_at + interval, interval);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping
+    });
+    // A peer silent this long is gone. Also bounds each send: a gone
+    // peer stops reading, and once the socket's buffers fill a send
+    // would otherwise wait out TCP's own retransmission timeout.
+    let dead_after = limits.websocket_ping_interval.map(|interval| interval * 2);
+
+    let mut serving = true;
+    loop {
+        tokio::select! {
+            () = &mut serve, if serving => serving = false,
+            message = out_rx.recv() => match message {
+                Some(message) => {
+                    if !send_bounded(&mut ws_sink, message, dead_after).await {
+                        return;
                     }
-                })
-                .serve()
-        })
+                }
+                // `serve` finished and everything it sent is forwarded.
+                None => return,
+            },
+            () = next_ping(&mut ping) => {
+                let dead_after = dead_after.unwrap_or_default();
+                let silent_for = opened_at.elapsed().saturating_sub(std::time::Duration::from_millis(
+                    last_received.load(std::sync::atomic::Ordering::Relaxed),
+                ));
+                if silent_for >= dead_after {
+                    // Nothing to say goodbye to: the peer isn't reading.
+                    return;
+                }
+                if !send_bounded(&mut ws_sink, Message::Ping(Default::default()), Some(dead_after)).await {
+                    return;
+                }
+            }
+            reason = &mut server_close => {
+                let (code, reason) = match reason {
+                    ServerClose::InitTimeout => {
+                        (INIT_TIMEOUT_CLOSE_CODE, "connection initialisation timeout")
+                    }
+                    ServerClose::CredentialExpired => {
+                        (CREDENTIAL_EXPIRED_CLOSE_CODE, "credential expired")
+                    }
+                };
+                let close = Message::Close(Some(CloseFrame {
+                    code,
+                    reason: reason.into(),
+                }));
+                send_bounded(&mut ws_sink, close, dead_after).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Sends `message`, giving up after `limit`. `false` when the socket is
+/// closed or the send timed out.
+async fn send_bounded(
+    sink: &mut async_graphql::futures_util::stream::SplitSink<
+        axum::extract::ws::WebSocket,
+        axum::extract::ws::Message,
+    >,
+    message: axum::extract::ws::Message,
+    limit: Option<std::time::Duration>,
+) -> bool {
+    use async_graphql::futures_util::SinkExt;
+    match limit {
+        Some(limit) => matches!(
+            tokio::time::timeout(limit, sink.send(message)).await,
+            Ok(Ok(()))
+        ),
+        None => sink.send(message).await.is_ok(),
+    }
+}
+
+/// The next ping tick, or never when pings are off.
+async fn next_ping(ping: &mut Option<tokio::time::Interval>) {
+    match ping {
+        Some(ping) => {
+            ping.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }

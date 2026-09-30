@@ -5216,6 +5216,23 @@ async fn mappings_from_rows(
         .collect())
 }
 
+/// The names of the bounded contexts `role_id` has an active mapping to -
+/// just the names, for the per-caller GraphQL schema
+/// (docs/architecture.md §138), which needs nothing else.
+pub async fn list_accessible_bounded_context_names(
+    pool: &Pool,
+    role_id: &str,
+) -> crate::error::Result<std::collections::BTreeSet<String>> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT bounded_context FROM role_access_mappings \
+         WHERE role_id = $1 AND status = 'active'",
+    )
+    .bind(role_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(names.into_iter().collect())
+}
+
 /// Every currently-*active* `RoleAccessMapping` for one `Role` - the
 /// `active_mappings` parameter `revoke_role` expects (see its own doc
 /// comment: "as already looked up by the caller").

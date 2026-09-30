@@ -687,8 +687,10 @@ fn projection_query_end_to_end() {
         assert_eq!(response["data"]["projection"]["total"], 20);
 
         // A caller with no grant on this bounded context at all is
-        // rejected - GrantScopedToBoundedContext's own "no mapping
-        // collapses into the same rejection a revoked one gets".
+        // rejected - and can't even tell it exists: its schema has no
+        // `{bc}_AccountBalance` type, so the query fails validation exactly
+        // as one naming a bounded context that doesn't exist does
+        // (docs/architecture.md §138).
         let stranger_subject = unique_name("stranger");
         let stranger_role = Role {
             id: generate_token_id(),
@@ -711,9 +713,27 @@ fn projection_query_end_to_end() {
             json!({ "bc": bc_name, "name": "AccountBalance", "wait": null }),
         )
         .await;
+        let absent_type =
+            skilj_graphql::projection_types::graphql_type_name("no_such_context", "AccountBalance");
+        let absent = graphql_request(
+            &router,
+            Some(&stranger_jwt),
+            &query.replace(&type_name, &absent_type),
+            json!({ "bc": "no_such_context", "name": "AccountBalance", "wait": null }),
+        )
+        .await;
+        assert!(response["data"].is_null(), "{response}");
         assert_eq!(
-            response["errors"][0]["extensions"]["code"],
-            "grant_not_active"
+            response["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .replace(&type_name, "<type>"),
+            absent["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .replace(&absent_type, "<type>"),
+            "an existing bounded context answers a stranger as a missing one does: \
+             {response} vs {absent}"
         );
 
         // An unknown projection name - the resolver rejects before ever
@@ -1753,5 +1773,162 @@ fn colliding_projection_type_names_serve_one_and_refuse_the_other() {
             json!([{ "name": served[0] }]),
             "the type is the served projection's own: {response:?}"
         );
+    });
+}
+
+/// docs/architecture.md §138: the schema names a type after every
+/// bounded context with a projection, and introspection needed no
+/// credential - so anyone could list the bounded contexts (tenants)
+/// `boundedContexts` keeps to superadmins, with their projections'
+/// shapes. Now a caller is served only the types of bounded contexts it
+/// has access to: none and no introspection at all without a credential,
+/// its own with one, every one as superadmin - and a new grant shows up
+/// on the next request.
+#[test]
+fn each_caller_sees_only_its_own_bounded_contexts_in_the_schema() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let role = |prefix: &str, superadmin: bool| Role {
+            id: generate_token_id(),
+            external_subject: unique_name(prefix),
+            name: prefix.to_string(),
+            superadmin,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        let reconciler = role("reconciler", false);
+        let reader = role("reader", false);
+        let superadmin = role("superadmin", true);
+        for role in [&reconciler, &reader, &superadmin] {
+            skilj_core::db::insert_role(&pool, role).await.unwrap();
+        }
+        let context = |name: &str| BoundedContext {
+            name: name.to_string(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        let mapping = |role: &Role, bc: &BoundedContext, level: AccessLevel| RoleAccessMapping {
+            role: role.clone(),
+            bounded_context: bc.clone(),
+            level,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        let ours = context(&unique_name("ours"));
+        let theirs = context(&unique_name("theirs"));
+        for bc in [&ours, &theirs] {
+            skilj_core::db::insert_bounded_context(&pool, bc)
+                .await
+                .unwrap();
+            skilj_core::db::insert_role_access_mapping(
+                &pool,
+                &mapping(&reconciler, bc, AccessLevel::Admin),
+            )
+            .await
+            .unwrap();
+        }
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &mapping(&reader, &ours, AccessLevel::Read),
+        )
+        .await
+        .unwrap();
+
+        let (skilj, _) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(ours.name.clone())
+            .event_type::<MoneyDeposited>()
+            .projection::<AccountBalance>()
+            .bounded_context(theirs.name.clone())
+            .event_type::<MoneyDeposited>()
+            .projection::<AccountBalance>()
+            .reconciliation_role(reconciler.external_subject.clone())
+            .async_projection_poll_interval(std::time::Duration::from_secs(3600))
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+
+        let ours_type =
+            skilj_graphql::projection_types::graphql_type_name(&ours.name, "AccountBalance");
+        let theirs_type =
+            skilj_graphql::projection_types::graphql_type_name(&theirs.name, "AccountBalance");
+        let type_names = |response: &serde_json::Value| -> Vec<String> {
+            response["data"]["__schema"]["types"]
+                .as_array()
+                .map(|types| {
+                    types
+                        .iter()
+                        .map(|t| t["name"].as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        const INTROSPECT: &str = "{ __schema { types { name } } }";
+
+        let anonymous = graphql_request(&router, None, INTROSPECT, json!({})).await;
+        // async-graphql answers disabled introspection with `null`.
+        assert!(anonymous["data"]["__schema"].is_null(), "{anonymous}");
+        assert!(type_names(&anonymous).is_empty(), "{anonymous}");
+
+        let as_reader = graphql_request(
+            &router,
+            Some(&sign_jwt(&reader.external_subject)),
+            INTROSPECT,
+            json!({}),
+        )
+        .await;
+        let names = type_names(&as_reader);
+        assert!(names.contains(&ours_type), "{as_reader}");
+        assert!(!names.contains(&theirs_type), "{as_reader}");
+        assert!(
+            !names.iter().any(|name| name.contains(&theirs.name)),
+            "nothing names the other bounded context: {names:?}"
+        );
+
+        let as_superadmin = graphql_request(
+            &router,
+            Some(&sign_jwt(&superadmin.external_subject)),
+            INTROSPECT,
+            json!({}),
+        )
+        .await;
+        let names = type_names(&as_superadmin);
+        assert!(
+            names.contains(&ours_type) && names.contains(&theirs_type),
+            "{as_superadmin}"
+        );
+
+        // Access is looked up per request, so a grant takes effect at once.
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &mapping(&reader, &theirs, AccessLevel::Read),
+        )
+        .await
+        .unwrap();
+        let as_reader = graphql_request(
+            &router,
+            Some(&sign_jwt(&reader.external_subject)),
+            INTROSPECT,
+            json!({}),
+        )
+        .await;
+        assert!(type_names(&as_reader).contains(&theirs_type), "{as_reader}");
     });
 }

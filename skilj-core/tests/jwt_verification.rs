@@ -14,7 +14,7 @@
 use jsonwebtoken::{EncodingKey, Header};
 use serde_json::json;
 use skilj_core::access_control::{
-    verify_and_extract_subject, IdpConfig, JwksCache, SigningAlgorithm,
+    verify_and_extract_subject, verify_jwt, IdpConfig, JwksCache, SigningAlgorithm,
 };
 use skilj_core::error::SkiljRejection;
 
@@ -208,6 +208,37 @@ fn verify_and_extract_subject_succeeds_for_a_validly_signed_jwt() {
             .await
             .unwrap();
         assert_eq!(subject, "user-123");
+    });
+}
+
+/// docs/architecture.md §135: `valid_until` is the token's `exp` plus the
+/// 60s leeway verification allows - what a websocket is closed at.
+#[test]
+fn verify_jwt_reports_when_the_token_stops_being_valid() {
+    runtime().block_on(async {
+        let jwks_url = serve_jwks().await;
+        let config = idp_config(&jwks_url);
+        let cache = JwksCache::new(config.jwks_endpoint.clone());
+        let jwt = sign_jwt(
+            "sub",
+            "user-123",
+            TEST_KID,
+            TEST_ISSUER,
+            TEST_PRIVATE_KEY_PEM,
+            false,
+        );
+        let exp = jsonwebtoken::dangerous::insecure_decode::<serde_json::Value>(&jwt)
+            .unwrap()
+            .claims["exp"]
+            .as_u64()
+            .unwrap();
+
+        let verified = verify_jwt(&jwt, &config, &cache).await.unwrap();
+        assert_eq!(verified.subject, "user-123");
+        assert_eq!(
+            verified.valid_until,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(exp + 60)
+        );
     });
 }
 

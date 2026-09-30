@@ -12,7 +12,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use skilj_tui::app::{App, AppEvent};
-use skilj_tui::graphql::{self, Client};
+use skilj_tui::graphql::{self, Client, TokenSource};
 use skilj_tui::{cli, ui};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -20,12 +20,28 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = cli::Args::parse();
-    let client = Arc::new(Client::new(args.endpoint.clone(), args.token.clone()));
+    // Before the terminal is taken over, so a failing token command's
+    // error reaches the operator as plain output.
+    let token = match (&args.token, &args.token_command) {
+        (_, Some(command)) => match TokenSource::from_command(command.clone()).await {
+            Ok(token) => token,
+            Err(e) => {
+                eprintln!("skilj-tui: {e}");
+                std::process::exit(1);
+            }
+        },
+        (Some(token), None) => TokenSource::fixed(token.clone()),
+        (None, None) => unreachable!("clap requires --token or --token-command"),
+    };
+    let client = Arc::new(Client::with_token_source(
+        args.endpoint.clone(),
+        token.clone(),
+    ));
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
     spawn_terminal_input_reader(tx.clone());
-    spawn_live_events_subscription(&args, tx.clone());
+    spawn_live_events_subscription(&args, token, tx.clone());
 
     let mut app = App::new(client, args.bounded_context.clone(), tx);
 
@@ -68,13 +84,17 @@ fn spawn_terminal_input_reader(tx: mpsc::UnboundedSender<AppEvent>) {
     });
 }
 
-fn spawn_live_events_subscription(args: &cli::Args, tx: mpsc::UnboundedSender<AppEvent>) {
+fn spawn_live_events_subscription(
+    args: &cli::Args,
+    token: TokenSource,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
     let ws_endpoint = graphql::to_websocket_url(&args.endpoint);
     // Reconnects, resuming from the last sequence shown, whenever the
     // server ends the subscription (docs/architecture.md §106).
     let mut rx = graphql::spawn_live_events(
         ws_endpoint,
-        args.token.clone(),
+        token,
         args.bounded_context.clone(),
         std::time::Duration::from_millis(500),
         std::time::Duration::from_secs(30),
