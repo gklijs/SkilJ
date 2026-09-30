@@ -3,7 +3,7 @@
 //! `BoundedContextArchival`'s per-context admin grant - see
 //! `bootstrap::delete_bounded_context`'s own doc comment).
 
-use super::{load_bounded_context_with_mappings, not_found, require_caller};
+use super::{load_bounded_context_with_mappings, not_found, require_superadmin};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -20,7 +20,7 @@ pub fn field() -> Field {
         TypeRef::named_nn("BoundedContext"),
         |ctx| {
             FieldFuture::new(async move {
-                let caller = require_caller(&ctx)?;
+                let caller = require_superadmin(&ctx)?;
                 let state = ctx.data::<GraphqlState>()?;
                 let name = ctx.args.try_get("name")?.string()?.to_string();
 

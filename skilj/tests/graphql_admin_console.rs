@@ -464,3 +464,84 @@ fn full_admin_console_lifecycle_end_to_end() {
         assert!(!contexts.iter().any(|c| c["name"] == bc_name));
     });
 }
+
+/// docs/architecture.md §139: the superadmin-only mutations looked up
+/// their bounded context (or role) before checking the caller was a
+/// superadmin, so any authenticated Role could tell an existing bounded
+/// context - the list of which is superadmin-only - from a missing one:
+/// "not found" versus "not a superadmin". Now both answer `not_superadmin`.
+#[test]
+fn a_non_superadmin_cannot_tell_existing_bounded_contexts_from_missing_ones() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+
+        let now = chrono::Utc::now();
+        let prober = skilj_core::access_control::Role {
+            id: generate_token_id(),
+            external_subject: unique_name("prober"),
+            name: "Prober".to_string(),
+            superadmin: false,
+            status: skilj_core::access_control::RoleStatus::Active,
+            created_at: now,
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &prober).await.unwrap();
+        let existing = unique_name("tenant");
+        skilj_core::db::insert_bounded_context(
+            &pool,
+            &skilj_core::event_store::BoundedContext {
+                name: existing.clone(),
+                status: skilj_core::event_store::BoundedContextStatus::Active,
+                created_at: now,
+                created_by: skilj_core::bootstrap::ContextCreator::SystemCreator,
+                template: None,
+            },
+        )
+        .await
+        .unwrap();
+        let missing = unique_name("no_such_tenant");
+        let jwt = sign_jwt(&prober.external_subject);
+
+        let mutations = [
+            "mutation($bc: String!) { deleteBoundedContext(name: $bc) { name } }",
+            "mutation($bc: String!) { resyncBoundedContextFromTemplate(boundedContext: $bc) { name } }",
+            "mutation($bc: String!, $role: ID!) { createBoundedContextFromTemplate(\
+                template: $bc, name: \"copy\", roleId: $role, level: READ, canReadSensitive: false) { name } }",
+            "mutation($bc: String!, $role: ID!) { grantRoleAccessMapping(\
+                roleId: $role, boundedContext: $bc, level: READ, canReadSensitive: false) { level } }",
+            "mutation($bc: String!, $role: ID!) { revokeRoleAccessMapping(roleId: $role, boundedContext: $bc) { level } }",
+        ];
+        for mutation in mutations {
+            for bc in [&existing, &missing] {
+                let response = graphql_request(
+                    &router,
+                    Some(&jwt),
+                    mutation,
+                    json!({ "bc": bc, "role": prober.id }),
+                )
+                .await;
+                assert_eq!(
+                    response["errors"][0]["extensions"]["code"], "not_superadmin",
+                    "{mutation} on {bc}: {response}"
+                );
+            }
+        }
+        for role in [prober.id.clone(), generate_token_id()] {
+            let response = graphql_request(
+                &router,
+                Some(&jwt),
+                "mutation($role: ID!) { revokeRole(roleId: $role) { id } }",
+                json!({ "role": role }),
+            )
+            .await;
+            assert_eq!(
+                response["errors"][0]["extensions"]["code"], "not_superadmin",
+                "{response}"
+            );
+        }
+    });
+}

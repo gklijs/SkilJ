@@ -105,6 +105,21 @@ pub fn require_caller(ctx: &ResolverContext) -> async_graphql::Result<Role> {
     })
 }
 
+/// [`require_caller`], refused unless an active superadmin - for the
+/// superadmin-only fields, before they look anything up. Checked after a
+/// lookup, a non-superadmin could tell an existing bounded context or
+/// role from a missing one ("not found" versus "not a superadmin") -
+/// the bounded context list is superadmin-only - and could make every
+/// request read a whole table (`createRole` lists every role,
+/// `grantRoleAccessMapping` every mapping) before being refused
+/// (docs/architecture.md §139). The core rules still check it too.
+pub fn require_superadmin(ctx: &ResolverContext) -> async_graphql::Result<Role> {
+    let caller = require_caller(ctx)?;
+    skilj_core::access_control::require_active_superadmin(&caller)
+        .map_err(crate::error::to_graphql_error)?;
+    Ok(caller)
+}
+
 /// The pre-resolution step every caller of `event_store::render_event`/
 /// `render_command` (via `query_events`/`inspect_event`/`fetch_commands`/
 /// `deliver_to_subscriptions`) needs before it can decrypt anything - a

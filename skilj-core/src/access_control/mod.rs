@@ -540,10 +540,12 @@ pub fn role_matches_required_team(role: &Role, required: Option<&str>) -> bool {
     }
 }
 
-/// `pub(crate)`: reused by `bootstrap::add_bounded_context`/
+/// Reused by `bootstrap::add_bounded_context`/
 /// `bootstrap::list_bounded_contexts` (both `facing caller: Superadmin`,
-/// the same actor every rule in this module already checks this way).
-pub(crate) fn require_active_superadmin(caller: &Role) -> crate::error::Result<()> {
+/// the same actor every rule in this module already checks this way),
+/// and by `skilj-graphql`'s superadmin-only resolvers, which check it
+/// before any lookup (docs/architecture.md §139).
+pub fn require_active_superadmin(caller: &Role) -> crate::error::Result<()> {
     if caller.status != RoleStatus::Active {
         return Err(Error::RoleNotActive.into());
     }

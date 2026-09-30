@@ -25,7 +25,7 @@
 //! validation/versioning/staging behaviour - wholesale rather than
 //! duplicating it.
 
-use super::{load_bounded_context_with_mappings, not_found, require_caller};
+use super::{load_bounded_context_with_mappings, not_found, require_superadmin};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -294,7 +294,7 @@ pub fn create_bounded_context_from_template_field() -> Field {
         TypeRef::named_nn("BoundedContext"),
         |ctx| {
             FieldFuture::new(async move {
-                let caller = require_caller(&ctx)?;
+                let caller = require_superadmin(&ctx)?;
                 let state = ctx.data::<GraphqlState>()?;
                 let template_name = ctx.args.try_get("template")?.string()?.to_string();
                 let name = ctx.args.try_get("name")?.string()?.to_string();
@@ -428,7 +428,7 @@ pub fn resync_bounded_context_from_template_field() -> Field {
         TypeRef::named_nn("BoundedContext"),
         |ctx| {
             FieldFuture::new(async move {
-                let caller = require_caller(&ctx)?;
+                let caller = require_superadmin(&ctx)?;
                 let state = ctx.data::<GraphqlState>()?;
                 let bounded_context_name =
                     ctx.args.try_get("boundedContext")?.string()?.to_string();

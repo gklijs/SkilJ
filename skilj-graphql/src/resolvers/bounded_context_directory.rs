@@ -3,7 +3,7 @@
 //! for real, and passes every context straight through unfiltered (see
 //! its own doc comment).
 
-use super::{load_bounded_context_with_mappings, not_found, require_caller};
+use super::{load_bounded_context_with_mappings, not_found, require_superadmin};
 use crate::error::to_graphql_error;
 use crate::gql_types::BoundedContextWithMappings;
 use crate::GraphqlState;
@@ -16,7 +16,7 @@ pub fn field() -> Field {
         TypeRef::named_nn_list_nn("BoundedContext"),
         |ctx| {
             FieldFuture::new(async move {
-                let caller = require_caller(&ctx)?;
+                let caller = require_superadmin(&ctx)?;
                 let state = ctx.data::<GraphqlState>()?;
 
                 let all_contexts = skilj_core::db::list_bounded_contexts(&state.pool)

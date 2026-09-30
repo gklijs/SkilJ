@@ -606,6 +606,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The superadmin-only GraphQL mutations (`deleteBoundedContext`,
+  `createBoundedContextFromTemplate`, `resyncBoundedContextFromTemplate`,
+  `grantRoleAccessMapping`, and the role ones) now refuse a
+  non-superadmin before looking anything up. They answered `not_found`
+  for a missing bounded context but `not_superadmin` for an existing one,
+  so any authenticated Role could probe which bounded contexts exist;
+  `createRole`/`grantRoleAccessMapping`/`addBoundedContext` also read a
+  whole table before refusing (docs/architecture.md §139).
 - GraphQL introspection no longer lists other tenants' bounded contexts.
   The schema names a type after every bounded context with a projection
   and introspection needed no credential, so anyone could enumerate the

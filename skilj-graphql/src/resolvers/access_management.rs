@@ -6,7 +6,7 @@
 //! real via `require_active_superadmin`, so this module never duplicates
 //! that check itself.
 
-use super::{not_found, require_caller};
+use super::{not_found, require_superadmin};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -17,7 +17,7 @@ use skilj_core::shared::generate_token_id;
 pub fn create_role_field() -> Field {
     Field::new("createRole", TypeRef::named_nn("Role"), |ctx| {
         FieldFuture::new(async move {
-            let caller = require_caller(&ctx)?;
+            let caller = require_superadmin(&ctx)?;
             let state = ctx.data::<GraphqlState>()?;
             let name = ctx.args.try_get("name")?.string()?.to_string();
             let superadmin = ctx.args.try_get("superadmin")?.boolean()?;
@@ -58,7 +58,7 @@ pub fn create_role_field() -> Field {
 pub fn revoke_role_field() -> Field {
     Field::new("revokeRole", TypeRef::named_nn("Role"), |ctx| {
         FieldFuture::new(async move {
-            let caller = require_caller(&ctx)?;
+            let caller = require_superadmin(&ctx)?;
             let state = ctx.data::<GraphqlState>()?;
             let role_id = ctx.args.try_get("roleId")?.string()?.to_string();
 
@@ -128,7 +128,7 @@ pub fn grant_role_access_mapping_field() -> Field {
         TypeRef::named_nn("RoleAccessMapping"),
         |ctx| {
             FieldFuture::new(async move {
-                let caller = require_caller(&ctx)?;
+                let caller = require_superadmin(&ctx)?;
                 let state = ctx.data::<GraphqlState>()?;
                 let role_id = ctx.args.try_get("roleId")?.string()?.to_string();
                 let bounded_context_name =
@@ -202,7 +202,7 @@ pub fn revoke_role_access_mapping_field() -> Field {
         TypeRef::named_nn("RoleAccessMapping"),
         |ctx| {
             FieldFuture::new(async move {
-                let caller = require_caller(&ctx)?;
+                let caller = require_superadmin(&ctx)?;
                 let state = ctx.data::<GraphqlState>()?;
                 let role_id = ctx.args.try_get("roleId")?.string()?.to_string();
                 let bounded_context_name =
