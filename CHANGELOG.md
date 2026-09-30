@@ -206,6 +206,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `fire_once` scheduled event type more than 1000 occurrences behind
+  (a per-second schedule after ~17 minutes of downtime) never fired
+  again: each scheduler tick walked 1000 occurrences from the same
+  position without reaching the last. It now raises the latest due
+  occurrence directly (docs/architecture.md §150).
 - The Kafka, AMQP and NATS bridges park an inbound message that isn't
   JSON on its first failure instead of retrying it through the whole
   retry policy, and the parked request keeps its content (as a JSON

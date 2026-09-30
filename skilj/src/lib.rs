@@ -3258,14 +3258,19 @@ const MAX_OCCURRENCES_PER_TICK: usize = 1000;
 /// since only a *successful* fire ever advances the real, shared
 /// position - without writing anywhere itself; only `db::fire_system_event`/
 /// `skip_missed_occurrences_for_event_type` ever touch the real
-/// `schedule_position`. This is what lets `fire_once` genuinely reach a
-/// backlog's own last occurrence within one tick, rather than being
-/// offered the same, correctly-rejected earliest one on every future
-/// tick too (the earlier version of this function's own bug: it only
-/// ever raised the first occurrence, so a `fire_once` type more than one
-/// occurrence behind could never fire again).
+/// `schedule_position`.
 ///
-/// Each raised occurrence is handled per policy:
+/// `fire_once` doesn't walk at all: it raises only the latest occurrence
+/// already due (`event_store::latest_occurrence_at_or_before`), the one
+/// its backlog collapses into - every earlier one would be rejected, and
+/// the position doesn't move until that last one fires. Walking to it
+/// from the position used to be how it was reached, which never arrived
+/// once the backlog outgrew `MAX_OCCURRENCES_PER_TICK`
+/// (docs/architecture.md §150); raising only the earliest, before that,
+/// never arrived at all.
+///
+/// Each occurrence raised for `skip`/`replay_backlog` is handled per
+/// policy:
 ///
 ///   - under `skip`, first checks whether a *second* occurrence is also
 ///     already due (`nothing_later_is_due` - the identical computation
@@ -3282,9 +3287,8 @@ const MAX_OCCURRENCES_PER_TICK: usize = 1000;
 ///     function's own checks are a cheap, non-authoritative pre-filter
 ///     only, the same "peek here, re-check under lock there" split
 ///     `submit_command` already uses. `replay_backlog` fires every
-///     occurrence in turn; `fire_once` correctly rejects every one but
-///     the backlog's own last, which the `cursor` walking forward is
-///     what actually lets it reach.
+///     occurrence in turn, moving the position with each, so a backlog
+///     longer than one tick's walk is simply continued next tick.
 ///
 /// A database error at any step is logged and that event type's own
 /// remaining backlog abandoned for this tick (not the whole function -
@@ -3386,6 +3390,51 @@ async fn scheduler_tick_for_bounded_context(
         ) else {
             continue;
         };
+
+        // `fire_once` fires only a backlog's last occurrence, and nothing
+        // moves the position until it does - so walking up to it from the
+        // position, as below, never arrived once the backlog was longer
+        // than one tick's walk: every tick restarted from the same place
+        // (docs/architecture.md §150). It's raised directly instead; the
+        // occurrences before it are the ones `create_system_event` would
+        // have rejected anyway.
+        if policy == skilj_core::event_store::MissedOccurrencePolicy::FireOnce {
+            let Some(last_due) =
+                skilj_core::event_store::latest_occurrence_at_or_before(schedule, now)
+                    .filter(|last| *last > initial_position)
+            else {
+                continue;
+            };
+            if let Err(e) = skilj_core::db::fire_system_event(
+                pool,
+                projection_dispatcher,
+                event_dispatcher,
+                broadcaster,
+                event_cache,
+                &bc.name,
+                &et.name,
+                last_due,
+                now,
+                encryption_master_key,
+            )
+            .await
+            {
+                tracing::warn!(
+                    bounded_context = %bc.name,
+                    event_type = %et.name,
+                    error = %e,
+                    "CreateSystemEvent failed"
+                );
+                BACKGROUND_TASK_ERRORS.add(
+                    1,
+                    &[
+                        KeyValue::new("task", "scheduler"),
+                        KeyValue::new("reason", "create_system_event_failed"),
+                    ],
+                );
+            }
+            continue;
+        }
 
         let mut cursor = initial_position;
         for _ in 0..MAX_OCCURRENCES_PER_TICK {

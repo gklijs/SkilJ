@@ -3838,6 +3838,29 @@ pub fn next_occurrence_after(
         .next()
 }
 
+/// The latest occurrence of `schedule` at or before `instant` - the one a
+/// `fire_once` backlog collapses into - found without walking the
+/// backlog (docs/architecture.md §150). `cron`'s backward step gives an
+/// occurrence just before `instant`; stepping forward from it while the
+/// next one is still at or before `instant` makes the answer exact
+/// whatever that step does at the boundary. `None` when the schedule
+/// doesn't parse or has no occurrence at or before `instant`.
+pub fn latest_occurrence_at_or_before(
+    schedule: &str,
+    instant: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use std::str::FromStr;
+    let schedule = cron::Schedule::from_str(schedule).ok()?;
+    let mut latest = schedule.after(&instant).next_back()?;
+    while let Some(next) = schedule.after(&latest).next() {
+        if next > instant {
+            break;
+        }
+        latest = next;
+    }
+    (latest <= instant).then_some(latest)
+}
+
 /// See `rule CreateSystemEvent`. `occurrence_at` is the instant
 /// `SystemTriggerDue` itself carries - what this event stands for, not
 /// inferred from `now` (which only ever appears in its `Metadata.created_at`,

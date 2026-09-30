@@ -92,6 +92,54 @@ fn next_occurrence_after_is_none_for_an_unparseable_schedule() {
 }
 
 // ---------------------------------------------------------------------
+// latest_occurrence_at_or_before (docs/architecture.md §150)
+// ---------------------------------------------------------------------
+
+#[test]
+fn latest_occurrence_at_or_before_includes_an_instant_on_the_schedule() {
+    assert_eq!(
+        event_store::latest_occurrence_at_or_before(&every_second(), timestamp(1000)),
+        Some(timestamp(1000))
+    );
+}
+
+#[test]
+fn latest_occurrence_at_or_before_rounds_a_sub_second_instant_down() {
+    let instant = timestamp(1000) + chrono::Duration::milliseconds(500);
+    assert_eq!(
+        event_store::latest_occurrence_at_or_before(&every_second(), instant),
+        Some(timestamp(1000))
+    );
+}
+
+#[test]
+fn latest_occurrence_at_or_before_finds_the_last_of_a_sparse_schedule() {
+    // Top of every hour; 5h02m after the epoch - the 5h occurrence.
+    assert_eq!(
+        event_store::latest_occurrence_at_or_before("0 0 * * * * *", timestamp(5 * 3600 + 120)),
+        Some(timestamp(5 * 3600))
+    );
+    // Exactly on one.
+    assert_eq!(
+        event_store::latest_occurrence_at_or_before("0 0 * * * * *", timestamp(5 * 3600)),
+        Some(timestamp(5 * 3600))
+    );
+}
+
+#[test]
+fn latest_occurrence_at_or_before_is_none_without_an_earlier_occurrence() {
+    // Only ever fires in 2099.
+    assert_eq!(
+        event_store::latest_occurrence_at_or_before("0 0 0 1 1 * 2099", timestamp(1000)),
+        None
+    );
+    assert_eq!(
+        event_store::latest_occurrence_at_or_before("not a cron expression", timestamp(1000)),
+        None
+    );
+}
+
+// ---------------------------------------------------------------------
 // create_system_event
 // ---------------------------------------------------------------------
 

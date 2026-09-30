@@ -480,3 +480,65 @@ async fn force_schedule_position(
     .await
     .unwrap();
 }
+
+/// docs/architecture.md §150: a `fire_once` backlog longer than one tick's
+/// walk (`MAX_OCCURRENCES_PER_TICK`, 1000) - here a per-second schedule
+/// 2000 seconds behind. The walk restarted from the persisted position
+/// every tick and never reached the backlog's last occurrence, the only
+/// one `fire_once` fires, so the type stalled for good (and every tick
+/// made 1000 round trips for nothing). It must collapse to one event and
+/// carry on.
+#[test]
+fn fire_once_resolves_a_backlog_longer_than_one_tick_can_walk() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let (bc_name, external_subject) = setup(&pool).await;
+
+        let (_skilj, report) = Skilj::builder(database_url)
+            .bounded_context(bc_name.clone())
+            .event_type::<OnceBeat>()
+            .reconciliation_role(external_subject)
+            .scheduler_poll_interval(std::time::Duration::from_millis(150))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+
+        let event_type = db::get_event_type(&pool, &bc_name, "OnceBeat")
+            .await
+            .unwrap()
+            .unwrap();
+        let backlog_start = Utc::now() - chrono::Duration::seconds(2000);
+        force_schedule_position(&pool, &event_type, backlog_start).await;
+
+        let mut caught_up = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let current = db::get_event_type(&pool, &bc_name, "OnceBeat")
+                .await
+                .unwrap()
+                .unwrap();
+            if current
+                .schedule_position
+                .is_some_and(|p| p > Utc::now() - chrono::Duration::seconds(5))
+            {
+                caught_up = true;
+                break;
+            }
+        }
+        assert!(
+            caught_up,
+            "schedule_position never got past a 2000-occurrence backlog - fire_once stalled"
+        );
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert!(
+            !events.is_empty() && events.len() <= 10,
+            "fire_once must collapse the backlog to one event: got {}",
+            events.len()
+        );
+    });
+}
