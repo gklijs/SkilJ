@@ -274,7 +274,7 @@ fn full_type_registration_lifecycle_end_to_end() {
         if test_database_url().await.is_none() {
             return;
         }
-        let (skilj, _pool, bc_name, jwt) = setup().await;
+        let (skilj, pool, bc_name, jwt) = setup().await;
         let router = skilj.graphql_router().await.unwrap();
 
         // Gating: no caller at all is rejected before anything runs.
@@ -616,6 +616,39 @@ fn full_type_registration_lifecycle_end_to_end() {
             "WithdrawMoney"
         );
         assert!(response["data"]["createCommandToken"]["scope"].is_null());
+
+        // docs/architecture.md §142: revokeToken can't tell a caller who
+        // may not revoke a token whether it exists - an existing and a
+        // missing id get the same refusal, with and without a credential.
+        let outsider = Role {
+            id: generate_token_id(),
+            external_subject: unique_name("outsider"),
+            name: "Outsider".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &outsider).await.unwrap();
+        let outsider_jwt = sign_jwt(&outsider.external_subject);
+        for (credential, code) in [
+            (None, "unauthenticated"),
+            (Some(outsider_jwt.as_str()), "grant_not_active"),
+        ] {
+            for id in [external_event_token_id.to_string(), generate_token_id()] {
+                let response = graphql_request(
+                    &router,
+                    credential,
+                    "mutation($id: ID!) { revokeToken(tokenId: $id) { __typename } }",
+                    json!({ "id": id }),
+                )
+                .await;
+                assert_eq!(
+                    response["errors"][0]["extensions"]["code"], code,
+                    "{id}: {response}"
+                );
+            }
+        }
 
         // revokeToken - the union return type, queried via an inline fragment.
         let response = graphql_request(

@@ -1450,6 +1450,13 @@ fn token_resolution_answers_each_outcome() {
             status(format!("{}.whatever", generate_token_id())).await,
             StatusCode::UNAUTHORIZED
         );
+        // Another kind's id with the wrong secret says nothing about that
+        // token (docs/architecture.md §142); its whole credential is a 403.
+        let (direct_id, _) = direct_credential.split_once('.').unwrap();
+        assert_eq!(
+            status(format!("{direct_id}.not-the-secret")).await,
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(status(direct_credential).await, StatusCode::FORBIDDEN);
     });
 }

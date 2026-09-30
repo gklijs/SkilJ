@@ -318,15 +318,20 @@ async fn resolve_token<T: TokenLookup>(
     // is the kind looked up, to tell 401 from 403; it used to be looked up
     // first on every request, reading the token row twice
     // (docs/architecture.md §128).
+    let hashed_secret = hash_secret(&credential.secret);
     if let Some(token) = T::get(&state.pool, &credential.id).await? {
-        return if secret_matches(&hash_secret(&credential.secret), token.secret()) {
+        return if secret_matches(&hashed_secret, token.secret()) {
             Ok(token)
         } else {
             Err(RestError::UnrecognisedCredential)
         };
     }
-    match db::access_token_kind(&state.pool, &credential.id).await? {
-        // No such token - or, `Some(T::KIND)`, one that vanished between
+    // 403 only for the whole credential of another kind: judged on the id
+    // alone, anyone holding just an id learned the token exists and what
+    // it's for (docs/architecture.md §142).
+    match db::access_token_kind_for_credential(&state.pool, &credential.id, &hashed_secret).await? {
+        // No such token, or not this secret - or, `Some(T::KIND)`, one
+        // that vanished between
         // the two reads with a concurrent `DeleteBoundedContext`: from the
         // caller's point of view, a token that's gone looks exactly like
         // one that was never recognised, not a 500.

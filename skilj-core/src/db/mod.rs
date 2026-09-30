@@ -12655,6 +12655,23 @@ pub async fn access_token_kind(
         .map(|r| AccessTokenKind::from_str(&r.columns.kind)))
 }
 
+/// [`access_token_kind`], but only for a token whose stored secret
+/// `hashed_secret` (the presented secret, already through
+/// `shared::hash_secret`) matches - so the kind, and that the id exists
+/// at all, is told only to a caller holding the whole credential
+/// (docs/architecture.md §142).
+#[tracing::instrument(skip_all)]
+pub async fn access_token_kind_for_credential(
+    pool: &Pool,
+    id: &str,
+    hashed_secret: &str,
+) -> crate::error::Result<Option<AccessTokenKind>> {
+    Ok(fetch_access_token_row(pool, id)
+        .await?
+        .filter(|r| crate::shared::secret_matches(hashed_secret, &r.columns.secret))
+        .map(|r| AccessTokenKind::from_str(&r.columns.kind)))
+}
+
 /// Persists a `revoke_token` outcome - a status-only update, addressed by
 /// `id` alone (unambiguous: `access_tokens.id` is that schema's own
 /// primary key). Resolves which schema holds the row the same way

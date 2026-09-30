@@ -606,6 +606,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A token id alone no longer tells anyone its token exists. `revokeToken`
+  answered `AccessToken_not_found` for a missing id and something else
+  for a real one, even with no credential; it now requires a caller and
+  refuses both alike. The REST routes' `403 wrong_token_variant` was
+  given for another kind's id whatever the secret; a wrong secret is now
+  always `401 unrecognised_credential` (docs/architecture.md §142).
 - `POST /v1/events/external` and `POST /v1/events/direct` now check the
   token and payload before touching the database. A revoked token, or
   any payload failing its schema, could create an encryption key for

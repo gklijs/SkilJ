@@ -6,7 +6,7 @@
 //! for three variants, `command_type.bounded_context` for `CommandToken`)
 //! once the token is resolved by id.
 
-use super::{not_found, require_admin_mapping};
+use super::{require_admin_mapping, require_caller};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -16,22 +16,27 @@ use skilj_core::db::AccessTokenKind;
 /// Resolves `id` to its full, typed `AccessToken` plus the bounded
 /// context name that scopes it (`token_scope`) - one lookup per variant,
 /// since which `db::get_*_token` function to call depends on
-/// `access_token_kind`'s own answer.
+/// `access_token_kind`'s own answer. A missing token is refused exactly
+/// like one on a bounded context the caller has no admin grant on
+/// (`grant_not_active`): answered `not_found`, any caller - with no
+/// credential at all, even - could tell which token ids exist
+/// (docs/architecture.md §142, the §138/§139 principle).
 async fn resolve_token(
     pool: &skilj_core::db::Pool,
     id: &str,
 ) -> async_graphql::Result<(AccessToken, String)> {
+    let missing = || to_graphql_error(skilj_core::access_control::Error::GrantNotActive);
     let kind = skilj_core::db::access_token_kind(pool, id)
         .await
         .map_err(to_graphql_error)?
-        .ok_or_else(|| not_found("AccessToken", id))?;
+        .ok_or_else(missing)?;
 
     Ok(match kind {
         AccessTokenKind::ExternalEvent => {
             let token = skilj_core::db::get_external_event_token(pool, id)
                 .await
                 .map_err(to_graphql_error)?
-                .ok_or_else(|| not_found("AccessToken", id))?;
+                .ok_or_else(missing)?;
             let scope = token.event_type.bounded_context.name.clone();
             (AccessToken::ExternalEventToken(token), scope)
         }
@@ -39,7 +44,7 @@ async fn resolve_token(
             let token = skilj_core::db::get_direct_creation_token(pool, id)
                 .await
                 .map_err(to_graphql_error)?
-                .ok_or_else(|| not_found("AccessToken", id))?;
+                .ok_or_else(missing)?;
             let scope = token.event_type.bounded_context.name.clone();
             (AccessToken::DirectCreationToken(token), scope)
         }
@@ -47,7 +52,7 @@ async fn resolve_token(
             let token = skilj_core::db::get_event_read_token(pool, id)
                 .await
                 .map_err(to_graphql_error)?
-                .ok_or_else(|| not_found("AccessToken", id))?;
+                .ok_or_else(missing)?;
             let scope = token.event_type.bounded_context.name.clone();
             (AccessToken::EventReadToken(token), scope)
         }
@@ -55,7 +60,7 @@ async fn resolve_token(
             let token = skilj_core::db::get_command_token(pool, id)
                 .await
                 .map_err(to_graphql_error)?
-                .ok_or_else(|| not_found("AccessToken", id))?;
+                .ok_or_else(missing)?;
             let scope = token.command_type.bounded_context.name.clone();
             (AccessToken::CommandToken(token), scope)
         }
@@ -72,6 +77,8 @@ pub fn revoke_token_field() -> Field {
             let state = ctx.data::<GraphqlState>()?;
             let token_id = ctx.args.try_get("tokenId")?.string()?.to_string();
 
+            // Authenticated before the token is looked up (§142).
+            require_caller(&ctx)?;
             let (token, bounded_context_name) = resolve_token(&state.pool, &token_id).await?;
             let access_mapping =
                 require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;

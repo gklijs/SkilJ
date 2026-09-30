@@ -63,9 +63,11 @@ pub enum RestError {
     /// presented `secret` doesn't match it - both read as "this isn't a
     /// credential we recognise" rather than leaking which half was wrong.
     UnrecognisedCredential,
-    /// An `AccessToken` matches the presented `id`, but of a different
-    /// `AccessTokenKind` than the route needs - §7.2's "presenting the
-    /// wrong token variant at a route is a 403, not a 404".
+    /// An `AccessToken` matches the presented `id` and `secret`, but of a
+    /// different `AccessTokenKind` than the route needs - §7.2's
+    /// "presenting the wrong token variant at a route is a 403, not a
+    /// 404". A wrong secret is `UnrecognisedCredential`, whatever the
+    /// kind (§142).
     WrongTokenVariant,
     /// A request-shape problem this crate's own routing layer catches
     /// before calling into skilj-core at all (e.g. `mode` isn't `"auto"`

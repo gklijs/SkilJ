@@ -1209,7 +1209,9 @@ POST /v1/commands/trigger       -- CommandTrigger (CommandToken)
 ```
 
 Presenting the wrong token variant at a route is a 403, not a 404 — the
-route exists, the credential just doesn't authorize that action.
+route exists, the credential just doesn't authorize that action. Only the
+whole credential (id and secret) earns the 403; a wrong secret is a 401
+whatever the id names (§142).
 
 ### 7.3 Request/response bodies
 
@@ -10336,3 +10338,16 @@ Test: `a_refused_read_loads_no_events` (`skilj/tests/event_fetch_rest.rs`): with
 Fix: the `requires` are `event_store::check_create_external_event`/`check_create_direct_event` (a shared `check_event_creation` for the common part), returning the tags they derive for the scope check. The two `db` functions call them first; `create_external_event`/`create_direct_event` call them too and use those tags, so there's one copy of each rule. `retryParkedDelivery` goes through `create_and_insert_external_event`, so a parked delivery whose token has since been revoked now stays parked with `TokenNotActive` rather than being cleared as a redelivery.
 
 Tests (`skilj-core/tests/external_event_dedup.rs`): `a_revoked_adapters_redelivery_is_refused_not_recognised`, and `a_refused_submission_provisions_no_encryption_key` - a revoked external token, a payload failing the schema and a revoked direct token each create no key, while an accepted submission (the control) does.
+
+## 142. A token id alone says nothing about its token
+
+Two places told a caller whether an `AccessToken` id existed without asking for anything else:
+
+- `revokeToken` looked the token up before checking the caller at all, answering `AccessToken_not_found` for a missing id and `unauthenticated` - or, for an authenticated Role without an admin grant on the token's bounded context, `grant_not_active` - for an existing one. No credential was needed to probe.
+- The REST auth layer's 401-versus-403 split (§7.2) was decided on the id alone: an id belonging to a token of another kind got `403 wrong_token_variant` whatever secret came with it, so an id told its holder the token existed and, from which routes answered 403, what it was for.
+
+Token ids are random UUIDs, so this is a leak about ids that got out some other way (a log line, a half-pasted credential), not an enumeration. Still, the §138/§139 principle is that a caller who may not act on a thing learns nothing about whether it exists.
+
+Fix: `revokeToken` calls `require_caller` first and refuses a missing token with the same `grant_not_active` a forbidden one gets. `skilj-rest`'s `resolve_token` asks `db::access_token_kind_for_credential`, which reports the other kind only when the presented secret matches that token's stored hash (the same `secret_matches` comparison); otherwise it's the ordinary `401 unrecognised_credential`.
+
+Tests: `full_type_registration_lifecycle_end_to_end` (`skilj/tests/graphql_type_registration.rs`) - `revokeToken` on an existing and a missing id answers `unauthenticated` without a credential and `grant_not_active` to a Role without a grant, alike for both. `token_resolution_answers_each_outcome` (`skilj/tests/event_fetch_rest.rs`) - another kind's id with a wrong secret is a 401, its whole credential still a 403.
