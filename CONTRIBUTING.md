@@ -9,6 +9,7 @@ solo-maintainer project, so the process is kept light.
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo fmt --check
 ```
 

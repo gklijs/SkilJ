@@ -71,6 +71,11 @@ steps:
       - rustup component add clippy
       - cargo build --workspace --all-targets
       - cargo clippy --workspace --all-targets -- -D warnings
+      # Broken intra-doc links and public docs linking to private items
+      # don't fail a build, and docs.rs renders them as dead text. Here
+      # rather than in its own step: documenting skilj-kafka runs
+      # rdkafka's build script, which needs the packages above.
+      - RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       # This container has no DATABASE_URL/Postgres service, so every
       # Postgres-backed test falls onto its own `postgresql_embedded`
       # fallback (see e.g. skilj-core/tests/persistence.rs's own doc

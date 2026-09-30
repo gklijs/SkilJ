@@ -77,7 +77,7 @@
 //!   consumer's own ack-wait timeout elapses, not on the very next pull
 //!   in the same session. Once the policy exhausts, the message is
 //!   reported to skilj's own `POST /v1/parked-deliveries`
-//!   ([`report_parked_delivery`]) and acked anyway - without that, a
+//!   (`report_parked_delivery`) and acked anyway - without that, a
 //!   poison message would keep being redelivered by JetStream forever,
 //!   on every ack-wait timeout.
 //! - **Outbound**: an event that keeps failing to publish is retried with
@@ -634,7 +634,7 @@ pub struct InboundMessageMeta {
     pub stream: String,
     pub stream_sequence: u64,
     pub message_id: Option<String>,
-    /// [`CORRELATION_ID_HEADER`]/[`CAUSATION_ID_HEADER`]'s own values
+    /// `CORRELATION_ID_HEADER`/`CAUSATION_ID_HEADER`'s own values
     /// (Codeberg issue #18) - both sender-optional, the same
     /// "may or may not be populated" story `message_id` above already
     /// has.
@@ -866,7 +866,7 @@ async fn report_parked_delivery(
 /// JetStream's own redelivery, which only replays after this consumer's
 /// own ack-wait timeout elapses, not on the very next pulled message in
 /// the same session. Once `retry_policy` exhausts, the message is
-/// reported to skilj via [`report_parked_delivery`] and acked anyway -
+/// reported to skilj via `report_parked_delivery` and acked anyway -
 /// without that, a poison message would keep being redelivered by
 /// JetStream forever, on every ack-wait timeout. If the *report* itself
 /// fails, the message is deliberately left unacked (a real gap - better

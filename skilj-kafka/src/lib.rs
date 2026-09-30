@@ -59,7 +59,7 @@
 //!   (an uncommitted offset only replays after a restart/rebalance, not
 //!   on the next `recv()` in the same session). Once the policy exhausts,
 //!   the message is reported to skilj's own `POST /v1/parked-deliveries`
-//!   ([`report_parked_delivery`]) and the offset is committed anyway -
+//!   (`report_parked_delivery`) and the offset is committed anyway -
 //!   without that, a poison message would block this mapping's own
 //!   durable commit point forever, redelivering an ever-growing backlog
 //!   on every future restart.
@@ -621,7 +621,7 @@ impl InboundAction {
 /// Reads a header's value as UTF-8 text - `None` for a missing header, a
 /// header present with no value (Kafka allows this), or one whose bytes
 /// aren't valid UTF-8. [`run_inbound`]'s own extraction step for
-/// [`CORRELATION_ID_HEADER`]/[`CAUSATION_ID_HEADER`], kept as a free
+/// `CORRELATION_ID_HEADER`/`CAUSATION_ID_HEADER`, kept as a free
 /// function rather than inlined so [`dispatch_inbound_message`] itself
 /// stays header-type-agnostic (see its own doc comment on why it takes
 /// plain `Option<&str>` rather than a whole headers object). Public so
@@ -830,7 +830,7 @@ async fn report_parked_delivery(
 /// session (an uncommitted offset only replays after a restart/
 /// rebalance; the next plain `recv()` here would just move on to the
 /// next message). Once `retry_policy` exhausts, the message is reported
-/// to skilj via [`report_parked_delivery`] and the offset is committed
+/// to skilj via `report_parked_delivery` and the offset is committed
 /// anyway - without that, a poison message would block this mapping's
 /// own durable commit point forever, redelivering an ever-growing
 /// backlog on every future restart. If the *report* itself fails, it is

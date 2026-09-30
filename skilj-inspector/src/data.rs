@@ -1,6 +1,6 @@
 //! The read-only data layer - every function here does exactly one
-//! `skilj_core::db` read call (or, for [`load_bounded_context`], four in
-//! sequence) and nothing else. See this crate's own root doc comment for
+//! `skilj_core::db` read call (or, for [`load_bounded_context_data`], an
+//! existence check and four reads in sequence) and nothing else. See this crate's own root doc comment for
 //! the "never a write path, never decryption" constraints every function
 //! here holds to.
 
@@ -42,7 +42,7 @@ pub async fn load_bounded_context_data(
     // `db::list_recent_events_for_bounded_context` (unlike the three
     // list functions below, each of which already guards this itself)
     // assumes its caller already knows the bounded context exists -
-    // `.expect()`s the row rather than returning `[]`. This crate's own
+    // it returns a not-found error rather than `[]`. This crate's own
     // whole premise is "let an operator look something up without
     // already knowing it's there", so that assumption doesn't hold here
     // - check first, short-circuit to the same all-empty shape the other

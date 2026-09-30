@@ -79,7 +79,7 @@
 //!   reads - see [`InboundMessageMeta`]'s own doc comment on how sparse
 //!   its own metadata already is). Once the policy exhausts, the message
 //!   is reported to skilj's own `POST /v1/parked-deliveries`
-//!   ([`report_parked_delivery`]) and the delivery is accepted anyway -
+//!   (`report_parked_delivery`) and the delivery is accepted anyway -
 //!   without that, a poison message would block redelivery forever on
 //!   whichever broker-side redelivery/ack-timeout mechanism applies.
 //! - **Outbound**: an event that keeps failing to send is retried with
@@ -627,12 +627,12 @@ pub struct InboundMessageMeta {
     pub group_sequence: Option<u32>,
     pub message_id: Option<MessageId>,
     /// AMQP 1.0's own standard `correlation-id` property (Codeberg issue
-    /// #18) - rendered via [`message_id_to_string`], same treatment
+    /// #18) - rendered via `message_id_to_string`, same treatment
     /// `message_id` above already gets. Forwarded as `correlationId` on
     /// whichever skilj call `dispatch_inbound_message` makes; `None`
     /// leaves it absent on the wire, letting skilj generate one itself.
     pub correlation_id: Option<MessageId>,
-    /// [`CAUSATION_ID_PROPERTY`]'s own value, read back from
+    /// `CAUSATION_ID_PROPERTY`'s own value, read back from
     /// `application-properties` - no standard AMQP property for this.
     pub causation_id: Option<String>,
 }
@@ -859,7 +859,7 @@ async fn report_parked_delivery(
 /// offsets) AMQP 1.0 gives this bridge no delivery/redelivery count to
 /// track instead - see this crate's own "Dead-letter/parking" doc
 /// section. Once `retry_policy` exhausts, the message is reported to
-/// skilj via [`report_parked_delivery`] and the delivery is accepted
+/// skilj via `report_parked_delivery` and the delivery is accepted
 /// anyway - without that, a poison message would block redelivery
 /// forever. If the *report* itself fails, the delivery is released
 /// (AMQP's "not processed" outcome), so the broker redelivers it and the

@@ -2044,6 +2044,17 @@ default SystemCreator skilj = { }
 --     runtime discovery. This is deliberate friction, not a fast path:
 --     see Projection.sync.
 --
+-- Both places run in a process, and project() is that process's own
+-- code. Processes of different versions can share one deployment (a
+-- rolling deploy), so a process can meet a registered Projection whose
+-- project() it doesn't carry. It never advances caught_up_to for such a
+-- projection without folding: the asynchronous consumer leaves it to a
+-- process that carries it, and a write whose event a sync projection it
+-- doesn't carry consumes is refused (sync_projection_not_declared), so
+-- another process can take it. Advancing without folding would lose the
+-- event for that projection for good, and for a sync one would break
+-- SyncProjectionNeverLags in substance while keeping its letter.
+--
 -- Either way, one call to project() may update more than one of that
 -- projection's instances: a transfer event updating both the giver's own
 -- row and the receiver's own row is one event touching two keys, not two

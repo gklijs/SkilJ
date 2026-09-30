@@ -3744,7 +3744,7 @@ pub async fn list_active_data_keys_for_subject_value(
 /// the status flip: `wrapped_key`/`wrap_nonce` are set to `NULL` in the
 /// same statement, so even the master key can no longer recover this
 /// subject's `DataKey` afterwards (see `forget_subject`'s own doc comment:
-/// "this function's own caller enacts [it] by destroying the key row").
+/// "this function's own caller enacts \[it\] by destroying the key row").
 /// Scoped to `status = 'active'` in the `WHERE` clause purely
 /// defensively, since the pure rule already rejects an inactive key
 /// before this is ever called.
@@ -8050,7 +8050,7 @@ pub struct OwnedSnapshotContext {
     pub as_of_sequence: i64,
 }
 
-/// One command's worth of everything [`submit_one_command_in_tx`] needs,
+/// One command's worth of everything `submit_one_command_in_tx` needs,
 /// entirely owned rather than borrowed - what a request becomes once it
 /// has to survive being queued for, and processed by, some other task
 /// entirely (`command_batcher::CommandBatcher`'s batch leader is
@@ -9069,7 +9069,7 @@ fn parked_deliveries_occurrence_index_ddl(schema: &str) -> String {
 /// Codeberg issue #25 review (docs/architecture.md §56): belt-and-suspenders
 /// for `catch_up_cross_context_route`'s own advisory-lock fix above -
 /// a `UNIQUE` index identifying one real failed occurrence (see
-/// [`parked_deliveries_occurrence_index_ddl`] for its exact key) so
+/// `parked_deliveries_occurrence_index_ddl` for its exact key) so
 /// `insert_parked_delivery`'s own `ON CONFLICT` can turn any remaining
 /// duplicate-insert path, from this bug or a future one, into a harmless
 /// upsert instead of a second row.
@@ -9157,7 +9157,7 @@ pub async fn migrate_parked_deliveries_dedup_and_unique_index(
 /// already uses - see its own doc comment) rather than left to the
 /// caller, since nothing about a parked delivery's own identity needs to
 /// be caller-chosen or caller-visible before this call returns it.
-/// `ON CONFLICT` on [`parked_deliveries_occurrence_index_ddl`]'s key
+/// `ON CONFLICT` on `parked_deliveries_occurrence_index_ddl`'s key
 /// (docs/architecture.md §56) turns a duplicate-occurrence insert into an
 /// upsert that refreshes the failure details onto the existing row
 /// rather than a second one -

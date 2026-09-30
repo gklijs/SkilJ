@@ -1135,6 +1135,16 @@ pub trait ScheduleDeadline {
 /// `list_events_for_bounded_context_matching_tags` already uses for
 /// events (docs/architecture.md §19 Problem 1), applied to the
 /// `deadlines` table's own `tags` column.
+///
+/// **Adding one to an existing schedule in a rolling deploy.** A due
+/// deadline waits until every cancel targeting its schedule has processed
+/// its source events up to the deadline's `fire_at` - but an instance only
+/// knows the cancels declared in its own code. While instances without
+/// the new cancel are still running, one of them can fire a deadline whose
+/// cancelling event had already committed but not yet been processed.
+/// Where that matters, deploy the new cancel while no such deadline can
+/// come due, or roll out completely before relying on it
+/// (docs/architecture.md §164).
 pub trait CancelDeadline {
     /// The event that, on commit, may cancel one or more pending
     /// deadlines.
