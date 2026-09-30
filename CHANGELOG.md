@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `skilj_temporal::run_with_retry`/`run_until_with_retry`: `run` with a
+  `skilj_retry::RetryPolicy` for failed dispatches. Once a bounded policy
+  is exhausted the event is logged, acknowledged and skipped, instead of
+  holding up every event behind it - a `Signal` for a workflow that has
+  already completed fails on every attempt. `run`/`run_until` keep
+  retrying forever, as before (docs/architecture.md §147).
 - `skilj-tui --token-command` (`SKILJ_TOKEN_COMMAND`): a shell command
   printing a JWT, run at startup and again whenever the server refuses
   the token as expired - the live feed reconnects with the fresh one,

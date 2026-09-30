@@ -952,9 +952,9 @@ pub async fn run_inbound_until(
                         attempt += 1;
                         let failed_at = *first_failed_at.get_or_insert_with(Utc::now);
                         let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
+                        // Not JSON: no retry can change that (§144).
                         if retry_policy.is_exhausted(attempt, elapsed)
-                    // Not JSON: no retry can change that (§144).
-                    || matches!(e, BridgeError::MalformedPayload(_))
+                            || matches!(e, BridgeError::MalformedPayload(_))
                         {
                             tracing::error!(
                                 stream = meta.stream,

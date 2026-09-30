@@ -194,10 +194,14 @@ struct AccountBalanceState {
 /// also need to tolerate the background consumer's own poll cadence.
 struct AccountBalance;
 
-/// `AccountBalance` as an async projection, in a `Skilj` whose poll
-/// interval is an hour: after `build()`'s first tick it never catches up
-/// during the test, so waiting for a committed sequence genuinely times
-/// out (docs/architecture.md §88).
+/// An async projection that never catches up, so waiting for a committed
+/// sequence genuinely times out (docs/architecture.md §88). Its `project`
+/// panics: `contain_panic` (§80) rolls that tick's catch-up back, so
+/// `caught_up_to` never moves. It used to be `AccountBalance` on an
+/// hour-long poll interval, relying on `build()`'s first tick running
+/// before the test's command - but that tick runs on a spawned task, and
+/// under load it ran after, caught up, and the expected timeout never
+/// came (§146).
 struct LaggingBalance;
 
 impl Projection for LaggingBalance {
@@ -207,8 +211,8 @@ impl Projection for LaggingBalance {
     fn consumed_event_types() -> Vec<&'static str> {
         vec!["MoneyDeposited"]
     }
-    fn project(state: &mut Self::State, event: &Self::Event, key: &str) {
-        AccountBalance::project(state, event, key)
+    fn project(_state: &mut Self::State, _event: &Self::Event, _key: &str) {
+        panic!("LaggingBalance never catches up - see its doc comment");
     }
 }
 

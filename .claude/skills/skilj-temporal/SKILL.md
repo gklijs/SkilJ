@@ -91,6 +91,15 @@ and `PaymentConfirmed` signal that exact run later.
   see `skilj-temporal/src/lib.rs`'s own `run` doc comment for why
   Temporal's `signal_with_start_workflow` was considered and rejected
   as the "fix this at the root" alternative.
+- **`run` retries a failing event forever, and events are handled in
+  order** - so one that can never succeed (a `Signal` for a workflow
+  that has already completed answers "not found" every time) holds up
+  every event behind it on that mapping. `run_with_retry`/
+  `run_until_with_retry` take a `skilj_retry::RetryPolicy`: once a
+  bounded policy is exhausted the event is logged at `error`,
+  acknowledged and skipped. Size the policy to outlast the
+  `Signal`-before-`Start` race above, which fails the same way until the
+  `Start` lands.
 - Depends only on Temporal's thin `temporalio-client` crate, never the
   full `temporalio-sdk` worker/Activity-authoring one - writing the
   actual Workflow/Activity definitions Temporal executes is a separate

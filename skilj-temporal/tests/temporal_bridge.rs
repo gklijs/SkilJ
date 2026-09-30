@@ -651,3 +651,76 @@ fn run_until_stops_when_asked() {
         let _ = temporal_server;
     });
 }
+
+/// docs/architecture.md §147: a `Signal` for a workflow that doesn't
+/// exist (never started, or already completed) fails on every attempt.
+/// With a bounded `retry_policy` it's skipped - acknowledged - once the
+/// policy is exhausted, and the event behind it gets its turn instead of
+/// waiting forever.
+#[test]
+fn run_with_a_bounded_policy_skips_an_event_that_keeps_failing() {
+    runtime().block_on(async {
+        let Some(temporal_server) = start_temporal().await else {
+            return;
+        };
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        enqueue(
+            &mock_state,
+            "signal-token",
+            "PaymentConfirmed",
+            [1, 2].map(|sequence| {
+                json!({
+                    "sequence": sequence,
+                    "eventType": "PaymentConfirmed",
+                    "payload": { "orderId": format!("o-gone-{sequence}") },
+                    "tags": [{ "key": "order", "value": format!("o-gone-{sequence}") }],
+                })
+            }),
+        );
+        let mappings = vec![EventTypeMapping {
+            event_type: "PaymentConfirmed".to_string(),
+            credential: "signal-token".to_string(),
+            correlation_tag_key: "order".to_string(),
+            action: MappingAction::Signal {
+                signal_name: "paymentConfirmed".to_string(),
+            },
+        }];
+        let target = temporal_server.target.clone();
+        tokio::spawn(async move {
+            let temporal = connect_temporal(&format!("http://{target}")).await;
+            skilj_temporal::run_with_retry(
+                &skilj_base_url,
+                &temporal,
+                "skipping",
+                &mappings,
+                Duration::from_millis(50),
+                &skilj_retry::RetryPolicy::bounded(
+                    Duration::from_millis(10),
+                    1.0,
+                    Duration::from_millis(10),
+                    2,
+                ),
+            )
+            .await;
+        });
+
+        let both = [
+            ("signal-token".to_string(), 1),
+            ("signal-token".to_string(), 2),
+        ];
+        let mut acked = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            acked = mock_state.acked.lock().unwrap().clone();
+            if both.iter().all(|a| acked.contains(a)) {
+                break;
+            }
+        }
+        assert!(
+            both.iter().all(|a| acked.contains(a)),
+            "both undeliverable signals must have been skipped: {acked:?}"
+        );
+        let _ = temporal_server;
+    });
+}

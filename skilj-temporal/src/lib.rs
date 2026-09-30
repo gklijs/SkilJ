@@ -277,8 +277,21 @@ pub async fn poll_once(
         bounded_context,
         mapping,
         &mut std::collections::VecDeque::new(),
+        None,
     )
     .await
+}
+
+/// The retry state of the event at the front of one mapping's pending
+/// queue (docs/architecture.md §147): which event it is, how often its
+/// dispatch has failed, since when, and when it may be tried again. The
+/// same shape as `skilj_kafka::OutboundRetryState`.
+#[derive(Debug, Clone, Copy)]
+struct HeadRetryState {
+    sequence: i64,
+    attempt: u32,
+    first_failed_at: std::time::Instant,
+    next_attempt_at: std::time::Instant,
 }
 
 /// [`poll_once`] with a buffer of events already served but not yet
@@ -292,6 +305,12 @@ pub async fn poll_once(
 /// either way it then dispatches and acknowledges from the front, and an
 /// error leaves the failing event and everything after it in `pending`
 /// for the next call. Returns how many events it worked through.
+///
+/// With `retry`, a failed dispatch is counted against the event at the
+/// front (docs/architecture.md §147): once the policy is exhausted the
+/// event is logged, acknowledged and skipped, rather than blocking every
+/// event behind it forever - a `Signal` for a workflow that has already
+/// completed fails the same way on every attempt.
 async fn poll_with_pending(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -299,6 +318,7 @@ async fn poll_with_pending(
     bounded_context: &str,
     mapping: &EventTypeMapping,
     pending: &mut std::collections::VecDeque<ConsumedEvent>,
+    mut retry: Option<(&skilj_retry::RetryPolicy, &mut Option<HeadRetryState>)>,
 ) -> Result<usize, BridgeError> {
     if pending.is_empty() {
         let response = http
@@ -325,14 +345,52 @@ async fn poll_with_pending(
     while let Some(event) = pending.front() {
         match correlation_workflow_id(bounded_context, &mapping.correlation_tag_key, &event.tags) {
             Some(workflow_id) => {
-                dispatch(
+                let dispatched = dispatch(
                     temporal,
                     &workflow_id,
                     &mapping.action,
                     event,
                     bounded_context,
                 )
-                .await?;
+                .await;
+                match (dispatched, retry.as_mut()) {
+                    (Ok(()), Some((_, state))) => {
+                        if state.is_some_and(|s| s.sequence == event.sequence) {
+                            **state = None;
+                        }
+                    }
+                    (Ok(()), None) => {}
+                    (Err(e), None) => return Err(e),
+                    (Err(e), Some((policy, state))) => {
+                        let now = std::time::Instant::now();
+                        let current = match state {
+                            Some(s) if s.sequence == event.sequence => {
+                                s.attempt += 1;
+                                s
+                            }
+                            _ => state.insert(HeadRetryState {
+                                sequence: event.sequence,
+                                attempt: 1,
+                                first_failed_at: now,
+                                next_attempt_at: now,
+                            }),
+                        };
+                        if !policy.is_exhausted(current.attempt, now - current.first_failed_at) {
+                            current.next_attempt_at = now + policy.next_backoff(current.attempt);
+                            return Err(e);
+                        }
+                        tracing::error!(
+                            event_type = %event.event_type,
+                            sequence = event.sequence,
+                            attempt = current.attempt,
+                            error = %e,
+                            "giving up on this event after repeated failures - skipping it \
+                             (acknowledging it without it ever reaching Temporal) so the events \
+                             behind it aren't blocked forever"
+                        );
+                        **state = None;
+                    }
+                }
             }
             None => {
                 let error = BridgeError::NoCorrelationTag {
@@ -414,6 +472,9 @@ pub async fn run(
 /// raced only against the idle sleep between cycles and checked after
 /// each cycle. Events served but not yet acknowledged when it returns come
 /// back after the consume lease, as they would after a crash.
+///
+/// Retries a failed dispatch every `poll_interval`, forever - see
+/// [`run_until_with_retry`] for a policy that gives up on an event.
 pub async fn run_until(
     skilj_base_url: &str,
     temporal: &Client,
@@ -422,16 +483,79 @@ pub async fn run_until(
     poll_interval: Duration,
     stop: impl std::future::Future<Output = ()>,
 ) {
+    run_until_with_retry(
+        skilj_base_url,
+        temporal,
+        bounded_context,
+        mappings,
+        poll_interval,
+        &skilj_retry::RetryPolicy::unbounded(poll_interval, 1.0, poll_interval),
+        stop,
+    )
+    .await;
+}
+
+/// [`run`] with a `retry_policy` for failed dispatches
+/// (docs/architecture.md §147) - the shape the Kafka/AMQP/NATS outbound
+/// loops already take. An event whose dispatch keeps failing is retried
+/// with the policy's backoff, and once the policy is exhausted it is
+/// logged, acknowledged and skipped, so the events behind it aren't held
+/// up forever. `RetryPolicy::unbounded` never skips; [`run`] is this with
+/// an unbounded policy backing off by `poll_interval`.
+pub async fn run_with_retry(
+    skilj_base_url: &str,
+    temporal: &Client,
+    bounded_context: &str,
+    mappings: &[EventTypeMapping],
+    poll_interval: Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
+) -> ! {
+    run_until_with_retry(
+        skilj_base_url,
+        temporal,
+        bounded_context,
+        mappings,
+        poll_interval,
+        retry_policy,
+        std::future::pending(),
+    )
+    .await;
+    unreachable!(
+        "run_until_with_retry only returns once `stop` resolves, and `pending()` never does"
+    )
+}
+
+/// [`run_with_retry`] until `stop` resolves - see [`run_until`].
+pub async fn run_until_with_retry(
+    skilj_base_url: &str,
+    temporal: &Client,
+    bounded_context: &str,
+    mappings: &[EventTypeMapping],
+    poll_interval: Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
+    stop: impl std::future::Future<Output = ()>,
+) {
     let mut stop = std::pin::pin!(stop);
     let http = http_client();
     // Per mapping, what it was served but hasn't acknowledged yet - kept
     // across cycles so a failed dispatch is retried next cycle rather
-    // than waiting out the consume lease (docs/architecture.md §99).
+    // than waiting out the consume lease (docs/architecture.md §99) - and
+    // the retry state of the event at its front (§147).
     let mut pending: Vec<std::collections::VecDeque<ConsumedEvent>> =
         mappings.iter().map(|_| Default::default()).collect();
+    let mut retry_states: Vec<Option<HeadRetryState>> = vec![None; mappings.len()];
     loop {
         let mut served_any = false;
-        for (mapping, pending) in mappings.iter().zip(pending.iter_mut()) {
+        for ((mapping, pending), retry_state) in mappings
+            .iter()
+            .zip(pending.iter_mut())
+            .zip(retry_states.iter_mut())
+        {
+            // A failing event waits out its backoff; the other mappings
+            // don't wait with it.
+            if retry_state.is_some_and(|s| std::time::Instant::now() < s.next_attempt_at) {
+                continue;
+            }
             match poll_with_pending(
                 &http,
                 skilj_base_url,
@@ -439,6 +563,7 @@ pub async fn run_until(
                 bounded_context,
                 mapping,
                 pending,
+                Some((retry_policy, retry_state)),
             )
             .await
             {
@@ -446,7 +571,7 @@ pub async fn run_until(
                 Err(e) => {
                     tracing::error!(
                         event_type = %mapping.event_type,
-                        "poll cycle failed, retrying after poll_interval: {e}"
+                        "poll cycle failed, retrying: {e}"
                     );
                 }
             }

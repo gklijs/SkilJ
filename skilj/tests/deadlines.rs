@@ -361,6 +361,38 @@ async fn provision() -> Option<TestDb> {
     Some(TestDb { database_url, pool })
 }
 
+/// Held by every test in this file for its whole run. Each `Skilj` built
+/// here runs a background deadline tick - at least the one it runs straight
+/// away - and that tick scans *every* bounded context in the shared test
+/// database, so while one test's `Skilj` is ticking, another test's due
+/// deadline can be claimed out from under it (seen as a deadline left
+/// `firing` instead of `fired`). Run one at a time, each stopping its
+/// `Skilj` before it lets go, no test sees another's ticks
+/// (docs/architecture.md §146).
+static ONE_DEADLINE_TEST_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A built `Skilj`'s dispatchers, with its background tasks stopped - for
+/// a test that fires deadlines with its own ticks. An hour-long interval
+/// isn't enough on its own: the background deadline task ticks once
+/// straight away, on a spawned task that can run late, after the test has
+/// inserted a due deadline (docs/architecture.md §146). `shutdown` waits
+/// for that tick to finish.
+async fn dispatchers_without_background_ticks(
+    skilj: Skilj,
+) -> (
+    std::sync::Arc<dyn skilj_core::plugin::CommandDispatcher>,
+    std::sync::Arc<dyn skilj_core::plugin::ProjectionDispatcher>,
+    std::sync::Arc<dyn skilj_core::plugin::SnapshotDispatcher>,
+) {
+    let dispatchers = (
+        skilj.command_dispatcher(),
+        skilj.projection_dispatcher(),
+        skilj.snapshot_dispatcher(),
+    );
+    skilj.shutdown(std::time::Duration::from_secs(20)).await;
+    dispatchers
+}
+
 fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", generate_token_id())
 }
@@ -389,6 +421,7 @@ async fn create_direct_event(
 #[test]
 fn a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag() {
     runtime().block_on(async {
+        let _one_at_a_time = ONE_DEADLINE_TEST_AT_A_TIME.lock().await;
         let Some((database_url, pool)) = test_db().await else {
             return;
         };
@@ -594,6 +627,8 @@ fn a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag() {
              and order-C must never have been scheduled at all - only order-B's CancelOrder \
              deadline should ever have fired"
         );
+        // Stopped before the lock is released - see `ONE_DEADLINE_TEST_AT_A_TIME`.
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
     });
 }
 
@@ -694,6 +729,7 @@ fn race_schema(bounded_context: &str) -> String {
 #[test]
 fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
     runtime().block_on(async {
+        let _one_at_a_time = ONE_DEADLINE_TEST_AT_A_TIME.lock().await;
         let Some((database_url, pool)) = test_db().await else {
             return;
         };
@@ -735,7 +771,8 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
 
         let (skilj, report) = Skilj::builder(database_url)
             // Only this test's own ticks fire deadlines: the background one
-            // scans every bounded context and would race them.
+            // scans every bounded context and would race them - stopped
+            // below (`dispatchers_without_background_ticks`).
             .deadline_poll_interval(std::time::Duration::from_secs(3600))
             .bounded_context(DEADLINE_RACE_BOUNDED_CONTEXT)
             .event_type::<RaceFired>()
@@ -746,6 +783,8 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
             .await
             .unwrap();
         assert_eq!(report.skipped_no_access, Vec::<String>::new());
+        let (command_dispatcher, projection_dispatcher, snapshot_dispatcher) =
+            dispatchers_without_background_ticks(skilj).await;
 
         // A real due-and-`pending` row, inserted directly - see this
         // section's own doc comment for why `catch_up_schedule_deadline`
@@ -769,9 +808,6 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
         .await
         .unwrap();
 
-        let command_dispatcher = skilj.command_dispatcher();
-        let projection_dispatcher = skilj.projection_dispatcher();
-        let snapshot_dispatcher = skilj.snapshot_dispatcher();
         let broadcaster = skilj_core::event_store::EventBroadcaster::new(16);
         let event_cache = skilj_core::event_cache::EventCache::new(0);
 
@@ -855,6 +891,7 @@ fn fire_due_deadlines_never_lets_a_claimed_row_also_get_cancelled() {
 #[test]
 fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
     runtime().block_on(async {
+        let _one_at_a_time = ONE_DEADLINE_TEST_AT_A_TIME.lock().await;
         let Some((database_url, pool)) = test_db().await else {
             return;
         };
@@ -900,7 +937,8 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
 
         let (skilj, report) = Skilj::builder(database_url)
             // Only this test's own ticks fire deadlines: the background one
-            // scans every bounded context and would race them.
+            // scans every bounded context and would race them - stopped
+            // below (`dispatchers_without_background_ticks`).
             .deadline_poll_interval(std::time::Duration::from_secs(3600))
             .bounded_context(target.clone())
             .event_type::<RaceFired>()
@@ -910,6 +948,8 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
             .await
             .unwrap();
         assert_eq!(report.skipped_no_access, Vec::<String>::new());
+        let (command_dispatcher, projection_dispatcher, snapshot_dispatcher) =
+            dispatchers_without_background_ticks(skilj).await;
         db::update_bounded_context_status(&pool, &target, BoundedContextStatus::Archived)
             .await
             .unwrap();
@@ -935,9 +975,9 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
 
         db::fire_due_deadlines(
             &pool,
-            &*skilj.command_dispatcher(),
-            &*skilj.projection_dispatcher(),
-            &*skilj.snapshot_dispatcher(),
+            &*command_dispatcher,
+            &*projection_dispatcher,
+            &*snapshot_dispatcher,
             &skilj_core::event_store::EventBroadcaster::new(16),
             &skilj_core::event_cache::EventCache::new(0),
             &source,
@@ -973,6 +1013,7 @@ fn a_deadline_whose_target_is_archived_resolves_without_submitting() {
 #[test]
 fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
     runtime().block_on(async {
+        let _one_at_a_time = ONE_DEADLINE_TEST_AT_A_TIME.lock().await;
         let Some((database_url, pool)) = test_db().await else {
             return;
         };
@@ -1017,7 +1058,8 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
         let (source, target) = (contexts[0].clone(), contexts[1].clone());
         let (skilj, _) = Skilj::builder(database_url)
             // Only this test's own ticks fire deadlines: the background one
-            // scans every bounded context and would race them.
+            // scans every bounded context and would race them - stopped
+            // below (`dispatchers_without_background_ticks`).
             .deadline_poll_interval(std::time::Duration::from_secs(3600))
             .bounded_context(target.clone())
             .event_type::<RaceFired>()
@@ -1026,6 +1068,8 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
             .build()
             .await
             .unwrap();
+        let (command_dispatcher, projection_dispatcher, snapshot_dispatcher) =
+            dispatchers_without_background_ticks(skilj).await;
 
         let now = test_now();
         let insert = |id: String, fire_at: chrono::DateTime<Utc>, payload: serde_json::Value| {
@@ -1081,9 +1125,9 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
         let tick = |at: chrono::DateTime<Utc>| {
             let (pool, source) = (pool.clone(), source.clone());
             let (c, p, s) = (
-                skilj.command_dispatcher(),
-                skilj.projection_dispatcher(),
-                skilj.snapshot_dispatcher(),
+                command_dispatcher.clone(),
+                projection_dispatcher.clone(),
+                snapshot_dispatcher.clone(),
             );
             async move {
                 db::fire_due_deadlines(

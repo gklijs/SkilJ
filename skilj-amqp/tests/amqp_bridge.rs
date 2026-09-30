@@ -120,9 +120,22 @@ async fn connect(
     fe2o3_amqp::connection::ConnectionHandle<()>,
     fe2o3_amqp::session::SessionHandle<()>,
 ) {
-    let mut connection = Connection::open(name, url)
-        .await
-        .expect("connecting to the ephemeral Artemis broker must succeed");
+    // Retried briefly: under load (a full workspace run, several broker
+    // containers starting at once) the broker's port can be up before it
+    // accepts AMQP connections, which failed every test in this file at
+    // once (docs/architecture.md §146).
+    let mut attempt = 0;
+    let mut connection = loop {
+        attempt += 1;
+        match Connection::open(name, url).await {
+            Ok(connection) => break connection,
+            Err(e) if attempt < 20 => {
+                eprintln!("connecting to Artemis (attempt {attempt}) failed, retrying: {e}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("connecting to the ephemeral Artemis broker must succeed: {e}"),
+        }
+    };
     let session = Session::begin(&mut connection)
         .await
         .expect("beginning a session must succeed");
