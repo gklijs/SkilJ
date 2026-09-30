@@ -35,7 +35,11 @@ documented Activity-idempotency guidance). See
 not just Workflow ID, is part of the key. A key deduplicates for
 `SkiljBuilder::idempotency_key_retention` (default one hour), so keep
 the Activity's retry policy (its schedule-to-close timeout) inside that
-window, or raise the retention - a retry after it lands twice.
+window, or raise the retention - a retry after it lands twice. Keep
+`no_decider_registered` and `sync_projection_not_declared` retryable:
+they mean the skilj instance reached can't process the command but
+another can (rolling deploy - docs/architecture.md §161;
+`skilj_retry::another_instance_can_do_it`).
 
 **2. Starting or signaling a Temporal workflow from a skilj event** -
 the `skilj-temporal` crate. One `EventTypeMapping` per `EventType` you

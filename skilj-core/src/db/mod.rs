@@ -1377,6 +1377,32 @@ pub async fn delete_expired_idempotency_keys(
     Ok(result.rows_affected())
 }
 
+/// Deletes up to `batch` deadlines in `bounded_context` resolved (fired,
+/// cancelled, parked or forgotten) before `cutoff`, returning how many
+/// went - `SkiljBuilder::deadline_retention`'s task (docs/architecture.md
+/// §163). A pending or firing deadline is never touched. Safe because a
+/// schedule's cursor only moves forward: the deleted row's deterministic
+/// id (`schedule:sequence`) is never derived again, so nothing relies on
+/// its `ON CONFLICT (id) DO NOTHING` once it's gone.
+pub async fn delete_expired_deadlines(
+    pool: &Pool,
+    bounded_context: &str,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> crate::error::Result<u64> {
+    let schema = schema_ident(bounded_context);
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {schema}.deadlines WHERE ctid IN ( \
+             SELECT ctid FROM {schema}.deadlines \
+             WHERE status NOT IN ('pending', 'firing') AND resolved_at < $1 LIMIT $2)"
+    )))
+    .bind(cutoff)
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Patches an already-provisioned bounded context's `idempotency_keys`
 /// (real ones exist, back to 0.0.2 - see `ensure_idempotency_keys_table`'s
 /// own doc comment for the full story) onto the `client_id`-scoped shape
@@ -9707,9 +9733,13 @@ pub fn render_parked_delivery(
 /// or - when that type is gone, or the payload doesn't parse - when the
 /// subject value appears anywhere in it, erring toward erasure as
 /// [`delete_parked_deliveries_for_subject`] does. A row already `firing`
-/// is past stopping and left alone. The resolved row stays, as a trace
-/// that a deadline was forgotten rather than fired or cancelled. Returns
-/// how many were resolved.
+/// is past stopping and left alone; its payload is cleared when it
+/// resolves. The resolved row stays, as a trace that a deadline was
+/// forgotten rather than fired or cancelled. A row resolved (fired,
+/// cancelled, parked) before resolution cleared its payload still holds
+/// it, and has it cleared here too, keeping its status
+/// (docs/architecture.md §162). Returns how many pending deadlines were
+/// resolved as `forgotten`.
 pub async fn forget_subject_in_deadlines(
     pool: &Pool,
     bounded_context: &str,
@@ -9757,21 +9787,25 @@ async fn forget_subject_in_holder_deadlines(
     let mut forgotten = 0;
     let mut after = String::new();
     loop {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT id, target_command_type, payload FROM {schema}.deadlines \
-                 WHERE target_bounded_context = $1 AND status = 'pending' AND id > $2 \
+        // Pending rows, and resolved ones still holding a payload - a row
+        // resolved before resolution cleared it (docs/architecture.md §162).
+        let rows: Vec<(String, String, String, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT id, target_command_type, payload, status FROM {schema}.deadlines \
+                 WHERE target_bounded_context = $1 AND id > $2 \
+                 AND (status = 'pending' OR (status <> 'firing' AND payload <> '{{}}')) \
                  ORDER BY id LIMIT $3"
-        )))
-        .bind(bounded_context)
-        .bind(&after)
-        .bind(PAGE)
-        .fetch_all(pool)
-        .await?;
-        let Some((last_id, _, _)) = rows.last() else {
+            )))
+            .bind(bounded_context)
+            .bind(&after)
+            .bind(PAGE)
+            .fetch_all(pool)
+            .await?;
+        let Some((last_id, _, _, _)) = rows.last() else {
             break;
         };
         after = last_id.clone();
-        for (id, command_type, payload) in &rows {
+        for (id, command_type, payload, status) in &rows {
             if !sensitive_fields.contains_key(command_type) {
                 let fields = get_command_type(pool, bounded_context, command_type)
                     .await?
@@ -9788,7 +9822,7 @@ async fn forget_subject_in_holder_deadlines(
                 (_, Some(json)) => json_mentions(json, subject_value),
                 (_, None) => payload.contains(subject_value),
             };
-            if names_subject {
+            if names_subject && status == "pending" {
                 forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {schema}.deadlines \
                      SET status = 'forgotten', payload = '{{}}', resolved_at = $1 \
@@ -9799,6 +9833,14 @@ async fn forget_subject_in_holder_deadlines(
                 .execute(pool)
                 .await?
                 .rows_affected();
+            } else if names_subject {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {schema}.deadlines SET payload = '{{}}' \
+                     WHERE id = $1 AND status NOT IN ('pending', 'firing')"
+                )))
+                .bind(id)
+                .execute(pool)
+                .await?;
             }
         }
         if (rows.len() as i64) < PAGE {
@@ -10708,7 +10750,8 @@ pub async fn catch_up_cancel_deadline(
                     .collect::<Vec<_>>()
                     .join(" OR ");
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "UPDATE {target_schema}.deadlines SET status = 'cancelled', resolved_at = $1 \
+                    "UPDATE {target_schema}.deadlines SET status = 'cancelled', resolved_at = $1, \
+                     payload = '{{}}' \
                      WHERE schedule_name = $2 AND status = 'pending' AND ({tag_clause})"
                 )))
                 .bind(Utc::now())
@@ -11076,7 +11119,8 @@ async fn record_deadline_failure(
         .await?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.deadlines SET status = 'parked', resolved_at = $1, \
-             attempt_count = $2, last_error = $3 WHERE id = $4 AND status = 'firing'"
+             attempt_count = $2, last_error = $3, payload = '{{}}' \
+             WHERE id = $4 AND status = 'firing'"
         )))
         .bind(now)
         .bind(attempt_count)
@@ -11117,7 +11161,7 @@ async fn mark_deadline_resolved(
     now: DateTime<Utc>,
 ) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE {schema}.deadlines SET status = $1, resolved_at = $2 \
+        "UPDATE {schema}.deadlines SET status = $1, resolved_at = $2, payload = '{{}}' \
          WHERE id = $3 AND status IN ('pending', 'firing')"
     )))
     .bind(status)

@@ -37,6 +37,17 @@ Content-Type: application/json
 GraphQL, the same key as an argument to `submitCommand` (see [`docs/architecture.md` §7](architecture.md#rest-wire-contract)/[§21](architecture.md#optional-idempotency-key-submission) for the
 full mutation shape).
 
+### Which failures to retry
+
+A rejected command (`accepted: false`) is a business outcome, not an Activity failure: nothing is
+recorded under its key, so a retry is simply decided again. Two refusals, though, mean only that the
+skilj instance the request reached can't process it and another can - ordinary during a rolling
+deploy ([§161](architecture.md)): `no_decider_registered` (that instance doesn't declare the command
+type; REST `500`) and `sync_projection_not_declared` (it doesn't declare a sync projection the
+resulting event feeds; REST `503`). Leave both retryable in the Activity's retry policy - the same
+idempotency key makes a retry that does land safe. `skilj_retry::another_instance_can_do_it(code)`
+recognises them.
+
 ## Why Run ID, not just Workflow ID
 
 A Workflow ID can outlive more than one Run - `continue-as-new`, a reset - and an Activity ID is

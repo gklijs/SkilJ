@@ -476,6 +476,27 @@ fn subject_erasure_end_to_end() {
         let naming_43 = deadline(bc_name.clone(), bc_name.clone(), "EmailUser", "43").await;
         let unresolvable_42 = deadline(bc_name.clone(), bc_name.clone(), "Gone", "42").await;
         let other_target = deadline(bc_name.clone(), holder.name.clone(), "EmailUser", "42").await;
+        // docs/architecture.md §162: fired before resolving cleared a
+        // deadline's payload, so it still holds it.
+        let fired = |row: (String, String)| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE \"bc_{}\".deadlines SET status = 'fired', resolved_at = now() \
+                     WHERE id = $1",
+                    row.0
+                )))
+                .bind(&row.1)
+                .execute(&pool)
+                .await
+                .unwrap();
+                row
+            }
+        };
+        let fired_naming_42 =
+            fired(deadline(bc_name.clone(), bc_name.clone(), "EmailUser", "42").await).await;
+        let fired_naming_43 =
+            fired(deadline(bc_name.clone(), bc_name.clone(), "EmailUser", "43").await).await;
         let deadline_row = |(held_by, id): (String, String)| {
             let pool = pool.clone();
             async move {
@@ -534,6 +555,13 @@ fn subject_erasure_end_to_end() {
         for kept in [naming_43, other_target] {
             assert_eq!(deadline_row(kept).await.0, "pending");
         }
+        // ...and clears an already-fired one's payload naming 42, keeping its
+        // status; 43's keeps its payload.
+        assert_eq!(
+            deadline_row(fired_naming_42).await,
+            ("fired".to_string(), "{}".to_string())
+        );
+        assert_ne!(deadline_row(fired_naming_43).await.1, "{}");
 
         // A second forgetSubject on the same, now-destroyed subject is
         // rejected - there is nothing active left to find.

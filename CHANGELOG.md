@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SkiljBuilder::deadline_retention(Duration)` (default 30 days) and
+  `keep_resolved_deadlines_forever()`: a background task deletes
+  deadlines resolved (fired, cancelled, parked or forgotten) longer ago
+  than the retention, in bounded batches. Pending and firing deadlines
+  are never deleted. Each `deadlines` table used to keep one row per
+  deadline ever scheduled (docs/architecture.md §163).
 - `skilj_retry::ANOTHER_INSTANCE_CODES`/`another_instance_can_do_it`/
   `ANOTHER_INSTANCE_RETRY_DELAY` and `skilj_core::Error::another_instance_can_do_it`:
   the refusals (`no_decider_registered`, `sync_projection_not_declared`)
@@ -716,6 +722,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A deadline kept its target command's plaintext payload after it
+  resolved (fired, cancelled or parked), for good, and `forgetSubject`
+  only cleared pending deadlines. So a forgotten subject's data stayed
+  readable in every deadline that had already fired for it. Resolving a
+  deadline now clears its payload, and `forgetSubject` also clears the
+  payload of an already-resolved deadline naming the subject
+  (docs/architecture.md §162).
 - `parkedDeliveries` and `forgetSubject` looked up a parked delivery's
   target type or token for every row they examined - several queries per
   row, over every parked row for a scoped grant filling a page. The

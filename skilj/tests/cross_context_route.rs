@@ -1600,6 +1600,7 @@ fn shutdown_finishes_ticks_aborts_at_the_timeout_and_drop_stops_nothing() {
                 "cancel_deadlines",
                 "cross_context_routes",
                 "cross_instance",
+                "deadline_retention",
                 "fire_deadlines",
                 "idempotency_key_retention",
                 "schedule_deadlines",

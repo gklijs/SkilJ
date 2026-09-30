@@ -10548,3 +10548,26 @@ With the user's choice (not counted and never parked, over parking after a long 
 Work that no instance ever declares again is retried every 10 seconds with a warning, rather than parked. That is the same stance §160 takes for a projection nobody declares. `skilj-temporal` dispatches to Temporal rather than submitting commands, so it is unaffected. An Activity calling skilj should treat these codes as retryable in the same way.
 
 Tests: `skilj/tests/deadlines.rs` `a_deadline_an_instance_cannot_fire_waits_for_one_that_can` (an instance declaring no command types claims it three times with a one-attempt policy: still `pending`, attempt 0, nothing parked; then the declaring instance fires it; with the guard disabled it is parked at once) and `skilj-core/tests/cross_context_route_parking.rs` `a_route_an_instance_cannot_deliver_waits_for_one_that_can` (the same for a route). Unit tests cover the code classification in `skilj-retry` and each bridge. The bridges' retry loops themselves need a broker and aren't exercised for this.
+
+## 162. A resolved deadline keeps no payload
+
+A deadline row holds its target command's payload in plaintext, outside any key's reach, so that it can submit it when due (§132). §132's own write-up, and `forget_subject_in_deadlines`' doc comment, describe that as lasting "until it fires". But nothing cleared it then. `mark_deadline_resolved` (fired), the cancel `UPDATE` (cancelled) and `record_deadline_failure` (parked) only changed the status, and resolved rows are never deleted. `forgetSubject` walked only `pending` deadlines. So once a deadline had fired, the subject's data sat in plaintext on its row for good, and erasing the subject left it there. The command the deadline submitted is fine: its sensitive fields were encrypted under the subject's key, which `forgetSubject` destroys.
+
+Nothing reads a resolved deadline's payload. A parked deadline is redriven from its `parked_deliveries` copy, which `forgetSubject` already deletes (§91). So:
+
+- The three resolving writes set `payload = '{}'` along with the status, the same value `forgotten` already stores.
+- `forget_subject_in_deadlines` also reads resolved rows whose payload isn't `'{}'`: rows resolved before this change. It clears the payload of each that names the subject, keeping its status. A `firing` row is still left to finish; resolving it clears it. The returned count still counts only pending deadlines resolved as `forgotten`.
+
+Rows already resolved for subjects nobody has asked to forget keep their payload until then. A bulk clear at startup would rewrite the whole table under its lock on every bounded context, for data an erasure now reaches anyway.
+
+Tests: `skilj/tests/deadlines.rs` checks that every fired or cancelled deadline in `a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag`, and the parked one in `a_failing_deadline_is_retried_then_parked_without_blocking_others`, ends with payload `{}`. `skilj/tests/subject_erasure.rs` adds two already-fired deadlines holding their payload: the one naming the forgotten subject is cleared and stays `fired`, and the other keeps its payload. All three fail on the previous code.
+
+## 163. Resolved deadlines are deleted after a retention
+
+Resolved deadline rows were never deleted, so each bounded context's `deadlines` table grew by one row for every deadline ever scheduled. After §162 a resolved row holds no payload, only which schedule it came from, its tags and when and how it resolved. What it did is in the command and events it submitted.
+
+With the user's choice (configurable, on by default at 30 days, over off by default or keeping them forever): `SkiljBuilder::deadline_retention(Duration)` sets the retention, `DEFAULT_DEADLINE_RETENTION` is 30 days, and `keep_resolved_deadlines_forever()` turns it off. A background task, `deadline_retention`, runs at most hourly (`min(retention, 1 hour)`). In every bounded context it calls `db::delete_expired_deadlines`, which deletes rows whose status is neither `pending` nor `firing` and whose `resolved_at` is before the cutoff, 10,000 per statement, repeating until a batch comes back short. It shares its loop with §87's idempotency-key retention: `retention_tick` takes a `RetentionTarget`. It has no startup grace like §94's, because nothing retries under a resolved deadline.
+
+Deleting a row gives up the protection its deterministic id (`{schedule}:{source sequence}`) gave through `ON CONFLICT (id) DO NOTHING`. That only matters if a schedule re-read a source event it had already processed. A schedule's cursor only moves forward, so after 30 days that no longer happens. There is no index on `resolved_at`: the hourly delete scans the table, which the retention itself keeps to about a month of deadlines.
+
+Tests: `skilj-core/tests/persistence.rs` `resolved_deadlines_past_their_retention_are_deleted_in_bounded_batches` (every resolved status past the cutoff goes, in batches; a recent one, a pending one and a firing one stay, however old) and `skilj/tests/deadlines.rs` `resolved_deadlines_are_deleted_after_their_retention` (a `Skilj` with a one-second retention deletes an hour-old fired deadline and leaves a pending one).

@@ -627,6 +627,24 @@ fn a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag() {
              and order-C must never have been scheduled at all - only order-B's CancelOrder \
              deadline should ever have fired"
         );
+        // docs/architecture.md §162: a resolved deadline keeps no payload -
+        // it was the target command's plaintext.
+        let resolved: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT status, payload FROM {}.deadlines WHERE status NOT IN ('pending', 'firing')",
+            race_schema(ORDERS_BOUNDED_CONTEXT)
+        )))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        for status in ["fired", "cancelled"] {
+            assert!(
+                resolved.iter().any(|(s, _)| s == status),
+                "no {status} deadline: {resolved:?}"
+            );
+        }
+        for (status, payload) in &resolved {
+            assert_eq!(payload, "{}", "a {status} deadline kept its payload");
+        }
         // Stopped before the lock is released - see `ONE_DEADLINE_TEST_AT_A_TIME`.
         skilj.shutdown(std::time::Duration::from_secs(20)).await;
     });
@@ -1171,6 +1189,15 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
         // context, redrivable under the deadline's own idempotency key.
         tick(now + chrono::Duration::seconds(61)).await.unwrap();
         assert_eq!(status(failing.clone()).await, "parked");
+        let (payload,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT payload FROM {}.deadlines WHERE id = $1",
+            race_schema(&source)
+        )))
+        .bind(&failing)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(payload, "{}", "a parked deadline kept its payload (§162)");
         let parked = db::list_parked_deliveries(&pool, &target).await.unwrap();
         assert_eq!(parked.len(), 1);
         let parked = &parked[0];
@@ -1383,5 +1410,77 @@ fn a_deadline_an_instance_cannot_fire_waits_for_one_that_can() {
         // The instance that declares it fires it.
         tick(newer, at).await;
         assert_eq!(state().await.0, "fired");
+    });
+}
+
+/// docs/architecture.md §163: `SkiljBuilder::deadline_retention` runs a
+/// background task deleting resolved deadlines past it - a pending one
+/// stays. Holds `ONE_DEADLINE_TEST_AT_A_TIME` and stops its `Skilj`: with a
+/// one-second retention it would delete the other tests' resolved rows.
+#[test]
+fn resolved_deadlines_are_deleted_after_their_retention() {
+    runtime().block_on(async {
+        let _one_at_a_time = ONE_DEADLINE_TEST_AT_A_TIME.lock().await;
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let bc = BoundedContext {
+            name: unique_name("retention"),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        db::insert_bounded_context(&pool, &bc).await.unwrap();
+        let old = test_now() - chrono::Duration::hours(1);
+        for (id, status, resolved_at) in
+            [("fired", "fired", Some(old)), ("pending", "pending", None)]
+        {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {}.deadlines \
+                 (id, schedule_name, fire_at, tags, target_bounded_context, target_command_type, \
+                  payload, status, created_at, resolved_at) \
+                 VALUES ($1, 's', $2, '[]'::jsonb, 'x', 'C', '{{}}', $3, $2, $4)",
+                race_schema(&bc.name)
+            )))
+            .bind(id)
+            .bind(old)
+            .bind(status)
+            .bind(resolved_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let (skilj, _) = Skilj::builder(database_url)
+            .deadline_poll_interval(std::time::Duration::from_secs(3600))
+            .deadline_retention(std::time::Duration::from_secs(1))
+            .build()
+            .await
+            .unwrap();
+        let ids = || {
+            let (pool, bc_name) = (pool.clone(), bc.name.clone());
+            async move {
+                let mut ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT id FROM {}.deadlines",
+                    race_schema(&bc_name)
+                )))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+                ids.sort();
+                ids
+            }
+        };
+        let mut remaining = ids().await;
+        for _ in 0..100 {
+            if remaining == vec!["pending".to_string()] {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            remaining = ids().await;
+        }
+        skilj.shutdown(std::time::Duration::from_secs(20)).await;
+        assert_eq!(remaining, vec!["pending".to_string()]);
     });
 }

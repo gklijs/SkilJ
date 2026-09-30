@@ -2268,6 +2268,66 @@ fn expired_idempotency_keys_are_deleted_in_bounded_batches() {
     });
 }
 
+/// docs/architecture.md §163: `delete_expired_deadlines` removes only
+/// deadlines resolved before the cutoff, at most `batch` per call - never
+/// a pending or firing one, however old.
+#[test]
+fn resolved_deadlines_past_their_retention_are_deleted_in_bounded_batches() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let now = test_now();
+        let old = now - chrono::Duration::days(40);
+        for (id, status, resolved_at) in [
+            ("fired", "fired", Some(old)),
+            ("cancelled", "cancelled", Some(old)),
+            ("parked", "parked", Some(old)),
+            ("forgotten", "forgotten", Some(old)),
+            ("recent", "fired", Some(now - chrono::Duration::days(1))),
+            ("pending", "pending", None),
+            ("firing", "firing", None),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO \"bc_{}\".deadlines \
+                 (id, schedule_name, fire_at, tags, target_bounded_context, target_command_type, \
+                  payload, status, created_at, resolved_at) \
+                 VALUES ($1, 's', $2, '[]'::jsonb, 'x', 'C', '{{}}', $3, $2, $4)",
+                bc.name
+            )))
+            .bind(id)
+            .bind(old)
+            .bind(status)
+            .bind(resolved_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let cutoff = now - chrono::Duration::days(30);
+        let mut deleted = Vec::new();
+        for _ in 0..3 {
+            deleted.push(
+                db::delete_expired_deadlines(&pool, &bc.name, cutoff, 3)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(deleted, vec![3, 1, 0]);
+
+        let mut remaining: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT id FROM \"bc_{}\".deadlines",
+            bc.name
+        )))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        remaining.sort();
+        assert_eq!(remaining, vec!["firing", "pending", "recent"]);
+    });
+}
+
 /// docs/architecture.md §107: `get_or_create_encryption_key`'s insert can
 /// lose to a concurrent provisioner whose key a concurrent `forgetSubject`
 /// then destroys before the loser re-reads it - no active key at all. That

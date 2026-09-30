@@ -81,6 +81,15 @@ const IDEMPOTENCY_KEY_STARTUP_GRACE: std::time::Duration = std::time::Duration::
 /// batch comes back short.
 const IDEMPOTENCY_KEY_CLEANUP_BATCH: i64 = 10_000;
 
+/// [`SkiljBuilder::deadline_retention`]'s default: 30 days.
+pub const DEFAULT_DEADLINE_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How often the deadline retention task runs at most (docs/architecture.md
+/// §163). A resolved deadline outlives its retention by at most about this
+/// much.
+const DEADLINE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Runs one unit of a background task's work (one bounded context's, one
 /// route's, one deadline schedule's), turning a panic into a logged error
 /// and a `reason = "panicked"` error count. The units run application
@@ -692,13 +701,13 @@ impl skilj_core::plugin::CancelDeadlineDispatcher for CancelDeadlineDispatcherIm
 impl Skilj {
     /// Stops this `Skilj` (docs/architecture.md §123): its background
     /// loops - projection and snapshot catch-up, routes, deadlines,
-    /// scheduled events, key retention, the cross-instance listener - each
-    /// finish the tick they are in and stop, then the connection pool
-    /// closes. Whatever is still running when `timeout` runs out is
-    /// aborted, and the pool is left to close on its own; the report says
-    /// which. An aborted tick is recovered like a crash would be - routes,
-    /// deadlines and bridges resume under their idempotency keys on the
-    /// next start.
+    /// scheduled events, key and deadline retention, the cross-instance
+    /// listener - each finish the tick they are in and stop, then the
+    /// connection pool closes. Whatever is still running when `timeout`
+    /// runs out is aborted, and the pool is left to close on its own; the
+    /// report says which. An aborted tick is recovered like a crash would
+    /// be - routes, deadlines and bridges resume under their idempotency
+    /// keys on the next start.
     ///
     /// Stop serving the routers from [`Skilj::rest_router`] and
     /// [`Skilj::graphql_router`] first: they share the pool, so requests
@@ -770,6 +779,7 @@ impl Skilj {
             // docs/architecture.md §87 - matches
             // `config.idempotency_key_retention` in specs/skilj.allium.
             idempotency_key_retention: Some(DEFAULT_IDEMPOTENCY_KEY_RETENTION),
+            deadline_retention: Some(DEFAULT_DEADLINE_RETENTION),
             application_version: None,
         }
     }
@@ -1569,6 +1579,7 @@ pub struct SkiljBuilder {
     event_cache_warm_up_count: usize,
     pool_options: Option<skilj_core::db::PgPoolOptions>,
     idempotency_key_retention: Option<std::time::Duration>,
+    deadline_retention: Option<std::time::Duration>,
     application_version: Option<u64>,
 }
 
@@ -1976,6 +1987,25 @@ impl SkiljBuilder {
     /// never removes a protection (§102).
     pub fn application_version(mut self, version: u64) -> Self {
         self.application_version = Some(version);
+        self
+    }
+
+    /// How long a resolved deadline (fired, cancelled, parked or
+    /// forgotten) is kept before a background task deletes it
+    /// (docs/architecture.md §163). Defaults to
+    /// [`DEFAULT_DEADLINE_RETENTION`] (30 days). Pending and firing
+    /// deadlines are never deleted. A resolved row holds no payload (§162),
+    /// only when and how it resolved; what it did is in the events and
+    /// commands it submitted.
+    pub fn deadline_retention(mut self, retention: std::time::Duration) -> Self {
+        self.deadline_retention = Some(retention);
+        self
+    }
+
+    /// Never delete resolved deadlines: each bounded context's `deadlines`
+    /// table keeps one row per deadline ever scheduled.
+    pub fn keep_resolved_deadlines_forever(mut self) -> Self {
+        self.deadline_retention = None;
         self
     }
 
@@ -2538,12 +2568,41 @@ impl SkiljBuilder {
                 }
                 loop {
                     let start = std::time::Instant::now();
-                    idempotency_key_retention_tick(&retention_pool, retention)
+                    retention_tick(&retention_pool, RetentionTarget::IdempotencyKeys, retention)
                         .instrument(tracing::info_span!("idempotency_key_retention_tick"))
                         .await;
                     BACKGROUND_TASK_TICK_DURATION.record(
                         start.elapsed().as_secs_f64(),
                         &[KeyValue::new("task", "idempotency_key_retention")],
+                    );
+                    if stop.sleep(cleanup_interval).await {
+                        return;
+                    }
+                }
+            });
+        }
+
+        // docs/architecture.md §163: resolved-deadline retention. No
+        // startup grace: nothing retries under a resolved deadline.
+        if let Some(retention) = self.deadline_retention {
+            let retention_pool = skilj.pool.clone();
+            let cleanup_interval = retention
+                .min(DEADLINE_CLEANUP_INTERVAL)
+                .max(std::time::Duration::from_secs(1));
+            let retention = chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
+            background.spawn("deadline_retention", move |mut stop| async move {
+                loop {
+                    let start = std::time::Instant::now();
+                    retention_tick(
+                        &retention_pool,
+                        RetentionTarget::ResolvedDeadlines,
+                        retention,
+                    )
+                    .instrument(tracing::info_span!("deadline_retention_tick"))
+                    .await;
+                    BACKGROUND_TASK_TICK_DURATION.record(
+                        start.elapsed().as_secs_f64(),
+                        &[KeyValue::new("task", "deadline_retention")],
                     );
                     if stop.sleep(cleanup_interval).await {
                         return;
@@ -3133,21 +3192,68 @@ impl SkiljBuilder {
     }
 }
 
-/// One pass of the idempotency-key retention task (docs/architecture.md
-/// §87): in every bounded context, delete keys recorded more than
-/// `retention` ago, a bounded batch at a time.
-async fn idempotency_key_retention_tick(pool: &Pool, retention: chrono::Duration) {
+/// What a retention task deletes.
+#[derive(Clone, Copy)]
+enum RetentionTarget {
+    /// docs/architecture.md §87.
+    IdempotencyKeys,
+    /// docs/architecture.md §163.
+    ResolvedDeadlines,
+}
+
+impl RetentionTarget {
+    fn task(self) -> &'static str {
+        match self {
+            RetentionTarget::IdempotencyKeys => "idempotency_key_retention",
+            RetentionTarget::ResolvedDeadlines => "deadline_retention",
+        }
+    }
+
+    async fn delete_batch(
+        self,
+        pool: &Pool,
+        bounded_context: &str,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> skilj_core::error::Result<u64> {
+        match self {
+            RetentionTarget::IdempotencyKeys => {
+                skilj_core::db::delete_expired_idempotency_keys(
+                    pool,
+                    bounded_context,
+                    cutoff,
+                    IDEMPOTENCY_KEY_CLEANUP_BATCH,
+                )
+                .await
+            }
+            RetentionTarget::ResolvedDeadlines => {
+                skilj_core::db::delete_expired_deadlines(
+                    pool,
+                    bounded_context,
+                    cutoff,
+                    IDEMPOTENCY_KEY_CLEANUP_BATCH,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// One pass of a retention task: in every bounded context, delete what
+/// `target` names recorded (or resolved) more than `retention` ago, a
+/// bounded batch at a time.
+async fn retention_tick(pool: &Pool, target: RetentionTarget, retention: chrono::Duration) {
+    let task = target.task();
     let cutoff = chrono::Utc::now()
         .checked_sub_signed(retention)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
     let bounded_contexts = match skilj_core::db::list_bounded_contexts(pool).await {
         Ok(bcs) => bcs,
         Err(e) => {
-            tracing::warn!(error = %e, "idempotency key retention failed to list bounded contexts");
+            tracing::warn!(error = %e, task, "retention failed to list bounded contexts");
             BACKGROUND_TASK_ERRORS.add(
                 1,
                 &[
-                    KeyValue::new("task", "idempotency_key_retention"),
+                    KeyValue::new("task", task),
                     KeyValue::new("reason", "list_bounded_contexts_failed"),
                 ],
             );
@@ -3156,28 +3262,22 @@ async fn idempotency_key_retention_tick(pool: &Pool, retention: chrono::Duration
     };
     stream::iter(&bounded_contexts)
         .for_each_concurrent(BACKGROUND_TASK_CONCURRENCY, |bc| {
-            contain_panic("idempotency_key_retention", bc.name.clone(), async move {
+            contain_panic(task, bc.name.clone(), async move {
                 loop {
-                    match skilj_core::db::delete_expired_idempotency_keys(
-                        pool,
-                        &bc.name,
-                        cutoff,
-                        IDEMPOTENCY_KEY_CLEANUP_BATCH,
-                    )
-                    .await
-                    {
+                    match target.delete_batch(pool, &bc.name, cutoff).await {
                         Ok(deleted) if deleted < IDEMPOTENCY_KEY_CLEANUP_BATCH as u64 => break,
                         Ok(_) => continue,
                         Err(e) => {
                             tracing::warn!(
                                 bounded_context = %bc.name,
                                 error = %e,
-                                "idempotency key retention failed"
+                                task,
+                                "retention failed"
                             );
                             BACKGROUND_TASK_ERRORS.add(
                                 1,
                                 &[
-                                    KeyValue::new("task", "idempotency_key_retention"),
+                                    KeyValue::new("task", task),
                                     KeyValue::new("reason", "delete_failed"),
                                 ],
                             );
