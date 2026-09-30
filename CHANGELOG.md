@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Event subscriptions read the caller's grant, private-field grants and
+  decryption keys once per batch of events rather than once per event -
+  a resumed subscription replaying a thousand events used to cost
+  thousands of queries (docs/architecture.md §154).
 - `allEvents`/`eventsByType` refuse a `fromSequence` past the bounded
   context's latest committed sequence with `from_sequence_not_committed`,
   and `GET /v1/events` refuses such an `after` with `400`. Accepted, the

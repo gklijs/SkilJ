@@ -10458,3 +10458,11 @@ A parked delivery's visibility and masking (§119) and whether `forgetSubject` m
 The rules depend only on the target, and the rows one bridge or route parks share it. `db::ParkedPayloadRulesCache` memoizes them for the length of one scan, keyed by the target type or token id; both scans use it. Rows still come a page (1000) at a time; what a request can no longer do is multiply that by per-row lookups. `retryParkedDelivery`/`discardParkedDelivery` look up one row and are unchanged.
 
 Test: `parked_payload_rules_are_looked_up_once_per_target` (`skilj-core/tests/cross_context_route_parking.rs`) - two rows for one route target; with the target type removed after the first lookup, the cache still answers the second, where an uncached lookup finds nothing.
+
+## 154. Subscriptions read the grant once per batch, not once per event
+
+Every event an `allEvents`/`eventsByType` subscription selected went through `deliver_one`, which re-read the caller's `RoleAccessMapping` (`RevocationClosesTheConnection`'s per-delivery re-check), resolved decrypt-on-read keys into a map of its own, and re-read the caller's private-field grants - several queries per event. Two paths hand a subscription many events at once: the resume span (§84), up to `max_events_per_read` committed events delivered before going live, and a live batch `in_sequence_order` (§90) loads when an event arrives ahead of ones not yet seen. A resume of a thousand events cost thousands of queries.
+
+`deliver_batch` does that work once per batch: it keeps the events the subscription selects (§85's filter, still before any query), reads the grant and the private-field grants once, resolves the data keys for all of them into one map, and renders each. A batch is assembled and delivered in one step, so this is as fresh as the per-event reads were; a live event arriving on its own is a batch of one, unchanged. Revocation still closes the stream through the push path (`revocation_closes_connection`) and through this re-read.
+
+No new test: the change is in how often the same reads happen, and the embedded test database has no statement statistics to count them with. `skilj/tests/event_subscription.rs` (resume span, ordering, revocation, private fields) and `decrypt_on_read.rs` cover that the behaviour is unchanged.

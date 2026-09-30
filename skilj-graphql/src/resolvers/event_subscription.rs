@@ -221,19 +221,17 @@ pub fn all_events_field() -> SubscriptionField {
                 // time, delivered first, in order; live events at or
                 // below `delivered_up_to` are then skipped as duplicates.
                 let mut processed_up_to = delivered_up_to;
-                for event in &resume_span {
-                    match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
-                        Ok(delivered) => {
-                            for (sequence, rendered) in delivered {
-                                yielder
-                                    .yield_ok(FieldValue::owned_any((sequence, rendered)))
-                                    .await;
-                            }
+                match deliver_batch(&state, &role_id, &bounded_context_name, &mut current, &resume_span).await {
+                    Ok(delivered) => {
+                        for (sequence, rendered) in delivered {
+                            yielder
+                                .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                .await;
                         }
-                        Err(err) => {
-                            yielder.yield_error(err).await;
-                            return Ok(());
-                        }
+                    }
+                    Err(err) => {
+                        yielder.yield_error(err).await;
+                        return Ok(());
                     }
                 }
                 loop {
@@ -276,19 +274,17 @@ pub fn all_events_field() -> SubscriptionField {
                                     return Ok(());
                                 }
                             };
-                            for event in &ordered {
-                                match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
-                                    Ok(delivered) => {
-                                        for (sequence, rendered) in delivered {
-                                            yielder
-                                                .yield_ok(FieldValue::owned_any((sequence, rendered)))
-                                                .await;
-                                        }
+                            match deliver_batch(&state, &role_id, &bounded_context_name, &mut current, &ordered).await {
+                                Ok(delivered) => {
+                                    for (sequence, rendered) in delivered {
+                                        yielder
+                                            .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                            .await;
                                     }
-                                    Err(err) => {
-                                        yielder.yield_error(err).await;
-                                        return Ok(());
-                                    }
+                                }
+                                Err(err) => {
+                                    yielder.yield_error(err).await;
+                                    return Ok(());
                                 }
                             }
                         }
@@ -389,19 +385,17 @@ pub fn events_by_type_field() -> SubscriptionField {
                 // time, delivered first, in order; live events at or
                 // below `delivered_up_to` are then skipped as duplicates.
                 let mut processed_up_to = delivered_up_to;
-                for event in &resume_span {
-                    match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
-                        Ok(delivered) => {
-                            for (sequence, rendered) in delivered {
-                                yielder
-                                    .yield_ok(FieldValue::owned_any((sequence, rendered)))
-                                    .await;
-                            }
+                match deliver_batch(&state, &role_id, &bounded_context_name, &mut current, &resume_span).await {
+                    Ok(delivered) => {
+                        for (sequence, rendered) in delivered {
+                            yielder
+                                .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                .await;
                         }
-                        Err(err) => {
-                            yielder.yield_error(err).await;
-                            return Ok(());
-                        }
+                    }
+                    Err(err) => {
+                        yielder.yield_error(err).await;
+                        return Ok(());
                     }
                 }
                 loop {
@@ -444,19 +438,17 @@ pub fn events_by_type_field() -> SubscriptionField {
                                     return Ok(());
                                 }
                             };
-                            for event in &ordered {
-                                match deliver_one(&state, &role_id, &bounded_context_name, &mut current, event).await {
-                                    Ok(delivered) => {
-                                        for (sequence, rendered) in delivered {
-                                            yielder
-                                                .yield_ok(FieldValue::owned_any((sequence, rendered)))
-                                                .await;
-                                        }
+                            match deliver_batch(&state, &role_id, &bounded_context_name, &mut current, &ordered).await {
+                                Ok(delivered) => {
+                                    for (sequence, rendered) in delivered {
+                                        yielder
+                                            .yield_ok(FieldValue::owned_any((sequence, rendered)))
+                                            .await;
                                     }
-                                    Err(err) => {
-                                        yielder.yield_error(err).await;
-                                        return Ok(());
-                                    }
+                                }
+                                Err(err) => {
+                                    yielder.yield_error(err).await;
+                                    return Ok(());
                                 }
                             }
                         }
@@ -612,24 +604,35 @@ fn resume_span_too_large_error(cap: usize) -> async_graphql::Error {
     .extend_with(|_, ext| ext.set("code", "resume_span_too_large"))
 }
 
-/// One committed event, delivered to one subscription: the grant
+/// Committed events, in order, delivered to one subscription: the grant
 /// re-checked live (never the subscribe-time snapshot -
 /// `RevocationClosesTheConnection`), decrypt-on-read keys resolved
 /// against it, private-field grants read fresh, then
-/// `deliver_to_subscriptions`. Returns each `(sequence, rendered
+/// `deliver_to_subscriptions` for each. Returns each `(sequence, rendered
 /// payload)` to push; an `Err` ends the stream with it. Shared by the
 /// resume span and the live feed of both event subscriptions.
-async fn deliver_one(
+///
+/// The grant, the private-field grants and the data keys are read once
+/// per call, not once per event (docs/architecture.md §154): a resume
+/// span is up to `max_events_per_read` events, and a live batch
+/// (`in_sequence_order`) can be too, and each read used to cost several
+/// queries per event. A batch is assembled and delivered in one step, so
+/// reading them at its start is as fresh as reading them per event was.
+async fn deliver_batch(
     state: &GraphqlState,
     role_id: &str,
     bounded_context_name: &str,
     current: &mut Subscription,
-    event: &skilj_core::event_store::Event,
+    events: &[skilj_core::event_store::Event],
 ) -> async_graphql::Result<Vec<(i64, String)>> {
-    // Everything below reads the database; an event this subscription
-    // can't select (another type, a failed filter) needs none of it
+    // Everything below reads the database; events this subscription
+    // can't select (another type, a failed filter) need none of it
     // (docs/architecture.md §85).
-    if !event_store::subscription_selects(current, event) {
+    let selected: Vec<_> = events
+        .iter()
+        .filter(|event| event_store::subscription_selects(current, event))
+        .collect();
+    if selected.is_empty() {
         return Ok(Vec::new());
     }
     let fresh_mapping =
@@ -639,16 +642,18 @@ async fn deliver_one(
             .ok_or_else(|| to_graphql_error(skilj_core::access_control::Error::GrantNotActive))?;
 
     let mut data_keys = std::collections::HashMap::new();
-    resolve_read_data_keys(
-        &state.pool,
-        bounded_context_name,
-        &event.event_type.sensitive_fields,
-        &event.payload,
-        &fresh_mapping,
-        state.encryption_master_key.as_ref(),
-        &mut data_keys,
-    )
-    .await?;
+    for event in &selected {
+        resolve_read_data_keys(
+            &state.pool,
+            bounded_context_name,
+            &event.event_type.sensitive_fields,
+            &event.payload,
+            &fresh_mapping,
+            state.encryption_master_key.as_ref(),
+            &mut data_keys,
+        )
+        .await?;
+    }
 
     let reader = fresh_mapping.role.clone();
     match current {
@@ -662,13 +667,16 @@ async fn deliver_one(
     )
     .await
     .map_err(to_graphql_error)?;
-    Ok(event_store::deliver_to_subscriptions(
-        event,
-        std::slice::from_ref(current),
-        |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
-        &private_field_grants,
-    )
-    .into_iter()
-    .map(|delivered| (delivered.event.sequence, delivered.rendered_payload))
-    .collect())
+    Ok(selected
+        .into_iter()
+        .flat_map(|event| {
+            event_store::deliver_to_subscriptions(
+                event,
+                std::slice::from_ref(current),
+                |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                &private_field_grants,
+            )
+        })
+        .map(|delivered| (delivered.event.sequence, delivered.rendered_payload))
+        .collect())
 }
