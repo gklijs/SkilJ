@@ -9218,6 +9218,7 @@ pub async fn delete_parked_deliveries_for_subject(
 ) -> crate::error::Result<u64> {
     let mut deleted = 0;
     let mut after: Option<ParkedDeliveryCursor> = None;
+    let mut rules_cache = ParkedPayloadRulesCache::default();
     loop {
         let page = list_parked_deliveries_page(pool, bounded_context, after.as_ref(), 1000).await?;
         let Some(last) = page.last() else {
@@ -9225,8 +9226,14 @@ pub async fn delete_parked_deliveries_for_subject(
         };
         after = Some(ParkedDeliveryCursor::of(last));
         for delivery in &page {
-            if parked_delivery_references_subject(pool, delivery, subject_key, subject_value)
-                .await?
+            if parked_delivery_references_subject(
+                pool,
+                &mut rules_cache,
+                delivery,
+                subject_key,
+                subject_value,
+            )
+            .await?
                 && delete_parked_delivery(pool, bounded_context, &delivery.id)
                     .await?
                     .is_some()
@@ -9239,11 +9246,12 @@ pub async fn delete_parked_deliveries_for_subject(
 
 async fn parked_delivery_references_subject(
     pool: &Pool,
+    rules_cache: &mut ParkedPayloadRulesCache,
     delivery: &ParkedDelivery,
     subject_key: &str,
     subject_value: &str,
 ) -> crate::error::Result<bool> {
-    let rules = parked_delivery_payload_rules(pool, delivery).await?;
+    let rules = rules_cache.get(pool, delivery).await?;
     Ok(match (rules, parked_delivery_payload(delivery)) {
         (Some(rules), Some(payload)) => {
             let payload = serde_json::to_string(payload)
@@ -9308,6 +9316,45 @@ pub async fn parked_delivery_payload_rules(
             None => None,
         },
     })
+}
+
+/// [`parked_delivery_payload_rules`], memoized for the length of one
+/// scan (docs/architecture.md §153). The rules depend only on what a row
+/// targets - its route's or deadline's command type, or its bridge's
+/// token - and the rows one bridge or route parks share that, so a scan
+/// over thousands of rows needs a handful of lookups rather than a few
+/// queries per row. `parkedDeliveries` filling a page for a scoped grant,
+/// and `forgetSubject` sweeping every row, both walk arbitrarily many.
+#[derive(Default)]
+pub struct ParkedPayloadRulesCache {
+    rules: std::collections::HashMap<String, Option<ParkedPayloadRules>>,
+}
+
+impl ParkedPayloadRulesCache {
+    pub async fn get(
+        &mut self,
+        pool: &Pool,
+        delivery: &ParkedDelivery,
+    ) -> crate::error::Result<Option<ParkedPayloadRules>> {
+        let key = match delivery.kind {
+            ParkedDeliveryKind::CrossContextRoute | ParkedDeliveryKind::Deadline => format!(
+                "type:{:?}:{:?}",
+                delivery.target_bounded_context, delivery.target_command_type
+            ),
+            ParkedDeliveryKind::ExternalEvent => {
+                format!("event-token:{:?}", delivery.access_token_id)
+            }
+            ParkedDeliveryKind::CommandTrigger => {
+                format!("command-token:{:?}", delivery.access_token_id)
+            }
+        };
+        if let Some(rules) = self.rules.get(&key) {
+            return Ok(rules.clone());
+        }
+        let rules = parked_delivery_payload_rules(pool, delivery).await?;
+        self.rules.insert(key, rules.clone());
+        Ok(rules)
+    }
 }
 
 /// The payload inside a parked delivery's request: the request itself for

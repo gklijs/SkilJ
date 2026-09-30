@@ -296,6 +296,10 @@ pub fn parked_deliveries_field() -> Field {
                 // the end.
                 let mut deliveries = Vec::new();
                 let mut after = after;
+                // A scoped grant can walk many rows to fill one page; each
+                // row's rules come from its target type or token, shared
+                // by the rows one bridge or route parks (§153).
+                let mut rules_cache = db::ParkedPayloadRulesCache::default();
                 'pages: loop {
                     let page = db::list_parked_deliveries_page(
                         &state.pool,
@@ -308,7 +312,8 @@ pub fn parked_deliveries_field() -> Field {
                     let exhausted = (page.len() as i64) < limit;
                     for delivery in &page {
                         after = Some(db::ParkedDeliveryCursor::of(delivery));
-                        let rules = db::parked_delivery_payload_rules(&state.pool, delivery)
+                        let rules = rules_cache
+                            .get(&state.pool, delivery)
                             .await
                             .map_err(to_graphql_error)?;
                         if db::parked_delivery_visible_to(delivery, rules.as_ref(), &access_mapping)

@@ -645,6 +645,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `parkedDeliveries` and `forgetSubject` looked up a parked delivery's
+  target type or token for every row they examined - several queries per
+  row, over every parked row for a scoped grant filling a page. The
+  lookups are now memoized per target for the length of a scan
+  (docs/architecture.md §153).
 - `queryEvents`, `countEvents`, `allEvents` and `fetchCommands` look up
   each distinct name in `eventTypes`/`commandTypes` once. A list
   repeating one name made a query per entry - some 200,000 for a

@@ -956,3 +956,65 @@ fn a_command_into_an_archived_bounded_context_is_refused() {
         );
     });
 }
+
+/// docs/architecture.md §153: `ParkedPayloadRulesCache` looks a target's
+/// rules up once per scan, not once per row - here two rows parked for
+/// the same route target. With the target's command type removed after
+/// the first lookup, the second row still gets the cached rules, where an
+/// uncached lookup finds nothing.
+#[test]
+fn parked_payload_rules_are_looked_up_once_per_target() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let target = seed_bounded_context(&pool).await;
+        seed_command_type(&pool, &target, "ReserveStock").await;
+        let park = |identifier: &'static str| {
+            let (pool, bc_name, target_name) = (pool.clone(), bc.name.clone(), target.name.clone());
+            async move {
+                db::insert_parked_delivery(
+                    &pool,
+                    &bc_name,
+                    "cross-context-route:reserve",
+                    ParkedDeliveryKind::CrossContextRoute,
+                    identifier,
+                    None,
+                    Some(&target_name),
+                    Some("ReserveStock"),
+                    &serde_json::json!({ "order_id": "o-1" }),
+                    "boom",
+                    1,
+                    test_now(),
+                    test_now(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let first = park("1").await;
+        let second = park("2").await;
+
+        let mut cache = db::ParkedPayloadRulesCache::default();
+        assert!(cache.get(&pool, &first).await.unwrap().is_some());
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM \"bc_{}\".command_types WHERE name = 'ReserveStock'",
+            target.name
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            db::parked_delivery_payload_rules(&pool, &second)
+                .await
+                .unwrap()
+                .is_none(),
+            "uncached, the removed type is gone"
+        );
+        assert!(
+            cache.get(&pool, &second).await.unwrap().is_some(),
+            "the same target's rules come from the cache"
+        );
+    });
+}
