@@ -8833,6 +8833,33 @@ async fn record_cross_context_route_retry_failure(
     Ok(())
 }
 
+/// Holds a route back until `next_attempt_at` without touching its
+/// attempt count or first failure (docs/architecture.md §161) - unlike
+/// [`record_cross_context_route_retry_failure`].
+async fn defer_cross_context_route(
+    pool: &Pool,
+    source_bounded_context: &str,
+    route_name: &str,
+    current_cursor: i64,
+    next_attempt_at: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(source_bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.cross_context_route_cursors \
+         (route_name, last_dispatched_sequence, updated_at, retry_next_attempt_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (route_name) DO UPDATE SET \
+         retry_next_attempt_at = EXCLUDED.retry_next_attempt_at"
+    )))
+    .bind(route_name)
+    .bind(current_cursor)
+    .bind(Utc::now())
+    .bind(next_attempt_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Codeberg issue #21 - which family of thing a [`ParkedDelivery`]
 /// originally was, and therefore how `retryParkedDelivery` redrives it.
 /// `target_bounded_context`/`target_command_type` are populated only for
@@ -10035,15 +10062,16 @@ async fn catch_up_cross_context_route_locked(
     // worth of retry state (not one per occurrence) already relies on.
     let (mut retry_attempt, mut retry_first_failed_at, retry_next_attempt_at) =
         get_cross_context_route_retry_state(pool, route.source_bounded_context, route.name).await?;
-    if retry_attempt > 0 {
-        if let Some(next_attempt_at) = retry_next_attempt_at {
-            if Utc::now() < next_attempt_at {
-                // Not yet time - this route's own blocked occurrence is
-                // still in backoff. Skip this tick entirely rather than
-                // re-attempting the identical failing submission on
-                // every single poll.
-                return Ok(());
-            }
+    // Not gated on `retry_attempt > 0`: a deferral to another instance
+    // (docs/architecture.md §161) sets a next attempt without spending
+    // one. Advancing the cursor clears it.
+    if let Some(next_attempt_at) = retry_next_attempt_at {
+        if Utc::now() < next_attempt_at {
+            // Not yet time - this route's own blocked occurrence is
+            // still in backoff. Skip this tick entirely rather than
+            // re-attempting the identical failing submission on
+            // every single poll.
+            return Ok(());
         }
     }
 
@@ -10147,6 +10175,29 @@ async fn catch_up_cross_context_route_locked(
                 // before this occurrence is parked.
                 let outcome = match outcome {
                     Ok(outcome) => outcome,
+                    Err(e) if e.another_instance_can_do_it() => {
+                        // docs/architecture.md §161: no attempt spent, never
+                        // parked - the route waits for an instance that can.
+                        let next_attempt_at = Utc::now()
+                            + chrono::Duration::from_std(ANOTHER_INSTANCE_RETRY_DELAY)
+                                .expect("a ten-second delay fits a chrono::Duration");
+                        tracing::warn!(
+                            sequence = event.sequence,
+                            error = %e,
+                            next_attempt_at = %next_attempt_at,
+                            "cross-context route: this instance can't submit the target \
+                             command, another can - retrying later; route blocked until then"
+                        );
+                        defer_cross_context_route(
+                            pool,
+                            route.source_bounded_context,
+                            route.name,
+                            cursor,
+                            next_attempt_at,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     Err(e) => {
                         retry_attempt += 1;
                         // Every path out of this `Err` arm either
@@ -10916,6 +10967,10 @@ pub async fn fire_due_deadlines(
         .await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
+            Err(e) if e.another_instance_can_do_it() => {
+                defer_deadline_to_another_instance(pool, &schema, &row, &e, now).await?;
+                continue;
+            }
             Err(e) => {
                 record_deadline_failure(pool, &schema, &row, &e, retry_policy, now).await?;
                 continue;
@@ -10945,6 +11000,43 @@ pub async fn fire_due_deadlines(
 /// exhausted - parked in the target bounded context and marked `parked`
 /// (docs/architecture.md §115). Only this instance's own claim is
 /// updated (`status = 'firing'`): a reclaim racing it leaves it alone.
+/// How long work this instance can't do, but another can
+/// ([`crate::error::Error::another_instance_can_do_it`]), waits before
+/// being tried again - by whichever instance claims it then
+/// (docs/architecture.md §161).
+pub const ANOTHER_INSTANCE_RETRY_DELAY: std::time::Duration =
+    skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY;
+
+/// Releases a claimed deadline this instance can't fire, for another
+/// instance to take after [`ANOTHER_INSTANCE_RETRY_DELAY`]. Unlike
+/// [`record_deadline_failure`] it spends no attempt and never parks.
+async fn defer_deadline_to_another_instance(
+    pool: &Pool,
+    schema: &str,
+    row: &DueDeadlineRow,
+    error: &crate::error::Error,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let next_attempt_at = now
+        + chrono::Duration::from_std(ANOTHER_INSTANCE_RETRY_DELAY)
+            .expect("a ten-second delay fits a chrono::Duration");
+    tracing::warn!(
+        deadline_id = %row.id,
+        error = %error,
+        next_attempt_at = %next_attempt_at,
+        "deadline: this instance can't fire it, another can - retrying later"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.deadlines SET status = 'pending', firing_at = NULL, \
+         next_attempt_at = $1 WHERE id = $2 AND status = 'firing'"
+    )))
+    .bind(next_attempt_at)
+    .bind(&row.id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn record_deadline_failure(
     pool: &Pool,
     schema: &str,

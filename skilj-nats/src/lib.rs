@@ -259,6 +259,29 @@ pub enum BridgeError {
     MessageInfo(#[source] async_nats::Error),
 }
 
+impl BridgeError {
+    /// Whether skilj refused this with one of
+    /// [`skilj_retry::ANOTHER_INSTANCE_CODES`]: the instance that took the
+    /// request can't process it, another one can - retried after
+    /// [`skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY`] without spending an
+    /// attempt, and never parked (docs/architecture.md §161).
+    fn another_instance_can_do_it(&self) -> bool {
+        match self {
+            BridgeError::SkiljStatus { body, .. } => {
+                serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|body| {
+                        body["code"]
+                            .as_str()
+                            .map(skilj_retry::another_instance_can_do_it)
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Codeberg issue #21 - the backoff state one [`OutboundMapping`]'s own
 /// blocked head-of-line event carries across [`produce_once`] calls,
 /// threaded in by [`run_outbound`] (one instance per mapping) - the
@@ -949,12 +972,21 @@ pub async fn run_inbound_until(
                         break;
                     }
                     Err(e) => {
-                        attempt += 1;
-                        let failed_at = *first_failed_at.get_or_insert_with(Utc::now);
+                        // docs/architecture.md §161: no attempt spent, never parked.
+                        let another_instance = e.another_instance_can_do_it();
+                        if !another_instance {
+                            attempt += 1;
+                        }
+                        let failed_at = if another_instance {
+                            first_failed_at.unwrap_or_else(Utc::now)
+                        } else {
+                            *first_failed_at.get_or_insert_with(Utc::now)
+                        };
                         let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
                         // Not JSON: no retry can change that (§144).
-                        if retry_policy.is_exhausted(attempt, elapsed)
-                            || matches!(e, BridgeError::MalformedPayload(_))
+                        if !another_instance
+                            && (retry_policy.is_exhausted(attempt, elapsed)
+                                || matches!(e, BridgeError::MalformedPayload(_)))
                         {
                             tracing::error!(
                                 stream = meta.stream,
@@ -994,7 +1026,11 @@ pub async fn run_inbound_until(
                             }
                             break;
                         }
-                        let backoff = retry_policy.next_backoff(attempt);
+                        let backoff = if another_instance {
+                            skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY
+                        } else {
+                            retry_policy.next_backoff(attempt)
+                        };
                         tracing::warn!(
                             stream = meta.stream,
                             stream_sequence = meta.stream_sequence,
@@ -1048,6 +1084,29 @@ async fn wait_keeping_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// docs/architecture.md §161: only skilj's "another instance can"
+    /// codes are retried without spending an attempt.
+    #[test]
+    fn another_instance_refusals_are_recognised_by_their_code() {
+        let status = |status: u16, body: &str| BridgeError::SkiljStatus {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            body: body.to_string(),
+        };
+        assert!(status(
+            503,
+            r#"{"code":"sync_projection_not_declared","message":"x"}"#
+        )
+        .another_instance_can_do_it());
+        assert!(
+            status(500, r#"{"code":"no_decider_registered","message":"x"}"#)
+                .another_instance_can_do_it()
+        );
+        assert!(
+            !status(503, r#"{"code":"database_error","message":"x"}"#).another_instance_can_do_it()
+        );
+        assert!(!status(502, "Bad Gateway").another_instance_can_do_it());
+    }
 
     fn tag(key: &str, value: &str) -> Tag {
         Tag {

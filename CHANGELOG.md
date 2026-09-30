@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `skilj_retry::ANOTHER_INSTANCE_CODES`/`another_instance_can_do_it`/
+  `ANOTHER_INSTANCE_RETRY_DELAY` and `skilj_core::Error::another_instance_can_do_it`:
+  the refusals (`no_decider_registered`, `sync_projection_not_declared`)
+  that mean "this instance can't do it, another can"
+  (docs/architecture.md §161).
 - `skilj_temporal::run_with_retry`/`run_until_with_retry`: `run` with a
   `skilj_retry::RetryPolicy` for failed dispatches. Once a bounded policy
   is exhausted the event is logged, acknowledged and skipped, instead of
@@ -51,6 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Deadlines, cross-context routes and the Kafka/AMQP/NATS bridges' inbound
+  path no longer spend their retry policy on a `no_decider_registered` or
+  `sync_projection_not_declared` refusal, and never park for one: the
+  work is retried after 10 seconds, when an instance that declares the
+  command type or projection can take it. During a rolling deploy these
+  used to use up all the attempts and park work that nothing was wrong with
+  (docs/architecture.md §161).
 - An event that a sync projection consumes is refused with the new
   `sync_projection_not_declared` (REST `503`) on an instance that
   doesn't declare that projection - an older version mid rolling deploy,

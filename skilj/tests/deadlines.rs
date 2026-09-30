@@ -1207,3 +1207,181 @@ fn a_failing_deadline_is_retried_then_parked_without_blocking_others() {
         );
     });
 }
+
+/// An instance that declares no command types at all - an older version,
+/// mid rolling deploy, next to one that declares the deadline's target.
+struct OlderInstance;
+
+impl skilj_core::plugin::CommandDispatcher for OlderInstance {
+    fn dispatch(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+        _payload: &str,
+        _matching_events: &[skilj_core::event_store::Event],
+    ) -> Option<skilj_core::error::Result<skilj_core::shared::CommandDecision>> {
+        None
+    }
+    fn required_role(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn snapshot_name(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn dispatch_from_snapshot(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+        _payload: &str,
+        _snapshot_state_json: &str,
+        _events_since_snapshot: &[skilj_core::event_store::Event],
+    ) -> Option<skilj_core::error::Result<skilj_core::shared::CommandDecision>> {
+        None
+    }
+}
+
+/// docs/architecture.md §161: an instance that doesn't declare a due
+/// deadline's target command type leaves it for one that does - no
+/// attempt spent, never parked, however often it's the one to claim it.
+/// It used to count as an ordinary failure, so a rolling deploy could
+/// park a deadline nothing was wrong with.
+#[test]
+fn a_deadline_an_instance_cannot_fire_waits_for_one_that_can() {
+    runtime().block_on(async {
+        let _one_at_a_time = ONE_DEADLINE_TEST_AT_A_TIME.lock().await;
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let mut contexts = Vec::new();
+        for prefix in ["source", "target"] {
+            let bc = BoundedContext {
+                name: unique_name(prefix),
+                status: BoundedContextStatus::Active,
+                created_at: test_now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            };
+            db::insert_bounded_context(&pool, &bc).await.unwrap();
+            db::insert_role_access_mapping(
+                &pool,
+                &RoleAccessMapping {
+                    role: role.clone(),
+                    bounded_context: bc.clone(),
+                    level: AccessLevel::Admin,
+                    can_read_sensitive: false,
+                    scope: None,
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            contexts.push(bc.name);
+        }
+        let (source, target) = (contexts[0].clone(), contexts[1].clone());
+        let (skilj, _) = Skilj::builder(database_url)
+            .deadline_poll_interval(std::time::Duration::from_secs(3600))
+            .bounded_context(target.clone())
+            .event_type::<RaceFired>()
+            .command_type::<RaceCommand>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        let (newer, projection_dispatcher, snapshot_dispatcher) =
+            dispatchers_without_background_ticks(skilj).await;
+        let older: std::sync::Arc<dyn skilj_core::plugin::CommandDispatcher> =
+            std::sync::Arc::new(OlderInstance);
+
+        let now = test_now();
+        let id = unique_name("deadline");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {}.deadlines \
+             (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+              target_command_type, payload, status, created_at) \
+             VALUES ($1, 'schedule', $2, '[]'::jsonb, NULL, $3, $4, $5, 'pending', $2)",
+            race_schema(&source)
+        )))
+        .bind(&id)
+        .bind(now - chrono::Duration::seconds(1))
+        .bind(&target)
+        .bind(RaceCommand::NAME)
+        .bind(serde_json::json!({ "order_id": "order-1" }).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = || {
+            let (pool, source, id) = (pool.clone(), source.clone(), id.clone());
+            async move {
+                let row: (String, i32) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT status, attempt_count FROM {}.deadlines WHERE id = $1",
+                    race_schema(&source)
+                )))
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                row
+            }
+        };
+        let tick = |dispatcher: std::sync::Arc<dyn skilj_core::plugin::CommandDispatcher>,
+                    at: chrono::DateTime<Utc>| {
+            let (pool, source) = (pool.clone(), source.clone());
+            let (p, s) = (projection_dispatcher.clone(), snapshot_dispatcher.clone());
+            async move {
+                db::fire_due_deadlines(
+                    &pool,
+                    &*dispatcher,
+                    &*p,
+                    &*s,
+                    &skilj_core::event_store::EventBroadcaster::new(16),
+                    &skilj_core::event_cache::EventCache::new(0),
+                    &source,
+                    at,
+                    None,
+                    // One attempt would park an ordinary failure at once.
+                    &skilj_retry::RetryPolicy {
+                        initial_backoff: std::time::Duration::from_secs(60),
+                        multiplier: 1.0,
+                        max_backoff: std::time::Duration::from_secs(60),
+                        max_attempts: Some(1),
+                        max_elapsed: None,
+                    },
+                    &[],
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        // The older instance claims it three times over: each time it's
+        // handed back, with no attempt spent and nothing parked.
+        let retry = chrono::Duration::from_std(db::ANOTHER_INSTANCE_RETRY_DELAY).unwrap();
+        let mut at = now;
+        for _ in 0..3 {
+            tick(older.clone(), at).await;
+            assert_eq!(state().await, ("pending".to_string(), 0));
+            at += retry + chrono::Duration::seconds(1);
+        }
+        assert!(db::list_parked_deliveries(&pool, &target)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The instance that declares it fires it.
+        tick(newer, at).await;
+        assert_eq!(state().await.0, "fired");
+    });
+}

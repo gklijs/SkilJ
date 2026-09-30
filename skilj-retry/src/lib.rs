@@ -10,6 +10,25 @@
 
 use std::time::Duration;
 
+/// The error codes (GraphQL `extensions.code`, the REST body's `code`)
+/// that mean "this skilj instance can't do it, another can": it doesn't
+/// declare the command type's `decide()`, or a sync projection the
+/// resulting event feeds - ordinary mid rolling deploy. A caller retrying
+/// on one of these waits [`ANOTHER_INSTANCE_RETRY_DELAY`] instead of
+/// spending an attempt of its [`RetryPolicy`], and never parks for it
+/// (docs/architecture.md §161).
+pub const ANOTHER_INSTANCE_CODES: [&str; 2] =
+    ["no_decider_registered", "sync_projection_not_declared"];
+
+/// Whether `code` is one of [`ANOTHER_INSTANCE_CODES`].
+pub fn another_instance_can_do_it(code: &str) -> bool {
+    ANOTHER_INSTANCE_CODES.contains(&code)
+}
+
+/// How long work refused with one of [`ANOTHER_INSTANCE_CODES`] waits
+/// before it is tried again.
+pub const ANOTHER_INSTANCE_RETRY_DELAY: Duration = Duration::from_secs(10);
+
 /// Geometric backoff with an optional attempt cap and/or elapsed-time
 /// cap. Either cap alone is enough to exhaust the policy - see
 /// `is_exhausted`'s own doc comment. Leaving both `None`
@@ -142,6 +161,13 @@ impl Default for RetryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_instance_codes() {
+        assert!(another_instance_can_do_it("no_decider_registered"));
+        assert!(another_instance_can_do_it("sync_projection_not_declared"));
+        assert!(!another_instance_can_do_it("payload_does_not_match_schema"));
+    }
 
     #[test]
     fn backoff_grows_geometrically_then_caps() {

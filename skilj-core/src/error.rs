@@ -81,6 +81,22 @@ pub enum Error {
     Migration(#[from] sqlx::migrate::MigrateError),
 }
 
+impl Error {
+    /// Whether this failure is this instance's alone: it doesn't declare
+    /// what the work needs - the target command type's `decide()`, or a
+    /// sync projection the resulting event feeds - and an instance that
+    /// does can do the same work. Mid rolling deploy that's ordinary, so
+    /// deadlines and cross-context routes retry it after a short delay
+    /// without spending their retry policy, and never park it
+    /// (docs/architecture.md §161).
+    pub fn another_instance_can_do_it(&self) -> bool {
+        match self {
+            Error::BatchFailed { code, .. } => skilj_retry::another_instance_can_do_it(code),
+            other => skilj_retry::another_instance_can_do_it(other.code()),
+        }
+    }
+}
+
 /// Implemented by every error tier so the eventual GraphQL/REST rendering
 /// layer (`skilj-graphql`/`skilj-rest`) can treat "a library error" and "a
 /// business rejection" uniformly, without needing to know which tier

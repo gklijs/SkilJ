@@ -1018,3 +1018,140 @@ fn parked_payload_rules_are_looked_up_once_per_target() {
         );
     });
 }
+
+/// An instance declaring no command types - an older version, mid
+/// rolling deploy.
+struct OlderInstance;
+
+impl CommandDispatcher for OlderInstance {
+    fn dispatch(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+        _payload: &str,
+        _matching_events: &[Event],
+    ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        None
+    }
+    fn required_role(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn snapshot_name(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn dispatch_from_snapshot(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+        _payload: &str,
+        _snapshot_state_json: &str,
+        _events_since_snapshot: &[Event],
+    ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        None
+    }
+}
+
+/// docs/architecture.md §161: a route whose target command this instance
+/// doesn't declare waits for one that does - no attempt spent, never
+/// parked, however many times it's this instance that ticks. It used to
+/// be an ordinary failure, parked once the policy ran out.
+#[test]
+fn a_route_an_instance_cannot_deliver_waits_for_one_that_can() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let shipping_bc = seed_bounded_context(&pool).await;
+        let inventory_bc = seed_bounded_context(&pool).await;
+        let source_et = seed_order_shipped_event_type(&pool, &shipping_bc).await;
+        seed_command_type(&pool, &inventory_bc, "ReserveStock").await;
+        seed_stock_reserved_event_type(&pool, &inventory_bc).await;
+        let route_info = CrossContextRouteInfo {
+            name: ROUTE_NAME,
+            source_bounded_context: Box::leak(shipping_bc.name.clone().into_boxed_str()),
+            source_event_type: "OrderShipped",
+            target_bounded_context: Box::leak(inventory_bc.name.clone().into_boxed_str()),
+            target_command_type: "ReserveStock",
+            start_from: CrossContextRouteStartFrom::Beginning,
+        };
+        // An ordinary failure parks at once under this policy.
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(30),
+            1.0,
+            Duration::from_millis(30),
+            1,
+        );
+        let tick = |dispatcher: &'static dyn CommandDispatcher| {
+            let pool = pool.clone();
+            let route_dispatcher = PassthroughRouteDispatcher { info: route_info };
+            async move {
+                db::catch_up_cross_context_route(
+                    &pool,
+                    &route_info,
+                    &route_dispatcher,
+                    dispatcher,
+                    &NoopProjectionDispatcher,
+                    &NoopSnapshotDispatcher,
+                    &EventBroadcaster::new(16),
+                    &EventCache::new(1000),
+                    None,
+                    &retry_policy,
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let retry_state = || {
+            let (pool, schema) = (pool.clone(), format!("\"bc_{}\"", shipping_bc.name));
+            async move {
+                let row: (i32, bool) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT retry_attempt_count, retry_next_attempt_at > now() \
+                     FROM {schema}.cross_context_route_cursors WHERE route_name = $1"
+                )))
+                .bind(ROUTE_NAME)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                row
+            }
+        };
+
+        insert_order_shipped(&pool, &shipping_bc, &source_et, "order-1").await;
+
+        for _ in 0..3 {
+            tick(&OlderInstance).await;
+            assert_eq!(retry_state().await, (0, true));
+            assert!(db::list_parked_deliveries(&pool, &inventory_bc.name)
+                .await
+                .unwrap()
+                .is_empty());
+            // As if `ANOTHER_INSTANCE_RETRY_DELAY` had passed.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE \"bc_{}\".cross_context_route_cursors \
+                 SET retry_next_attempt_at = now() - interval '1 second'",
+                shipping_bc.name
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            db::latest_sequence(&pool, &inventory_bc.name)
+                .await
+                .unwrap(),
+            None,
+            "delivered by an instance that can't"
+        );
+
+        let declaring: &'static FlakyCommandDispatcher =
+            Box::leak(Box::new(FlakyCommandDispatcher::new(0)));
+        tick(declaring).await;
+        assert_eq!(declaring.call_count(), 1);
+        assert_eq!(
+            db::latest_sequence(&pool, &inventory_bc.name)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+    });
+}
