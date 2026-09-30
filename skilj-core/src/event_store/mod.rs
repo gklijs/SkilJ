@@ -3257,6 +3257,23 @@ pub fn fetch_events(
     )
 }
 
+/// Every way [`fetch_events_page`] can refuse a request - none of which
+/// depend on the events - so a caller can check them before loading any
+/// (docs/architecture.md §140).
+pub fn check_fetch_events(token: &EventReadToken, filters: &[Filter]) -> crate::error::Result<()> {
+    if token.status != TokenStatus::Active {
+        return Err(crate::access_control::Error::TokenNotActive.into());
+    }
+    let read_type = &token.event_type;
+    if !read_type.event_read_allowed {
+        return Err(Error::EventReadNotAllowed.into());
+    }
+    if !valid_filters(read_type, filters) {
+        return Err(Error::InvalidFilter.into());
+    }
+    Ok(())
+}
+
 /// [`fetch_events`] with an explicit `config.max_events_per_read`. Also
 /// what `skilj-rest` calls once per chunk while paging through history
 /// (see `db::collect_event_page`).
@@ -3268,16 +3285,8 @@ pub fn fetch_events_page(
     correlation_id: Option<&str>,
     max_events: usize,
 ) -> crate::error::Result<Vec<Event>> {
-    if token.status != TokenStatus::Active {
-        return Err(crate::access_control::Error::TokenNotActive.into());
-    }
+    check_fetch_events(token, filters)?;
     let read_type = &token.event_type;
-    if !read_type.event_read_allowed {
-        return Err(Error::EventReadNotAllowed.into());
-    }
-    if !valid_filters(read_type, filters) {
-        return Err(Error::InvalidFilter.into());
-    }
 
     let after = after_sequence.unwrap_or(-1);
     Ok(events
@@ -3427,6 +3436,29 @@ pub fn initial_consume_position<'a>(
     }
 }
 
+/// Every way [`consume_events_page`] can refuse a request - none of which
+/// depend on the events - so a caller can check them before loading any.
+/// `skilj-rest` does, because resolving a new `Latest`/`AtTime` cursor's
+/// position walks the event type's whole history: checked only after
+/// that walk, a revoked token, a type closed to reads, an invalid filter
+/// or a first call without a `mode` paid for a full scan on every request
+/// before being refused (docs/architecture.md §140).
+pub fn check_consume_events(
+    token: &EventReadToken,
+    existing_cursor: Option<&ReadCursor>,
+    ack_mode: Option<AckMode>,
+    filters: &[Filter],
+) -> crate::error::Result<()> {
+    check_fetch_events(token, filters)?;
+    match (existing_cursor, ack_mode) {
+        (None, None) => Err(Error::CursorAckModeMismatch.into()),
+        (Some(cursor), Some(requested)) if requested != cursor.ack_mode => {
+            Err(Error::CursorAckModeMismatch.into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// [`consume_events`] with a new cursor's starting position already
 /// resolved (`new_cursor_position`, from [`initial_consume_position`];
 /// ignored when `existing_cursor` is `Some`) and an explicit
@@ -3453,26 +3485,9 @@ pub fn consume_events_page(
     checkout_lease: chrono::Duration,
     max_events: usize,
 ) -> crate::error::Result<ConsumeEventsResult> {
-    if token.status != TokenStatus::Active {
-        return Err(crate::access_control::Error::TokenNotActive.into());
-    }
+    check_consume_events(token, existing_cursor, ack_mode, filters)?;
     let read_type = &token.event_type;
-    if !read_type.event_read_allowed {
-        return Err(Error::EventReadNotAllowed.into());
-    }
-    if !valid_filters(read_type, filters) {
-        return Err(Error::InvalidFilter.into());
-    }
-
     let is_new = existing_cursor.is_none();
-    if is_new && ack_mode.is_none() {
-        return Err(Error::CursorAckModeMismatch.into());
-    }
-    if let (Some(cursor), Some(requested)) = (existing_cursor, ack_mode) {
-        if requested != cursor.ack_mode {
-            return Err(Error::CursorAckModeMismatch.into());
-        }
-    }
 
     let mode = ack_mode
         .or_else(|| existing_cursor.map(|c| c.ack_mode))

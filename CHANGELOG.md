@@ -606,6 +606,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `GET /v1/events/consume` and `GET /v1/events` now refuse a revoked
+  token, an invalid filter or a type closed to reads before loading any
+  events. A new `Latest`/`AtTime` consumer's start position is found by
+  scanning the event type's whole history, and that scan ran first - so
+  a revoked credential, or a first call missing `mode`, could make every
+  request scan it (docs/architecture.md §140).
 - The superadmin-only GraphQL mutations (`deleteBoundedContext`,
   `createBoundedContextFromTemplate`, `resyncBoundedContextFromTemplate`,
   `grantRoleAccessMapping`, and the role ones) now refuse a

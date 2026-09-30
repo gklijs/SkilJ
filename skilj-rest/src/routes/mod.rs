@@ -753,6 +753,8 @@ async fn get_events(
 ) -> Result<impl IntoResponse, RestError> {
     let filters = parse_filter_params(&query.filter)?;
     let token = resolve_token::<EventReadToken>(&state, &credential).await?;
+    // Refused before any event is loaded (docs/architecture.md §140).
+    event_store::check_fetch_events(&token, &filters)?;
     // At most `max_events_per_read`, loaded a chunk at a time - a caller
     // pages on with `after` = this response's `nextCursor`.
     let page = db::collect_scanned_event_page(
@@ -845,9 +847,13 @@ async fn get_events_consume(
     // (another consume or ack committed), the read is redone from where it
     // now stands.
     let bounded_context_name = &token.event_type.bounded_context.name;
-    let mut expected = db::get_read_cursor(&state.pool, &token)
-        .await?
-        .map(|cursor| cursor.sequence);
+    let cursor = db::get_read_cursor(&state.pool, &token).await?;
+    // Refused before any event is loaded, not after: a new `Latest`/
+    // `AtTime` cursor's seed below walks the type's whole history
+    // (docs/architecture.md §140). `consume_events_page` checks again
+    // under the lock, against the cursor as it then stands.
+    event_store::check_consume_events(&token, cursor.as_ref(), ack_mode, &filters)?;
+    let mut expected = cursor.map(|cursor| cursor.sequence);
     let result = loop {
         // Where serving starts: the cursor, or for a new one its seed
         // (`initial_consume_position`) - which for `Latest`/`AtTime` is the

@@ -1453,3 +1453,69 @@ fn token_resolution_answers_each_outcome() {
         assert_eq!(status(direct_credential).await, StatusCode::FORBIDDEN);
     });
 }
+
+/// docs/architecture.md §140: `GET /v1/events/consume` loaded events
+/// (for a new `Latest`/`AtTime` cursor, the type's whole history) before
+/// its rule could refuse the request, and `GET /v1/events` a chunk, so a
+/// revoked token, an invalid filter or a first call without a `mode` paid
+/// for a scan every time. With the events table out of reach, each must
+/// still get its own refusal rather than the scan's failure.
+#[test]
+fn a_refused_read_loads_no_events() {
+    runtime().block_on(async {
+        let Some(database_url) = test_db().await else {
+            return;
+        };
+        let (skilj, direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+        deposit(&router, &direct_credential, 5).await;
+
+        let pool = db::connect(&database_url).await.unwrap();
+        let token_id = read_credential.split('.').next().unwrap();
+        let token = db::get_event_read_token(&pool, token_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let schema = format!("\"bc_{}\"", token.event_type.bounded_context.name);
+        let rename = |from: &str, to: &str| format!("ALTER TABLE {schema}.{from} RENAME TO {to}");
+        sqlx::query(sqlx::AssertSqlSafe(rename("events", "events_unreachable")))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let consume = |uri: &'static str| {
+            let router = router.clone();
+            let credential = read_credential.clone();
+            async move {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap();
+                router.oneshot(request).await.unwrap().status()
+            }
+        };
+        assert_eq!(consume("/v1/events/consume").await, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            consume("/v1/events?filter=bogus_field:equals:x").await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            consume("/v1/events/consume?mode=auto&filter=bogus_field:equals:x").await,
+            StatusCode::BAD_REQUEST
+        );
+        db::revoke_access_token(&pool, token_id, test_now())
+            .await
+            .unwrap();
+        assert_eq!(
+            consume("/v1/events/consume?mode=auto").await,
+            StatusCode::FORBIDDEN
+        );
+
+        sqlx::query(sqlx::AssertSqlSafe(rename("events_unreachable", "events")))
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+}
