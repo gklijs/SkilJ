@@ -1526,3 +1526,38 @@ fn a_refused_read_loads_no_events() {
             .unwrap();
     });
 }
+
+/// docs/architecture.md §148: an `after` past the latest committed
+/// sequence isn't a cursor this route handed out - served, it would come
+/// back unchanged as `nextCursor` and silently skip every event up to it.
+/// Refused; the latest itself is an ordinary caught-up poll.
+#[test]
+fn get_events_refuses_a_cursor_past_the_latest_committed_sequence() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup().await;
+        let router = skilj.rest_router();
+        deposit(&router, &direct_credential, 5).await;
+        let latest = get_json(&router, &read_credential, "/v1/events").await["events"][0]
+            ["sequence"]
+            .as_i64()
+            .unwrap();
+
+        let status = |after: i64| {
+            let (router, credential) = (router.clone(), read_credential.clone());
+            async move {
+                let request = Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/events?after={after}"))
+                    .header("authorization", format!("Bearer {credential}"))
+                    .body(Body::empty())
+                    .unwrap();
+                router.oneshot(request).await.unwrap().status()
+            }
+        };
+        assert_eq!(status(latest + 1000).await, StatusCode::BAD_REQUEST);
+        assert_eq!(status(latest).await, StatusCode::OK);
+    });
+}

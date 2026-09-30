@@ -26,6 +26,11 @@ A few things that trip people up:
   same excluded events every time. A `consume` cursor moves the same way (for manual-ack, only
   on a call that serves nothing). Use the same `filter` for the whole walk: a cursor reached under
   one filter has passed over events a different filter would have matched.
+- **An `after` past the latest committed sequence is refused** with `400 invalid_request`. It
+  can't be a `nextCursor` this route returned - most often it's a checkpoint kept from before the
+  bounded context was deleted and recreated, whose sequences start over. Reset the checkpoint
+  (omit `after` to read from the start). Before this was refused, such a cursor came back
+  unchanged as `nextCursor` and every event up to it was silently skipped.
 - **Filters are bounded.** A read takes at most 32 `filter` parameters, each value at most 4096
   characters, and an `is_like` pattern at most 1024. Past that the call is refused with `400`
   `invalid_filter` rather than answered - every filter runs against every event the read walks

@@ -760,6 +760,22 @@ async fn get_events(
     let token = resolve_token::<EventReadToken>(&state, &credential).await?;
     // Refused before any event is loaded (docs/architecture.md §140).
     event_store::check_fetch_events(&token, &filters)?;
+    // A cursor past the latest committed sequence isn't one this route
+    // handed out - a checkpoint from before the bounded context was
+    // deleted and recreated, say. Served, it would come back unchanged
+    // as `nextCursor` and every event up to it would be skipped, silently
+    // (docs/architecture.md §148).
+    if let Some(after) = query.after {
+        let latest = db::latest_sequence(&state.pool, &token.event_type.bounded_context.name)
+            .await?
+            .unwrap_or(-1);
+        if after > latest {
+            return Err(RestError::InvalidRequest(format!(
+                "after {after} is past the latest committed sequence {latest} - pass a \
+                 nextCursor this route returned, or omit it to read from the start"
+            )));
+        }
+    }
     // At most `max_events_per_read`, loaded a chunk at a time - a caller
     // pages on with `after` = this response's `nextCursor`.
     let page = db::collect_scanned_event_page(

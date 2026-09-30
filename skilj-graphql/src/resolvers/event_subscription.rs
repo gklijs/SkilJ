@@ -498,7 +498,8 @@ pub fn events_by_type_field() -> SubscriptionField {
 /// misses nothing committed before this subscription existed. At most
 /// `max_events_per_read` of them; a larger span is refused with
 /// `resume_span_too_large` rather than loaded, and the caller reads it
-/// back with `queryEvents` first. Must run after the broadcaster
+/// back with `queryEvents` first. One above the latest is refused with
+/// `from_sequence_not_committed` (§148). Must run after the broadcaster
 /// subscription: anything committed after the latest sequence read here
 /// arrives live, and anything at or below it is skipped when it does.
 async fn resolve_start(
@@ -511,6 +512,19 @@ async fn resolve_start(
         .await
         .map_err(to_graphql_error)?
         .unwrap_or(-1);
+    // A sequence past the latest committed one can't be one the caller
+    // read - most likely another bounded context's, or one from before
+    // this bounded context was deleted and recreated. Started from it,
+    // the subscription would drop every live event up to it as already
+    // processed: silently empty until the bounded context caught up
+    // (docs/architecture.md §148, §88's reasoning for `waitForSequence`).
+    if let Some(from) = from_sequence.filter(|from| *from > latest) {
+        return Err(async_graphql::Error::new(format!(
+            "fromSequence {from} is past the latest committed sequence {latest} of \
+             {bounded_context:?} - pass a sequence already read, or omit it to start from now"
+        ))
+        .extend_with(|_, ext| ext.set("code", "from_sequence_not_committed")));
+    }
     let Some(from_sequence) = from_sequence.filter(|from| *from < latest) else {
         let start = from_sequence.unwrap_or(latest);
         return Ok((start, Vec::new(), start));

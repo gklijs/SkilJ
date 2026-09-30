@@ -1807,6 +1807,30 @@ fn resuming_from_a_sequence_replays_the_missed_span_then_goes_live() {
             refused["payload"]["errors"][0]["extensions"]["code"], "resume_span_too_large",
             "{refused}"
         );
+
+        // docs/architecture.md §148: past the latest committed sequence is
+        // refused - started from there, the subscription would drop every
+        // live event up to it - while the latest itself is fine.
+        ws_send_json(&mut ws, subscribe("4", live + 1000)).await;
+        // Past the `complete` that followed subscription "2"'s error.
+        let refused = loop {
+            let message = ws_recv_json(&mut ws).await;
+            if message["type"] != "complete" {
+                break message;
+            }
+        };
+        assert_eq!(refused["id"], "4", "{refused}");
+        assert_eq!(
+            refused["payload"]["errors"][0]["extensions"]["code"], "from_sequence_not_committed",
+            "{refused}"
+        );
+        assert_eq!(ws_recv_json(&mut ws).await["type"], "complete");
+        ws_send_json(&mut ws, subscribe("5", live)).await;
+        assert_eq!(
+            ws_try_recv_json(&mut ws, Duration::from_millis(300)).await,
+            None,
+            "subscribing from the latest sequence is accepted, with nothing to replay"
+        );
     });
 }
 

@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `allEvents`/`eventsByType` refuse a `fromSequence` past the bounded
+  context's latest committed sequence with `from_sequence_not_committed`,
+  and `GET /v1/events` refuses such an `after` with `400`. Accepted, the
+  subscription silently dropped every event up to that value, and the
+  REST cursor came back unchanged, skipping them (docs/architecture.md
+  §148).
 - `registerProjection` (and a Rust `Projection::consumed_event_types()`)
   refuses a consumed event type named more than once, with
   `duplicate_consumed_event_type` - consumed event types are a set
