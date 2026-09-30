@@ -912,8 +912,7 @@ pub async fn run_inbound_until(
                 let partition = msg.partition();
                 let offset = msg.offset();
 
-                let mut attempt: u32 = 0;
-                let mut first_failed_at: Option<DateTime<Utc>> = None;
+                let mut retry = skilj_retry::MessageRetry::default();
                 loop {
                     match dispatch_inbound_message(
                         http,
@@ -935,100 +934,94 @@ pub async fn run_inbound_until(
                             break;
                         }
                         Err(e) => {
-                            // docs/architecture.md §161: no attempt spent, never parked.
-                            let another_instance = e.another_instance_can_do_it();
-                            if !another_instance {
-                                attempt += 1;
-                            }
-                            let failed_at = if another_instance {
-                                first_failed_at.unwrap_or_else(Utc::now)
-                            } else {
-                                *first_failed_at.get_or_insert_with(Utc::now)
-                            };
-                            let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
-                            // Not JSON: no retry can change that (§144).
-                            if !another_instance
-                                && (retry_policy.is_exhausted(attempt, elapsed)
-                                    || matches!(e, BridgeError::MalformedPayload(_)))
-                            {
-                                tracing::error!(
-                                    topic,
-                                    partition,
-                                    offset,
+                            let backoff = match retry.on_failure(
+                                retry_policy,
+                                Utc::now(),
+                                |at| (Utc::now() - at).to_std().unwrap_or_default(),
+                                // docs/architecture.md §161: no attempt spent, never parked.
+                                e.another_instance_can_do_it(),
+                                // Not JSON: no retry can change that (§144).
+                                matches!(e, BridgeError::MalformedPayload(_)),
+                            ) {
+                                skilj_retry::RetryDecision::Park {
                                     attempt,
-                                    error = %e,
-                                    "dispatch failed repeatedly - parking and committing so \
-                                     this message doesn't block progress forever"
-                                );
-                                let payload_json = parked_payload(payload);
-                                let partition_key = format!("{topic}:{partition}");
-                                let body = inbound_request_body(
-                                    mapping,
-                                    &payload_json,
-                                    &partition_key,
-                                    offset,
-                                    correlation_id,
-                                    causation_id,
-                                );
-                                let identifier = format!("{partition_key}:{offset}");
-                                let idempotency_key =
-                                    inbound_idempotency_key(mapping, &partition_key, offset);
-                                // docs/architecture.md §97: Kafka offsets are
-                                // cumulative - committing any later message in
-                                // this partition would commit past this one too.
-                                // So until it is reported, this bridge doesn't
-                                // move on: moving on would lose it, neither
-                                // processed nor parked.
-                                let mut report_attempt: u32 = 0;
-                                while let Err(report_err) = report_parked_delivery(
-                                    http,
-                                    skilj_base_url,
-                                    mapping,
-                                    &identifier,
-                                    &body,
-                                    idempotency_key.as_deref(),
-                                    &e.to_string(),
-                                    attempt,
-                                    failed_at,
-                                )
-                                .await
-                                {
-                                    report_attempt = report_attempt.saturating_add(1);
+                                    first_failed_at: failed_at,
+                                } => {
                                     tracing::error!(
                                         topic,
                                         partition,
                                         offset,
-                                        report_attempt,
-                                        "reporting this parked delivery failed - retrying; \
+                                        attempt,
+                                        error = %e,
+                                        "dispatch failed repeatedly - parking and committing so \
+                                         this message doesn't block progress forever"
+                                    );
+                                    let payload_json = parked_payload(payload);
+                                    let partition_key = format!("{topic}:{partition}");
+                                    let body = inbound_request_body(
+                                        mapping,
+                                        &payload_json,
+                                        &partition_key,
+                                        offset,
+                                        correlation_id,
+                                        causation_id,
+                                    );
+                                    let identifier = format!("{partition_key}:{offset}");
+                                    let idempotency_key =
+                                        inbound_idempotency_key(mapping, &partition_key, offset);
+                                    // docs/architecture.md §97: Kafka offsets are
+                                    // cumulative - committing any later message in
+                                    // this partition would commit past this one too.
+                                    // So until it is reported, this bridge doesn't
+                                    // move on: moving on would lose it, neither
+                                    // processed nor parked.
+                                    let mut report_attempt: u32 = 0;
+                                    while let Err(report_err) = report_parked_delivery(
+                                        http,
+                                        skilj_base_url,
+                                        mapping,
+                                        &identifier,
+                                        &body,
+                                        idempotency_key.as_deref(),
+                                        &e.to_string(),
+                                        attempt,
+                                        failed_at,
+                                    )
+                                    .await
+                                    {
+                                        report_attempt = report_attempt.saturating_add(1);
+                                        tracing::error!(
+                                            topic,
+                                            partition,
+                                            offset,
+                                            report_attempt,
+                                            "reporting this parked delivery failed - retrying; \
                                          this partition waits until it succeeds: {report_err}"
-                                    );
-                                    tokio::select! {
-                                        biased;
-                                        () = &mut stop => return,
-                                        () = tokio::time::sleep(
-                                            retry_policy.next_backoff(report_attempt),
-                                        ) => {}
+                                        );
+                                        tokio::select! {
+                                            biased;
+                                            () = &mut stop => return,
+                                            () = tokio::time::sleep(
+                                                retry_policy.next_backoff(report_attempt),
+                                            ) => {}
+                                        }
                                     }
+                                    if let Err(commit_err) =
+                                        consumer.commit_message(&msg, CommitMode::Async)
+                                    {
+                                        tracing::error!(
+                                            "committing a Kafka offset failed: {commit_err}"
+                                        );
+                                    }
+                                    break;
                                 }
-                                if let Err(commit_err) =
-                                    consumer.commit_message(&msg, CommitMode::Async)
-                                {
-                                    tracing::error!(
-                                        "committing a Kafka offset failed: {commit_err}"
-                                    );
-                                }
-                                break;
-                            }
-                            let backoff = if another_instance {
-                                skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY
-                            } else {
-                                retry_policy.next_backoff(attempt)
+                                skilj_retry::RetryDecision::Wait(backoff) => backoff,
                             };
                             tracing::warn!(
                                 topic,
                                 partition,
                                 offset,
-                                attempt,
+                                attempt = retry.attempt(),
                                 error = %e,
                                 "dispatch failed - retrying after backoff"
                             );

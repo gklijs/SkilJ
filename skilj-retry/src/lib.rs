@@ -158,9 +158,133 @@ impl Default for RetryPolicy {
     }
 }
 
+/// What to do after one failed attempt at a message - see
+/// [`MessageRetry::on_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryDecision<T> {
+    /// Give up on it and park it: `attempt` attempts, the first failing at
+    /// `first_failed_at`.
+    Park { attempt: u32, first_failed_at: T },
+    /// Try again after this long.
+    Wait(Duration),
+}
+
+/// One message's retry state in a bridge's inbound loop: how many attempts
+/// have failed, and when the first did. Pure like the rest of this crate -
+/// the caller supplies the time, in whatever type it keeps time in (`T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageRetry<T> {
+    attempt: u32,
+    first_failed_at: Option<T>,
+}
+
+impl<T> Default for MessageRetry<T> {
+    fn default() -> Self {
+        Self {
+            attempt: 0,
+            first_failed_at: None,
+        }
+    }
+}
+
+impl<T: Copy> MessageRetry<T> {
+    /// Attempts failed so far, not counting refusals another instance can
+    /// take (see `on_failure`).
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Records a failed attempt made at `now` and decides what follows.
+    /// `elapsed_since(t)` is how long ago `t` was. `another_instance` - the
+    /// refusal was one of [`ANOTHER_INSTANCE_CODES`] - waits
+    /// [`ANOTHER_INSTANCE_RETRY_DELAY`], spending no attempt and never
+    /// parking (docs/architecture.md §161). `permanent` - no retry can
+    /// change the outcome, such as a payload that isn't JSON - parks at
+    /// once. Otherwise it parks once `policy` is exhausted and waits its
+    /// backoff until then.
+    pub fn on_failure(
+        &mut self,
+        policy: &RetryPolicy,
+        now: T,
+        elapsed_since: impl FnOnce(T) -> Duration,
+        another_instance: bool,
+        permanent: bool,
+    ) -> RetryDecision<T> {
+        if another_instance {
+            return RetryDecision::Wait(ANOTHER_INSTANCE_RETRY_DELAY);
+        }
+        self.attempt += 1;
+        let first_failed_at = *self.first_failed_at.get_or_insert(now);
+        if permanent || policy.is_exhausted(self.attempt, elapsed_since(first_failed_at)) {
+            RetryDecision::Park {
+                attempt: self.attempt,
+                first_failed_at,
+            }
+        } else {
+            RetryDecision::Wait(policy.next_backoff(self.attempt))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_retry_parks_once_the_policy_is_exhausted() {
+        let policy = RetryPolicy::bounded(Duration::from_secs(1), 2.0, Duration::from_secs(60), 3);
+        let mut retry = MessageRetry::<u64>::default();
+        let elapsed = |_| Duration::ZERO;
+        assert_eq!(
+            retry.on_failure(&policy, 10, elapsed, false, false),
+            RetryDecision::Wait(policy.next_backoff(1))
+        );
+        assert_eq!(
+            retry.on_failure(&policy, 11, elapsed, false, false),
+            RetryDecision::Wait(policy.next_backoff(2))
+        );
+        assert_eq!(
+            retry.on_failure(&policy, 12, elapsed, false, false),
+            RetryDecision::Park {
+                attempt: 3,
+                first_failed_at: 10
+            }
+        );
+    }
+
+    #[test]
+    fn message_retry_never_spends_an_attempt_on_another_instance_refusals() {
+        let policy = RetryPolicy::bounded(Duration::from_secs(1), 2.0, Duration::from_secs(60), 1);
+        let mut retry = MessageRetry::<u64>::default();
+        for now in 0..10 {
+            assert_eq!(
+                retry.on_failure(&policy, now, |_| Duration::from_secs(3600), true, false),
+                RetryDecision::Wait(ANOTHER_INSTANCE_RETRY_DELAY)
+            );
+        }
+        assert_eq!(retry.attempt(), 0);
+        // The first ordinary failure is attempt 1, first failing now.
+        assert_eq!(
+            retry.on_failure(&policy, 42, |_| Duration::ZERO, false, false),
+            RetryDecision::Park {
+                attempt: 1,
+                first_failed_at: 42
+            }
+        );
+    }
+
+    #[test]
+    fn message_retry_parks_a_permanent_failure_at_once() {
+        let policy = RetryPolicy::unbounded(Duration::from_secs(1), 2.0, Duration::from_secs(60));
+        let mut retry = MessageRetry::<u64>::default();
+        assert_eq!(
+            retry.on_failure(&policy, 7, |_| Duration::ZERO, false, true),
+            RetryDecision::Park {
+                attempt: 1,
+                first_failed_at: 7
+            }
+        );
+    }
 
     #[test]
     fn another_instance_codes() {

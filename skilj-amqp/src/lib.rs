@@ -964,8 +964,7 @@ pub async fn run_inbound_until(
         };
         let payload = delivery.body().0.as_ref();
 
-        let mut attempt: u32 = 0;
-        let mut first_failed_at: Option<DateTime<Utc>> = None;
+        let mut retry = skilj_retry::MessageRetry::default();
         loop {
             match dispatch_inbound_message(http, skilj_base_url, mapping, &meta, payload).await {
                 Ok(()) => {
@@ -975,75 +974,71 @@ pub async fn run_inbound_until(
                     break;
                 }
                 Err(e) => {
-                    // docs/architecture.md §161: no attempt spent, never parked.
-                    let another_instance = e.another_instance_can_do_it();
-                    if !another_instance {
-                        attempt += 1;
-                    }
-                    let failed_at = if another_instance {
-                        first_failed_at.unwrap_or_else(Utc::now)
-                    } else {
-                        *first_failed_at.get_or_insert_with(Utc::now)
-                    };
-                    let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
-                    // Not JSON: no retry can change that (§144).
-                    if !another_instance
-                        && (retry_policy.is_exhausted(attempt, elapsed)
-                            || matches!(e, BridgeError::MalformedPayload(_)))
-                    {
-                        tracing::error!(
-                            address,
+                    let backoff = match retry.on_failure(
+                        retry_policy,
+                        Utc::now(),
+                        |at| (Utc::now() - at).to_std().unwrap_or_default(),
+                        // docs/architecture.md §161: no attempt spent, never parked.
+                        e.another_instance_can_do_it(),
+                        // Not JSON: no retry can change that (§144).
+                        matches!(e, BridgeError::MalformedPayload(_)),
+                    ) {
+                        skilj_retry::RetryDecision::Park {
                             attempt,
-                            error = %e,
-                            "dispatch failed repeatedly - parking and accepting so this \
-                             message doesn't block redelivery forever"
-                        );
-                        let payload_json = parked_payload(payload);
-                        let body = inbound_request_body(mapping, &meta, &payload_json);
-                        let identifier = message_identifier(&meta);
-                        let idempotency_key = inbound_idempotency_key(mapping, &meta);
-                        if let Err(report_err) = report_parked_delivery(
-                            http,
-                            skilj_base_url,
-                            mapping,
-                            &identifier,
-                            &body,
-                            idempotency_key.as_deref(),
-                            &e.to_string(),
-                            attempt,
-                            failed_at,
-                        )
-                        .await
-                        {
-                            // docs/architecture.md §98: released, not left
-                            // unsettled - an unsettled delivery stays with
-                            // this link (redelivered only once the connection
-                            // closes) and holds a unit of its credit.
-                            // Released, the broker redelivers it now, and the
-                            // next round of retries reports it again.
+                            first_failed_at: failed_at,
+                        } => {
                             tracing::error!(
                                 address,
-                                "reporting this parked delivery failed - releasing it \
-                                 for redelivery: {report_err}"
+                                attempt,
+                                error = %e,
+                                "dispatch failed repeatedly - parking and accepting so this \
+                                 message doesn't block redelivery forever"
                             );
-                            if let Err(release_err) = receiver.release(&delivery).await {
-                                tracing::error!("releasing an AMQP delivery failed: {release_err}");
+                            let payload_json = parked_payload(payload);
+                            let body = inbound_request_body(mapping, &meta, &payload_json);
+                            let identifier = message_identifier(&meta);
+                            let idempotency_key = inbound_idempotency_key(mapping, &meta);
+                            if let Err(report_err) = report_parked_delivery(
+                                http,
+                                skilj_base_url,
+                                mapping,
+                                &identifier,
+                                &body,
+                                idempotency_key.as_deref(),
+                                &e.to_string(),
+                                attempt,
+                                failed_at,
+                            )
+                            .await
+                            {
+                                // docs/architecture.md §98: released, not left
+                                // unsettled - an unsettled delivery stays with
+                                // this link (redelivered only once the connection
+                                // closes) and holds a unit of its credit.
+                                // Released, the broker redelivers it now, and the
+                                // next round of retries reports it again.
+                                tracing::error!(
+                                    address,
+                                    "reporting this parked delivery failed - releasing it \
+                                 for redelivery: {report_err}"
+                                );
+                                if let Err(release_err) = receiver.release(&delivery).await {
+                                    tracing::error!(
+                                        "releasing an AMQP delivery failed: {release_err}"
+                                    );
+                                }
+                                break;
+                            }
+                            if let Err(accept_err) = receiver.accept(&delivery).await {
+                                tracing::error!("accepting an AMQP delivery failed: {accept_err}");
                             }
                             break;
                         }
-                        if let Err(accept_err) = receiver.accept(&delivery).await {
-                            tracing::error!("accepting an AMQP delivery failed: {accept_err}");
-                        }
-                        break;
-                    }
-                    let backoff = if another_instance {
-                        skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY
-                    } else {
-                        retry_policy.next_backoff(attempt)
+                        skilj_retry::RetryDecision::Wait(backoff) => backoff,
                     };
                     tracing::warn!(
                         address,
-                        attempt,
+                        attempt = retry.attempt(),
                         error = %e,
                         "dispatch failed - retrying after backoff"
                     );

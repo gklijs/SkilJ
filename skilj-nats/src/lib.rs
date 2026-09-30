@@ -953,8 +953,7 @@ pub async fn run_inbound_until(
                 }
             };
 
-            let mut attempt: u32 = 0;
-            let mut first_failed_at: Option<DateTime<Utc>> = None;
+            let mut retry = skilj_retry::MessageRetry::default();
             loop {
                 match dispatch_inbound_message(
                     http,
@@ -972,69 +971,64 @@ pub async fn run_inbound_until(
                         break;
                     }
                     Err(e) => {
-                        // docs/architecture.md §161: no attempt spent, never parked.
-                        let another_instance = e.another_instance_can_do_it();
-                        if !another_instance {
-                            attempt += 1;
-                        }
-                        let failed_at = if another_instance {
-                            first_failed_at.unwrap_or_else(Utc::now)
-                        } else {
-                            *first_failed_at.get_or_insert_with(Utc::now)
-                        };
-                        let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
-                        // Not JSON: no retry can change that (§144).
-                        if !another_instance
-                            && (retry_policy.is_exhausted(attempt, elapsed)
-                                || matches!(e, BridgeError::MalformedPayload(_)))
-                        {
-                            tracing::error!(
-                                stream = meta.stream,
-                                stream_sequence = meta.stream_sequence,
+                        let backoff = match retry.on_failure(
+                            retry_policy,
+                            Utc::now(),
+                            |at| (Utc::now() - at).to_std().unwrap_or_default(),
+                            // docs/architecture.md §161: no attempt spent, never parked.
+                            e.another_instance_can_do_it(),
+                            // Not JSON: no retry can change that (§144).
+                            matches!(e, BridgeError::MalformedPayload(_)),
+                        ) {
+                            skilj_retry::RetryDecision::Park {
                                 attempt,
-                                error = %e,
-                                "dispatch failed repeatedly - parking and acking so this \
-                                 message doesn't get redelivered forever"
-                            );
-                            let payload_json = parked_payload(&message.payload);
-                            let body = inbound_request_body(mapping, &meta, &payload_json);
-                            let identifier = format!("{}:{}", meta.stream, meta.stream_sequence);
-                            let idempotency_key = inbound_idempotency_key(mapping, &meta);
-                            if let Err(report_err) = report_parked_delivery(
-                                http,
-                                skilj_base_url,
-                                mapping,
-                                &identifier,
-                                &body,
-                                idempotency_key.as_deref(),
-                                &e.to_string(),
-                                attempt,
-                                failed_at,
-                            )
-                            .await
-                            {
+                                first_failed_at: failed_at,
+                            } => {
                                 tracing::error!(
                                     stream = meta.stream,
                                     stream_sequence = meta.stream_sequence,
-                                    "reporting this parked delivery failed - not acking, \
-                                     will redeliver: {report_err}"
+                                    attempt,
+                                    error = %e,
+                                    "dispatch failed repeatedly - parking and acking so this \
+                                     message doesn't get redelivered forever"
                                 );
+                                let payload_json = parked_payload(&message.payload);
+                                let body = inbound_request_body(mapping, &meta, &payload_json);
+                                let identifier =
+                                    format!("{}:{}", meta.stream, meta.stream_sequence);
+                                let idempotency_key = inbound_idempotency_key(mapping, &meta);
+                                if let Err(report_err) = report_parked_delivery(
+                                    http,
+                                    skilj_base_url,
+                                    mapping,
+                                    &identifier,
+                                    &body,
+                                    idempotency_key.as_deref(),
+                                    &e.to_string(),
+                                    attempt,
+                                    failed_at,
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        stream = meta.stream,
+                                        stream_sequence = meta.stream_sequence,
+                                        "reporting this parked delivery failed - not acking, \
+                                     will redeliver: {report_err}"
+                                    );
+                                    break;
+                                }
+                                if let Err(ack_err) = message.ack().await {
+                                    tracing::error!("acking a JetStream message failed: {ack_err}");
+                                }
                                 break;
                             }
-                            if let Err(ack_err) = message.ack().await {
-                                tracing::error!("acking a JetStream message failed: {ack_err}");
-                            }
-                            break;
-                        }
-                        let backoff = if another_instance {
-                            skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY
-                        } else {
-                            retry_policy.next_backoff(attempt)
+                            skilj_retry::RetryDecision::Wait(backoff) => backoff,
                         };
                         tracing::warn!(
                             stream = meta.stream,
                             stream_sequence = meta.stream_sequence,
-                            attempt,
+                            attempt = retry.attempt(),
                             error = %e,
                             "dispatch failed - retrying after backoff"
                         );

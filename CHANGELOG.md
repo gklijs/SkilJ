@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `skilj_retry::MessageRetry`/`RetryDecision`: one message's retry state
+  and the park-or-wait decision after each failure, including §161's
+  "another instance can" refusals. The Kafka, AMQP and NATS inbound loops
+  now share it instead of each carrying its own copy
+  (docs/architecture.md §161).
 - `SkiljBuilder::deadline_retention(Duration)` (default 30 days) and
   `keep_resolved_deadlines_forever()`: a background task deletes
   deadlines resolved (fired, cancelled, parked or forgotten) longer ago
