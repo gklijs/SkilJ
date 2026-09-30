@@ -145,6 +145,8 @@ fn status_for(err: &CoreError) -> StatusCode {
             EventStoreError::ReservedIdempotencyKeyPrefix => StatusCode::BAD_REQUEST,
             EventStoreError::IdempotencyKeyTooLong => StatusCode::BAD_REQUEST,
             EventStoreError::InvalidParkedDeliveryRequest(_) => StatusCode::BAD_REQUEST,
+            // Another instance can take it (docs/architecture.md §160).
+            EventStoreError::SyncProjectionNotDeclared(_) => StatusCode::SERVICE_UNAVAILABLE,
             // Not reachable over REST today - RegisterEventType is
             // GraphQL-only (TypeRegistration) - but matched explicitly
             // rather than left to the wildcard below, the same "each

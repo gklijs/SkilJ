@@ -275,3 +275,186 @@ fn startup_still_adds_a_missing_column_and_index() {
         assert!(index, "the dropped index wasn't created again");
     });
 }
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+struct MoneyDepositedPayload {
+    amount: i64,
+}
+
+struct MoneyDeposited;
+
+impl skilj::EventType for MoneyDeposited {
+    type Payload = MoneyDepositedPayload;
+    const NAME: &'static str = "MoneyDeposited";
+}
+
+/// docs/architecture.md §159: reconciliation reads a bounded context's
+/// registration tables, so it runs after the schema patches that bring
+/// an older bounded context's tables up to date - not before, where a
+/// column added since (here `event_types.private_fields`) failed startup
+/// before any patch could add it.
+#[test]
+fn reconciliation_runs_on_a_patched_bounded_context() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let name = seed_bounded_context(&pool).await;
+        let role = skilj_core::access_control::Role {
+            id: generate_token_id(),
+            external_subject: format!("reconciler_{}", generate_token_id()),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: skilj_core::access_control::RoleStatus::Active,
+            created_at: Utc::now().trunc_subsecs(6),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        db::insert_role_access_mapping(
+            &pool,
+            &skilj_core::access_control::RoleAccessMapping {
+                role: role.clone(),
+                bounded_context: db::get_bounded_context(&pool, &name)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                level: skilj_core::access_control::AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: skilj_core::access_control::RoleStatus::Active,
+                created_at: Utc::now().trunc_subsecs(6),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let start = || {
+            Skilj::builder(database_url.clone())
+                .pool_options(db::PgPoolOptions::new().max_connections(2))
+                .bounded_context(name.clone())
+                .event_type::<MoneyDeposited>()
+                .reconciliation_role(role.external_subject.clone())
+                .build()
+        };
+        start().await.unwrap();
+
+        // As a bounded context provisioned before private fields existed.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE \"bc_{name}\".event_types DROP COLUMN private_fields"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        if let Err(err) = start().await {
+            panic!("startup failed on the older bounded context: {err}");
+        }
+        let event_type = db::get_event_type(&pool, &name, "MoneyDeposited")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(event_type.private_fields.is_empty());
+    });
+}
+
+/// Every column (with its type, nullability and default), index and
+/// constraint of `bounded_context`'s schema, as sorted text lines.
+async fn schema_shape(pool: &Pool, bounded_context: &str) -> Vec<String> {
+    let schema = format!("bc_{bounded_context}");
+    let mut shape: Vec<String> =
+        sqlx::query_as::<_, (String, String, String, String, Option<String>)>(
+            "SELECT table_name, column_name, data_type, is_nullable, column_default \
+             FROM information_schema.columns WHERE table_schema = $1",
+        )
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(table, column, ty, nullable, default)| {
+            // A serial column's default names its sequence, schema included.
+            let default = default.map(|d| d.replace(&schema, "bc"));
+            format!("column {table}.{column} {ty} nullable={nullable} default={default:?}")
+        })
+        .collect();
+    shape.extend(
+        sqlx::query_as::<_, (String,)>(
+            "SELECT regexp_replace(indexdef, ' ON \"?' || $1 || '\"?\\.', ' ON ') \
+             FROM pg_indexes WHERE schemaname = $1",
+        )
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(def,)| format!("index {def}")),
+    );
+    shape.extend(
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT c.relname, con.conname, pg_get_constraintdef(con.oid) \
+             FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1",
+        )
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(table, name, def)| {
+            format!("constraint {table}.{name} {}", def.replace(&schema, "bc"))
+        }),
+    );
+    shape.sort();
+    shape
+}
+
+/// docs/architecture.md §159: a bounded context provisioned by skilj
+/// v0.0.1 - the oldest release - comes out of the current version's
+/// startup with the same columns, indexes and constraints as one
+/// provisioned today.
+/// Every table or column added since needs its startup patch; this is
+/// what notices one that's missing.
+#[test]
+fn startup_upgrades_a_v0_0_1_bounded_context_to_the_current_schema() {
+    runtime().block_on(async {
+        let Some((database_url, pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        let current = seed_bounded_context(&pool).await;
+        let old = seed_bounded_context(&pool).await;
+
+        let schema = format!("\"bc_{old}\"");
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let v0_0_1 = include_str!("fixtures/v0_0_1_bounded_context.sql").replace("{schema}", &schema);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(v0_0_1))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        Skilj::builder(database_url)
+            .pool_options(db::PgPoolOptions::new().max_connections(2))
+            .build()
+            .await
+            .unwrap();
+        // `registered_by_version` is added the first time an instance with
+        // an application version registers a type there (§104), not at
+        // every startup.
+        db::ensure_registration_version_columns(&pool, &old)
+            .await
+            .unwrap();
+
+        let expected = schema_shape(&pool, &current).await;
+        let upgraded = schema_shape(&pool, &old).await;
+        let missing: Vec<_> = expected.iter().filter(|l| !upgraded.contains(l)).collect();
+        let extra: Vec<_> = upgraded.iter().filter(|l| !expected.contains(l)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "upgraded v0.0.1 schema differs from a fresh one\nmissing: {missing:#?}\nextra: {extra:#?}"
+        );
+    });
+}

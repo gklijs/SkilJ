@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An event that a sync projection consumes is refused with the new
+  `sync_projection_not_declared` (REST `503`) on an instance that
+  doesn't declare that projection - an older version mid rolling deploy,
+  say - instead of being committed with the projection skipping it for
+  good. Another instance that declares it can take the write
+  (docs/architecture.md §160).
 - `db::resolve_data_keys_for_reading`'s accumulator is now
   `HashMap<(String, String), Option<DataKey>>`: a granted subject with no
   active key (forgotten, or never provisioned) is recorded as `None`, so
@@ -215,6 +221,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An instance whose code doesn't declare an async projection - an older
+  version during a rolling deploy, or one sharing the database - walked
+  it in background catch-up anyway, found nothing to fold, and advanced
+  its `caught_up_to`. The events in between were never folded by anyone.
+  Catch-up now leaves projections it doesn't declare to an instance that
+  does (docs/architecture.md §160).
+- Startup reconciled declared types before patching bounded contexts'
+  schemas, and reconciliation reads the registration tables' current
+  columns. An instance registering a type on a bounded context from
+  before `private_fields` (or another later column) failed startup with
+  `column ... does not exist`. Reconciliation now runs after the patches.
+  Upgraded bounded contexts also now get the `CHECK` on
+  `access_tokens.start_from` that a fresh one has (docs/architecture.md
+  §159).
 - Restarting an instance took an `ACCESS EXCLUSIVE` lock on about twenty
   tables of every bounded context (among them `events`), and a `SHARE`
   lock on several more, even when there was nothing to change: Postgres

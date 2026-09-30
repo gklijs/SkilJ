@@ -1620,3 +1620,38 @@ fn an_async_fold_never_deadlocks_against_a_promotion() {
         assert_eq!(projection.caught_up_to, Some(second));
     });
 }
+
+/// docs/architecture.md §160: an instance whose dispatcher doesn't know a
+/// projection - an older version during a rolling deploy, or one whose
+/// code no longer declares it - leaves it alone. It used to walk every
+/// registered projection, find no keys for one it didn't know, and
+/// advance its `caught_up_to` past events nothing ever folded, which no
+/// instance would then revisit.
+#[test]
+fn catch_up_leaves_a_projection_it_does_not_know_alone() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        seed_async_projection(&pool, &bc, "SomeoneElsesProjection", vec![et.clone()]).await;
+        let last = insert_plain_event(&pool, &bc, &et, 20).await;
+
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        let known = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(known.caught_up_to, Some(last));
+        let unknown = db::get_projection(&pool, &bc.name, "SomeoneElsesProjection")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unknown.caught_up_to, None, "advanced without folding");
+    });
+}

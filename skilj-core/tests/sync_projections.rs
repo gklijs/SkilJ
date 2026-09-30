@@ -492,3 +492,62 @@ fn two_sync_projections_both_update_from_one_event() {
         );
     });
 }
+
+/// docs/architecture.md §160: a sync projection this instance's
+/// dispatcher doesn't declare - a newer version's, mid rolling deploy -
+/// can't be folded here. An event it consumes is refused, not committed
+/// with the projection skipping it for good; an event it doesn't consume
+/// is written as usual, and advances it as usual.
+#[test]
+fn an_event_a_sync_projection_this_instance_does_not_declare_consumes_is_refused() {
+    use skilj_core::error::SkiljRejection;
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let money_deposited = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        let other = seed_event_type(&pool, &bc, "SomethingElseHappened").await;
+        seed_sync_projection(
+            &pool,
+            &bc,
+            "NewerVersionsBalance",
+            vec![money_deposited.clone()],
+        )
+        .await;
+        let insert = |e: Event| {
+            let pool = pool.clone();
+            async move {
+                db::insert_event_and_update_sync_projections(
+                    &pool,
+                    &e,
+                    None,
+                    &TestDispatcher,
+                    &[],
+                    &skilj_core::event_store::EventBroadcaster::new(16),
+                    &skilj_core::event_cache::EventCache::new(1000),
+                )
+                .await
+            }
+        };
+
+        let seq = db::next_sequence(&pool, &bc.name).await.unwrap();
+        match insert(event(&bc, &money_deposited, seq, 5)).await {
+            Err(err) => assert_eq!(err.code(), "sync_projection_not_declared"),
+            Ok(()) => panic!("an event the undeclared projection consumes was written"),
+        }
+        let projection = db::get_projection(&pool, &bc.name, "NewerVersionsBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.caught_up_to, None);
+
+        let seq = db::next_sequence(&pool, &bc.name).await.unwrap();
+        insert(event(&bc, &other, seq, 5)).await.unwrap();
+        let projection = db::get_projection(&pool, &bc.name, "NewerVersionsBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.caught_up_to, Some(seq));
+    });
+}

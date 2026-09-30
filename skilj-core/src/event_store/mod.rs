@@ -646,6 +646,17 @@ pub enum Error {
     /// bridge-supplied JSON.
     #[error("parked delivery request does not match its kind's request shape: {0}")]
     InvalidParkedDeliveryRequest(String),
+
+    /// Not spec-modeled (docs/architecture.md §160): this event's type is
+    /// consumed by a sync projection this instance doesn't declare - a
+    /// newer version's, mid rolling deploy - so it can't fold the event in
+    /// the same transaction. Refused rather than committed with the
+    /// projection skipping it for good. Another instance, one that
+    /// declares it, can take the write.
+    #[error(
+        "this instance does not declare sync projection {0:?}, which consumes this event type"
+    )]
+    SyncProjectionNotDeclared(String),
 }
 
 impl SkiljRejection for Error {
@@ -684,6 +695,7 @@ impl SkiljRejection for Error {
             Error::PayloadDecodeFailed(_) => "payload_decode_failed",
             Error::CorrelationIdTooLong => "correlation_id_too_long",
             Error::InvalidParkedDeliveryRequest(_) => "invalid_parked_delivery_request",
+            Error::SyncProjectionNotDeclared(_) => "sync_projection_not_declared",
         }
     }
 

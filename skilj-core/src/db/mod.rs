@@ -403,6 +403,18 @@ fn create_index_patch(schema: &str, index: &str, ddl: String) -> String {
     )
 }
 
+/// `ddl`, adding constraint `name` to `table` in the bounded context's
+/// `schema`, run only when the table has no constraint of that name
+/// (docs/architecture.md §158/§159).
+fn add_constraint_patch(schema: &str, table: &str, name: &str, ddl: String) -> String {
+    format!(
+        "DO $patch$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint \
+         WHERE conrelid = to_regclass({}) AND conname = {}) THEN {ddl}; END IF; END $patch$",
+        sql_literal(&format!("{schema}.{table}")),
+        sql_literal(name)
+    )
+}
+
 // --- per-bounded-context schema provisioning / hard deletion ---
 
 /// Every `CREATE TABLE` a bounded context's own schema needs, in
@@ -2280,6 +2292,21 @@ pub async fn ensure_event_read_token_start_from_column(
         &["start_at_time"],
         format!(
             "ALTER TABLE {schema}.access_tokens ADD COLUMN IF NOT EXISTS start_at_time TIMESTAMPTZ"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    // The check a freshly provisioned `start_from` has, under the name
+    // Postgres gives it there. Added on its own, not with the column: a
+    // bounded context that got the column from an earlier version of
+    // this patch lacks it too (docs/architecture.md §159).
+    sqlx::query(sqlx::AssertSqlSafe(add_constraint_patch(
+        &schema,
+        "access_tokens",
+        "access_tokens_start_from_check",
+        format!(
+            "ALTER TABLE {schema}.access_tokens ADD CONSTRAINT access_tokens_start_from_check \
+             CHECK (start_from IN ('beginning', 'latest', 'at_sequence', 'at_time'))"
         ),
     )))
     .execute(pool)
@@ -6743,12 +6770,33 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
     }
 
     for projection_name in sync_projections {
-        // `Some(vec![])` (registered, but this event's type isn't
-        // consumed) and `None` (dispatcher doesn't recognise this
-        // projection at all) both fall through to an empty loop below -
-        // zero instances touched either way, `caught_up_to` still
-        // advances unconditionally after it (§9's "keyed / multi-row
-        // Projections" pass).
+        // `Some(vec![])` - registered, but this event's type isn't
+        // consumed - falls through to an empty loop below: zero instances
+        // touched, `caught_up_to` still advancing after it (§9's "keyed /
+        // multi-row Projections" pass). `None` - this instance doesn't
+        // declare the projection - can't be folded here at all. If it
+        // consumes this event the write is refused: committed, the
+        // projection would skip the event for good (docs/architecture.md
+        // §160).
+        if dispatcher
+            .default_state(bounded_context, projection_name)
+            .is_none()
+        {
+            let consumes: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT EXISTS (SELECT 1 FROM {schema}.projection_consumed_event_types \
+                 WHERE projection_name = $1 AND event_type_name = $2)"
+            )))
+            .bind(projection_name)
+            .bind(&event.event_type.name)
+            .fetch_one(&mut **tx)
+            .await?;
+            if consumes {
+                return Err(crate::event_store::Error::SyncProjectionNotDeclared(
+                    projection_name.clone(),
+                )
+                .into());
+            }
+        }
         let keys = dispatcher
             .keys(bounded_context, projection_name, event)
             .unwrap_or_default();
@@ -11199,7 +11247,17 @@ pub async fn catch_up_bounded_context(
     let schema = schema_ident(bounded_context);
     let latest = latest_sequence(pool, bounded_context).await?.unwrap_or(-1);
 
-    let all_projections = list_projections_for_bounded_context(pool, bounded_context).await?;
+    // docs/architecture.md §160: only the projections this instance's
+    // dispatcher knows. One it doesn't - declared by a newer version
+    // during a rolling deploy, or no longer declared at all - has no keys
+    // and no fold here, and walking it anyway advanced its `caught_up_to`
+    // past events nothing folded. It's left to an instance that knows it.
+    let all_projections: Vec<Projection> =
+        list_projections_for_bounded_context(pool, bounded_context)
+            .await?
+            .into_iter()
+            .filter(|p| dispatcher.default_state(bounded_context, &p.name).is_some())
+            .collect();
     // Codeberg issue #25 (docs/architecture.md §51) - every async
     // projection is split here by its own `Projection::PARTITION_COUNT`
     // (via the dispatcher, since that's a Rust-only config the domain

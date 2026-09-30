@@ -2087,52 +2087,18 @@ impl SkiljBuilder {
         let command_types = Arc::new(self.command_types);
         let snapshots = Arc::new(self.snapshots);
 
-        // Codeberg issue #13: reconciliation immediately below never
-        // looks up a templated tenant's own name (it only ever loops
-        // over the literal keys this process's own `.bounded_context
-        // (name)`/`#[auto_register]` calls declared, always a template's
-        // name or an ordinary untemplated one - never a tenant's, chosen
-        // later at runtime), so `reconciliation_dispatcher` just below
-        // gets a real clone of this same cache for structural
+        // Codeberg issue #13: reconciliation (after the schema patches
+        // below) never looks up a templated tenant's own name (it only
+        // ever loops over the literal keys this process's own
+        // `.bounded_context(name)`/`#[auto_register]` calls declared,
+        // always a template's name or an ordinary untemplated one -
+        // never a tenant's, chosen later at runtime), so its
+        // `reconciliation_dispatcher` gets a real clone of this same cache for structural
         // consistency, even though every lookup it makes resolves to
         // itself.
         let bounded_contexts_for_warm_up = skilj_core::db::list_bounded_contexts(&pool).await?;
         let template_cache = skilj_core::template_cache::TemplateCache::new();
         template_cache.refresh(&pool).await?;
-
-        let mut report = ReconciliationReport::default();
-        if let Some(external_subject) = &self.reconciliation_role {
-            let role = skilj_core::access_control::resolve_role_by_external_subject(
-                external_subject,
-                &roles,
-            )?
-            .clone();
-
-            let version = RegistrationVersion::new(self.application_version);
-            reconcile_event_types(
-                &pool,
-                &role,
-                &self.event_types,
-                &mut report,
-                chrono::Utc::now(),
-                &version,
-            )
-            .await?;
-            reconcile_command_types(&pool, &role, &command_types, &mut report, &version).await?;
-            let reconciliation_dispatcher = ProjectionDispatcherImpl {
-                projections: projections.clone(),
-                template_cache: template_cache.clone(),
-            };
-            reconcile_projections(
-                &pool,
-                &role,
-                &projections,
-                &mut report,
-                &reconciliation_dispatcher,
-                &version,
-            )
-            .await?;
-        }
 
         let identity_provider = self.identity_provider.map(|config| {
             Arc::new(IdentityProvider {
@@ -2356,6 +2322,44 @@ impl SkiljBuilder {
             .buffer_unordered(BACKGROUND_TASK_CONCURRENCY)
             .try_collect::<Vec<()>>()
             .await?;
+
+        // After the schema patches above (docs/architecture.md §159):
+        // reconciliation reads each declared bounded context's
+        // registration tables, which a bounded context from an older
+        // version only has every column of once they've run.
+        let mut report = ReconciliationReport::default();
+        if let Some(external_subject) = &self.reconciliation_role {
+            let role = skilj_core::access_control::resolve_role_by_external_subject(
+                external_subject,
+                &roles,
+            )?
+            .clone();
+
+            let version = RegistrationVersion::new(self.application_version);
+            reconcile_event_types(
+                &pool,
+                &role,
+                &self.event_types,
+                &mut report,
+                chrono::Utc::now(),
+                &version,
+            )
+            .await?;
+            reconcile_command_types(&pool, &role, &command_types, &mut report, &version).await?;
+            let reconciliation_dispatcher = ProjectionDispatcherImpl {
+                projections: projections.clone(),
+                template_cache: template_cache.clone(),
+            };
+            reconcile_projections(
+                &pool,
+                &role,
+                &projections,
+                &mut report,
+                &reconciliation_dispatcher,
+                &version,
+            )
+            .await?;
+        }
 
         // The initial GraphQL schema (Codeberg issue #2; `@guarantee
         // RegistrationReachesEveryInstance`) - built here, ahead of
