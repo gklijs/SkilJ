@@ -210,6 +210,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- skilj-tui's live feed resumes from now when the server refuses its
+  remembered position with `from_sequence_not_committed` (the bounded
+  context was recreated), instead of retrying the same refused position
+  on every reconnect (docs/architecture.md §148).
 - After a `Snapshot::VERSION` bump, the next event for a tag value reset
   its snapshot and folded only that event into it, so decisions using the
   snapshot ran on state missing the tag's whole earlier history. A reset

@@ -270,8 +270,10 @@ pub const LIVE_EVENTS_QUERY: &str = "subscription($bc: String!, $from: Int) { \
 /// [`ClientError::SubscriptionEnded`] and resubscribes, with `fromSequence`
 /// set to the last `allEvents.sequence` delivered, backing off from
 /// `initial_delay` up to `max_delay` while connecting keeps failing. A
-/// `resume_span_too_large` refusal (too far behind to replay) resumes from
-/// now instead, after reporting it. Ends only when the receiver is dropped.
+/// `resume_span_too_large` refusal (too far behind to replay) or a
+/// `from_sequence_not_committed` one (the bounded context was recreated,
+/// its sequences starting over - §148) resumes from now instead, after
+/// reporting it. Ends only when the receiver is dropped.
 ///
 /// When the server closes the connection because the token expired, or
 /// refuses `connection_init`, the token is refreshed first if `token`
@@ -311,10 +313,19 @@ pub fn spawn_live_events(
                         }
                         delay = initial_delay;
                     }
+                    // Resuming from `last_sequence` is refused for good:
+                    // too far behind to replay, or - `from_sequence_not_committed`
+                    // - past the latest sequence, the bounded context having
+                    // been deleted and recreated (docs/architecture.md
+                    // §148). Retried as it was, it would be refused on
+                    // every reconnect; it resumes from now instead.
                     Err(ClientError::Graphql(errors))
-                        if errors
-                            .iter()
-                            .any(|e| e.code.as_deref() == Some("resume_span_too_large")) =>
+                        if errors.iter().any(|e| {
+                            matches!(
+                                e.code.as_deref(),
+                                Some("resume_span_too_large" | "from_sequence_not_committed")
+                            )
+                        }) =>
                     {
                         last_sequence = None;
                     }

@@ -20,6 +20,9 @@ struct MockState {
     connections: Arc<AtomicUsize>,
     /// Each `subscribe`'s `variables`, in order.
     subscriptions: Arc<Mutex<Vec<Value>>>,
+    /// The code the first connection's subscription ends with -
+    /// `subscription_lagged` when `None`.
+    end_code: Option<&'static str>,
 }
 
 async fn serve(state: MockState) -> reqwest::Url {
@@ -70,8 +73,8 @@ async fn run(mut socket: WebSocket, state: MockState) {
             &mut socket,
             json!({ "id": "1", "type": "next",
                     "payload": { "data": null, "errors": [{
-                        "message": "fell behind",
-                        "extensions": { "code": "subscription_lagged" },
+                        "message": "ended",
+                        "extensions": { "code": state.end_code.unwrap_or("subscription_lagged") },
                     }] } }),
         )
         .await;
@@ -133,4 +136,45 @@ async fn a_subscription_the_server_ends_is_resumed_from_the_last_sequence() {
     let subscriptions = state.subscriptions.lock().unwrap().clone();
     assert_eq!(subscriptions[0], json!({ "bc": "banking", "from": null }));
     assert_eq!(subscriptions[1], json!({ "bc": "banking", "from": 5 }));
+}
+
+/// A refusal to resume from the last sequence - too far behind
+/// (`resume_span_too_large`), or past the latest sequence because the
+/// bounded context was recreated (`from_sequence_not_committed`,
+/// docs/architecture.md §148) - is refused on every retry, so the feed
+/// resumes from now (`from: null`) instead of repeating it forever.
+#[tokio::test]
+async fn a_refused_resume_starts_again_from_now() {
+    for code in ["resume_span_too_large", "from_sequence_not_committed"] {
+        let state = MockState {
+            end_code: Some(code),
+            ..MockState::default()
+        };
+        let ws_endpoint = serve(state.clone()).await;
+        let mut rx = spawn_live_events(
+            ws_endpoint,
+            "test-jwt".to_string(),
+            "banking".to_string(),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        );
+        recv(&mut rx).await.unwrap();
+        match recv(&mut rx).await {
+            Err(ClientError::Graphql(errors)) => assert_eq!(errors[0].code.as_deref(), Some(code)),
+            other => panic!("expected the {code} error, got {other:?}"),
+        }
+        match recv(&mut rx).await {
+            Err(ClientError::SubscriptionEnded { resuming_after }) => {
+                assert_eq!(resuming_after, None, "{code}")
+            }
+            other => panic!("expected SubscriptionEnded, got {other:?}"),
+        }
+        recv(&mut rx).await.unwrap();
+        let subscriptions = state.subscriptions.lock().unwrap().clone();
+        assert_eq!(
+            subscriptions[1],
+            json!({ "bc": "banking", "from": null }),
+            "{code}"
+        );
+    }
 }
