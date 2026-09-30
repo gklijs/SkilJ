@@ -5634,6 +5634,15 @@ time.)
      Reusing this same ID for both the start and every later signal is
      what makes Temporal's own idempotent-start-by-workflow-ID semantics
      apply for free - no dedup work of skilj's own to write.
+     The id is unique per entity for the *name* of a bounded context,
+     not per incarnation of it: delete a bounded context and recreate
+     it under the same name, and its entities reuse the old one's
+     workflow ids. With `RejectDuplicate` a `Start` for such an entity
+     is refused as a duplicate of the old, closed run - treated as
+     success, so no workflow runs for it - and its signals reach that
+     closed run. Recreate under a new name instead, or give the new
+     incarnation its own Temporal namespace (documented rather than
+     changed, decided with the user - §149).
    - **Delivery mechanism**: `GET /v1/events/consume?mode=manual` +
      `POST /v1/events/consume/ack` (`skilj-rest/src/routes/mod.rs`),
      not a GraphQL `EventSubscription` - a polling loop needs no
@@ -10407,3 +10416,7 @@ Fix: the same treatment §88 gave `waitForSequence` - a `fromSequence` above the
 REST's client-tracked read, `GET /v1/events?after=`, had the same problem in its own form: a future `after` returned no events and a `nextCursor` equal to it, so a client polling from a stale checkpoint - `docs/rest-event-reading.md` tells clients to persist one - kept asking from there, skipping every event up to it without a sign. It's refused the same way, as `400 invalid_request`, before any event is loaded; the client guide says so. GraphQL `queryEvents`' `afterSequence` is left alone: it echoes no cursor, and a future one just returns an empty page, which ends a caller's paging correctly.
 
 Tests: `resuming_from_a_sequence_replays_the_missed_span_then_goes_live` (`skilj/tests/event_subscription.rs`) now also subscribes from `live + 1000` (refused) and from `live` (accepted, nothing replayed); `get_events_refuses_a_cursor_past_the_latest_committed_sequence` (`skilj/tests/event_fetch_rest.rs`) - `after` past the latest is a 400, the latest itself a 200. Each fails without its check.
+
+## 149. Deleting and recreating a bounded context under the same name
+
+Checked what survives `deleteBoundedContext` followed by `addBoundedContext`/`createBoundedContextFromTemplate` with the same name. Everything persistent - tokens, read cursors, parked deliveries, deadlines, dedupe watermarks, snapshots - lives in the bounded context's own schema and goes with it. In memory: `TemplateCache` is refreshed on every instance by the `RegistrationChanged` notification both the delete and the insert send (the sending instance receives its own); the event cache is stamped with the table's OID (§95); `CommandBatcher`'s queues hold only pending commands; the compiled-schema cache is keyed by schema content. None carries the old incarnation's state into the new one. Two things did: a client's remembered sequence (§148, now refused), and `skilj-temporal`'s workflow ids, which are per name, not per incarnation - documented in §34 and in the `skilj-temporal` skill rather than changed, since changing the id format would stop later signals reaching every running workflow.

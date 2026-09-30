@@ -100,6 +100,13 @@ and `PaymentConfirmed` signal that exact run later.
   acknowledged and skipped. Size the policy to outlast the
   `Signal`-before-`Start` race above, which fails the same way until the
   `Start` lands.
+- **Workflow ids are per bounded-context *name*, not per incarnation.**
+  Delete a bounded context and recreate it under the same name, and its
+  entities reuse the old workflow ids: a `Start` is refused as a
+  duplicate of the old, closed run (the bridge treats that as success,
+  so no workflow runs) and signals reach that closed run. Recreate under
+  a new name, or point the new one at its own Temporal namespace
+  (`docs/architecture.md` §34/§149).
 - Depends only on Temporal's thin `temporalio-client` crate, never the
   full `temporalio-sdk` worker/Activity-authoring one - writing the
   actual Workflow/Activity definitions Temporal executes is a separate
