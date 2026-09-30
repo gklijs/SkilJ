@@ -29,6 +29,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use fe2o3_amqp::link::receiver::CreditMode;
 use fe2o3_amqp::types::messaging::{Data, Message, MessageId, Properties};
 use fe2o3_amqp::{Connection, Receiver, Sender, Session};
 use serde_json::{json, Value};
@@ -1220,5 +1221,184 @@ fn the_run_loops_stop_when_asked() {
         receiver.accept(&delivery).await.unwrap();
         let payload: Value = serde_json::from_slice(delivery.body().0.as_ref()).unwrap();
         assert_eq!(payload, json!({ "orderId": "o-9" }));
+    });
+}
+
+/// docs/architecture.md §144: a message that isn't JSON is parked on its
+/// first failure - no retry can make it JSON - and the parked request
+/// keeps its raw content, not a `null`.
+#[test]
+fn a_non_json_message_is_parked_at_once_with_its_raw_content() {
+    runtime().block_on(async {
+        let Some(url) = test_broker().await else {
+            return;
+        };
+        let address = unique_address("orders-malformed");
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let (_send_conn, mut send_session) = connect(url, "malformed-sender-conn").await;
+        let mut sender =
+            Sender::attach(&mut send_session, "malformed-sender-link", address.as_str())
+                .await
+                .unwrap();
+        let (_recv_conn, mut recv_session) = connect(url, "malformed-receiver-conn").await;
+        let mut receiver = Receiver::attach(
+            &mut recv_session,
+            "malformed-receiver-link",
+            address.as_str(),
+        )
+        .await
+        .unwrap();
+        sender
+            .send(Message::builder().data(b"not json {".to_vec()).build())
+            .await
+            .unwrap()
+            .accepted_or_else(|o| format!("{o:?}"))
+            .unwrap();
+
+        let mut mappings = std::collections::HashMap::new();
+        mappings.insert(
+            address.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_amqp::http_client();
+        // Retried, this would take 20 s and five attempts to park.
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_secs(5),
+            1.0,
+            Duration::from_secs(5),
+            5,
+        );
+        tokio::spawn(async move {
+            run_inbound(
+                &mut receiver,
+                &http,
+                &skilj_base_url,
+                &address,
+                &mappings,
+                &retry_policy,
+            )
+            .await;
+        });
+
+        let mut parked = None;
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(p) = mock_state.parked_deliveries.lock().unwrap().first() {
+                parked = Some(p.clone());
+                break;
+            }
+        }
+        let parked = parked.expect("run_inbound must have parked the malformed message");
+        assert_eq!(parked["attemptCount"], json!(1));
+        assert_eq!(parked["request"]["payload"], json!("not json {"));
+        assert!(mock_state.external_requests.lock().unwrap().is_empty());
+    });
+}
+
+/// docs/architecture.md §144: a message whose body isn't data sections
+/// (here an `amqp-value` string, as a JMS `TextMessage` arrives) can't be
+/// decoded. It used to be left unsettled, holding a unit of link credit
+/// for good; with a credit of one, nothing after it ever arrived. It is
+/// rejected now, so the next message still gets through.
+#[test]
+fn an_undecodable_message_is_rejected_and_does_not_stall_the_receiver() {
+    runtime().block_on(async {
+        let Some(url) = test_broker().await else {
+            return;
+        };
+        let address = unique_address("orders-undecodable");
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let (_send_conn, mut send_session) = connect(url, "undecodable-sender-conn").await;
+        let mut sender = Sender::attach(
+            &mut send_session,
+            "undecodable-sender-link",
+            address.as_str(),
+        )
+        .await
+        .unwrap();
+        let (_recv_conn, mut recv_session) = connect(url, "undecodable-receiver-conn").await;
+        let mut receiver = Receiver::builder()
+            .name("undecodable-receiver-link")
+            .source(address.as_str())
+            .credit_mode(CreditMode::Auto(1))
+            .attach(&mut recv_session)
+            .await
+            .unwrap();
+        sender
+            .send(
+                Message::builder()
+                    .value(r#"{"orderId":"o-text"}"#.to_string())
+                    .build(),
+            )
+            .await
+            .unwrap()
+            .accepted_or_else(|o| format!("{o:?}"))
+            .unwrap();
+        sender
+            .send(
+                Message::builder()
+                    .data(br#"{"orderId":"o-after"}"#.to_vec())
+                    .build(),
+            )
+            .await
+            .unwrap()
+            .accepted_or_else(|o| format!("{o:?}"))
+            .unwrap();
+
+        let mut mappings = std::collections::HashMap::new();
+        mappings.insert(
+            address.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_amqp::http_client();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(10),
+            1.0,
+            Duration::from_millis(10),
+            2,
+        );
+        tokio::spawn(async move {
+            run_inbound(
+                &mut receiver,
+                &http,
+                &skilj_base_url,
+                &address,
+                &mappings,
+                &retry_policy,
+            )
+            .await;
+        });
+
+        let mut delivered = false;
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !mock_state.external_requests.lock().unwrap().is_empty() {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(
+            delivered,
+            "the message after the undecodable one must still be dispatched"
+        );
+        let requests = mock_state.external_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["payload"], json!({ "orderId": "o-after" }));
     });
 }

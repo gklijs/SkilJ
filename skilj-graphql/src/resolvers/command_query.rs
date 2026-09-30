@@ -10,7 +10,9 @@
 //! naturally fit this surface the way `EventQuery`'s genuine sequence
 //! cursor does (confirmed with the user - see the Phase 3 plan).
 
-use super::{not_found, parse_rfc3339, require_admin_mapping, resolve_read_data_keys};
+use super::{
+    distinct_names, not_found, parse_rfc3339, require_admin_mapping, resolve_read_data_keys,
+};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -29,8 +31,7 @@ pub fn fetch_commands_field() -> Field {
                     require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
 
                 let mut command_types = Vec::new();
-                for item in ctx.args.try_get("commandTypes")?.list()?.iter() {
-                    let name = item.string()?.to_string();
+                for name in distinct_names(&ctx.args.try_get("commandTypes")?)? {
                     let ct =
                         skilj_core::db::get_command_type(&state.pool, &bounded_context_name, &name)
                             .await

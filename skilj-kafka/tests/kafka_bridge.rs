@@ -1322,3 +1322,80 @@ fn the_run_loops_stop_when_asked() {
             .unwrap();
     });
 }
+
+/// docs/architecture.md §144: a message that isn't JSON is parked on its
+/// first failure - no retry can make it JSON - and the parked request
+/// keeps its raw content, not a `null`.
+#[test]
+fn a_non_json_message_is_parked_at_once_with_its_raw_content() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-in-malformed");
+        create_topic(bootstrap_servers, &topic).await;
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-malformed")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+
+        producer
+            .send(
+                FutureRecord::to(&topic).payload("not json {").key("k"),
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap();
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            topic.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+
+        let http = skilj_kafka::http_client();
+        // Retried, this would take 20 s and five attempts to park.
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_secs(5),
+            1.0,
+            Duration::from_secs(5),
+            5,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mappings, &retry_policy).await;
+        });
+
+        let mut parked = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(p) = mock_state.parked_deliveries.lock().unwrap().first() {
+                parked = Some(p.clone());
+                break;
+            }
+        }
+        let parked = parked.expect("run_inbound must have parked the malformed message");
+        assert_eq!(parked["attemptCount"], json!(1));
+        assert_eq!(parked["request"]["payload"], json!("not json {"));
+        assert!(mock_state.external_requests.lock().unwrap().is_empty());
+    });
+}

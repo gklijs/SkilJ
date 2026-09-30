@@ -247,8 +247,8 @@ pub enum BridgeError {
     /// A Kafka message's own payload wasn't valid JSON - unrecoverable
     /// the same way `skilj_temporal`'s own `NoCorrelationTag` is: no
     /// amount of retrying produces valid JSON out of bytes that aren't.
-    /// The caller ([`run_inbound`]) still commits the offset on this
-    /// error, logging rather than redelivering it forever.
+    /// [`run_inbound`] parks it on the first failure, raw content kept,
+    /// and commits past it - it doesn't retry (docs/architecture.md §144).
     #[error("Kafka message payload is not valid JSON: {0}")]
     MalformedPayload(#[from] serde_json::Error),
 }
@@ -613,6 +613,18 @@ pub fn header_str<'a, H: Headers>(headers: Option<&'a H>, key: &str) -> Option<&
         .and_then(|v| std::str::from_utf8(v).ok())
 }
 
+/// The `payload` a parked delivery's stored request carries: the message
+/// as JSON, or - when it isn't JSON at all - its raw content as a JSON
+/// string, so an operator can see what arrived rather than a `null`
+/// (docs/architecture.md §144). A retry of such a row sends that string,
+/// which no event or command schema accepts, so it stays parked until
+/// discarded.
+fn parked_payload(payload: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(payload).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(payload).into_owned())
+    })
+}
+
 /// Dispatches one Kafka message to skilj - the one place [`InboundAction`]
 /// is interpreted. Exposed separately from [`run_inbound`] so it can be
 /// tested directly against raw `(topic, partition, offset, payload)`
@@ -903,7 +915,10 @@ pub async fn run_inbound_until(
                             attempt += 1;
                             let failed_at = *first_failed_at.get_or_insert_with(Utc::now);
                             let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
-                            if retry_policy.is_exhausted(attempt, elapsed) {
+                            if retry_policy.is_exhausted(attempt, elapsed)
+                    // Not JSON: no retry can change that (§144).
+                    || matches!(e, BridgeError::MalformedPayload(_))
+                            {
                                 tracing::error!(
                                     topic,
                                     partition,
@@ -913,9 +928,7 @@ pub async fn run_inbound_until(
                                     "dispatch failed repeatedly - parking and committing so \
                                      this message doesn't block progress forever"
                                 );
-                                let payload_json: serde_json::Value =
-                                    serde_json::from_slice(payload)
-                                        .unwrap_or(serde_json::Value::Null);
+                                let payload_json = parked_payload(payload);
                                 let partition_key = format!("{topic}:{partition}");
                                 let body = inbound_request_body(
                                     mapping,

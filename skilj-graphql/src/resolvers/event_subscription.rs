@@ -47,7 +47,9 @@
 //!   `state.revocation_broadcaster`, published the instant
 //!   `resolvers::access_management` actually revokes the mapping.
 
-use super::{not_found, parse_filters, require_read_mapping, resolve_read_data_keys};
+use super::{
+    distinct_names, not_found, parse_filters, require_read_mapping, resolve_read_data_keys,
+};
 use crate::error::to_graphql_error;
 use crate::GraphqlState;
 use async_graphql::dynamic::{
@@ -138,8 +140,7 @@ pub fn all_events_field() -> SubscriptionField {
 
             let mut event_types = Vec::new();
             if let Some(list) = ctx.args.get("eventTypes").filter(|v| !v.is_null()) {
-                for item in list.list()?.iter() {
-                    let name = item.string()?.to_string();
+                for name in distinct_names(&list)? {
                     let et =
                         skilj_core::db::get_event_type(&state.pool, &bounded_context_name, &name)
                             .await

@@ -190,6 +190,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Kafka, AMQP and NATS bridges park an inbound message that isn't
+  JSON on its first failure instead of retrying it through the whole
+  retry policy, and the parked request keeps its content (as a JSON
+  string) instead of `null`. The AMQP bridge rejects a message whose
+  body isn't data sections (e.g. an `amqp-value`) instead of leaving it
+  unsettled, where it held link credit for good and could stall the
+  receiver (docs/architecture.md §144).
 - Caller-supplied idempotency keys had no length bound, though one is
   stored per accepted command; keys over 255 characters are now refused
   as `idempotency_key_too_long` (400 on REST) (docs/architecture.md §134).
@@ -606,6 +613,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `queryEvents`, `countEvents`, `allEvents` and `fetchCommands` look up
+  each distinct name in `eventTypes`/`commandTypes` once. A list
+  repeating one name made a query per entry - some 200,000 for a
+  request body's worth (docs/architecture.md §143).
 - A token id alone no longer tells anyone its token exists. `revokeToken`
   answered `AccessToken_not_found` for a missing id and something else
   for a real one, even with no credential; it now requires a caller and

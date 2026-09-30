@@ -246,8 +246,8 @@ pub enum BridgeError {
     EventTypeMismatch { declared: String, actual: String },
     /// A JetStream message's own body wasn't valid JSON - unrecoverable
     /// the same way every other bridge's `MalformedPayload` is.
-    /// [`run_inbound`] still acks the message on this error, logging
-    /// rather than redelivering it forever.
+    /// [`run_inbound`] parks it on the first failure, raw content kept,
+    /// and acks it - it doesn't retry (docs/architecture.md §144).
     #[error("JetStream message payload is not valid JSON: {0}")]
     MalformedPayload(#[from] serde_json::Error),
     /// Reading a consumed message's own `(stream, stream_sequence)` -
@@ -657,6 +657,18 @@ impl InboundMessageMeta {
     }
 }
 
+/// The `payload` a parked delivery's stored request carries: the message
+/// as JSON, or - when it isn't JSON at all - its raw content as a JSON
+/// string, so an operator can see what arrived rather than a `null`
+/// (docs/architecture.md §144). A retry of such a row sends that string,
+/// which no event or command schema accepts, so it stays parked until
+/// discarded.
+fn parked_payload(payload: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(payload).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(payload).into_owned())
+    })
+}
+
 /// Dispatches one JetStream message to skilj - the one place
 /// [`InboundAction`] is interpreted, the identical shape
 /// `skilj_kafka::dispatch_inbound_message`/`skilj_amqp::dispatch_inbound_message`
@@ -940,7 +952,10 @@ pub async fn run_inbound_until(
                         attempt += 1;
                         let failed_at = *first_failed_at.get_or_insert_with(Utc::now);
                         let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
-                        if retry_policy.is_exhausted(attempt, elapsed) {
+                        if retry_policy.is_exhausted(attempt, elapsed)
+                    // Not JSON: no retry can change that (§144).
+                    || matches!(e, BridgeError::MalformedPayload(_))
+                        {
                             tracing::error!(
                                 stream = meta.stream,
                                 stream_sequence = meta.stream_sequence,
@@ -949,9 +964,7 @@ pub async fn run_inbound_until(
                                 "dispatch failed repeatedly - parking and acking so this \
                                  message doesn't get redelivered forever"
                             );
-                            let payload_json: serde_json::Value =
-                                serde_json::from_slice(&message.payload)
-                                    .unwrap_or(serde_json::Value::Null);
+                            let payload_json = parked_payload(&message.payload);
                             let body = inbound_request_body(mapping, &meta, &payload_json);
                             let identifier = format!("{}:{}", meta.stream, meta.stream_sequence);
                             let idempotency_key = inbound_idempotency_key(mapping, &meta);

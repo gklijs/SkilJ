@@ -10351,3 +10351,23 @@ Token ids are random UUIDs, so this is a leak about ids that got out some other 
 Fix: `revokeToken` calls `require_caller` first and refuses a missing token with the same `grant_not_active` a forbidden one gets. `skilj-rest`'s `resolve_token` asks `db::access_token_kind_for_credential`, which reports the other kind only when the presented secret matches that token's stored hash (the same `secret_matches` comparison); otherwise it's the ordinary `401 unrecognised_credential`.
 
 Tests: `full_type_registration_lifecycle_end_to_end` (`skilj/tests/graphql_type_registration.rs`) - `revokeToken` on an existing and a missing id answers `unauthenticated` without a credential and `grant_not_active` to a Role without a grant, alike for both. `token_resolution_answers_each_outcome` (`skilj/tests/event_fetch_rest.rs`) - another kind's id with a wrong secret is a 401, its whole credential still a 403.
+
+## 143. A repeated type name is looked up once
+
+`queryEvents`, `countEvents`, `allEvents` and `fetchCommands` take a list of type names (`eventTypes`/`commandTypes`) and looked each one up in turn - one `get_event_type`/`get_command_type` query per list entry, and one entry in the type filter every event is then compared against. The lookup stops at the first unknown name, but nothing stopped a caller repeating a real one: a request body has room (§72's 2 MiB, websocket messages included per §73) for some 200,000 copies of a short name, each its own query, from any Role with a grant on the bounded context - `allEvents` needs only read access.
+
+Fix: `resolvers::distinct_names` reads such a list keeping each name once, in first-seen order; the four resolvers look up and filter by that. Which events match is unchanged - a type named twice was never matched twice. `registerProjection`'s `consumedEventTypes` is left as it was: it's admin-only, and whether a repeated name there should be an error or ignored is its own question.
+
+Test: `distinct_names_keeps_each_name_once_in_order` (`skilj-graphql/src/resolvers/mod.rs`), through a real `async_graphql` argument.
+
+## 144. The bridges park a malformed message at once, and keep what it said
+
+Three problems with an inbound message the bridges couldn't read:
+
+- **Not JSON, retried anyway.** `MalformedPayload`'s own doc comment calls it unrecoverable, but `run_inbound` in `skilj-kafka`, `skilj-amqp` and `skilj-nats` went through the whole `retry_policy` before parking it - holding up a Kafka partition, and on every bridge the messages behind it, for as long as the policy allows (a bounded policy's minutes, not milliseconds).
+- **Parked as `null`.** The parked request was built with `from_slice(payload).unwrap_or(Null)`, so what arrived was lost: the operator saw a `null` payload, not the bytes that failed, and a `retryParkedDelivery` sent `null`.
+- **AMQP bodies that aren't data sections were never settled.** `run_inbound` receives `Data` bodies; a message with an `amqp-value` body - how a JMS `TextMessage` reaches an AMQP client through Artemis - fails to decode, and the bridge logged the error and moved on, leaving the delivery unsettled. It held a unit of link credit for good, the §98 failure: enough of them and the receiver stopped receiving.
+
+Fix: a `MalformedPayload` counts as exhausted on its first failure, so it's parked straight away (and committed/accepted/acked as any parked message is). The parked request's payload is `parked_payload`: the message as JSON when it is JSON, otherwise its content as a JSON string (lossy UTF-8) - visible to the operator, and refused by any schema if retried, so it stays parked until discarded. The AMQP bridge `reject`s a delivery it can't decode (`RecvError::MessageDecode` carries its `DeliveryInfo`), settling it and freeing its credit; the broker's dead-lettering takes it from there. Reading `amqp-value` bodies as JSON text is a feature, not part of this fix.
+
+Tests: `a_non_json_message_is_parked_at_once_with_its_raw_content` in each bridge's suite (real Kafka, Artemis and NATS brokers) - a policy that would take five attempts and 20 s parks it after one, payload `"not json {"`. `an_undecodable_message_is_rejected_and_does_not_stall_the_receiver` (`skilj-amqp`) - with a link credit of one, an `amqp-value` message followed by a valid one: the valid one is dispatched. Each fails against the unfixed bridge.

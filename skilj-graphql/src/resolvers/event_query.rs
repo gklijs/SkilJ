@@ -1,7 +1,7 @@
 //! `surface EventQuery` - `queryEvents`, `countEvents`, `inspectEvent`.
 //! `AdminAccess`-gated, via the shared `require_admin_mapping` helper.
 
-use super::{not_found, require_admin_mapping, resolve_read_data_keys};
+use super::{distinct_names, not_found, require_admin_mapping, resolve_read_data_keys};
 use crate::error::to_graphql_error;
 use crate::gql_types::InspectedEventData;
 use crate::GraphqlState;
@@ -44,8 +44,7 @@ pub fn query_events_field() -> Field {
                     require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
 
                 let mut event_types = Vec::new();
-                for item in ctx.args.try_get("eventTypes")?.list()?.iter() {
-                    let name = item.string()?.to_string();
+                for name in distinct_names(&ctx.args.try_get("eventTypes")?)? {
                     let et =
                         skilj_core::db::get_event_type(&state.pool, &bounded_context_name, &name)
                             .await
@@ -189,8 +188,7 @@ pub fn count_events_field() -> Field {
                 require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
 
             let mut event_types = Vec::new();
-            for item in ctx.args.try_get("eventTypes")?.list()?.iter() {
-                let name = item.string()?.to_string();
+            for name in distinct_names(&ctx.args.try_get("eventTypes")?)? {
                 let et = skilj_core::db::get_event_type(&state.pool, &bounded_context_name, &name)
                     .await
                     .map_err(to_graphql_error)?

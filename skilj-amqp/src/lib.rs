@@ -243,8 +243,8 @@ pub enum BridgeError {
     /// An AMQP message's own body wasn't valid JSON - unrecoverable the
     /// same way `skilj_kafka::BridgeError::MalformedPayload` is: no
     /// amount of retrying produces valid JSON out of bytes that aren't.
-    /// [`run_inbound`] still accepts the delivery on this error, logging
-    /// rather than redelivering it forever.
+    /// [`run_inbound`] parks it on the first failure, raw content kept,
+    /// and accepts it - it doesn't retry (docs/architecture.md §144).
     #[error("AMQP message body is not valid JSON: {0}")]
     MalformedPayload(#[from] serde_json::Error),
 }
@@ -635,6 +635,18 @@ fn message_id_to_string(id: &MessageId) -> String {
     }
 }
 
+/// The `payload` a parked delivery's stored request carries: the message
+/// as JSON, or - when it isn't JSON at all - its raw content as a JSON
+/// string, so an operator can see what arrived rather than a `null`
+/// (docs/architecture.md §144). A retry of such a row sends that string,
+/// which no event or command schema accepts, so it stays parked until
+/// discarded.
+fn parked_payload(payload: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(payload).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(payload).into_owned())
+    })
+}
+
 /// The exact `ExternalEventRequest`/`CommandTriggerRequest` body
 /// [`dispatch_inbound_message`] sends for `mapping`/`meta`/`payload_json` -
 /// factored out so [`report_parked_delivery`] can store the identical
@@ -881,6 +893,23 @@ pub async fn run_inbound_until(
         };
         let delivery = match received {
             Ok(delivery) => delivery,
+            // A body that isn't `Data` sections (an `amqp-value`, say)
+            // can't be read as bytes to dispatch. Left unsettled it would
+            // hold a unit of link credit forever - enough of them and the
+            // receiver stalls, §98's failure - so it's rejected: the
+            // broker's own dead-lettering takes it from there
+            // (docs/architecture.md §144).
+            Err(fe2o3_amqp::link::RecvError::MessageDecode(e)) => {
+                tracing::error!(
+                    address,
+                    "AMQP message body is not data sections - rejecting it: {}",
+                    e.source
+                );
+                if let Err(reject_err) = receiver.reject(e.info, None).await {
+                    tracing::error!("rejecting an AMQP delivery failed: {reject_err}");
+                }
+                continue;
+            }
             Err(e) => {
                 tracing::error!(address, "AMQP receive error: {e}");
                 continue;
@@ -926,7 +955,10 @@ pub async fn run_inbound_until(
                     attempt += 1;
                     let failed_at = *first_failed_at.get_or_insert_with(Utc::now);
                     let elapsed = (Utc::now() - failed_at).to_std().unwrap_or_default();
-                    if retry_policy.is_exhausted(attempt, elapsed) {
+                    if retry_policy.is_exhausted(attempt, elapsed)
+                    // Not JSON: no retry can change that (§144).
+                    || matches!(e, BridgeError::MalformedPayload(_))
+                    {
                         tracing::error!(
                             address,
                             attempt,
@@ -934,8 +966,7 @@ pub async fn run_inbound_until(
                             "dispatch failed repeatedly - parking and accepting so this \
                              message doesn't block redelivery forever"
                         );
-                        let payload_json: serde_json::Value =
-                            serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+                        let payload_json = parked_payload(payload);
                         let body = inbound_request_body(mapping, &meta, &payload_json);
                         let identifier = message_identifier(&meta);
                         let idempotency_key = inbound_idempotency_key(mapping, &meta);

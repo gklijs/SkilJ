@@ -226,6 +226,23 @@ pub async fn require_read_mapping(
         .ok_or_else(|| to_graphql_error(skilj_core::access_control::Error::GrantNotActive))
 }
 
+/// The distinct names in a `[String!]` argument (`eventTypes`,
+/// `commandTypes`), in first-seen order. Each is looked up once, so a
+/// list repeating one name can't turn a single request into as many
+/// lookups - and filter comparisons per event - as a request body has
+/// room for (docs/architecture.md §143).
+pub fn distinct_names(value: &ValueAccessor) -> async_graphql::Result<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for item in value.list()?.iter() {
+        let name = item.string()?;
+        if seen.insert(name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
 /// Parses a `[TagMappingInput!]!` argument into `Vec<TagMapping>` -
 /// shared by `registerEventType`/`registerCommandType`.
 pub fn parse_tag_mappings(value: &ValueAccessor) -> async_graphql::Result<Vec<TagMapping>> {
@@ -481,3 +498,43 @@ macro_rules! create_type_token_field {
     };
 }
 pub(crate) use create_type_token_field;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_graphql::dynamic::{
+        Field, FieldFuture, FieldValue, InputValue, Object, Schema, TypeRef,
+    };
+
+    /// docs/architecture.md §143: a repeated name is kept once, in
+    /// first-seen order.
+    #[tokio::test]
+    async fn distinct_names_keeps_each_name_once_in_order() {
+        let query = Object::new("Query").field(
+            Field::new("names", TypeRef::named_nn_list_nn(TypeRef::STRING), |ctx| {
+                FieldFuture::new(async move {
+                    let names = distinct_names(&ctx.args.try_get("of")?)?;
+                    Ok(Some(FieldValue::list(
+                        names.into_iter().map(FieldValue::value),
+                    )))
+                })
+            })
+            .argument(InputValue::new(
+                "of",
+                TypeRef::named_nn_list_nn(TypeRef::STRING),
+            )),
+        );
+        let schema = Schema::build("Query", None, None)
+            .register(query)
+            .finish()
+            .unwrap();
+        let response = schema
+            .execute(r#"{ names(of: ["b", "a", "b", "b", "c", "a"]) }"#)
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap(),
+            serde_json::json!({ "names": ["b", "a", "c"] })
+        );
+    }
+}
