@@ -206,6 +206,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- After a `Snapshot::VERSION` bump, the next event for a tag value reset
+  its snapshot and folded only that event into it, so decisions using the
+  snapshot ran on state missing the tag's whole earlier history. A reset
+  (or new) snapshot row is now folded from the tag's full history
+  (docs/architecture.md §152).
 - A projection rebuild could be promoted with the wrong state when more
   than one instance catches up: an instance working from a stale snapshot
   could delete state another instance had just folded, or - after a

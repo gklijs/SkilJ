@@ -687,3 +687,114 @@ fn partitioned_snapshot_uneven_tag_distribution_converges() {
         assert_eq!(state.balance, 11);
     });
 }
+
+/// docs/architecture.md §152: after a `Snapshot::VERSION` bump, the next
+/// event for a tag value used to reset that row to the default state and
+/// fold *only that event* into it, at the new version - so the row claimed
+/// to be current as of that event while having seen nothing before it,
+/// and `decide_from_snapshot` (which trusts a row at the current version
+/// and fetches only what came after it) decided on that. Whatever the row
+/// holds afterwards, it must never be a current-version state that has
+/// lost the history: either absent (a full replay) or the whole balance.
+#[test]
+fn a_version_bump_never_leaves_a_current_row_missing_history() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let withdrawn = seed_event_type(&pool, &bc, "Withdrawn", "account").await;
+        let account = unique_name("account");
+        let v1 = TestSnapshotDispatcher {
+            tag_key: "account",
+            version: 1,
+        };
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 100).await;
+        insert_money_event(&pool, &bc, &withdrawn, "account", &account, 30).await;
+        db::catch_up_snapshots(&pool, &bc.name, &v1).await.unwrap();
+
+        // The model changed; the next deposit arrives and is caught up at
+        // the new version.
+        let v2 = TestSnapshotDispatcher {
+            tag_key: "account",
+            version: 2,
+        };
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 5).await;
+        for _ in 0..3 {
+            db::catch_up_snapshots(&pool, &bc.name, &v2).await.unwrap();
+        }
+
+        let resolved = db::resolve_snapshot_context(
+            &pool,
+            &bc.name,
+            &v2,
+            "Balance",
+            &[tag("account", &account)],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+        assert!(
+            resolved.as_of_sequence == -1 || state.balance == 75,
+            "a current-version row must hold the whole history (75) or be absent, got \
+             balance {} as of {}",
+            state.balance,
+            resolved.as_of_sequence
+        );
+    });
+}
+
+/// `a_version_bump_never_leaves_a_current_row_missing_history`, through
+/// the partitioned catch-up (`Snapshot::PARTITION_COUNT` > 1), which
+/// resets and folds rows the same way.
+#[test]
+fn a_version_bump_never_leaves_a_partitioned_row_missing_history() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let withdrawn = seed_event_type(&pool, &bc, "Withdrawn", "account").await;
+        let account = unique_name("account");
+        let at = |version| PartitionedTestSnapshotDispatcher {
+            inner: TestSnapshotDispatcher {
+                tag_key: "account",
+                version,
+            },
+            partition_count: 4,
+        };
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 100).await;
+        insert_money_event(&pool, &bc, &withdrawn, "account", &account, 30).await;
+        db::catch_up_snapshots(&pool, &bc.name, &at(1))
+            .await
+            .unwrap();
+
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 5).await;
+        for _ in 0..3 {
+            db::catch_up_snapshots(&pool, &bc.name, &at(2))
+                .await
+                .unwrap();
+        }
+
+        let resolved = db::resolve_snapshot_context(
+            &pool,
+            &bc.name,
+            &at(2),
+            "Balance",
+            &[tag("account", &account)],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+        assert!(
+            resolved.as_of_sequence == -1 || state.balance == 75,
+            "got balance {} as of {}",
+            state.balance,
+            resolved.as_of_sequence
+        );
+    });
+}

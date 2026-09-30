@@ -3698,7 +3698,10 @@ doesn't exist - fall back to a full (or tag-indexed) replay for that one
 tag value. The same "coverage miss, not a wrong answer" philosophy
 `EventCache`'s own module doc comment already states, applied to a
 different subsystem rather than shared with it. Self-healing: the next
-write past that point can lay down a fresh row at the new version.
+write past that point can lay down a fresh row at the new version -
+folded from the tag's whole history, not just that write's event
+(§152: folding just the one event left a current-version row that had
+lost everything before it).
 
 **Write cadence** - a `SNAPSHOT_EVERY: u32` cadence (store a state after
 every N events, not every one), written by its own small background
@@ -10439,3 +10442,11 @@ Tests: `fire_once_resolves_a_backlog_longer_than_one_tick_can_walk` (`skilj/test
 Fix: each fold transaction takes the rebuild row `FOR UPDATE` and re-reads `caught_up_to`. The rebuild is folded only if that is exactly the sequence of the event before this one in the walk (`previous`, starting at the walk's own lower bound); otherwise it's skipped, and the next tick's fresh snapshot picks it up where it really stands. When the locked value is NULL - the first fold of a build - the leftover `projection_rebuild_state` rows are deleted in the same transaction, under that lock, so no other instance can be folding into them; the unlocked delete at the top of the tick is gone. Lock order stays the rebuild row before its state rows, the order the transition itself takes them. The per-key `as_of_sequence` guards are unchanged.
 
 Test: `a_rebuild_restarted_under_a_stale_catch_up_is_replayed_from_nothing` (`skilj-core/tests/async_projections.rs`) - the test holds the rebuild row's lock while a catch-up reaches it, restarts the rebuild, and lets go; the promoted state must be the full replay. It fails against the old code with exactly the `1012`. The stale-delete race has no lock to hold a catch-up at, so it isn't reproduced directly; the delete it depended on no longer exists outside the lock.
+
+## 152. A snapshot row reset by a version bump is refolded from its whole history
+
+§19's "model changed" rule: a stored snapshot row whose `snapshot_version` isn't the registered `Snapshot::VERSION` is treated as absent, and "the next write past that point can lay down a fresh row at the new version". The catch-up did lay one down - `get_or_create_snapshot_state_for_update` resets an old-version row to the default state at `as_of_sequence = -1`, atomically - and then folded into it *only the event in hand*, writing `as_of_sequence` = that event. But the catch-up's progress (`snapshot_progress`, per snapshot name, not per version) was already past every earlier event for that tag value, so they were never folded again. The row now claimed to be current at the new version while having seen one event, and `resolve_snapshot_context` trusts a current-version row: `decide_from_snapshot` fetches only events after `as_of_sequence`, so every decision for that tag value ran on state missing its whole history - here a balance of 5 where the account held 75. Every `VERSION` bump in a running system did this to every tag value touched afterwards. The partitioned catch-up (`Snapshot::PARTITION_COUNT` > 1) resets and folds the same way and had the same flaw.
+
+Fix: a row that comes back from `get_or_create_snapshot_state_for_update` at `as_of_sequence = -1` - just created, or just reset - is filled by `fold_snapshot_tag_history`: every event carrying that tag, through the tag index (§108), folded from the default state up to and including the event in hand, a chunk at a time, on the catch-up's own transaction (no second pooled connection, cf. §116). For a tag value first seen at that event it's the one event, as before; for a row a version bump reset it's the whole history, once. Rows not yet touched after the bump stay at the old version and keep being treated as absent - a full replay, correct if slower - until their next event refolds them. Considered instead: versioning `snapshot_progress` so a bump replays the whole bounded context's history under the new version. It needs a schema change and a replay of every event rather than just the touched tag values, and two versions running side by side in a rolling deploy would keep resetting it.
+
+Tests: `a_version_bump_never_leaves_a_current_row_missing_history` and `a_version_bump_never_leaves_a_partitioned_row_missing_history` (`skilj-core/tests/snapshot_context.rs`) - a balance of 100 − 30 caught up at version 1, then a deposit of 5 caught up at version 2: the row must hold 75 (or be absent). Both fail against the old code with a balance of 5.

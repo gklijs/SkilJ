@@ -11607,6 +11607,60 @@ async fn list_projection_partition_progress(
         .collect())
 }
 
+/// A snapshot row's state for `tag_value`, folded from nothing over every
+/// event carrying that tag up to and including `up_to` - what a catch-up
+/// writes into a row `get_or_create_snapshot_state_for_update` has just
+/// created or reset (`as_of_sequence` -1), rather than folding only the
+/// event in hand (docs/architecture.md §152). For a tag value first seen
+/// at `up_to` that's the one event, as before. For a row reset by a
+/// `Snapshot::VERSION` bump - progress already past the tag's earlier
+/// events, which will never be walked again - it's the whole history,
+/// where folding the one event left a row claiming to be current while
+/// missing everything before it. Read through `conn` (the catch-up's own
+/// transaction), a chunk at a time, through the tag index.
+#[allow(clippy::too_many_arguments)]
+async fn fold_snapshot_tag_history(
+    conn: &mut sqlx::PgConnection,
+    bc: &BoundedContext,
+    dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    snapshot_name: &str,
+    tag_key: &str,
+    tag_value: &str,
+    default_state_json: &str,
+    up_to: i64,
+) -> crate::error::Result<String> {
+    const CHUNK: i64 = 1000;
+    let tags = [Tag {
+        key: tag_key.to_string(),
+        value: Some(tag_value.to_string()),
+    }];
+    let mut state = default_state_json.to_string();
+    let mut after = -1;
+    loop {
+        let chunk = list_events_for_bounded_context_matching_tags_with_bc(
+            &mut *conn,
+            bc,
+            &tags,
+            Some(after),
+            None,
+            Some(CHUNK),
+        )
+        .await?;
+        for event in &chunk {
+            if event.sequence > up_to {
+                return Ok(state);
+            }
+            if let Some(result) = dispatcher.fold(&bc.name, snapshot_name, &state, event) {
+                state = result?;
+            }
+        }
+        match chunk.last() {
+            Some(last) if chunk.len() as i64 == CHUNK => after = last.sequence,
+            _ => return Ok(state),
+        }
+    }
+}
+
 /// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2" - the background half of
 /// `Snapshot`: one poll tick, for one bounded context, folding every
 /// committed event not yet reflected in any registered snapshot.
@@ -11691,6 +11745,10 @@ pub async fn catch_up_snapshots(
         .await?
     };
 
+    let bc = match events.first() {
+        Some(_) => Some(require_bounded_context(pool, bounded_context).await?),
+        None => None,
+    };
     for event in &events {
         let mut tx = pool.begin().await?;
 
@@ -11734,9 +11792,24 @@ pub async fn catch_up_snapshots(
                 continue;
             }
 
-            let new_state = match dispatcher.fold(bounded_context, name, &current_state, event) {
-                Some(result) => result?,
-                None => current_state,
+            let new_state = if as_of_sequence == -1 {
+                // Just created or reset - see `fold_snapshot_tag_history`.
+                fold_snapshot_tag_history(
+                    &mut tx,
+                    bc.as_ref().expect("fetched whenever there are events"),
+                    dispatcher,
+                    name,
+                    tag_key,
+                    tag_value,
+                    &default_state_json,
+                    event.sequence,
+                )
+                .await?
+            } else {
+                match dispatcher.fold(bounded_context, name, &current_state, event) {
+                    Some(result) => result?,
+                    None => current_state,
+                }
             };
 
             // Cross-tenant read fix (docs/architecture.md's own
@@ -11900,6 +11973,7 @@ async fn catch_up_partitioned_snapshot(
             .default_state(bounded_context, name)
             .unwrap_or_default();
         let owner_tag_key = dispatcher.owner_tag_key(bounded_context, name).flatten();
+        let bc = require_bounded_context(pool, bounded_context).await?;
 
         for partition_index in 0..partition_count {
             if progress.get(&partition_index).copied().unwrap_or(-1) >= batch_end {
@@ -11952,12 +12026,26 @@ async fn catch_up_partitioned_snapshot(
                         // makes cross-instance racing safe, the
                         // advisory lock being only an optimization.
                         if as_of_sequence < event.sequence {
-                            let new_state =
+                            let new_state = if as_of_sequence == -1 {
+                                // See `fold_snapshot_tag_history`.
+                                fold_snapshot_tag_history(
+                                    &mut tx,
+                                    &bc,
+                                    dispatcher,
+                                    name,
+                                    tag_key,
+                                    tag_value,
+                                    &default_state_json,
+                                    event.sequence,
+                                )
+                                .await?
+                            } else {
                                 match dispatcher.fold(bounded_context, name, &current_state, event)
                                 {
                                     Some(result) => result?,
                                     None => current_state,
-                                };
+                                }
+                            };
                             let owner = owner_tag_key.and_then(|owner_tag_key| {
                                 event
                                     .tags
