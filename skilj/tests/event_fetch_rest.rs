@@ -114,6 +114,14 @@ async fn setup_with_pool(pool_options: skilj_core::db::PgPoolOptions) -> (Skilj,
     let database_url = test_db()
         .await
         .expect("test_db() must be Some - caller already checked");
+    setup_in(database_url, pool_options).await
+}
+
+/// [`setup_with_pool`] on a database of the caller's choosing.
+async fn setup_in(
+    database_url: String,
+    pool_options: skilj_core::db::PgPoolOptions,
+) -> (Skilj, String, String) {
     let pool = db::connect(&database_url).await.unwrap();
 
     let external_subject = unique_name("subject");
@@ -1470,10 +1478,25 @@ fn token_resolution_answers_each_outcome() {
 #[test]
 fn a_refused_read_loads_no_events() {
     runtime().block_on(async {
-        let Some(database_url) = test_db().await else {
+        // A database of its own: the renamed `events` table below would
+        // otherwise fail any other test's `build()` meanwhile, which warms
+        // every bounded context's event cache.
+        let Some(database_url) =
+            skilj_test_support::embedded_database_url("skilj_event_fetch_rest_refused_read").await
+        else {
             return;
         };
-        let (skilj, direct_credential, read_credential) = setup().await;
+        if connect_and_migrate(&database_url, "embedded PostgreSQL")
+            .await
+            .is_none()
+        {
+            return;
+        }
+        let (skilj, direct_credential, read_credential) = setup_in(
+            database_url.clone(),
+            skilj_core::db::PgPoolOptions::new().max_connections(4),
+        )
+        .await;
         let router = skilj.rest_router();
         deposit(&router, &direct_credential, 5).await;
 

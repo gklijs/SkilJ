@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `db::resolve_data_keys_for_reading`'s accumulator is now
+  `HashMap<(String, String), Option<DataKey>>`: a granted subject with no
+  active key (forgotten, or never provisioned) is recorded as `None`, so
+  a page of events about one forgotten subject looks its key up once
+  instead of once per event (docs/architecture.md §155).
 - Event subscriptions read the caller's grant, private-field grants and
   decryption keys once per batch of events rather than once per event -
   a resumed subscription replaying a thousand events used to cost
@@ -210,6 +215,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Catching up an async projection could deadlock against another
+  instance promoting that projection's rebuild: the fold locked a state
+  row and then the projection row, promotion the other way round.
+  Postgres aborted one of them and the tick was retried. The fold now
+  locks the projection row first (docs/architecture.md §156).
 - skilj-tui's live feed resumes from now when the server refuses its
   remembered position with `from_sequence_not_committed` (the bounded
   context was recreated), instead of retrying the same refused position

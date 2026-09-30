@@ -166,7 +166,12 @@ pub fn fetch_commands_field() -> Field {
                         skilj_core::event_store::render_command(
                             c,
                             &access_mapping,
-                            &|sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                            &|sk, sv| {
+                                data_keys
+                                    .get(&(sk.to_string(), sv.to_string()))
+                                    .cloned()
+                                    .flatten()
+                            },
                             &private_field_grants,
                         ),
                     ))

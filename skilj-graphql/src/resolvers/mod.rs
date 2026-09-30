@@ -136,7 +136,7 @@ pub async fn resolve_read_data_keys(
     payload: &str,
     access_mapping: &RoleAccessMapping,
     master_key: Option<&EncryptionMasterKey>,
-    resolved: &mut std::collections::HashMap<(String, String), DataKey>,
+    resolved: &mut std::collections::HashMap<(String, String), Option<DataKey>>,
 ) -> async_graphql::Result<()> {
     skilj_core::db::resolve_data_keys_for_reading(
         pool,

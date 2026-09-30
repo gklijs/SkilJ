@@ -226,7 +226,10 @@ pub fn submit_command_field() -> Field {
                         )
                         .await?;
                         let resolve = |sk: &str, sv: &str| {
-                            data_keys.get(&(sk.to_string(), sv.to_string())).cloned()
+                            data_keys
+                                .get(&(sk.to_string(), sv.to_string()))
+                                .cloned()
+                                .flatten()
                         };
                         let rendered = visible
                             .into_iter()

@@ -1548,3 +1548,75 @@ fn a_rebuild_restarted_under_a_stale_catch_up_is_replayed_from_nothing() {
         );
     });
 }
+
+/// docs/architecture.md §156: promotion locks the projection row, then
+/// deletes its state rows. The async fold locked a state row first and
+/// the projection row last, so a fold on one instance and a promotion on
+/// another could each wait on the other - a deadlock Postgres broke by
+/// aborting one. Here a transaction holds the projection row the way
+/// promotion does while the fold runs, then deletes the state rows: the
+/// fold must wait before touching them, so both finish.
+#[test]
+fn an_async_fold_never_deadlocks_against_a_promotion() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        insert_plain_event(&pool, &bc, &et, 20).await;
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+        let second = insert_plain_event(&pool, &bc, &et, 5).await;
+
+        let schema = format!("\"bc_{}\"", bc.name);
+        let mut promotion = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.projections SET schema_version = schema_version \
+             WHERE name = 'AccountBalance'"
+        )))
+        .execute(&mut *promotion)
+        .await
+        .unwrap();
+
+        let fold = tokio::spawn({
+            let pool = pool.clone();
+            let bc_name = bc.name.clone();
+            async move { db::catch_up_bounded_context(&pool, &bc_name, &TestDispatcher).await }
+        });
+        // Until the fold is blocked on a lock in this bounded context.
+        let waiting = format!("%{}%", bc.name);
+        for attempt in 0.. {
+            let (blocked,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND query LIKE $1",
+            )
+            .bind(&waiting)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if blocked > 0 {
+                break;
+            }
+            assert!(attempt < 500, "the fold never waited on the promotion");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {schema}.projection_state WHERE projection_name = 'AccountBalance'"
+        )))
+        .execute(&mut *promotion)
+        .await
+        .expect("the promotion's delete deadlocked");
+        promotion.commit().await.unwrap();
+        fold.await.unwrap().expect("the fold deadlocked");
+
+        let projection = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.caught_up_to, Some(second));
+    });
+}

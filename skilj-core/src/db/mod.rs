@@ -3360,9 +3360,12 @@ pub async fn resolve_encryption_keys(
 /// deserves to know the server can't produce one, not silent ciphertext
 /// indistinguishable from "you're not authorised." A subject that *is*
 /// granted but has no active key (destroyed by `ForgetSubject`, or never
-/// provisioned) simply isn't inserted into `resolved` - `render_event`/
+/// provisioned) is recorded in `resolved` as `None` - `render_event`/
 /// `render_command`'s own `resolve_data_key` closure sees `None` for it,
-/// the correct crypto-shredding outcome, not an error.
+/// the correct crypto-shredding outcome, not an error. Recording the
+/// miss, rather than leaving the subject out, is what stops a forgotten
+/// subject shared across a page of events from being looked up again
+/// for every one of them.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn resolve_data_keys_for_reading(
     pool: &Pool,
@@ -3371,7 +3374,7 @@ pub async fn resolve_data_keys_for_reading(
     payload: &str,
     access_mapping: &crate::access_control::RoleAccessMapping,
     master_key: Option<&EncryptionMasterKey>,
-    resolved: &mut std::collections::HashMap<(String, String), DataKey>,
+    resolved: &mut std::collections::HashMap<(String, String), Option<DataKey>>,
 ) -> crate::error::Result<()> {
     let granted_subjects: Vec<(String, String)> =
         crate::event_store::sensitive_field_subjects(sensitive_fields, payload)
@@ -3388,17 +3391,15 @@ pub async fn resolve_data_keys_for_reading(
         if resolved.contains_key(&(subject_key.clone(), subject_value.clone())) {
             continue;
         }
-        if let Some(data_key) = get_active_data_key(
+        let data_key = get_active_data_key(
             pool,
             bounded_context,
             &subject_key,
             &subject_value,
             master_key,
         )
-        .await?
-        {
-            resolved.insert((subject_key, subject_value), data_key);
-        }
+        .await?;
+        resolved.insert((subject_key, subject_value), data_key);
     }
     Ok(())
 }
@@ -11081,6 +11082,26 @@ pub async fn catch_up_bounded_context(
         for projection in &unpartitioned_async_projections {
             if projection.caught_up_to.unwrap_or(-1) >= event.sequence {
                 continue;
+            }
+
+            // docs/architecture.md §156: the projection row is locked
+            // before any of its state rows, the order promotion
+            // (`promote_projection_rebuild`) takes them in. Taking the
+            // state rows first deadlocked against a concurrent promotion
+            // on another instance. Re-read under the lock, a projection
+            // already past `event`, turned sync or gone since the
+            // snapshot above is left alone.
+            let current: Option<(Option<i64>, bool)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT caught_up_to, sync FROM {schema}.projections \
+                     WHERE name = $1 FOR UPDATE"
+                )))
+                .bind(&projection.name)
+                .fetch_optional(&mut *tx)
+                .await?;
+            match current {
+                Some((caught_up_to, false)) if caught_up_to.unwrap_or(-1) < event.sequence => {}
+                _ => continue,
             }
 
             // `Some(vec![])`/`None` both mean zero instances touched -

@@ -673,7 +673,12 @@ async fn deliver_batch(
             event_store::deliver_to_subscriptions(
                 event,
                 std::slice::from_ref(current),
-                |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                |sk, sv| {
+                    data_keys
+                        .get(&(sk.to_string(), sv.to_string()))
+                        .cloned()
+                        .flatten()
+                },
                 &private_field_grants,
             )
         })

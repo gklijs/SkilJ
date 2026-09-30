@@ -2110,6 +2110,58 @@ fn list_active_data_keys_for_subject_value_errors_when_master_key_missing_but_a_
     });
 }
 
+/// A granted subject with no active key (forgotten) is recorded in the
+/// accumulator as a miss, so a page of events sharing that subject looks
+/// it up once rather than once per event.
+#[test]
+fn resolve_data_keys_for_reading_records_a_forgotten_subject_as_a_miss() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let role = seed_role(&pool, false).await;
+        let mapping = RoleAccessMapping {
+            can_read_sensitive: true,
+            ..seed_active_role_access_mapping(&pool, &role, &bc, AccessLevel::Read).await
+        };
+        let master = EncryptionMasterKey::from_bytes([9u8; 32]);
+        let sensitive_fields = [skilj_core::shared::SensitiveField {
+            field: "email".into(),
+            subject_key: "user".into(),
+            subject_field: "user_id".into(),
+        }];
+        db::get_or_create_encryption_key(&pool, &bc.name, "user", "kept", &master)
+            .await
+            .unwrap();
+        db::get_or_create_encryption_key(&pool, &bc.name, "user", "gone", &master)
+            .await
+            .unwrap();
+        db::destroy_encryption_key(&pool, &bc.name, "user", "gone", test_now())
+            .await
+            .unwrap();
+
+        let mut resolved = std::collections::HashMap::new();
+        for user_id in ["kept", "gone"] {
+            db::resolve_data_keys_for_reading(
+                &pool,
+                &bc.name,
+                &sensitive_fields,
+                &format!(r#"{{"user_id":"{user_id}","email":"x"}}"#),
+                &mapping,
+                Some(&master),
+                &mut resolved,
+            )
+            .await
+            .unwrap();
+        }
+
+        let entry = |v: &str| resolved.get(&("user".to_string(), v.to_string()));
+        assert!(matches!(entry("kept"), Some(Some(_))));
+        assert!(matches!(entry("gone"), Some(None)));
+    });
+}
+
 /// `schedule_position`/`last_fired_at` belong to the scheduler once a row
 /// exists. Re-registration (every instance re-registers every type at
 /// startup) builds its `EventType` from an unlocked read; if the scheduler

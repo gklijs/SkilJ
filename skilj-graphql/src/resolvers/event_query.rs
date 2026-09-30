@@ -147,7 +147,12 @@ pub fn query_events_field() -> Field {
                     after_sequence,
                     correlation_id.as_deref(),
                     &page,
-                    |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                    |sk, sv| {
+                        data_keys
+                            .get(&(sk.to_string(), sv.to_string()))
+                            .cloned()
+                            .flatten()
+                    },
                     &private_field_grants,
                     state.max_events_per_read,
                 )
@@ -333,7 +338,12 @@ pub fn inspect_event_field() -> Field {
             let inspected = skilj_core::event_store::inspect_event(
                 &access_mapping,
                 &event,
-                |sk, sv| data_keys.get(&(sk.to_string(), sv.to_string())).cloned(),
+                |sk, sv| {
+                    data_keys
+                        .get(&(sk.to_string(), sv.to_string()))
+                        .cloned()
+                        .flatten()
+                },
                 &private_field_grants,
             )
             .map_err(to_graphql_error)?;

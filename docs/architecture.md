@@ -10337,6 +10337,8 @@ Fix: the event-independent checks are their own functions in `event_store` - `ch
 
 Test: `a_refused_read_loads_no_events` (`skilj/tests/event_fetch_rest.rs`): with the bounded context's `events` table renamed away, a consume without a `mode`, reads with an invalid filter, and reads with a revoked token still get their own 400/403 - before the fix, the scan's failure (a 500) came first.
 
+The test runs on an embedded database of its own. On the shared one, the renamed table failed any other test's `Skilj::build()` that ran meanwhile: startup warms the event cache of every bounded context in the database, and this one's `events` was missing (`42P01`). About one run in four failed that way.
+
 ## 141. Event creation checks its `requires` before touching the database
 
 `rule CreateExternalEvent` lists every `requires` - token active, external creation allowed, bounded context active, payload valid, correlation ids valid, owner scope satisfied - ahead of the redelivery case. `db::create_and_insert_external_event` ran them last, inside the pure `create_external_event`, after three things that need the database:
@@ -10466,3 +10468,21 @@ Every event an `allEvents`/`eventsByType` subscription selected went through `de
 `deliver_batch` does that work once per batch: it keeps the events the subscription selects (§85's filter, still before any query), reads the grant and the private-field grants once, resolves the data keys for all of them into one map, and renders each. A batch is assembled and delivered in one step, so this is as fresh as the per-event reads were; a live event arriving on its own is a batch of one, unchanged. Revocation still closes the stream through the push path (`revocation_closes_connection`) and through this re-read.
 
 No new test: the change is in how often the same reads happen, and the embedded test database has no statement statistics to count them with. `skilj/tests/event_subscription.rs` (resume span, ordering, revocation, private fields) and `decrypt_on_read.rs` cover that the behaviour is unchanged.
+
+## 155. A forgotten subject's missing key is looked up once per page
+
+`db::resolve_data_keys_for_reading` accumulates the data keys a batch of events or commands needs, so a subject shared across a page resolves once. A granted subject with no active key - destroyed by `ForgetSubject`, or never provisioned - was left out of the map, so the next row about the same subject missed the map and queried `encryption_keys` again. A page of `queryEvents`, `commands`, or a subscription's resume span, all about one forgotten customer, cost a query per row.
+
+The map now holds `Option<DataKey>`, and a miss is recorded as `None`. The render closures read `get(..).cloned().flatten()`, so a forgotten subject still renders as ciphertext, as before. The map lives for one resolver call, like the hits it already cached, so a subject forgotten during a page is seen as forgotten from the next page on - the same freshness a hit already had.
+
+`skilj-core/tests/persistence.rs` `resolve_data_keys_for_reading_records_a_forgotten_subject_as_a_miss` checks that a kept subject is recorded as `Some` and a destroyed one as `None`.
+
+## 156. An async fold locks the projection row before its state rows
+
+`catch_up_bounded_context` folds each event into every unpartitioned async projection in one transaction per event. For each projection it locked and updated the state rows the event touches, and then advanced the `projections` row's `caught_up_to`. `promote_projection_rebuild` takes these locks in the opposite order: after the sequence lock it updates the `projections` row, and then deletes and replaces the live `projection_state` rows. The live projection keeps being folded while its rebuild builds. So one instance folding an event into it while another promoted the rebuild could each hold what the other needed. Postgres detected the deadlock and aborted one side, which the next tick retried: an error in the logs and a lost tick, but no wrong state.
+
+The fold now takes `SELECT caught_up_to, sync FROM projections WHERE name = $1 FOR UPDATE` before any state row, the same order promotion uses. It also re-reads under that lock what the tick's snapshot of the projection may have missed: a projection already past the event (another instance folded it, or a promotion just replaced it), one that promotion turned `sync`, or one that is gone is skipped. Two instances folding the same projection now wait on its row rather than on its state rows. They already serialized per event, so this costs nothing new. The sync insert path already takes the sequence lock first, as promotion does, so it could never interleave with promotion.
+
+The partitioned path (Codeberg issue #25) advances `caught_up_to` from a separate statement after its partition transactions commit, so it never holds a state row while waiting on the projection row. `create_projection` writes the projection row before folding history into state. Neither needed a change.
+
+`skilj-core/tests/async_projections.rs` `an_async_fold_never_deadlocks_against_a_promotion` holds the projection row in a transaction the way promotion does, waits (via `pg_stat_activity`) until the fold is blocked, then deletes the state rows. With the old order this fails with `40P01 deadlock detected`.
