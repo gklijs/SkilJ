@@ -131,7 +131,3 @@ root available; wherever the publish actually runs needs this too,
   `scripts/check-template.sh` builds it against the workspace instead, so
   an API change that breaks the template shows up before a release.) 0.0.8
   shipped with the template still on 0.0.7, where it didn't compile at all.
-- Move the relevant item(s) in `docs/open-source-todo.md` to its "Done"
-  section once the crates are live - in particular, switching
-  `templates/skilj-template/Cargo.toml` off its git dependency onto a
-  real version requirement only makes sense after this point.

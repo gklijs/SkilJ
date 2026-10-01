@@ -2363,10 +2363,6 @@ so what follows is a mapping, not a migration:
 
 Two other Rust event stores - Tephra and Disintegrate - already appear
 in DCB's own [implementation list](https://dcb.events/resources/libraries/)
-- worth knowing about as neighbors, not a comparison to relitigate here.
-Whether to list skilj there too is tracked separately in
-`docs/open-source-todo.md`, gated on this repository actually being
-public - a link to a private repo serves no one who'd read that list.
 
 ### 10.1 The query algebra is narrower than the spec's, deliberately
 
