@@ -101,7 +101,7 @@ members = [
 #                 skilj-core directly, same posture as skilj-inspector.
 
 [workspace.package]
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://codeberg.org/gklijs/SkilJ"
@@ -193,12 +193,12 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 opentelemetry-appender-tracing = "0.33"
 
 # Path dependencies between skilj's own crates
-skilj-core = { path = "skilj-core", version = "0.0.8" }
-skilj-graphql = { path = "skilj-graphql", version = "0.0.8" }
-skilj-macros = { path = "skilj-macros", version = "0.0.8" }
-skilj-rest = { path = "skilj-rest", version = "0.0.8" }
-skilj = { path = "skilj", version = "0.0.8" }
-skilj-codegen = { path = "skilj-codegen", version = "0.0.8" }
-skilj-test-fixture = { path = "skilj-test-fixture", version = "0.0.8" }
-skilj-retry = { path = "skilj-retry", version = "0.0.8" }
-skilj-bridge = { path = "skilj-bridge", version = "0.0.8" }
+skilj-core = { path = "skilj-core", version = "0.0.9" }
+skilj-graphql = { path = "skilj-graphql", version = "0.0.9" }
+skilj-macros = { path = "skilj-macros", version = "0.0.9" }
+skilj-rest = { path = "skilj-rest", version = "0.0.9" }
+skilj = { path = "skilj", version = "0.0.9" }
+skilj-codegen = { path = "skilj-codegen", version = "0.0.9" }
+skilj-test-fixture = { path = "skilj-test-fixture", version = "0.0.9" }
+skilj-retry = { path = "skilj-retry", version = "0.0.9" }
+skilj-bridge = { path = "skilj-bridge", version = "0.0.9" }

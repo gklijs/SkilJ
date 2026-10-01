@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: breaking changes may land in minor/patch versions until 1.0).
 
-## [Unreleased]
+## [0.0.9] - 2026-10-01
 
 ### Added
 
@@ -1328,7 +1328,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.8...HEAD
+[Unreleased]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.9...HEAD
+[0.0.9]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.8...v0.0.9
 [0.0.8]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.7...v0.0.8
 [0.0.7]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.6...v0.0.7
 [0.0.6]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.5...v0.0.6
