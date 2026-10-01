@@ -31,7 +31,8 @@ Not 15 separate per-crate edits - one field plus 9 matching version
 strings (`skilj-temporal`/`skilj-kafka`/`skilj-amqp`/`skilj-nats` have
 no internal dependents either - `skilj-retry` is a dependency of
 `skilj-core`/`skilj-bridge`/`skilj-kafka`/`skilj-amqp`/`skilj-nats`, and
-`skilj-bridge` of the three broker bridges, not the other way round -
+`skilj-bridge` of the three broker bridges and `skilj-temporal`, not the
+other way round -
 the same reason `skilj-tui`/`skilj-inspector` need no entry).
 
 ### Doing this with `cargo-release`
@@ -65,8 +66,9 @@ Derived from the real internal dependency graph:
 4. `skilj` (depends on `skilj-core`, `skilj-graphql`, `skilj-rest`,
    `skilj-macros`)
 5. `skilj-tui` (zero internal deps), `skilj-inspector` (depends on
-   `skilj-core` only), `skilj-temporal` (zero internal deps - it speaks
-   only skilj's wire protocol, the same posture as `skilj-tui`),
+   `skilj-core` only), `skilj-temporal` (depends on `skilj-retry` and
+   `skilj-bridge` - it speaks only skilj's wire protocol, the same posture
+   as `skilj-tui`),
    `skilj-kafka`/`skilj-amqp`/`skilj-nats` (depend on `skilj-retry` and
    `skilj-bridge`, already published, plus skilj's wire protocol - the same
    posture as `skilj-temporal` otherwise) - independent of each other

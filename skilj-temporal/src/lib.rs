@@ -50,6 +50,9 @@ use temporalio_client::{
 use temporalio_common::data_converters::{PayloadConverter, RawValue};
 use temporalio_common::UntypedWorkflow;
 
+// docs/architecture.md §165: the skilj side the bridges share.
+pub use skilj_bridge::{http_client, HTTP_REQUEST_TIMEOUT};
+
 /// One skilj `EventType`'s own mapping to a Temporal action.
 pub struct EventTypeMapping {
     /// The `EventType::NAME` this mapping applies to.
@@ -97,19 +100,22 @@ pub struct Tag {
     pub value: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConsumeResponse {
-    events: Vec<ConsumedEvent>,
-    /// The `EventReadToken`'s own scoped event type, echoed back by
-    /// skilj on every response (`docs/rest-event-reading.md`'s own
-    /// wire contract) - checked in `poll_once` against
-    /// `EventTypeMapping::event_type`, since a copy-paste mismatch
-    /// between a mapping and the credential it was actually given would
-    /// otherwise silently apply the wrong `MappingAction`/
-    /// `correlation_tag_key` to whatever events the credential really
-    /// serves, with no diagnostic at all.
-    event_type_name: String,
+impl From<skilj_bridge::ConsumedEvent> for ConsumedEvent {
+    fn from(event: skilj_bridge::ConsumedEvent) -> Self {
+        ConsumedEvent {
+            sequence: event.sequence,
+            event_type: event.event_type,
+            payload: event.payload,
+            tags: event
+                .tags
+                .into_iter()
+                .map(|tag| Tag {
+                    key: tag.key,
+                    value: tag.value,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The fixed correlation convention ([docs/architecture.md §34](../../docs/architecture.md#skilj-temporal-plan)):
@@ -172,6 +178,20 @@ pub enum BridgeError {
          to \"{actual}\" - wrong token for this mapping"
     )]
     EventTypeMismatch { declared: String, actual: String },
+}
+
+impl From<skilj_bridge::SkiljError> for BridgeError {
+    fn from(error: skilj_bridge::SkiljError) -> Self {
+        match error {
+            skilj_bridge::SkiljError::Http(e) => BridgeError::Skilj(e),
+            skilj_bridge::SkiljError::SkiljStatus { status, body } => {
+                BridgeError::SkiljStatus { status, body }
+            }
+            skilj_bridge::SkiljError::EventTypeMismatch { declared, actual } => {
+                BridgeError::EventTypeMismatch { declared, actual }
+            }
+        }
+    }
 }
 
 /// Dispatches one mapped event to Temporal - the one place `MappingAction`
@@ -321,24 +341,14 @@ async fn poll_with_pending(
     mut retry: Option<(&skilj_retry::RetryPolicy, &mut Option<HeadRetryState>)>,
 ) -> Result<usize, BridgeError> {
     if pending.is_empty() {
-        let response = http
-            .get(format!("{skilj_base_url}/v1/events/consume?mode=manual"))
-            .bearer_auth(&mapping.credential)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(BridgeError::SkiljStatus { status, body });
-        }
-        let consumed: ConsumeResponse = response.json().await?;
-        if consumed.event_type_name != mapping.event_type {
-            return Err(BridgeError::EventTypeMismatch {
-                declared: mapping.event_type.clone(),
-                actual: consumed.event_type_name,
-            });
-        }
-        pending.extend(consumed.events);
+        let consumed = skilj_bridge::consume(
+            http,
+            skilj_base_url,
+            &mapping.credential,
+            &mapping.event_type,
+        )
+        .await?;
+        pending.extend(consumed.events.into_iter().map(ConsumedEvent::from));
     }
 
     let mut worked_through = 0;
@@ -404,17 +414,7 @@ async fn poll_with_pending(
                 );
             }
         }
-        let ack = http
-            .post(format!("{skilj_base_url}/v1/events/consume/ack"))
-            .bearer_auth(&mapping.credential)
-            .json(&serde_json::json!({ "sequence": event.sequence }))
-            .send()
-            .await?;
-        if !ack.status().is_success() {
-            let status = ack.status();
-            let body = ack.text().await.unwrap_or_default();
-            return Err(BridgeError::SkiljStatus { status, body });
-        }
+        skilj_bridge::ack(http, skilj_base_url, &mapping.credential, event.sequence).await?;
         pending.pop_front();
         worked_through += 1;
     }
@@ -647,57 +647,5 @@ mod tests {
         let a = signal_request_id("orders", "PaymentConfirmed", 42);
         let b = signal_request_id("orders", "PaymentConfirmed", 43);
         assert_ne!(a, b);
-    }
-}
-
-/// How long one HTTP request to skilj may take, end to end, before it
-/// fails and the loop's own retry handling takes over. Without a bound, a
-/// request stuck on a half-open connection (a network partition, a
-/// stalled proxy) stalled the loop forever with nothing logged
-/// (docs/architecture.md §82). Retrying after a timeout is safe: inbound
-/// requests carry an idempotency key or dedupe cursor, and an outbound
-/// consume's checkout lease covers one that was served but never answered.
-pub const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The `reqwest::Client` this crate's own loops use: bounded by
-/// [`HTTP_REQUEST_TIMEOUT`] and a 10-second connect timeout. Pass it to
-/// `run_inbound` too, unless the caller's own client is bounded already.
-pub fn http_client() -> reqwest::Client {
-    http_client_with_timeout(HTTP_REQUEST_TIMEOUT)
-}
-
-fn http_client_with_timeout(timeout: std::time::Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(std::time::Duration::from_secs(10).min(timeout))
-        .build()
-        .expect("a client with only timeouts configured always builds")
-}
-
-#[cfg(test)]
-mod http_client_tests {
-    /// A server that accepts the connection and never answers must fail
-    /// the request within the timeout, not hang the loop (§82).
-    #[tokio::test]
-    async fn a_stalled_skilj_fails_the_request_instead_of_hanging() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                held.push(socket);
-            }
-        });
-        let client = super::http_client_with_timeout(std::time::Duration::from_millis(200));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client
-                .get(format!("http://{addr}/v1/events/consume"))
-                .send(),
-        )
-        .await
-        .expect("the request hung past its own timeout");
-        assert!(result.unwrap_err().is_timeout());
     }
 }

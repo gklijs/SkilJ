@@ -50,12 +50,14 @@ pub struct ConsumedEvent {
     pub event_type: String,
     pub payload: serde_json::Value,
     pub tags: Vec<Tag>,
+    /// Defaults to no ids when a response leaves it out.
+    #[serde(default)]
     pub metadata: ConsumedEventMetadata,
 }
 
 /// The subset of `EventDto.metadata`'s wire shape the bridges need - the
 /// two Codeberg-issue-#18 ids, forwarded onto an outbound message.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumedEventMetadata {
     pub correlation_id: Option<String>,
