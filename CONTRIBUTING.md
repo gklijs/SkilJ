@@ -70,9 +70,13 @@ setting it. Confirmed by testing, not assumed: a full real-Kafka
 integration test (produce, consume, assert the payload round-trips)
 compiled and ran clean with only this env var set.
 
-`skilj-kafka`'s own real-Kafka tests (`skilj-kafka/tests/`) need a
-reachable Docker daemon (`testcontainers-modules`' `kafka` feature - a
-real, ephemeral, KRaft-mode Kafka container, no ZooKeeper). On WSL with
+`skilj-kafka`, `skilj-amqp`, `skilj-nats`, and `skilj-temporal`'s real-
+broker tests (`skilj-kafka/tests/`, `skilj-amqp/tests/`,
+`skilj-nats/tests/`, `skilj-temporal/tests/`) each need a reachable Docker
+daemon (`testcontainers-modules` or `testcontainers` spinning up real,
+ephemeral Kafka/Artemis/NATS containers, and `skilj-temporal` downloads a
+small ephemeral Temporal server binary on first run, cached under
+`~/.cache/skilj-temporal-test-server` for 15 days). On WSL with
 Docker Desktop, the `docker` CLI on `PATH` may be a wrapper script that
 hardcodes a stale `DOCKER_HOST` (observed pointing at a
 `docker-desktop-bind-mounts` socket path that no longer exists) -
@@ -83,6 +87,19 @@ once unset). A known environment quirk, not a code problem - these
 tests skip gracefully (the same `skipping:` tolerance every other
 real-dependency test in this codebase already has) if Docker still
 can't be reached after that.
+
+To run just the broker bridge test suites locally (with Docker
+available), after applying the `unset DOCKER_HOST` workaround on WSL:
+
+```sh
+cargo test -p skilj-kafka -p skilj-amqp -p skilj-nats -p skilj-temporal
+```
+
+CI does not run these (see `.woodpecker.yml`'s `build-clippy-test`
+step: the `rust:1-bookworm` image has no Docker daemon), so they
+always skip in the pipeline - run them by hand before merging changes
+that touch any bridge crate. `skilj-temporal`'s own ephemeral-server
+download also needs outbound network access on first run.
 
 The embedded Postgres a test binary starts (via `skilj-test-support`),
 and the Kafka/Artemis/NATS containers the bridge crates' tests start,
