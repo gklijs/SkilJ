@@ -198,7 +198,7 @@ pub(crate) fn acquire_subscription_slot(
     };
     connection
         .0
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |running| {
             (running < max).then_some(running + 1)
         })
         .map_err(|running| {
