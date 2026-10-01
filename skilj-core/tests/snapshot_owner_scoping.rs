@@ -126,31 +126,16 @@ async fn test_pool() -> Option<Pool> {
 }
 
 async fn provision() -> Option<TestDb> {
-    if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        let pool = match db::connect(&database_url).await {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("skipping: DATABASE_URL is set but connecting failed: {e}");
-                return None;
-            }
-        };
-        if let Err(e) = db::migrate(&pool).await {
-            eprintln!("skipping: DATABASE_URL migration failed: {e}");
-            return None;
-        }
-        return Some(TestDb { pool });
-    }
-
     let url = skilj_test_support::database_url("skilj_snapshot_owner_scoping_test").await?;
     let pool = match db::connect(&url).await {
         Ok(pool) => pool,
         Err(e) => {
-            eprintln!("skipping: connecting to embedded PostgreSQL failed: {e}");
+            eprintln!("skipping: connecting to the test database failed: {e}");
             return None;
         }
     };
     if let Err(e) = db::migrate(&pool).await {
-        eprintln!("skipping: migrating embedded PostgreSQL failed: {e}");
+        eprintln!("skipping: migrating the test database failed: {e}");
         return None;
     }
     Some(TestDb { pool })

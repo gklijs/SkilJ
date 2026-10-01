@@ -19,10 +19,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 async fn test_pool() -> Option<Pool> {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => skilj_test_support::database_url("skilj_cross_instance_listener_test").await?,
-    };
+    let database_url =
+        skilj_test_support::database_url("skilj_cross_instance_listener_test").await?;
     let pool = match db::connect(&database_url).await {
         Ok(pool) => pool,
         Err(e) => {

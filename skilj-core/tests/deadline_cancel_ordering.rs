@@ -31,12 +31,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 async fn test_pool() -> Option<Pool> {
     TEST_DB
         .get_or_init(|| async {
-            let url = match std::env::var("DATABASE_URL") {
-                Ok(url) => url,
-                Err(_) => {
-                    skilj_test_support::database_url("skilj_deadline_cancel_ordering_test").await?
-                }
-            };
+            let url =
+                skilj_test_support::database_url("skilj_deadline_cancel_ordering_test").await?;
             let pool = db::connect(&url).await.ok()?;
             db::migrate(&pool).await.ok()?;
             Some(TestDb { pool })

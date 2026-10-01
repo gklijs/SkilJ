@@ -22,21 +22,36 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
 }
 
+/// This binary's one database, provisioned once per process.
+///
+/// The `OnceCell` matters more here than in the other test files: `test_database`
+/// is called by every test, and `database_url` drops and recreates its
+/// database on each call. Called per test it would wipe the database
+/// between them, and - because the tests take the `SERIAL` lock *after*
+/// this returns - concurrently mid-test.
+static TEST_DB: tokio::sync::OnceCell<Option<(String, Pool)>> = tokio::sync::OnceCell::const_new();
+
 async fn test_database() -> Option<(String, Pool)> {
-    let url =
-        skilj_test_support::embedded_database_url("skilj_startup_bounded_contexts_test").await?;
-    let pool = match db::connect(&url).await {
-        Ok(pool) => pool,
-        Err(e) => {
-            eprintln!("skipping: connecting to PostgreSQL failed: {e}");
-            return None;
-        }
-    };
-    if let Err(e) = db::migrate(&pool).await {
-        eprintln!("skipping: migrating PostgreSQL failed: {e}");
-        return None;
-    }
-    Some((url, pool))
+    TEST_DB
+        .get_or_init(|| async {
+            let url =
+                skilj_test_support::database_url("skilj_startup_bounded_contexts_test").await?;
+            let pool = match db::connect(&url).await {
+                Ok(pool) => pool,
+                Err(e) => {
+                    eprintln!("skipping: connecting to PostgreSQL failed: {e}");
+                    return None;
+                }
+            };
+            if let Err(e) = db::migrate(&pool).await {
+                eprintln!("skipping: migrating PostgreSQL failed: {e}");
+                return None;
+            }
+            Some((url, pool))
+        })
+        .await
+        .as_ref()
+        .map(|(url, pool)| (url.clone(), pool.clone()))
 }
 
 /// One test at a time: another test's startup would otherwise be what

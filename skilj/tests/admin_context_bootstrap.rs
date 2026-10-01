@@ -54,15 +54,10 @@ async fn connect_and_migrate(database_url: &str, label: &str) -> Option<()> {
 }
 
 async fn provision() -> Option<TestDb> {
-    let database_url = if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        database_url
-    } else {
-        let url = skilj_test_support::database_url("skilj_admin_context_bootstrap_test").await?;
-        connect_and_migrate(&url, "embedded PostgreSQL").await?;
-        return Some(TestDb { database_url: url });
-    };
+    let database_url =
+        skilj_test_support::database_url("skilj_admin_context_bootstrap_test").await?;
 
-    connect_and_migrate(&database_url, "DATABASE_URL").await?;
+    connect_and_migrate(&database_url, "the test database").await?;
     Some(TestDb { database_url })
 }
 
@@ -119,19 +114,21 @@ fn build_stamps_the_admin_context_once_and_never_restamps_it() {
 #[test]
 fn two_concurrent_builds_against_a_fresh_database_both_succeed() {
     runtime().block_on(async {
-        // Deliberately not `test_db()`'s own shared database, and always
-        // embedded Postgres regardless of `DATABASE_URL` (unlike every
+        // Deliberately not `test_db()`'s own shared database, and a
+        // database of its own regardless of `DATABASE_URL` (unlike every
         // other test here) - this test needs a database nothing has
         // touched yet, so the race is between these two builds
         // specifically, not resolved by an earlier test in this binary
         // (or a shared `DATABASE_URL` database from a prior run) having
         // already stamped `admin`.
         let Some(database_url) =
-            skilj_test_support::embedded_database_url("skilj_admin_context_race_test").await
+            skilj_test_support::database_url("skilj_admin_context_race_test").await
         else {
             return;
         };
-        let Some(()) = connect_and_migrate(&database_url, "embedded PostgreSQL").await else {
+        let Some(()) =
+            connect_and_migrate(&database_url, "the exclusive PostgreSQL database").await
+        else {
             return;
         };
         let pool = db::connect(&database_url).await.unwrap();

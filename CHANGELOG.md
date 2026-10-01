@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: breaking changes may land in minor/patch versions until 1.0).
 
+## [Unreleased]
+
+### Fixed
+
+- Two projections whose generated GraphQL type names collide
+  (`{a_b}` + `c` against `{a}` + `b_c`, or a nested `{parent}_{field}`
+  against another top-level name) are now resolved the same way on every
+  schema build, in every process. The winner was decided by
+  `HashMap` iteration order over bounded contexts, so it could differ
+  between runs - and change between two builds in one run, which meant a
+  caller could be served one projection and, after an unrelated
+  registration change, be served the other. `list_bounded_contexts` and
+  `list_projections_for_bounded_context` now return name order
+  (docs/architecture.md §168).
+
 ## [0.0.9] - 2026-10-01
 
 ### Added

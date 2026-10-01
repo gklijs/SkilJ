@@ -96,15 +96,16 @@ async fn check_reachable(database_url: &str, label: &str) -> bool {
     }
 }
 
+/// This whole binary asks for a database dropped and recreated on
+/// provisioning, which every `database_url` call now does: the lifecycle
+/// test below asserts a `Skilj` built here still has a bootstrap secret,
+/// which is only true while no superadmin Role exists anywhere in the
+/// database - and the second test builds its own `Skilj` against the
+/// same one. Its name is the binary's own, so nothing outside this file
+/// can be holding it open.
 async fn provision() -> Option<TestDb> {
-    if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        return check_reachable(&database_url, "DATABASE_URL")
-            .await
-            .then_some(TestDb { database_url });
-    }
-
     let url = skilj_test_support::database_url("skilj_graphql_admin_console_test").await?;
-    if !check_reachable(&url, "embedded PostgreSQL").await {
+    if !check_reachable(&url, "the test database").await {
         return None;
     }
     Some(TestDb { database_url: url })

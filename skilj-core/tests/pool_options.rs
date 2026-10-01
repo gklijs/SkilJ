@@ -36,11 +36,7 @@ async fn test_database_url() -> Option<String> {
 }
 
 async fn provision() -> Option<TestDb> {
-    if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        return Some(TestDb { database_url });
-    }
-    let url = skilj_test_support::database_url("skilj_pool_options_test").await?;
-    let database_url = url;
+    let database_url = skilj_test_support::database_url("skilj_pool_options_test").await?;
     Some(TestDb { database_url })
 }
 

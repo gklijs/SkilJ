@@ -142,31 +142,16 @@ async fn provision() -> Option<TestDb> {
     // artificially small pool rather than exercising real concurrency.
     let pool_options = db::PgPoolOptions::new().max_connections(50);
 
-    if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        let pool = match db::connect_with(&database_url, pool_options).await {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("skipping: DATABASE_URL is set but connecting failed: {e}");
-                return None;
-            }
-        };
-        if let Err(e) = db::migrate(&pool).await {
-            eprintln!("skipping: DATABASE_URL migration failed: {e}");
-            return None;
-        }
-        return Some(TestDb { pool });
-    }
-
     let url = skilj_test_support::database_url("skilj_command_batcher_test").await?;
     let pool = match db::connect_with(&url, pool_options).await {
         Ok(pool) => pool,
         Err(e) => {
-            eprintln!("skipping: connecting to embedded PostgreSQL failed: {e}");
+            eprintln!("skipping: connecting to the test database failed: {e}");
             return None;
         }
     };
     if let Err(e) = db::migrate(&pool).await {
-        eprintln!("skipping: migrating embedded PostgreSQL failed: {e}");
+        eprintln!("skipping: migrating the test database failed: {e}");
         return None;
     }
     Some(TestDb { pool })

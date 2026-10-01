@@ -18,10 +18,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 async fn test_database() -> Option<(String, Pool)> {
-    let url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => skilj_test_support::database_url("skilj_superadmin_bootstrap_test").await?,
-    };
+    let url = skilj_test_support::database_url("skilj_superadmin_bootstrap_test").await?;
     let pool = match db::connect(&url).await {
         Ok(pool) => pool,
         Err(e) => {

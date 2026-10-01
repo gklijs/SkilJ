@@ -83,15 +83,9 @@ async fn connect_and_migrate(database_url: &str, label: &str) -> Option<()> {
 }
 
 async fn provision() -> Option<TestDb> {
-    let database_url = if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        database_url
-    } else {
-        let url = skilj_test_support::database_url("skilj_event_fetch_rest_test").await?;
-        connect_and_migrate(&url, "embedded PostgreSQL").await?;
-        return Some(TestDb { database_url: url });
-    };
+    let database_url = skilj_test_support::database_url("skilj_event_fetch_rest_test").await?;
 
-    connect_and_migrate(&database_url, "DATABASE_URL").await?;
+    connect_and_migrate(&database_url, "the test database").await?;
     Some(TestDb { database_url })
 }
 
@@ -1482,11 +1476,11 @@ fn a_refused_read_loads_no_events() {
         // otherwise fail any other test's `build()` meanwhile, which warms
         // every bounded context's event cache.
         let Some(database_url) =
-            skilj_test_support::embedded_database_url("skilj_event_fetch_rest_refused_read").await
+            skilj_test_support::database_url("skilj_event_fetch_rest_refused_read").await
         else {
             return;
         };
-        if connect_and_migrate(&database_url, "embedded PostgreSQL")
+        if connect_and_migrate(&database_url, "the exclusive PostgreSQL database")
             .await
             .is_none()
         {

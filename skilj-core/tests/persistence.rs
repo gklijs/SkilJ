@@ -85,31 +85,16 @@ async fn test_pool() -> Option<Pool> {
 }
 
 async fn provision() -> Option<TestDb> {
-    if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        let pool = match db::connect(&database_url).await {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("skipping: DATABASE_URL is set but connecting failed: {e}");
-                return None;
-            }
-        };
-        if let Err(e) = db::migrate(&pool).await {
-            eprintln!("skipping: DATABASE_URL migration failed: {e}");
-            return None;
-        }
-        return Some(TestDb { pool });
-    }
-
     let url = skilj_test_support::database_url("skilj_test").await?;
     let pool = match db::connect(&url).await {
         Ok(pool) => pool,
         Err(e) => {
-            eprintln!("skipping: connecting to embedded PostgreSQL failed: {e}");
+            eprintln!("skipping: connecting to the test database failed: {e}");
             return None;
         }
     };
     if let Err(e) = db::migrate(&pool).await {
-        eprintln!("skipping: migrating embedded PostgreSQL failed: {e}");
+        eprintln!("skipping: migrating the test database failed: {e}");
         return None;
     }
     Some(TestDb { pool })
@@ -293,6 +278,52 @@ fn list_bounded_contexts_includes_every_inserted_context() {
 
         assert!(listed.contains(&bc_a));
         assert!(listed.contains(&bc_b));
+    });
+}
+
+/// The order `list_bounded_contexts` returns is part of its contract, and
+/// it is a caller-visible one: `skilj-graphql`'s schema build walks these
+/// contexts in order and resolves generated type-name collisions
+/// first-wins, so an unordered return let *which* of two colliding
+/// projections a caller is served depend on a `HashMap`'s per-process
+/// hash seed - and change between two schema builds in one run. This
+/// asserts the order rather than the reasoning, because the order is the
+/// only part a caller can rely on.
+#[test]
+fn list_bounded_contexts_returns_them_in_name_order() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        // Inserted in an order no name ordering agrees with, and named so
+        // that sorted order is neither insertion nor reverse order.
+        for name in ["zz_first", "aa_last", "mm_middle"] {
+            db::insert_bounded_context(
+                &pool,
+                &BoundedContext {
+                    name: name.to_string(),
+                    status: BoundedContextStatus::Active,
+                    created_at: test_now(),
+                    created_by: ContextCreator::SystemCreator,
+                    template: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Repeated, because the failure mode this pins down was a random
+        // seed: one call in one process cannot tell sorted from lucky.
+        for _ in 0..8 {
+            let listed = db::list_bounded_contexts(&pool).await.unwrap();
+            let names: Vec<&str> = listed.iter().map(|bc| bc.name.as_str()).collect();
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                names, sorted,
+                "list_bounded_contexts must return name order"
+            );
+        }
     });
 }
 

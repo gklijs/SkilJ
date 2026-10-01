@@ -9,4 +9,5 @@ publish = false
 
 [dependencies]
 postgresql_embedded = "0.21.0"
+sqlx.workspace = true
 tokio.workspace = true

@@ -97,14 +97,8 @@ async fn check_reachable(database_url: &str, label: &str) -> bool {
 }
 
 async fn provision() -> Option<TestDb> {
-    if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        return check_reachable(&database_url, "DATABASE_URL")
-            .await
-            .then_some(TestDb { database_url });
-    }
-
     let url = skilj_test_support::database_url("skilj_graphql_type_registration_test").await?;
-    if !check_reachable(&url, "embedded PostgreSQL").await {
+    if !check_reachable(&url, "the test database").await {
         return None;
     }
     Some(TestDb { database_url: url })

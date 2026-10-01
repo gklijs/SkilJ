@@ -160,18 +160,9 @@ async fn test_db() -> Option<(String, Pool)> {
 }
 
 async fn provision() -> Option<TestDb> {
-    let database_url = if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        database_url
-    } else {
-        let url = skilj_test_support::database_url("skilj_reconciliation_test").await?;
-        let pool = connect_and_migrate(&url, "embedded PostgreSQL").await?;
-        return Some(TestDb {
-            database_url: url,
-            pool,
-        });
-    };
+    let database_url = skilj_test_support::database_url("skilj_reconciliation_test").await?;
 
-    let pool = connect_and_migrate(&database_url, "DATABASE_URL").await?;
+    let pool = connect_and_migrate(&database_url, "the test database").await?;
     Some(TestDb { database_url, pool })
 }
 

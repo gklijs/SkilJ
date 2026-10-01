@@ -2778,11 +2778,25 @@ pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<Boun
         contexts_by_name.get_mut(&name).unwrap().template = Some(Box::new(template));
     }
 
-    // Order isn't part of this function's contract (see callers - a
-    // `HashMap`-keyed round trip like this one loses whatever order the
-    // query returned), matching `list_roles`/`list_role_access_mappings`'s
-    // own unordered `Vec` return.
-    Ok(contexts_by_name.into_values().collect())
+    // Name order, deliberately, and the reason is a caller-visible
+    // decision rather than tidiness: `skilj-graphql`'s schema build walks
+    // these contexts in order and resolves generated type-name collisions
+    // first-wins, so which of two colliding projections is served is
+    // whatever order it walks them in. `HashMap::into_values()` is
+    // `RandomState` order - per-thread, and re-seeded per process - so the
+    // winner could change between two schema builds in one run, and a
+    // caller could be served one projection and then, after an unrelated
+    // registration change, be served the other. Observed in CI as
+    // `colliding_projection_type_names_serve_one_and_refuse_the_other`
+    // failing with *both* colliding projections served
+    // (skilj/tests/projection_query.rs:1760), which is what a mid-test
+    // rebuild that re-decided the collision looks like.
+    //
+    // So this order is now part of the function's contract, unlike
+    // `list_roles`/`list_role_access_mappings`'s unordered `Vec` return.
+    let mut contexts: Vec<BoundedContext> = contexts_by_name.into_values().collect();
+    contexts.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(contexts)
 }
 
 /// Ultra-review bug_005's own fix - see migration `0003_add_bounded_
@@ -4882,6 +4896,16 @@ pub async fn list_projections_for_bounded_context(
             caught_up_to: row.caught_up_to,
         });
     }
+    // Name order, and part of the contract for the same reason
+    // `list_bounded_contexts`'s is: `skilj-graphql`'s schema build walks
+    // these in order and resolves generated type-name collisions
+    // first-wins, so whichever projection survives a collision is decided
+    // by the order it walks them in. Two contexts colliding needs names
+    // like `a_b` + `c` against `a` + `b_c`, but one bounded context can
+    // collide with itself too - a nested `{parent}_{field}` type name can
+    // equal another of its own top-level names - and then the row order
+    // Postgres happens to return is what decides it.
+    projections.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(projections)
 }
 

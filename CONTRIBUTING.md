@@ -13,8 +13,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo fmt --check
 ```
 
-Some integration tests spin up a real, embedded Postgres via
-`postgresql_embedded`. On some Linux setups (observed on WSL after a
+Without `DATABASE_URL` set, integration tests spin up a real, embedded
+Postgres via `postgresql_embedded`. On some Linux setups (observed on WSL after a
 distro package upgrade) the cached `postgres` binary was built against
 an older libxml2 ABI (`libxml2.so.2`) than the one the system now
 provides (e.g. `libxml2.so.16`), and fails to start with `error while
@@ -27,6 +27,46 @@ it (a JetBrains IDE's bundled LLDB often ships one, e.g. under
 `~/.cache/JetBrains/*/bin/lldb/linux/x64/lib`; `find / -iname
 'libxml2.so.2*' 2>/dev/null` locates one) - this is a known environment
 quirk, not a code problem, and not specific to this project.
+
+Setting `DATABASE_URL` to a Postgres you run yourself sidesteps all of
+it: no embedded server is started, so nothing depends on that binary or
+its libraries. What `DATABASE_URL` then supplies is the *server* - host,
+port, credentials - not the database: each test binary drops and
+recreates a named database of its own on that server (docs/architecture.md
+§167), so the role behind `DATABASE_URL` needs `CREATEDB` and, if a
+previous run was killed rather than exited and left sessions attached,
+enough privilege to terminate them. Locally a real Postgres is
+preferable anyway: an embedded server is downloaded and `initdb`'d on
+first use, where a local Postgres is already there. CI sets it for the
+same reason, to a `services:` container in `.woodpecker.yml`
+(docs/architecture.md §166).
+
+CI's database setup and test run live in `scripts/ci-test.sh` rather
+than inline in `.woodpecker.yml`, and `bash scripts/ci-test.sh`
+reproduces them by hand. It prefers the pipeline's `services:`
+container, and falls back to a Postgres started inside the step's own
+container (`scripts/ci-postgres-local.sh`) when the service doesn't
+answer - so a database that isn't there is a loud `[ci-test] WARNING` in
+the step's output rather than a red build, and the tests still run
+against something real. `scripts/ci-wait-for-postgres.sh` is the
+poller, and on failure prints what the step can see (name resolution,
+hosts file, routes, a raw `/dev/tcp` connect, psql's own error); the
+service's logs are not in the step's output, so that is the whole of
+what there is to go on.
+
+Two CI-config facts worth knowing before editing `.woodpecker.yml`:
+
+- **`services:` is a workflow-level key, not a step-level one.** Drone's
+  shape put it under the step; Woodpecker's schema has it at the top
+  level, and a step object has no such property. Getting that wrong is
+  what made five CI runs chase a Postgres that was never started - see
+  docs/architecture.md §166.
+- **Woodpecker's own linter reports schema problems without failing the
+  pipeline.** `scripts/check-woodpecker-config.sh` (a CI step) validates
+  the file against that same schema and *does* fail the build, so a key
+  that would only warn cannot cost a run. It needs `python3-yaml` and
+  `python3-jsonschema`, and network access for the schema fetch;
+  `WOODPECKER_SCHEMA_URL` pins a specific version.
 
 Building `skilj-temporal` ([docs/architecture.md §34](docs/architecture.md#skilj-temporal-plan)) no longer needs a
 system `protoc` binary: `temporalio-client`/`temporalio-common` 1.0.0
@@ -115,7 +155,7 @@ before this fix, or from a VM crash that took the watchdog down too -
 servers (`kill` their `postgres -D /tmp/.tmp...` postmaster), then
 `rm -rf /tmp/.tmp*` and `docker rm -f` the containers. Setting
 `DATABASE_URL` to one Postgres you run yourself avoids embedded servers
-entirely.
+entirely, so does CI.
 
 A separate, easier-to-miss disk-space issue: `target/` lives on the
 *real* root filesystem, not `/tmp`, and a long session doing many full
