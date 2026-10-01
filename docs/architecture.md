@@ -100,6 +100,58 @@ listed separately here; see that section itself for its own structure.
 - [45. A given/when/then test fixture for decide()/project() (Codeberg issue #19)](#given-when-then-test-fixture)
 - [46. A native one-shot, per-entity deadline/timer (Codeberg issue #20)](#native-deadlines)
 - [47. Dead-letter/parking for failed event/message handler delivery (Codeberg issue #21)](#parked-deliveries)
+- [48. Investigation: atomic transactions spanning multiple command types (Codeberg issue #22)](#atomic-transactions-multiple-commands)
+- [49. A GraphQL subscription for Projections: `projectionUpdates` (Codeberg issue #23)](#projection-subscription)
+- [50. Investigation: segmented/parallel event processing for horizontal scale-out (Codeberg issue #25)](#segmented-parallel-investigation)
+- [51. Segmented/parallel event processing, built (Codeberg issue #25, part two)](#segmented-parallel-built)
+- [52. Scoping parallelism beyond Projection catch-up, and building the Snapshot half](#parallelism-scoping-snapshot)
+- [53. Closing the Kafka/AMQP/NATS bridges' double-publish gap: `ReadCursor.checked_out_at`](#bridge-double-publish-gap)
+- [54. Bridge partitioning: skilj-kafka/skilj-amqp/skilj-nats, on top of §53](#bridge-partitioning)
+- [55. Closing the `CancelDeadline` fire-vs-cancel race](#cancel-deadline-race)
+- [56. Closing the parked-delivery duplication race in `catch_up_cross_context_route`](#parked-delivery-duplication-race)
+- [57. Shortening `submit_command`'s own lock hold (Codeberg issue #32)](#submit-command-lock-hold)
+- [58. Group-commit batching for `submit_command` (Codeberg issue #32, round two)](#group-commit-batching)
+- [59. Fixing §58's own permanent-hang regression, and closing the cross-instance routing investigation alongside it (Codeberg issues #36, #35)](#group-commit-hang-regression)
+- [60. Shrinking a batch's own per-command round trips further (Codeberg issue #32, round three)](#batch-round-trips)
+- [61. Closing §60's own measurement gap, a real load-test surprise about `skilj-helpdesk`'s own tenancy shape, and one more round-trip cut (Codeberg issue #32, round four)](#batch-measurement-gap)
+- [62. Finding and fixing the real ceiling: a redispatch check's own row-materialization cost (Codeberg issue #32, round four, continued)](#batch-redispatch-ceiling)
+- [63. Code-review fixes for the group-commit batcher (post-0.0.7 review)](#group-commit-review-fixes)
+- [64. Hardening `POST /v1/parked-deliveries` (§47 follow-up)](#parked-deliveries-hardening)
+- [65. Two concurrency bugs: JWKS cold-cache 401s and double-redriven parked deliveries](#jwks-cold-cache-double-redrive)
+- [66. Test harness: the embedded Postgres (and broker containers) never stopped](#test-harness-cleanup)
+- [67. CI's silent-skip guard never fired](#ci-silent-skip-guard)
+- [68. Colliding or invalid projection type names in `ProjectionQuery`](#projection-type-collision)
+- [69. Bounded event reads (`config.max_events_per_read`)](#bounded-event-reads)
+- [70. Bounded, pageable `fetchCommands`](#pageable-fetch-commands)
+- [71. No request or background path loads a whole history any more](#bounded-history-reads)
+- [72. Per-request bounds on `/graphql`](#graphql-body-cap)
+- [73. The websocket endpoint shares the body cap](#websocket-body-cap)
+- [74. Subscriptions per websocket connection](#subscriptions-per-websocket)
+- [75. Acknowledgements serialized with consume](#acknowledgements-serialized)
+- [76. Re-registration no longer rewinds the scheduler](#reregistration-scheduler)
+- [77. `skilj-codegen` validates a spec before emitting it](#codegen-spec-validation)
+- [78. `RetryPolicy` backoff can't panic or collapse to zero](#retry-backoff-panic)
+- [79. A zero-sized event cache is off, not "everything is empty"](#zero-sized-event-cache)
+- [80. A panic in plugin code no longer ends a background task](#plugin-panic-background-task)
+- [81. JWT audience is required](#jwt-audience-required)
+- [82. Every outbound HTTP request is bounded](#bounded-http-requests)
+- [83. A dropped cross-instance connection is noticed, not hidden](#cross-instance-connection-drop)
+- [84. Resuming a subscription delivers the missed span](#subscription-missed-span)
+- [85. Subscriptions select before they read the database](#subscription-select-before-read)
+- [86. Bounded, stable pages for `parkedDeliveries`](#parked-deliveries-pagination)
+- [87. Idempotency keys expire (`idempotency_key_retention`)](#idempotency-key-expiry)
+- [88. `waitForSequence` can't be used to make a query expensive](#wait-for-sequence-expensive)
+- [89. The event cache never serves a hole or a duplicate](#event-cache-holes)
+- [90. Live subscriptions deliver in sequence order](#live-subscription-ordering)
+- [91. `forgetSubject` also erases parked deliveries](#forget-subject-parked-deliveries)
+- [92. A scoped admin can't mint or revoke its way out of its scope](#scoped-admin-scope-escape)
+- [93. Database error text stays in the server log](#database-error-logging)
+- [94. Key retention waits out startup](#key-retention-startup)
+- [95. The event cache can't outlive the bounded context it cached](#event-cache-lifecycle)
+- [96. Archived means archived for internal submissions too](#archived-internal-submissions)
+- [97. `skilj-kafka` never commits past an unreported message](#kafka-commit-unreported)
+- [98. `skilj-amqp` releases a message it couldn't report](#amqp-release-unreported)
+- [99. `skilj-temporal` retries what it was served instead of waiting out the lease](#temporal-retry-leased-events)
 
 ---
 
@@ -7640,6 +7692,7 @@ change to DCB's own model or the Allium spec.
   (`skilj-retry`/`skilj-core`/`skilj-rest`/`skilj-graphql`/`skilj`/
   `skilj-kafka`/`skilj-amqp`/`skilj-nats`/`skilj-tui`).
 
+<a id="atomic-transactions-multiple-commands"></a>
 ## 48. Investigation: atomic transactions spanning multiple command types (Codeberg issue #22)
 
 Issue #22 asked whether `skilj` needs a way to atomically process
@@ -7708,6 +7761,7 @@ model level, which is the level DCB itself operates at. No feature
 gap identified; issue closed as already-solved, pointing at
 `EnrollStudentInCourse` as the existing proof.
 
+<a id="projection-subscription"></a>
 ## 49. A GraphQL subscription for Projections: `projectionUpdates` (Codeberg issue #23)
 
 `EventSubscription` ([§9](#next-steps)'s "last surface out of the
@@ -7827,6 +7881,7 @@ tests) all pass unchanged against real embedded Postgres, confirming the
 `fetch_projection_result` refactor didn't alter `projection`'s own
 behaviour.
 
+<a id="segmented-parallel-investigation"></a>
 ## 50. Investigation: segmented/parallel event processing for horizontal scale-out (Codeberg issue #25)
 
 Speculative, not a commitment - the issue asked whether skilj should
@@ -7931,6 +7986,7 @@ one-off timing fluke) and pass deterministically after it.
 `async_projections.rs`/`sync_projections.rs`/`projection_registration.rs`
 suites unchanged.
 
+<a id="segmented-parallel-built"></a>
 ## 51. Segmented/parallel event processing, built (Codeberg issue #25, part two)
 
 §50 above recommended a narrow fix over segmentation - no evidence of a
@@ -8136,6 +8192,7 @@ confirming the unpartitioned path is genuinely untouched and GraphQL's
 build/clippy --workspace --all-targets -- -D warnings` and `cargo fmt
 --check` clean.
 
+<a id="parallelism-scoping-snapshot"></a>
 ## 52. Scoping parallelism beyond Projection catch-up, and building the Snapshot half
 
 After §51, the question came up: does the same design apply anywhere
@@ -8268,6 +8325,7 @@ and the three partitioned-snapshot tests pass deterministically across
 `snapshot_owner_scoping.rs` (8 tests), and `skilj-demo/tests/snapshot.rs`
 (2 tests) all pass.
 
+<a id="bridge-double-publish-gap"></a>
 ## 53. Closing the Kafka/AMQP/NATS bridges' double-publish gap: `ReadCursor.checked_out_at`
 
 §52 found a real, previously-unverified gap in the bridge crates
@@ -8362,6 +8420,7 @@ round-trip tests - `Claimed` persists without moving `sequence`,
 Full `skilj-core`/`skilj-rest` suites pass unchanged elsewhere, confirming
 `auto_advance` and every other cursor path stayed untouched.
 
+<a id="bridge-partitioning"></a>
 ## 54. Bridge partitioning: skilj-kafka/skilj-amqp/skilj-nats, on top of §53
 
 The design from §52's scoping: per-partition `EventReadToken`s, not
@@ -8429,6 +8488,7 @@ Codeberg issue #25, in full: §51 (Projection partitioning), §52
 fit, the bridge gap found), §53 (the `read_cursors` checkout mechanism
 that gap needed), and this section (partitioning built on top of it).
 
+<a id="cancel-deadline-race"></a>
 ## 55. Closing the `CancelDeadline` fire-vs-cancel race
 
 A segmented review of everything since v0.0.6 (this project's own
@@ -8501,6 +8561,7 @@ the command still ran), then verified passing again with the fix
 restored - this project's own standing discipline of not trusting a new
 test until it's been shown to actually catch the bug it claims to.
 
+<a id="parked-delivery-duplication-race"></a>
 ## 56. Closing the parked-delivery duplication race in `catch_up_cross_context_route`
 
 The same review pass (§55) found a second real bug, in §47's own
@@ -8578,6 +8639,7 @@ code first (both the advisory lock and the unique index/upsert
 temporarily reverted, reproducing exactly two parked rows for the one
 occurrence), then verified passing again with the fix restored.
 
+<a id="submit-command-lock-hold"></a>
 ## 57. Shortening `submit_command`'s own lock hold (Codeberg issue #32)
 
 A load test of `skilj-helpdesk` against this library (its own
@@ -8696,6 +8758,7 @@ call's own rollback path unchanged - both provisionally allocated
 sequences roll back together on the poison event's failure, same as
 before this pass.
 
+<a id="group-commit-batching"></a>
 ## 58. Group-commit batching for `submit_command` (Codeberg issue #32, round two)
 
 §57's round-trip reductions helped, but a follow-up load test against
@@ -8845,6 +8908,7 @@ identically whether a command is alone in its own batch or one of 256,
 and idempotency-key deduplication (§37) is checked per command, inside
 its own savepoint, unchanged.
 
+<a id="group-commit-hang-regression"></a>
 ## 59. Fixing §58's own permanent-hang regression, and closing the cross-instance routing investigation alongside it (Codeberg issues #36, #35)
 
 A real load test against `skilj-helpdesk` (Codeberg issue #36) found
@@ -8970,6 +9034,7 @@ running at once - reproduced identically against unmodified `main`
 this pass introduced; every test file this pass actually touches passes
 cleanly and repeatably in isolation.
 
+<a id="batch-round-trips"></a>
 ## 60. Shrinking a batch's own per-command round trips further (Codeberg issue #32, round three)
 
 A follow-up load test against `skilj-helpdesk` (post-§59) confirmed the
@@ -9076,6 +9141,7 @@ above is derived from reading the code path, not measured throughput,
 so treat the ceiling improvement as directionally expected rather than
 quantified until re-run against `skilj-helpdesk`.
 
+<a id="batch-measurement-gap"></a>
 ## 61. Closing §60's own measurement gap, a real load-test surprise about `skilj-helpdesk`'s own tenancy shape, and one more round-trip cut (Codeberg issue #32, round four)
 
 §60 shipped without a fresh load-test number. This pass re-ran the exact
@@ -9184,6 +9250,7 @@ that already produced two real regressions (§59, Codeberg issues #36/#35),
 wasn't judged worth it this round. Landed on `perf/batch-round-trip-reduction`,
 same branch as §60.
 
+<a id="batch-redispatch-ceiling"></a>
 ## 62. Finding and fixing the real ceiling: a redispatch check's own row-materialization cost (Codeberg issue #32, round four, continued)
 
 §61's SAVEPOINT removal, measured directly against `skilj-helpdesk`,
@@ -9287,6 +9354,7 @@ sidestep this lock's contention entirely. Landed on
 `perf/batch-round-trip-reduction`, same branch as §60/§61.
 
 
+<a id="group-commit-review-fixes"></a>
 ## 63. Code-review fixes for the group-commit batcher (post-0.0.7 review)
 
 A `/code-review high v0.0.7..HEAD` pass over the batching work (§58-§62) found six things; two were real permanent-hang bugs of the same class as issue #36.
@@ -9302,6 +9370,7 @@ A `/code-review high v0.0.7..HEAD` pass over the batching work (§58-§62) found
 
 **The `PoolTimedOut` test flake, root-caused.** `skilj/tests/command_trigger.rs` and `event_fetch_rest.rs` failed intermittently (a "pool starving under sandbox variance" hypothesis in earlier load-test reports). Real cause: every test leaks a live `Skilj` whose background tasks keep its default 10-connection pool open, so ~10 tests sharing one embedded Postgres exhaust its 100-connection limit and the last `build()` fails after the 30s acquire timeout - reproducible even with `--test-threads=1`, and it predates the batching work. Fixed test-side by giving those files' `Skilj::builder` a 4-connection pool; both files now pass in ~1s / ~3s. No library change.
 
+<a id="parked-deliveries-hardening"></a>
 ## 64. Hardening `POST /v1/parked-deliveries` (§47 follow-up)
 
 A review of §47's bridge-facing parking route found four things, all fixed:
@@ -9313,6 +9382,7 @@ A review of §47's bridge-facing parking route found four things, all fixed:
 
 Tests: `parked_delivery_reports_are_shape_checked_token_scoped_and_need_an_active_token` and `retrying_a_delivery_with_a_malformed_stored_request_errors_gracefully` in `skilj/tests/parked_deliveries_graphql.rs`.
 
+<a id="jwks-cold-cache-double-redrive"></a>
 ## 65. Two concurrency bugs: JWKS cold-cache 401s and double-redriven parked deliveries
 
 Found while writing a concurrent-retry test for §64's follow-up: the test's two parallel GraphQL requests failed *authentication* before they ever reached the code under test.
@@ -9328,6 +9398,7 @@ Visible change: a redriven `CrossContextRoute` command's `client_id` is now `cro
 
 Tests: `concurrent_retries_of_one_parked_delivery_redrive_it_once` (`skilj/tests/parked_deliveries_graphql.rs`, failed with 2 events before the fix, stable over 5 runs after), and the redrive in `a_persistently_failing_target_parks_instead_of_blocking_forever` now goes through `parked_delivery_redrive_identity` and asserts that a second redrive is `Deduplicated`.
 
+<a id="test-harness-cleanup"></a>
 ## 66. Test harness: the embedded Postgres (and broker containers) never stopped
 
 `/tmp` - a 7.7G RAM-backed tmpfs on the WSL dev machine - hit 100% during a session of three full `cargo test --workspace` runs, taking the Kafka broker tests down with admin-operation timeouts and making even shell output fail with `ENOSPC`. The cause: 46 test files each started their own `postgresql_embedded` server and kept it in a `static` `OnceCell`. Rust never drops statics, so `PostgreSQL`'s `Drop` (stop the server, delete the temp data dir) never ran. Every run left about one live Postgres per test binary plus its data dir behind: 128 orphaned servers (1,100+ processes) and 297 `/tmp/.tmp*` dirs by the time it was noticed. It had been happening since the first embedded-Postgres test. This is very likely what was behind this project's repeated mid-session WSL crashes: memory pressure from tmpfs plus hundreds of idle postmasters, not anything in skilj itself. The bridge crates' Kafka/Artemis/NATS testcontainers had the identical leak for the identical reason (a `ContainerAsync` in a `static`).
@@ -9340,12 +9411,14 @@ Each test file keeps its own connect/migrate logic (they differ: pool sizes, whe
 
 `cargo publish` strips a dev-dependency with a `path` and no `version` (checked with `cargo package -p skilj-core`: the packaged manifest has no `skilj-test-support`), so none of the published crates gain a dependency on the unpublished one. The cost: tests in a downloaded `.crate` tarball no longer build on their own, which nothing here relies on.
 
+<a id="ci-silent-skip-guard"></a>
 ## 67. CI's silent-skip guard never fired
 
 `.woodpecker.yml` greps the test log for Postgres `skipping: ...` notes and fails the build if any appear (commits `67960be`/`d3281ab`), so a CI run can't go green without touching the database. It ran `cargo test --workspace` without `--nocapture`. The note is printed from inside a test that then returns early and *passes*, and libtest discards a passing test's captured output, so the note never reached the log. Reproduced by pointing `DATABASE_URL` at a dead port: all 59 `persistence.rs` tests skipped and "passed", `cargo test` exited 0, and the CI grep matched nothing. The earlier verification used a hand-inserted log line, which can't show a capture problem.
 
 Fix: CI runs `cargo test --workspace -- --nocapture`, and the grep drops its `^` anchor, since parallel tests can interleave a note mid-line after another test's `test ... ` prefix. Checked both ways: the dead-port reproduction now matches, and a healthy full run (119 KB of output) matches nothing. The same capture effect had hidden the Docker-down broker skips locally too. They show up under `--nocapture` (`skilj-kafka`/`-amqp`/`-nats` tests "passing" in 0.01s is the other tell).
 
+<a id="projection-type-collision"></a>
 ## 68. Colliding or invalid projection type names in `ProjectionQuery`
 
 Each registered projection gets a GraphQL type named `{bounded_context}_{projection}` (`projection_types::graphql_type_name`), with nested shapes and enums named `{parent}_{field}`. Two problems, both silent:
@@ -9358,6 +9431,7 @@ Fix, in line with how this module already treats an unparseable projection schem
 Tests: `colliding_projection_type_names_serve_one_and_refuse_the_other` (`skilj/tests/projection_query.rs`; both served before, exactly one after, and the shared type carries only the served projection's field) plus unit tests for the name grammar, all-or-nothing admission and field skipping.
 
 
+<a id="bounded-event-reads"></a>
 ## 69. Bounded event reads (`config.max_events_per_read`)
 
 `GET /v1/events`, `GET /v1/events/consume` and GraphQL `queryEvents` each served *every* matching event after their cursor, and loaded the whole remaining history into memory first to find them. A new consumer starting from the beginning of a long history, or one `GET /v1/events` without `after`, made the server load and serialize all of it in one response - enough to exhaust memory on either end.
@@ -9376,6 +9450,7 @@ Tests: `colliding_projection_type_names_serve_one_and_refuse_the_other` (`skilj/
 Tests: `reads_serve_bounded_pages_and_continue_where_they_stopped` (`skilj/tests/event_fetch_rest.rs`: page size 3 and a two-event cache window, so chunks come from both Postgres and the cache; `GET /v1/events` pages 7 events as 3+3+1 via `nextCursor`, a filtered page `[1,3,5]` fills across chunks, consume pages 3+3+1+0, and a `Latest` consumer minted after seven events seeds past all of them. Making the chunk walk stop after one chunk turns the filtered page into `[1,3]`) and `query_events_serves_bounded_pages_over_graphql` (`skilj/tests/graphql_business_surfaces.rs`, the bounded-context-wide path).
 
 
+<a id="pageable-fetch-commands"></a>
 ## 70. Bounded, pageable `fetchCommands`
 
 The command-side counterpart to §69, and the worse case of the two. `fetchCommands` loaded the bounded context's entire command history (`list_commands_for_bounded_context`, with no `ORDER BY`, so in whatever order Postgres returned rows), then made a database round trip per matching command to resolve decryption keys, then rendered all of them. It returned bare payload strings with no id or timestamp, so a client couldn't have paged even if it wanted to. §8's earlier decision to keep it a flat `[String!]!` was made when `Command` had no exposed id; that no longer holds.
@@ -9388,6 +9463,7 @@ The command-side counterpart to §69, and the worse case of the two. `fetchComma
 
 Test: `fetch_commands_serves_bounded_pages_over_graphql` (page size 3: seven commands come back 3+3+1 in recording order via `afterCommandId`, each with `createdAt`; an unknown id is `Command_not_found`). The two existing `fetchCommands` assertions in the same file moved to the object shape.
 
+<a id="bounded-history-reads"></a>
 ## 71. No request or background path loads a whole history any more
 
 A sweep for the remaining callers of the full-history loaders after §69/§70 found five, none of them a paged read:
@@ -9401,6 +9477,7 @@ A sweep for the remaining callers of the full-history loaders after §69/§70 fo
 
 Tests: `a_catch_up_tick_is_bounded_and_the_next_one_continues` (1003 source events against a 1000-event cache window: tick one routes exactly 1000 via the `LIMIT`ed Postgres path, tick two the last 3 from the cache, tick three nothing), and `query_events_serves_bounded_pages_over_graphql` now also checks `countEvents` = 7 across three 3-event chunks. The existing route/deadline start-position, subscription, templating, reconciliation and sync-projection suites all pass unchanged.
 
+<a id="graphql-body-cap"></a>
 ## 72. Per-request bounds on `/graphql`
 
 §69-§71 bounded what one *field* reads, but a GraphQL request could still route around them, and `/graphql` had no limits at all:
@@ -9418,12 +9495,14 @@ The defaults fit the standard full introspection query (graphql-js `getIntrospec
 
 Tests: `graphql_requests_are_bounded_in_size_depth_and_expensive_fields` (unauthenticated 3 MiB body gets 413, was 200 before; 20 `countEvents` aliases gets `query_too_expensive`; a 30-level-deep query is refused; full introspection passes), plus unit tests for alias/fragment counting, the most-expensive-operation rule, and a fragment cycle. Adding the tenth test to `skilj/tests/graphql_business_surfaces.rs` tipped it into §63's `PoolTimedOut` leak (every test leaks a `Skilj` with a 10-connection pool), so that file's setup now uses the same 4-connection pool its siblings do.
 
+<a id="websocket-body-cap"></a>
 ## 73. The websocket endpoint shares the body cap
 
 §72's body cap only covered `POST /graphql`. On the websocket (`GET /graphql` upgrade, subscriptions) every message is a GraphQL document too, and the connection accepts messages before - or without - a credential: a `connection_init` with no bearer resolves to no caller, which is allowed, since a subscription may need none. The upgrade used axum's defaults, 64 MiB per message and 16 MiB per frame. Reproduced: an unauthenticated connection sending a 3 MiB `subscribe` message had it parsed and executed (`next` with data). `graphql_ws_handler` now sets `max_message_size`/`max_frame_size` to `GraphqlLimits::max_request_body_bytes`, so one setting caps both transports; beyond it the connection is closed. Depth, complexity and the expensive-field budget already applied to subscription documents (same schema). Test: `an_oversized_websocket_message_closes_the_connection`.
 
 How many subscriptions one authenticated connection may hold at once was left unbounded here; §74 closes that.
 
+<a id="subscriptions-per-websocket"></a>
 ## 74. Subscriptions per websocket connection
 
 Each subscription holds its own event-broadcast receiver and filters every committed event, so one connection opening thousands of them multiplied per-event work with no bound. No wrapping of `async_graphql`'s protocol handling was needed: `connection_init` inserts a per-connection `ConnectionSubscriptions` counter into the connection's data, and each subscription resolver (`allEvents`, `eventsByType`, `projectionUpdates`) claims a slot after its authorization checks - so a refused unauthenticated attempt never takes one - refusing with `too_many_subscriptions` once `GraphqlLimits::max_subscriptions_per_connection` (default 100) are running. The claim is a `SubscriptionSlot` guard owned by the subscription's stream, released on drop, so it goes however the stream ends: a client `complete`, the stream finishing, or the connection closing. Outside a websocket connection (a schema executed directly) there's no counter and no bound.
@@ -9432,6 +9511,7 @@ Wire note: `async_graphql` reports this resolver error as a `next` message carry
 
 Test: `a_connection_holds_at_most_max_subscriptions_at_once` (limit 2: two run, a third is refused, completing one lets a fourth start). With the guard's release removed, the fourth is refused and the test fails.
 
+<a id="acknowledgements-serialized"></a>
 ## 75. Acknowledgements serialized with consume
 
 `POST /v1/events/consume/ack` read the token's `ReadCursor`, checked `rule AcknowledgeEvents`' `sequence >= cursor.sequence` in Rust, and wrote the new position - three separate autocommit steps, outside the per-token advisory lock `GET /v1/events/consume` takes (§53). Two races followed:
@@ -9443,6 +9523,7 @@ Fix: the ack route runs in one transaction under `lock_read_cursor_for_consume`,
 
 Manual-ack clients now acknowledge once per page (§69), which makes this path busier than it was.
 
+<a id="reregistration-scheduler"></a>
 ## 76. Re-registration no longer rewinds the scheduler
 
 `register_event_type`'s own comment says re-registration "leaves the position exactly where the scheduler left it" and that `last_fired_at` "is never touched". Under concurrency the implementation contradicted it. Registration builds its `EventType` from an unlocked `get_event_type` and `upsert_event_type` wrote *every* column on conflict, `schedule_position` and `last_fired_at` included. The scheduler advances those two under `SELECT ... FOR UPDATE`, so a scheduler firing between registration's read and its write was undone: the position rewound and the occurrence fired again. Every instance re-registers every type at startup, and a rolling deploy starts instances while others' schedulers run, so this is an ordinary window, not an exotic one. Reproduced deterministically: read the type, advance it the way the scheduler does, upsert the stale read - the position went back an hour.
@@ -9451,6 +9532,7 @@ Fix, in the upsert itself so every caller (the GraphQL mutation, startup reconci
 
 Checked and left alone: `upsert_projection` writes `caught_up_to` from the registration's copy the same way. A rewound `caught_up_to` only causes a rescan: the fold skips any event at or below a state row's own `as_of_sequence`, so nothing is folded twice, and registration legitimately sets `caught_up_to` after a new sync projection's history fold.
 
+<a id="codegen-spec-validation"></a>
 ## 77. `skilj-codegen` validates a spec before emitting it
 
 `generate` parsed a `.skilj.toml` (with `deny_unknown_fields`, so typos in *keys* were already caught) and emitted code straight from it, with no check on the *values*. Probed directly:
@@ -9466,6 +9548,7 @@ Now `spec::validate` runs first and returns every problem at once as the new `Er
 
 Tests: four new ones in `skilj-codegen/tests/generate.rs` (every problem named in one error; a collision with the generated enum; `r#type` emitted with tag field `type`; `r#type` is `type` on the wire and in the schema). `skilj-demo`'s real `banking.skilj.toml` passes unchanged.
 
+<a id="retry-backoff-panic"></a>
 ## 78. `RetryPolicy` backoff can't panic or collapse to zero
 
 `RetryPolicy`'s fields are public and `next_backoff` runs inside long-lived background tasks (every `CrossContextRoute` catch-up and every bridge's retry loop), where a panic stops the task. Two ordinary-looking policies panicked inside `core::time`'s float-to-`Duration` conversion:
@@ -9478,6 +9561,7 @@ The four callers that store a due time rather than sleeping (the route's catch-u
 
 Tests: `skilj-retry/tests/backoff_edges.rs` (uncapped, negative and non-finite multipliers across attempts up to `u32::MAX` never panic and stay within the cap - the first two panicked before; `next_attempt_at` saturates rather than returning "now", and doesn't overflow near the end of time).
 
+<a id="zero-sized-event-cache"></a>
 ## 79. A zero-sized event cache is off, not "everything is empty"
 
 `EventCache::try_events_after` treats an existing but empty window as proof the bounded context has no events (true when the window can hold events: `freshen` has just caught it up). With `SkiljBuilder::event_cache_warm_up_count(0)` - the natural way to turn the cache off - every window was empty for a different reason: `freshen` loaded the *entire* history (the window knew no sequence, so it fetched from -1), pushed each event, and evicted each immediately. Every cache-backed read - `GET /v1/events`, consume, untagged `queryEvents`, the catch-up ticks - then silently returned **no events**, after loading the whole history for nothing. Reproduced: a zero-capacity cache reported a bounded context holding three events as empty.
@@ -9488,6 +9572,7 @@ Also from the same sweep of configuration values that reach tokio primitives: `e
 
 Tests: `a_zero_capacity_cache_misses_instead_of_claiming_nothing_exists` (failed before), `a_cold_window_fills_from_the_recent_tail`, `a_zero_capacity_broadcaster_is_still_usable`.
 
+<a id="plugin-panic-background-task"></a>
 ## 80. A panic in plugin code no longer ends a background task
 
 Every background task `SkiljBuilder::build` spawns (async projection and snapshot catch-up, `CrossContextRoute`/`ScheduleDeadline`/`CancelDeadline` catch-up, deadline firing, the scheduler) is one detached `tokio::spawn` looping over a `for_each_concurrent` fan-out, and each unit of that fan-out runs application code: `Projection::project`, `Snapshot` folds, routes' and deadlines' mappings, deciders. Errors were handled per unit (logged, counted, retried next tick), but a *panic* - an `unwrap()` on a bad assumption in a projection - unwound out of `for_each_concurrent` and ended the task. For the async projection task that meant one buggy projection in one bounded context stopped async catch-up for **every** bounded context, permanently, with no signal beyond tokio's own panic message on stderr. Reproduced: a projection that panics in bounded context A, then an event in bounded context B - B's async projection never updated.
@@ -9501,6 +9586,7 @@ Checked and left alone:
 
 Test: `a_panicking_projection_does_not_stop_catch_up_for_other_bounded_contexts` (`skilj/tests/background_task_panics.rs`): a panicking async projection in one bounded context, then an event in another. The healthy projection never updated before the fix; after it, the broken projection panics every tick and the healthy one catches up.
 
+<a id="jwt-audience-required"></a>
 ## 81. JWT audience is required
 
 `verify_and_extract_subject` checked the signature, issuer, algorithm and expiry, but set `validate_aud = false`, and `IdpConfig` had no audience at all. The comment explained why: `jsonwebtoken::Validation::new` defaults to checking `aud` against an empty expected set, which rejected every real OIDC token (found against Dex in `skilj-helpdesk`), so the check was turned off rather than configured.
@@ -9513,6 +9599,7 @@ Tests (`skilj-core/tests/jwt_verification.rs`): `verify_and_extract_subject_reje
 
 Also from this pass: `db::schema_ident` doubles an embedded `"` when quoting a bounded context name. No reachable path supplies one - names are validated at creation (`valid_bounded_context_name`), and resolvers check access, and so existence, before touching a per-context schema - but the function's doc comment calls the quoting defence in depth, and it wasn't without the escape. Unit test `schema_ident_quotes_and_escapes`.
 
+<a id="bounded-http-requests"></a>
 ## 82. Every outbound HTTP request is bounded
 
 Six `reqwest::Client::new()`s, none with a timeout - `reqwest` has no default one.
@@ -9522,6 +9609,7 @@ Six `reqwest::Client::new()`s, none with a timeout - `reqwest` has no default on
 
 Left alone: `skilj-tui`'s client. It's interactive and the user can quit it, so a stall there is visible and recoverable by hand.
 
+<a id="cross-instance-connection-drop"></a>
 ## 83. A dropped cross-instance connection is noticed, not hidden
 
 `cross_instance::Listener` wrapped `sqlx`'s `PgListener::recv`, which reconnects and re-`LISTEN`s on its own after a dropped connection (a Postgres restart or failover, an idle-connection reaper, a network blip) - transparently, so skilj never learned it happened. Every `NOTIFY` sent while it was down was lost. The module's doc comment said a missed message "just means the same self-heal path a same-process lagged receiver already takes (a fresh read)", but nothing did that read:
@@ -9539,6 +9627,7 @@ The spec's two guarantees now say how the caller learns about the gap and when t
 
 Tests, each in its own binary and database because they terminate every `LISTEN` backend: `a_dropped_connection_is_reported_as_resync_after_listening_again` (`skilj-core/tests/cross_instance_listener.rs`: terminate the listener's backend, `NOTIFY` while it's down, and `recv` returns `Resync` and then later notifications again. With the old transparent `recv` it waits forever for the lost one, failing at the 10 s bound) and `a_lost_listener_connection_ends_live_event_subscriptions` (`skilj/tests/cross_instance_resync.rs`: a live `allEvents` websocket subscription ends with `subscription_lagged` when its instance's listener connection is terminated; without `signal_gap` it carries on).
 
+<a id="subscription-missed-span"></a>
 ## 84. Resuming a subscription delivers the missed span
 
 The spec's handoff into the live feed - read state up to a sequence (`queryEvents`/`FetchEvents`/`QueryProjection`), then subscribe with that sequence as `fromSequence` - was described as gap-free, and it is the reconnect path every "subscription ended" signal points clients at (`subscription_lagged`, §83's gap, an ordinary disconnect). It wasn't gap-free. A subscription only receives events published to the broadcaster after it is created, and `fromSequence` merely filtered those (`from_sequence < event.sequence`). An event committed after the client's read but before its subscribe was in neither: not in the read, never delivered live. On a busy bounded context that window - a network round trip or two - is routinely non-empty. The spec model had the same hole (`DeliverToSubscriptions` fires only for events committed while a subscription exists), so the wording promised what neither the spec nor the code delivered. No test used `fromSequence` at all.
@@ -9549,6 +9638,7 @@ Spec: both creation rules gain `requires: <events after starting_point>.count <=
 
 Test: `resuming_from_a_sequence_replays_the_missed_span_then_goes_live` (`skilj/tests/event_subscription.rs`, cap 3): four events, subscribe from the first, receive the other three in order, then a live one exactly once. `eventsByType` resumed from the third receives the fourth and the live one. A subscription from `-1` (five events) is refused with `resume_span_too_large`. With the span cleared, it times out waiting for the first replayed event.
 
+<a id="subscription-select-before-read"></a>
 ## 85. Subscriptions select before they read the database
 
 Each live event subscription handled every event committed in its bounded context the same way (`deliver_one`, §84, and the two loop bodies it replaced): re-fetch the caller's grant, resolve decrypt-on-read keys against it (more queries when the event type declares sensitive fields), read the context's private-field grants, and only then call `deliver_to_subscriptions`, which decides whether this subscription wants the event at all. For an `eventsByType` subscription, or an `allEvents` restricted to some types or filtered, most events fail that last step, so the database work was spent for nothing. The work is per subscription per event: `max_subscriptions_per_connection` (100) subscriptions on each of many connections, against a busy bounded context, is a steady multiple of the write rate in reads.
@@ -9559,6 +9649,7 @@ One consequence, checked and accepted: a grant revoked without the revocation pu
 
 Test: `subscription_selects_is_the_grant_free_part_of_delivery` (`skilj-core/tests/event_broadcast.rs`: another type and an event at `from_sequence` aren't selected and aren't delivered; a matching one is both; a revoked grant still selects but delivers nothing). The query saving itself isn't asserted by a test - Postgres' per-table statistics are flushed asynchronously, too loosely for a reliable count. The subscription suites pass unchanged.
 
+<a id="parked-deliveries-pagination"></a>
 ## 86. Bounded, stable pages for `parkedDeliveries`
 
 The last whole-table read on a request path after §69-§71: `parkedDeliveries(boundedContext:)` loaded every parked row in the bounded context, each with its full `request_json`, and returned them all. Parked rows accumulate exactly when something is persistently wrong - a bridge on a poison topic parks one per message - so the listing got heavier precisely when an operator needed it. It also wasn't in §72's expensive-field budget, so aliases multiplied it.
@@ -9572,6 +9663,7 @@ The last whole-table read on a request path after §69-§71: `parkedDeliveries(b
 
 Test: `parked_deliveries_are_served_in_bounded_stable_pages` (`skilj/tests/parked_deliveries_graphql.rs`, page size 2, five rows): pages come newest-parked first. Between pages, the last row served is discarded and the oldest row fails again (newest `lastFailedAt`). The remaining pages still yield exactly the other three in order, then empty. A bad cursor is refused. Before, one call returned all five. `legacy_parked_delivery_index_migrates_to_the_token_scoped_one` now expects the new index alongside the migrated ones.
 
+<a id="idempotency-key-expiry"></a>
 ## 87. Idempotency keys expire (`idempotency_key_retention`)
 
 `idempotency_keys` kept one row per accepted keyed submission forever - the spec said "Nothing expires" (§21's "no retention/TTL" precedent). Every bridge keys every inbound message (§64), as do `CrossContextRoute` deliveries, deadline firings and parked redrives, so the table grew with total traffic, unbounded. Flagged during this sweep; the user's decision: expire keys after a configurable window, one hour by default, documented properly.
@@ -9592,6 +9684,7 @@ Found while editing and fixed in a follow-up: the same `ProcessCommand` prose st
 
 Tests: `a_key_deduplicates_within_its_retention_and_is_new_after_it` (`skilj/tests/idempotency_key_retention.rs`, its own binary because the task sweeps the whole database; retention 1 s: a retry within the window is deduplicated, the key is then deleted, and the same key afterwards is a new command with new events) and `expired_idempotency_keys_are_deleted_in_bounded_batches` (`skilj-core/tests/persistence.rs`: rows older than the cutoff go 2, then 1, then 0 per call with a batch of 2; a newer row stays).
 
+<a id="wait-for-sequence-expensive"></a>
 ## 88. `waitForSequence` can't be used to make a query expensive
 
 `ProjectionQuery`'s read-your-writes wait (`wait_until_caught_up`) polled `db::get_projection` - three queries: the bounded context, the projection row, its consumed event types - every 20 ms until the projection's `caught_up_to` reached `waitForSequence` or `projection_query_wait_timeout` (default 5 s) ran out. That's about 250 lookups, 750 queries, for a query that waits the whole time. `waitForSequence` is caller-controlled and wasn't checked against anything. So any reader could name a sequence that will never be reached and make every `projection` field cost the full timeout's worth of polling - ten per request under §72's expensive-field budget - while holding the request open for the whole wait.
@@ -9606,6 +9699,7 @@ Spec: `QueryProjection` gains `requires: wait_for_sequence = null or wait_for_se
 
 Tests (`skilj/tests/projection_query.rs`, `projection_query_end_to_end`): the timeout path needs a committed sequence the projection hasn't reached. That can't happen with the file's sync projections, so a new async `LaggingBalance` in a `Skilj` with an hour-long poll interval provides one: waiting for the committed first sequence times out (`projection_caught_up_timed_out`, after at least the 150 ms timeout). The old case - a sequence 1000 past anything committed - is now `wait_for_sequence_not_committed`, answered in under the timeout. With the refusal disabled, it's the timeout again and the test fails.
 
+<a id="event-cache-holes"></a>
 ## 89. The event cache never serves a hole or a duplicate
 
 `EventCache` keeps each bounded context's most recent events in a window, which `freshen` checks against Postgres on every read. If the window's highest sequence equals `MAX(sequence)`, the window is trusted as complete from its first event on. Otherwise the missing range is loaded. The window was fed from two places, and neither checked what it was adding:
@@ -9621,6 +9715,7 @@ Sequence allocation is gapless per bounded context (the `sequence` row's `UPDATE
 
 Tests (`skilj-core/tests/event_cache.rs`): `appending_past_an_unseen_event_does_not_leave_a_hole` (another writer's event, then a local append past it: served `[b, a]`; before, `[a]`) and `a_late_append_of_an_already_freshened_event_is_not_a_duplicate` (freshen, then the committing path's append: served once; before, twice).
 
+<a id="live-subscription-ordering"></a>
 ## 90. Live subscriptions deliver in sequence order
 
 `DeliveryIsAtMostOnce` promises that while the connection is live "every matching event arrives once, in sequence order: no duplicates, no gaps". The live feed is the `EventBroadcaster`, which carries events in the order they were *published* on this instance, and that isn't commit order:
@@ -9638,6 +9733,7 @@ Cost: one bounded read per subscription per out-of-order arrival - in a multi-in
 
 Test: `a_live_subscription_delivers_in_sequence_order_across_an_unpublished_event` (`skilj/tests/event_subscription.rs`): an event committed straight to Postgres and never published (standing in for another instance's, or a not-yet-published concurrent commit), then one committed through `submitCommand`. The subscriber receives both, in order, and nothing else. Without the gap fill it only ever receives the second.
 
+<a id="forget-subject-parked-deliveries"></a>
 ## 91. `forgetSubject` also erases parked deliveries
 
 Crypto-shredding works because every stored copy of a sensitive value is ciphertext under the subject's data key. Events and commands are encrypted at write, and projection and snapshot state is folded from ciphertext and only decrypted on read (`render_event` is the only decryption on a read path; no fold, decider or stored state ever sees plaintext). Destroying the key makes all of it unreadable. `parked_deliveries` (§47, Rust-only - not in the spec) broke that. A parked row's `request_json` is the request as submitted, before any encryption: a bridge's `POST /v1/events/external` or `/v1/commands/trigger` body, or a `CrossContextRoute`'s target command payload. After `forgetSubject`:
@@ -9653,6 +9749,7 @@ Checked for other plaintext copies: idempotency keys store only sequences, exter
 
 Test: `subject_erasure_end_to_end` (`skilj/tests/subject_erasure.rs`) now parks three `ExternalEvent` rows before `forgetSubject` for subject `user/42`: one naming 42 through `AccountOpened`'s sensitive field, one naming 43, and one whose token doesn't exist but whose request mentions 42. Afterwards only 43's row remains. Without the cleanup, all three do.
 
+<a id="scoped-admin-scope-escape"></a>
 ## 92. A scoped admin can't mint or revoke its way out of its scope
 
 A `RoleAccessMapping.scope` confines a grant to one owner's records wherever an owner dimension is declared (§23/§25/§30), for admin-level grants too: `inspectSnapshot` is admin-gated and fails closed on a scope mismatch. But the four token-minting rules took a token's `scope` "independent of the minting admin's", and checked the grant only for level and bounded context. So a tenant-scoped admin could mint an `EventReadToken` with no scope and read every owner's events over REST, or a `CommandToken`/`ExternalEventToken`/`DirectCreationToken` with another owner's scope and act as them. Likewise `RevokeToken` let it revoke any token in the bounded context, cutting off other owners' and staff credentials. The spec's own motivating example was only the narrowing case: an unscoped staff admin minting a company-scoped token.
@@ -9668,6 +9765,7 @@ Not changed, and worth knowing: other admin surfaces stay bounded-context-wide f
 
 Tests (`skilj-core/tests/token_lifecycle.rs`): `an_unscoped_admin_mints_any_scope`, `a_scoped_admin_mints_only_within_its_own_scope` (all four kinds: omitted inherits, the same scope passes, another is `token_scope_beyond_grant`) and `a_scoped_admin_revokes_only_within_its_own_scope` (own scope revoked; another owner's or an unrestricted token refused; an unscoped admin revokes any).
 
+<a id="database-error-logging"></a>
 ## 93. Database error text stays in the server log
 
 `skilj_core::Error::message()` - what both renderers put in a response's `message` - returned `sqlx::Error::to_string()` for `Database` and `MigrateError::to_string()` for `Migration`. So a 500 answered with Postgres' own text: `relation "bc_acme_corp.events" does not exist`, `duplicate key value violates unique constraint ...`. That names schemas (every bounded context's schema is `bc_<name>`, and bounded contexts are often tenants), constraints, columns and SQL fragments. The `database_error` code already told the caller everything actionable. This also reached callers before authentication completed (REST token resolution is a database read), and `BatchFailed` copied the leader's message to every follower.
@@ -9680,6 +9778,7 @@ Checked: no resolver or route builds a caller-facing message from an internal er
 
 Tests: `a_database_error_does_not_reach_the_caller_verbatim` in both `skilj-rest` (the full `IntoResponse` body: code `database_error`, the generic message, no schema name anywhere) and `skilj-graphql` (`to_graphql_error`'s message), plus `a_vanished_row_and_pool_exhaustion_stay_distinguishable` (and that `internal_detail` still has the raw text). `skilj-graphql` gains `sqlx` as a dev-dependency only, to build such an error; the library itself stays free of it.
 
+<a id="key-retention-startup"></a>
 ## 94. Key retention waits out startup
 
 §87's retention counts wall-clock time from when a key was recorded, and every instance swept from the moment it started. Several recovery paths retry under a key right after a restart: a `'firing'` deadline reclaimed after its 5-minute stale window (`fire_due_deadlines` resubmits under `skilj-deadline:{id}`), a `CrossContextRoute` re-reading a source event whose cursor update didn't land, and a bridge whose broker redelivers a message whose offset or acknowledgement wasn't committed. Each exists for a crash between a command committing and the bookkeeping after it. If the whole deployment then stayed down longer than the retention, the restarted instances ran the sweep and those recovery paths at the same moment, and the sweep could delete the key first - the recovered delivery then landed as a second command. Found while checking deadline firing's multi-instance safety, which is itself sound: the claim is a conditional `UPDATE`, and only its winner submits.
@@ -9688,6 +9787,7 @@ Fix: an instance waits `min(retention, 1 hour)` (`IDEMPOTENCY_KEY_STARTUP_GRACE`
 
 Test: `a_key_deduplicates_within_its_retention_and_is_new_after_it` (`skilj/tests/idempotency_key_retention.rs`, retention 2 s) now inserts a key recorded two hours earlier before `build()`. It's still there half a second after startup, and gone once the grace has passed, along with the test's own keys. With the grace removed, the first sweep deletes it immediately and the test fails.
 
+<a id="event-cache-lifecycle"></a>
 ## 95. The event cache can't outlive the bounded context it cached
 
 `DeleteBoundedContext` hard-deletes a context's schema and "frees the name for reuse" (`hard_delete_bounded_context`). The event cache keys its windows by bounded-context *name* and has no eviction at all. Even an instance that evicted on delete couldn't cover the others, since deletion isn't pushed to them. `freshen` decided a window's validity from sequences alone, and a successor's sequences are indistinguishable from its predecessor's: both start at 0. Reproduced: a context with three cached events is deleted and recreated under the same name with one new event, and the cache serves the three deleted events. Once the successor's sequence passes the old window's highest, the delta read appends its events onto the dead ones. Every cache-backed read serves that window - `GET /v1/events`, consume, untagged `queryEvents`, `countEvents`, the command path's DCB pre-check, and the route/deadline catch-ups - so a new tenant given a deleted tenant's name would be shown the deleted tenant's events, on every instance that had them cached.
@@ -9698,6 +9798,7 @@ Checked, and not affected: live subscriptions on the deleted context (`subscript
 
 Test: `a_recreated_bounded_context_never_sees_its_predecessors_cached_events` (`skilj-core/tests/event_cache.rs`): three events cached, delete, recreate, one new event, and the cache serves exactly that one. After four more - past the old window - it serves exactly the successor's five. It failed on the first assertion before, serving the three deleted events.
 
+<a id="archived-internal-submissions"></a>
 ## 96. Archived means archived for internal submissions too
 
 `ArchiveBoundedContext`: "archiving stops new commands and events while leaving everything recorded still readable". The public write rules each refuse an archived context: `authorise_command_submission`/`authorise_command_trigger`, `create_external_event`/`create_direct_event`/`create_system_event`. But three paths submit commands without an authorisation rule in front: `catch_up_cross_context_route` (into the route's target), `fire_due_deadlines` (into the deadline's target), and a `CrossContextRoute`-kind `retryParkedDelivery`. All three go through `decide_and_submit_command`, and nothing on that path looked at the status. Reproduced: `decide_and_submit_command` against an archived context's command type returned `Accepted` and wrote an event stamped `status: Archived`. A route whose target was archived therefore kept writing into it, as did any deadline whose target was archived. Deadlines live in their *source* context, whose fire tick keeps running.
@@ -9710,6 +9811,7 @@ Spec: `ProcessCommand` gains `requires: command_type.bounded_context.status = ac
 
 Tests: `a_command_into_an_archived_bounded_context_is_refused` (`skilj-core/tests/cross_context_route_parking.rs`: `decide_and_submit_command` is refused with `bounded_context_archived` and writes nothing - accepted and written before) and `a_deadline_whose_target_is_archived_resolves_without_submitting` (`skilj/tests/deadlines.rs`: an active source holding a due deadline for an archived target; firing marks it `fired` and the target gets no event. Without the up-front check, firing errors instead).
 
+<a id="kafka-commit-unreported"></a>
 ## 97. `skilj-kafka` never commits past an unreported message
 
 `run_inbound` retries a failing message per `retry_policy`, then reports it to skilj (`POST /v1/parked-deliveries`) and commits its offset, so a poison message can't block the partition forever (§47). If the *report* also failed, it logged "not committing, will redeliver" and `break`-ed to the next message. On Kafka that redelivery never happens: offsets are cumulative per partition, so the next message's successful commit commits past the unreported one too. The message was neither processed nor parked - lost. The trigger is ordinary: skilj unavailable long enough for a message to exhaust its retries, still unavailable for the report, back in time for the next message. Reproduced against a real broker: two messages, the first failing its dispatch and then its report twice. The second was delivered and committed, and the first was never parked.
@@ -9718,6 +9820,7 @@ Fix: the report is retried with `retry_policy.next_backoff` (logged at `error` e
 
 Test: `a_message_whose_park_report_fails_is_never_committed_past` (`skilj-kafka/tests/kafka_bridge.rs`, real Kafka, the mock skilj gains `fail_parked_reports`): by the time the second message is delivered, the first has been parked. Before the fix it never was.
 
+<a id="amqp-release-unreported"></a>
 ## 98. `skilj-amqp` releases a message it couldn't report
 
 §97's follow-up on the AMQP bridge. There, a message whose park report failed was left unsettled: "not accepting, will redeliver". Nothing is lost that way - AMQP settles per message, unlike Kafka's cumulative offsets - but "will redeliver" only held once the link's connection closed, and `run_inbound` never closes it. So while the bridge kept running, the message sat unsettled indefinitely: never retried, never parked. And every unsettled delivery holds a unit of the receiver's link credit, so enough of them (a skilj outage spanning many messages) left the receiver with no credit and stalled it for good.
@@ -9726,6 +9829,7 @@ Fix: the delivery is `release`d - AMQP's "not processed" outcome. The broker red
 
 Test: `a_message_whose_park_report_fails_is_released_and_parked_on_redelivery` (`skilj-amqp/tests/amqp_bridge.rs`, the mock gains `fail_parked_reports`): two failed dispatches, a failed report, then - once redelivered - two more failed dispatches and a successful report. Exactly one parked delivery must result. Run against a real Artemis broker: it passes, and with the release removed (the delivery left unsettled) it fails - never redelivered, never parked.
 
+<a id="temporal-retry-leased-events"></a>
 ## 99. `skilj-temporal` retries what it was served instead of waiting out the lease
 
 A manual-ack consume (`GET /v1/events/consume?mode=manual`) claims what it serves: `ReadCursor.checked_out_at`, held for `read_cursor_checkout_lease` (default 5 minutes, §53). Until the events are acknowledged or the claim lapses, the same token's next consume is served *nothing* (`is_leased`). That's deliberate: two bridge instances sharing a token must never both be served the same events. It puts the retry burden on the client, which must keep what it was served and retry it itself. The Kafka/AMQP/NATS outbound loops do (`OutboundRetryState`). `skilj_temporal::run` didn't. `poll_once` consumed, dispatched and acknowledged each event, returning an error at the first failed dispatch - dropping the rest of the batch, the failed event included - and `run` simply called `poll_once` again next cycle, which consumed nothing until the lease lapsed. Any transient Temporal failure stalled that mapping for the whole lease. That includes the `Signal`-before-`Start` race `run`'s own doc comment calls self-healing ("the failed cycle retries next `poll_interval`").
