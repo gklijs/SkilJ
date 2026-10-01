@@ -104,7 +104,7 @@ members = [
 version = "0.0.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://codeberg.org/gklijs/SklilJ"
+repository = "https://codeberg.org/gklijs/SkilJ"
 
 # Shared dependency versions across the workspace, so crates that share a
 # dependency (e.g. skilj-core and skilj-graphql both need serde) can't drift

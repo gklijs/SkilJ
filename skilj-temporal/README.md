@@ -1,6 +1,6 @@
 # skilj-temporal
 
-A small bridge from [skilj](https://codeberg.org/gklijs/SklilJ)'s event stream to
+A small bridge from [skilj](https://codeberg.org/gklijs/SkilJ)'s event stream to
 [Temporal](https://temporal.io): a skilj event **starts** a fresh workflow execution, or
 **signals** one that is already running.
 
@@ -52,7 +52,7 @@ run("http://localhost:8080", &temporal_client, "orders", &mappings, Duration::fr
 Mint each read token with `startFrom: LATEST` unless you deliberately want a backfill: by default a
 token's first poll replays the event type's entire history, which would start one workflow per
 historical event. See
-[`docs/temporal-integration.md`](https://codeberg.org/gklijs/SklilJ/src/branch/main/docs/temporal-integration.md)
+[`docs/temporal-integration.md`](https://codeberg.org/gklijs/SkilJ/src/branch/main/docs/temporal-integration.md)
 for the full walkthrough.
 
 ## Caveats
@@ -64,8 +64,8 @@ for the full walkthrough.
 
 ## More
 
-- [Design notes](https://codeberg.org/gklijs/SklilJ/src/branch/main/docs/architecture.md)
-  (section 34) and the [Temporal pairing guide](https://codeberg.org/gklijs/SklilJ/src/branch/main/docs/temporal-integration.md)
+- [Design notes](https://codeberg.org/gklijs/SkilJ/src/branch/main/docs/architecture.md)
+  (section 34) and the [Temporal pairing guide](https://codeberg.org/gklijs/SkilJ/src/branch/main/docs/temporal-integration.md)
 - End-to-end test against an ephemeral Temporal service: `tests/temporal_bridge.rs`
 
 Licensed under either of MIT or Apache-2.0, at your option.

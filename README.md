@@ -73,7 +73,7 @@ events on every query.
 The fastest way to try it is to generate a small, working project:
 
 ```sh
-cargo generate --git https://codeberg.org/gklijs/SklilJ.git templates/skilj-template
+cargo generate --git https://codeberg.org/gklijs/SkilJ.git templates/skilj-template
 ```
 
 That gives you a runnable server with one bounded context (the wallet example above) already

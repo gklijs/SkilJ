@@ -1,7 +1,7 @@
 # {{project-name}}
 
-A working [skilj](https://codeberg.org/gklijs/SklilJ) app, scaffolded from
-[skilj-template](https://codeberg.org/gklijs/SklilJ/src/branch/main/templates/skilj-template).
+A working [skilj](https://codeberg.org/gklijs/SkilJ) app, scaffolded from
+[skilj-template](https://codeberg.org/gklijs/SkilJ/src/branch/main/templates/skilj-template).
 `skilj` is a Rust library for building event-sourced applications backed by Postgres, with
 GraphQL and REST surfaces built in - see its own README for what that means and why.
 
@@ -43,7 +43,7 @@ logs` instead.
   as their own modules next to it (see `src/lib.rs`'s own doc comment).
 - `src/bin/server.rs` - the bootstrap shown here is a shortcut (seeds a
   `Role` directly), not the intended production flow. See
-  [`docs/architecture.md` §5/§6](https://codeberg.org/gklijs/SklilJ/src/branch/main/docs/architecture.md)
+  [`docs/architecture.md` §5/§6](https://codeberg.org/gklijs/SkilJ/src/branch/main/docs/architecture.md)
   in the skilj repository for the real bootstrap secret / superadmin /
   GraphQL admin console flow, and for wiring a real `identity_provider`
   so GraphQL's Role-based auth works (this scaffold only sets up REST
