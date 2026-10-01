@@ -1,4 +1,4 @@
-# SklilJ
+# SkilJ
 
 `skilj` is a Rust library for building event-sourced applications backed by Postgres. You define
 your domain as **events** (facts that happened) and **commands** (requests to make something

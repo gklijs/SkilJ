@@ -1,4 +1,4 @@
-# Once SklilJ is open source
+# Once SkilJ is open source
 
 A running list of things that are only worth doing (or only *make sense*
 to do) once this repository is public - so they don't get lost between
