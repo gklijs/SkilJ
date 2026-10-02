@@ -2030,6 +2030,28 @@ impl SkiljBuilder {
         self
     }
 
+    /// Convenience method for production pool settings:
+    /// - `max_connections`: 2x CPU cores (rule of thumb from eventcore-postgres)
+    /// - `min_connections`: half of max (warm pool, avoids connection churn)
+    /// - `acquire_timeout`: 30s (fail fast under contention)
+    /// - `idle_timeout`: 10min (reclaim idle connections)
+    ///
+    /// Override any setting by chaining `.pool_options()` after this:
+    /// `.pool_options_performance_optimized().pool_options(custom_options)`
+    pub fn pool_options_performance_optimized(self) -> Self {
+        use std::thread::available_parallelism;
+        let cpu_count = available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let max_connections = (cpu_count * 2) as u32;
+        let min_connections = (max_connections / 2).max(1);
+        self.pool_options(
+            skilj_core::db::PgPoolOptions::new()
+                .max_connections(max_connections)
+                .min_connections(min_connections)
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .idle_timeout(std::time::Duration::from_secs(10 * 60)),
+        )
+    }
+
     /// Runs the startup reconciliation loop automatically (§1.5). Returns
     /// `Err` only for a genuine registration rejection (e.g. an
     /// incompatible schema change) - a bounded context the reconciliation
