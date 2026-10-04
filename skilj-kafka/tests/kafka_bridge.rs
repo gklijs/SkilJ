@@ -121,6 +121,10 @@ struct MockSkiljState {
     queues: Arc<Mutex<std::collections::HashMap<String, VecDeque<Value>>>>,
     event_types: Arc<Mutex<std::collections::HashMap<String, String>>>,
     acked: Arc<Mutex<Vec<i64>>>,
+    /// The highest sequence acknowledged so far per bearer credential -
+    /// a lower one is refused with 409, the real server's own
+    /// `acknowledgement_regresses` (a read cursor never moves backwards).
+    ack_cursors: Arc<Mutex<HashMap<String, i64>>>,
     /// Every `POST /v1/events/external` body this mock ever received,
     /// in order - what the inbound `Record` tests assert against.
     external_requests: Arc<Mutex<Vec<Value>>>,
@@ -188,8 +192,15 @@ async fn post_events_consume_ack(
         }
     }
     let sequence = body["sequence"].as_i64().unwrap();
-    state.acked.lock().unwrap().push(sequence);
     let token = bearer_token(&headers);
+    {
+        let mut cursors = state.ack_cursors.lock().unwrap();
+        if cursors.get(&token).is_some_and(|&cursor| sequence < cursor) {
+            return StatusCode::CONFLICT;
+        }
+        cursors.insert(token.clone(), sequence);
+    }
+    state.acked.lock().unwrap().push(sequence);
     if let Some(q) = state.queues.lock().unwrap().get_mut(&token) {
         q.retain(|e| e["sequence"].as_i64().unwrap_or(i64::MIN) > sequence);
     }
@@ -1124,6 +1135,96 @@ fn two_partitioned_mappings_together_produce_every_key_exactly_once() {
         assert_eq!(
             acked, expected_sequences,
             "every sequence must be acknowledged, owned by this partition or not"
+        );
+    });
+}
+
+/// Codeberg issue #39: a partitioned mapping must never acknowledge an
+/// event this instance doesn't own *past* an owned one it hasn't
+/// produced yet. The read cursor is a single position, so that ack
+/// would move it beyond the owned event - and if producing that event
+/// then fails, the next `consume` starts after it and it is never
+/// fetched again. Here the owned event's own payload is larger than the
+/// producer's `message.max.bytes`, a deterministic produce failure, and
+/// the not-owned event behind it must stay unacknowledged.
+#[test]
+fn a_failed_owned_event_is_never_acknowledged_past_by_a_partition_skip() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-partition-fail");
+        create_topic(bootstrap_servers, &topic).await;
+
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let partition = Some((0u32, 2u32));
+        let candidates: Vec<String> = (0..64).map(|i| format!("o-{i}")).collect();
+        let owned_key = candidates
+            .iter()
+            .find(|k| skilj_bridge::owns_partition(partition, Some(k)))
+            .unwrap();
+        let other_key = candidates
+            .iter()
+            .find(|k| !skilj_bridge::owns_partition(partition, Some(k)))
+            .unwrap();
+        let event = |sequence: i64, order_id: &str, payload: Value| {
+            json!({
+                "sequence": sequence,
+                "eventType": "OrderPlaced",
+                "payload": payload,
+                "tags": [{ "key": "order", "value": order_id }],
+                "metadata": { "correlationId": null, "causationId": null },
+            })
+        };
+        let token = "read-token-partition-fail".to_string();
+        enqueue(
+            &mock_state,
+            &token,
+            "OrderPlaced",
+            vec![
+                event(1, owned_key, json!({ "padding": "x".repeat(10_000) })),
+                event(2, other_key, json!({ "orderId": other_key })),
+            ],
+        );
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .set("message.max.bytes", "2000")
+            .create()
+            .unwrap();
+        let mapping = OutboundMapping {
+            event_type: "OrderPlaced".to_string(),
+            credential: token,
+            topic,
+            key_tag_key: Some("order".to_string()),
+            partition,
+        };
+        let http = skilj_kafka::http_client();
+        let retry_policy = skilj_retry::RetryPolicy::default();
+        let mut retry_state = None;
+
+        let served = produce_once(
+            &http,
+            &skilj_base_url,
+            &producer,
+            &mapping,
+            &retry_policy,
+            &mut retry_state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(served, 0);
+        assert!(
+            retry_state.is_some(),
+            "the failed produce must be retried, not skipped"
+        );
+        assert!(
+            mock_state.acked.lock().unwrap().is_empty(),
+            "nothing may be acknowledged past the owned event that failed to produce"
         );
     });
 }

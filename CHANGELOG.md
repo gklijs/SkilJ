@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registration change, be served the other. `list_bounded_contexts` and
   `list_projections_for_bounded_context` now return name order
   (docs/architecture.md §168).
+- `skilj-kafka`'s docs said the producer's `enable.idempotence` keeps an
+  event that is produced again (after its acknowledgement to skilj
+  failed) from landing in Kafka twice. It doesn't: it only covers the
+  producer's own internal retries, so outbound delivery is at-least-once
+  and Kafka consumers must tolerate duplicates. The crate docs now say
+  so, with a "Producer configuration" section (docs/architecture.md
+  §169).
 
 ## [0.0.9] - 2026-10-01
 

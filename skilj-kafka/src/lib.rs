@@ -5,32 +5,6 @@
 //! other skilj crate, the same "independently usable, wire protocol
 //! only" posture `skilj-tui`/`skilj-temporal` already have.
 //!
-//! # Performance recommendations
-//!
-//! For production workloads, configure the rdkafka producer with:
-//!
-//! - `compression.type=snappy` — 60-80% payload reduction for JSON, low CPU
-//! - `enable.idempotence=true` — required for exactly-once semantics when
-//!   batching (see [`produce_once`]'s batching behaviour)
-//! - `linger.ms=5` — small batching window to accumulate events without
-//!   adding meaningful latency
-//! - `batch.size=16384` — rdkafka's default, works well with snappy
-//!
-//! Example:
-//!
-//! ```rust,no_run
-//! use rdkafka::producer::FutureProducer;
-//! use rdkafka::ClientConfig;
-//!
-//! let producer: FutureProducer = ClientConfig::new()
-//!     .set("bootstrap.servers", "localhost:9092")
-//!     .set("compression.type", "snappy")
-//!     .set("enable.idempotence", "true")
-//!     .set("linger.ms", "5")
-//!     .create()
-//!     .expect("producer creation failed");
-//! ```
-//!
 //! Two independent directions, each driven by its own mapping list -
 //! unlike `skilj-temporal`, which only ever reacts to skilj's own
 //! events, a message broker genuinely needs both:
@@ -99,9 +73,38 @@
 //!   on, logged loudly - no parked-delivery record, since there is
 //!   nothing wrong with the *message*, only (temporarily) with reaching
 //!   the broker.
+//!
+//! # Producer configuration
+//!
+//! [`produce_once`] produces and acknowledges strictly one event at a
+//! time, in sequence order: the read cursor is a single position that
+//! refuses to move backwards, so acknowledging any later event first
+//! (or concurrently) could pass an earlier one that then fails, and
+//! nothing would ever fetch it again. With one record in flight per
+//! mapping, per-key order in Kafka holds without any producer setting.
+//!
+//! What the caller's own `ClientConfig` still decides:
+//!
+//! - `enable.idempotence=true` stops the *producer's own* internal
+//!   retries from writing a record twice. It does not deduplicate a
+//!   record this crate sends again because its acknowledgement to skilj
+//!   failed - delivery to Kafka is at-least-once either way.
+//! - `compression.type` (`snappy`, `lz4` or `zstd`) is worth setting for
+//!   JSON payloads; what it saves depends on the payloads.
+//!
+//! ```rust,no_run
+//! use rdkafka::producer::FutureProducer;
+//! use rdkafka::ClientConfig;
+//!
+//! let producer: FutureProducer = ClientConfig::new()
+//!     .set("bootstrap.servers", "localhost:9092")
+//!     .set("enable.idempotence", "true")
+//!     .set("compression.type", "zstd")
+//!     .create()
+//!     .expect("producer creation failed");
+//! ```
 
 use chrono::{DateTime, Utc};
-use futures_util::future::join_all;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Header, Headers, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -272,87 +275,50 @@ async fn ack_event(
 }
 
 /// Produces one event to Kafka, then acknowledges it to skilj - never
-/// Produces multiple events to Kafka in a batch, then acknowledges them
-/// to skilj. Returns the number of successfully produced+acked events,
-/// or an error if the batch flush fails.
-///
-/// Uses individual `send` calls (buffered by rdkafka) followed by
-/// `flush()` to wait for all to complete. This leverages rdkafka's
-/// internal batching (controlled by `linger.ms`, `batch.size`) and
-/// compression when the producer is configured with `compression.type`.
-async fn produce_and_ack_batch(
+/// the other order, so a crash between the two redelivers the same event
+/// next cycle rather than silently dropping it. That redelivered produce
+/// does land on Kafka a second time: `enable.idempotence` only covers the
+/// producer's own internal retries, not a fresh `send` of the same event
+/// (see this crate's own "Producer configuration" section), so Kafka
+/// consumers must tolerate duplicates.
+async fn produce_and_ack_one(
     http: &reqwest::Client,
     skilj_base_url: &str,
     producer: &FutureProducer,
     mapping: &OutboundMapping,
-    events: &[&ConsumedEvent],
-) -> Result<usize, BridgeError> {
-    if events.is_empty() {
-        return Ok(0);
+    event: &ConsumedEvent,
+) -> Result<(), BridgeError> {
+    let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
+    let payload = event.payload.to_string();
+    let mut record = FutureRecord::to(&mapping.topic).payload(&payload);
+    if let Some(k) = key.as_deref() {
+        record = record.key(k);
     }
-
-    // Pre-compute owned payload/key/header data so it lives long enough
-    // for the futures returned by `send`.
-    struct EventData {
-        payload: Vec<u8>,
-        key: Option<Vec<u8>>,
-        headers: OwnedHeaders,
-    }
-    let mut event_data = Vec::with_capacity(events.len());
-    for event in events {
-        let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
-        let payload = event.payload.to_string();
-        let mut headers = OwnedHeaders::new();
-        if let Some(id) = &event.metadata.correlation_id {
-            headers = headers.insert(Header {
-                key: CORRELATION_ID_HEADER,
-                value: Some(id.as_bytes()),
-            });
-        }
-        if let Some(id) = &event.metadata.causation_id {
-            headers = headers.insert(Header {
-                key: CAUSATION_ID_HEADER,
-                value: Some(id.as_bytes()),
-            });
-        }
-        event_data.push(EventData {
-            payload: payload.into_bytes(),
-            key: key.as_deref().map(|k| k.as_bytes().to_vec()),
-            headers,
+    // Codeberg issue #18 - forwards the event's own correlation_id/
+    // causation_id (always present on correlation_id, per the spec's own
+    // CorrelationIdIsAlwaysRecorded invariant; causation_id absent for a
+    // root event) as headers, distinct from `key` above.
+    let mut headers = OwnedHeaders::new();
+    if let Some(id) = &event.metadata.correlation_id {
+        headers = headers.insert(Header {
+            key: CORRELATION_ID_HEADER,
+            value: Some(id),
         });
     }
-
-    // Create futures for all events
-    let mut futures = Vec::with_capacity(event_data.len());
-    for data in &event_data {
-        let mut record = FutureRecord::to(&mapping.topic).payload(&data.payload);
-        if let Some(k) = &data.key {
-            record = record.key(k);
-        }
-        if data.headers.count() > 0 {
-            record = record.headers(data.headers.clone());
-        }
-        futures.push(producer.send(record, Duration::from_secs(10)));
+    if let Some(id) = &event.metadata.causation_id {
+        headers = headers.insert(Header {
+            key: CAUSATION_ID_HEADER,
+            value: Some(id),
+        });
     }
-
-    // Wait for all sends to complete (this flushes the internal batch)
-    let results = join_all(futures).await;
-
-    // Check for any send errors
-    for result in &results {
-        if let Err((e, _)) = result {
-            // If any send failed, we don't ack any - they'll be retried
-            // on the next cycle.
-            return Err(BridgeError::Produce(e.clone()));
-        }
+    if headers.count() > 0 {
+        record = record.headers(headers);
     }
-
-    // All sends succeeded, now ack all events to skilj
-    for event in events {
-        ack_event(http, skilj_base_url, mapping, event.sequence).await?;
-    }
-
-    Ok(events.len())
+    producer
+        .send(record, Duration::from_secs(10))
+        .await
+        .map_err(|(e, _)| e)?;
+    ack_event(http, skilj_base_url, mapping, event.sequence).await
 }
 
 /// One fetch-produce-ack cycle for a single [`OutboundMapping`] -
@@ -367,15 +333,9 @@ async fn produce_and_ack_batch(
 /// cycle make real progress" isn't misled into thinking Kafka actually
 /// received it.
 ///
-/// **Batching**: all owned events in this cycle are produced to Kafka in
-/// a single batch (via individual `send` calls buffered by rdkafka,
-/// followed by `flush()`), then acknowledged to skilj together. This
-/// leverages rdkafka's internal batching (`linger.ms`, `batch.size`) and
-/// compression when the producer is configured with `compression.type`.
-///
-/// A failure producing *or* acknowledging the batch stops this cycle
-/// right there - `retry_state` records it, and no event behind the batch
-/// is even attempted this cycle (the identical "the head blocks everything
+/// A failure produces *or* acknowledging one event stops this cycle
+/// right there - `retry_state` records it, and no event behind it is
+/// even attempted this cycle (the identical "the head blocks everything
 /// behind it" behaviour `catch_up_cross_context_route` has, and for the
 /// same reason: skipping ahead would silently drop the blocked event
 /// from ever being retried, since nothing would ever revisit it once a
@@ -402,48 +362,46 @@ pub async fn produce_once(
     )
     .await?;
 
-    // Partition events into owned (this instance produces) and
-    // non-owned (partition belongs to another instance, just ack)
-    let mut owned_events = Vec::new();
     let mut served = 0;
     for event in &consumed.events {
         let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
         let owned = owns_partition_for(mapping, key.as_deref());
-        if owned {
-            owned_events.push(event);
+        let outcome = if owned {
+            produce_and_ack_one(http, skilj_base_url, producer, mapping, event).await
         } else {
-            // Not this instance's partition: acknowledge without producing
-            ack_event(http, skilj_base_url, mapping, event.sequence).await?;
-        }
-    }
-
-    // Produce owned events in a batch
-    if !owned_events.is_empty() {
-        let batch_result =
-            produce_and_ack_batch(http, skilj_base_url, producer, mapping, &owned_events).await;
-
-        match batch_result {
-            Ok(batch_served) => {
-                served += batch_served;
-                // Clear retry state for all events in the batch
-                if let Some(state) = retry_state {
-                    if owned_events.iter().any(|e| e.sequence == state.sequence) {
-                        *retry_state = None;
-                    }
+            // Codeberg issue #25's investigation (docs/architecture.md
+            // §54) - not this instance's own partition: acknowledged
+            // (so this instance's own cursor still advances past it)
+            // without ever being produced to Kafka. Whichever instance
+            // *does* own this event's own partition sees it too, via its
+            // own dedicated credential/cursor - see `OutboundMapping::partition`'s
+            // own doc comment.
+            ack_event(http, skilj_base_url, mapping, event.sequence).await
+        };
+        match outcome {
+            Ok(()) => {
+                // A partition-skip is acknowledged but not counted here,
+                // the identical "not misleading a caller checking did
+                // this cycle make real progress" treatment this
+                // function's own doc comment already gives a
+                // retry-exhausted skip below.
+                if owned {
+                    served += 1;
+                }
+                if retry_state.is_some_and(|s| s.sequence == event.sequence) {
+                    *retry_state = None;
                 }
             }
             Err(e) => {
-                // Batch failed - find the head event (first in batch) for retry state
-                let head_event = &owned_events[0];
                 let now = Utc::now();
                 let (attempt, first_failed_at) = match retry_state {
-                    Some(state) if state.sequence == head_event.sequence => {
+                    Some(state) if state.sequence == event.sequence => {
                         state.attempt += 1;
                         (state.attempt, state.first_failed_at)
                     }
                     _ => {
                         *retry_state = Some(OutboundRetryState {
-                            sequence: head_event.sequence,
+                            sequence: event.sequence,
                             attempt: 1,
                             first_failed_at: now,
                             next_attempt_at: now,
@@ -455,24 +413,23 @@ pub async fn produce_once(
                 if retry_policy.is_exhausted(attempt, elapsed) {
                     tracing::error!(
                         event_type = %mapping.event_type,
-                        sequence = head_event.sequence,
+                        sequence = event.sequence,
                         attempt,
                         error = %e,
                         "giving up on this event after repeated failures - skipping it \
                          (acknowledging without ever producing it to Kafka) so the stream \
                          isn't blocked forever"
                     );
-                    // Ack the head event to unblock the stream
-                    ack_event(http, skilj_base_url, mapping, head_event.sequence).await?;
+                    ack_event(http, skilj_base_url, mapping, event.sequence).await?;
                     *retry_state = None;
-                    return Ok(served);
+                    continue;
                 }
                 tracing::warn!(
                     event_type = %mapping.event_type,
-                    sequence = head_event.sequence,
+                    sequence = event.sequence,
                     attempt,
                     error = %e,
-                    "producing/acknowledging batch failed - will retry with backoff"
+                    "producing/acknowledging this event failed - will retry with backoff"
                 );
                 if let Some(state) = retry_state {
                     state.next_attempt_at = retry_policy.next_attempt_at(now, attempt);
@@ -481,7 +438,6 @@ pub async fn produce_once(
             }
         }
     }
-
     Ok(served)
 }
 
@@ -494,13 +450,8 @@ pub async fn produce_once(
 /// [`produce_once`]'s own doc comment and this crate's own "Dead-letter/
 /// parking" section for what it governs.
 ///
-/// # Performance
-///
-/// The caller-provided `producer` should be configured with
-/// `compression.type=snappy` and `enable.idempotence=true` for production
-/// workloads — see the module-level docs for a complete example. These
-/// settings reduce network/broker I/O by ~60-80% for JSON payloads and
-/// enable safe batching via rdkafka's internal batching (`linger.ms`).
+/// See this crate's own "Producer configuration" section for which
+/// `producer` settings matter.
 pub async fn run_outbound(
     skilj_base_url: &str,
     producer: &FutureProducer,
