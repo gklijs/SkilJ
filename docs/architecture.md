@@ -10930,3 +10930,39 @@ A failed acknowledgement is charged to the run's first event, the one the next `
 `produce_once`'s return value means delivered *and* acknowledged, as before - a delivered event whose acknowledgement failed isn't counted.
 
 Tests: `skilj-bridge/tests/outbound_cycle.rs` drives the cycle against a mock of the consume/ack routes, which refuses a regressing acknowledgement with 409, and a fake broker. It asserts one call for a contiguous page, an acknowledgement up to but not past a failed delivery, a partition skip never passing a failed owned event, a failed acknowledgement re-delivering its run and then giving up, a given-up event acknowledged with its run, and a cycle in backoff not even consuming. The three bridges' mocks now refuse regressing acknowledgements too, and their partitioned tests assert one acknowledgement per instance for the whole page instead of one per sequence. All three real-broker suites pass. `skilj-temporal`'s `poll_once` still acknowledges each event on its own; it is not a broker bridge and doesn't use this loop.
+
+<a id="inbound-throughput-investigation"></a>
+## 172. Inbound throughput: measured, and no batch endpoint yet
+
+Codeberg issue #41 asked whether the broker bridges' inbound side (broker -> `POST /v1/events/external` or `POST /v1/commands/trigger`) needs batching. Each bridge sends one message, awaits skilj's answer, then takes the next - one message in flight per consumer, across every partition it is assigned.
+
+**Measured** with `skilj/tests/inbound_throughput.rs`, an `#[ignore]`d benchmark that sends 400 messages per scenario through `Skilj::rest_router()` in-process (no network) into one bounded context, against the embedded Postgres on a development machine. Two rounds, after a warm-up:
+
+| scenario | throughput | p50 latency | p99 latency |
+|---|---|---|---|
+| external event, 1 in flight | ~510 msg/s | 1.9 ms | 2.9 ms |
+| external event, 8 partitions in flight | ~1280 msg/s | 4.5 ms | 20 ms |
+| command trigger, 1 in flight | ~280 msg/s | 3.5 ms | 5.0 ms |
+| command trigger, 8 partitions in flight | ~830 msg/s | 8-10 ms | 15 ms |
+
+The absolute numbers depend on the machine and on Postgres's commit cost; the ratios are what matter. One message in flight is bounded by per-request latency, and a real bridge adds a network round trip on top, so it is lower still. Several partitions in flight gave 2.5× for external events, which take the bounded context's sequence lock one request at a time, and about 3× for triggers, because `CommandBatcher` (§58) can only group-commit requests that arrive concurrently - from a one-at-a-time bridge every batch has size 1.
+
+**Conclusions:**
+
+- **No batch REST endpoint for now.** It would amortize the lock and the commit further, but it is new API surface: per-item results, per-item parking, and a dedupe watermark per item. Concurrency across partitions gets most of the gain with the existing endpoints.
+- **Concurrency is only safe per partition.** The §39 watermark drops any sequence at or below the highest one recorded for its partition key, and `decide()` needs commands in order, so at most one message per partition key may be in flight. For Kafka that means one per Kafka partition: possible today by running more bridge instances in one consumer group, and in one process by Codeberg issue #60.
+- **The same watermark rule exposed two problems**, filed separately. #58 is a confirmed bug: a parked external event whose partition later messages overtook is deduped away when it's redriven, and the row is deleted as if it had succeeded (`a_parked_message_overtaken_on_its_partition_is_still_created_on_retry`, ignored until it's fixed). #59 is an investigation: NATS uses the whole stream as one partition key, and AMQP uses the group id, so competing consumers on either can record a lower sequence after a higher one and silently drop it.
+
+<a id="parked-external-event-redrive-cursor"></a>
+## 173. A retried parked external event no longer reuses the bridge's dedupe cursor
+
+Codeberg issue #58, found while measuring inbound throughput (§172). A bridge parks an inbound message that carries a `dedupe` cursor - Kafka always sends one, NATS always, AMQP when the message has a group id and sequence - commits past it (§97), and carries on. Later messages on that partition are recorded, so its watermark (§39) moves past the parked sequence. `retryParkedDelivery` redrove the parked request with its original cursor, `create_and_insert_external_event` saw a sequence at or below the watermark and returned `Redelivered`, the resolver ignored the outcome, and the row was deleted as if the retry had succeeded. The message was gone and nothing said so. §96's per-row cursor fallback had only covered requests *without* a cursor; with one, the request "kept it" so a redrive would also dedupe against the bridge's original attempt.
+
+The watermark keeps only the highest sequence per partition, so a redrive can't tell "later messages overtook it" from "the original attempt committed after all, and the bridge never heard back". Three ways out were considered: redrive under a per-row cursor; record which sequences were actually created; or stop a partition's watermark from passing a parked position. **With the user's choice, the first:** every `ExternalEvent` redrive now uses `db::parked_delivery_redrive_dedupe_partition_key` - partition `skilj-parked-delivery:{id}` at sequence 1 - whether or not the stored request has a cursor. Repeated redrives of one row still dedupe against each other (`a_retry_after_a_failed_row_delete_does_not_land_the_event_twice` is unchanged). The bridge's cursor stays in the stored request, so an operator can still see it, but the redrive no longer decodes it.
+
+The cost is one case: an original attempt that committed without the bridge hearing back (a lost response), was retried until exhaustion and parked, and is then retried by an operator, creates its event a second time. That needs a commit followed by enough failed retries to park, and a duplicate event is visible and correctable, where the old behaviour lost the message silently. The other two options would close that case too, at the price of new storage and an index, or of tying parking into the watermark.
+
+A redrive that is `Redelivered` under the per-row cursor can only mean an earlier retry of the same row created the event, so the row is still removed, now with an `info` log line saying so.
+
+Test: `a_parked_message_overtaken_on_its_partition_is_still_created_on_retry` (`skilj/tests/parked_deliveries_graphql.rs`) parks message 77 on partition `orders:0`, records 78 on the same partition over REST, retries 77, and asserts two events and no parked row. It failed before the fix with one event.
+

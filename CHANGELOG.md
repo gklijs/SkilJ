@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retrying a parked inbound external event (`retryParkedDelivery`) could
+  silently lose it. When the bridge's request carried a `dedupe` cursor
+  and later messages on the same partition had been recorded since, the
+  retry was taken for a stale redelivery: nothing was created and the
+  parked row was deleted as if it had succeeded. A retry now dedupes
+  under a cursor of its own per parked row, so it is created. The one
+  case this trades away: an original attempt that committed without the
+  bridge hearing back and was parked anyway is created twice on retry
+  (docs/architecture.md §173, Codeberg issue #58).
 - Two projections whose generated GraphQL type names collide
   (`{a_b}` + `c` against `{a}` + `b_c`, or a nested `{parent}_{field}`
   against another top-level name) are now resolved the same way on every

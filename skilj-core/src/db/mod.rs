@@ -9414,19 +9414,26 @@ pub fn parked_delivery_redrive_identity(
     }
 }
 
-/// The `dedupe` partition an `ExternalEvent`-kind redrive uses when the
-/// bridge's own request carried no `dedupe` cursor, always at sequence
-/// `1`: one partition per parked row, under the row's own token (the
-/// watermark's `adapter_id`). The first redrive lands and sets the
-/// watermark; any later redrive of the same row - one whose event
-/// committed but whose row delete then failed - is `Redelivered`, not a
-/// second event. The `ExternalEvent` counterpart of
+/// The `dedupe` partition every `ExternalEvent`-kind redrive uses,
+/// always at sequence `1`: one partition per parked row, under the row's
+/// own token (the watermark's `adapter_id`). The first redrive lands and
+/// sets the watermark; any later redrive of the same row - one whose
+/// event committed but whose row delete then failed - is `Redelivered`,
+/// not a second event. The `ExternalEvent` counterpart of
 /// [`parked_delivery_redrive_identity`]'s idempotency keys. Leaves one
-/// `external_message_cursors` row per such redrive, which is bounded by
-/// how often operators retry parked deliveries.
+/// `external_message_cursors` row per redrive, which is bounded by how
+/// often operators retry parked deliveries.
 ///
-/// A request that did carry a cursor keeps it: that cursor also dedupes
-/// against the bridge's own original attempt, which this can't.
+/// Used even when the bridge's request carried a cursor of its own
+/// (Codeberg issue #58). By the time a parked message is retried, the
+/// bridge has committed past it and kept recording that partition, so
+/// the partition's watermark is usually beyond the parked sequence, and
+/// redriving under the original cursor was deduped away - nothing
+/// created, the row deleted as a success. The cost: an original attempt
+/// that committed without the bridge hearing back, then got parked, is
+/// created a second time on retry. The watermark keeps only the highest
+/// sequence per partition, so that case can't be told apart from a
+/// message later ones overtook (docs/architecture.md §173).
 pub fn parked_delivery_redrive_dedupe_partition_key(delivery: &ParkedDelivery) -> String {
     format!(
         "{}{}",

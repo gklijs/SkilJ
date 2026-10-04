@@ -33,23 +33,17 @@ use skilj_core::db::{self, ParkedDelivery, ParkedDeliveryKind};
 /// on that this small a struct would justify adding" reasoning
 /// `skilj-graphql::error::current_trace_id`'s own doc comment gives for
 /// its identical `skilj-rest` copy. What a bridge originally sent is
-/// exactly what a retry resubmits.
+/// what a retry resubmits, except its `dedupe` cursor, which is left
+/// stored but not decoded: the redrive uses one of its own (see
+/// `db::parked_delivery_redrive_dedupe_partition_key`).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExternalEventRedrive {
     payload: serde_json::Value,
     source_content: String,
     source_context: Option<String>,
-    dedupe: Option<DedupeRedrive>,
     correlation_id: Option<String>,
     causation_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DedupeRedrive {
-    partition_key: String,
-    sequence: i64,
 }
 
 /// Mirrors `skilj-rest::routes::CommandTriggerRequest`'s own wire shape -
@@ -175,18 +169,16 @@ async fn redrive_parked_delivery(
             let redrive: ExternalEventRedrive = decode_request(&delivery.request_json)?;
             let payload = serde_json::to_string(&redrive.payload)
                 .expect("serde_json::Value serialization is infallible");
-            let fallback_partition_key = db::parked_delivery_redrive_dedupe_partition_key(delivery);
-            let dedupe = match &redrive.dedupe {
-                Some(d) => db::DedupeCursor {
-                    partition_key: &d.partition_key,
-                    sequence: d.sequence,
-                },
-                None => db::DedupeCursor {
-                    partition_key: &fallback_partition_key,
-                    sequence: 1,
-                },
+            // Never the bridge's own cursor (Codeberg issue #58): the
+            // bridge committed past this message and kept recording, so
+            // its partition's watermark is usually beyond it already, and
+            // reusing the cursor would dedupe the redrive away.
+            let partition_key = db::parked_delivery_redrive_dedupe_partition_key(delivery);
+            let dedupe = db::DedupeCursor {
+                partition_key: &partition_key,
+                sequence: 1,
             };
-            db::create_and_insert_external_event(
+            let outcome = db::create_and_insert_external_event(
                 &state.pool,
                 state.projection_dispatcher.as_ref(),
                 &state.event_broadcaster,
@@ -202,6 +194,16 @@ async fn redrive_parked_delivery(
                 state.encryption_master_key.as_ref(),
             )
             .await?;
+            // Only an earlier redrive of this same row can have used this
+            // cursor - one whose event committed but whose row delete
+            // failed - so the event exists and dropping the row is right.
+            if matches!(outcome, db::CreateExternalEventOutcome::Redelivered) {
+                tracing::info!(
+                    parked_delivery = %delivery.id,
+                    "parked external event was already created by an earlier retry - \
+                     removing the row without creating it again"
+                );
+            }
         }
         ParkedDeliveryKind::CommandTrigger => {
             let access_token_id = delivery

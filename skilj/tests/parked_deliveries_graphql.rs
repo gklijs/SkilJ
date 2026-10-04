@@ -880,6 +880,95 @@ fn concurrent_retries_of_one_parked_delivery_redrive_it_once() {
     });
 }
 
+/// A bridge parks a message that carries a `dedupe` cursor and then
+/// carries on: later messages on the same partition are recorded, moving
+/// that partition's watermark past the parked one. Redriving the parked
+/// message must still create its event - before the fix (Codeberg issue
+/// #58) it reused the original cursor, was taken for a stale
+/// redelivery, created nothing, and the row was deleted as if it had
+/// succeeded.
+#[test]
+fn a_parked_message_overtaken_on_its_partition_is_still_created_on_retry() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _) = setup().await;
+        let credential = mint_external_event_token(&pool, &bc_name).await;
+        let rest = skilj.rest_router();
+        let graphql = skilj.graphql_router().await.unwrap();
+
+        // Message 77 failed and was parked with its cursor...
+        let seeded = db::insert_parked_delivery(
+            &pool,
+            &bc_name,
+            "kafka-inbound",
+            db::ParkedDeliveryKind::ExternalEvent,
+            "orders:0:77",
+            Some(&credential.0),
+            None,
+            None,
+            &json!({
+                "payload": { "amount": 77 },
+                "sourceContent": "kafka:orders:0:77",
+                "dedupe": { "partitionKey": "orders:0", "sequence": 77 },
+            }),
+            "connection refused",
+            3,
+            test_now(),
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        // ...and the bridge moved on to message 78 on the same partition.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events/external")
+            .header(
+                "authorization",
+                format!("Bearer {}.{}", credential.0, credential.1),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "payload": { "amount": 78 },
+                    "sourceContent": "kafka:orders:0:78",
+                    "dedupe": { "partitionKey": "orders:0", "sequence": 78 },
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = rest.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let retried = graphql_request(
+            &graphql,
+            Some(&jwt),
+            "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+            json!({ "bc": bc_name, "id": seeded.id }),
+        )
+        .await;
+        assert!(retried.get("errors").is_none(), "{retried:?}");
+
+        let amounts: Vec<String> = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert_eq!(
+            amounts.len(),
+            2,
+            "the parked message must be created, not deduped away: {amounts:?}"
+        );
+        assert!(db::list_parked_deliveries(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
 /// A retry whose redrive commits but whose row delete then fails leaves
 /// the row parked; retrying it again must not land the event a second
 /// time. An `ExternalEvent` request without a `dedupe` cursor has no key
