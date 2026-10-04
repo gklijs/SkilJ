@@ -109,7 +109,7 @@ use futures_util::TryStreamExt;
 use skilj_bridge::parked_payload;
 pub use skilj_bridge::{
     correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
-    InboundMapping, Tag, HTTP_REQUEST_TIMEOUT,
+    InboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
 };
 
 /// Header names for the two Codeberg-issue-#18 ids this bridge carries,
@@ -152,12 +152,6 @@ pub struct OutboundMapping {
     /// skilj-side bookkeeping, with no broker-side echo. `None` (the
     /// default) means unpartitioned.
     pub partition: Option<(u32, u32)>,
-}
-
-/// `skilj_kafka::owns_partition_for`'s own identical twin, for
-/// `OutboundMapping::partition` here.
-fn owns_partition_for(mapping: &OutboundMapping, key: Option<&str>) -> bool {
-    skilj_bridge::owns_partition(mapping.partition, key)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -223,92 +217,61 @@ impl BridgeError {
     }
 }
 
-/// Codeberg issue #21 - the backoff state one [`OutboundMapping`]'s own
-/// blocked head-of-line event carries across [`produce_once`] calls,
-/// threaded in by [`run_outbound`] (one instance per mapping) - the
-/// identical shape `skilj_kafka::OutboundRetryState`/
-/// `skilj_amqp::OutboundRetryState` already have.
-#[derive(Debug, Clone, Copy)]
-pub struct OutboundRetryState {
-    /// Which event this state belongs to - `produce_once` clears the
-    /// state whenever a different sequence succeeds, so a stale state
-    /// left over from an old, now-skipped event is never mistaken for
-    /// the current head's.
-    sequence: i64,
-    attempt: u32,
-    first_failed_at: DateTime<Utc>,
-    next_attempt_at: DateTime<Utc>,
+/// JetStream's own half of [`skilj_bridge::outbound_cycle`]: publishes
+/// one event to the mapping's subject and waits for JetStream's publish
+/// acknowledgement. The `Nats-Msg-Id` this sets (see this module's own
+/// "Redelivery safety" doc section) is what keeps an event published
+/// again - after its acknowledgement to skilj failed - from landing
+/// twice, via JetStream's own server-side dedup window.
+struct JetstreamSink<'a> {
+    jetstream: &'a Jetstream,
+    bounded_context: &'a str,
+    mapping: &'a OutboundMapping,
 }
 
-async fn ack_event(
-    http: &reqwest::Client,
-    skilj_base_url: &str,
-    mapping: &OutboundMapping,
-    sequence: i64,
-) -> Result<(), BridgeError> {
-    Ok(skilj_bridge::ack(http, skilj_base_url, &mapping.credential, sequence).await?)
-}
+impl skilj_bridge::OutboundSink for JetstreamSink<'_> {
+    type Error = BridgeError;
 
-/// Publishes one event to JetStream, then acknowledges it to skilj -
-/// never the other order, so a crash between the two redelivers the
-/// same event next cycle rather than silently dropping it; the
-/// `Nats-Msg-Id` this sets (see this module's own "Redelivery safety"
-/// doc section) is what keeps that redelivered publish from landing
-/// twice on the JetStream side, for free, via JetStream's own
-/// server-side dedup window.
-async fn publish_and_ack_one(
-    http: &reqwest::Client,
-    skilj_base_url: &str,
-    jetstream: &Jetstream,
-    bounded_context: &str,
-    mapping: &OutboundMapping,
-    event: &ConsumedEvent,
-) -> Result<(), BridgeError> {
-    let payload = event.payload.to_string().into_bytes();
-    let message_id = format!("{bounded_context}:{}", event.sequence);
-    let mut publish = PublishMessage::build()
-        .payload(payload.into())
-        .message_id(message_id);
-    if let Some(key) = correlation_key(mapping.correlation_tag_key.as_deref(), &event.tags) {
-        publish = publish.header("Skilj-Correlation-Key", key.as_str());
+    fn broker_name(&self) -> &'static str {
+        "JetStream"
     }
-    // Codeberg issue #18 - always present on correlation_id (the spec's
-    // own CorrelationIdIsAlwaysRecorded invariant), absent for a root
-    // event's causation_id. Distinct headers from `Skilj-Correlation-Key`
-    // above - see this module's own doc comment on `CORRELATION_ID_HEADER`.
-    if let Some(id) = &event.metadata.correlation_id {
-        publish = publish.header(CORRELATION_ID_HEADER, id.as_str());
+
+    async fn deliver(&mut self, event: &ConsumedEvent) -> Result<(), BridgeError> {
+        let payload = event.payload.to_string().into_bytes();
+        let message_id = format!("{}:{}", self.bounded_context, event.sequence);
+        let mut publish = PublishMessage::build()
+            .payload(payload.into())
+            .message_id(message_id);
+        if let Some(key) = correlation_key(self.mapping.correlation_tag_key.as_deref(), &event.tags)
+        {
+            publish = publish.header("Skilj-Correlation-Key", key.as_str());
+        }
+        // Codeberg issue #18 - always present on correlation_id (the spec's
+        // own CorrelationIdIsAlwaysRecorded invariant), absent for a root
+        // event's causation_id. Distinct headers from `Skilj-Correlation-Key`
+        // above - see this module's own doc comment on `CORRELATION_ID_HEADER`.
+        if let Some(id) = &event.metadata.correlation_id {
+            publish = publish.header(CORRELATION_ID_HEADER, id.as_str());
+        }
+        if let Some(id) = &event.metadata.causation_id {
+            publish = publish.header(CAUSATION_ID_HEADER, id.as_str());
+        }
+        self.jetstream
+            .send_publish(self.mapping.subject.clone(), publish)
+            .await?
+            .await?;
+        Ok(())
     }
-    if let Some(id) = &event.metadata.causation_id {
-        publish = publish.header(CAUSATION_ID_HEADER, id.as_str());
-    }
-    jetstream
-        .send_publish(mapping.subject.clone(), publish)
-        .await?
-        .await?;
-    ack_event(http, skilj_base_url, mapping, event.sequence).await
 }
 
 /// One fetch-publish-ack cycle for a single [`OutboundMapping`] -
 /// [`run_outbound`] is just this in a loop. Exposed separately so it can
 /// be driven directly in tests, the identical shape
 /// `skilj_kafka::produce_once`/`skilj_amqp::produce_once` already have.
-/// Returns how many events this cycle actually published (0 when the
-/// mapping's own read cursor is already caught up, or when its own head
-/// event is still in backoff - see [`OutboundRetryState`]'s own doc
-/// comment). A skipped event (Codeberg issue #21 - `retry_policy`
-/// exhausted) is acknowledged but not counted here, so a caller checking
-/// "did this cycle make real progress" isn't misled into thinking
-/// JetStream actually received it.
-///
-/// A failure publishing *or* acknowledging one event stops this cycle
-/// right there - `retry_state` records it, and no event behind it is
-/// even attempted this cycle (the identical "the head blocks everything
-/// behind it" behaviour `skilj_kafka::produce_once`/
-/// `catch_up_cross_context_route` already have, and for the same reason:
-/// skipping ahead would silently drop the blocked event from ever being
-/// retried, since nothing would ever revisit it once a later one's own
-/// ack passes it).
+/// See [`skilj_bridge::outbound_cycle`] for what a cycle does: events are
+/// published strictly in sequence order, one at a time, and acknowledged
+/// once per contiguous run; it returns how many were published and
+/// acknowledged.
 pub async fn produce_once(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -318,98 +281,26 @@ pub async fn produce_once(
     retry_policy: &skilj_retry::RetryPolicy,
     retry_state: &mut Option<OutboundRetryState>,
 ) -> Result<usize, BridgeError> {
-    if let Some(state) = retry_state {
-        if Utc::now() < state.next_attempt_at {
-            return Ok(0);
-        }
-    }
-
-    let consumed = skilj_bridge::consume(
+    let target = skilj_bridge::OutboundTarget {
+        credential: &mapping.credential,
+        event_type: &mapping.event_type,
+        partition: mapping.partition,
+        key_tag_key: mapping.correlation_tag_key.as_deref(),
+    };
+    let mut sink = JetstreamSink {
+        jetstream,
+        bounded_context,
+        mapping,
+    };
+    skilj_bridge::outbound_cycle(
         http,
         skilj_base_url,
-        &mapping.credential,
-        &mapping.event_type,
+        &target,
+        &mut sink,
+        retry_policy,
+        retry_state,
     )
-    .await?;
-
-    let mut served = 0;
-    for event in &consumed.events {
-        let key = correlation_key(mapping.correlation_tag_key.as_deref(), &event.tags);
-        let owned = owns_partition_for(mapping, key.as_deref());
-        let outcome = if owned {
-            publish_and_ack_one(
-                http,
-                skilj_base_url,
-                jetstream,
-                bounded_context,
-                mapping,
-                event,
-            )
-            .await
-        } else {
-            // Codeberg issue #25's investigation (docs/architecture.md
-            // §54) - not this instance's own partition: acknowledged
-            // (advancing this instance's own cursor) without ever being
-            // published to JetStream - see `OutboundMapping::partition`'s
-            // own doc comment.
-            ack_event(http, skilj_base_url, mapping, event.sequence).await
-        };
-        match outcome {
-            Ok(()) => {
-                if owned {
-                    served += 1;
-                }
-                if retry_state.is_some_and(|s| s.sequence == event.sequence) {
-                    *retry_state = None;
-                }
-            }
-            Err(e) => {
-                let now = Utc::now();
-                let (attempt, first_failed_at) = match retry_state {
-                    Some(state) if state.sequence == event.sequence => {
-                        state.attempt += 1;
-                        (state.attempt, state.first_failed_at)
-                    }
-                    _ => {
-                        *retry_state = Some(OutboundRetryState {
-                            sequence: event.sequence,
-                            attempt: 1,
-                            first_failed_at: now,
-                            next_attempt_at: now,
-                        });
-                        (1, now)
-                    }
-                };
-                let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
-                if retry_policy.is_exhausted(attempt, elapsed) {
-                    tracing::error!(
-                        event_type = %mapping.event_type,
-                        sequence = event.sequence,
-                        attempt,
-                        error = %e,
-                        "giving up on this event after repeated failures - skipping it \
-                         (acknowledging without ever publishing it to JetStream) so the \
-                         stream isn't blocked forever"
-                    );
-                    ack_event(http, skilj_base_url, mapping, event.sequence).await?;
-                    *retry_state = None;
-                    continue;
-                }
-                tracing::warn!(
-                    event_type = %mapping.event_type,
-                    sequence = event.sequence,
-                    attempt,
-                    error = %e,
-                    "publishing/acknowledging this event failed - will retry with backoff"
-                );
-                if let Some(state) = retry_state {
-                    state.next_attempt_at = retry_policy.next_attempt_at(now, attempt);
-                }
-                return Ok(served);
-            }
-        }
-    }
-    Ok(served)
+    .await
 }
 
 /// Runs [`produce_once`] forever, one mapping at a time in the order
@@ -968,60 +859,4 @@ mod tests {
     }
 
     // --- Codeberg issue #25's investigation (docs/architecture.md §54) ---
-
-    #[test]
-    fn owns_partition_for_is_always_true_when_unpartitioned() {
-        let mapping = OutboundMapping {
-            event_type: "OrderPlaced".to_string(),
-            credential: "irrelevant".to_string(),
-            subject: "irrelevant".to_string(),
-            correlation_tag_key: None,
-            partition: None,
-        };
-        for key in [None, Some("o-1"), Some("o-2"), Some("")] {
-            assert!(owns_partition_for(&mapping, key));
-        }
-    }
-
-    /// Every key must be owned by exactly one partition index - not zero
-    /// (a key silently dropped by every instance) and not more than one
-    /// (a key double-published by two instances), for a real spread of
-    /// keys, not just one.
-    #[test]
-    fn owns_partition_for_assigns_every_key_to_exactly_one_partition() {
-        let partition_count = 4;
-        let keys: Vec<Option<&str>> = vec![
-            Some("o-1"),
-            Some("o-2"),
-            Some("o-3"),
-            Some("o-4"),
-            Some("o-5"),
-            Some("o-6"),
-            Some("o-7"),
-            Some("o-8"),
-            None,
-        ];
-        for key in keys {
-            let owners: Vec<u32> = (0..partition_count)
-                .filter(|&partition_index| {
-                    owns_partition_for(
-                        &OutboundMapping {
-                            event_type: "OrderPlaced".to_string(),
-                            credential: "irrelevant".to_string(),
-                            subject: "irrelevant".to_string(),
-                            correlation_tag_key: None,
-                            partition: Some((partition_index, partition_count)),
-                        },
-                        key,
-                    )
-                })
-                .collect();
-            assert_eq!(
-                owners.len(),
-                1,
-                "key {key:?} must be owned by exactly one of {partition_count} partitions, \
-                 got {owners:?}"
-            );
-        }
-    }
 }

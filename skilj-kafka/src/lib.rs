@@ -76,12 +76,13 @@
 //!
 //! # Producer configuration
 //!
-//! [`produce_once`] produces and acknowledges strictly one event at a
-//! time, in sequence order: the read cursor is a single position that
-//! refuses to move backwards, so acknowledging any later event first
-//! (or concurrently) could pass an earlier one that then fails, and
-//! nothing would ever fetch it again. With one record in flight per
-//! mapping, per-key order in Kafka holds without any producer setting.
+//! [`produce_once`] produces strictly one event at a time, in sequence
+//! order, and acknowledges once per contiguous run of handled events -
+//! never past one that hasn't been produced. The read cursor is a single
+//! position that refuses to move backwards, so acknowledging a later
+//! event before an earlier one is produced could pass it, and nothing
+//! would ever fetch it again. With one record in flight per mapping,
+//! per-key order in Kafka holds without any producer setting.
 //!
 //! What the caller's own `ClientConfig` still decides:
 //!
@@ -116,7 +117,7 @@ use std::time::Duration;
 use skilj_bridge::parked_payload;
 pub use skilj_bridge::{
     correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
-    InboundMapping, Tag, HTTP_REQUEST_TIMEOUT,
+    InboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
 };
 
 /// Header names for the two Codeberg-issue-#18 ids this bridge carries
@@ -179,15 +180,6 @@ pub struct OutboundMapping {
     pub partition: Option<(u32, u32)>,
 }
 
-/// Whether `mapping` (partitioned or not) is responsible for an event
-/// whose own [`correlation_key`] output is `key` - `true` unconditionally
-/// for an unpartitioned mapping (`partition: None`), matching
-/// [`partition_for_key`] against this mapping's own `partition_index`
-/// otherwise.
-fn owns_partition_for(mapping: &OutboundMapping, key: Option<&str>) -> bool {
-    skilj_bridge::owns_partition(mapping.partition, key)
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error("calling skilj's own REST surface: {0}")]
@@ -245,101 +237,67 @@ impl BridgeError {
     }
 }
 
-/// Codeberg issue #21 - the backoff state one [`OutboundMapping`]'s own
-/// blocked head-of-line event carries across [`produce_once`] calls,
-/// threaded in by [`run_outbound`] (one instance per mapping - see its
-/// own doc comment). Only the head can ever be blocked: [`produce_once`]
-/// never attempts an event *behind* one still in backoff (see its own
-/// doc comment), the identical invariant `skilj_core::db`'s own
-/// `cross_context_route_cursors` retry columns rely on for the same
-/// reason.
-#[derive(Debug, Clone, Copy)]
-pub struct OutboundRetryState {
-    /// Which event this state belongs to - `produce_once` clears the
-    /// state whenever a different sequence succeeds, so a stale state
-    /// left over from an old, now-skipped event is never mistaken for
-    /// the current head's.
-    sequence: i64,
-    attempt: u32,
-    first_failed_at: DateTime<Utc>,
-    next_attempt_at: DateTime<Utc>,
+/// Kafka's own half of [`skilj_bridge::outbound_cycle`]: produces one
+/// event to the mapping's topic, keyed by its [`correlation_key`].
+struct KafkaSink<'a> {
+    producer: &'a FutureProducer,
+    mapping: &'a OutboundMapping,
 }
 
-async fn ack_event(
-    http: &reqwest::Client,
-    skilj_base_url: &str,
-    mapping: &OutboundMapping,
-    sequence: i64,
-) -> Result<(), BridgeError> {
-    Ok(skilj_bridge::ack(http, skilj_base_url, &mapping.credential, sequence).await?)
-}
+impl skilj_bridge::OutboundSink for KafkaSink<'_> {
+    type Error = BridgeError;
 
-/// Produces one event to Kafka, then acknowledges it to skilj - never
-/// the other order, so a crash between the two redelivers the same event
-/// next cycle rather than silently dropping it. That redelivered produce
-/// does land on Kafka a second time: `enable.idempotence` only covers the
-/// producer's own internal retries, not a fresh `send` of the same event
-/// (see this crate's own "Producer configuration" section), so Kafka
-/// consumers must tolerate duplicates.
-async fn produce_and_ack_one(
-    http: &reqwest::Client,
-    skilj_base_url: &str,
-    producer: &FutureProducer,
-    mapping: &OutboundMapping,
-    event: &ConsumedEvent,
-) -> Result<(), BridgeError> {
-    let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
-    let payload = event.payload.to_string();
-    let mut record = FutureRecord::to(&mapping.topic).payload(&payload);
-    if let Some(k) = key.as_deref() {
-        record = record.key(k);
+    fn broker_name(&self) -> &'static str {
+        "Kafka"
     }
-    // Codeberg issue #18 - forwards the event's own correlation_id/
-    // causation_id (always present on correlation_id, per the spec's own
-    // CorrelationIdIsAlwaysRecorded invariant; causation_id absent for a
-    // root event) as headers, distinct from `key` above.
-    let mut headers = OwnedHeaders::new();
-    if let Some(id) = &event.metadata.correlation_id {
-        headers = headers.insert(Header {
-            key: CORRELATION_ID_HEADER,
-            value: Some(id),
-        });
+
+    async fn deliver(&mut self, event: &ConsumedEvent) -> Result<(), BridgeError> {
+        let key = correlation_key(self.mapping.key_tag_key.as_deref(), &event.tags);
+        let payload = event.payload.to_string();
+        let mut record = FutureRecord::to(&self.mapping.topic).payload(&payload);
+        if let Some(k) = key.as_deref() {
+            record = record.key(k);
+        }
+        // Codeberg issue #18 - forwards the event's own correlation_id/
+        // causation_id (always present on correlation_id, per the spec's
+        // own CorrelationIdIsAlwaysRecorded invariant; causation_id absent
+        // for a root event) as headers, distinct from `key` above.
+        let mut headers = OwnedHeaders::new();
+        if let Some(id) = &event.metadata.correlation_id {
+            headers = headers.insert(Header {
+                key: CORRELATION_ID_HEADER,
+                value: Some(id),
+            });
+        }
+        if let Some(id) = &event.metadata.causation_id {
+            headers = headers.insert(Header {
+                key: CAUSATION_ID_HEADER,
+                value: Some(id),
+            });
+        }
+        if headers.count() > 0 {
+            record = record.headers(headers);
+        }
+        self.producer
+            .send(record, Duration::from_secs(10))
+            .await
+            .map_err(|(e, _)| e)?;
+        Ok(())
     }
-    if let Some(id) = &event.metadata.causation_id {
-        headers = headers.insert(Header {
-            key: CAUSATION_ID_HEADER,
-            value: Some(id),
-        });
-    }
-    if headers.count() > 0 {
-        record = record.headers(headers);
-    }
-    producer
-        .send(record, Duration::from_secs(10))
-        .await
-        .map_err(|(e, _)| e)?;
-    ack_event(http, skilj_base_url, mapping, event.sequence).await
 }
 
 /// One fetch-produce-ack cycle for a single [`OutboundMapping`] -
 /// [`run_outbound`] is just this in a loop. Exposed separately so it can
 /// be driven directly in tests without needing to interrupt a running
-/// loop, the same shape `skilj_temporal::poll_once` already has. Returns
-/// how many events this cycle actually produced (0 when the mapping's
-/// own read cursor is already caught up, or when its own head event is
-/// still in backoff - see [`OutboundRetryState`]'s own doc comment). A
-/// skipped event (Codeberg issue #21 - `retry_policy` exhausted) is
-/// acknowledged but not counted here, so a caller checking "did this
-/// cycle make real progress" isn't misled into thinking Kafka actually
-/// received it.
-///
-/// A failure produces *or* acknowledging one event stops this cycle
-/// right there - `retry_state` records it, and no event behind it is
-/// even attempted this cycle (the identical "the head blocks everything
-/// behind it" behaviour `catch_up_cross_context_route` has, and for the
-/// same reason: skipping ahead would silently drop the blocked event
-/// from ever being retried, since nothing would ever revisit it once a
-/// later one's own ack passes it).
+/// loop, the same shape `skilj_temporal::poll_once` already has. See
+/// [`skilj_bridge::outbound_cycle`] for what a cycle does: events are
+/// produced strictly in sequence order, one at a time, and acknowledged
+/// once per contiguous run; it returns how many were produced and
+/// acknowledged. An event is acknowledged only after Kafka accepted it,
+/// so a crash in between produces it again next cycle - and that second
+/// produce does land on Kafka: `enable.idempotence` only covers the
+/// producer's own internal retries (see this crate's own "Producer
+/// configuration" section), so Kafka consumers must tolerate duplicates.
 pub async fn produce_once(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -348,97 +306,22 @@ pub async fn produce_once(
     retry_policy: &skilj_retry::RetryPolicy,
     retry_state: &mut Option<OutboundRetryState>,
 ) -> Result<usize, BridgeError> {
-    if let Some(state) = retry_state {
-        if Utc::now() < state.next_attempt_at {
-            return Ok(0);
-        }
-    }
-
-    let consumed = skilj_bridge::consume(
+    let target = skilj_bridge::OutboundTarget {
+        credential: &mapping.credential,
+        event_type: &mapping.event_type,
+        partition: mapping.partition,
+        key_tag_key: mapping.key_tag_key.as_deref(),
+    };
+    let mut sink = KafkaSink { producer, mapping };
+    skilj_bridge::outbound_cycle(
         http,
         skilj_base_url,
-        &mapping.credential,
-        &mapping.event_type,
+        &target,
+        &mut sink,
+        retry_policy,
+        retry_state,
     )
-    .await?;
-
-    let mut served = 0;
-    for event in &consumed.events {
-        let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
-        let owned = owns_partition_for(mapping, key.as_deref());
-        let outcome = if owned {
-            produce_and_ack_one(http, skilj_base_url, producer, mapping, event).await
-        } else {
-            // Codeberg issue #25's investigation (docs/architecture.md
-            // §54) - not this instance's own partition: acknowledged
-            // (so this instance's own cursor still advances past it)
-            // without ever being produced to Kafka. Whichever instance
-            // *does* own this event's own partition sees it too, via its
-            // own dedicated credential/cursor - see `OutboundMapping::partition`'s
-            // own doc comment.
-            ack_event(http, skilj_base_url, mapping, event.sequence).await
-        };
-        match outcome {
-            Ok(()) => {
-                // A partition-skip is acknowledged but not counted here,
-                // the identical "not misleading a caller checking did
-                // this cycle make real progress" treatment this
-                // function's own doc comment already gives a
-                // retry-exhausted skip below.
-                if owned {
-                    served += 1;
-                }
-                if retry_state.is_some_and(|s| s.sequence == event.sequence) {
-                    *retry_state = None;
-                }
-            }
-            Err(e) => {
-                let now = Utc::now();
-                let (attempt, first_failed_at) = match retry_state {
-                    Some(state) if state.sequence == event.sequence => {
-                        state.attempt += 1;
-                        (state.attempt, state.first_failed_at)
-                    }
-                    _ => {
-                        *retry_state = Some(OutboundRetryState {
-                            sequence: event.sequence,
-                            attempt: 1,
-                            first_failed_at: now,
-                            next_attempt_at: now,
-                        });
-                        (1, now)
-                    }
-                };
-                let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
-                if retry_policy.is_exhausted(attempt, elapsed) {
-                    tracing::error!(
-                        event_type = %mapping.event_type,
-                        sequence = event.sequence,
-                        attempt,
-                        error = %e,
-                        "giving up on this event after repeated failures - skipping it \
-                         (acknowledging without ever producing it to Kafka) so the stream \
-                         isn't blocked forever"
-                    );
-                    ack_event(http, skilj_base_url, mapping, event.sequence).await?;
-                    *retry_state = None;
-                    continue;
-                }
-                tracing::warn!(
-                    event_type = %mapping.event_type,
-                    sequence = event.sequence,
-                    attempt,
-                    error = %e,
-                    "producing/acknowledging this event failed - will retry with backoff"
-                );
-                if let Some(state) = retry_state {
-                    state.next_attempt_at = retry_policy.next_attempt_at(now, attempt);
-                }
-                return Ok(served);
-            }
-        }
-    }
-    Ok(served)
+    .await
 }
 
 /// Runs [`produce_once`] forever, one mapping at a time in the order
@@ -976,60 +859,4 @@ mod tests {
     }
 
     // --- Codeberg issue #25's investigation (docs/architecture.md §54) ---
-
-    #[test]
-    fn owns_partition_for_is_always_true_when_unpartitioned() {
-        let mapping = OutboundMapping {
-            event_type: "OrderPlaced".to_string(),
-            credential: "irrelevant".to_string(),
-            topic: "irrelevant".to_string(),
-            key_tag_key: None,
-            partition: None,
-        };
-        for key in [None, Some("o-1"), Some("o-2"), Some("")] {
-            assert!(owns_partition_for(&mapping, key));
-        }
-    }
-
-    /// Every key must be owned by exactly one partition index - not zero
-    /// (a key silently dropped by every instance) and not more than one
-    /// (a key double-published by two instances), for a real spread of
-    /// keys, not just one.
-    #[test]
-    fn owns_partition_for_assigns_every_key_to_exactly_one_partition() {
-        let partition_count = 4;
-        let keys: Vec<Option<&str>> = vec![
-            Some("o-1"),
-            Some("o-2"),
-            Some("o-3"),
-            Some("o-4"),
-            Some("o-5"),
-            Some("o-6"),
-            Some("o-7"),
-            Some("o-8"),
-            None,
-        ];
-        for key in keys {
-            let owners: Vec<u32> = (0..partition_count)
-                .filter(|&partition_index| {
-                    owns_partition_for(
-                        &OutboundMapping {
-                            event_type: "OrderPlaced".to_string(),
-                            credential: "irrelevant".to_string(),
-                            topic: "irrelevant".to_string(),
-                            key_tag_key: None,
-                            partition: Some((partition_index, partition_count)),
-                        },
-                        key,
-                    )
-                })
-                .collect();
-            assert_eq!(
-                owners.len(),
-                1,
-                "key {key:?} must be owned by exactly one of {partition_count} partitions, \
-                 got {owners:?}"
-            );
-        }
-    }
 }

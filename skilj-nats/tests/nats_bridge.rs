@@ -152,6 +152,10 @@ struct MockSkiljState {
     queues: Arc<Mutex<std::collections::HashMap<String, std::collections::VecDeque<Value>>>>,
     event_types: Arc<Mutex<std::collections::HashMap<String, String>>>,
     acked: Arc<Mutex<Vec<i64>>>,
+    /// The highest sequence acknowledged so far per bearer credential -
+    /// a lower one is refused with 409, the real server's own
+    /// `acknowledgement_regresses` (a read cursor never moves backwards).
+    ack_cursors: Arc<Mutex<std::collections::HashMap<String, i64>>>,
     external_requests: Arc<Mutex<Vec<Value>>>,
     trigger_requests: Arc<Mutex<Vec<TriggerRequest>>>,
     /// Codeberg issue #21 - `POST /v1/events/external` returns a 500
@@ -209,8 +213,15 @@ async fn post_events_consume_ack(
         }
     }
     let sequence = body["sequence"].as_i64().unwrap();
-    state.acked.lock().unwrap().push(sequence);
     let token = bearer_token(&headers);
+    {
+        let mut cursors = state.ack_cursors.lock().unwrap();
+        if cursors.get(&token).is_some_and(|&cursor| sequence < cursor) {
+            return StatusCode::CONFLICT;
+        }
+        cursors.insert(token.clone(), sequence);
+    }
+    state.acked.lock().unwrap().push(sequence);
     if let Some(q) = state.queues.lock().unwrap().get_mut(&token) {
         q.retain(|e| e["sequence"].as_i64().unwrap_or(i64::MIN) > sequence);
     }
@@ -860,13 +871,14 @@ fn two_partitioned_mappings_together_publish_every_key_exactly_once() {
             "every key must be published exactly once across both partitions"
         );
 
-        let expected_sequences: Vec<i64> = (0..order_ids.len() as i64).collect();
-        let mut acked = mock_state.acked.lock().unwrap().clone();
-        acked.sort_unstable();
-        acked.dedup();
+        // Codeberg issue #40: each instance acknowledges its whole page -
+        // owned events and partition skips alike - with one call for the
+        // last sequence, which moves its cursor past every one of them.
+        let last = order_ids.len() as i64 - 1;
         assert_eq!(
-            acked, expected_sequences,
-            "every sequence must be acknowledged, owned by this partition or not"
+            mock_state.acked.lock().unwrap().as_slice(),
+            &[last, last],
+            "each instance's cursor must pass every sequence, owned by its partition or not"
         );
     });
 }

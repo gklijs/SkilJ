@@ -104,7 +104,7 @@ use std::collections::HashMap;
 use skilj_bridge::parked_payload;
 pub use skilj_bridge::{
     correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
-    InboundMapping, Tag, HTTP_REQUEST_TIMEOUT,
+    InboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
 };
 
 /// The `application-properties` key this bridge uses for causation_id
@@ -144,12 +144,6 @@ pub struct OutboundMapping {
     /// §53's own per-token checkout). `None` (the default) means
     /// unpartitioned.
     pub partition: Option<(u32, u32)>,
-}
-
-/// `skilj_kafka::owns_partition_for`'s own identical twin, for
-/// `OutboundMapping::partition` here.
-fn owns_partition_for(mapping: &OutboundMapping, key: Option<&str>) -> bool {
-    skilj_bridge::owns_partition(mapping.partition, key)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -218,102 +212,79 @@ impl BridgeError {
     }
 }
 
-/// Codeberg issue #21 - the backoff state one [`OutboundMapping`]'s own
-/// blocked head-of-line event carries across [`produce_once`] calls,
-/// threaded in by [`run_outbound`] (one instance per mapping). Only the
-/// head can ever be blocked - see `skilj_kafka::OutboundRetryState`'s own
-/// doc comment for the identical invariant and why.
-#[derive(Debug, Clone, Copy)]
-pub struct OutboundRetryState {
-    sequence: i64,
-    attempt: u32,
-    first_failed_at: DateTime<Utc>,
-    next_attempt_at: DateTime<Utc>,
-}
-
-async fn ack_event(
-    http: &reqwest::Client,
-    skilj_base_url: &str,
-    mapping: &OutboundMapping,
-    sequence: i64,
-) -> Result<(), BridgeError> {
-    Ok(skilj_bridge::ack(http, skilj_base_url, &mapping.credential, sequence).await?)
-}
-
-/// Sends one event to AMQP, then acknowledges it to skilj - never the
-/// other order, so a crash between the two redelivers the same event
-/// next cycle rather than silently dropping it. `group-sequence` is this
-/// event's own skilj sequence number, cast to AMQP 1.0's own 32-bit
-/// field - `None` (omitted, not wrapped) if it doesn't fit, logged as a
-/// real, if distant, protocol-level limit rather than silently producing
-/// a meaningless wrapped value a downstream consumer might mistake for a
+/// AMQP's own half of [`skilj_bridge::outbound_cycle`]: sends one event
+/// to the mapping's address. `group-sequence` is the event's own skilj
+/// sequence number, cast to AMQP 1.0's own 32-bit field - `None`
+/// (omitted, not wrapped) if it doesn't fit, logged as a real, if
+/// distant, protocol-level limit rather than silently producing a
+/// meaningless wrapped value a downstream consumer might mistake for a
 /// genuine ordering.
-async fn send_and_ack_one(
-    http: &reqwest::Client,
-    skilj_base_url: &str,
-    sender: &mut AmqpSender,
-    mapping: &OutboundMapping,
-    event: &ConsumedEvent,
-) -> Result<(), BridgeError> {
-    let group_id = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
-    let group_sequence = match u32::try_from(event.sequence) {
-        Ok(seq) => Some(seq),
-        Err(_) => {
-            tracing::warn!(
-                sequence = event.sequence,
-                "event sequence exceeds AMQP 1.0's own 32-bit group-sequence field - \
-                 omitting it rather than wrapping into a meaningless value"
-            );
-            None
-        }
-    };
-    let payload = event.payload.to_string().into_bytes();
-    // Codeberg issue #18 - `correlation-id` is a real AMQP 1.0 standard
-    // property (`Properties::correlation_id`), set directly;
-    // `causation_id` has no standard equivalent, so it rides in
-    // `application-properties` instead (see `CAUSATION_ID_PROPERTY`'s own
-    // doc comment). correlation_id is always present by this point (the
-    // spec's own CorrelationIdIsAlwaysRecorded invariant); causation_id is
-    // absent for a root event.
-    let mut properties_builder = Properties::builder()
-        .group_id(group_id)
-        .group_sequence(group_sequence);
-    if let Some(id) = event.metadata.correlation_id.clone() {
-        properties_builder = properties_builder.correlation_id(MessageId::String(id));
+struct AmqpSink<'a> {
+    sender: &'a mut AmqpSender,
+    mapping: &'a OutboundMapping,
+}
+
+impl skilj_bridge::OutboundSink for AmqpSink<'_> {
+    type Error = BridgeError;
+
+    fn broker_name(&self) -> &'static str {
+        "AMQP"
     }
-    let application_properties = event.metadata.causation_id.as_deref().map(|id| {
-        ApplicationProperties::builder()
-            .insert(CAUSATION_ID_PROPERTY, id)
-            .build()
-    });
-    let message = Message::builder()
-        .properties(properties_builder.build())
-        .application_properties(application_properties)
-        .data(payload)
-        .build();
-    sender
-        .send(message)
-        .await?
-        .accepted_or_else(BridgeError::NotAccepted)?;
-    ack_event(http, skilj_base_url, mapping, event.sequence).await
+
+    async fn deliver(&mut self, event: &ConsumedEvent) -> Result<(), BridgeError> {
+        let group_id = correlation_key(self.mapping.key_tag_key.as_deref(), &event.tags);
+        let group_sequence = match u32::try_from(event.sequence) {
+            Ok(seq) => Some(seq),
+            Err(_) => {
+                tracing::warn!(
+                    sequence = event.sequence,
+                    "event sequence exceeds AMQP 1.0's own 32-bit group-sequence field - \
+                     omitting it rather than wrapping into a meaningless value"
+                );
+                None
+            }
+        };
+        let payload = event.payload.to_string().into_bytes();
+        // Codeberg issue #18 - `correlation-id` is a real AMQP 1.0 standard
+        // property (`Properties::correlation_id`), set directly;
+        // `causation_id` has no standard equivalent, so it rides in
+        // `application-properties` instead (see `CAUSATION_ID_PROPERTY`'s
+        // own doc comment). correlation_id is always present by this point
+        // (the spec's own CorrelationIdIsAlwaysRecorded invariant);
+        // causation_id is absent for a root event.
+        let mut properties_builder = Properties::builder()
+            .group_id(group_id)
+            .group_sequence(group_sequence);
+        if let Some(id) = event.metadata.correlation_id.clone() {
+            properties_builder = properties_builder.correlation_id(MessageId::String(id));
+        }
+        let application_properties = event.metadata.causation_id.as_deref().map(|id| {
+            ApplicationProperties::builder()
+                .insert(CAUSATION_ID_PROPERTY, id)
+                .build()
+        });
+        let message = Message::builder()
+            .properties(properties_builder.build())
+            .application_properties(application_properties)
+            .data(payload)
+            .build();
+        self.sender
+            .send(message)
+            .await?
+            .accepted_or_else(BridgeError::NotAccepted)?;
+        Ok(())
+    }
 }
 
 /// One fetch-send-ack cycle for a single [`OutboundMapping`] -
 /// [`run_outbound`] is just this in a loop. Exposed separately so it can
 /// be driven directly in tests, the identical shape
 /// `skilj_kafka::produce_once`/`skilj_temporal::poll_once` already have.
-/// Returns how many events this cycle actually sent (0 when the
-/// mapping's own read cursor is already caught up, or when its own head
-/// event is still in backoff - see [`OutboundRetryState`]'s own doc
-/// comment). A skipped event (Codeberg issue #21 - `retry_policy`
-/// exhausted) is acknowledged but not counted here, the identical
-/// "don't misrepresent a skip as real delivery" reasoning
-/// `skilj_kafka::produce_once` already documents.
-///
-/// A failure sending *or* acknowledging one event stops this cycle right
-/// there - `retry_state` records it, and no event behind it is even
-/// attempted this cycle, the identical "the head blocks everything
-/// behind it" behaviour `skilj_kafka::produce_once` already has.
+/// See [`skilj_bridge::outbound_cycle`] for what a cycle does: events are
+/// sent strictly in sequence order, one at a time, and acknowledged once
+/// per contiguous run; it returns how many were sent and acknowledged. An
+/// event is acknowledged only after the broker accepted it, so a crash in
+/// between sends it again next cycle.
 pub async fn produce_once(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -322,90 +293,22 @@ pub async fn produce_once(
     retry_policy: &skilj_retry::RetryPolicy,
     retry_state: &mut Option<OutboundRetryState>,
 ) -> Result<usize, BridgeError> {
-    if let Some(state) = retry_state {
-        if Utc::now() < state.next_attempt_at {
-            return Ok(0);
-        }
-    }
-
-    let consumed = skilj_bridge::consume(
+    let target = skilj_bridge::OutboundTarget {
+        credential: &mapping.credential,
+        event_type: &mapping.event_type,
+        partition: mapping.partition,
+        key_tag_key: mapping.key_tag_key.as_deref(),
+    };
+    let mut sink = AmqpSink { sender, mapping };
+    skilj_bridge::outbound_cycle(
         http,
         skilj_base_url,
-        &mapping.credential,
-        &mapping.event_type,
+        &target,
+        &mut sink,
+        retry_policy,
+        retry_state,
     )
-    .await?;
-
-    let mut served = 0;
-    for event in &consumed.events {
-        let key = correlation_key(mapping.key_tag_key.as_deref(), &event.tags);
-        let owned = owns_partition_for(mapping, key.as_deref());
-        let outcome = if owned {
-            send_and_ack_one(http, skilj_base_url, sender, mapping, event).await
-        } else {
-            // Codeberg issue #25's investigation (docs/architecture.md
-            // §54) - not this instance's own partition: acknowledged
-            // (advancing this instance's own cursor) without ever being
-            // sent to AMQP - see `OutboundMapping::partition`'s own doc
-            // comment.
-            ack_event(http, skilj_base_url, mapping, event.sequence).await
-        };
-        match outcome {
-            Ok(()) => {
-                if owned {
-                    served += 1;
-                }
-                if retry_state.is_some_and(|s| s.sequence == event.sequence) {
-                    *retry_state = None;
-                }
-            }
-            Err(e) => {
-                let now = Utc::now();
-                let (attempt, first_failed_at) = match retry_state {
-                    Some(state) if state.sequence == event.sequence => {
-                        state.attempt += 1;
-                        (state.attempt, state.first_failed_at)
-                    }
-                    _ => {
-                        *retry_state = Some(OutboundRetryState {
-                            sequence: event.sequence,
-                            attempt: 1,
-                            first_failed_at: now,
-                            next_attempt_at: now,
-                        });
-                        (1, now)
-                    }
-                };
-                let elapsed = (now - first_failed_at).to_std().unwrap_or_default();
-                if retry_policy.is_exhausted(attempt, elapsed) {
-                    tracing::error!(
-                        event_type = %mapping.event_type,
-                        sequence = event.sequence,
-                        attempt,
-                        error = %e,
-                        "giving up on this event after repeated failures - skipping it \
-                         (acknowledging without ever sending it to AMQP) so the stream \
-                         isn't blocked forever"
-                    );
-                    ack_event(http, skilj_base_url, mapping, event.sequence).await?;
-                    *retry_state = None;
-                    continue;
-                }
-                tracing::warn!(
-                    event_type = %mapping.event_type,
-                    sequence = event.sequence,
-                    attempt,
-                    error = %e,
-                    "sending/acknowledging this event failed - will retry with backoff"
-                );
-                if let Some(state) = retry_state {
-                    state.next_attempt_at = retry_policy.next_attempt_at(now, attempt);
-                }
-                return Ok(served);
-            }
-        }
-    }
-    Ok(served)
+    .await
 }
 
 /// Runs [`produce_once`] forever, one mapping at a time in the order
@@ -964,62 +867,6 @@ mod tests {
     }
 
     // --- Codeberg issue #25's investigation (docs/architecture.md §54) ---
-
-    #[test]
-    fn owns_partition_for_is_always_true_when_unpartitioned() {
-        let mapping = OutboundMapping {
-            event_type: "OrderPlaced".to_string(),
-            credential: "irrelevant".to_string(),
-            address: "irrelevant".to_string(),
-            key_tag_key: None,
-            partition: None,
-        };
-        for key in [None, Some("o-1"), Some("o-2"), Some("")] {
-            assert!(owns_partition_for(&mapping, key));
-        }
-    }
-
-    /// Every key must be owned by exactly one partition index - not zero
-    /// (a key silently dropped by every instance) and not more than one
-    /// (a key double-sent by two instances), for a real spread of keys,
-    /// not just one.
-    #[test]
-    fn owns_partition_for_assigns_every_key_to_exactly_one_partition() {
-        let partition_count = 4;
-        let keys: Vec<Option<&str>> = vec![
-            Some("o-1"),
-            Some("o-2"),
-            Some("o-3"),
-            Some("o-4"),
-            Some("o-5"),
-            Some("o-6"),
-            Some("o-7"),
-            Some("o-8"),
-            None,
-        ];
-        for key in keys {
-            let owners: Vec<u32> = (0..partition_count)
-                .filter(|&partition_index| {
-                    owns_partition_for(
-                        &OutboundMapping {
-                            event_type: "OrderPlaced".to_string(),
-                            credential: "irrelevant".to_string(),
-                            address: "irrelevant".to_string(),
-                            key_tag_key: None,
-                            partition: Some((partition_index, partition_count)),
-                        },
-                        key,
-                    )
-                })
-                .collect();
-            assert_eq!(
-                owners.len(),
-                1,
-                "key {key:?} must be owned by exactly one of {partition_count} partitions, \
-                 got {owners:?}"
-            );
-        }
-    }
 
     #[test]
     fn message_id_to_string_is_stable_for_each_variant() {

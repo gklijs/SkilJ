@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `skilj-kafka`, `skilj-amqp` and `skilj-nats` acknowledge outbound
+  events to skilj once per contiguous run - one call for a whole page
+  in the common case - instead of once per event. Events are still
+  delivered one at a time, in order, and never acknowledged past one
+  that failed. A failed acknowledgement now re-delivers the whole run
+  rather than one event (still at-least-once). The outbound loop the
+  three shared by copy now lives in `skilj-bridge`
+  (`outbound_cycle`, `OutboundSink`); the bridges' public APIs are
+  unchanged (docs/architecture.md §171, Codeberg issue #40).
+
 ### Fixed
 
 - Two projections whose generated GraphQL type names collide

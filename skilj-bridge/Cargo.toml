@@ -18,6 +18,8 @@ reqwest.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 skilj-retry.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 tokio.workspace = true

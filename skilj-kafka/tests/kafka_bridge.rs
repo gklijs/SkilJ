@@ -1128,13 +1128,14 @@ fn two_partitioned_mappings_together_produce_every_key_exactly_once() {
         // Every sequence acknowledged on *both* tokens - a partition-skip
         // still advances this instance's own cursor, it just never
         // produces to Kafka.
-        let expected_sequences: Vec<i64> = (0..order_ids.len() as i64).collect();
-        let mut acked = mock_state.acked.lock().unwrap().clone();
-        acked.sort_unstable();
-        acked.dedup();
+        // Codeberg issue #40: each instance acknowledges its whole page -
+        // owned events and partition skips alike - with one call for the
+        // last sequence, which moves its cursor past every one of them.
+        let last = order_ids.len() as i64 - 1;
         assert_eq!(
-            acked, expected_sequences,
-            "every sequence must be acknowledged, owned by this partition or not"
+            mock_state.acked.lock().unwrap().as_slice(),
+            &[last, last],
+            "each instance's cursor must pass every sequence, owned by its partition or not"
         );
     });
 }

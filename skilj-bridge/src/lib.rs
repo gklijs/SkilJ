@@ -331,6 +331,270 @@ pub fn owns_partition(partition: Option<(u32, u32)>, key: Option<&str>) -> bool 
     }
 }
 
+/// Codeberg issue #21 - the backoff state one outbound mapping's own
+/// blocked head-of-line event carries across [`outbound_cycle`] calls,
+/// threaded in by each bridge's own `run_outbound` (one instance per
+/// mapping). Only the head can ever be blocked: a cycle never attempts an
+/// event *behind* one still in backoff, the identical invariant
+/// `skilj_core::db`'s own `cross_context_route_cursors` retry columns rely
+/// on for the same reason.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboundRetryState {
+    /// Which event this state belongs to - cleared once an
+    /// acknowledgement covers it, so a stale state left over from an old,
+    /// now-passed event is never mistaken for the current head's.
+    sequence: i64,
+    attempt: u32,
+    first_failed_at: DateTime<Utc>,
+    next_attempt_at: DateTime<Utc>,
+}
+
+/// The broker-specific half of one outbound mapping: hands one event to
+/// the broker. Each bridge implements it over its own client (a Kafka
+/// producer, an AMQP sender, a JetStream context); [`outbound_cycle`]
+/// owns everything on the skilj side.
+pub trait OutboundSink {
+    /// The bridge's own error type, which a failed skilj call converts
+    /// into.
+    type Error: std::fmt::Display + From<SkiljError>;
+
+    /// What a log line calls the broker ("Kafka", "AMQP", "JetStream").
+    fn broker_name(&self) -> &'static str;
+
+    /// Delivers `event`, resolving only once the broker has accepted it.
+    fn deliver(
+        &mut self,
+        event: &ConsumedEvent,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// One outbound mapping, as [`outbound_cycle`] needs it.
+pub struct OutboundTarget<'a> {
+    /// The mapping's own `EventReadToken` credential.
+    pub credential: &'a str,
+    /// The event type the mapping declares - checked against what
+    /// `consume` returns, and used in log lines.
+    pub event_type: &'a str,
+    /// `(partition_index, partition_count)` for a partitioned mapping.
+    pub partition: Option<(u32, u32)>,
+    /// The tag key whose value is an event's [`correlation_key`], which
+    /// decides partition ownership.
+    pub key_tag_key: Option<&'a str>,
+}
+
+/// Events delivered (or passed over) since the last acknowledgement,
+/// not yet acknowledged themselves.
+struct UnackedRun {
+    /// The first of them - what the next `consume` returns first if the
+    /// acknowledgement fails.
+    head: i64,
+    /// The last of them - what one acknowledgement covers.
+    last: i64,
+    /// How many were actually delivered, rather than passed over as
+    /// another partition's or skipped.
+    delivered: usize,
+}
+
+/// What [`record_failure`] decided.
+enum FailureOutcome {
+    /// The retry policy is exhausted - give up on this event.
+    GiveUp,
+    /// Retry later; the cycle stops here.
+    Backoff,
+}
+
+/// One fetch-deliver-acknowledge cycle for one outbound mapping - each
+/// bridge's own `produce_once` is this with its own [`OutboundSink`].
+/// Returns how many events this cycle delivered *and* acknowledged (0
+/// when the mapping's read cursor is caught up, or when its head event is
+/// still in backoff). An event this instance doesn't own (§54) or gave up
+/// on (Codeberg issue #21) is acknowledged but not counted, so a caller
+/// checking "did this cycle make real progress" isn't misled.
+///
+/// Events are handled strictly in sequence order, one delivery at a time,
+/// so per-key order holds at the broker. Acknowledgements are not sent
+/// per event: the read cursor is a single position that never moves
+/// backwards (§75), so acknowledging the last event of a contiguous run of
+/// handled ones covers the whole run in one call (Codeberg issue #40). A
+/// run is acknowledged before a failed event is dealt with and at the end
+/// of the page - never past an event that hasn't been delivered, which
+/// would move the cursor beyond it and lose it (§169).
+///
+/// A failure stops the cycle there and records backoff in
+/// `retry_state`; nothing behind it is attempted until it succeeds,
+/// because skipping ahead would acknowledge past it. A failed delivery is
+/// charged to that event. A failed acknowledgement is charged to the
+/// run's first event, the one the next `consume` returns first, and that
+/// whole run is delivered again - at-least-once, as every bridge already
+/// documents. When `retry_policy` is exhausted the event is acknowledged
+/// without being delivered, logged loudly.
+pub async fn outbound_cycle<S: OutboundSink>(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    target: &OutboundTarget<'_>,
+    sink: &mut S,
+    retry_policy: &skilj_retry::RetryPolicy,
+    retry_state: &mut Option<OutboundRetryState>,
+) -> Result<usize, S::Error> {
+    if let Some(state) = retry_state {
+        if Utc::now() < state.next_attempt_at {
+            return Ok(0);
+        }
+    }
+
+    let consumed = consume(http, skilj_base_url, target.credential, target.event_type).await?;
+
+    let mut served = 0;
+    let mut run: Option<UnackedRun> = None;
+    for event in &consumed.events {
+        let key = correlation_key(target.key_tag_key, &event.tags);
+        let delivered = if owns_partition(target.partition, key.as_deref()) {
+            match sink.deliver(event).await {
+                Ok(()) => true,
+                Err(e) => {
+                    // Everything before this event is done - acknowledge
+                    // it first, so a retry starts here and not earlier.
+                    if !flush_run(
+                        http,
+                        skilj_base_url,
+                        target,
+                        sink.broker_name(),
+                        run.take(),
+                        retry_policy,
+                        retry_state,
+                        &mut served,
+                    )
+                    .await?
+                    {
+                        return Ok(served);
+                    }
+                    match record_failure(
+                        target,
+                        sink.broker_name(),
+                        event.sequence,
+                        &e,
+                        retry_policy,
+                        retry_state,
+                    ) {
+                        FailureOutcome::Backoff => return Ok(served),
+                        FailureOutcome::GiveUp => false,
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        let run = run.get_or_insert(UnackedRun {
+            head: event.sequence,
+            last: event.sequence,
+            delivered: 0,
+        });
+        run.last = event.sequence;
+        if delivered {
+            run.delivered += 1;
+        }
+    }
+    flush_run(
+        http,
+        skilj_base_url,
+        target,
+        sink.broker_name(),
+        run,
+        retry_policy,
+        retry_state,
+        &mut served,
+    )
+    .await?;
+    Ok(served)
+}
+
+/// Acknowledges `run`, if there is one. `Ok(true)` when the cycle may
+/// carry on, `Ok(false)` when the acknowledgement failed and is now in
+/// backoff. An exhausted retry policy gives up the way a failed delivery
+/// does - by acknowledging anyway - so a failure of that last attempt is
+/// returned as the cycle's error.
+#[allow(clippy::too_many_arguments)]
+async fn flush_run<E: std::fmt::Display + From<SkiljError>>(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    target: &OutboundTarget<'_>,
+    broker_name: &str,
+    run: Option<UnackedRun>,
+    retry_policy: &skilj_retry::RetryPolicy,
+    retry_state: &mut Option<OutboundRetryState>,
+    served: &mut usize,
+) -> Result<bool, E> {
+    let Some(run) = run else {
+        return Ok(true);
+    };
+    match ack(http, skilj_base_url, target.credential, run.last).await {
+        Ok(()) => {
+            *served += run.delivered;
+            if retry_state.is_some_and(|s| s.sequence <= run.last) {
+                *retry_state = None;
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            match record_failure(target, broker_name, run.head, &e, retry_policy, retry_state) {
+                FailureOutcome::Backoff => Ok(false),
+                FailureOutcome::GiveUp => {
+                    ack(http, skilj_base_url, target.credential, run.last).await?;
+                    Ok(true)
+                }
+            }
+        }
+    }
+}
+
+/// Charges one failure to `sequence`'s retry state and decides whether to
+/// retry it later or give up on it now.
+fn record_failure(
+    target: &OutboundTarget<'_>,
+    broker_name: &str,
+    sequence: i64,
+    error: &dyn std::fmt::Display,
+    retry_policy: &skilj_retry::RetryPolicy,
+    retry_state: &mut Option<OutboundRetryState>,
+) -> FailureOutcome {
+    let now = Utc::now();
+    let state = match retry_state {
+        Some(state) if state.sequence == sequence => {
+            state.attempt += 1;
+            state
+        }
+        _ => retry_state.insert(OutboundRetryState {
+            sequence,
+            attempt: 1,
+            first_failed_at: now,
+            next_attempt_at: now,
+        }),
+    };
+    let attempt = state.attempt;
+    let elapsed = (now - state.first_failed_at).to_std().unwrap_or_default();
+    if retry_policy.is_exhausted(attempt, elapsed) {
+        tracing::error!(
+            event_type = %target.event_type,
+            sequence,
+            attempt,
+            error = %error,
+            "giving up on this event after repeated failures - acknowledging past it \
+             (it may never have reached {broker_name}) so the stream isn't blocked forever"
+        );
+        *retry_state = None;
+        return FailureOutcome::GiveUp;
+    }
+    tracing::warn!(
+        event_type = %target.event_type,
+        sequence,
+        attempt,
+        error = %error,
+        "delivering to {broker_name} or acknowledging to skilj failed - will retry with backoff"
+    );
+    state.next_attempt_at = retry_policy.next_attempt_at(now, attempt);
+    FailureOutcome::Backoff
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
