@@ -596,6 +596,12 @@ pub enum Error {
     #[error("an idempotency key may be at most 255 characters")]
     IdempotencyKeyTooLong,
 
+    /// An external event naming both a `dedupe` cursor and an
+    /// `Idempotency-Key` - specs/skilj.allium's `rule CreateExternalEvent`
+    /// takes one or the other (docs/architecture.md §175).
+    #[error("an external event takes either a dedupe cursor or an idempotency key, not both")]
+    DedupeAndIdempotencyKey,
+
     /// Not spec-modeled: the spec's own `ProcessCommand` assumes `decide()`
     /// only ever names an `EventType` its bounded context actually
     /// registered - a plugin-author responsibility, not a case the spec
@@ -691,6 +697,7 @@ impl SkiljRejection for Error {
             Error::PayloadDoesNotMatchSchema => "payload_does_not_match_schema",
             Error::ReservedIdempotencyKeyPrefix => "reserved_idempotency_key_prefix",
             Error::IdempotencyKeyTooLong => "idempotency_key_too_long",
+            Error::DedupeAndIdempotencyKey => "dedupe_and_idempotency_key",
             Error::UnregisteredEventType(_) => "unregistered_event_type",
             Error::PayloadDecodeFailed(_) => "payload_decode_failed",
             Error::CorrelationIdTooLong => "correlation_id_too_long",

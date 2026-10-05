@@ -56,8 +56,13 @@
 //! ack redelivers the identical event next cycle, and JetStream's own
 //! server-side dedup window recognises the repeated `Nats-Msg-Id` and
 //! reports `duplicate: true` rather than storing a second message.
-//! Inbound: [`InboundAction::Record`] uses the message's own
-//! always-present `(stream, stream_sequence)` as [§39](../../docs/architecture.md#external-message-dedup-create-external-event)'s `dedupe` pair;
+//! Inbound: [`InboundAction::Record`] sends the message's own
+//! always-present `"{stream}:{stream_sequence}"` as its `Idempotency-Key`,
+//! a per-message key ([§175](../../docs/architecture.md#external-message-keys)), not as [§39](../../docs/architecture.md#external-message-dedup-create-external-event)'s `dedupe` pair: JetStream
+//! redelivers an unacknowledged message after `ack_wait`, after newer
+//! ones, so a per-stream watermark would drop the redelivery as already
+//! seen - after a bridge restart, say, or with several bridge instances
+//! on one consumer, which is therefore safe too.
 //! [`InboundAction::Trigger`] uses `Nats-Msg-Id` (when the upstream
 //! sender populated one) as `Idempotency-Key` - omitted, never
 //! fabricated, when absent, the same "omitting it is always fine"
@@ -444,19 +449,6 @@ impl InboundMessageMeta {
     }
 }
 
-/// Dispatches one JetStream message to skilj - the one place
-/// [`InboundAction`] is interpreted, the identical shape
-/// `skilj_kafka::dispatch_inbound_message`/`skilj_amqp::dispatch_inbound_message`
-/// already have. Exposed separately from [`run_inbound`] so it can be
-/// tested directly against a plain [`InboundMessageMeta`] and raw
-/// payload bytes, without needing a real JetStream delivery.
-///
-/// `stream_sequence` is cast from JetStream's own `u64` to the `i64`
-/// `dedupe.sequence` expects - checked, not wrapped: a stream whose own
-/// sequence has (astronomically improbably) exceeded `i64::MAX` omits
-/// `dedupe` rather than sending a negative, meaningless value, the same
-/// "omit rather than wrap" register `skilj_amqp::produce_once` already
-/// uses for AMQP 1.0's own narrower 32-bit `group-sequence`.
 /// The exact `ExternalEventRequest`/`CommandTriggerRequest` body
 /// [`dispatch_inbound_message`] sends for `mapping`/`payload_json`/`meta` -
 /// factored out so [`report_parked_delivery`] can store the identical
@@ -471,29 +463,15 @@ fn inbound_request_body(
 ) -> serde_json::Value {
     match &mapping.action {
         InboundAction::Record { .. } => {
-            let mut body = serde_json::json!({
+            // No `dedupe` cursor: its watermark would drop the messages
+            // JetStream redelivers after later ones (docs/architecture.md
+            // §175). Deduplicated by `inbound_idempotency_key` instead.
+            serde_json::json!({
                 "payload": payload_json,
                 "sourceContent": "nats-jetstream",
                 "correlationId": meta.correlation_id,
                 "causationId": meta.causation_id,
-            });
-            match i64::try_from(meta.stream_sequence) {
-                Ok(sequence) => {
-                    body["dedupe"] = serde_json::json!({
-                        "partitionKey": meta.stream,
-                        "sequence": sequence,
-                    });
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        stream = meta.stream,
-                        stream_sequence = meta.stream_sequence,
-                        "stream sequence exceeds i64::MAX - omitting dedupe rather than \
-                         sending a wrapped, meaningless value"
-                    );
-                }
-            }
-            body
+            })
         }
         InboundAction::Trigger { .. } => serde_json::json!({
             "payload": payload_json,
@@ -503,20 +481,29 @@ fn inbound_request_body(
     }
 }
 
-/// The `Idempotency-Key` a `Trigger` mapping's request carries: the
-/// message's own Nats-Msg-Id, when the sender set one - `None` otherwise,
-/// and always for `Record`, which dedupes via its body's `dedupe` cursor.
-/// Shared by [`dispatch_inbound_message`] (as the header) and
+/// The `Idempotency-Key` an inbound request carries. `Record`:
+/// `"{stream}:{stream_sequence}"`, which names exactly one message and is
+/// always there - per message, because JetStream redelivers an
+/// unacknowledged message after `ack_wait`, after newer ones, and §39's
+/// per-stream watermark would drop it as already seen (docs/architecture.md
+/// §175). `Trigger`: the message's own Nats-Msg-Id, when the sender set
+/// one - `None` otherwise. Shared by [`dispatch_inbound_message`] (as the header) and
 /// [`report_parked_delivery`] (so `retryParkedDelivery` redrives under
 /// the same key, deduping against the original attempt if it committed
 /// after all).
 fn inbound_idempotency_key(mapping: &InboundMapping, meta: &InboundMessageMeta) -> Option<String> {
     match mapping.action {
-        InboundAction::Record { .. } => None,
+        InboundAction::Record { .. } => Some(format!("{}:{}", meta.stream, meta.stream_sequence)),
         InboundAction::Trigger { .. } => meta.message_id.clone(),
     }
 }
 
+/// Dispatches one JetStream message to skilj - the one place
+/// [`InboundAction`] is interpreted, the identical shape
+/// `skilj_kafka::dispatch_inbound_message`/`skilj_amqp::dispatch_inbound_message`
+/// already have. Exposed separately from [`run_inbound`] so it can be
+/// tested directly against a plain [`InboundMessageMeta`] and raw
+/// payload bytes, without needing a real JetStream delivery.
 pub async fn dispatch_inbound_message(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -551,8 +538,8 @@ pub async fn dispatch_inbound_message(
 /// relies on) - the identical role `skilj_kafka::report_parked_delivery`/
 /// `skilj_amqp::report_parked_delivery` already play. `identifier` is
 /// `"{stream}:{stream_sequence}"` - always available (unlike
-/// `Nats-Msg-Id`, sender-optional), the same pair [`inbound_request_body`]
-/// already sends as `dedupe` for a `Record` action. `request` is
+/// `Nats-Msg-Id`, sender-optional), the same value
+/// [`inbound_idempotency_key`] sends for a `Record` action. `request` is
 /// [`inbound_request_body`]'s own output, the exact body that kept
 /// failing, stored verbatim so a later `retryParkedDelivery` redrives
 /// the identical request.

@@ -52,10 +52,13 @@
 //!
 //! # Redelivery safety (inbound)
 //!
-//! [`InboundAction::Record`] uses `group-id`/`group-sequence` (when
-//! both are present) as [docs/architecture.md §39](../../docs/architecture.md#external-message-dedup-create-external-event)'s `dedupe` pair - the
-//! identical mechanism `skilj-kafka`'s own `"{topic}:{partition}"`/
-//! offset pair feeds. [`InboundAction::Trigger`] uses `message-id`
+//! [`InboundAction::Record`] sends `"{group-id}:{group-sequence}"` (when
+//! both are present), or else `message-id`, as its `Idempotency-Key` - a
+//! per-message key ([docs/architecture.md §175](../../docs/architecture.md#external-message-keys)), not [§39](../../docs/architecture.md#external-message-dedup-create-external-event)'s `dedupe`
+//! watermark: a released or unsettled message comes back after
+//! deliveries the link already holds, and with competing consumers in
+//! any order, so a per-group watermark would drop it as already seen.
+//! [`InboundAction::Trigger`] uses `message-id`
 //! (when present) as `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission)) - a broader, more commonly
 //! populated standard property (most senders set it, often to a UUID),
 //! usable on its own without needing the ordering `group-sequence`
@@ -399,11 +402,11 @@ pub async fn run_outbound_until(
 ///
 /// **When a field is absent**: `dispatch_inbound_message` simply omits
 /// the corresponding skilj mechanism rather than inventing a value or
-/// refusing the message - a `Record` action with no `group_id`/
-/// `group_sequence` pair calls `ExternalEventIngestion` without
-/// `dedupe` (created every time, exactly as if this crate's own dedupe
-/// support didn't exist - `ExternalEventIngestion`'s own
-/// `OmittingTheDedupePairChangesNothing` guarantee, [§39](../../docs/architecture.md#external-message-dedup-create-external-event)); a `Trigger`
+/// refusing the message - a `Record` action with neither a `group_id`/
+/// `group_sequence` pair nor a `message_id` calls `ExternalEventIngestion`
+/// without `Idempotency-Key` (created every time, exactly as if this
+/// crate's own dedupe support didn't exist - `ExternalEventIngestion`'s own
+/// `OmittingTheDedupePairChangesNothing` guarantee, [§175](../../docs/architecture.md#external-message-keys)); a `Trigger`
 /// action with no `message_id` calls `CommandTrigger` without
 /// `Idempotency-Key` (accepted, just not redelivery-safe - `submitCommand`'s
 /// own long-standing "omitting it is always fine" behaviour, [§21](../../docs/architecture.md#optional-idempotency-key-submission)).
@@ -458,25 +461,14 @@ fn inbound_request_body(
 ) -> serde_json::Value {
     let correlation_id = meta.correlation_id.as_ref().map(message_id_to_string);
     match &mapping.action {
-        InboundAction::Record { .. } => {
-            let dedupe = match (&meta.group_id, meta.group_sequence) {
-                (Some(partition_key), Some(sequence)) => Some(serde_json::json!({
-                    "partitionKey": partition_key,
-                    "sequence": sequence,
-                })),
-                _ => None,
-            };
-            let mut body = serde_json::json!({
-                "payload": payload_json,
-                "sourceContent": "amqp",
-                "correlationId": correlation_id,
-                "causationId": meta.causation_id,
-            });
-            if let Some(dedupe) = dedupe {
-                body["dedupe"] = dedupe;
-            }
-            body
-        }
+        // No `dedupe` cursor: deduplicated by `inbound_idempotency_key`
+        // instead (docs/architecture.md §175).
+        InboundAction::Record { .. } => serde_json::json!({
+            "payload": payload_json,
+            "sourceContent": "amqp",
+            "correlationId": correlation_id,
+            "causationId": meta.causation_id,
+        }),
         InboundAction::Trigger { .. } => serde_json::json!({
             "payload": payload_json,
             "correlationId": correlation_id,
@@ -489,8 +481,7 @@ fn inbound_request_body(
 /// `POST /v1/parked-deliveries`' own `identifier` field - purely
 /// informational (an operator's own way of finding the original message
 /// in the broker's own tooling), never used for redelivery-safety
-/// itself (that's [`inbound_request_body`]'s own `dedupe`/
-/// `Idempotency-Key`, sent separately). Prefers `group-id`/`group-sequence`
+/// itself (that's [`inbound_idempotency_key`], sent separately). Prefers `group-id`/`group-sequence`
 /// (when both present), falls back to `message-id`, falls back to a
 /// fixed placeholder when the sender populated neither - the identical
 /// "never an error, just less identifiable" register every other use of
@@ -512,16 +503,22 @@ fn message_identifier(meta: &InboundMessageMeta) -> String {
 /// already has. Exposed separately from [`run_inbound`] so it can be
 /// tested directly against a plain [`InboundMessageMeta`] and raw
 /// payload bytes, without needing a real `fe2o3_amqp` delivery object.
-/// The `Idempotency-Key` a `Trigger` mapping's request carries: the
-/// message's own AMQP `message-id`, when the sender set one - `None` otherwise,
-/// and always for `Record`, which dedupes via its body's `dedupe` cursor.
-/// Shared by [`dispatch_inbound_message`] (as the header) and
+/// The `Idempotency-Key` an inbound request carries. `Record`:
+/// `"{group-id}:{group-sequence}"` when the sender set both - this
+/// crate's own [`produce_once`] always does - or else `message-id`, or
+/// `None`; a per-message key, since a watermark over the group would drop
+/// a message redelivered after later ones (docs/architecture.md §175).
+/// `Trigger`: the message's own AMQP `message-id`, when the sender set
+/// one - `None` otherwise. Shared by [`dispatch_inbound_message`] (as the header) and
 /// [`report_parked_delivery`] (so `retryParkedDelivery` redrives under
 /// the same key, deduping against the original attempt if it committed
 /// after all).
 fn inbound_idempotency_key(mapping: &InboundMapping, meta: &InboundMessageMeta) -> Option<String> {
     match mapping.action {
-        InboundAction::Record { .. } => None,
+        InboundAction::Record { .. } => match (&meta.group_id, meta.group_sequence) {
+            (Some(group_id), Some(group_sequence)) => Some(format!("{group_id}:{group_sequence}")),
+            _ => meta.message_id.as_ref().map(message_id_to_string),
+        },
         InboundAction::Trigger { .. } => meta.message_id.as_ref().map(message_id_to_string),
     }
 }

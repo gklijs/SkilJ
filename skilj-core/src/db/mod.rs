@@ -541,6 +541,7 @@ async fn provision_bounded_context_schema(
     ensure_idempotency_keys_table(&mut **tx, bounded_context).await?;
     ensure_cross_context_route_cursors_table(&mut **tx, bounded_context).await?;
     ensure_external_message_cursors_table(&mut **tx, bounded_context).await?;
+    ensure_external_message_keys_table(&mut **tx, bounded_context).await?;
     ensure_deadline_cursors_table(&mut **tx, bounded_context).await?;
     // Codeberg issue #21 - `parked_deliveries`, a brand-new table, so no
     // `ALTER TABLE` patch is needed here the way `cross_context_route_cursors`'
@@ -1377,6 +1378,26 @@ pub async fn delete_expired_idempotency_keys(
     Ok(result.rows_affected())
 }
 
+/// [`delete_expired_idempotency_keys`]' twin for `external_message_keys`
+/// (docs/architecture.md §175): the same retention, the same batching.
+pub async fn delete_expired_external_message_keys(
+    pool: &Pool,
+    bounded_context: &str,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> crate::error::Result<u64> {
+    let schema = schema_ident(bounded_context);
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {schema}.external_message_keys WHERE ctid IN ( \
+             SELECT ctid FROM {schema}.external_message_keys WHERE created_at < $1 LIMIT $2)"
+    )))
+    .bind(cutoff)
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Deletes up to `batch` deadlines in `bounded_context` resolved (fired,
 /// cancelled, parked or forgotten) before `cutoff`, returning how many
 /// went - `SkiljBuilder::deadline_retention`'s task (docs/architecture.md
@@ -1885,6 +1906,44 @@ pub async fn ensure_external_message_cursors_table<'e>(
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (adapter_id, partition_key)
         )"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `external_message_keys` - the durable state behind
+/// `recorded_external_event(adapter, idempotency_key)` in specs/skilj.allium's
+/// own `rule CreateExternalEvent` (docs/architecture.md §175): one row per
+/// `(adapter_id, message_key)` that created an event, naming that event.
+/// The per-message counterpart of `external_message_cursors`, for sources
+/// that redeliver out of order. Expires with `idempotency_keys`
+/// (`delete_expired_external_message_keys`), hence the `created_at`
+/// index. Created on every `build()` and at provisioning, like
+/// `ensure_external_message_cursors_table`.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_external_message_keys_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let index = create_index_patch(
+        &schema,
+        "external_message_keys_created_at",
+        format!(
+            "CREATE INDEX IF NOT EXISTS external_message_keys_created_at \
+             ON {schema}.external_message_keys (created_at)"
+        ),
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.external_message_keys (
+            adapter_id TEXT NOT NULL,
+            message_key TEXT NOT NULL,
+            event_sequence BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (adapter_id, message_key)
+        );
+        {index}"
     )))
     .execute(executor)
     .await?;
@@ -6928,6 +6987,7 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
 /// JSON deserialization before this type is ever built, the same
 /// "malformed request, not this crate's rejection to model" register
 /// any other structurally-invalid request body already gets.
+#[derive(Debug, Clone, Copy)]
 pub struct DedupeCursor<'a> {
     /// Names the partition, shard, or stream this message came from -
     /// e.g. `"{topic}:{partition}"` for Kafka, a shard id for Kinesis.
@@ -6937,6 +6997,23 @@ pub struct DedupeCursor<'a> {
     /// source, the property this whole mechanism relies on and cannot
     /// verify itself (see `highest_dedupe_sequence`'s own doc comment).
     pub sequence: i64,
+}
+
+/// How `create_and_insert_external_event` recognises a redelivery -
+/// specs/skilj.allium's `rule CreateExternalEvent` takes either the
+/// dedupe pair or an `idempotency_key`, never both, and an enum makes
+/// "both" unrepresentable the way [`DedupeCursor`] makes "only one of the
+/// pair" unrepresentable.
+#[derive(Debug, Clone, Copy)]
+pub enum ExternalEventDedupe<'a> {
+    /// The per-partition watermark (docs/architecture.md §39): for a
+    /// source that replays a partition in order from a committed position.
+    Watermark(DedupeCursor<'a>),
+    /// One record per message, in `external_message_keys`
+    /// (docs/architecture.md §175): for a source that redelivers a message
+    /// after later ones - NATS JetStream, AMQP - where a watermark would
+    /// drop the redelivery as already seen.
+    Key(&'a str),
 }
 
 /// What `create_and_insert_external_event` settles on - either a real
@@ -6953,10 +7030,14 @@ pub struct DedupeCursor<'a> {
 /// nothing, on purpose, since a watermark remembers only the highest
 /// sequence seen, not which event any particular past message produced.
 /// See specs/skilj.allium's own `ExternalEventIngestion.ARedeliveryProducesNoEventAndNoOutcome`.
+///
+/// A key hit (`ExternalEventDedupe::Key`) does know which event the
+/// message became, since its record names it, and says so in `sequence`;
+/// a watermark hit leaves it `None`.
 #[derive(Debug)]
 pub enum CreateExternalEventOutcome {
     Created(Box<Event>),
-    Redelivered,
+    Redelivered { sequence: Option<i64> },
 }
 
 /// `highest_dedupe_sequence(adapter, dedupe_partition_key)` from
@@ -6990,6 +7071,52 @@ async fn highest_dedupe_sequence<'e>(
     .fetch_optional(executor)
     .await?;
     Ok(row.map(|(seq,)| seq))
+}
+
+/// `recorded_external_event(adapter, idempotency_key)` from
+/// specs/skilj.allium's own `rule CreateExternalEvent`: the sequence of
+/// the event this adapter created for `key`, or `None`. Same locking
+/// story as `highest_dedupe_sequence`: called with the bounded context's
+/// `sequence` row lock already held, so a plain `SELECT` is race-free.
+async fn recorded_external_event<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    schema: &str,
+    adapter_id: &str,
+    key: &str,
+) -> crate::error::Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT event_sequence FROM {schema}.external_message_keys \
+         WHERE adapter_id = $1 AND message_key = $2"
+    )))
+    .bind(adapter_id)
+    .bind(key)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(|(seq,)| seq))
+}
+
+/// Records `key` against the event it created, in the event's own
+/// transaction. A plain insert, like `insert_idempotency_key`: the
+/// sequence lock rules out a concurrent duplicate getting this far.
+async fn record_external_message_key<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    schema: &str,
+    adapter_id: &str,
+    key: &str,
+    event_sequence: i64,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.external_message_keys \
+         (adapter_id, message_key, event_sequence, created_at) VALUES ($1, $2, $3, $4)"
+    )))
+    .bind(adapter_id)
+    .bind(key)
+    .bind(event_sequence)
+    .bind(now)
+    .execute(executor)
+    .await?;
+    Ok(())
 }
 
 /// Records `sequence` as the new watermark for `(adapter_id,
@@ -7065,6 +7192,11 @@ async fn advance_dedupe_watermark<'e>(
 /// `event_store::create_external_event` at all; a miss proceeds exactly
 /// as `None` would, plus one more write in the same transaction -
 /// `advance_dedupe_watermark` - before `tx.commit()`.
+///
+/// `Some(ExternalEventDedupe::Key(key))` is checked at the same point
+/// against `external_message_keys` instead (docs/architecture.md §175): a
+/// hit is `Redelivered` with the sequence of the event the key created,
+/// a miss records the key against the new event before the commit.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 pub async fn create_and_insert_external_event(
@@ -7078,7 +7210,7 @@ pub async fn create_and_insert_external_event(
     source_context: Option<String>,
     correlation_id: Option<String>,
     causation_id: Option<String>,
-    dedupe: Option<DedupeCursor<'_>>,
+    dedupe: Option<ExternalEventDedupe<'_>>,
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
 ) -> crate::error::Result<CreateExternalEventOutcome> {
@@ -7108,16 +7240,29 @@ pub async fn create_and_insert_external_event(
     let mut tx = pool.begin().await?;
     let next_seq = next_sequence(&mut *tx, &bounded_context_name).await?;
 
-    if let Some(cursor) = &dedupe {
-        let watermark =
-            highest_dedupe_sequence(&mut *tx, &schema, &adapter.id, cursor.partition_key).await?;
-        if watermark.is_some_and(|w| cursor.sequence <= w) {
-            // Implicit rollback - nothing else was written, the same
-            // "a hit is a cached prior answer, not a new decision, tx is
-            // simply dropped" treatment `submit_command`'s own
-            // idempotency-key check already uses.
-            return Ok(CreateExternalEventOutcome::Redelivered);
+    // On a hit: implicit rollback - nothing else was written, the same
+    // "a hit is a cached prior answer, not a new decision, tx is simply
+    // dropped" treatment `submit_command`'s own idempotency-key check
+    // already uses.
+    match &dedupe {
+        Some(ExternalEventDedupe::Watermark(cursor)) => {
+            let watermark =
+                highest_dedupe_sequence(&mut *tx, &schema, &adapter.id, cursor.partition_key)
+                    .await?;
+            if watermark.is_some_and(|w| cursor.sequence <= w) {
+                return Ok(CreateExternalEventOutcome::Redelivered { sequence: None });
+            }
         }
+        Some(ExternalEventDedupe::Key(key)) => {
+            if let Some(sequence) =
+                recorded_external_event(&mut *tx, &schema, &adapter.id, key).await?
+            {
+                return Ok(CreateExternalEventOutcome::Redelivered {
+                    sequence: Some(sequence),
+                });
+            }
+        }
+        None => {}
     }
 
     let event = crate::event_store::create_external_event(
@@ -7154,16 +7299,23 @@ pub async fn create_and_insert_external_event(
         &sync_projections,
     )
     .await?;
-    if let Some(cursor) = &dedupe {
-        advance_dedupe_watermark(
-            &mut *tx,
-            &schema,
-            &adapter.id,
-            cursor.partition_key,
-            cursor.sequence,
-            now,
-        )
-        .await?;
+    match &dedupe {
+        Some(ExternalEventDedupe::Watermark(cursor)) => {
+            advance_dedupe_watermark(
+                &mut *tx,
+                &schema,
+                &adapter.id,
+                cursor.partition_key,
+                cursor.sequence,
+                now,
+            )
+            .await?;
+        }
+        Some(ExternalEventDedupe::Key(key)) => {
+            record_external_message_key(&mut *tx, &schema, &adapter.id, key, event.sequence, now)
+                .await?;
+        }
+        None => {}
     }
     tx.commit().await?;
     broadcaster.publish(&event);

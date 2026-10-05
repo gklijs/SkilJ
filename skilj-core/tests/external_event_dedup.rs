@@ -13,7 +13,7 @@
 use chrono::Utc;
 use skilj_core::access_control::{self, DirectCreationToken, ExternalEventToken, TokenStatus};
 use skilj_core::bootstrap::ContextCreator;
-use skilj_core::db::{self, CreateExternalEventOutcome, DedupeCursor, Pool};
+use skilj_core::db::{self, CreateExternalEventOutcome, DedupeCursor, ExternalEventDedupe, Pool};
 use skilj_core::encryption::EncryptionMasterKey;
 use skilj_core::error::SkiljRejection;
 use skilj_core::event_cache::EventCache;
@@ -179,6 +179,25 @@ async fn create(
     order_id: &str,
     dedupe: Option<DedupeCursor<'_>>,
 ) -> CreateExternalEventOutcome {
+    create_with(
+        pool,
+        broadcaster,
+        event_cache,
+        token,
+        order_id,
+        dedupe.map(ExternalEventDedupe::Watermark),
+    )
+    .await
+}
+
+async fn create_with(
+    pool: &Pool,
+    broadcaster: &EventBroadcaster,
+    event_cache: &EventCache,
+    token: &ExternalEventToken,
+    order_id: &str,
+    dedupe: Option<ExternalEventDedupe<'_>>,
+) -> CreateExternalEventOutcome {
     db::create_and_insert_external_event(
         pool,
         &NoopProjectionDispatcher,
@@ -329,7 +348,7 @@ fn a_redelivered_or_stale_sequence_creates_no_event() {
         .await;
         assert!(matches!(
             redelivered,
-            CreateExternalEventOutcome::Redelivered
+            CreateExternalEventOutcome::Redelivered { sequence: None }
         ));
 
         // A stale replay from further back in the partition.
@@ -345,7 +364,10 @@ fn a_redelivered_or_stale_sequence_creates_no_event() {
             }),
         )
         .await;
-        assert!(matches!(stale, CreateExternalEventOutcome::Redelivered));
+        assert!(matches!(
+            stale,
+            CreateExternalEventOutcome::Redelivered { sequence: None }
+        ));
 
         // Only the one, real, non-redelivered event actually exists.
         let events = db::list_events_for_bounded_context(&pool, &bc.name)
@@ -513,7 +535,7 @@ fn a_revoked_adapters_redelivery_is_refused_not_recognised() {
             None,
             None,
             None,
-            Some(dedupe()),
+            Some(ExternalEventDedupe::Watermark(dedupe())),
             test_now(),
             None,
         )
@@ -641,5 +663,87 @@ fn a_refused_submission_provisions_no_encryption_key() {
             .await
             .unwrap();
         assert!(key_exists("c3").await);
+    });
+}
+
+/// docs/architecture.md §175: a key recognises its own message whatever
+/// arrived in between - the out-of-order redelivery a watermark drops.
+/// A repeated key creates nothing and names the event it already became.
+#[test]
+fn an_idempotency_key_recognises_its_message_in_any_order() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_order_placed_event_type(&pool, &bc).await;
+        let token = adapter(et, "adapter-1");
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+        let keyed = |key: &'static str| Some(ExternalEventDedupe::Key(key));
+
+        // Stream positions 10 and 9, recorded in that order.
+        let ten = create_with(&pool, &broadcaster, &event_cache, &token, "B", keyed("s:10")).await;
+        let nine = create_with(&pool, &broadcaster, &event_cache, &token, "A", keyed("s:9")).await;
+        let CreateExternalEventOutcome::Created(nine) = nine else {
+            panic!("a key not seen before must create its event, whatever came first: {nine:?}");
+        };
+        assert!(matches!(ten, CreateExternalEventOutcome::Created(_)));
+
+        let again = create_with(&pool, &broadcaster, &event_cache, &token, "A", keyed("s:9")).await;
+        assert!(
+            matches!(again, CreateExternalEventOutcome::Redelivered { sequence: Some(s) } if s == nine.sequence),
+            "a repeated key must create nothing and name its event: {again:?}"
+        );
+
+        // Scoped to the adapter, like the watermark.
+        let other = adapter(token.event_type.clone(), "adapter-2");
+        let elsewhere = create_with(&pool, &broadcaster, &event_cache, &other, "A", keyed("s:9")).await;
+        assert!(matches!(elsewhere, CreateExternalEventOutcome::Created(_)));
+
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 3);
+    });
+}
+
+/// docs/architecture.md §175: message keys expire with command
+/// idempotency keys. One gone is unseen, so its message is created anew.
+#[test]
+fn an_expired_message_key_no_longer_deduplicates() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_order_placed_event_type(&pool, &bc).await;
+        let token = adapter(et, "adapter-1");
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+        let keyed = Some(ExternalEventDedupe::Key("s:1"));
+
+        create_with(&pool, &broadcaster, &event_cache, &token, "A", keyed).await;
+        let kept = db::delete_expired_external_message_keys(
+            &pool,
+            &bc.name,
+            test_now() - chrono::Duration::seconds(1),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept, 0, "a key recorded after the cutoff must stay");
+        let deleted = db::delete_expired_external_message_keys(
+            &pool,
+            &bc.name,
+            test_now() + chrono::Duration::seconds(1),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, 1);
+
+        let again = create_with(&pool, &broadcaster, &event_cache, &token, "A", keyed).await;
+        assert!(matches!(again, CreateExternalEventOutcome::Created(_)));
     });
 }

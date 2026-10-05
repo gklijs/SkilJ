@@ -384,9 +384,9 @@ struct DedupeRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExternalEventResponse {
-    // `None` only for a `redelivered` response - nothing was created, so
-    // there is no sequence to report, the same "no outcome to describe"
-    // register CreateExternalEventOutcome::Redelivered itself uses.
+    // For a `redelivered` response, the event the message already became
+    // when it was recognised by its `Idempotency-Key`, and `None` when by
+    // the `dedupe` watermark, which can't say (docs/architecture.md §175).
     sequence: Option<i64>,
     redelivered: bool,
 }
@@ -649,12 +649,12 @@ struct ParkedDeliveryRequest {
     attempt_count: i32,
     first_failed_at: chrono::DateTime<Utc>,
     request: serde_json::Value,
-    /// `command_trigger` only: the `Idempotency-Key` header the original
-    /// `POST /v1/commands/trigger` carried, which isn't part of `request`
-    /// (the body). Stored with it so `retryParkedDelivery` redrives
-    /// under the same key - which dedupes against the original attempt
-    /// if that attempt committed after all (a lost response, say) -
-    /// rather than landing the command a second time.
+    /// The `Idempotency-Key` header the original `POST
+    /// /v1/commands/trigger` or `POST /v1/events/external` carried, which
+    /// isn't part of `request` (the body). Stored with it so
+    /// `retryParkedDelivery` redrives under the same key - which dedupes
+    /// against the original attempt if that attempt committed after all (a
+    /// lost response, say) - rather than landing it a second time.
     idempotency_key: Option<String>,
 }
 
@@ -668,9 +668,28 @@ struct ParkedDeliveryResponse {
 async fn post_events_external(
     State(state): State<AppState>,
     credential: BearerCredential,
+    headers: HeaderMap,
     Json(body): Json<ExternalEventRequest>,
 ) -> Result<impl IntoResponse, RestError> {
     let token = resolve_token::<ExternalEventToken>(&state, &credential).await?;
+    // docs/architecture.md §175: the per-message alternative to `dedupe`,
+    // for a source that redelivers out of order. Same header, same limits
+    // as on `POST /v1/commands/trigger`.
+    let idempotency_key = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok());
+    event_store::reject_reserved_idempotency_key(idempotency_key)?;
+    let dedupe = match (&body.dedupe, idempotency_key) {
+        (Some(_), Some(_)) => {
+            return Err(
+                skilj_core::error::Error::from(event_store::Error::DedupeAndIdempotencyKey).into(),
+            )
+        }
+        (Some(d), None) => Some(db::ExternalEventDedupe::Watermark(db::DedupeCursor {
+            partition_key: &d.partition_key,
+            sequence: d.sequence,
+        })),
+        (None, Some(key)) => Some(db::ExternalEventDedupe::Key(key)),
+        (None, None) => None,
+    };
     let payload = serde_json::to_string(&body.payload)
         .expect("serde_json::Value serialization is infallible");
 
@@ -690,10 +709,7 @@ async fn post_events_external(
         body.source_context,
         body.correlation_id,
         body.causation_id,
-        body.dedupe.as_ref().map(|d| db::DedupeCursor {
-            partition_key: &d.partition_key,
-            sequence: d.sequence,
-        }),
+        dedupe,
         Utc::now(),
         state.encryption_master_key.as_ref(),
     )
@@ -704,9 +720,10 @@ async fn post_events_external(
     // guarantee describes; it's just that nothing was created. Neither
     // outcome is an error, so both share this one success response shape,
     // distinguished by `redelivered` rather than by status code.
+    // A key hit names the event the message became; a watermark hit can't.
     let (sequence, redelivered) = match outcome {
         db::CreateExternalEventOutcome::Created(event) => (Some(event.sequence), false),
-        db::CreateExternalEventOutcome::Redelivered => (None, true),
+        db::CreateExternalEventOutcome::Redelivered { sequence } => (sequence, true),
     };
 
     Ok((
@@ -1168,16 +1185,19 @@ async fn post_parked_deliveries(
     })?;
     let mut request = body.request;
     if let Some(idempotency_key) = body.idempotency_key {
-        if !matches!(kind, db::ParkedDeliveryKind::CommandTrigger) {
+        event_store::reject_reserved_idempotency_key(Some(&idempotency_key))?;
+        // docs/architecture.md §175: an external event's key and its
+        // `dedupe` cursor exclude each other here as on the original request.
+        if matches!(kind, db::ParkedDeliveryKind::ExternalEvent)
+            && request.get("dedupe").is_some_and(|d| !d.is_null())
+        {
             return Err(skilj_core::error::Error::from(
-                event_store::Error::InvalidParkedDeliveryRequest(
-                    "idempotencyKey only applies to kind command_trigger".to_string(),
-                ),
+                event_store::Error::DedupeAndIdempotencyKey,
             )
             .into());
         }
-        event_store::reject_reserved_idempotency_key(Some(&idempotency_key))?;
-        // An object: it just parsed as `CommandTriggerRequest`.
+        // An object: it just parsed as `CommandTriggerRequest` or
+        // `ExternalEventRequest`.
         request["idempotencyKey"] = serde_json::Value::String(idempotency_key);
     }
 

@@ -156,6 +156,8 @@ struct MockSkiljState {
     /// `acknowledgement_regresses` (a read cursor never moves backwards).
     ack_cursors: Arc<Mutex<std::collections::HashMap<String, i64>>>,
     external_requests: Arc<Mutex<Vec<Value>>>,
+    /// The `Idempotency-Key` header of each `external_requests` entry.
+    external_request_keys: Arc<Mutex<Vec<Option<String>>>>,
     trigger_requests: Arc<Mutex<Vec<TriggerRequest>>>,
     /// Codeberg issue #21 - `POST /v1/events/external` returns a 500
     /// while this is `> 0`, decrementing it each time - see
@@ -224,6 +226,7 @@ async fn post_events_consume_ack(
 
 async fn post_events_external(
     State(state): State<MockSkiljState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     {
@@ -234,6 +237,12 @@ async fn post_events_external(
         }
     }
     state.external_requests.lock().unwrap().push(body);
+    state.external_request_keys.lock().unwrap().push(
+        headers
+            .get("idempotency-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+    );
     (
         StatusCode::CREATED,
         Json(json!({ "sequence": 1, "redelivered": false })),
@@ -429,11 +438,13 @@ fn an_order_placed_event_is_sent_with_its_own_tag_as_the_group_id() {
 /// `group-id`/`group-sequence` properties (as an upstream, non-skilj
 /// sender would), received back with a real `Receiver`, and dispatched
 /// through `dispatch_inbound_message` exactly as `run_inbound` would -
-/// proving the `dedupe` partition key/sequence sent to skilj are
-/// genuinely read from this message's own real AMQP properties, not
-/// synthesised.
+/// proving the `Idempotency-Key` sent to skilj is genuinely read from
+/// this message's own real AMQP properties, not synthesised. A key, not a
+/// `dedupe` cursor: a watermark over the group would drop a message
+/// redelivered after later ones (docs/architecture.md §175). Without a
+/// group, `message-id` is the key.
 #[test]
-fn an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_dedupe() {
+fn an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_key() {
     runtime().block_on(async {
         let Some(url) = test_broker().await else {
             return;
@@ -500,11 +511,28 @@ fn an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_dedup
         .await
         .unwrap();
 
+        let without_group = InboundMessageMeta {
+            message_id: Some(MessageId::String("m-7".to_string())),
+            ..Default::default()
+        };
+        dispatch_inbound_message(
+            &http,
+            &skilj_base_url,
+            &mapping,
+            &without_group,
+            br#"{"orderId":"o-2"}"#,
+        )
+        .await
+        .unwrap();
+
         let requests = mock_state.external_requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["payload"], json!({ "orderId": "o-1" }));
-        assert_eq!(requests[0]["dedupe"]["partitionKey"], json!("partition-a"));
-        assert_eq!(requests[0]["dedupe"]["sequence"], json!(42));
+        assert_eq!(requests[0].get("dedupe"), None);
+        assert_eq!(
+            mock_state.external_request_keys.lock().unwrap().as_slice(),
+            &[Some("partition-a:42".to_string()), Some("m-7".to_string())]
+        );
     });
 }
 
@@ -708,7 +736,7 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
             .unwrap();
         // The receiver must attach *before* the message is sent - the
         // same ordering every other inbound test in this file already
-        // uses (see e.g. `an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_dedupe`
+        // uses (see e.g. `an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_key`
         // above), since there's no durable subscription here for a
         // broker to hold the message for otherwise.
         let (_recv_conn, mut recv_session) = connect(url, "parking-receiver-conn").await;

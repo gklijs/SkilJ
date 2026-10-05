@@ -44,6 +44,10 @@ struct ExternalEventRedrive {
     source_context: Option<String>,
     correlation_id: Option<String>,
     causation_id: Option<String>,
+    /// Not part of `ExternalEventRequest` itself: the original request's
+    /// `Idempotency-Key` header, merged in by `POST /v1/parked-deliveries`
+    /// (docs/architecture.md §175).
+    idempotency_key: Option<String>,
 }
 
 /// Mirrors `skilj-rest::routes::CommandTriggerRequest`'s own wire shape -
@@ -169,14 +173,23 @@ async fn redrive_parked_delivery(
             let redrive: ExternalEventRedrive = decode_request(&delivery.request_json)?;
             let payload = serde_json::to_string(&redrive.payload)
                 .expect("serde_json::Value serialization is infallible");
-            // Never the bridge's own cursor (Codeberg issue #58): the
-            // bridge committed past this message and kept recording, so
-            // its partition's watermark is usually beyond it already, and
-            // reusing the cursor would dedupe the redrive away.
+            // The original key when the bridge sent one (docs/architecture.md
+            // §175): a per-message record, so later messages can't have
+            // overtaken it, and an original attempt that committed after all
+            // dedupes too. Otherwise never the bridge's own cursor (Codeberg
+            // issue #58): the bridge committed past this message and kept
+            // recording, so its partition's watermark is usually beyond it
+            // already, and reusing the cursor would dedupe the redrive away.
+            skilj_core::event_store::reject_reserved_idempotency_key(
+                redrive.idempotency_key.as_deref(),
+            )?;
             let partition_key = db::parked_delivery_redrive_dedupe_partition_key(delivery);
-            let dedupe = db::DedupeCursor {
-                partition_key: &partition_key,
-                sequence: 1,
+            let dedupe = match redrive.idempotency_key.as_deref() {
+                Some(key) => db::ExternalEventDedupe::Key(key),
+                None => db::ExternalEventDedupe::Watermark(db::DedupeCursor {
+                    partition_key: &partition_key,
+                    sequence: 1,
+                }),
             };
             let outcome = db::create_and_insert_external_event(
                 &state.pool,
@@ -194,13 +207,15 @@ async fn redrive_parked_delivery(
                 state.encryption_master_key.as_ref(),
             )
             .await?;
-            // Only an earlier redrive of this same row can have used this
-            // cursor - one whose event committed but whose row delete
-            // failed - so the event exists and dropping the row is right.
-            if matches!(outcome, db::CreateExternalEventOutcome::Redelivered) {
+            // Under the per-row cursor only an earlier redrive of this same
+            // row can have created the event - one whose row delete then
+            // failed; under the original key, that or the original attempt.
+            // Either way the event exists and dropping the row is right.
+            if let db::CreateExternalEventOutcome::Redelivered { sequence } = outcome {
                 tracing::info!(
                     parked_delivery = %delivery.id,
-                    "parked external event was already created by an earlier retry - \
+                    ?sequence,
+                    "parked external event was already created - \
                      removing the row without creating it again"
                 );
             }

@@ -170,6 +170,17 @@ struct MockSkiljState {
     fail_acks: Arc<Mutex<usize>>,
     /// Every `POST /v1/parked-deliveries` body this mock ever received.
     parked_deliveries: Arc<Mutex<Vec<Value>>>,
+    /// The `Idempotency-Key` header of each `external_requests` entry.
+    external_request_keys: Arc<Mutex<Vec<Option<String>>>>,
+    /// The real server's two ways to recognise a redelivered external
+    /// event: §39's watermark, the highest `dedupe.sequence` recorded per
+    /// `dedupe.partitionKey` (a request at or below it is `redelivered`),
+    /// and §175's per-message `Idempotency-Key`.
+    dedupe_watermarks: Arc<Mutex<std::collections::HashMap<String, i64>>>,
+    message_keys: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Every external request that created an event: its key, or
+    /// `"{partitionKey}:{sequence}"` for a `dedupe` cursor.
+    created: Arc<Mutex<Vec<String>>>,
 }
 
 async fn get_events_consume(
@@ -230,6 +241,7 @@ async fn post_events_consume_ack(
 
 async fn post_events_external(
     State(state): State<MockSkiljState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     {
@@ -239,7 +251,43 @@ async fn post_events_external(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(Value::Null));
         }
     }
-    state.external_requests.lock().unwrap().push(body);
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    state.external_requests.lock().unwrap().push(body.clone());
+    state
+        .external_request_keys
+        .lock()
+        .unwrap()
+        .push(key.clone());
+    let redelivered = (
+        StatusCode::CREATED,
+        Json(json!({ "sequence": null, "redelivered": true })),
+    );
+    if let Some(key) = key {
+        if !state.message_keys.lock().unwrap().insert(key.clone()) {
+            return redelivered;
+        }
+        state.created.lock().unwrap().push(key);
+    } else if let (Some(partition_key), Some(sequence)) = (
+        body["dedupe"]["partitionKey"].as_str(),
+        body["dedupe"]["sequence"].as_i64(),
+    ) {
+        let mut watermarks = state.dedupe_watermarks.lock().unwrap();
+        if watermarks
+            .get(partition_key)
+            .is_some_and(|&highest| sequence <= highest)
+        {
+            return redelivered;
+        }
+        watermarks.insert(partition_key.to_string(), sequence);
+        state
+            .created
+            .lock()
+            .unwrap()
+            .push(format!("{partition_key}:{sequence}"));
+    }
     (
         StatusCode::CREATED,
         Json(json!({ "sequence": 1, "redelivered": false })),
@@ -419,12 +467,13 @@ fn an_order_placed_event_is_published_with_its_own_tag_as_correlation_header() {
 /// The inbound `Record` scenario: a real message published to a real
 /// stream, consumed back with a real pull consumer, and dispatched
 /// through `dispatch_inbound_message` exactly as `run_inbound` would -
-/// proving the `dedupe` partition key/sequence sent to skilj are
-/// genuinely read from this message's own real, broker-assigned
-/// `(stream, stream_sequence)`, not synthesised - and, unlike AMQP,
-/// always present (never optional) for any real JetStream delivery.
+/// proving the `Idempotency-Key` sent to skilj is genuinely read from
+/// this message's own real, broker-assigned `(stream, stream_sequence)`,
+/// not synthesised - and, unlike AMQP, always present (never optional)
+/// for any real JetStream delivery. No `dedupe` cursor: its watermark
+/// would drop JetStream's out-of-order redeliveries (§175).
 #[test]
-fn an_inbound_record_message_carries_its_own_real_stream_and_sequence_as_dedupe() {
+fn an_inbound_record_message_carries_its_own_real_stream_and_sequence_as_key() {
     runtime().block_on(async {
         let Some(url) = test_nats().await else {
             return;
@@ -467,8 +516,11 @@ fn an_inbound_record_message_carries_its_own_real_stream_and_sequence_as_dedupe(
         let requests = mock_state.external_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["payload"], json!({ "orderId": "o-1" }));
-        assert_eq!(requests[0]["dedupe"]["partitionKey"], json!(stream_name));
-        assert_eq!(requests[0]["dedupe"]["sequence"], json!(1));
+        assert_eq!(requests[0].get("dedupe"), None);
+        assert_eq!(
+            mock_state.external_request_keys.lock().unwrap().as_slice(),
+            &[Some(format!("{stream_name}:1"))]
+        );
     });
 }
 
@@ -1144,5 +1196,120 @@ fn a_non_json_message_is_parked_at_once_with_its_raw_content() {
         assert_eq!(parked["attemptCount"], json!(1));
         assert_eq!(parked["request"]["payload"], json!("not json {"));
         assert!(mock_state.external_requests.lock().unwrap().is_empty());
+    });
+}
+
+/// Codeberg issue #59: JetStream redelivers an unacknowledged message only
+/// after `ack_wait`, and delivers newer messages meanwhile. A bridge that
+/// stops while retrying a message - an ordinary restart - leaves it (and
+/// everything it had already pulled) unacknowledged; the next bridge
+/// records a newer message first, and §39's watermark then answers every
+/// redelivered one `redelivered`, so it's acked without ever being created.
+#[test]
+fn messages_redelivered_after_a_restart_are_all_created() {
+    runtime().block_on(async {
+        let Some(url) = test_nats().await else {
+            return;
+        };
+        let stream_name = unique_name("ORDERSRESTART");
+        let jetstream = jetstream_with_stream(url, &stream_name).await;
+        let consumer: PullConsumer = jetstream
+            .get_stream(&stream_name)
+            .await
+            .unwrap()
+            .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some("restart-consumer".to_string()),
+                ack_wait: Duration::from_secs(3),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mock_state = MockSkiljState::default();
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+        let subject = format!("{stream_name}.in");
+        for n in 1..=3 {
+            jetstream
+                .publish(subject.clone(), json!({ "n": n }).to_string().into())
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        let mapping = Arc::new(InboundMapping {
+            credential: "external-token".to_string(),
+            action: InboundAction::Record {
+                event_type: "OrderPlaced".to_string(),
+            },
+        });
+        let run = |stop: tokio::sync::oneshot::Receiver<()>| {
+            let (consumer, skilj_base_url, mapping) =
+                (consumer.clone(), skilj_base_url.clone(), mapping.clone());
+            tokio::spawn(async move {
+                run_inbound_until(
+                    &consumer,
+                    &skilj_nats::http_client(),
+                    &skilj_base_url,
+                    &mapping,
+                    &skilj_retry::RetryPolicy::bounded(
+                        Duration::from_secs(60),
+                        1.0,
+                        Duration::from_secs(60),
+                        10,
+                    ),
+                    async {
+                        let _ = stop.await;
+                    },
+                )
+                .await;
+            })
+        };
+
+        // The first bridge pulls messages 1-3 and is still retrying 1 when it stops.
+        *mock_state.fail_external_requests.lock().unwrap() = 1;
+        let (stop_first, stopped) = tokio::sync::oneshot::channel::<()>();
+        let first = run(stopped);
+        for _ in 0..150 {
+            if *mock_state.fail_external_requests.lock().unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(*mock_state.fail_external_requests.lock().unwrap(), 0);
+        stop_first.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("run_inbound_until must return once asked")
+            .unwrap();
+
+        // A new message arrives, and the restarted bridge runs.
+        jetstream
+            .publish(subject.clone(), json!({ "n": 4 }).to_string().into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        let (stop_second, stopped) = tokio::sync::oneshot::channel::<()>();
+        let second = run(stopped);
+        for _ in 0..150 {
+            if mock_state.external_requests.lock().unwrap().len() >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Long enough for every redelivery after ack_wait to be dispatched.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        stop_second.send(()).unwrap();
+        second.await.unwrap();
+
+        let mut created = mock_state.created.lock().unwrap().clone();
+        created.sort_unstable();
+        assert_eq!(
+            created,
+            (1..=4)
+                .map(|n| format!("{stream_name}:{n}"))
+                .collect::<Vec<_>>(),
+            "every message must be created once; requests sent with keys: {:?}",
+            mock_state.external_request_keys.lock().unwrap()
+        );
     });
 }

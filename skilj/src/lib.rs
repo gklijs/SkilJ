@@ -2296,6 +2296,8 @@ impl SkiljBuilder {
                         // comment.
                         skilj_core::db::ensure_external_message_cursors_table(pool, &bc.name)
                             .await?;
+                        // Its per-message counterpart (docs/architecture.md §175).
+                        skilj_core::db::ensure_external_message_keys_table(pool, &bc.name).await?;
                         // "New subscriber replays all history" fix
                         // (docs/architecture.md's own write-up of this pass) -
                         // `access_tokens.start_from`, same "patched into every
@@ -3238,14 +3240,25 @@ impl RetentionTarget {
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> skilj_core::error::Result<u64> {
         match self {
+            // External events' message keys share the retention
+            // (docs/architecture.md §175). The two counts are summed, so a
+            // batch is "full" while either table still filled its own.
             RetentionTarget::IdempotencyKeys => {
-                skilj_core::db::delete_expired_idempotency_keys(
+                let commands = skilj_core::db::delete_expired_idempotency_keys(
                     pool,
                     bounded_context,
                     cutoff,
                     IDEMPOTENCY_KEY_CLEANUP_BATCH,
                 )
-                .await
+                .await?;
+                let external = skilj_core::db::delete_expired_external_message_keys(
+                    pool,
+                    bounded_context,
+                    cutoff,
+                    IDEMPOTENCY_KEY_CLEANUP_BATCH,
+                )
+                .await?;
+                Ok(commands + external)
             }
             RetentionTarget::ResolvedDeadlines => {
                 skilj_core::db::delete_expired_deadlines(

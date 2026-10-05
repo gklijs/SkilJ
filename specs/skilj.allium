@@ -2137,7 +2137,7 @@ rule CreateExternalEvent {
     when:
         SubmitExternalEvent(
             adapter, event_type, payload, source_content, source_context?,
-            dedupe_partition_key?, dedupe_sequence?,
+            dedupe_partition_key?, dedupe_sequence?, idempotency_key?,
             correlation_id?, causation_id?)
     requires: event_type.external_creation_allowed = true
     requires: adapter.event_type = event_type
@@ -2236,14 +2236,16 @@ rule CreateExternalEvent {
     --
     -- One number per pair, not a row per message, and that compactness is
     -- the whole design rather than an optimisation of it. It is sound
-    -- because the caller's own source already guarantees strictly
-    -- increasing delivery order within one partition, which is exactly the
-    -- property that makes everything at or below the highest seen
-    -- redundant. What it buys in cheapness it gives up in generality: this
-    -- deduplicates ordered message streams and nothing else. An adapter
-    -- with arbitrary unordered identifiers to deduplicate by has no
-    -- mechanism here, and should not reach for this one by inventing an
-    -- ordering its source does not have.
+    -- only when every message of a partition reaches this rule in order,
+    -- a redelivery included: a source that replays a partition from a
+    -- committed position (Kafka and its kin) does, and nothing at or below
+    -- the highest seen can then be new. What it buys in cheapness it gives
+    -- up in generality: this deduplicates ordered message streams and
+    -- nothing else. A source that redelivers one message at a time, after
+    -- later ones - NATS JetStream after its ack wait, an AMQP broker
+    -- after a release, competing consumers on either - would have every
+    -- redelivery dropped as already seen, and is what idempotency_key
+    -- below is for.
     --
     -- The cost of a watermark, stated plainly rather than left to be
     -- discovered: a message arriving out of order within its own partition
@@ -2265,13 +2267,38 @@ rule CreateExternalEvent {
     -- Nothing expires - unlike a recorded idempotency key (see rule
     -- ProcessCommand), and because of the compactness above: one number
     -- per pair does not grow with traffic, and forgetting it would
-    -- re-admit every redelivery of its partition. A watermark is also not the opaque source_context blob and never parsed out of it:
-    -- an adapter that puts its Kafka topic/partition/offset in there for
+    -- re-admit every redelivery of its partition.
+    --
+    -- idempotency_key is the other way to be recognised: a value naming
+    -- this one message, in any order relative to the others - typically
+    -- the source's own message id, or its stream and position together.
+    -- recorded_external_event(adapter, idempotency_key) is the sequence of
+    -- the event a submission bearing that key from that adapter created,
+    -- or null when the key is null or nothing has been recorded for it; a
+    -- black box like highest_dedupe_sequence. A key with a recorded event
+    -- is a redelivery, with the same consequences as one below the
+    -- watermark; a key without one creates the event and records the key
+    -- against it in the same transaction. It costs a record per message
+    -- where the watermark costs one number per partition, which is why
+    -- both exist, and an adapter supplies one or the other, never both:
+    -- the guard below refuses a submission naming both as malformed.
+    --
+    -- Scoped to the adapter, as the watermark is and for the same
+    -- reason, and kept for config.idempotency_key_retention like a
+    -- command's key (see rule ProcessCommand), since a record per message
+    -- kept forever grows with traffic without bound. The obligation this
+    -- puts on a deployment is the same as there: a redelivery arriving
+    -- after the retention creates its event a second time.
+    requires: idempotency_key = null or dedupe_partition_key = null
+
+    -- Neither a watermark nor a key is the opaque source_context blob, or
+    -- ever parsed out of it: an adapter that puts its Kafka topic/partition/offset in there for
     -- provenance has said nothing to this mechanism, which acts only on
     -- values named separately and explicitly (see variant
     -- ExternalTriggered).
     let watermark = highest_dedupe_sequence(adapter, dedupe_partition_key)
-    let is_redelivery = watermark != null and dedupe_sequence <= watermark
+    let prior_sequence = recorded_external_event(adapter, idempotency_key)
+    let is_redelivery = prior_sequence != null or (watermark != null and dedupe_sequence <= watermark)
 
     -- Every sync projection consuming this event type is updated inline,
     -- in this same transaction - see the project() note above the rules.
@@ -6753,7 +6780,7 @@ surface ExternalEventIngestion {
     provides:
         SubmitExternalEvent(
             adapter, event_type, payload, source_content, source_context?,
-            dedupe_partition_key?, dedupe_sequence?,
+            dedupe_partition_key?, dedupe_sequence?, idempotency_key?,
             correlation_id?, causation_id?)
 
     @guarantee TokenScopedToEventType
@@ -6799,11 +6826,11 @@ surface ExternalEventIngestion {
         -- above the rules.
         --
         -- Neither value takes any part in deduplication. A redelivery is
-        -- recognised by dedupe_partition_key and dedupe_sequence and by
-        -- nothing else, so two submissions differing only in correlation_id
-        -- are the same message, and a resubmission bearing a fresh
-        -- correlation_id creates no event if its sequence is at or below the
-        -- watermark.
+        -- recognised by dedupe_partition_key and dedupe_sequence, or by
+        -- idempotency_key, and by nothing else, so two submissions differing
+        -- only in correlation_id are the same message, and a resubmission
+        -- bearing a fresh correlation_id creates no event if it is a
+        -- redelivery by either.
 
     @guarantee OmittingTheDedupePairChangesNothing
         -- dedupe_partition_key and dedupe_sequence are optional, and
@@ -6818,6 +6845,11 @@ surface ExternalEventIngestion {
         -- They travel as a pair. An adapter supplying exactly one of them
         -- is refused outright, which is a rejection of a malformed request
         -- and is not the same thing as the accepted no-op below.
+        --
+        -- idempotency_key is optional on the same terms: omitted, nothing
+        -- is looked up or recorded for it. It is the alternative to the
+        -- pair, for a source that redelivers messages out of order, and a
+        -- submission naming both is refused as malformed.
 
     @guarantee ARedeliveryProducesNoEventAndNoOutcome
         -- A submission whose dedupe_sequence is at or below the highest
@@ -6835,6 +6867,12 @@ surface ExternalEventIngestion {
         -- watermark remembers one number and not which event any particular
         -- past message produced, so there is no original outcome to return
         -- and none is fabricated (see rule CreateExternalEvent).
+        --
+        -- A submission whose idempotency_key this adapter already had an
+        -- event created for is a redelivery in the same way. The key's
+        -- record does name that event, so the answer may carry its
+        -- sequence; it is still not an outcome to act on, only which event
+        -- the message became.
         --
         -- Scoped to this adapter and this partition key alone, so two
         -- adapters that independently chose the same partition key string

@@ -219,10 +219,12 @@ impl InboundAction {
 }
 
 /// Sends an inbound message's request `body` for `mapping` - `POST
-/// /v1/events/external` for `Record`, `POST /v1/commands/trigger` with
-/// `idempotency_key` for `Trigger`. A `Trigger` rejection is a `200 {
-/// accepted: false, ... }`, not an error: the message was delivered and
-/// decided upon, which is all a bridge promises.
+/// /v1/events/external` for `Record`, `POST /v1/commands/trigger` for
+/// `Trigger`, either with `idempotency_key` as its `Idempotency-Key`
+/// header (an external event's per-message key, docs/architecture.md
+/// §175). A `Trigger` rejection is a `200 { accepted: false, ... }`, not
+/// an error: the message was delivered and decided upon, which is all a
+/// bridge promises.
 pub async fn post_inbound(
     http: &reqwest::Client,
     skilj_base_url: &str,
@@ -232,13 +234,11 @@ pub async fn post_inbound(
 ) -> Result<(), SkiljError> {
     let request = match &mapping.action {
         InboundAction::Record { .. } => http.post(format!("{skilj_base_url}/v1/events/external")),
-        InboundAction::Trigger { .. } => {
-            let request = http.post(format!("{skilj_base_url}/v1/commands/trigger"));
-            match idempotency_key {
-                Some(key) => request.header("Idempotency-Key", key),
-                None => request,
-            }
-        }
+        InboundAction::Trigger { .. } => http.post(format!("{skilj_base_url}/v1/commands/trigger")),
+    };
+    let request = match idempotency_key {
+        Some(key) => request.header("Idempotency-Key", key),
+        None => request,
     };
     let response = request
         .bearer_auth(&mapping.credential)

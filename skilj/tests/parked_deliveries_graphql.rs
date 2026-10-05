@@ -191,19 +191,28 @@ async fn setup_with(
         .expect("test_database_url() must be Some - caller already checked");
     let jwks_url = serve_jwks().await;
 
-    let (skilj, _report) = configure(Skilj::builder(database_url.clone()).identity_provider(
-        IdpConfig::new(
-            jwks_url.parse().unwrap(),
-            TEST_ISSUER,
-            TEST_AUDIENCE,
-            SigningAlgorithm::Rs256,
-        ),
-    ))
+    // Small pools: every test here runs at once against one server, and
+    // two default-sized pools per test outgrow its 100 connections - the
+    // tests then fail with `PoolTimedOut` ("too many clients"). `configure`
+    // can still set its own.
+    let (skilj, _report) = configure(
+        Skilj::builder(database_url.clone())
+            .pool_options(db::PgPoolOptions::new().max_connections(4))
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            )),
+    )
     .build()
     .await
     .unwrap();
 
-    let pool = skilj_core::db::connect(&database_url).await.unwrap();
+    let pool =
+        skilj_core::db::connect_with(&database_url, db::PgPoolOptions::new().max_connections(2))
+            .await
+            .unwrap();
 
     let admin_subject = unique_name("admin");
     let role = Role {
@@ -1907,5 +1916,98 @@ fn parked_requests_are_masked_and_scoped_per_caller() {
 
         let remaining: Vec<String> = list(plain).await.into_iter().map(|(id, _)| id).collect();
         assert_eq!(remaining, ["acme-Gone", "globex-Admit"]);
+    });
+}
+
+/// docs/architecture.md §175, over the wire: an external event keyed by
+/// `Idempotency-Key` is created once, a repeat names the event it already
+/// became, and a request naming both a key and a `dedupe` cursor is
+/// refused, at submission and at report time. A message whose keyed
+/// original committed without the bridge hearing back, then parked with
+/// its key, is not created again when retried.
+#[test]
+fn retrying_a_parked_external_event_whose_keyed_original_committed_is_deduplicated() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _) = setup().await;
+        let credential = mint_external_event_token(&pool, &bc_name).await;
+        let rest = skilj.rest_router();
+        let post = |uri: &'static str, key: Option<&'static str>, body: serde_json::Value| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(
+                    "authorization",
+                    format!("Bearer {}.{}", credential.0, credential.1),
+                )
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header("Idempotency-Key", key);
+            }
+            let rest = rest.clone();
+            async move {
+                let response = rest
+                    .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            }
+        };
+        let original = json!({ "payload": { "amount": 9 }, "sourceContent": "nats-jetstream" });
+
+        let (status, created) = post("/v1/events/external", Some("ORDERS:9"), original.clone()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["redelivered"], false);
+        let (status, repeated) = post("/v1/events/external", Some("ORDERS:9"), original.clone()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(repeated["redelivered"], true);
+        assert_eq!(repeated["sequence"], created["sequence"]);
+
+        let mut with_cursor = original.clone();
+        with_cursor["dedupe"] = json!({ "partitionKey": "ORDERS", "sequence": 10 });
+        let (status, refused) =
+            post("/v1/events/external", Some("ORDERS:10"), with_cursor.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["code"], "dedupe_and_idempotency_key", "{refused}");
+
+        let report = |request: serde_json::Value| {
+            json!({
+                "source": "nats-inbound",
+                "kind": "external_event",
+                "identifier": "ORDERS:9",
+                "error": "timed out",
+                "attemptCount": 3,
+                "firstFailedAt": test_now(),
+                "request": request,
+                "idempotencyKey": "ORDERS:9",
+            })
+        };
+        let (status, _) = post("/v1/parked-deliveries", None, report(with_cursor)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, parked) = post("/v1/parked-deliveries", None, report(original)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let graphql = skilj.graphql_router().await.unwrap();
+        let retried = graphql_request(
+            &graphql,
+            Some(&jwt),
+            "mutation($bc: String!, $id: String!) { retryParkedDelivery(boundedContext: $bc, id: $id) { id } }",
+            json!({ "bc": bc_name, "id": parked["id"] }),
+        )
+        .await;
+        assert!(retried.get("errors").is_none(), "{retried:?}");
+
+        let events = db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "the keyed original must not be created twice");
+        assert!(db::list_parked_deliveries(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
     });
 }

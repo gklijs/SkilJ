@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `skilj-nats` and `skilj-amqp` could lose inbound `Record` messages.
+  JetStream redelivers an unacknowledged message after newer ones, and an
+  AMQP broker returns a released message after later deliveries. The
+  external-message watermark then took the redelivery for one already
+  recorded, the bridge acknowledged it, and it was never created - after
+  an ordinary bridge restart, for instance. `POST /v1/events/external`
+  now accepts an `Idempotency-Key` header, a per-message key
+  (`external_message_keys`, kept for `idempotency_key_retention`, refused
+  together with `dedupe`). A keyed redelivery returns the original
+  event's `sequence`. NATS sends `{stream}:{stream_sequence}`, and AMQP
+  `{group-id}:{group-sequence}` or its `message-id`. Parked external
+  events keep their key and are retried under it. Kafka is unchanged. In
+  `skilj-core`, `create_and_insert_external_event` takes
+  `Option<ExternalEventDedupe>` and `CreateExternalEventOutcome::Redelivered`
+  carries `sequence` (docs/architecture.md §175, Codeberg issue #59).
+
 - Retrying a parked inbound external event (`retryParkedDelivery`) could
   silently lose it. When the bridge's request carried a `dedupe` cursor
   and later messages on the same partition had been recorded since, the
