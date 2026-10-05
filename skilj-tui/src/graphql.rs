@@ -260,6 +260,29 @@ pub const LIVE_EVENTS_QUERY: &str = "subscription($bc: String!, $from: Int) { \
     allEvents(boundedContext: $bc, fromSequence: $from) { sequence payload } \
 }";
 
+/// [`LIVE_EVENTS_QUERY`] with the database epoch `$from` was read in
+/// (docs/architecture.md §176), for a server that has one: after a
+/// failover or restore it's refused with `epoch_changed` rather than
+/// resumed from a sequence the new history may have reused.
+pub const LIVE_EVENTS_IN_EPOCH_QUERY: &str =
+    "subscription($bc: String!, $from: Int, $epoch: String) { \
+    allEvents(boundedContext: $bc, fromSequence: $from, epoch: $epoch) { sequence payload } \
+}";
+
+/// The server's current database epoch (`{ epoch }`), or `None` when it
+/// can't be had - a server from before §176 has no such field, and the
+/// feed then resumes without one, as it always did.
+async fn fetch_epoch(ws_endpoint: reqwest::Url, token: String) -> Option<String> {
+    let mut rx = spawn_subscription(ws_endpoint, token, "{ epoch }".to_string(), json!({}));
+    match rx.recv().await? {
+        Ok(data) => data
+            .get("epoch")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Err(_) => None,
+    }
+}
+
 /// [`spawn_subscription`] for [`LIVE_EVENTS_QUERY`], kept alive
 /// (docs/architecture.md §106). The server ends a subscription on
 /// purpose - it fell behind (`subscription_lagged`), a missed
@@ -273,7 +296,10 @@ pub const LIVE_EVENTS_QUERY: &str = "subscription($bc: String!, $from: Int) { \
 /// `resume_span_too_large` refusal (too far behind to replay) or a
 /// `from_sequence_not_committed` one (the bounded context was recreated,
 /// its sequences starting over - §148) resumes from now instead, after
-/// reporting it. Ends only when the receiver is dropped.
+/// reporting it, and so does `epoch_changed` (a failover or restore since
+/// the last sequence was read - §176): whenever it starts from now it
+/// reads the server's epoch first and resumes in it. Ends only when the
+/// receiver is dropped.
 ///
 /// When the server closes the connection because the token expired, or
 /// refuses `connection_init`, the token is refreshed first if `token`
@@ -290,14 +316,30 @@ pub fn spawn_live_events(
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut last_sequence: Option<i64> = None;
+        let mut epoch: Option<String> = None;
         let mut delay = initial_delay;
         loop {
             let used_token = token.current().await;
+            // Starting from now: the epoch the sequences about to arrive
+            // are read in, sent back with the last of them on a resume.
+            if last_sequence.is_none() {
+                epoch = fetch_epoch(ws_endpoint.clone(), used_token.clone()).await;
+            }
+            let (query, variables) = match &epoch {
+                Some(epoch) => (
+                    LIVE_EVENTS_IN_EPOCH_QUERY,
+                    json!({ "bc": bounded_context, "from": last_sequence, "epoch": epoch }),
+                ),
+                None => (
+                    LIVE_EVENTS_QUERY,
+                    json!({ "bc": bounded_context, "from": last_sequence }),
+                ),
+            };
             let mut inner = spawn_subscription(
                 ws_endpoint.clone(),
                 used_token.clone(),
-                LIVE_EVENTS_QUERY.to_string(),
-                json!({ "bc": bounded_context, "from": last_sequence }),
+                query.to_string(),
+                variables,
             );
             let mut expired = false;
             let mut refused = false;
@@ -317,13 +359,19 @@ pub fn spawn_live_events(
                     // too far behind to replay, or - `from_sequence_not_committed`
                     // - past the latest sequence, the bounded context having
                     // been deleted and recreated (docs/architecture.md
-                    // §148). Retried as it was, it would be refused on
-                    // every reconnect; it resumes from now instead.
+                    // §148), or - `epoch_changed` - read before a failover
+                    // or restore (§176). Retried as it was, it would be
+                    // refused on every reconnect; it resumes from now
+                    // instead.
                     Err(ClientError::Graphql(errors))
                         if errors.iter().any(|e| {
                             matches!(
                                 e.code.as_deref(),
-                                Some("resume_span_too_large" | "from_sequence_not_committed")
+                                Some(
+                                    "resume_span_too_large"
+                                        | "from_sequence_not_committed"
+                                        | "epoch_changed"
+                                )
                             )
                         }) =>
                     {

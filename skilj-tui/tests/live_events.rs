@@ -47,7 +47,6 @@ async fn send(socket: &mut WebSocket, value: Value) {
 }
 
 async fn run(mut socket: WebSocket, state: MockState) {
-    let connection = state.connections.fetch_add(1, Ordering::SeqCst);
     let Some(Ok(Message::Text(_init))) = socket.recv().await else {
         return;
     };
@@ -56,6 +55,18 @@ async fn run(mut socket: WebSocket, state: MockState) {
         return;
     };
     let subscribe: Value = serde_json::from_str(&subscribe).unwrap();
+    // The feed reads the database epoch before starting from now
+    // (docs/architecture.md §176); not a subscription of its own.
+    if subscribe["payload"]["query"] == "{ epoch }" {
+        send(
+            &mut socket,
+            json!({ "id": "1", "type": "next", "payload": { "data": { "epoch": "e1" } } }),
+        )
+        .await;
+        send(&mut socket, json!({ "id": "1", "type": "complete" })).await;
+        return;
+    }
+    let connection = state.connections.fetch_add(1, Ordering::SeqCst);
     state
         .subscriptions
         .lock()
@@ -134,18 +145,30 @@ async fn a_subscription_the_server_ends_is_resumed_from_the_last_sequence() {
     );
 
     let subscriptions = state.subscriptions.lock().unwrap().clone();
-    assert_eq!(subscriptions[0], json!({ "bc": "banking", "from": null }));
-    assert_eq!(subscriptions[1], json!({ "bc": "banking", "from": 5 }));
+    assert_eq!(
+        subscriptions[0],
+        json!({ "bc": "banking", "from": null, "epoch": "e1" })
+    );
+    assert_eq!(
+        subscriptions[1],
+        json!({ "bc": "banking", "from": 5, "epoch": "e1" })
+    );
 }
 
 /// A refusal to resume from the last sequence - too far behind
 /// (`resume_span_too_large`), or past the latest sequence because the
 /// bounded context was recreated (`from_sequence_not_committed`,
-/// docs/architecture.md §148) - is refused on every retry, so the feed
-/// resumes from now (`from: null`) instead of repeating it forever.
+/// docs/architecture.md §148), or read before a failover
+/// (`epoch_changed`, §176) - is refused on every retry, so the feed
+/// resumes from now (`from: null`, in the epoch read again) instead of
+/// repeating it forever.
 #[tokio::test]
 async fn a_refused_resume_starts_again_from_now() {
-    for code in ["resume_span_too_large", "from_sequence_not_committed"] {
+    for code in [
+        "resume_span_too_large",
+        "from_sequence_not_committed",
+        "epoch_changed",
+    ] {
         let state = MockState {
             end_code: Some(code),
             ..MockState::default()
@@ -173,7 +196,7 @@ async fn a_refused_resume_starts_again_from_now() {
         let subscriptions = state.subscriptions.lock().unwrap().clone();
         assert_eq!(
             subscriptions[1],
-            json!({ "bc": "banking", "from": null }),
+            json!({ "bc": "banking", "from": null, "epoch": "e1" }),
             "{code}"
         );
     }

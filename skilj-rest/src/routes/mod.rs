@@ -478,6 +478,9 @@ impl From<&Event> for EventDto {
 struct EventsResponse {
     events: Vec<EventDto>,
     next_cursor: Option<String>,
+    // docs/architecture.md §176: the database epoch `next_cursor` was
+    // read in - sent back as `epoch` with it.
+    epoch: String,
     event_type_name: String,
     event_type_schema: String,
     event_type_schema_version: i64,
@@ -487,6 +490,9 @@ struct EventsResponse {
 #[serde(rename_all = "camelCase")]
 struct ConsumeResponse {
     events: Vec<EventDto>,
+    // docs/architecture.md §176: the database epoch these events were
+    // read in - sent back as `epoch` with their acknowledgement.
+    epoch: String,
     event_type_name: String,
     event_type_schema: String,
     event_type_schema_version: i64,
@@ -498,6 +504,9 @@ struct EventsQuery {
     #[serde(default)]
     filter: Vec<String>,
     after: Option<i64>,
+    // docs/architecture.md §176: the `epoch` the response carrying `after`
+    // as its `nextCursor` came with.
+    epoch: Option<String>,
     // Codeberg issue #18 - "show me everything in this transaction",
     // the REST-side counterpart to `queryEvents`'s own `correlationId`
     // GraphQL argument.
@@ -560,6 +569,9 @@ fn parse_filter_params(raw: &[String]) -> Result<Vec<Filter>, RestError> {
 #[derive(Deserialize)]
 struct AckRequest {
     sequence: i64,
+    // docs/architecture.md §176: the `epoch` the consume response that
+    // served `sequence` came with.
+    epoch: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -782,10 +794,15 @@ async fn get_events(
     // deleted and recreated, say. Served, it would come back unchanged
     // as `nextCursor` and every event up to it would be skipped, silently
     // (docs/architecture.md §148).
+    //
+    // A cursor from another database epoch is refused whatever its value:
+    // after a failover the log may end before it, or have reused it for
+    // other events since (docs/architecture.md §176).
+    let (latest, epoch) =
+        db::latest_sequence_and_epoch(&state.pool, &token.event_type.bounded_context.name).await?;
+    db::require_epoch(query.epoch.as_deref(), &epoch)?;
     if let Some(after) = query.after {
-        let latest = db::latest_sequence(&state.pool, &token.event_type.bounded_context.name)
-            .await?
-            .unwrap_or(-1);
+        let latest = latest.unwrap_or(-1);
         if after > latest {
             return Err(RestError::InvalidRequest(format!(
                 "after {after} is past the latest committed sequence {latest} - pass a \
@@ -829,6 +846,9 @@ async fn get_events(
     let next_cursor = next_position
         .or(query.after)
         .map(|sequence| sequence.to_string());
+    // A failover during the read would hand out a cursor from the old
+    // history under the new epoch.
+    db::require_epoch(Some(epoch.as_str()), &db::current_epoch(&state.pool).await?)?;
 
     // `redact_private_fields` - unconditional, no `Role`/`access_mapping`
     // to condition it on (see that function's own doc comment, and
@@ -843,6 +863,7 @@ async fn get_events(
     Ok(Json(EventsResponse {
         events: matched.iter().map(EventDto::from).collect(),
         next_cursor,
+        epoch: epoch.to_string(),
         event_type_name: token.event_type.name.clone(),
         event_type_schema: token.event_type.schema.clone(),
         event_type_schema_version: token.event_type.schema_version,
@@ -885,6 +906,11 @@ async fn get_events_consume(
     // (another consume or ack committed), the read is redone from where it
     // now stands.
     let bounded_context_name = &token.event_type.bounded_context.name;
+    // Read before the events, and checked again inside the cursor's
+    // transaction below: a failover in between would otherwise move the
+    // cursor on the new history over events read from the old one
+    // (docs/architecture.md §176).
+    let epoch = db::current_epoch(&state.pool).await?;
     let cursor = db::get_read_cursor(&state.pool, &token).await?;
     // Refused before any event is loaded, not after: a new `Latest`/
     // `AtTime` cursor's seed below walks the type's whole history
@@ -951,6 +977,7 @@ async fn get_events_consume(
             .await
             .map_err(skilj_core::error::Error::from)?;
         db::lock_read_cursor_for_consume(&mut tx, &token).await?;
+        db::require_epoch(Some(epoch.as_str()), &db::current_epoch(&mut *tx).await?)?;
         let existing_cursor = db::get_read_cursor(&mut *tx, &token).await?;
         let current = existing_cursor.as_ref().map(|cursor| cursor.sequence);
         if current != expected {
@@ -983,6 +1010,7 @@ async fn get_events_consume(
         .collect();
     Ok(Json(ConsumeResponse {
         events: served.iter().map(EventDto::from).collect(),
+        epoch: epoch.to_string(),
         event_type_name: token.event_type.name.clone(),
         event_type_schema: token.event_type.schema.clone(),
         event_type_schema_version: token.event_type.schema_version,
@@ -1007,6 +1035,9 @@ async fn post_events_consume_ack(
         .await
         .map_err(skilj_core::error::Error::from)?;
     db::lock_read_cursor_for_consume(&mut tx, &token).await?;
+    // A sequence served in another epoch may name a different event now,
+    // or none (docs/architecture.md §176).
+    db::require_epoch(body.epoch.as_deref(), &db::current_epoch(&mut *tx).await?)?;
     let cursor = db::get_read_cursor(&mut *tx, &token).await?;
 
     let (sequence, updated_at) =

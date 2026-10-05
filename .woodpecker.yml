@@ -131,8 +131,13 @@ steps:
       # crate's own Cargo features avoid - hence libcurl4-openssl-dev
       # too. (skilj-temporal no longer needs a system protoc as of
       # 0.0.5 - it builds via temporalio-client's own vendored-protox
-      # feature instead.)
-      - apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev postgresql-client
+      # feature instead.) `postgresql` is the server: the failover test
+      # (skilj_test_support::FailoverServer, docs/architecture.md §176)
+      # runs a primary and a standby of its own, and Postgres refuses to
+      # run as root, so as root it runs the system's binaries as the
+      # `postgres` user this package creates - the embedded ones live in
+      # root's home, out of that user's reach.
+      - apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev postgresql-client postgresql
       # Settle the database first, not last. Everything below this is
       # minutes of compiling, and a `services:` container comes with no
       # readiness signal: if it never comes up, the run should say so in

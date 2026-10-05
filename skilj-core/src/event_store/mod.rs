@@ -602,6 +602,17 @@ pub enum Error {
     #[error("an external event takes either a dedupe cursor or an idempotency key, not both")]
     DedupeAndIdempotencyKey,
 
+    /// A position read in another database epoch - before a standby was
+    /// promoted, or the database restored (docs/architecture.md §176).
+    /// The log may end before it, and its sequences may since name other
+    /// events, so it can't be resumed from.
+    #[error(
+        "this position was read in database epoch {supplied}, but the database is now in \
+         epoch {current} (a failover or restore): events after an earlier point may be gone \
+         and their sequences reused - start again from a position read in the current epoch"
+    )]
+    EpochChanged { supplied: String, current: String },
+
     /// Not spec-modeled: the spec's own `ProcessCommand` assumes `decide()`
     /// only ever names an `EventType` its bounded context actually
     /// registered - a plugin-author responsibility, not a case the spec
@@ -698,6 +709,7 @@ impl SkiljRejection for Error {
             Error::ReservedIdempotencyKeyPrefix => "reserved_idempotency_key_prefix",
             Error::IdempotencyKeyTooLong => "idempotency_key_too_long",
             Error::DedupeAndIdempotencyKey => "dedupe_and_idempotency_key",
+            Error::EpochChanged { .. } => "epoch_changed",
             Error::UnregisteredEventType(_) => "unregistered_event_type",
             Error::PayloadDecodeFailed(_) => "payload_decode_failed",
             Error::CorrelationIdTooLong => "correlation_id_too_long",

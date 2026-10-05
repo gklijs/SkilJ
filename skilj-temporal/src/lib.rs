@@ -296,10 +296,19 @@ pub async fn poll_once(
         temporal,
         bounded_context,
         mapping,
-        &mut std::collections::VecDeque::new(),
+        &mut Pending::default(),
         None,
     )
     .await
+}
+
+/// One mapping's events served but not yet acknowledged, and the database
+/// epoch they were served in - sent back with each acknowledgement
+/// (docs/architecture.md §176).
+#[derive(Default)]
+struct Pending {
+    events: std::collections::VecDeque<ConsumedEvent>,
+    epoch: Option<String>,
 }
 
 /// The retry state of the event at the front of one mapping's pending
@@ -337,10 +346,10 @@ async fn poll_with_pending(
     temporal: &Client,
     bounded_context: &str,
     mapping: &EventTypeMapping,
-    pending: &mut std::collections::VecDeque<ConsumedEvent>,
+    pending: &mut Pending,
     mut retry: Option<(&skilj_retry::RetryPolicy, &mut Option<HeadRetryState>)>,
 ) -> Result<usize, BridgeError> {
-    if pending.is_empty() {
+    if pending.events.is_empty() {
         let consumed = skilj_bridge::consume(
             http,
             skilj_base_url,
@@ -348,11 +357,14 @@ async fn poll_with_pending(
             &mapping.event_type,
         )
         .await?;
-        pending.extend(consumed.events.into_iter().map(ConsumedEvent::from));
+        pending.epoch = consumed.epoch;
+        pending
+            .events
+            .extend(consumed.events.into_iter().map(ConsumedEvent::from));
     }
 
     let mut worked_through = 0;
-    while let Some(event) = pending.front() {
+    while let Some(event) = pending.events.front() {
         match correlation_workflow_id(bounded_context, &mapping.correlation_tag_key, &event.tags) {
             Some(workflow_id) => {
                 let dispatched = dispatch(
@@ -414,8 +426,39 @@ async fn poll_with_pending(
                 );
             }
         }
-        skilj_bridge::ack(http, skilj_base_url, &mapping.credential, event.sequence).await?;
-        pending.pop_front();
+        match skilj_bridge::ack(
+            http,
+            skilj_base_url,
+            &mapping.credential,
+            event.sequence,
+            pending.epoch.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            // docs/architecture.md §176: served before a failover or
+            // restore. The rest of the batch is stale too; the next
+            // consume serves from the read cursor as the new history has
+            // it - nothing skipped there, at-least-once as before.
+            Err(e) if e.is_epoch_changed() => {
+                tracing::error!(
+                    event_type = %mapping.event_type,
+                    sequence = event.sequence,
+                    error = %e,
+                    "the database's epoch changed (a failover or restore) since these events \
+                     were consumed - dropping them unacknowledged and consuming again. Workflows \
+                     already started or signalled from them may refer to events that no longer \
+                     exist"
+                );
+                pending.events.clear();
+                if let Some((_, state)) = retry.as_mut() {
+                    **state = None;
+                }
+                return Ok(worked_through);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        pending.events.pop_front();
         worked_through += 1;
     }
     Ok(worked_through)
@@ -541,8 +584,7 @@ pub async fn run_until_with_retry(
     // across cycles so a failed dispatch is retried next cycle rather
     // than waiting out the consume lease (docs/architecture.md §99) - and
     // the retry state of the event at its front (§147).
-    let mut pending: Vec<std::collections::VecDeque<ConsumedEvent>> =
-        mappings.iter().map(|_| Default::default()).collect();
+    let mut pending: Vec<Pending> = mappings.iter().map(|_| Pending::default()).collect();
     let mut retry_states: Vec<Option<HeadRetryState>> = vec![None; mappings.len()];
     loop {
         let mut served_any = false;

@@ -78,6 +78,11 @@ pub struct ConsumeResponse {
     /// The `EventReadToken`'s own scoped event type, echoed back on every
     /// response - [`consume`] checks it against the mapping's.
     pub event_type_name: String,
+    /// The database epoch these events were read in (docs/architecture.md
+    /// §176), sent back with their acknowledgement. `None` from a server
+    /// that predates it.
+    #[serde(default)]
+    pub epoch: Option<String>,
 }
 
 /// The value of the tag named `key_tag_key` among `tags` - an outbound
@@ -110,6 +115,26 @@ pub enum SkiljError {
          to \"{actual}\" - wrong token for this mapping"
     )]
     EventTypeMismatch { declared: String, actual: String },
+}
+
+impl SkiljError {
+    /// Whether skilj refused a position because the database's epoch
+    /// changed since it was read - a failover or restore
+    /// (`epoch_changed`, docs/architecture.md §176). Not a failure to retry
+    /// or give up on: the consumed batch is stale, and the next consume
+    /// reads from the read cursor as the new history has it.
+    pub fn is_epoch_changed(&self) -> bool {
+        match self {
+            SkiljError::SkiljStatus { status, body } => {
+                *status == reqwest::StatusCode::CONFLICT
+                    && serde_json::from_str::<serde_json::Value>(body)
+                        .ok()
+                        .and_then(|v| v.get("code").and_then(|c| c.as_str().map(str::to_string)))
+                        .is_some_and(|code| code == "epoch_changed")
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Whether a skilj error response `body` carries one of
@@ -163,17 +188,19 @@ pub async fn consume(
 }
 
 /// Acknowledges `sequence` for `credential`'s read cursor (`POST
-/// /v1/events/consume/ack`).
+/// /v1/events/consume/ack`), with the `epoch` of the consume response that
+/// served it (docs/architecture.md §176).
 pub async fn ack(
     http: &reqwest::Client,
     skilj_base_url: &str,
     credential: &str,
     sequence: i64,
+    epoch: Option<&str>,
 ) -> Result<(), SkiljError> {
     let response = http
         .post(format!("{skilj_base_url}/v1/events/consume/ack"))
         .bearer_auth(credential)
-        .json(&serde_json::json!({ "sequence": sequence }))
+        .json(&serde_json::json!({ "sequence": sequence, "epoch": epoch }))
         .send()
         .await?;
     require_success(response).await?;
@@ -459,6 +486,7 @@ pub async fn outbound_cycle<S: OutboundSink>(
                         skilj_base_url,
                         target,
                         sink.broker_name(),
+                        consumed.epoch.as_deref(),
                         run.take(),
                         retry_policy,
                         retry_state,
@@ -499,6 +527,7 @@ pub async fn outbound_cycle<S: OutboundSink>(
         skilj_base_url,
         target,
         sink.broker_name(),
+        consumed.epoch.as_deref(),
         run,
         retry_policy,
         retry_state,
@@ -519,6 +548,7 @@ async fn flush_run<E: std::fmt::Display + From<SkiljError>>(
     skilj_base_url: &str,
     target: &OutboundTarget<'_>,
     broker_name: &str,
+    epoch: Option<&str>,
     run: Option<UnackedRun>,
     retry_policy: &skilj_retry::RetryPolicy,
     retry_state: &mut Option<OutboundRetryState>,
@@ -527,7 +557,7 @@ async fn flush_run<E: std::fmt::Display + From<SkiljError>>(
     let Some(run) = run else {
         return Ok(true);
     };
-    match ack(http, skilj_base_url, target.credential, run.last).await {
+    match ack(http, skilj_base_url, target.credential, run.last, epoch).await {
         Ok(()) => {
             *served += run.delivered;
             if retry_state.is_some_and(|s| s.sequence <= run.last) {
@@ -535,11 +565,32 @@ async fn flush_run<E: std::fmt::Display + From<SkiljError>>(
             }
             Ok(true)
         }
+        // docs/architecture.md §176: the batch was read before a failover
+        // or restore. Nothing to retry or give up on - acknowledging it
+        // would be refused again. The cycle ends unacknowledged, and the
+        // next consume serves from the read cursor as the new history has
+        // it: at-least-once still, nothing skipped there. What this run
+        // already delivered may name events the new history lost.
+        Err(e) if e.is_epoch_changed() => {
+            tracing::error!(
+                event_type = %target.event_type,
+                broker = broker_name,
+                first_sequence = run.head,
+                last_sequence = run.last,
+                error = %e,
+                "the database's epoch changed (a failover or restore) since these events were \
+                 consumed - not acknowledging them; consuming again from the new history. \
+                 Events already delivered to the broker from this batch may no longer exist, \
+                 and their sequences may be reused"
+            );
+            *retry_state = None;
+            Ok(false)
+        }
         Err(e) => {
             match record_failure(target, broker_name, run.head, &e, retry_policy, retry_state) {
                 FailureOutcome::Backoff => Ok(false),
                 FailureOutcome::GiveUp => {
-                    ack(http, skilj_base_url, target.credential, run.last).await?;
+                    ack(http, skilj_base_url, target.credential, run.last, epoch).await?;
                     Ok(true)
                 }
             }

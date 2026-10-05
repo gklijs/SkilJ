@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Database epochs (docs/architecture.md §176, Codeberg issue #42): event
+  reads return the database's `epoch` (system identifier and timeline),
+  which changes after a failover to an asynchronous standby or a
+  point-in-time restore. `GET /v1/events` (`epoch=` with `after`),
+  `POST /v1/events/consume/ack` (`epoch`) and the GraphQL `allEvents`/
+  `eventsByType` subscriptions (`epoch` with `fromSequence`) refuse a
+  position from another epoch with `epoch_changed` (409 over REST)
+  instead of skipping the events that now carry its sequences. GraphQL
+  gains a root `epoch` field. A change is logged at `error` and counted
+  (`skilj.database.epoch_changes`); migration 0006 adds `skilj_epoch`.
+  The bridges and skilj-tui send the epoch back and start over on a
+  refusal. `skilj_bridge::ack` takes the epoch (breaking).
+
 ### Changed
 
 - `skilj-kafka`'s `run_inbound` dispatches the partitions it is assigned
@@ -33,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- After a failover or restore, the event cache kept serving events the
+  database had lost - to queries and to `decide()` - until a restart: a
+  promoted standby keeps the table's OID, the cache's only stamp. Windows
+  are now stamped with the database epoch too (docs/architecture.md §176).
 - `skilj-nats` and `skilj-amqp` could lose inbound `Record` messages.
   JetStream redelivers an unacknowledged message after newer ones, and an
   AMQP broker returns a released message after later deliveries. The

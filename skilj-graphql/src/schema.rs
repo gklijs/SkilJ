@@ -163,6 +163,7 @@ async fn build(
         .field(resolvers::event_query::query_events_field())
         .field(resolvers::event_query::count_events_field())
         .field(resolvers::event_query::inspect_event_field())
+        .field(resolvers::event_query::epoch_field())
         .field(resolvers::snapshot_query::inspect_snapshot_field())
         .field(resolvers::command_query::fetch_commands_field())
         .field(resolvers::private_field_grant_management::list_private_field_grants_field())

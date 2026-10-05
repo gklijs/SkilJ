@@ -155,6 +155,12 @@ pub fn all_events_field() -> SubscriptionField {
                 .filter(|v| !v.is_null())
                 .map(|v| v.i64())
                 .transpose()?;
+            let epoch = ctx
+                .args
+                .get("epoch")
+                .filter(|v| !v.is_null())
+                .map(|v| v.string().map(str::to_string))
+                .transpose()?;
 
             // Subscribed *before* the snapshot read just below, not after
             // (drift audit finding #7, 2026-08-20 - see project memory
@@ -191,6 +197,7 @@ pub fn all_events_field() -> SubscriptionField {
                 &bounded_context_name,
                 None,
                 from_sequence,
+                epoch.as_deref(),
             )
             .await?;
 
@@ -310,6 +317,9 @@ pub fn all_events_field() -> SubscriptionField {
         "fromSequence",
         TypeRef::named(TypeRef::INT),
     ))
+    // docs/architecture.md §176: the database epoch `fromSequence` was
+    // read in (the `epoch` query).
+    .argument(InputValue::new("epoch", TypeRef::named(TypeRef::STRING)))
 }
 
 /// `eventsByType(boundedContext: String!, eventType: String!, filters: [FilterInput!], fromSequence: Int): QueriedEvent!`
@@ -341,6 +351,12 @@ pub fn events_by_type_field() -> SubscriptionField {
                 .filter(|v| !v.is_null())
                 .map(|v| v.i64())
                 .transpose()?;
+            let epoch = ctx
+                .args
+                .get("epoch")
+                .filter(|v| !v.is_null())
+                .map(|v| v.string().map(str::to_string))
+                .transpose()?;
 
             // Subscribed before the snapshot read just below - see
             // `all_events_field`'s own identical comment for why (drift
@@ -354,6 +370,7 @@ pub fn events_by_type_field() -> SubscriptionField {
                 &bounded_context_name,
                 Some(&event_type_name),
                 from_sequence,
+                epoch.as_deref(),
             )
             .await?;
 
@@ -478,6 +495,9 @@ pub fn events_by_type_field() -> SubscriptionField {
         "fromSequence",
         TypeRef::named(TypeRef::INT),
     ))
+    // docs/architecture.md §176: the database epoch `fromSequence` was
+    // read in (the `epoch` query).
+    .argument(InputValue::new("epoch", TypeRef::named(TypeRef::STRING)))
 }
 
 /// Where a subscription starts, and what it replays first (docs/
@@ -491,7 +511,10 @@ pub fn events_by_type_field() -> SubscriptionField {
 /// `max_events_per_read` of them; a larger span is refused with
 /// `resume_span_too_large` rather than loaded, and the caller reads it
 /// back with `queryEvents` first. One above the latest is refused with
-/// `from_sequence_not_committed` (§148). Must run after the broadcaster
+/// `from_sequence_not_committed` (§148), and an `epoch` other than the
+/// database's current one with `epoch_changed` (§176): after a failover
+/// the log may end before `fromSequence`, or reuse it for other events,
+/// so it isn't refused by its value alone. Must run after the broadcaster
 /// subscription: anything committed after the latest sequence read here
 /// arrives live, and anything at or below it is skipped when it does.
 async fn resolve_start(
@@ -499,11 +522,14 @@ async fn resolve_start(
     bounded_context: &str,
     event_type: Option<&str>,
     from_sequence: Option<i64>,
+    epoch: Option<&str>,
 ) -> async_graphql::Result<(i64, Vec<skilj_core::event_store::Event>, i64)> {
-    let latest = skilj_core::db::latest_sequence(&state.pool, bounded_context)
-        .await
-        .map_err(to_graphql_error)?
-        .unwrap_or(-1);
+    let (latest, current_epoch) =
+        skilj_core::db::latest_sequence_and_epoch(&state.pool, bounded_context)
+            .await
+            .map_err(to_graphql_error)?;
+    skilj_core::db::require_epoch(epoch, &current_epoch).map_err(to_graphql_error)?;
+    let latest = latest.unwrap_or(-1);
     // A sequence past the latest committed one can't be one the caller
     // read - most likely another bounded context's, or one from before
     // this bounded context was deleted and recreated. Started from it,

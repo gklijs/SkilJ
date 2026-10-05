@@ -145,6 +145,7 @@ fn status_for(err: &CoreError) -> StatusCode {
             EventStoreError::ReservedIdempotencyKeyPrefix => StatusCode::BAD_REQUEST,
             EventStoreError::IdempotencyKeyTooLong => StatusCode::BAD_REQUEST,
             EventStoreError::DedupeAndIdempotencyKey => StatusCode::BAD_REQUEST,
+            EventStoreError::EpochChanged { .. } => StatusCode::CONFLICT,
             EventStoreError::InvalidParkedDeliveryRequest(_) => StatusCode::BAD_REQUEST,
             // Another instance can take it (docs/architecture.md §160).
             EventStoreError::SyncProjectionNotDeclared(_) => StatusCode::SERVICE_UNAVAILABLE,

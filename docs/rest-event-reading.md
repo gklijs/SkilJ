@@ -31,6 +31,17 @@ A few things that trip people up:
   bounded context was deleted and recreated, whose sequences start over. Reset the checkpoint
   (omit `after` to read from the start). Before this was refused, such a cursor came back
   unchanged as `nextCursor` and every event up to it was silently skipped.
+- **Keep the `epoch` with your checkpoint, and send it back.** Every `GET /v1/events` and
+  `consume` response carries an `epoch`, the database's identity and timeline. It changes when
+  the database fails over to a standby that hadn't received everything yet, or is restored to an
+  earlier point: events you already read may be gone, and their sequences reused for different
+  events. A position sent back with its epoch - `after` with `epoch=...`, an acknowledgement's
+  `sequence` with `"epoch"` - is refused with `409 epoch_changed` once it changed, instead of
+  silently skipping the new events or acknowledging ones you never saw
+  ([§176](architecture.md)). On that refusal, decide what your side does about what it already
+  handled from the lost tail, then start again: omit `after` (or rewind to a checkpoint you trust)
+  and take the new `epoch`; for `consume`, just call it again - its server-side cursor rolled back
+  with the events. Without `epoch` nothing is checked, as before.
 - **Filters are bounded.** A read takes at most 32 `filter` parameters, each value at most 4096
   characters, and an `is_like` pattern at most 1024. Past that the call is refused with `400`
   `invalid_filter` rather than answered - every filter runs against every event the read walks

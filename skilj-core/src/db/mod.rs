@@ -5691,18 +5691,140 @@ pub async fn next_sequence_batch<'e>(
 /// it creates a new table with a new OID - so anything keyed by the *name*
 /// (the event cache's windows) can tell a successor from its predecessor,
 /// which sequences alone can't (docs/architecture.md §95).
+///
+/// The identity includes the database's [`Epoch`] too (docs/architecture.md
+/// §176): a promoted standby keeps the table's OID, but its log can end
+/// before the old primary's did, and the sequences past that end are
+/// reused for different events.
 pub async fn events_table_identity(
     pool: &Pool,
     bounded_context: &str,
-) -> crate::error::Result<(i64, Option<i64>)> {
+) -> crate::error::Result<(TableIdentity, Option<i64>)> {
     let schema = schema_ident(bounded_context);
-    let (oid, max): (i64, Option<i64>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT '{schema}.events'::regclass::oid::bigint, \
-                (SELECT MAX(sequence) FROM {schema}.events)"
+    let (oid, max, epoch): (i64, Option<i64>, String) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT '{schema}.events'::regclass::oid::bigint, \
+                    (SELECT MAX(sequence) FROM {schema}.events), {EPOCH_SQL}"
+        )))
+        .fetch_one(pool)
+        .await?;
+    Ok((
+        TableIdentity {
+            oid,
+            epoch: Epoch(epoch),
+        },
+        max,
+    ))
+}
+
+/// Which `events` table, on which history, a set of events came from -
+/// see [`events_table_identity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableIdentity {
+    pub oid: i64,
+    pub epoch: Epoch,
+}
+
+/// The database's epoch: its system identifier and current timeline,
+/// `"{system_identifier}-{timeline}"` (docs/architecture.md §176). A
+/// promoted standby keeps the system identifier but starts a new
+/// timeline, and so does a point-in-time restore; a fresh cluster (a
+/// dump restored elsewhere) has a new system identifier. In each case the
+/// log may end before positions held outside the database - a client's
+/// `after`, a bridge's consumed batch, a broker's acknowledged offset -
+/// and later sequences are reused for different events, so a position is
+/// only meaningful together with the epoch it was read in. Opaque to
+/// clients: compared for equality, never parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Epoch(String);
+
+impl Epoch {
+    /// An epoch a client handed back, to compare against [`current_epoch`].
+    pub fn from_client(epoch: impl Into<String>) -> Self {
+        Self(epoch.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Epoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The SQL expression for [`Epoch`]. Both functions are executable by
+/// every role by default. The timeline comes from the current WAL file's
+/// name: it changes the moment a standby is promoted, where
+/// `pg_control_checkpoint()`'s only changes at the next checkpoint. Valid
+/// on a primary only, which is the only server skilj talks to.
+const EPOCH_SQL: &str = "(SELECT system_identifier::text FROM pg_control_system()) \
+     || '-' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)";
+
+/// The database's current [`Epoch`] - on a transaction's connection, the
+/// epoch of the server that transaction commits on.
+pub async fn current_epoch<'e>(executor: impl sqlx::PgExecutor<'e>) -> crate::error::Result<Epoch> {
+    let (epoch,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {EPOCH_SQL}")))
+        .fetch_one(executor)
+        .await?;
+    Ok(Epoch(epoch))
+}
+
+/// Refuses `supplied` - an epoch a client read a position in - unless it
+/// is `current` (docs/architecture.md §176). `None` passes: a client that
+/// sends no epoch is served as before.
+pub fn require_epoch(supplied: Option<&str>, current: &Epoch) -> crate::error::Result<()> {
+    match supplied {
+        Some(supplied) if supplied != current.as_str() => {
+            Err(crate::event_store::Error::EpochChanged {
+                supplied: supplied.to_string(),
+                current: current.to_string(),
+            }
+            .into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`latest_sequence`] and [`current_epoch`] in one round trip, so both
+/// come from the same server: what a client-supplied position is checked
+/// against (docs/architecture.md §148, §176).
+pub async fn latest_sequence_and_epoch(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<(Option<i64>, Epoch)> {
+    let schema = schema_ident(bounded_context);
+    let (max, epoch): (Option<i64>, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT (SELECT MAX(sequence) FROM {schema}.events), {EPOCH_SQL}"
     )))
     .fetch_one(pool)
     .await?;
-    Ok((oid, max))
+    Ok((max, Epoch(epoch)))
+}
+
+/// Records `epoch` as the last one seen and returns the one recorded
+/// before it, when it differs - `None` the first time and while it's
+/// unchanged. Of several instances noticing the same change, only the
+/// first gets it back, so it's reported once (docs/architecture.md §176).
+pub async fn record_epoch(
+    pool: &Pool,
+    epoch: &Epoch,
+    now: DateTime<Utc>,
+) -> crate::error::Result<Option<Epoch>> {
+    let previous: Option<(Option<String>,)> = sqlx::query_as(
+        "WITH previous AS (SELECT epoch FROM skilj_epoch WHERE id = 1) \
+         INSERT INTO skilj_epoch (id, epoch, recorded_at) VALUES (1, $1, $2) \
+         ON CONFLICT (id) DO UPDATE SET epoch = EXCLUDED.epoch, recorded_at = EXCLUDED.recorded_at \
+         WHERE skilj_epoch.epoch <> EXCLUDED.epoch \
+         RETURNING (SELECT epoch FROM previous)",
+    )
+    .bind(epoch.as_str())
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(previous.and_then(|(previous,)| previous).map(Epoch))
 }
 
 pub async fn latest_sequence(

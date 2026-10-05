@@ -105,6 +105,17 @@ async fn run_ws(mut socket: WebSocket, state: WsState) {
         return;
     };
     let subscribe: Value = serde_json::from_str(&subscribe).unwrap();
+    // The feed reads the database epoch before starting from now
+    // (docs/architecture.md §176); not a subscription of its own.
+    if subscribe["payload"]["query"] == "{ epoch }" {
+        send(
+            &mut socket,
+            json!({ "id": "1", "type": "next", "payload": { "data": { "epoch": "e1" } } }),
+        )
+        .await;
+        send(&mut socket, json!({ "id": "1", "type": "complete" })).await;
+        return;
+    }
     state
         .connections
         .lock()
@@ -178,7 +189,10 @@ async fn an_expired_token_on_the_live_feed_is_refreshed_and_the_feed_resumes() {
     let connections = state.connections.lock().unwrap().clone();
     assert_eq!(connections[0].0, "old");
     assert_eq!(connections[1].0, "new", "reconnected with the fresh token");
-    assert_eq!(connections[1].1, json!({ "bc": "banking", "from": 5 }));
+    assert_eq!(
+        connections[1].1,
+        json!({ "bc": "banking", "from": 5, "epoch": "e1" })
+    );
     assert_eq!(token.current().await, "new", "shared with queries too");
     assert_eq!(command.runs(), 2, "at startup, then once for the expiry");
 }

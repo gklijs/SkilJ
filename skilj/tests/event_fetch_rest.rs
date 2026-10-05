@@ -1578,3 +1578,159 @@ fn get_events_refuses_a_cursor_past_the_latest_committed_sequence() {
         assert_eq!(status(latest).await, StatusCode::OK);
     });
 }
+
+/// `GET /v1/events` with `query` (after `?`, may be empty): its status
+/// and JSON body.
+async fn get_events(
+    router: &axum::Router,
+    credential: &str,
+    query: &str,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .uri(format!("/v1/events?{query}"))
+        .header("authorization", format!("Bearer {credential}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// docs/architecture.md §176, against a real failover: an asynchronous
+/// standby promoted in the primary's place, on the same port, without the
+/// two events committed after its base backup. Their sequences are reused
+/// by the next two. A cursor read before the failover is refused with
+/// `epoch_changed` rather than skipping the new events, and the event
+/// cache - which held the lost events, under a table OID the promotion
+/// kept - serves the new history, not the old one.
+#[test]
+fn a_failover_refuses_old_cursors_and_the_cache_drops_the_lost_events() {
+    runtime().block_on(async {
+        let Some((server, database_url)) =
+            skilj_test_support::FailoverServer::start("skilj_failover_test").await
+        else {
+            return;
+        };
+        db::migrate(&db::connect(&database_url).await.unwrap())
+            .await
+            .unwrap();
+        let (skilj, direct, read) = setup_in(
+            database_url.clone(),
+            skilj_core::db::PgPoolOptions::new().max_connections(4),
+        )
+        .await;
+        let router = skilj.rest_router();
+
+        deposit(&router, &direct, 1).await;
+        server.base_backup().unwrap();
+        deposit(&router, &direct, 2).await;
+        deposit(&router, &direct, 3).await;
+        let (status, before) = get_events(&router, &read, "").await;
+        assert_eq!(status, StatusCode::OK, "{before}");
+        assert_eq!(amounts(&before), vec![1, 2, 3]);
+        let old_epoch = before["epoch"].as_str().unwrap().to_string();
+        let old_cursor = before["nextCursor"].as_str().unwrap().to_string();
+
+        server.fail_over().unwrap();
+
+        // The pool's connections to the old primary are dead; the first
+        // requests may fail while it reconnects.
+        let mut after = serde_json::Value::Null;
+        for _ in 0..50 {
+            let (status, body) = get_events(&router, &read, "").await;
+            if status == StatusCode::OK {
+                after = body;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            amounts(&after),
+            vec![1],
+            "only the backed-up event survives"
+        );
+        assert_ne!(after["epoch"].as_str().unwrap(), old_epoch);
+
+        deposit(&router, &direct, 4).await;
+        deposit(&router, &direct, 5).await;
+        let (status, refused) = get_events(
+            &router,
+            &read,
+            &format!("after={old_cursor}&epoch={old_epoch}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "epoch_changed");
+
+        let (status, now) = get_events(&router, &read, "").await;
+        assert_eq!(status, StatusCode::OK, "{now}");
+        assert_eq!(
+            amounts(&now),
+            vec![1, 4, 5],
+            "the cache must not keep serving the events the failover lost"
+        );
+
+        // Recorded at startup, so the change is reported once.
+        let pool = db::connect(&database_url).await.unwrap();
+        let current = db::current_epoch(&pool).await.unwrap();
+        db::record_epoch(&pool, &current, test_now()).await.unwrap();
+        assert_eq!(
+            db::record_epoch(&pool, &current, test_now()).await.unwrap(),
+            None,
+            "an unchanged epoch is not reported"
+        );
+        drop(server);
+    });
+}
+
+/// docs/architecture.md §176 without a failover: every read response
+/// names the epoch, the same one each time, and a position sent back
+/// with any other epoch is refused with `409 epoch_changed` - a cursor
+/// on `GET /v1/events`, a consumed sequence on the acknowledgement. Sent
+/// back with the epoch it came with, or with none, it's served as before.
+#[test]
+fn positions_from_another_epoch_are_refused() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, direct, read) = setup().await;
+        let router = skilj.rest_router();
+        deposit(&router, &direct, 1).await;
+
+        let (status, page) = get_events(&router, &read, "").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let epoch = page["epoch"].as_str().unwrap().to_string();
+        let cursor = page["nextCursor"].as_str().unwrap().to_string();
+        let (status, refused) =
+            get_events(&router, &read, &format!("after={cursor}&epoch=elsewhere-1")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "epoch_changed");
+        let (status, same) =
+            get_events(&router, &read, &format!("after={cursor}&epoch={epoch}")).await;
+        assert_eq!(status, StatusCode::OK, "{same}");
+        assert_eq!(same["epoch"], epoch.as_str());
+
+        let consumed = get_json(&router, &read, "/v1/events/consume?mode=manual").await;
+        assert_eq!(consumed["epoch"], epoch.as_str());
+        let sequence = consumed["events"][0]["sequence"].as_i64().unwrap();
+        let ack = |epoch: &str| {
+            let body = format!(r#"{{"sequence":{sequence},"epoch":"{epoch}"}}"#);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/events/consume/ack")
+                .header("authorization", format!("Bearer {read}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            router.clone().oneshot(request)
+        };
+        assert_eq!(
+            ack("elsewhere-1").await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(ack(&epoch).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(post_ack(&router, &read, sequence).await, StatusCode::OK);
+    });
+}

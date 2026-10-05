@@ -11004,3 +11004,45 @@ NATS JetStream and AMQP redeliver one message at a time instead. JetStream hands
 Tests: `an_idempotency_key_recognises_its_message_in_any_order` and `an_expired_message_key_no_longer_deduplicates` (`skilj-core/tests/external_event_dedup.rs`); `retrying_a_parked_external_event_whose_keyed_original_committed_is_deduplicated` (`skilj/tests/parked_deliveries_graphql.rs`: create, repeat, both-refused, report, retry); the NATS restart test above; the NATS and AMQP `Record` tests now assert the key and the absence of `dedupe`. AMQP's out-of-order case wasn't reproduced against Artemis. It follows from the same redelivery rule, and the change for it is the same.
 
 `parked_deliveries_graphql.rs`'s `setup` now gives every test small pools (4 for `Skilj`, 2 for the test's own). The thirteenth test pushed the file's concurrent default-sized pools past the embedded server's 100 connections, and tests failed with `PoolTimedOut`.
+
+<a id="database-epoch"></a>
+## 176. Positions from before a failover are refused, and the event cache drops what the failover lost
+
+Codeberg issue #42. When the database fails over to an asynchronous standby, the new primary can lack the tail of the old one's log. A point-in-time restore does the same. The next commits then reuse those sequence numbers for different events.
+
+**What goes stale, checked rather than assumed.** The issue expected the §39 dedupe watermarks and the read cursors to go stale. They don't: every position skilj stores sits in the same transactions as the events it describes, so it rolls back with them. What does go stale lives outside the database:
+
+- **Client positions.** A REST `after`, a subscription's `fromSequence`, an acknowledged sequence. §148 refuses one past the latest sequence, but only until the log grows past it again. After that it's accepted, and the events now carrying those sequences are skipped without any error.
+- **The event cache.** This one was a real bug, found while checking the above. Each window is stamped with the `events` table's OID (§95), and a promoted standby keeps the OID. After the promotion, `freshen` found the window ahead of the log, fetched a delta from beyond its end (nothing), and kept the lost events. The new primary's first commits reused their sequences: `append` drops an event that isn't exactly one past the window's highest, and once the log was as long as the window again, `freshen` saw nothing to do. From then until a restart, queries and `decide()` were served events that no longer existed.
+- **What the bridges already passed on.** Messages published downstream from the lost tail, and broker offsets acknowledged after commits that were lost. skilj can't undo those. With the user's choice, it detects and refuses (below) but doesn't attempt recovery, such as seeking a Kafka consumer back to the surviving watermark.
+
+**The epoch.** `db::Epoch` is `"{system_identifier}-{timeline}"`. A promotion and a PITR start a new timeline, and a restore into a new cluster has a new system identifier. The timeline comes from `pg_walfile_name(pg_current_wal_lsn())`, which changes the moment a standby is promoted (`pg_control_checkpoint()`'s changes only at the next checkpoint). Both functions are executable by `PUBLIC` by default. This was verified against a real promotion with the embedded Postgres 18 binaries, as a non-superuser: timeline 1 became 2 at once, and the row committed after the base backup was gone. Managed services may restrict the functions; that wasn't checked. A disk-snapshot restore (same identifier, same timeline) and failover without loss (shared storage, synchronous replication) don't change the epoch, and don't need to.
+
+**Detected.** `observe_epoch` runs at `build()` and on every cross-instance `Resync` (a failover always drops the listener's connection, §83). It records the epoch in a new one-row `skilj_epoch` table (migration 0006). When the recorded one differs, it logs at `error` and counts `skilj.database.epoch_changes`, once across instances, because only the instance whose update changes the row gets the old value back.
+
+**Refused.** Every read names its epoch, and a position handed back with another one is refused with `epoch_changed` (409 over REST):
+
+- `GET /v1/events` returns `epoch` and takes `epoch=` with `after`. The epoch is read in the same query as the latest sequence before the page, and again after it, so a failover during the read can't hand out an old-history cursor under the new epoch.
+- `GET /v1/events/consume` returns `epoch`. The epoch is read before the candidate events and checked again inside the cursor's transaction, so the cursor never moves on the new history over events read from the old one. `POST /v1/events/consume/ack` takes `epoch`, checked inside its transaction.
+- GraphQL has a root `epoch` field (any authenticated caller). `allEvents`/`eventsByType` take `epoch` with `fromSequence`. The live stream itself needs nothing new: a failover drops the listener, `Resync` ends every subscription (§83), and the resubscribe is where the check happens.
+- `waitForSequence` and `queryEvents`' `afterSequence` don't take one. The first names a sequence from a command response, which doesn't carry an epoch; the second echoes no cursor (§148).
+- Sending no epoch is served as before, and the spec says so (`current_epoch()` above the rules; `PositionsAreRefusedAcrossEpochs`, `ResumesAreRefusedAcrossEpochs`).
+
+**Dropped from the cache.** `events_table_identity` returns a `TableIdentity { oid, epoch }` from the query it already ran, and a window stamped with another one is refilled, as §95 does for a new OID. No extra round trip.
+
+**Clients.**
+- The outbound bridges (`skilj_bridge::outbound_cycle`, and `skilj-temporal`'s pending queue) send the consume response's epoch with every ack. On `epoch_changed` they log at `error`, drop the batch unacknowledged, and consume again. This is neither a failure to back off from nor one to give up on: giving up means acknowledging anyway, and that would be refused too. The server-side cursor rolled back with the events, so nothing is skipped. What was already delivered from the lost tail is named in the log.
+- skilj-tui's live feed reads `{ epoch }` whenever it starts from now and resubscribes with it. It treats `epoch_changed` like `from_sequence_not_committed`, and starts from now. Against a server without the field it subscribes as before.
+
+**Breaking changes:** `skilj_bridge::ack` takes the epoch; `db::events_table_identity` returns a `TableIdentity`.
+
+**Tests:**
+- `a_failover_refuses_old_cursors_and_the_cache_drops_the_lost_events` (`skilj/tests/event_fetch_rest.rs`) uses the new `skilj_test_support::FailoverServer`: a base backup promoted in place of the primary on the same port, as clients behind a virtual IP would see it. Two events are committed after the backup and lost. The test asserts that an old cursor is refused, that reads serve `[1]` and then `[1, 4, 5]`, and that an unchanged epoch isn't reported twice. With the cache comparing only the OID, it failed with `[1, 2, 3]`.
+- `positions_from_another_epoch_are_refused` covers REST reads and acks without a failover.
+- The subscription resume test refuses a foreign epoch and accepts the current one.
+- `an_epoch_change_drops_the_batch_and_consumes_again` (`skilj-bridge/tests/outbound_cycle.rs`).
+- The TUI live-feed tests cover `epoch_changed` and the epoch sent back.
+
+`FailoverServer` always runs servers of its own, never `DATABASE_URL`'s. `pg_basebackup --checkpoint=fast` keeps the test at about a second; the default spread checkpoint took 108.
+
+The first CI run skipped the test, and the silent-skip guard failed the build: `initdb: error: cannot be run as root`. CI runs tests as root, and Postgres refuses to run as root. As root, `FailoverServer` therefore uses the system's server binaries (`/usr/lib/postgresql/*/bin`, or `SKILJ_TEST_PGBIN`) with trust auth on a free local port, and runs every server command through `runuser -u postgres --`, the way `scripts/ci-postgres-local.sh` does. The embedded binaries live in root's home, out of that user's reach. CI's test step now installs `postgresql` next to `postgresql-client`. Elsewhere it uses the embedded server as before. `skilj-test-support/tests/failover_server.rs` tests the helper itself: the backup's row survives, the later row doesn't, and the timeline changes. It passed as root in an Alpine container with the distribution's Postgres 16, and as a normal user with the embedded binaries.

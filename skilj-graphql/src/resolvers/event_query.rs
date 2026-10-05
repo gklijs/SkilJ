@@ -1,7 +1,9 @@
 //! `surface EventQuery` - `queryEvents`, `countEvents`, `inspectEvent`.
 //! `AdminAccess`-gated, via the shared `require_admin_mapping` helper.
 
-use super::{distinct_names, not_found, require_admin_mapping, resolve_read_data_keys};
+use super::{
+    distinct_names, not_found, require_admin_mapping, require_caller, resolve_read_data_keys,
+};
 use crate::error::to_graphql_error;
 use crate::gql_types::InspectedEventData;
 use crate::GraphqlState;
@@ -359,4 +361,23 @@ pub fn inspect_event_field() -> Field {
         TypeRef::named_nn(TypeRef::STRING),
     ))
     .argument(InputValue::new("sequence", TypeRef::named_nn(TypeRef::INT)))
+}
+
+/// `epoch: String!` - the database's current epoch (docs/architecture.md
+/// §176), for a client to keep next to the sequences it reads and pass
+/// back as `allEvents`/`eventsByType`'s `epoch` when it resubscribes from
+/// one. After a failover or restore it differs, and such a resubscription
+/// is refused with `epoch_changed` instead of silently skipping events
+/// whose sequences the new history reused. Any authenticated caller.
+pub fn epoch_field() -> Field {
+    Field::new("epoch", TypeRef::named_nn(TypeRef::STRING), |ctx| {
+        FieldFuture::new(async move {
+            require_caller(&ctx)?;
+            let state = ctx.data::<GraphqlState>()?;
+            let epoch = skilj_core::db::current_epoch(&state.pool)
+                .await
+                .map_err(to_graphql_error)?;
+            Ok(Some(FieldValue::value(epoch.to_string())))
+        })
+    })
 }

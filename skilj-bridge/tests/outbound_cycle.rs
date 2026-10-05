@@ -28,6 +28,12 @@ struct Mock {
     acks: Vec<i64>,
     consumes: usize,
     fail_acks: usize,
+    /// The database epoch consume serves under, and an ack must name if it
+    /// names one (docs/architecture.md §176).
+    epoch: String,
+    /// Becomes `epoch` right after the next consume - a failover between
+    /// a consume and its acknowledgement.
+    fail_over_to: Option<String>,
 }
 
 type Shared = Arc<Mutex<Mock>>;
@@ -42,28 +48,42 @@ async fn consume(State(mock): State<Shared>) -> Json<Value> {
         .filter(|e| e["sequence"].as_i64().unwrap() > cursor)
         .cloned()
         .collect();
-    Json(json!({ "events": events, "eventTypeName": EVENT_TYPE }))
+    let epoch = mock.epoch.clone();
+    if let Some(next) = mock.fail_over_to.take() {
+        mock.epoch = next;
+    }
+    Json(json!({ "events": events, "eventTypeName": EVENT_TYPE, "epoch": epoch }))
 }
 
-async fn ack(State(mock): State<Shared>, Json(body): Json<Value>) -> StatusCode {
+async fn ack(State(mock): State<Shared>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     let mut mock = mock.lock().unwrap();
     if mock.fail_acks > 0 {
         mock.fail_acks -= 1;
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(Value::Null));
+    }
+    if body["epoch"]
+        .as_str()
+        .is_some_and(|epoch| epoch != mock.epoch)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "code": "epoch_changed" })),
+        );
     }
     let sequence = body["sequence"].as_i64().unwrap();
     if sequence < mock.cursor {
-        return StatusCode::CONFLICT;
+        return (StatusCode::CONFLICT, Json(Value::Null));
     }
     mock.cursor = sequence;
     mock.acks.push(sequence);
-    StatusCode::OK
+    (StatusCode::OK, Json(json!({})))
 }
 
 async fn serve(events: Vec<Value>) -> (String, Shared) {
     let mock: Shared = Arc::new(Mutex::new(Mock {
         events,
         cursor: -1,
+        epoch: "epoch-1".to_string(),
         ..Mock::default()
     }));
     let app = Router::new()
@@ -379,4 +399,42 @@ async fn a_cycle_in_backoff_does_not_even_consume() {
     assert_eq!(served, 0);
     assert_eq!(mock.lock().unwrap().consumes, 1);
     assert!(mock.lock().unwrap().acks.is_empty());
+}
+
+/// docs/architecture.md §176: a failover between a consume and its
+/// acknowledgement. The acknowledgement is refused with `epoch_changed`;
+/// that's neither retried in backoff nor given up on by acknowledging
+/// anyway (which would be refused again). The next cycle consumes from the
+/// cursor afresh and acknowledges under the new epoch.
+#[tokio::test]
+async fn an_epoch_change_drops_the_batch_and_consumes_again() {
+    let (base_url, mock) = serve((1..=3).map(|s| event(s, "o-1")).collect()).await;
+    mock.lock().unwrap().fail_over_to = Some("epoch-2".to_string());
+    let mut broker = FakeBroker::default();
+    let mut retry_state = None;
+    let policy = retry_at_once(1);
+
+    let served = cycle(
+        &base_url,
+        &target(None),
+        &mut broker,
+        &policy,
+        &mut retry_state,
+    )
+    .await;
+    assert_eq!(served, 0, "nothing was acknowledged");
+    assert!(retry_state.is_none(), "not a failure to back off from");
+    assert!(mock.lock().unwrap().acks.is_empty());
+
+    let served = cycle(
+        &base_url,
+        &target(None),
+        &mut broker,
+        &policy,
+        &mut retry_state,
+    )
+    .await;
+    assert_eq!(served, 3);
+    assert_eq!(broker.delivered, [1, 2, 3, 1, 2, 3], "at-least-once");
+    assert_eq!(mock.lock().unwrap().acks, [3]);
 }

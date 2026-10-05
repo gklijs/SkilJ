@@ -1825,6 +1825,38 @@ fn resuming_from_a_sequence_replays_the_missed_span_then_goes_live() {
             None,
             "subscribing from the latest sequence is accepted, with nothing to replay"
         );
+
+        // docs/architecture.md §176: `fromSequence` with the epoch it was
+        // read in. Another epoch's is refused - after a failover it may
+        // name a different event - and the current one is accepted.
+        let epoch = graphql_request(&router, Some(&jwt), "{ epoch }", json!({})).await;
+        let epoch = epoch["data"]["epoch"].as_str().unwrap().to_string();
+        let subscribe_in = |id: &str, from: i64, epoch: &str| {
+            json!({
+                "id": id,
+                "type": "subscribe",
+                "payload": {
+                    "query": "subscription($bc: String!, $from: Int, $epoch: String) { \
+                        allEvents(boundedContext: $bc, fromSequence: $from, epoch: $epoch) \
+                        { sequence } }",
+                    "variables": { "bc": bc_name, "from": from, "epoch": epoch },
+                },
+            })
+        };
+        ws_send_json(&mut ws, subscribe_in("6", live, "elsewhere-1")).await;
+        let refused = ws_recv_json(&mut ws).await;
+        assert_eq!(refused["id"], "6", "{refused}");
+        assert_eq!(
+            refused["payload"]["errors"][0]["extensions"]["code"], "epoch_changed",
+            "{refused}"
+        );
+        assert_eq!(ws_recv_json(&mut ws).await["type"], "complete");
+        ws_send_json(&mut ws, subscribe_in("7", live, &epoch)).await;
+        assert_eq!(
+            ws_try_recv_json(&mut ws, Duration::from_millis(300)).await,
+            None,
+            "the current epoch is accepted"
+        );
     });
 }
 

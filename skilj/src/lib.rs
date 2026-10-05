@@ -2063,6 +2063,9 @@ impl SkiljBuilder {
             None => skilj_core::db::connect(&self.database_url).await?,
         };
         skilj_core::db::migrate(&pool).await?;
+        // docs/architecture.md §176: a promotion or restore since the last
+        // instance ran is reported, not just survived.
+        observe_epoch(&pool).await;
 
         // `default BoundedContext admin`'s own `created_at`/`created_by`
         // stamping - unconditional, every startup, and independent of
@@ -3205,6 +3208,10 @@ impl SkiljBuilder {
                         // after the rebuild above, so a subscriber that
                         // reconnects in response finds the fresh schema.
                         if matches!(message, skilj_core::cross_instance::Message::Resync) {
+                            // A failover always drops the listener's
+                            // connection, so this is where one is noticed
+                            // (docs/architecture.md §176).
+                            observe_epoch(&cross_instance_pool).await;
                             cross_instance_event_broadcaster.signal_gap();
                         }
                     }
@@ -3213,6 +3220,58 @@ impl SkiljBuilder {
         });
 
         Ok((skilj, report))
+    }
+}
+
+static EPOCH_CHANGES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    opentelemetry::global::meter("skilj")
+        .u64_counter("skilj.database.epoch_changes")
+        .with_description(
+            "Database epoch changes (a promotion or point-in-time restore) skilj noticed.",
+        )
+        .build()
+});
+
+/// Records the database's epoch and reports a change - a standby
+/// promoted, or a point-in-time restore - at `error`, with a metric
+/// (docs/architecture.md §176). The log may end before the old one did:
+/// events a client, bridge or broker already saw can be gone, and their
+/// sequences are reused. Nothing stored in the database is stale - every
+/// position in it rolled back with the events - but positions held
+/// outside it are, and they're refused with `epoch_changed` when they come
+/// back with their epoch. A failure is only logged: this is a report, and
+/// the refusals don't depend on it.
+async fn observe_epoch(pool: &Pool) {
+    let observed = async {
+        let epoch = skilj_core::db::current_epoch(pool).await?;
+        let previous = skilj_core::db::record_epoch(pool, &epoch, chrono::Utc::now()).await?;
+        Ok::<_, skilj_core::Error>((epoch, previous))
+    }
+    .await;
+    match observed {
+        Ok((epoch, Some(previous))) => {
+            EPOCH_CHANGES.add(1, &[]);
+            tracing::error!(
+                %previous,
+                current = %epoch,
+                "the database's epoch changed (a standby was promoted, or it was restored): \
+                 events committed on the old one may be gone and their sequences reused - \
+                 positions held outside the database from before are refused with \
+                 epoch_changed, and anything already published or acknowledged to a \
+                 broker from the lost tail needs checking"
+            );
+        }
+        Ok((_, None)) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, "reading the database's epoch failed");
+            BACKGROUND_TASK_ERRORS.add(
+                1,
+                &[
+                    KeyValue::new("task", "cross_instance"),
+                    KeyValue::new("reason", "epoch_failed"),
+                ],
+            );
+        }
     }
 }
 

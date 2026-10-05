@@ -1786,6 +1786,22 @@ default SystemCreator skilj = { }
 -- Rules
 ------------------------------------------------------------
 
+-- current_epoch(), used below in FetchEvents, AcknowledgeEvents and the
+-- two subscription rules, is the database's epoch: an opaque value that
+-- stays the same while the log only grows, and changes when it may have
+-- been cut short - a standby promoted after an asynchronous replica lost
+-- the tail of the old primary's log, or a restore to an earlier point. It
+-- is a black box like next_sequence; the implementation reads the
+-- database's system identifier and timeline. Everything this library
+-- stores beside its events rolls back with them, so nothing inside the
+-- database is stale after such a change. A position held outside it is:
+-- the sequence a reader last saw may be gone, and once the bounded
+-- context's log grows past it again, name a different event. A caller
+-- that hands a position back together with the epoch it was read in is
+-- refused when the epoch is no longer current, rather than served from a
+-- sequence that now means something else. One that sends no epoch is
+-- served as before.
+--
 -- next_sequence(bounded_context), used below in CreateExternalEvent,
 -- CreateDirectEvent and ProcessCommand, and the consistency-boundary
 -- re-check in ProcessCommand, are both enforced at the Postgres level
@@ -2722,8 +2738,10 @@ rule SkipMissedOccurrences {
 -- quickly.
 
 rule FetchEvents {
-    when: FetchEvents(token, read_type, filters, after_sequence?)
+    when: FetchEvents(token, read_type, filters, after_sequence?, epoch?)
     requires: token.status = active
+    -- after_sequence read in another epoch: see current_epoch() above.
+    requires: epoch = null or epoch = current_epoch()
     requires: token.event_type = read_type
     requires: read_type.event_read_allowed = true
     requires: valid_filters(read_type, filters)
@@ -3059,8 +3077,10 @@ rule ConsumeEvents {
 }
 
 rule AcknowledgeEvents {
-    when: AcknowledgeEvents(token, sequence)
+    when: AcknowledgeEvents(token, sequence, epoch?)
     requires: token.status = active
+    -- A sequence served in another epoch: see current_epoch() above.
+    requires: epoch = null or epoch = current_epoch()
 
     let cursor = ReadCursor{token: token}
     requires: exists cursor
@@ -3291,8 +3311,10 @@ rule QueryProjection {
 -- see the note above it.
 
 rule CreateAllEventsSubscription {
-    when: CreateAllEventsSubscription(access_mapping, event_types, from_sequence?)
+    when: CreateAllEventsSubscription(access_mapping, event_types, from_sequence?, epoch?)
     requires: access_mapping.status = active
+    -- from_sequence read in another epoch: see current_epoch() above.
+    requires: epoch = null or epoch = current_epoch()
     requires: access_mapping.bounded_context.status = active
 
     -- Every named event type must belong to the same bounded context as
@@ -3322,8 +3344,10 @@ rule CreateAllEventsSubscription {
 }
 
 rule CreateEventTypeSubscription {
-    when: CreateEventTypeSubscription(access_mapping, event_type, filters, from_sequence?)
+    when: CreateEventTypeSubscription(access_mapping, event_type, filters, from_sequence?, epoch?)
     requires: access_mapping.status = active
+    -- from_sequence read in another epoch: see current_epoch() above.
+    requires: epoch = null or epoch = current_epoch()
     requires: access_mapping.bounded_context = event_type.bounded_context
     requires: event_type.bounded_context.status = active
     requires: valid_filters(event_type, filters)
@@ -6941,9 +6965,18 @@ surface EventFetch {
         event_type.schema_version
 
     provides:
-        FetchEvents(token, event_type, filters, after_sequence?)
+        FetchEvents(token, event_type, filters, after_sequence?, epoch?)
         ConsumeEvents(token, ack_mode?, filters)
-        AcknowledgeEvents(token, sequence)
+        AcknowledgeEvents(token, sequence, epoch?)
+
+    @guarantee PositionsAreRefusedAcrossEpochs
+        -- Every read names the database epoch it was served in. A position
+        -- handed back with that epoch - after_sequence on a fetch, a
+        -- consumed sequence on its acknowledgement - is refused once the
+        -- epoch has changed (a failover or a restore), instead of being
+        -- served as if it still named the same event. The read cursor
+        -- itself is stored with the events and needs no epoch. See
+        -- current_epoch() above the rules.
 
     @guarantee TokenScopedToEventType
         -- A token only authorises reading events of the one EventType it
@@ -7260,8 +7293,14 @@ surface EventSubscription {
     facing access_mapping: ReadAccess
 
     provides:
-        CreateAllEventsSubscription(access_mapping, event_types, from_sequence?)
-        CreateEventTypeSubscription(access_mapping, event_type, filters, from_sequence?)
+        CreateAllEventsSubscription(access_mapping, event_types, from_sequence?, epoch?)
+        CreateEventTypeSubscription(access_mapping, event_type, filters, from_sequence?, epoch?)
+
+    @guarantee ResumesAreRefusedAcrossEpochs
+        -- A subscription resumed from from_sequence together with the
+        -- epoch it was read in is refused once the epoch has changed,
+        -- rather than skipping the events that now carry the sequences up
+        -- to it. See current_epoch() above the rules.
 
     @guarantee GrantScopedToBoundedContext
         -- A grant only authorises subscribing within its own bounded

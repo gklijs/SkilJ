@@ -74,7 +74,10 @@ struct ContextWindow {
     /// hard-deleted and recreated under the same name has a new table, so
     /// a mismatch means these events belong to its predecessor and the
     /// window is refilled rather than served (docs/architecture.md §95).
-    table: Option<i64>,
+    /// The same goes for a new database epoch (§176): after a promotion the
+    /// table is the same but its log may end before events this window
+    /// holds, and later sequences are reused for different events.
+    table: Option<crate::db::TableIdentity>,
 }
 
 impl ContextWindow {
@@ -182,7 +185,7 @@ impl EventCache {
         &self,
         pool: &Pool,
         bounded_context: &str,
-        table: i64,
+        table: crate::db::TableIdentity,
     ) -> crate::error::Result<()> {
         let recent =
             crate::db::list_recent_events_for_bounded_context(pool, bounded_context, self.capacity)
@@ -227,7 +230,7 @@ impl EventCache {
         let (known, known_table) = {
             let contexts = self.contexts.read().await;
             match contexts.get(bounded_context) {
-                Some(w) => (w.highest_known_sequence(), w.table),
+                Some(w) => (w.highest_known_sequence(), w.table.clone()),
                 None => (None, None),
             }
         };
@@ -235,7 +238,9 @@ impl EventCache {
         // docs/architecture.md §95: a window from another incarnation of
         // this name - or one only `append` has started, which can't vouch
         // for its table - is replaced wholesale.
-        if known_table.is_some_and(|t| t != table) || (known_table.is_none() && known.is_some()) {
+        if known_table.as_ref().is_some_and(|t| *t != table)
+            || (known_table.is_none() && known.is_some())
+        {
             return self.refill(pool, bounded_context, table).await;
         }
         if known == latest {
