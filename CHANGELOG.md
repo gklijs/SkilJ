@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `skilj-kafka`'s `run_inbound` dispatches the partitions it is assigned
+  concurrently, one message in flight per partition, instead of one
+  message at a time for the whole consumer. Messages of one partition
+  are still dispatched in offset order, and a message that keeps failing
+  now holds up only its own partition. A partition with
+  `INBOUND_PARTITION_BUFFER` messages waiting is paused until they
+  drain. `run_inbound_until`'s `stop` now lets dispatches already in
+  flight finish and commit. Messages from different partitions reach
+  skilj in a less predictable order than before; the crate docs now
+  state that messages whose order matters must share a Kafka key
+  (docs/architecture.md §174, Codeberg issue #60).
 - `skilj-kafka`, `skilj-amqp` and `skilj-nats` acknowledge outbound
   events to skilj once per contiguous run - one call for a whole page
   in the common case - instead of once per event. Events are still

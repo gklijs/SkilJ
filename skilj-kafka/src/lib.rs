@@ -53,8 +53,8 @@
 //! full design, only summarised here:
 //!
 //! - **Inbound**: a message that keeps failing to dispatch is retried
-//!   with backoff, *for that one message*, before this consumer ever
-//!   calls `recv()` again ([`run_inbound`]) - not tracked via Kafka's own
+//!   with backoff, *for that one message*, before anything behind it in
+//!   its partition is dispatched ([`run_inbound`]) - not tracked via Kafka's own
 //!   redelivery, which doesn't apply within one running session anyway
 //!   (an uncommitted offset only replays after a restart/rebalance, not
 //!   on the next `recv()` in the same session). Once the policy exhausts,
@@ -73,6 +73,37 @@
 //!   on, logged loudly - no parked-delivery record, since there is
 //!   nothing wrong with the *message*, only (temporarily) with reaching
 //!   the broker.
+//!
+//! # Inbound concurrency
+//!
+//! [`run_inbound`] dispatches one message at a time *per partition*, in
+//! offset order, and the partitions it is assigned concurrently
+//! (docs/architecture.md §174). Kafka only orders messages within a
+//! partition, and that is all the `dedupe` watermark and `decide()` rely
+//! on, so this is as much concurrency as stays safe. A message that keeps
+//! failing holds up its own partition only.
+//!
+//! Concurrency never weakens DCB consistency: a bounded context has one
+//! sequence and one lock, and every `decide()` runs under it against all
+//! committed events with its tags. What it changes is the *order* in
+//! which messages from different partitions reach skilj, and with DCB
+//! the order can change the outcome ("cancel order 1" decided before
+//! "place order 1" is rejected - consistently, but differently). Kafka
+//! never promised an order across partitions, and a sequential consumer
+//! interleaves them however librdkafka hands them over, so this was
+//! already true; concurrency makes it happen more often. So:
+//!
+//! **Messages whose relative order matters must share a Kafka key** -
+//! typically the value of the DCB consistency tag they're about (the
+//! order id), so they land in one partition. A command that spans two
+//! entities (a transfer from A to B) sees A-keyed and B-keyed messages
+//! in no guaranteed order whatever the key; DCB keeps the outcome
+//! consistent, and arrival order decides which it is.
+//!
+//! One instance has at most as many requests in flight as it has
+//! assigned partitions. To scale out further, run more instances in the
+//! same consumer group - each partition goes to one of them, so up to one
+//! instance per partition does useful work.
 //!
 //! # Producer configuration
 //!
@@ -106,11 +137,12 @@
 //! ```
 
 use chrono::{DateTime, Utc};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::{Header, Headers, OwnedHeaders};
+use rdkafka::message::{Header, Headers, OwnedHeaders, OwnedMessage};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::Message;
-use std::collections::HashMap;
+use rdkafka::{Message, Offset, TopicPartitionList};
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 // docs/architecture.md §165: the skilj side every bridge shares.
@@ -569,26 +601,230 @@ async fn report_parked_delivery(
     .await?)
 }
 
+/// How many received messages one partition may have waiting behind the
+/// one in flight before [`run_inbound`] pauses fetching it
+/// (docs/architecture.md §174). Fetching resumes once its queue is down
+/// to half of this.
+pub const INBOUND_PARTITION_BUFFER: usize = 64;
+
+/// What [`handle_inbound_message`] ended with.
+enum Handled {
+    /// Dispatched, or parked and reported - commit its offset.
+    Commit,
+    /// Asked to stop before either happened - leave it uncommitted.
+    Stopped,
+}
+
+/// One partition's state in [`run_inbound_until`]: whether a message of
+/// it is in flight, the messages received behind that one, and the
+/// offset the next new message must be at least.
+struct PartitionQueue<'m> {
+    busy: bool,
+    paused: bool,
+    queue: VecDeque<(OwnedMessage, &'m InboundMapping)>,
+    next_offset: i64,
+}
+
+fn partition_list(topic: &str, partition: i32) -> TopicPartitionList {
+    let mut list = TopicPartitionList::new();
+    list.add_partition(topic, partition);
+    list
+}
+
+/// Commits `msg`'s offset - the next offset to read, like
+/// `commit_message` does.
+fn commit(consumer: &StreamConsumer, msg: &OwnedMessage) {
+    let mut list = TopicPartitionList::new();
+    if let Err(e) = list.add_partition_offset(
+        msg.topic(),
+        msg.partition(),
+        Offset::Offset(msg.offset() + 1),
+    ) {
+        tracing::error!("committing a Kafka offset failed: {e}");
+        return;
+    }
+    if let Err(e) = consumer.commit(&list, CommitMode::Async) {
+        tracing::error!("committing a Kafka offset failed: {e}");
+    }
+}
+
+/// Resolves once `stop` has been set - [`run_inbound_until`]'s signal to
+/// a message's retry backoff that the loop is stopping.
+async fn stopping(mut stop: tokio::sync::watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stopping| *stopping).await;
+}
+
+/// Dispatches one message, retrying and finally parking it per
+/// `retry_policy` - everything [`run_inbound`] does for a message before
+/// its offset is committed. Returns `msg` so the caller can commit it
+/// and move its partition on.
+async fn handle_inbound_message(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
+    msg: OwnedMessage,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> (OwnedMessage, Handled) {
+    let handled =
+        dispatch_with_retry(http, skilj_base_url, mapping, retry_policy, &msg, stop).await;
+    (msg, handled)
+}
+
+async fn dispatch_with_retry(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    mapping: &InboundMapping,
+    retry_policy: &skilj_retry::RetryPolicy,
+    msg: &OwnedMessage,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Handled {
+    let topic = msg.topic();
+    let partition = msg.partition();
+    let offset = msg.offset();
+    // `run_inbound_until` only queues messages with a payload.
+    let payload = msg.payload().unwrap_or_default();
+    let headers = msg.headers();
+    let correlation_id = header_str(headers, CORRELATION_ID_HEADER);
+    let causation_id = header_str(headers, CAUSATION_ID_HEADER);
+
+    let mut retry = skilj_retry::MessageRetry::default();
+    loop {
+        let e = match dispatch_inbound_message(
+            http,
+            skilj_base_url,
+            mapping,
+            topic,
+            partition,
+            offset,
+            payload,
+            correlation_id,
+            causation_id,
+        )
+        .await
+        {
+            Ok(()) => return Handled::Commit,
+            Err(e) => e,
+        };
+        let backoff = match retry.on_failure(
+            retry_policy,
+            Utc::now(),
+            |at| (Utc::now() - at).to_std().unwrap_or_default(),
+            // docs/architecture.md §161: no attempt spent, never parked.
+            e.another_instance_can_do_it(),
+            // Not JSON: no retry can change that (§144).
+            matches!(e, BridgeError::MalformedPayload(_)),
+        ) {
+            skilj_retry::RetryDecision::Park {
+                attempt,
+                first_failed_at: failed_at,
+            } => {
+                tracing::error!(
+                    topic,
+                    partition,
+                    offset,
+                    attempt,
+                    error = %e,
+                    "dispatch failed repeatedly - parking and committing so \
+                     this message doesn't block progress forever"
+                );
+                let payload_json = parked_payload(payload);
+                let partition_key = format!("{topic}:{partition}");
+                let body = inbound_request_body(
+                    mapping,
+                    &payload_json,
+                    &partition_key,
+                    offset,
+                    correlation_id,
+                    causation_id,
+                );
+                let identifier = format!("{partition_key}:{offset}");
+                let idempotency_key = inbound_idempotency_key(mapping, &partition_key, offset);
+                // docs/architecture.md §97: Kafka offsets are cumulative -
+                // committing any later message in this partition would
+                // commit past this one too. So until it is reported, this
+                // partition doesn't move on: moving on would lose it,
+                // neither processed nor parked.
+                let mut report_attempt: u32 = 0;
+                while let Err(report_err) = report_parked_delivery(
+                    http,
+                    skilj_base_url,
+                    mapping,
+                    &identifier,
+                    &body,
+                    idempotency_key.as_deref(),
+                    &e.to_string(),
+                    attempt,
+                    failed_at,
+                )
+                .await
+                {
+                    report_attempt = report_attempt.saturating_add(1);
+                    tracing::error!(
+                        topic,
+                        partition,
+                        offset,
+                        report_attempt,
+                        "reporting this parked delivery failed - retrying; \
+                         this partition waits until it succeeds: {report_err}"
+                    );
+                    tokio::select! {
+                        biased;
+                        () = stopping(stop.clone()) => return Handled::Stopped,
+                        () = tokio::time::sleep(retry_policy.next_backoff(report_attempt)) => {}
+                    }
+                }
+                return Handled::Commit;
+            }
+            skilj_retry::RetryDecision::Wait(backoff) => backoff,
+        };
+        tracing::warn!(
+            topic,
+            partition,
+            offset,
+            attempt = retry.attempt(),
+            error = %e,
+            "dispatch failed - retrying after backoff"
+        );
+        tokio::select! {
+            biased;
+            () = stopping(stop.clone()) => return Handled::Stopped,
+            () = tokio::time::sleep(backoff) => {}
+        }
+    }
+}
+
 /// Runs forever: for every message this `consumer` receives (already
 /// subscribed to whatever topics its own caller configured), looks up
 /// the [`InboundMapping`] for that message's own topic and dispatches it
 /// via [`dispatch_inbound_message`], committing the offset
-/// (`CommitMode::Async`, via `commit_message` - the caller's own
-/// `ClientConfig` must set `enable.auto.commit = false` for this to be
-/// the only thing that ever advances it) once that call succeeds.
+/// (`CommitMode::Async` - the caller's own `ClientConfig` must set
+/// `enable.auto.commit = false` for this to be the only thing that ever
+/// advances it) once that call succeeds.
+///
+/// Messages of one partition are dispatched one at a time, in offset
+/// order; different partitions are dispatched concurrently, one message
+/// in flight each (docs/architecture.md §174, Codeberg issue #60). So
+/// this instance has as many requests to skilj in flight as it has
+/// assigned partitions with work. Messages received for a partition
+/// while one of its messages is in flight wait in a queue; once
+/// [`INBOUND_PARTITION_BUFFER`] are waiting, fetching that partition is
+/// paused until half of them are done. See the crate docs' *Inbound
+/// concurrency* section for what this means for the order messages reach
+/// skilj in.
 ///
 /// Codeberg issue #21: a dispatch failure is retried, *for this one
 /// message*, with backoff up to `retry_policy` - not by relying on
 /// Kafka's own redelivery, which doesn't apply within one running
 /// session (an uncommitted offset only replays after a restart/
-/// rebalance; the next plain `recv()` here would just move on to the
-/// next message). Once `retry_policy` exhausts, the message is reported
-/// to skilj via `report_parked_delivery` and the offset is committed
-/// anyway - without that, a poison message would block this mapping's
-/// own durable commit point forever, redelivering an ever-growing
-/// backlog on every future restart. If the *report* itself fails, it is
-/// retried (with `retry_policy`'s backoff, logged each time) until it
-/// succeeds, and nothing after this message is consumed meanwhile:
+/// rebalance). Its partition waits meanwhile; the others carry on. Once
+/// `retry_policy` exhausts, the message is reported to skilj via
+/// `report_parked_delivery` and the offset is committed anyway - without
+/// that, a poison message would block its partition's durable commit
+/// point forever, redelivering an ever-growing backlog on every future
+/// restart. If the *report* itself fails, it is retried (with
+/// `retry_policy`'s backoff, logged each time) until it succeeds, and
+/// nothing after this message in its partition is dispatched meanwhile:
 /// offsets are cumulative, so committing any later message would commit
 /// past this one and lose it (docs/architecture.md §97).
 /// An unmapped topic or an empty payload is logged and skipped - not
@@ -599,7 +835,7 @@ async fn report_parked_delivery(
 /// partition, as offsets are cumulative.
 ///
 /// `http` should be bounded by a timeout - [`http_client`] is - or one
-/// request stuck on a dead connection stalls this loop forever (§82).
+/// request stuck on a dead connection stalls its partition forever (§82).
 pub async fn run_inbound(
     consumer: &StreamConsumer,
     http: &reqwest::Client,
@@ -620,10 +856,10 @@ pub async fn run_inbound(
 }
 
 /// [`run_inbound`] until `stop` resolves (docs/architecture.md §129).
-/// `stop` is raced against the wait for the next message and against the
-/// backoff between a failing message's retries - never against a dispatch
-/// or report in flight. A message it stops during is left uncommitted and
-/// comes back on the next start, where skilj's own dedupe and
+/// Once it does, nothing new is received or started; the dispatches and
+/// park reports in flight finish and are committed, while a message
+/// waiting out a retry backoff is abandoned. Messages left uncommitted
+/// come back on the next start, where skilj's own dedupe and
 /// `Idempotency-Key` make the redelivery harmless.
 pub async fn run_inbound_until(
     consumer: &StreamConsumer,
@@ -634,14 +870,52 @@ pub async fn run_inbound_until(
     stop: impl std::future::Future<Output = ()>,
 ) {
     let mut stop = std::pin::pin!(stop);
+    let (stopping_tx, stopping_rx) = tokio::sync::watch::channel(false);
+    let start = |msg: OwnedMessage, mapping| {
+        handle_inbound_message(
+            http,
+            skilj_base_url,
+            mapping,
+            retry_policy,
+            msg,
+            stopping_rx.clone(),
+        )
+    };
+    let mut partitions: HashMap<(String, i32), PartitionQueue<'_>> = HashMap::new();
+    let mut in_flight = FuturesUnordered::new();
     loop {
-        let received = tokio::select! {
+        tokio::select! {
             biased;
-            () = &mut stop => return,
-            received = consumer.recv() => received,
-        };
-        match received {
-            Ok(msg) => {
+            () = &mut stop => break,
+            Some((msg, handled)) = in_flight.next() => {
+                if let Handled::Commit = handled {
+                    commit(consumer, &msg);
+                }
+                let key = (msg.topic().to_string(), msg.partition());
+                let Some(state) = partitions.get_mut(&key) else {
+                    continue;
+                };
+                match state.queue.pop_front() {
+                    Some((next, mapping)) => in_flight.push(start(next, mapping)),
+                    None => state.busy = false,
+                }
+                if state.paused && state.queue.len() <= INBOUND_PARTITION_BUFFER / 2 {
+                    state.paused = false;
+                    if let Err(e) = consumer.resume(&partition_list(&key.0, key.1)) {
+                        // Most likely revoked meanwhile; a new assignment
+                        // starts unpaused.
+                        tracing::debug!(topic = key.0, partition = key.1, "resuming failed: {e}");
+                    }
+                }
+            }
+            received = consumer.recv() => {
+                let msg = match received {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        tracing::error!("Kafka consumer error: {e}");
+                        continue;
+                    }
+                };
                 let topic = msg.topic();
                 let Some(mapping) = mappings.get(topic) else {
                     tracing::warn!(
@@ -650,7 +924,7 @@ pub async fn run_inbound_until(
                     );
                     continue;
                 };
-                let Some(payload) = msg.payload() else {
+                if msg.payload().is_none() {
                     tracing::warn!(
                         topic,
                         partition = msg.partition(),
@@ -658,138 +932,50 @@ pub async fn run_inbound_until(
                         "message has no payload - skipping, not committing"
                     );
                     continue;
-                };
-                let headers = msg.headers();
-                let correlation_id = header_str(headers, CORRELATION_ID_HEADER);
-                let causation_id = header_str(headers, CAUSATION_ID_HEADER);
-                let partition = msg.partition();
-                let offset = msg.offset();
-
-                let mut retry = skilj_retry::MessageRetry::default();
-                loop {
-                    match dispatch_inbound_message(
-                        http,
-                        skilj_base_url,
-                        mapping,
+                }
+                let state = partitions
+                    .entry((topic.to_string(), msg.partition()))
+                    .or_insert_with(|| PartitionQueue {
+                        busy: false,
+                        paused: false,
+                        queue: VecDeque::new(),
+                        next_offset: i64::MIN,
+                    });
+                // A rebalance that hands this partition back can fetch
+                // again from the last committed offset - messages already
+                // queued or handled here. Dispatching them again would be
+                // harmless (skilj dedupes them) but out of order.
+                if msg.offset() < state.next_offset {
+                    tracing::debug!(
                         topic,
-                        partition,
-                        offset,
-                        payload,
-                        correlation_id,
-                        causation_id,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
-                                tracing::error!("committing a Kafka offset failed: {e}");
-                            }
-                            break;
-                        }
-                        Err(e) => {
-                            let backoff = match retry.on_failure(
-                                retry_policy,
-                                Utc::now(),
-                                |at| (Utc::now() - at).to_std().unwrap_or_default(),
-                                // docs/architecture.md §161: no attempt spent, never parked.
-                                e.another_instance_can_do_it(),
-                                // Not JSON: no retry can change that (§144).
-                                matches!(e, BridgeError::MalformedPayload(_)),
-                            ) {
-                                skilj_retry::RetryDecision::Park {
-                                    attempt,
-                                    first_failed_at: failed_at,
-                                } => {
-                                    tracing::error!(
-                                        topic,
-                                        partition,
-                                        offset,
-                                        attempt,
-                                        error = %e,
-                                        "dispatch failed repeatedly - parking and committing so \
-                                         this message doesn't block progress forever"
-                                    );
-                                    let payload_json = parked_payload(payload);
-                                    let partition_key = format!("{topic}:{partition}");
-                                    let body = inbound_request_body(
-                                        mapping,
-                                        &payload_json,
-                                        &partition_key,
-                                        offset,
-                                        correlation_id,
-                                        causation_id,
-                                    );
-                                    let identifier = format!("{partition_key}:{offset}");
-                                    let idempotency_key =
-                                        inbound_idempotency_key(mapping, &partition_key, offset);
-                                    // docs/architecture.md §97: Kafka offsets are
-                                    // cumulative - committing any later message in
-                                    // this partition would commit past this one too.
-                                    // So until it is reported, this bridge doesn't
-                                    // move on: moving on would lose it, neither
-                                    // processed nor parked.
-                                    let mut report_attempt: u32 = 0;
-                                    while let Err(report_err) = report_parked_delivery(
-                                        http,
-                                        skilj_base_url,
-                                        mapping,
-                                        &identifier,
-                                        &body,
-                                        idempotency_key.as_deref(),
-                                        &e.to_string(),
-                                        attempt,
-                                        failed_at,
-                                    )
-                                    .await
-                                    {
-                                        report_attempt = report_attempt.saturating_add(1);
-                                        tracing::error!(
-                                            topic,
-                                            partition,
-                                            offset,
-                                            report_attempt,
-                                            "reporting this parked delivery failed - retrying; \
-                                         this partition waits until it succeeds: {report_err}"
-                                        );
-                                        tokio::select! {
-                                            biased;
-                                            () = &mut stop => return,
-                                            () = tokio::time::sleep(
-                                                retry_policy.next_backoff(report_attempt),
-                                            ) => {}
-                                        }
-                                    }
-                                    if let Err(commit_err) =
-                                        consumer.commit_message(&msg, CommitMode::Async)
-                                    {
-                                        tracing::error!(
-                                            "committing a Kafka offset failed: {commit_err}"
-                                        );
-                                    }
-                                    break;
-                                }
-                                skilj_retry::RetryDecision::Wait(backoff) => backoff,
-                            };
-                            tracing::warn!(
-                                topic,
-                                partition,
-                                offset,
-                                attempt = retry.attempt(),
-                                error = %e,
-                                "dispatch failed - retrying after backoff"
-                            );
-                            tokio::select! {
-                                biased;
-                                () = &mut stop => return,
-                                () = tokio::time::sleep(backoff) => {}
-                            }
-                        }
+                        partition = msg.partition(),
+                        offset = msg.offset(),
+                        "message already received - skipping"
+                    );
+                    continue;
+                }
+                state.next_offset = msg.offset() + 1;
+                let partition = msg.partition();
+                let msg = msg.detach();
+                if !state.busy {
+                    state.busy = true;
+                    in_flight.push(start(msg, mapping));
+                    continue;
+                }
+                state.queue.push_back((msg, mapping));
+                if state.queue.len() >= INBOUND_PARTITION_BUFFER {
+                    state.paused = true;
+                    if let Err(e) = consumer.pause(&partition_list(topic, partition)) {
+                        tracing::warn!(topic, "pausing a partition failed: {e}");
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!("Kafka consumer error: {e}");
-            }
+        }
+    }
+    let _ = stopping_tx.send(true);
+    while let Some((msg, handled)) = in_flight.next().await {
+        if let Handled::Commit = handled {
+            commit(consumer, &msg);
         }
     }
 }

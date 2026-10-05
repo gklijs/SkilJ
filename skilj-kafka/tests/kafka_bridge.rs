@@ -143,6 +143,12 @@ struct MockSkiljState {
     /// each refused attempt carried goes into `failed_trigger_keys`.
     fail_trigger_requests: Arc<Mutex<usize>>,
     failed_trigger_keys: Arc<Mutex<Vec<Option<String>>>>,
+    /// `POST /v1/events/external` returns a 500 for a payload whose
+    /// `orderId` is in here, for as long as it is - a message that keeps
+    /// failing while others succeed.
+    fail_order_ids: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// How many requests `fail_order_ids` refused.
+    refused_order_requests: Arc<Mutex<usize>>,
     /// Every `POST /v1/parked-deliveries` body this mock ever received.
     parked_deliveries: Arc<Mutex<Vec<Value>>>,
     /// Same idea again, for `POST /v1/parked-deliveries` itself - the
@@ -217,6 +223,13 @@ async fn post_events_external(
             *remaining -= 1;
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(Value::Null));
         }
+    }
+    if body["payload"]["orderId"]
+        .as_str()
+        .is_some_and(|id| state.fail_order_ids.lock().unwrap().contains(id))
+    {
+        *state.refused_order_requests.lock().unwrap() += 1;
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(Value::Null));
     }
     state.external_requests.lock().unwrap().push(body);
     (
@@ -355,11 +368,16 @@ async fn recv_within(
 /// anyway - proactively creating it here is more realistic, not just
 /// more convenient for the test.
 async fn create_topic(bootstrap_servers: &str, topic: &str) {
+    create_topic_with_partitions(bootstrap_servers, topic, 1).await;
+}
+
+/// [`create_topic`] with `partitions` partitions.
+async fn create_topic_with_partitions(bootstrap_servers: &str, topic: &str, partitions: i32) {
     let admin: AdminClient<_> = ClientConfig::new()
         .set("bootstrap.servers", bootstrap_servers)
         .create()
         .unwrap();
-    let new_topic = NewTopic::new(topic, 1, TopicReplication::Fixed(1));
+    let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
     // The library's own default admin timeout (~5s) is tight when
     // several of this file's own tests each start their own separate
     // container concurrently (`cargo test`'s default parallelism) in a
@@ -1322,6 +1340,235 @@ fn a_message_whose_park_report_fails_is_never_committed_past() {
             parked[0]["request"]["payload"],
             json!({ "orderId": "o-first" })
         );
+    });
+}
+
+/// docs/architecture.md §174 (Codeberg issue #60): partitions are
+/// dispatched concurrently, one message in flight each. A message that
+/// keeps failing holds up only the messages behind it in its own
+/// partition: the other partition's message is delivered meanwhile, and
+/// its own successor only once it has gone through.
+#[test]
+fn a_failing_message_holds_up_only_its_own_partition() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-in-partitions");
+        create_topic_with_partitions(bootstrap_servers, &topic, 2).await;
+
+        let mock_state = MockSkiljState::default();
+        mock_state
+            .fail_order_ids
+            .lock()
+            .unwrap()
+            .insert("o-stuck".to_string());
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let produce = |order: &'static str, partition: i32| {
+            let producer = producer.clone();
+            let topic = topic.clone();
+            async move {
+                producer
+                    .send(
+                        FutureRecord::to(&topic)
+                            .payload(&format!(r#"{{"orderId":"{order}"}}"#))
+                            .key("k")
+                            .partition(partition),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .map_err(|(e, _)| e)
+                    .unwrap();
+            }
+        };
+        produce("o-stuck", 0).await;
+        produce("o-behind", 0).await;
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-partitions")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            topic.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_kafka::http_client();
+        // Never parks within this test.
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(20),
+            1.0,
+            Duration::from_millis(20),
+            100_000,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mappings, &retry_policy).await;
+        });
+
+        // Only once the stuck message is failing does the other partition
+        // get a message - so it can't have been received first.
+        // See `an_inbound_message_parks_and_reports_after_exhausting_retries`
+        // for the 20s budget.
+        for _ in 0..200 {
+            if *mock_state.refused_order_requests.lock().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(*mock_state.refused_order_requests.lock().unwrap() > 0);
+        produce("o-free", 1).await;
+
+        let delivered = |state: &MockSkiljState| -> Vec<String> {
+            state
+                .external_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r["payload"]["orderId"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for _ in 0..100 {
+            if !delivered(&mock_state).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(delivered(&mock_state), ["o-free"]);
+        // Give partition 0 time to run ahead if it wrongly would.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(delivered(&mock_state), ["o-free"]);
+
+        mock_state.fail_order_ids.lock().unwrap().clear();
+        for _ in 0..100 {
+            if delivered(&mock_state).len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(delivered(&mock_state), ["o-free", "o-stuck", "o-behind"]);
+        assert!(mock_state.parked_deliveries.lock().unwrap().is_empty());
+    });
+}
+
+/// docs/architecture.md §174: a partition with more than
+/// `INBOUND_PARTITION_BUFFER` messages waiting behind a failing one is
+/// paused, and resumed once they drain. Every message still reaches skilj
+/// exactly once, in offset order - pausing drops what librdkafka had
+/// prefetched for the partition, and resuming must fetch again from the
+/// first message not yet received, neither skipping nor repeating any.
+#[test]
+fn a_paused_partition_resumes_without_skipping_or_repeating_messages() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let topic = unique_topic("orders-in-paused");
+        create_topic(bootstrap_servers, &topic).await;
+
+        let mock_state = MockSkiljState::default();
+        mock_state
+            .fail_order_ids
+            .lock()
+            .unwrap()
+            .insert("o-0".to_string());
+        let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "10000")
+            .create()
+            .unwrap();
+        let count = 3 * skilj_kafka::INBOUND_PARTITION_BUFFER;
+        let expected: Vec<String> = (0..count).map(|i| format!("o-{i}")).collect();
+        for order in &expected {
+            producer
+                .send(
+                    FutureRecord::to(&topic)
+                        .payload(&format!(r#"{{"orderId":"{order}"}}"#))
+                        .key("k"),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)
+                .unwrap();
+        }
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("group.id", "test-group-paused")
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("session.timeout.ms", "6000")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .unwrap();
+        consumer.subscribe(&[topic.as_str()]).unwrap();
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            topic.clone(),
+            InboundMapping {
+                credential: "external-token".to_string(),
+                action: InboundAction::Record {
+                    event_type: "OrderPlaced".to_string(),
+                },
+            },
+        );
+        let http = skilj_kafka::http_client();
+        let retry_policy = skilj_retry::RetryPolicy::bounded(
+            Duration::from_millis(20),
+            1.0,
+            Duration::from_millis(20),
+            100_000,
+        );
+        tokio::spawn(async move {
+            run_inbound(&consumer, &http, &skilj_base_url, &mappings, &retry_policy).await;
+        });
+
+        for _ in 0..200 {
+            if *mock_state.refused_order_requests.lock().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(*mock_state.refused_order_requests.lock().unwrap() > 0);
+        // Long enough for the rest to be fetched and the partition paused.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(mock_state.external_requests.lock().unwrap().is_empty());
+
+        mock_state.fail_order_ids.lock().unwrap().clear();
+        let delivered = |state: &MockSkiljState| -> Vec<String> {
+            state
+                .external_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r["payload"]["orderId"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for _ in 0..200 {
+            if delivered(&mock_state).len() >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Anything repeated would have arrived by now as well.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(delivered(&mock_state), expected);
     });
 }
 
