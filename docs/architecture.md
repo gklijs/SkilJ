@@ -11073,3 +11073,27 @@ Codeberg issue #48, from the kafgres read-through: kafgres refuses to report set
 - `build()` logs a `warn` for every projection that consumes an event type with private fields, naming them and its `team_only`, so it's a choice rather than an accident (`skilj_core::projections::private_fields_consumed`, unit-tested in `projection_registration.rs`).
 
 **A capability manifest: not built.** The REST routes are fixed code, the GraphQL schema is introspectable per caller (§138), and the spec is already the manifest: `allium check` runs on every change, and `allium:weed` audits catch drift between it and the code. A generated manifest would be a third copy to keep in step, without closing anything this check found.
+
+<a id="command-recheck-position"></a>
+## 178. A command's re-check under the lock starts where its read ended
+
+Codeberg issue #45: refresh the performance baseline, profile the command commit path, then decide on follow-ups. The old baseline (~45-60 commands/s per bounded context) came from the `skilj-helpdesk` app's load runs. This repo had no command benchmark of its own.
+
+**Benchmark.** `skilj/tests/command_throughput.rs` (`#[ignore]`d, like §172's `inbound_throughput.rs`) sends 800 commands per scenario through `POST /v1/commands/trigger` on the in-process router, from 1, 8, 32 and 80 callers, in a **spread** workload (each command on its own account) and a **hot** one (all on one account). A tracing layer sums the batcher's own `debug` events (`command batch leader lock wait`, `command batch phase timing`, `command decide delta query`) per scenario, so each row says how large the batches were and what each command spent inside the lock. The results and their reading are in `docs/performance.md`.
+
+**What the profile found.** Inside the lock, a command's `decide` phase was 0.4-6.6 ms in the spread workload, where `decide()` itself is trivial. The cost was 100% the "delta query" in `decide_command_in_tx`, the re-check for consistency-tag events committed since the command's optimistic read. It ran for almost every command, and with one caller as well, and grew with the bounded context's total history (round 2 was slower than round 1). The query's lower bound was the highest *matching* sequence the read held, which for an account with no events is `-1`. Every command re-read its tags across the whole history under the lock, not since its read. #32's round-four investigation had timed this query but not looked at its bound. It also logged at `info` for every command.
+
+**Fix.** The read reports the position it is complete through: `list_events_for_bounded_context_matching_tags_cached` returns it with the events, and it travels on `ResolvedCommandSubmission`/`BatchedCommand` as `covered_through`.
+- From the event cache, it is the window's highest sequence, from the same `try_events_after(-1)` snapshot.
+- From Postgres, it is `latest_sequence` read *before* the tag query. Events commit in sequence order under the bounded context's lock, so everything up to it is visible to the query that follows.
+
+The re-check starts at `max(covered_through, highest matching sequence held)`. The second term matters: a Postgres read can hold an event above the position it reports, and nothing it holds may come back as new. `submit_command` and `CommandBatcher::submit` take it as a new last parameter, an `Option<i64>`. `None` keeps the old start for a caller that doesn't know it (the existing direct tests). The delta query logs at `debug`.
+
+The DCB guarantee is unchanged. Everything committed after the position is still re-read under the lock, and the read covered everything up to it. `a_known_read_position_still_catches_a_conflict_committed_after_it` (`skilj-core/tests/submit_command.rs`) moves the history to sequence 1 with other orders, gives a read for order A complete through 1, commits A at 2, and requires the redispatch and rejection. `an_event_the_read_already_holds_above_its_position_is_not_counted_twice` gives a read holding A at 0 with a reported position of -1, and requires no redispatch and one matching event.
+
+**Effect.** With one caller the in-lock query is gone: 0 µs, against 0.8-4.7 ms that grew with history. Under concurrency it reads only what was committed since the read: 0.2-1 ms. Spread throughput rose from 250-720 to 410-850 commands/s across the same runs. The rates are noisy; the machine was shared, with a load average of 6-15. The hot workload is unchanged: its cost is the account's own growing history, carried into the lock and folded per command.
+
+**Follow-ups noted, not built:**
+- Hot keys pay for their history twice per command inside the lock: a copy of the read's events in `decide_command_in_tx`, and the consistency boundary over them in `persist`. A `Snapshot` (§19) is the existing answer; avoiding the copy when nothing new arrived would trim the rest.
+- `persist`, 0.5-0.8 ms per command, is a savepoint plus several statements per command. Fewer round trips per command is #32's territory.
+- Once a bounded context holds more events than the event cache window (1000 by default), `try_events_after(-1)` can't cover its history, and every command's read goes to Postgres. That's #51.

@@ -231,6 +231,7 @@ impl CommandBatcher {
         now: DateTime<Utc>,
         snapshot: Option<SnapshotContext<'_>>,
         idempotency_key: Option<&str>,
+        covered_through: Option<i64>,
     ) -> Result<SubmitCommandOutcome> {
         let bounded_context_name = command_type.bounded_context.name.clone();
 
@@ -257,6 +258,7 @@ impl CommandBatcher {
             correlation_id: correlation_id.map(str::to_string),
             causation_id: causation_id.map(str::to_string),
             bounded_context_events: bounded_context_events.to_vec(),
+            covered_through,
             consistency_tags: consistency_tags.to_vec(),
             matching_events: matching_events.to_vec(),
             initial_decision,
@@ -398,6 +400,7 @@ impl CommandBatcher {
                     as_of_sequence: ctx.as_of_sequence,
                 }),
             idempotency_key,
+            Some(resolved.covered_through),
         )
         .await
     }

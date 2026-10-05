@@ -55,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A command's re-check under the bounded context's lock started at the
+  last event its consistency tags already had - for a new key, the start
+  of history - so every command re-read its tags across the whole history
+  while holding the lock, costing more as the bounded context grew. It now
+  starts where the command's optimistic read ended. Same DCB guarantee;
+  measured in the new `command_throughput` benchmark and refreshed in
+  docs/performance.md (docs/architecture.md §178, Codeberg issue #45).
+  `db::submit_command` and `CommandBatcher::submit` take the read's
+  position as a new last parameter (`None` keeps the old behaviour), and
+  the per-command `command decide delta query` log is now `debug`.
 - After a failover or restore, the event cache kept serving events the
   database had lost - to queries and to `decide()` - until a restart: a
   promoted standby keeps the table's OID, the cache's only stamp. Windows

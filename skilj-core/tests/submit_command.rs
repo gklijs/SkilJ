@@ -419,6 +419,7 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
             test_now(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -505,6 +506,7 @@ fn submit_command_does_not_redispatch_for_an_unrelated_concurrent_event() {
             test_now(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -568,6 +570,7 @@ fn submit_command_persists_a_real_command_id_that_round_trips() {
             initial_decision,
             None,
             test_now(),
+            None,
             None,
             None,
         )
@@ -644,6 +647,7 @@ fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original
             test_now(),
             None,
             Some(key),
+            None,
         )
         .await
         .unwrap();
@@ -676,6 +680,7 @@ fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original
             test_now(),
             None,
             Some(key),
+            None,
         )
         .await
         .unwrap();
@@ -752,6 +757,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             test_now(),
             None,
             Some(key),
+            None,
         )
         .await
         .unwrap();
@@ -787,6 +793,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             test_now(),
             None,
             Some(key),
+            None,
         )
         .await
         .unwrap();
@@ -843,6 +850,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             test_now(),
             None,
             Some(key),
+            None,
         )
         .await
         .unwrap();
@@ -975,6 +983,7 @@ fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
             test_now(),
             None,
             Some("legacy-key"),
+            None,
         )
         .await
         .unwrap();
@@ -1032,6 +1041,7 @@ fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
             test_now(),
             None,
             Some("a-different-key-this-client-owns"),
+            None,
         )
         .await
         .unwrap();
@@ -1178,6 +1188,7 @@ fn submit_command_without_an_idempotency_key_still_double_processes_a_repeated_s
                 test_now(),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1260,6 +1271,7 @@ fn ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_th
             test_now(),
             None,
             Some(key),
+            None,
         )
         .await
         .unwrap();
@@ -1287,6 +1299,7 @@ fn ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_th
             test_now(),
             None,
             Some(key),
+            None,
         )
         .await
         .unwrap();
@@ -1335,6 +1348,7 @@ fn submit_command_leaves_no_sequence_gap_when_process_command_fails() {
             initial_decision,
             None,
             test_now(),
+            None,
             None,
             None,
         )
@@ -1397,6 +1411,7 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
             initial_decision,
             None,
             test_now(),
+            None,
             None,
             None,
         )
@@ -1470,6 +1485,7 @@ fn submit_command_batches_sequence_allocation_for_a_multi_event_command() {
             test_now(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1508,6 +1524,7 @@ fn batched(
         correlation_id: None,
         causation_id: None,
         bounded_context_events: Vec::new(),
+        covered_through: None,
         consistency_tags,
         matching_events: Vec::new(),
         initial_decision,
@@ -1943,5 +1960,126 @@ fn submit_command_batch_deduplicates_a_repeated_idempotency_key_shared_by_two_co
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
+    });
+}
+
+/// docs/architecture.md §178: with the position the optimistic read is
+/// complete through, the re-check under the lock starts there - and still
+/// catches a conflicting event committed after it. Two unrelated events
+/// move the history on first, so the read for order "A" is complete
+/// through sequence 1 while holding nothing.
+#[test]
+fn a_known_read_position_still_catches_a_conflict_committed_after_it() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+
+        insert_concurrent_event(&pool, &bc, &et, "X").await;
+        insert_concurrent_event(&pool, &bc, &et, "Y").await;
+        let payload = r#"{"order_id":"A"}"#;
+        let consistency_tags = skilj_core::event_store::derive_tags(&ct.tag_mappings, payload);
+        let initial_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &[])
+            .unwrap()
+            .unwrap();
+        insert_concurrent_event(&pool, &bc, &et, "A").await;
+
+        let outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "client-1",
+            None,
+            None,
+            &[],
+            &consistency_tags,
+            &[],
+            initial_decision,
+            None,
+            test_now(),
+            None,
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dispatcher.call_count(), 2, "redispatched");
+        assert!(
+            matches!(outcome, SubmitCommandOutcome::Rejected { ref matching_events, .. } if matching_events.len() == 1),
+            "the conflict after the read's position was missed: {outcome:?}"
+        );
+    });
+}
+
+/// docs/architecture.md §178: a read from Postgres can hold an event above
+/// the position it reports (it saw a commit made after that position was
+/// read). The re-check starts above the highest event the read holds, so
+/// that event doesn't come back as new - no redispatch, counted once.
+#[test]
+fn an_event_the_read_already_holds_above_its_position_is_not_counted_twice() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let broadcaster = EventBroadcaster::new(16);
+        let event_cache = EventCache::new(1000);
+
+        insert_concurrent_event(&pool, &bc, &et, "A").await;
+        let held = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        let payload = r#"{"order_id":"A"}"#;
+        let consistency_tags = skilj_core::event_store::derive_tags(&ct.tag_mappings, payload);
+        let initial_decision = dispatcher
+            .dispatch(&bc.name, &ct.name, payload, &held)
+            .unwrap()
+            .unwrap();
+
+        let outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            &broadcaster,
+            &event_cache,
+            &ct,
+            payload,
+            "client-1",
+            None,
+            None,
+            &held,
+            &consistency_tags,
+            &held,
+            initial_decision,
+            None,
+            test_now(),
+            None,
+            None,
+            // Read before the event committed, the read itself after.
+            Some(-1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dispatcher.call_count(), 1, "nothing new - no redispatch");
+        assert!(
+            matches!(outcome, SubmitCommandOutcome::Rejected { ref matching_events, .. } if matching_events.len() == 1),
+            "the held event must count once: {outcome:?}"
+        );
     });
 }

@@ -24,19 +24,54 @@ Consequences:
 
 ## Measured numbers
 
-From the `skilj-helpdesk` showcase app (single shared bounded context,
-one Postgres, local sandbox, 4-minute ramp steps), commit `0d9c409`:
+`skilj/tests/command_throughput.rs` is the benchmark (`#[ignore]`d; run it with
+`cargo test --release -p skilj --test command_throughput -- --ignored
+--nocapture`). It sends 800 commands per scenario through `POST
+/v1/commands/trigger` on the in-process router (no network) into one bounded
+context, from 1, 8, 32 or 80 concurrent callers, and reads the command
+batcher's own `debug` events to report batch size, lock wait and where the
+time inside the lock goes. Two workloads: **spread** (every command on its own
+account, so `decide()` sees an empty history) and **hot** (every command on
+one account, whose history grows as the run goes).
 
-| workers | before batching round-trip cuts | after |
-|---|---|---|
-| 20 | ~27/s | ~45/s |
-| 80 | ~27/s | ~58/s |
+Measured on a 22-core development machine against the embedded Postgres 18,
+shared with other work - the load average moved between 6 and 15 during the
+runs, so the absolute rates moved by up to 2x between rounds. Per-command time
+inside the lock is the steadier figure. After the fix in docs/architecture.md
+§178:
 
-Mean batch size at 80 workers was ~35. Treat ~45-60 commands/s for a *single*
-bounded context on modest hardware as the working figure; it is a
-lower bound for your hardware, not a guarantee. These figures pre-date the
-post-0.0.7 review fixes (§63); that change touches the hot path only by
-adding a semaphore acquire per batch, but it has not been re-load-tested.
+| workload | callers | commands/s | p50 | mean batch | in lock per command |
+|---|---|---|---|---|---|
+| spread | 1 | 70-230 | 4-15 ms | 1 | ~0.6-1.4 ms (persist 0.4-1 ms) |
+| spread | 8 | 410-790 | 9-19 ms | 2-3 | ~0.9-1.7 ms |
+| spread | 32 | 580-850 | 36-54 ms | 10-11 | ~0.9-1.4 ms |
+| spread | 80 | 480-800 | 95-160 ms | 19-30 | ~0.8-1.7 ms |
+| hot | 1 | 36-54 | 15-23 ms | 1 | ~2.8-4.4 ms |
+| hot | 8 | ~100 | 70-76 ms | 2 | ~4.8-5 ms |
+| hot | 32 | 107-116 | 263-270 ms | 11-12 | ~4.7-5.2 ms |
+| hot | 80 | 80-130 | 0.6-1.1 s | 30-32 | ~4.6-8.4 ms |
+
+What the profile says:
+
+- Group commit works: at 80 callers a batch holds 20-40 commands, and the
+  final commit drops to a few microseconds per command.
+- **Spread** was dominated, before §178, by a re-check query under the lock
+  that started at the account's last event instead of where the command's
+  read ended - for a new account, at the start of history. It cost 0.8-6.6 ms
+  per command and grew with the bounded context's size, even with one caller.
+  Now it only runs when something was committed since the read, and covers
+  just that: 0 with one caller, 0.2-1 ms under concurrency. What remains is
+  `persist` - per-command savepoint, command and event inserts, ~0.5-0.8 ms.
+- **Hot** is bounded by the account's history, which every command carries
+  into the lock and folds: `decide` takes ~1 ms even with nothing new to
+  re-check, and the consistency boundary is computed over the same history
+  in `persist`. This grows with the account's event count. The lever is a
+  `Snapshot` for such keys (§19), not the batcher.
+
+Older figures, from the `skilj-helpdesk` showcase app (4-minute ramp steps,
+commit `0d9c409`): ~45 commands/s at 20 workers, ~58/s at 80, for one shared
+bounded context. A different application's commands, a networked client and
+another machine - not comparable with the in-process figures above.
 
 ## Knobs
 

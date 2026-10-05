@@ -326,21 +326,29 @@ impl EventCache {
     /// coverage miss, identical convention to every other method here -
     /// the caller falls back to
     /// `db::list_events_for_bounded_context_matching_tags`.
+    ///
+    /// Alongside the events, the position they are complete through: the
+    /// highest sequence the window held, matching or not (`-1` when there
+    /// is none) - every event at or below it was looked at. A command's
+    /// re-check under the lock only needs what came after it
+    /// (docs/architecture.md §178).
     pub async fn try_events_matching_tags(
         &self,
         pool: &Pool,
         bounded_context: &str,
         tags: &[Tag],
-    ) -> crate::error::Result<Option<Vec<Event>>> {
+    ) -> crate::error::Result<Option<(Vec<Event>, i64)>> {
         let Some(events) = self.try_events_after(pool, bounded_context, -1).await? else {
             return Ok(None);
         };
-        Ok(Some(
+        let covered_through = events.last().map_or(-1, |e| e.sequence);
+        Ok(Some((
             events
                 .into_iter()
                 .filter(|e| tags.iter().any(|t| e.tags.contains(t)))
                 .collect(),
-        ))
+            covered_through,
+        )))
     }
 
     /// `InspectEvent`'s own single-row lookup. `Ok(None)` is a cache

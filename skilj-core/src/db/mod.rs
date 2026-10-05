@@ -6775,6 +6775,16 @@ pub async fn list_events_for_bounded_context_cached(
 /// already has, via `EventCache::try_events_matching_tags` instead of
 /// `try_events_after`. Already tag-scoped either way - see that
 /// function's own doc comment.
+///
+/// Also returns the position the read is complete through - every
+/// matching event at or below it is in the result - which is where a
+/// command's re-check under the lock starts (docs/architecture.md §178).
+/// From the cache, the window's highest sequence. From Postgres, the
+/// latest sequence read *before* the tag query: events commit in sequence
+/// order under the bounded context's lock, so everything up to it is
+/// visible to the query that follows. A newer event the query also
+/// happened to see is above the position; the re-check starts above the
+/// highest event the read holds anyway, so it doesn't come back.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_events_for_bounded_context_matching_tags_cached(
     pool: &Pool,
@@ -6782,23 +6792,28 @@ pub async fn list_events_for_bounded_context_matching_tags_cached(
     bounded_context: &str,
     tags: &[Tag],
     after_sequence: Option<i64>,
-) -> crate::error::Result<Vec<Event>> {
+) -> crate::error::Result<(Vec<Event>, i64)> {
     match cache
         .try_events_matching_tags(pool, bounded_context, tags)
         .await?
     {
-        Some(events) => Ok(events
-            .into_iter()
-            .filter(|e| e.sequence > after_sequence.unwrap_or(-1))
-            .collect()),
+        Some((events, covered_through)) => Ok((
+            events
+                .into_iter()
+                .filter(|e| e.sequence > after_sequence.unwrap_or(-1))
+                .collect(),
+            covered_through,
+        )),
         None => {
-            list_events_for_bounded_context_matching_tags(
+            let covered_through = latest_sequence(pool, bounded_context).await?.unwrap_or(-1);
+            let events = list_events_for_bounded_context_matching_tags(
                 pool,
                 bounded_context,
                 tags,
                 after_sequence,
             )
-            .await
+            .await?;
+            Ok((events, covered_through))
         }
     }
 }
@@ -7663,6 +7678,7 @@ pub async fn submit_command(
     now: DateTime<Utc>,
     snapshot: Option<SnapshotContext<'_>>,
     idempotency_key: Option<&str>,
+    covered_through: Option<i64>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
 
@@ -7714,6 +7730,7 @@ pub async fn submit_command(
         &[],
         event_types_by_name,
         resolved,
+        covered_through,
     )
     .await?;
 
@@ -7902,6 +7919,7 @@ async fn decide_command_in_tx(
     locked_highest: i64,
     extra_committed_events: &[Event],
     mut event_types_by_name: std::collections::HashMap<String, EventType>,
+    covered_through: Option<i64>,
 ) -> crate::error::Result<DecideOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
@@ -7951,7 +7969,17 @@ async fn decide_command_in_tx(
     // match on our own consistency_tags is an actual DCB conflict; see
     // docs/architecture.md §19's "Problem 1" fix for why the query is
     // tag-indexed rather than an unfiltered range scan.
-    let mut delta = if locked_highest > original_highest {
+    //
+    // It starts where the optimistic read is complete through, when the
+    // caller knows that, else at the highest event the read holds. Not
+    // just the latter: for a tag with no recent events that is far back,
+    // and the query below walked the bounded context's history from there
+    // for every command, under the lock (docs/architecture.md §178). The
+    // larger of the two: a read from Postgres can hold an event above the
+    // position it reports (it saw a later commit), and nothing it holds
+    // must come back as new.
+    let covered = covered_through.map_or(original_highest, |c| c.max(original_highest));
+    let mut delta = if locked_highest > covered {
         // `command_type.bounded_context` is already this exact row -
         // every command a `CommandBatcher` batch ever holds shares one
         // bounded context (the queue is keyed on it), so there is never
@@ -7973,7 +8001,7 @@ async fn decide_command_in_tx(
             &mut *conn,
             &command_type.bounded_context,
             consistency_tags,
-            Some(original_highest),
+            Some(covered),
             Some(&event_types_by_name),
             None,
         )
@@ -7982,7 +8010,8 @@ async fn decide_command_in_tx(
         // earlier command in this batch inserted (above `locked_highest`);
         // those come from `extra_committed_events` below instead.
         result.retain(|e| e.sequence <= locked_highest);
-        tracing::info!(
+        // `debug`: one line per command was `info` (docs/architecture.md §178).
+        tracing::debug!(
             bounded_context = %bounded_context_name,
             delta_query_us = delta_query_started.elapsed().as_micros(),
             delta_rows = result.len(),
@@ -7995,9 +8024,7 @@ async fn decide_command_in_tx(
     delta.extend(
         extra_committed_events
             .iter()
-            .filter(|e| {
-                e.sequence > original_highest && consistency_tags.iter().any(|t| e.tags.contains(t))
-            })
+            .filter(|e| e.sequence > covered && consistency_tags.iter().any(|t| e.tags.contains(t)))
             .cloned(),
     );
 
@@ -8278,6 +8305,7 @@ async fn submit_one_command_in_tx(
     extra_committed_events: &[Event],
     event_types_by_name: std::collections::HashMap<String, EventType>,
     resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    covered_through: Option<i64>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let decided = match decide_command_in_tx(
@@ -8295,6 +8323,7 @@ async fn submit_one_command_in_tx(
         locked_highest,
         extra_committed_events,
         event_types_by_name,
+        covered_through,
     )
     .await?
     {
@@ -8369,6 +8398,10 @@ pub struct BatchedCommand {
     pub correlation_id: Option<String>,
     pub causation_id: Option<String>,
     pub bounded_context_events: Vec<Event>,
+    /// See `ResolvedCommandSubmission::covered_through`; `None` for a
+    /// caller that doesn't know it, whose re-check then starts from the
+    /// highest event it does hold.
+    pub covered_through: Option<i64>,
     pub consistency_tags: Vec<Tag>,
     pub matching_events: Vec<Event>,
     pub initial_decision: crate::shared::CommandDecision,
@@ -8699,6 +8732,7 @@ pub async fn commit_command_batch(
             locked_highest,
             &extra_committed_events,
             item.event_types_by_name,
+            item.covered_through,
         )
         .await;
         decide_total += decide_started.elapsed();
@@ -8861,6 +8895,9 @@ pub async fn submit_command_batch(
 /// respectively), computed identically by both.
 pub struct ResolvedCommandSubmission {
     pub bounded_context_events: Vec<Event>,
+    /// The position `bounded_context_events` is complete through - see
+    /// `list_events_for_bounded_context_matching_tags_cached`.
+    pub covered_through: i64,
     pub consistency_tags: Vec<Tag>,
     pub matching_events: Vec<Event>,
     pub decision: crate::shared::CommandDecision,
@@ -8903,14 +8940,15 @@ pub async fn resolve_command_submission(
         _ => None,
     };
 
-    let bounded_context_events = list_events_for_bounded_context_matching_tags_cached(
-        pool,
-        event_cache,
-        &bounded_context_name,
-        &consistency_tags,
-        snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
-    )
-    .await?;
+    let (bounded_context_events, covered_through) =
+        list_events_for_bounded_context_matching_tags_cached(
+            pool,
+            event_cache,
+            &bounded_context_name,
+            &consistency_tags,
+            snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
+        )
+        .await?;
     let (_boundary, matching_events) = crate::event_store::consistency_boundary_and_matching_events(
         &bounded_context_events,
         &consistency_tags,
@@ -8938,6 +8976,7 @@ pub async fn resolve_command_submission(
 
     Ok(ResolvedCommandSubmission {
         bounded_context_events,
+        covered_through,
         consistency_tags,
         matching_events,
         decision,
@@ -9026,6 +9065,7 @@ pub async fn decide_and_submit_command(
                 as_of_sequence: ctx.as_of_sequence,
             }),
         idempotency_key,
+        Some(resolved.covered_through),
     )
     .await
 }
