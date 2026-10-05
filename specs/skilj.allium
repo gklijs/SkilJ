@@ -7227,6 +7227,21 @@ surface ProjectionQuery {
         -- EventSubscription's push is the contrasting case: it decides
         -- per field, each against that field's own subject.
 
+    @guarantee PrivateFieldsAreTheProjectionsToKeep
+        -- Unlike a sensitive field, a private field reaches project() as
+        -- stored, in plaintext - it is redacted when an event or command
+        -- is read (see EventQuery and value PrivateField), not before a
+        -- fold. Whatever of it a projection keeps in its state, every
+        -- caller this surface serves that projection to reads, whatever
+        -- their own entitlement to the field: state has no per-record
+        -- creator, team or addressee to redact against. Keeping one is
+        -- the projection's choice, made where its state is defined - leave
+        -- it out of the state, or gate the whole projection with
+        -- team_only (TeamGatedWhenDeclared). The library reports every
+        -- projection consuming an event type with private fields when it
+        -- starts, and refuses none of them, since a staff view may need
+        -- exactly that.
+
     @guarantee ReadYourWritesWhenRequested
         -- A query naming a wait_for_sequence is never answered from a
         -- position behind it: either the projection has reached that
@@ -7661,6 +7676,12 @@ surface SnapshotInspection {
         -- scoping holds unchanged, and a scope only narrows further within
         -- it - the same relationship ProjectionQuery's own two guarantees
         -- have.
+
+    @guarantee PrivateFieldsAreTheSnapshotsToKeep
+        -- The same boundary ProjectionQuery's
+        -- PrivateFieldsAreTheProjectionsToKeep states: a snapshot is folded
+        -- from events as stored, so a private field it keeps is shown here
+        -- to any admin of the context, whatever their entitlement to it.
 
     @guarantee UnknownNameIsAnError
         -- snapshot_name naming something that was never defined for this

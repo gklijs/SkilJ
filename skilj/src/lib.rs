@@ -4087,6 +4087,24 @@ async fn reconcile_projections(
             report.skipped_no_access.push(key);
             continue;
         };
+        // docs/architecture.md §177: private fields aren't redacted before
+        // a projection folds them, only when an event is read.
+        let private = skilj_core::projections::private_fields_consumed(&consumed_event_types);
+        if !private.is_empty() {
+            let fields: Vec<String> = private
+                .iter()
+                .map(|(event_type, field)| format!("{event_type}.{field}"))
+                .collect();
+            tracing::warn!(
+                projection = %key,
+                private_fields = ?fields,
+                team_only = ?registered.team_only,
+                "this Projection consumes event types with private fields - they reach \
+                 project() unredacted, and anything of them it keeps in its state is visible \
+                 to every reader of the projection, whatever their private-field grants. \
+                 Leave them out of the state, or gate the projection with team_only"
+            );
+        }
 
         let existing = skilj_core::db::get_projection(pool, bounded_context_name, name).await?;
         if existing.is_some()

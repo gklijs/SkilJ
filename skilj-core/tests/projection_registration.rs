@@ -950,3 +950,36 @@ fn discard_projection_rebuild_staged_is_always_pending_by_construction() {
 // A relationship projection, not a stored field - the same "caller
 // resolves it" treatment every other relationship projection in this
 // codebase gets (Role.access_mappings, EventType.*_tokens, ...).
+
+/// docs/architecture.md §177: every private field a projection's consumed
+/// event types declare, by event type - what `build()` warns about.
+#[test]
+fn private_fields_consumed_names_every_private_field_by_event_type() {
+    let plain = event_type("Plain");
+    let mut noted = event_type("Noted");
+    noted.private_fields = vec![
+        skilj_core::shared::PrivateField {
+            field: "note".to_string(),
+            kind: skilj_core::shared::PrivateFieldKind::Own,
+            team: None,
+            addressee_field: None,
+        },
+        skilj_core::shared::PrivateField {
+            field: "staff_remark".to_string(),
+            kind: skilj_core::shared::PrivateFieldKind::Team,
+            team: Some("staff".to_string()),
+            addressee_field: None,
+        },
+    ];
+    assert_eq!(
+        skilj_core::projections::private_fields_consumed(std::slice::from_ref(&plain)),
+        Vec::<(String, String)>::new()
+    );
+    assert_eq!(
+        skilj_core::projections::private_fields_consumed(&[plain, noted]),
+        vec![
+            ("Noted".to_string(), "note".to_string()),
+            ("Noted".to_string(), "staff_remark".to_string()),
+        ]
+    );
+}

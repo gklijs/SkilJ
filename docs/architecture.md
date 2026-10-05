@@ -5235,6 +5235,9 @@ time, a materially different evaluability shape from the three built
 here, with its own open questions about staleness. Nothing here forecloses
 it; nothing here is shaped around it either.
 
+(A private field is redacted when an event or command is read, not
+before a projection, snapshot or route folds it - see [§177](#advertised-vs-enforced).)
+
 **Design decision, made explicit early and load-bearing throughout**: no
 encryption, anywhere. `sensitive_fields` earns its `EncryptionKey`/
 ciphertext-at-rest weight from GDPR erasure - none of these three kinds
@@ -11046,3 +11049,27 @@ Codeberg issue #42. When the database fails over to an asynchronous standby, the
 `FailoverServer` always runs servers of its own, never `DATABASE_URL`'s. `pg_basebackup --checkpoint=fast` keeps the test at about a second; the default spread checkpoint took 108.
 
 The first CI run skipped the test, and the silent-skip guard failed the build: `initdb: error: cannot be run as root`. CI runs tests as root, and Postgres refuses to run as root. As root, `FailoverServer` therefore uses the system's server binaries (`/usr/lib/postgresql/*/bin`, or `SKILJ_TEST_PGBIN`) with trust auth on a free local port, and runs every server command through `runuser -u postgres --`, the way `scripts/ci-postgres-local.sh` does. The embedded binaries live in root's home, out of that user's reach. CI's test step now installs `postgresql` next to `postgresql-client`. Elsewhere it uses the embedded server as before. `skilj-test-support/tests/failover_server.rs` tests the helper itself: the backup's row survives, the later row doesn't, and the timeline changes. It passed as root in an Alpine container with the distribution's Postgres 16, and as a normal user with the embedded binaries.
+
+<a id="advertised-vs-enforced"></a>
+## 177. What the self-describing surface advertises, checked against where it's enforced
+
+Codeberg issue #48, from the kafgres read-through: kafgres refuses to report settings it doesn't enforce. Two questions: does SkilJ's self-description (`eventTypes`, `commandTypes`, `projections`, `scheduledEventTypes`, §13) ever claim a protection that doesn't hold for the caller? And would a generated capability manifest with a CI check be worth having?
+
+**Who sees the self-description.** Each field requires admin access to the bounded context it names, and since §138 a caller is only served its own bounded contexts' schema. Nothing leaks across callers or contexts.
+
+**What it advertises, and where each claim holds:**
+
+| advertised | enforced at |
+|---|---|
+| `externalCreationAllowed`, `directCreationAllowed`, `systemTriggeredAllowed`, `restTriggerAllowed`, `eventReadAllowed` | the creation, trigger and token checks (`check_create_*`, `authorise_command_trigger`, minting) |
+| `tagMappings`, `ownerTagKey` | tag derivation on every write; owner scoping on reads and writes (§23-§30) |
+| `sensitiveFields` | encryption on every event write path (`fire_system_event`, `create_and_insert_external_event`, `create_and_insert_direct_event`, the command path) and for command payloads; parked rows (§91) and deadlines (§162) are covered; projections and snapshots fold ciphertext and decrypt only for a granted reader |
+| `privateFields` | redaction on every *event and command read*: `queryEvents`, `inspectEvent`, the subscriptions, `fetchCommands`, a rejection's matching events, REST fetch and consume (so the bridges never see one), parked rows; a private field can't also be a tag mapping or a sensitive field |
+
+**The gap: private fields in projection and snapshot state.** A private field is stored in plaintext by design (§31) and redacted only when an event or command is rendered for a reader. Projections and decider snapshots fold events as stored. Whatever of a private field a projection keeps in its state, every reader of that projection gets through `projection` and `projectionUpdates`, and every admin through `inspectSnapshot`, whatever their own entitlement. The `EventType` still lists the field as private. A `CrossContextRoute` that copies one into another context's command does the same. Neither §31 nor the spec said so. `private_field_grant_lifecycle_end_to_end` (`skilj/tests/graphql_business_surfaces.rs`) now shows it: the colleague who gets `{"note":null}` from `inspectEvent` reads `"call back Monday"` from the sync projection `LatestTicketNote`.
+
+**With the user's choice, documented and reported, not redacted.** The options were redacting private fields before every fold (a staff view behind `team_only` legitimately needs them), or an opt-in per projection (trait change, registration check, spec). Instead:
+- The spec says it: `ProjectionQuery`'s `PrivateFieldsAreTheProjectionsToKeep` and `SnapshotInspection`'s `PrivateFieldsAreTheSnapshotsToKeep`. Keeping a private field is the projection's choice: leave it out of the state, or gate the whole projection with `team_only`.
+- `build()` logs a `warn` for every projection that consumes an event type with private fields, naming them and its `team_only`, so it's a choice rather than an accident (`skilj_core::projections::private_fields_consumed`, unit-tested in `projection_registration.rs`).
+
+**A capability manifest: not built.** The REST routes are fixed code, the GraphQL schema is introspectable per caller (§138), and the spec is already the manifest: `allium check` runs on every change, and `allium:weed` audits catch drift between it and the code. A generated manifest would be a third copy to keep in step, without closing anything this check found.

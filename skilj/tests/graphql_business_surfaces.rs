@@ -14,7 +14,9 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{requires_role, CommandType, EventType, IdpConfig, SigningAlgorithm, Skilj, Snapshot};
+use skilj::{
+    requires_role, CommandType, EventType, IdpConfig, Projection, SigningAlgorithm, Skilj, Snapshot,
+};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::Pool;
@@ -165,7 +167,6 @@ impl EventType for TicketNoteAdded {
 }
 
 enum TicketNoteEvent {
-    #[allow(dead_code)]
     TicketNoteAdded(TicketNoteAddedPayload),
 }
 
@@ -198,6 +199,32 @@ impl CommandType for AddTicketNote {
                 payload: serde_json::json!({ "note": payload.note }),
             }],
         }
+    }
+}
+
+/// Keeps the latest ticket note - including its `own`-kind private
+/// `note`, which reaches `project()` unredacted (docs/architecture.md
+/// §177). `sync()` so it's current the moment the command commits.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct LatestTicketNoteState {
+    note: String,
+}
+
+struct LatestTicketNote;
+
+impl Projection for LatestTicketNote {
+    type State = LatestTicketNoteState;
+    type Event = TicketNoteEvent;
+    const NAME: &'static str = "LatestTicketNote";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["TicketNoteAdded"]
+    }
+    fn sync() -> bool {
+        true
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        let TicketNoteEvent::TicketNoteAdded(payload) = event;
+        state.note = payload.note.clone();
     }
 }
 
@@ -718,6 +745,7 @@ async fn setup_with(
         .command_type::<CloseAccount>()
         .event_type::<TicketNoteAdded>()
         .command_type::<AddTicketNote>()
+        .projection::<LatestTicketNote>()
         .event_type::<ThingHappened>()
         .snapshot::<ThingTotalSnapshot>()
         .command_type::<DoThingFast>()
@@ -1590,6 +1618,28 @@ fn private_field_grant_lifecycle_end_to_end() {
         assert_eq!(
             response["data"]["inspectEvent"]["renderedPayload"],
             r#"{"note":null}"#
+        );
+
+        // docs/architecture.md §177, the boundary: a private field is
+        // redacted when the *event* is read, not before a projection folds
+        // it. `LatestTicketNote` keeps the note in its state, so the same
+        // colleague reads it there in full - which `build()` warns about.
+        let type_name =
+            skilj_graphql::projection_types::graphql_type_name(&bc_name, "LatestTicketNote");
+        let response = graphql_request(
+            &router,
+            Some(&colleague_jwt),
+            &format!(
+                "query($bc: String!) {{ projection(boundedContext: $bc, name: \"LatestTicketNote\") \
+                 {{ ... on {type_name} {{ note }} }} }}"
+            ),
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        assert_eq!(
+            response["data"]["projection"]["note"], "call back Monday",
+            "a projection's state is not redacted per reader"
         );
 
         // The creator shares this one record with the colleague.

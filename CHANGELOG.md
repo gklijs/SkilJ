@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `build()` warns for every projection that consumes an event type with
+  private fields: they reach `project()` unredacted, and whatever of
+  them a projection keeps in its state, every reader of that projection
+  sees, whatever their private-field grants. Now stated in the spec and
+  docs (docs/architecture.md §177, Codeberg issue #48), along with the
+  same for snapshots and cross-context routes; nothing is refused.
+
 - Database epochs (docs/architecture.md §176, Codeberg issue #42): event
   reads return the database's `epoch` (system identifier and timeline),
   which changes after a failover to an asynchronous standby or a

@@ -178,6 +178,28 @@ pub fn check_consumed_event_type_names<'a>(
     Ok(())
 }
 
+/// Every `(event type, private field)` among `consumed_event_types` - what
+/// a projection consuming them is handed in plaintext (docs/architecture.md
+/// §177). `privateFields` are redacted when an event or command is read,
+/// not before a projection folds it: whatever of them a projection keeps
+/// in its state, every reader of that projection sees, whatever their
+/// private-field grants. Nothing here refuses that - a projection may need
+/// one (a staff view behind `team_only`, say) - but `SkiljBuilder::build`
+/// reports each one, so it is a choice rather than an accident.
+pub fn private_fields_consumed(
+    consumed_event_types: &[crate::event_store::EventType],
+) -> Vec<(String, String)> {
+    consumed_event_types
+        .iter()
+        .flat_map(|event_type| {
+            event_type
+                .private_fields
+                .iter()
+                .map(|field| (event_type.name.clone(), field.field.clone()))
+        })
+        .collect()
+}
+
 /// See `rule RegisterProjection`. `existing` is `Projection{bounded_context,
 /// name}` and `staged` is `ProjectionRebuild{projection: existing, status:
 /// pending}`, both as already looked up by the caller - the same get-or-
