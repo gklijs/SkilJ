@@ -406,6 +406,24 @@ impl EventCache {
         bounded_context: &str,
         after_sequence: i64,
     ) -> crate::error::Result<Option<Vec<Event>>> {
+        Ok(self
+            .try_events_where(pool, bounded_context, after_sequence, |_| true)
+            .await?
+            .map(|(events, _)| events))
+    }
+
+    /// `try_events_after`, keeping only the events `keep` accepts, plus the
+    /// window's highest sequence (`-1` when it holds none). `keep` runs
+    /// before an event is served, so what it turns away is never cloned -
+    /// a tag read used to clone the whole window to return a handful of
+    /// it (docs/architecture.md §187).
+    async fn try_events_where(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        after_sequence: i64,
+        keep: impl Fn(&Event) -> bool,
+    ) -> crate::error::Result<Option<(Vec<Event>, i64)>> {
         if self.is_disabled() {
             return Ok(None);
         }
@@ -415,20 +433,40 @@ impl EventCache {
             // Freshened and still nothing - a genuinely empty bounded
             // context, which trivially covers everything from the
             // beginning.
-            return Ok(Some(Vec::new()));
+            return Ok(Some((Vec::new(), -1)));
         };
         match window.covers_from() {
-            None => Ok(Some(Vec::new())), // freshened, still empty - see above
-            Some(covers_from) if after_sequence >= covers_from - 1 => Ok(Some(
-                window
+            None => Ok(Some((Vec::new(), -1))), // freshened, still empty - see above
+            Some(covers_from) if after_sequence >= covers_from - 1 => {
+                let from = window
                     .events
-                    .iter()
-                    .filter(|e| e.sequence > after_sequence)
-                    .map(|e| window.serve(e))
-                    .collect(),
-            )),
+                    .partition_point(|e| e.sequence <= after_sequence);
+                Ok(Some((
+                    window
+                        .events
+                        .range(from..)
+                        .filter(|e| keep(e))
+                        .map(|e| window.serve(e))
+                        .collect(),
+                    window.highest_known_sequence().unwrap_or(-1),
+                )))
+            }
             Some(_) => Ok(None), // after_sequence reaches further back than this window can prove
         }
+    }
+
+    /// Whether `bounded_context`'s window has already let go of its first
+    /// event, so it can't serve a read from the beginning however it is
+    /// freshened: freshening only appends and evicts, and a refill takes
+    /// the most recent `capacity` events of a log already longer than
+    /// that. The exception is a refill onto another table (§95/§176), which
+    /// needs a window stamped with one, so a window only `append` has
+    /// touched never counts.
+    async fn has_evicted_the_beginning(&self, bounded_context: &str) -> bool {
+        let contexts = self.contexts.read().await;
+        contexts
+            .get(bounded_context)
+            .is_some_and(|w| w.table.is_some() && w.covers_from().is_some_and(|front| front > 0))
     }
 
     /// [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 1" fix -
@@ -457,17 +495,18 @@ impl EventCache {
         bounded_context: &str,
         tags: &[Tag],
     ) -> crate::error::Result<Option<(Vec<Event>, i64)>> {
-        let Some(events) = self.try_events_after(pool, bounded_context, -1).await? else {
+        // A window that has evicted sequence 0 misses here whatever
+        // `freshen` does, so its round trip is skipped. Only a miss can come
+        // of skipping it: a window that ends up stale this way (its bounded
+        // context recreated) keeps sending these reads to Postgres until any
+        // other read freshens it (docs/architecture.md §187).
+        if self.has_evicted_the_beginning(bounded_context).await {
             return Ok(None);
-        };
-        let covered_through = events.last().map_or(-1, |e| e.sequence);
-        Ok(Some((
-            events
-                .into_iter()
-                .filter(|e| tags.iter().any(|t| e.tags.contains(t)))
-                .collect(),
-            covered_through,
-        )))
+        }
+        self.try_events_where(pool, bounded_context, -1, |e| {
+            tags.iter().any(|t| e.tags.contains(t))
+        })
+        .await
     }
 
     /// `InspectEvent`'s own single-row lookup. `Ok(None)` is a cache
@@ -491,8 +530,8 @@ impl EventCache {
         };
         Ok(window
             .events
-            .iter()
-            .find(|e| e.sequence == sequence)
-            .map(|e| window.serve(e)))
+            .binary_search_by_key(&sequence, |e| e.sequence)
+            .ok()
+            .map(|i| window.serve(&window.events[i])))
     }
 }

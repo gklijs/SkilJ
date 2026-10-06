@@ -11245,3 +11245,19 @@ Nothing that holds a lock waits for a second pooled connection (§116), so those
 The `pool_options` doc comment said sqlx's default had no timeouts; it has a 30s acquire timeout, a 10min idle timeout and a 30min max lifetime. Corrected.
 
 **Not done.** No measured optimum: §184's benchmark varies callers, not pool size. `BACKGROUND_TASK_CONCURRENCY` stays a fixed 16.
+
+## 187. Event cache tag reads: measured, two fixes, no index
+
+Codeberg issue #50 asked whether `EventCache`'s tag-matching reads want a tag -> positions index, or `ArcSwap`-style snapshot reads in place of the `tokio::sync::RwLock`. Measured with temporary timing around the cache's part of a command's pre-read, in the `command_throughput` benchmark (§178, 800 commands per scenario):
+
+- **Read lock wait: 0-50 µs** per read, even at 80 callers. The lock isn't worth replacing.
+- **The scan, while the window held the whole history: 0.45-0.75 ms** per read. Almost none of that was scanning: `try_events_matching_tags` served (cloned, with its registrations substituted, §180) *every* event in the window and then filtered by tag. It now filters first, so only matching events are cloned (`try_events_where`). The tag comparison over 1000 events takes microseconds, so an index isn't worth it either.
+- **Freshen: 0.5 ms at one caller, up to 7 ms at 80** (round trips plus pool waits) - and paid for nothing once a bounded context grows past the cache's capacity. The DCB pre-read needs the whole history (`try_events_after(-1)`), so a window that has evicted sequence 0 can never serve it, yet every read freshened the window first and then missed. Past 1000 events, which the benchmark reaches during warm-up, that was every command. Now `try_events_matching_tags` misses straight away when the window, already stamped with a table, starts above sequence 0. Freshening can't change that: it only appends and evicts, and a refill takes the most recent `capacity` events of a log already longer than that. The one exception is a refill onto a recreated table (§95) or a new epoch (§176), which can start at 0 again. Skipping in that case only costs a miss: tag reads for that bounded context go to Postgres until some other read (fetch, query, inspect) freshens the window.
+
+After both fixes, the cache's share of a pre-read that misses is 0-2 µs. The two benchmark rounds were run back to back at load average 1.5-2.6. Spread throughput in round 1 went from 166/622/702/630 to 242/748/873/862 commands/s (1/8/32/80 callers), and hot throughput went from 55/91/96/96 to 67/107/115/118. Round 2 moved the same way, with more noise. What's left per command is Postgres: the pre-read's tag query, the re-check under the lock (§178), and `persist`.
+
+`try_event_by_sequence` finds the event by binary search, and `try_events_after` starts from the first event past `after_sequence`, rather than scanning the window linearly. Both are cheap; neither showed in the profile.
+
+Tests (`skilj-core/tests/event_cache.rs`): `a_tag_read_serves_the_matching_events_complete_through_the_whole_window`, and `a_tag_read_past_the_windows_first_event_misses_without_a_round_trip`, which warms through a pool, closes the pool, and expects a clean miss rather than a connection error. That test fails on the old code.
+
+**Not done.** Serving tag reads from a window that doesn't reach the start (snapshots, a `covered_from` position) is #51.

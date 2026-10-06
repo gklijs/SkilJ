@@ -17,7 +17,7 @@ use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{
     BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType,
 };
-use skilj_core::shared::{generate_token_id, Metadata, PrivateField, PrivateFieldKind};
+use skilj_core::shared::{generate_token_id, Metadata, PrivateField, PrivateFieldKind, Tag};
 
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
 
@@ -108,6 +108,15 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
 /// `submit_command.rs::insert_concurrent_event` already plays for DCB
 /// conflict tests.
 async fn insert_event_bypassing_cache(pool: &Pool, bc: &BoundedContext, et: &EventType) -> Event {
+    insert_tagged_event_bypassing_cache(pool, bc, et, Vec::new()).await
+}
+
+async fn insert_tagged_event_bypassing_cache(
+    pool: &Pool,
+    bc: &BoundedContext,
+    et: &EventType,
+    tags: Vec<Tag>,
+) -> Event {
     let seq = db::next_sequence(pool, &bc.name).await.unwrap();
     let e = Event {
         bounded_context: bc.clone(),
@@ -122,12 +131,19 @@ async fn insert_event_bypassing_cache(pool: &Pool, bc: &BoundedContext, et: &Eve
             causation_id: None,
         },
         sequence: seq,
-        tags: Vec::new(),
+        tags,
         encryption_keys: Vec::new(),
         origin: EventOrigin::DirectlyCreated,
     };
     db::insert_event(pool, &e, None).await.unwrap();
     e
+}
+
+fn account(id: &str) -> Tag {
+    Tag {
+        key: "account".to_string(),
+        value: Some(id.to_string()),
+    }
 }
 
 #[test]
@@ -602,5 +618,86 @@ fn a_scheduled_fire_does_not_change_the_registrations_stamp() {
         .unwrap();
         let reregistered = db::events_table_identity(&pool, &bc.name).await.unwrap();
         assert_ne!(after.registrations, reregistered.registrations);
+    });
+}
+
+/// docs/architecture.md §187 (Codeberg #50): a tag read returns only the
+/// matching events, and says it is complete through the window's highest
+/// sequence - matching or not - which is where a command's re-check under
+/// the lock starts (§178).
+#[test]
+fn a_tag_read_serves_the_matching_events_complete_through_the_whole_window() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let a1 = insert_tagged_event_bypassing_cache(&pool, &bc, &et, vec![account("a")]).await;
+        insert_tagged_event_bypassing_cache(&pool, &bc, &et, vec![account("b")]).await;
+        let a2 =
+            insert_tagged_event_bypassing_cache(&pool, &bc, &et, vec![account("b"), account("a")])
+                .await;
+        let last = insert_event_bypassing_cache(&pool, &bc, &et).await;
+
+        let cache = EventCache::new(1000);
+        cache.warm(&pool, &bc.name).await.unwrap();
+        let (events, covered_through) = cache
+            .try_events_matching_tags(&pool, &bc.name, &[account("a")])
+            .await
+            .unwrap()
+            .expect("the window holds the whole history");
+        assert_eq!(
+            events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![a1.sequence, a2.sequence]
+        );
+        assert_eq!(covered_through, last.sequence);
+
+        let (events, covered_through) = cache
+            .try_events_matching_tags(&pool, &bc.name, &[account("nobody")])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(covered_through, last.sequence);
+    });
+}
+
+/// docs/architecture.md §187 (Codeberg #50): once a window has evicted
+/// the first event, a tag read - which needs the whole history - misses
+/// without the freshen round trip it used to pay first. Shown with a pool
+/// that is closed by then: the tag read still misses cleanly, while a
+/// read the window could serve has to reach the database and fails.
+#[test]
+fn a_tag_read_past_the_windows_first_event_misses_without_a_round_trip() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        for _ in 0..5 {
+            insert_tagged_event_bypassing_cache(&pool, &bc, &et, vec![account("a")]).await;
+        }
+        let own_pool = db::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let cache = EventCache::new(3);
+        cache.warm(&own_pool, &bc.name).await.unwrap();
+        own_pool.close().await;
+
+        assert_eq!(
+            cache
+                .try_events_matching_tags(&own_pool, &bc.name, &[account("a")])
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(cache
+            .try_events_after(&own_pool, &bc.name, 3)
+            .await
+            .is_err());
     });
 }

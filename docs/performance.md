@@ -62,6 +62,12 @@ What the profile says:
   Now it only runs when something was committed since the read, and covers
   just that: 0 with one caller, 0.2-1 ms under concurrency. What remains is
   `persist` - per-command savepoint, command and event inserts, ~0.5-0.8 ms.
+- Before the lock, a bounded context with more events than the event cache
+  holds (1000 by default) used to freshen the cache on every command, only
+  to miss and read Postgres anyway: 0.5-7 ms per command, growing with
+  callers. It now goes straight to Postgres, which raised spread
+  throughput by roughly a quarter in one back-to-back run
+  (docs/architecture.md §187). The table above predates that.
 - **Hot** is bounded by the account's history, which every command carries
   into the lock and folds: `decide` takes ~1 ms even with nothing new to
   re-check, and the consistency boundary is computed over the same history

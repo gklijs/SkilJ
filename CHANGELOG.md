@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A command's DCB pre-read is cheaper in a bounded context with more
+  events than the event cache holds (1000 by default): once the cache's
+  window no longer reaches back to the first event, the pre-read goes
+  straight to Postgres instead of first freshening a window it can't be
+  served from - one database round trip less per command. When the
+  window does hold the whole history, only the matching events are
+  copied out of it, not all of them (docs/architecture.md §187, Codeberg
+  issue #50).
+
 - Async projection catch-up folds up to 100 events per transaction
   instead of one, and reads and writes each projection's keys once per
   chunk instead of once per event: 25-50x faster in the new
