@@ -27,12 +27,12 @@ async fn each_background_loop_records_the_tick_duration_histogram() {
     let pool: Pool = match db::connect(&database_url).await {
         Ok(pool) => pool,
         Err(e) => {
-            eprintln!("skipping: connecting failed: {e}");
+            eprintln!("skipping: connecting to the test database failed: {e}");
             return;
         }
     };
     if let Err(e) = db::migrate(&pool).await {
-        eprintln!("skipping: migrating failed: {e}");
+        eprintln!("skipping: migrating the test database failed: {e}");
         return;
     }
 

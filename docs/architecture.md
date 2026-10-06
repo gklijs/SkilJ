@@ -11182,3 +11182,10 @@ An owner tag sets a key's `owner` from the last event that carried one; a key no
 **Not changed:**
 - The partitioned path still reads and writes each key once per event, inside its one transaction per partition. Batching those reads and writes would help it the same way.
 - `fold_history_into_new_sync_projection` still commits once per event. It runs once per registration.
+
+<a id="what-the-tests-cover"></a>
+## 183. What the test suite does and doesn't verify
+
+Codeberg issue #44. `CONTRIBUTING.md` ("What the tests do and don't verify") now sorts the guarantees three ways: those that hold by construction (Postgres transactions and constraints), those that tests verify, and those nothing verifies. The main entry under "nothing" is SQL. Every statement is `AssertSqlSafe(format!(...))` because of per-bounded-context schemas, so nothing checks SQL at compile time. The Postgres suites, and §67's guard that makes sure they ran, are the only check.
+
+**A hole in that guard, found while writing it.** The guard matches `skipping:.*(postgres|database)`, case-insensitive. `skilj/tests/metrics_background_tasks.rs` and `skilj/tests/tracing_background_tasks.rs` printed `skipping: connecting failed: {e}` and `skipping: migrating failed: {e}`, so they matched only when sqlx's error text happened to contain "database". `error communicating with database` does. `pool timed out while waiting for an open connection` doesn't, so those two binaries could skip under a slow or overloaded server and CI would stay green. They now say "the test database", as the other binaries' notes have since §167. Every other Postgres skip note names the database or Postgres in its fixed text.

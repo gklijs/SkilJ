@@ -17,6 +17,8 @@ cargo test --workspace
 
 The CI pipeline (`scripts/ci-test.sh`, which runs `cargo test --workspace -- --nocapture`) additionally checks that no Postgres-backed tests silently skip. It runs against a `postgres` service container via `DATABASE_URL`, falling back to a Postgres inside the CI step's own container when that service doesn't answer (docs/architecture.md §166). `bash scripts/ci-test.sh` reproduces that setup and run by hand.
 
+CONTRIBUTING.md's "What the tests do and don't verify" lists which guarantees hold by construction, which the tests verify, and which nothing verifies (docs/architecture.md §183). In particular, no SQL is checked at compile time, so the Postgres suites are its only check.
+
 `skilj/tests/conformance.rs` compares what GraphQL and REST answer against the checked-in `skilj/tests/fixtures/conformance.transcript`, and against each other (docs/architecture.md §179). When a change to either surface is intended, re-record it with `SKILJ_RECORD_CONFORMANCE=1 cargo test -p skilj --test conformance` and review the diff; a deliberate difference between the surfaces goes in the test's `DIVERGENCES` catalogue with its reason.
 
 Some integration tests require external services:

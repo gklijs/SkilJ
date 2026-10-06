@@ -169,6 +169,75 @@ target` reclaims it unconditionally - it is pure build cache, never
 source or data, and the next `cargo build` regenerates whatever it
 needs, just slower for that one run.
 
+## What the tests do and don't verify
+
+A green `cargo test --workspace` doesn't vouch for every guarantee
+equally. Some guarantees hold whatever the tests do, some hold only as
+far as a test exercises them, and some aren't checked at all
+(docs/architecture.md §183).
+
+**By construction.** These hold even on code paths no test reaches.
+- A bounded context's sequence is gapless, and its events commit in
+  sequence order. Allocation is an `UPDATE` of the context's `sequence`
+  row inside the writing transaction. A rollback undoes it, and the row
+  lock is held until commit (§57, §89).
+- A command's DCB check, its command row, the events it triggers and its
+  idempotency key commit or roll back together. So does every position
+  skilj stores next to the events it describes: dedupe watermarks, read
+  cursors, `caught_up_to` (§10, §176).
+- The spec's uniqueness invariants (`Unique*NamePerContext`,
+  `UniqueActiveExternalSubject`, `UniqueActiveAccessPerRoleAndContext`,
+  `UniqueActiveEncryptionKeyPerSubject`, `UniqueReadCursorPerToken`) are
+  primary keys or unique indexes.
+
+**By tests.**
+- **All SQL**, through the Postgres-backed suites in `skilj-core`,
+  `skilj`, `skilj-demo` and `skilj-inspector`. In CI they run against a
+  real Postgres, and `scripts/ci-test.sh` fails the build if any of them
+  skipped (§67, §166).
+- **The GraphQL and REST surfaces**: `skilj/tests/`, and both checked
+  against one transcript in `skilj/tests/conformance.rs` (§179).
+- **Several instances on one database**: `skilj/tests/cross_instance*.rs`.
+  These run two `Skilj` instances in one test process, with real
+  `LISTEN`/`NOTIFY` between them.
+- **Failover**: `skilj-test-support`'s `FailoverServer`, a real primary
+  and standby, used by `skilj/tests/event_fetch_rest.rs` (§176).
+- **Upgrading from v0.0.1**: a checked-in schema fixture in
+  `skilj/tests/startup_bounded_contexts.rs` (§159).
+- **Known races**: a targeted test each, often using a trigger to force
+  the interleaving. There is one property test,
+  `UniqueReadCursorPerToken` in `skilj-core/tests/event_fetch_surface.rs`.
+- **The template**: `scripts/check-template.sh` generates it and builds
+  it, but doesn't run it.
+
+**By nothing.**
+- **SQL at compile time.** No `sqlx::query!`. Every statement is
+  `AssertSqlSafe(format!(...))` (over 300 of them), because table names
+  depend on each bounded context's schema and the macros need fixed
+  ones. A wrong column name or type compiles, and fails only when the
+  statement runs. The Postgres suites, and the skip guard that makes
+  sure they actually ran, are the only check on SQL. Nothing measures
+  coverage either, so no one knows which statements no test reaches.
+- **The broker bridges in CI.** The Kafka, AMQP, NATS and Temporal tests
+  need Docker. The CI image has none, so they skip on every run, and the
+  skip guard ignores their notes on purpose. Run them by hand (above)
+  before merging a bridge change.
+- **Postgres versions.** CI runs `postgres:17-alpine`. Locally you get
+  whatever `DATABASE_URL` points at, or the embedded fallback. Nothing
+  runs the suite against several major versions.
+- **Performance.** The benchmarks (`command_throughput`,
+  `inbound_throughput`, `projection_catch_up_throughput`) are
+  `#[ignore]`d. A throughput regression fails nothing.
+- **Mixed versions on one database.** Upgrading is tested. Two skilj
+  versions running side by side during a rolling deploy are not; §164
+  records one known gap.
+- **Spec against code.** No test is generated from `specs/skilj.allium`.
+  Their alignment is checked by periodic drift audits.
+- **Interleavings in general.** Races someone thought of have tests.
+  Nothing explores interleavings systematically (no `loom`, no model
+  checking), and nothing tests separate processes or a network partition
+  between an instance and its database.
+
 ## Where things live
 
 - [`specs/skilj.allium`](specs/skilj.allium) is the behavioural

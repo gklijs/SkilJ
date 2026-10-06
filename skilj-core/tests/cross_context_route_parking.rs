@@ -363,6 +363,19 @@ async fn insert_order_shipped(
     seq
 }
 
+/// As if the route's backoff had passed: its blocked occurrence is due
+/// for a retry on the next tick.
+async fn make_route_retry_due(pool: &Pool, source_bc: &BoundedContext) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE \"bc_{}\".cross_context_route_cursors \
+         SET retry_next_attempt_at = now() - interval '1 second'",
+        source_bc.name
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// A persistently-failing target submission parks after `RetryPolicy`
 /// exhausts (rather than blocking the route's cursor forever), the
 /// blocked occurrence is genuinely throttled by backoff in between (not
@@ -400,10 +413,15 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
         let snapshot_dispatcher = NoopSnapshotDispatcher;
         let broadcaster = EventBroadcaster::new(16);
         let event_cache = EventCache::new(1000);
+        // A backoff no tick can outlast, however slow the machine: the
+        // test moves `retry_next_attempt_at` into the past itself
+        // (`make_route_retry_due`) when it wants the retry to be due. A
+        // 30ms backoff and a 40ms sleep flaked under load, when the
+        // "immediate" second tick ran after the backoff had passed.
         let retry_policy = skilj_retry::RetryPolicy::bounded(
-            Duration::from_millis(30),
+            Duration::from_secs(3600),
             1.0,
-            Duration::from_millis(30),
+            Duration::from_secs(3600),
             2,
         );
 
@@ -458,7 +476,7 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
             "backoff must throttle retries, not re-attempt on every tick"
         );
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        make_route_retry_due(&pool, &shipping_bc).await;
 
         // Tick 3: backoff has elapsed - dispatch() fails again (call
         // 2/2), which exhausts the policy (max_attempts: 2). The
@@ -606,7 +624,7 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
         )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        make_route_retry_due(&pool, &shipping_bc).await;
         db::catch_up_cross_context_route(
             &pool,
             &route_info,
@@ -1111,14 +1129,7 @@ fn a_route_an_instance_cannot_deliver_waits_for_one_that_can() {
                 .unwrap()
                 .is_empty());
             // As if `ANOTHER_INSTANCE_RETRY_DELAY` had passed.
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE \"bc_{}\".cross_context_route_cursors \
-                 SET retry_next_attempt_at = now() - interval '1 second'",
-                shipping_bc.name
-            )))
-            .execute(&pool)
-            .await
-            .unwrap();
+            make_route_retry_due(&pool, &shipping_bc).await;
         }
         assert_eq!(
             db::latest_sequence(&pool, &inventory_bc.name)
