@@ -58,9 +58,16 @@
 //! partial merge (see the note above `rule ProcessCommand`'s own call
 //! site in db/mod.rs for why a partial, tag-scoped completion was
 //! considered and deliberately not built).
+//!
+//! **Declarations are served current**: an event holds a copy of its
+//! type, and a type's declarations (`private_fields`, `owner_tag_key`)
+//! apply to its whole history the moment they change. So every event
+//! leaves a window with its bounded context's current registrations,
+//! reloaded whenever `freshen`'s stamp of them changes - see
+//! `Registrations` (docs/architecture.md §180).
 
 use crate::db::Pool;
-use crate::event_store::Event;
+use crate::event_store::{CommandType, Event, EventOrigin, EventType};
 use crate::shared::Tag;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -78,9 +85,59 @@ struct ContextWindow {
     /// table is the same but its log may end before events this window
     /// holds, and later sequences are reused for different events.
     table: Option<crate::db::TableIdentity>,
+    /// The bounded context's registrations as of `stamp`, or `None` until
+    /// the next `freshen` loads them. Every event leaves this window with
+    /// these copies of its type rather than the one it came in with
+    /// (docs/architecture.md §180).
+    registrations: Option<Registrations>,
+}
+
+/// The current `EventType`s and `CommandType`s of one bounded context. A
+/// declaration like `private_fields` or `owner_tag_key` applies to a
+/// type's whole history the moment it changes, but an event holds a copy
+/// of its type from when it was read or committed - so a window that kept
+/// handing those copies out rendered and scoped its events by an old
+/// registration until they were evicted, while the same read served from
+/// Postgres got the new one (docs/architecture.md §180).
+struct Registrations {
+    stamp: crate::db::RegistrationsStamp,
+    event_types: HashMap<String, EventType>,
+    command_types: HashMap<String, CommandType>,
+}
+
+impl Registrations {
+    /// `event` with its own type, and its originating command's, replaced
+    /// by the current registration. A name not registered here (a command
+    /// from another bounded context) keeps the copy it has.
+    fn current(&self, event: &Event) -> Event {
+        let mut event = event.clone();
+        if let Some(et) = self.event_types.get(&event.event_type.name) {
+            event.event_type = et.clone();
+        }
+        if let EventOrigin::CommandTriggered { command } = &mut event.origin {
+            if command
+                .command_type
+                .bounded_context
+                .same_as(&event.bounded_context)
+            {
+                if let Some(ct) = self.command_types.get(&command.command_type.name) {
+                    command.command_type = ct.clone();
+                }
+            }
+        }
+        event
+    }
 }
 
 impl ContextWindow {
+    /// How `event` is served out of this window - see [`Registrations`].
+    fn serve(&self, event: &Event) -> Event {
+        match &self.registrations {
+            Some(r) => r.current(event),
+            None => event.clone(),
+        }
+    }
+
     fn highest_known_sequence(&self) -> Option<i64> {
         self.events.back().map(|e| e.sequence)
     }
@@ -173,8 +230,53 @@ impl EventCache {
         if self.is_disabled() {
             return Ok(());
         }
-        let (table, _) = crate::db::events_table_identity(pool, bounded_context).await?;
-        self.refill(pool, bounded_context, table).await
+        let state = crate::db::events_table_identity(pool, bounded_context).await?;
+        self.refill(pool, bounded_context, state.table).await?;
+        self.refresh_registrations(pool, bounded_context, state.registrations)
+            .await
+    }
+
+    /// Loads `bounded_context`'s registrations into its window unless the
+    /// window already holds them as of `stamp`. `stamp` is read before
+    /// the registrations, so a re-registration racing this leaves a window
+    /// stamped older than what it holds, which the next `freshen` reloads
+    /// - never one stamped current while holding an old registration.
+    async fn refresh_registrations(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        stamp: crate::db::RegistrationsStamp,
+    ) -> crate::error::Result<()> {
+        let current = {
+            let contexts = self.contexts.read().await;
+            match contexts.get(bounded_context) {
+                Some(w) => w.registrations.as_ref().is_some_and(|r| r.stamp == stamp),
+                // Nothing to serve, so nothing to refresh.
+                None => true,
+            }
+        };
+        if current {
+            return Ok(());
+        }
+        let event_types =
+            crate::db::list_event_types_for_bounded_context(pool, bounded_context).await?;
+        let command_types =
+            crate::db::list_command_types_for_bounded_context(pool, bounded_context).await?;
+        let mut contexts = self.contexts.write().await;
+        if let Some(window) = contexts.get_mut(bounded_context) {
+            window.registrations = Some(Registrations {
+                stamp,
+                event_types: event_types
+                    .into_iter()
+                    .map(|et| (et.name.clone(), et))
+                    .collect(),
+                command_types: command_types
+                    .into_iter()
+                    .map(|ct| (ct.name.clone(), ct))
+                    .collect(),
+            });
+        }
+        Ok(())
     }
 
     /// Replaces `bounded_context`'s window with its most recent `capacity`
@@ -196,6 +298,7 @@ impl EventCache {
             ContextWindow {
                 events: recent.into(),
                 table: Some(table),
+                registrations: None,
             },
         );
         Ok(())
@@ -219,6 +322,7 @@ impl EventCache {
             .or_insert_with(|| ContextWindow {
                 events: VecDeque::new(),
                 table: None,
+                registrations: None,
             });
         window.append_committed(event.clone(), self.capacity);
     }
@@ -227,6 +331,21 @@ impl EventCache {
     /// this module's own doc comment on why every call does this, not
     /// just a cold one) and returns whether it now covers `sequence`.
     async fn freshen(&self, pool: &Pool, bounded_context: &str) -> crate::error::Result<()> {
+        let state = crate::db::events_table_identity(pool, bounded_context).await?;
+        self.freshen_events(pool, bounded_context, state.table, state.latest)
+            .await?;
+        self.refresh_registrations(pool, bounded_context, state.registrations)
+            .await
+    }
+
+    /// `freshen`'s events half: brings the window up to `latest`.
+    async fn freshen_events(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        table: crate::db::TableIdentity,
+        latest: Option<i64>,
+    ) -> crate::error::Result<()> {
         let (known, known_table) = {
             let contexts = self.contexts.read().await;
             match contexts.get(bounded_context) {
@@ -234,7 +353,6 @@ impl EventCache {
                 None => (None, None),
             }
         };
-        let (table, latest) = crate::db::events_table_identity(pool, bounded_context).await?;
         // docs/architecture.md §95: a window from another incarnation of
         // this name - or one only `append` has started, which can't vouch
         // for its table - is replaced wholesale.
@@ -267,6 +385,7 @@ impl EventCache {
             .or_insert_with(|| ContextWindow {
                 events: VecDeque::new(),
                 table: Some(table),
+                registrations: None,
             });
         for event in delta {
             window.push_from_database(event, self.capacity);
@@ -305,7 +424,7 @@ impl EventCache {
                     .events
                     .iter()
                     .filter(|e| e.sequence > after_sequence)
-                    .cloned()
+                    .map(|e| window.serve(e))
                     .collect(),
             )),
             Some(_) => Ok(None), // after_sequence reaches further back than this window can prove
@@ -374,6 +493,6 @@ impl EventCache {
             .events
             .iter()
             .find(|e| e.sequence == sequence)
-            .cloned())
+            .map(|e| window.serve(e)))
     }
 }

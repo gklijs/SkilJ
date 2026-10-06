@@ -17,7 +17,7 @@ use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{
     BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType,
 };
-use skilj_core::shared::{generate_token_id, Metadata};
+use skilj_core::shared::{generate_token_id, Metadata, PrivateField, PrivateFieldKind};
 
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
 
@@ -489,5 +489,118 @@ fn a_recreated_bounded_context_never_sees_its_predecessors_cached_events() {
             expected.push((e.sequence, e.metadata.created_at));
         }
         assert_eq!(served(cache).await, expected, "past the old window");
+    });
+}
+
+/// docs/architecture.md §180 (Codeberg #67): `private_fields` is a live
+/// declaration - declaring a field private hides it across the type's
+/// whole history at once. A cached event used to keep the copy of its
+/// type it was cached with, so after a re-registration (here by another
+/// instance, which this cache never hears of) REST still served the field
+/// in the clear from the cache, while the same read from Postgres redacted
+/// it.
+#[test]
+fn a_re_registration_applies_to_events_already_cached() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let earlier = insert_event_bypassing_cache(&pool, &bc, &et).await;
+        let seq = db::next_sequence(&pool, &bc.name).await.unwrap();
+        let event = Event {
+            payload: r#"{"note":"for my eyes only"}"#.to_string(),
+            sequence: seq,
+            ..earlier
+        };
+        db::insert_event(&pool, &event, None).await.unwrap();
+
+        let cache = EventCache::new(1000);
+        cache.warm(&pool, &bc.name).await.unwrap();
+        assert!(cache
+            .try_events_after(&pool, &bc.name, -1)
+            .await
+            .unwrap()
+            .unwrap()
+            .iter()
+            .all(|e| e.event_type.private_fields.is_empty()));
+
+        let private = EventType {
+            schema: r#"{"properties":{"note":{"type":"string"}}}"#.to_string(),
+            private_fields: vec![PrivateField {
+                field: "note".to_string(),
+                kind: PrivateFieldKind::Own,
+                team: None,
+                addressee_field: None,
+            }],
+            ..et.clone()
+        };
+        db::upsert_event_type(&pool, &private).await.unwrap();
+
+        let served = cache
+            .try_events_after(&pool, &bc.name, -1)
+            .await
+            .unwrap()
+            .expect("still covered");
+        let served = served.iter().find(|e| e.sequence == seq).unwrap();
+        assert_eq!(served.event_type.private_fields, private.private_fields);
+        assert_eq!(
+            skilj_core::event_store::redact_private_fields(served).payload,
+            r#"{"note":null}"#
+        );
+        let inspected = cache
+            .try_event_by_sequence(&pool, &bc.name, seq)
+            .await
+            .unwrap()
+            .expect("cached");
+        assert_eq!(inspected.event_type.private_fields, private.private_fields);
+    });
+}
+
+/// The registrations stamp the cache compares on every read leaves out
+/// what a scheduled fire moves, so a type firing every second doesn't
+/// make the cache reload its registrations on every read (§180).
+#[test]
+fn a_scheduled_fire_does_not_change_the_registrations_stamp() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let scheduled = EventType {
+            system_triggered_allowed: true,
+            system_triggered_schedule: Some("0 * * * * *".to_string()),
+            missed_occurrence_policy: Some(skilj_core::event_store::MissedOccurrencePolicy::Skip),
+            schedule_position: Some(test_now() - chrono::Duration::hours(1)),
+            ..et
+        };
+        db::upsert_event_type(&pool, &scheduled).await.unwrap();
+        let before = db::events_table_identity(&pool, &bc.name).await.unwrap();
+
+        let advanced = db::skip_missed_occurrences_for_event_type(
+            &pool,
+            &bc.name,
+            &scheduled.name,
+            test_now(),
+        )
+        .await
+        .unwrap();
+        assert!(advanced.is_some(), "the position must actually have moved");
+        let after = db::events_table_identity(&pool, &bc.name).await.unwrap();
+        assert_eq!(before.registrations, after.registrations);
+
+        db::upsert_event_type(
+            &pool,
+            &EventType {
+                event_read_allowed: false,
+                ..scheduled
+            },
+        )
+        .await
+        .unwrap();
+        let reregistered = db::events_table_identity(&pool, &bc.name).await.unwrap();
+        assert_ne!(after.registrations, reregistered.registrations);
     });
 }

@@ -5696,26 +5696,57 @@ pub async fn next_sequence_batch<'e>(
 /// §176): a promoted standby keeps the table's OID, but its log can end
 /// before the old primary's did, and the sequences past that end are
 /// reused for different events.
+///
+/// The same round trip also stamps the bounded context's type
+/// registrations ([`RegistrationsStamp`]), so the event cache notices a
+/// re-registration - by any instance - before serving events that carry
+/// copies of the old one (docs/architecture.md §180).
 pub async fn events_table_identity(
     pool: &Pool,
     bounded_context: &str,
-) -> crate::error::Result<(TableIdentity, Option<i64>)> {
+) -> crate::error::Result<EventsTableState> {
     let schema = schema_ident(bounded_context);
-    let (oid, max, epoch): (i64, Option<i64>, String) =
+    let (oid, max, epoch, registrations): (i64, Option<i64>, String, String) =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT '{schema}.events'::regclass::oid::bigint, \
-                    (SELECT MAX(sequence) FROM {schema}.events), {EPOCH_SQL}"
+                    (SELECT MAX(sequence) FROM {schema}.events), {EPOCH_SQL}, \
+                    (SELECT md5(coalesce(string_agg((to_jsonb(t) - 'schema' \
+                        - 'schedule_position' - 'last_fired_at')::text, ',' ORDER BY t.name), '')) \
+                     FROM {schema}.event_types t) \
+                    || (SELECT md5(coalesce(string_agg((to_jsonb(c) - 'schema')::text, ',' \
+                        ORDER BY c.name), '')) FROM {schema}.command_types c)"
         )))
         .fetch_one(pool)
         .await?;
-    Ok((
-        TableIdentity {
+    Ok(EventsTableState {
+        table: TableIdentity {
             oid,
             epoch: Epoch(epoch),
         },
-        max,
-    ))
+        latest: max,
+        registrations: RegistrationsStamp(registrations),
+    })
 }
+
+/// What [`events_table_identity`] reads in its one round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventsTableState {
+    pub table: TableIdentity,
+    /// [`latest_sequence`].
+    pub latest: Option<i64>,
+    pub registrations: RegistrationsStamp,
+}
+
+/// A fingerprint of a bounded context's `EventType`/`CommandType`
+/// registrations as they stand: it changes whenever a declaration does
+/// (`private_fields`, `owner_tag_key`, `tag_mappings`, ...) and only then.
+/// A schema change shows through `schema_version`, so the schema text
+/// itself isn't hashed; a scheduled fire moves only `schedule_position`/
+/// `last_fired_at`, which are left out so firing doesn't look like a
+/// re-registration (docs/architecture.md §180). Compared for equality,
+/// never parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationsStamp(String);
 
 /// Which `events` table, on which history, a set of events came from -
 /// see [`events_table_identity`].
