@@ -40,7 +40,7 @@ use crate::encryption::{self, DataKey, EncryptionMasterKey};
 use crate::event_store::{
     AckMode, BoundedContext, BoundedContextStatus, Command, CommandType, CursorUpdate,
     EncryptionKey, EncryptionKeyStatus, Event, EventOrigin, EventType, MissedOccurrencePolicy,
-    ReadCursor,
+    ReadCursor, WouldBeEvent,
 };
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
 use crate::shared::{Metadata, PrivateField, SensitiveField, Tag, TagMapping};
@@ -8987,6 +8987,121 @@ pub async fn resolve_command_submission(
         matching_events,
         decision,
         snapshot_context,
+    })
+}
+
+/// What [`dry_run_command`] found: `decide()`'s answer, and the matching
+/// events it decided from.
+#[derive(Debug)]
+pub struct CommandDryRun {
+    pub decision: DryRunDecision,
+    /// Unrendered and unscoped, every event `decide()` saw. A surface that
+    /// shows them narrows and renders them first, as `submitCommand` does
+    /// for a rejection's (`event_store::visible_matching_events`).
+    pub matching_events: Vec<Event>,
+}
+
+#[derive(Debug)]
+pub enum DryRunDecision {
+    /// Unrendered: plaintext, as `decide()` emitted them. See
+    /// `event_store::render_would_be_event`.
+    Accepted {
+        events: Vec<WouldBeEvent>,
+    },
+    Rejected {
+        reason: String,
+        kind: String,
+    },
+}
+
+/// `rule DryRunCommand`/`rule DryRunTriggerCommand` past authorisation
+/// (Codeberg issue #47): what a submission of `payload` would decide
+/// right now. It is [`resolve_command_submission`] - the same snapshot
+/// resolution, the same tag-indexed read, the same `decide()` - and
+/// nothing after it. No lock is taken, nothing is written, no sequence
+/// is used up, no encryption key is provisioned, and no idempotency key
+/// is looked up or recorded. Nor does it re-check under a lock, so a
+/// commit racing it can make the real submission decide differently.
+///
+/// An accepted decision fails where the real submission would before
+/// writing: with `UnregisteredEventType` for an event type this bounded
+/// context hasn't registered, and with `MasterKeyNotConfigured` when the
+/// command or a would-be event has a sensitive field to encrypt and no
+/// `encryption_master_key` is configured. The key itself is never
+/// looked up or provisioned. `client_id` is stamped on each would-be
+/// event, as
+/// `process_command` stamps it: it is what an `Own` private field's
+/// default reader is decided by.
+#[allow(clippy::too_many_arguments)]
+pub async fn dry_run_command(
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    event_cache: &crate::event_cache::EventCache,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<CommandDryRun> {
+    let resolved = resolve_command_submission(
+        pool,
+        dispatcher,
+        snapshot_dispatcher,
+        event_cache,
+        command_type,
+        payload,
+    )
+    .await?;
+    let decision = match resolved.decision {
+        crate::shared::CommandDecision::Rejected { reason, kind } => {
+            DryRunDecision::Rejected { reason, kind }
+        }
+        crate::shared::CommandDecision::Accepted { events: specs } => {
+            let mut event_types: std::collections::HashMap<String, EventType> =
+                std::collections::HashMap::new();
+            let mut events = Vec::with_capacity(specs.len());
+            for spec in specs {
+                if !event_types.contains_key(&spec.event_type) {
+                    let event_type =
+                        get_event_type(pool, &command_type.bounded_context.name, &spec.event_type)
+                            .await?
+                            .ok_or_else(|| {
+                                crate::event_store::Error::UnregisteredEventType(
+                                    spec.event_type.clone(),
+                                )
+                            })?;
+                    event_types.insert(spec.event_type.clone(), event_type);
+                }
+                let event_type = event_types[&spec.event_type].clone();
+                let payload = spec.payload.to_string();
+                events.push(WouldBeEvent {
+                    tags: crate::event_store::derive_tags(&event_type.tag_mappings, &payload),
+                    event_type,
+                    payload,
+                    client_id: client_id.to_string(),
+                });
+            }
+            let needs_a_key = !crate::event_store::sensitive_field_subjects(
+                &command_type.sensitive_fields,
+                payload,
+            )
+            .is_empty()
+                || events.iter().any(|e| {
+                    !crate::event_store::sensitive_field_subjects(
+                        &e.event_type.sensitive_fields,
+                        &e.payload,
+                    )
+                    .is_empty()
+                });
+            if needs_a_key && encryption_master_key.is_none() {
+                return Err(encryption::Error::MasterKeyNotConfigured.into());
+            }
+            DryRunDecision::Accepted { events }
+        }
+    };
+    Ok(CommandDryRun {
+        decision,
+        matching_events: resolved.matching_events,
     })
 }
 

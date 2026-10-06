@@ -55,6 +55,14 @@ without the other. A rejection is ordinary typed data, not thrown or
 turned into a GraphQL/HTTP error - the caller sees `accepted: false` and
 these two fields on the mutation's own result.
 
+To see what `decide()` would say without committing anything, an
+Admin-level caller can run the `dryRunCommand` GraphQL query: the
+decision, the events it would append (rendered under the usual
+sensitive/private-field rules), and the matching events it decided
+from. A `CommandToken` holder gets only the outcome, from `POST
+/v1/commands/dry-run`. Neither writes a command, an event or an
+idempotency record.
+
 Real example - `skilj-demo/src/banking.rs`'s `WithdrawMoney`:
 
 ```rust

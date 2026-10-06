@@ -17,6 +17,12 @@ submit_payload_missing_field	graphql	200	{"error":"payload_does_not_match_schema
 submit_payload_missing_field	rest	400	{"error":"payload_does_not_match_schema"}
 submit_without_credential	graphql	200	{"error":"unauthenticated"}
 submit_without_credential	rest	401	{"error":"missing_credential"}
+dry_run_accepted	graphql	200	{"accepted":true}
+dry_run_accepted	rest	200	{"accepted":true}
+dry_run_rejected	graphql	200	{"accepted":false,"rejectionKind":"over_limit","rejectionReason":"over the deposit limit"}
+dry_run_rejected	rest	200	{"accepted":false,"rejectionKind":"over_limit","rejectionReason":"over the deposit limit"}
+dry_run_payload_off_schema	graphql	200	{"error":"payload_does_not_match_schema"}
+dry_run_payload_off_schema	rest	400	{"error":"payload_does_not_match_schema"}
 read_all	graphql	200	{"events":[{"payload":{"amount":20},"sequence":0},{"payload":{"amount":30},"sequence":1}]}
 read_all	rest	200	{"events":[{"payload":{"amount":20},"sequence":0},{"payload":{"amount":30},"sequence":1}]}
 read_after_first	graphql	200	{"events":[{"payload":{"amount":30},"sequence":1}]}
@@ -29,5 +35,7 @@ read_without_credential	graphql	200	{"error":"unauthenticated"}
 read_without_credential	rest	401	{"error":"missing_credential"}
 submit_archived	graphql	200	{"error":"bounded_context_archived"}
 submit_archived	rest	409	{"error":"bounded_context_archived"}
+dry_run_archived	graphql	200	{"error":"bounded_context_archived"}
+dry_run_archived	rest	409	{"error":"bounded_context_archived"}
 read_archived	graphql	200	{"events":[{"payload":{"amount":20},"sequence":0},{"payload":{"amount":30},"sequence":1}]}
 read_archived	rest	200	{"events":[{"payload":{"amount":20},"sequence":0},{"payload":{"amount":30},"sequence":1}]}

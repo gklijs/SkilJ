@@ -2219,6 +2219,71 @@ pub fn render_command(
     })
 }
 
+/// An event a dry-run's `decide()` would emit (see `rule DryRunCommand`):
+/// what `process_command` would build from one accepted `EventSpec`,
+/// minus everything only a real submission has - a sequence, a
+/// `Command` origin, encryption. `payload` is the spec's own, in
+/// plaintext; render it with [`render_would_be_event`] before showing it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WouldBeEvent {
+    pub event_type: EventType,
+    pub payload: String,
+    pub tags: Vec<Tag>,
+    /// The submitter's, as `process_command` would stamp it.
+    pub client_id: String,
+}
+
+impl PrivateFieldRecord for WouldBeEvent {
+    fn private_fields(&self) -> &[PrivateField] {
+        &self.event_type.private_fields
+    }
+    fn client_id(&self) -> &str {
+        &self.client_id
+    }
+    fn payload(&self) -> &str {
+        &self.payload
+    }
+}
+
+/// `render_would_be_event(spec, access_mapping)` in the spec - what
+/// [`render_event`] does for a stored event, for one that doesn't exist.
+/// Nothing in it was encrypted, so a sensitive field the caller isn't
+/// granted (`sensitive_field_is_granted`) is set to `null` rather than
+/// left as ciphertext, and one it is granted is left as `decide()` wrote
+/// it. Private fields are redacted as `render_event` redacts them, except
+/// that no per-record `PrivateFieldGrant` can match: the event has no
+/// sequence for one to name.
+pub fn render_would_be_event(
+    event: &WouldBeEvent,
+    access_mapping: &RoleAccessMapping,
+    grants: &[PrivateFieldGrant],
+) -> String {
+    let sensitive_fields = &event.event_type.sensitive_fields;
+    let payload = if sensitive_fields.is_empty() {
+        event.payload.clone()
+    } else {
+        let mut parsed: serde_json::Value = serde_json::from_str(&event.payload)
+            .expect("render_would_be_event: a decided event's payload is serialized JSON");
+        for sf in sensitive_fields {
+            let granted = payload_field_value(&parsed, &sf.subject_field)
+                .and_then(json_scalar_to_string)
+                .is_some_and(|subject| sensitive_field_is_granted(access_mapping, &subject));
+            if granted {
+                continue;
+            }
+            if let Some(slot) = payload_field_value_mut(&mut parsed, &sf.field) {
+                *slot = serde_json::Value::Null;
+            }
+        }
+        serde_json::to_string(&parsed).expect("re-serialising a parsed JSON Value is infallible")
+    };
+    let record = WouldBeEvent {
+        payload,
+        ..event.clone()
+    };
+    redact_unentitled_private_fields(&record, &record.payload, access_mapping, grants, |_| false)
+}
+
 /// The redaction pass `render_event`/`render_command` both run after
 /// decrypting sensitive fields - a plain visibility rule, not a
 /// cryptographic one, with no `EncryptionKey`/`resolve_data_key`/
@@ -4223,6 +4288,25 @@ pub fn authorise_command_submission(
         correlation_id,
         causation_id,
     })
+}
+
+/// See `rule DryRunCommand`. `authorise_command_submission`'s checks with
+/// the access level raised to admin, since a dry-run shows event content
+/// (the would-be events and the matching events). The returned
+/// `CommandAuthorised` carries no correlation or causation id: nothing is
+/// stored for either to label.
+pub fn authorise_command_dry_run(
+    access_mapping: &RoleAccessMapping,
+    command_type: &CommandType,
+    payload: String,
+) -> crate::error::Result<CommandAuthorised> {
+    if access_mapping.status != RoleStatus::Active {
+        return Err(crate::access_control::Error::GrantNotActive.into());
+    }
+    if access_mapping.level != AccessLevel::Admin {
+        return Err(crate::access_control::Error::InsufficientAccessLevel.into());
+    }
+    authorise_command_submission(access_mapping, command_type, payload, None, None)
 }
 
 /// See the `boundary`/`matching_events` `let`s above rule `ProcessCommand`.

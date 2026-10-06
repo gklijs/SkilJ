@@ -134,6 +134,12 @@ enum Op {
     SubmitWithoutCredential {
         payload: Value,
     },
+    /// `dryRunCommand` / `POST /v1/commands/dry-run` (§185): the outcome
+    /// both answer. GraphQL's would-be and matching events are Admin-only
+    /// extras, left out like `submitCommand`'s `matchingEvents`.
+    DryRun {
+        payload: Value,
+    },
     Read {
         after: Option<i64>,
     },
@@ -147,6 +153,9 @@ fn scenarios() -> Vec<(&'static str, Op)> {
     let submit = |amount: Value, idempotency_key| Op::Submit {
         payload: json!({ "amount": amount }),
         idempotency_key,
+    };
+    let dry_run = |amount: Value| Op::DryRun {
+        payload: json!({ "amount": amount }),
     };
     vec![
         ("submit_accepted", submit(json!(20), None)),
@@ -178,6 +187,10 @@ fn scenarios() -> Vec<(&'static str, Op)> {
                 payload: json!({ "amount": 1 }),
             },
         ),
+        // Before read_all, which then shows they persisted nothing.
+        ("dry_run_accepted", dry_run(json!(10))),
+        ("dry_run_rejected", dry_run(json!(5000))),
+        ("dry_run_payload_off_schema", dry_run(json!("lots"))),
         ("read_all", Op::Read { after: None }),
         ("read_after_first", Op::Read { after: Some(0) }),
         ("read_after_latest", Op::Read { after: Some(1) }),
@@ -185,6 +198,7 @@ fn scenarios() -> Vec<(&'static str, Op)> {
         ("read_without_credential", Op::ReadWithoutCredential),
         ("archive", Op::Archive),
         ("submit_archived", submit(json!(20), None)),
+        ("dry_run_archived", dry_run(json!(20))),
         ("read_archived", Op::Read { after: None }),
     ]
 }
@@ -526,6 +540,13 @@ const SUBMIT_COMMAND: &str = "\
         } \
     }";
 
+const DRY_RUN_COMMAND: &str = "\
+    query($bc: String!, $payload: String!) { \
+        dryRunCommand(boundedContext: $bc, commandTypeName: \"DepositMoney\", payload: $payload) { \
+            accepted rejectionReason rejectionKind \
+        } \
+    }";
+
 const QUERY_EVENTS: &str = "\
     query($bc: String!, $after: Int) { \
         queryEvents(boundedContext: $bc, eventTypes: [\"MoneyDeposited\"], afterSequence: $after) { \
@@ -599,6 +620,14 @@ async fn run(deployment: &Deployment, surface: Surface, op: &Op) -> Option<(u16,
         (Surface::Graphql, Op::SubmitWithoutCredential { payload }) => {
             graphql(SUBMIT_COMMAND, submit_variables(payload, None), false).await
         }
+        (Surface::Graphql, Op::DryRun { payload }) => {
+            graphql(
+                DRY_RUN_COMMAND,
+                json!({ "bc": deployment.bounded_context, "payload": payload.to_string() }),
+                true,
+            )
+            .await
+        }
         (Surface::Graphql, Op::Read { after }) => {
             graphql(QUERY_EVENTS, read_variables(*after), true).await
         }
@@ -635,6 +664,16 @@ async fn run(deployment: &Deployment, surface: Surface, op: &Op) -> Option<(u16,
             )
             .await
         }
+        (Surface::Rest, Op::DryRun { payload }) => {
+            send(
+                &deployment.rest,
+                "POST",
+                "/v1/commands/dry-run",
+                &[bearer(&deployment.command_credential)],
+                Some(json!({ "payload": payload })),
+            )
+            .await
+        }
         (Surface::Rest, Op::Read { after }) => {
             let headers = [bearer(&deployment.read_credential)];
             send(&deployment.rest, "GET", &read_uri(*after), &headers, None).await
@@ -655,12 +694,12 @@ fn outcome(surface: Surface, op: &Op, status: u16, body: &Value) -> Value {
             if let Some(errors) = body.get("errors") {
                 return json!({ "error": errors[0]["extensions"]["code"] });
             }
-            body["data"][if reading {
-                "queryEvents"
-            } else {
-                "submitCommand"
-            }]
-            .clone()
+            let field = match op {
+                Op::Read { .. } | Op::ReadWithoutCredential => "queryEvents",
+                Op::DryRun { .. } => "dryRunCommand",
+                _ => "submitCommand",
+            };
+            body["data"][field].clone()
         }
         Surface::Rest => {
             if !(200..300).contains(&status) {

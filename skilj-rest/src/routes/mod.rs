@@ -211,6 +211,7 @@ pub fn router(
         .route("/v1/events/consume", get(get_events_consume))
         .route("/v1/events/consume/ack", post(post_events_consume_ack))
         .route("/v1/commands/trigger", post(post_commands_trigger))
+        .route("/v1/commands/dry-run", post(post_commands_dry_run))
         .route("/v1/parked-deliveries", post(post_parked_deliveries))
         .layer(middleware::from_fn(trace_request))
         .with_state(AppState {
@@ -589,6 +590,24 @@ struct CommandTriggerRequest {
     // special-cased away.
     correlation_id: Option<String>,
     causation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CommandDryRunRequest {
+    payload: serde_json::Value,
+}
+
+/// `rule DryRunTriggerCommand`'s answer: what a trigger with this token
+/// would decide right now, and nothing it would show beyond that - no
+/// would-be events, no matching events (`DryRunRevealsOnlyTheOutcome`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandDryRunResponse {
+    accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejection_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejection_kind: Option<String>,
 }
 
 /// §7.3's `-> 200 { accepted: true, triggeredEventSequences: [...] }` /
@@ -1157,6 +1176,55 @@ async fn post_commands_trigger(
             rejection_kind: None,
             deduplicated: true,
             correlation_id: None,
+        },
+    }))
+}
+
+/// `DryRunTriggerCommand` (Codeberg issue #47): `post_commands_trigger`'s
+/// authorisation and `decide()`, and nothing after - no command, no
+/// event, no sequence, no encryption key, and no idempotency record, so
+/// it takes no `Idempotency-Key` and no correlation ids. The answer is
+/// only what a real trigger with this token would tell it: accepted, or
+/// rejected with a reason and kind. A `CommandToken` carries no access
+/// level, so the would-be events and the matching events stay on
+/// GraphQL's admin-only `dryRunCommand`.
+async fn post_commands_dry_run(
+    State(state): State<AppState>,
+    credential: BearerCredential,
+    Json(body): Json<CommandDryRunRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let token = resolve_token::<CommandToken>(&state, &credential).await?;
+    let payload = serde_json::to_string(&body.payload)
+        .expect("serde_json::Value serialization is infallible");
+    let authorised = event_store::authorise_command_trigger(&token, payload, None, None)?;
+    let span = tracing::Span::current();
+    span.record(
+        "bounded_context",
+        authorised.command_type.bounded_context.name.as_str(),
+    );
+    span.record("command_type", authorised.command_type.name.as_str());
+
+    let dry_run = db::dry_run_command(
+        &state.pool,
+        state.dispatcher.as_ref(),
+        state.snapshot_dispatcher.as_ref(),
+        &state.event_cache,
+        &authorised.command_type,
+        &authorised.payload,
+        &authorised.client_id,
+        state.encryption_master_key.as_ref(),
+    )
+    .await?;
+    Ok(Json(match dry_run.decision {
+        db::DryRunDecision::Accepted { .. } => CommandDryRunResponse {
+            accepted: true,
+            rejection_reason: None,
+            rejection_kind: None,
+        },
+        db::DryRunDecision::Rejected { reason, kind } => CommandDryRunResponse {
+            accepted: false,
+            rejection_reason: Some(reason),
+            rejection_kind: Some(kind),
         },
     }))
 }

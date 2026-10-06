@@ -3980,6 +3980,116 @@ rule ProcessCommand {
 -- require the bounded context to be active: archiving stops new commands,
 -- and reading the ones submitted before that is the point.
 
+rule DryRunCommand {
+    when: DryRunCommand(access_mapping, command_type, payload)
+    requires: access_mapping.status = active
+    requires: access_mapping.level = admin
+    requires: access_mapping.bounded_context = command_type.bounded_context
+    requires: command_type.bounded_context.status = active
+    requires: valid_payload(command_type.schema, payload)
+
+    -- The ownership check AuthoriseCommandSubmission makes, on the same
+    -- terms: a scoped grant may dry-run only commands for the owner it
+    -- names, since a dry-run reads what a submission would read.
+    let consistency_tags = derive_tags(command_type, payload)
+    requires:
+        tag_owner_scope_satisfied(
+            consistency_tags, command_type.owner_tag_key, access_mapping.scope)
+
+    -- Exactly what ProcessCommand would decide from, and the same decide().
+    let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
+    let matching_events =
+        Events where bounded_context = command_type.bounded_context
+            and sequence <= boundary
+            and consistency_tags.any(t => t in tags)
+    let decision = decide(command_type, payload, matching_events)
+
+    let shown = last_by_sequence(
+        filter(matching_events, e => event_owner_scope_satisfied(e, access_mapping.scope)),
+        config.max_events_per_read)
+
+    ensures:
+        CommandDryRun(
+            access_mapping: access_mapping,
+            command_type: command_type,
+            accepted: decision.accepted,
+            rejection_reason: decision.reason,
+            rejection_kind: decision.kind,
+            would_be_events: map(decision.events, spec =>
+                render_would_be_event(spec, access_mapping)),
+            matching_events: map(shown, e => render_event(e, access_mapping))
+        )
+
+    @guidance
+        -- A question about ProcessCommand, answered without running it:
+        -- what would decide() say about this command right now? Nothing is
+        -- created - no Command, no event, no sequence number taken, no
+        -- encryption key provisioned, no idempotency key looked up or
+        -- remembered - so a dry-run changes nothing a later submission
+        -- sees. "Right now" is all it promises: an event committed after
+        -- the dry-run can make the real submission decide differently, as
+        -- it can between any two submissions.
+        --
+        -- Admin level only, unlike SubmitCommand's write level: decide()
+        -- reads the matching history, so what it would emit can carry that
+        -- history's content (a balance, a status), and the matching events
+        -- themselves are full event content - the reasoning of
+        -- CommandSubmission's MatchingEventsRequiresAdminLevel, applied to
+        -- both. Matching events are shown on an acceptance as well as a
+        -- rejection, served as that guarantee serves them.
+        --
+        -- render_would_be_event(spec, access_mapping) renders an event that
+        -- does not exist, so nothing in it was ever encrypted. A sensitive
+        -- field the caller is granted (see the two-grant test in the
+        -- render_event note above rule DeliverToSubscriptions) is shown as
+        -- decide() emitted it; one it is not granted is null, where a
+        -- stored event would show ciphertext. A private field is redacted
+        -- unless this Role is entitled to it as the record's creator, its
+        -- addressee or a member of its team. No PrivateFieldGrant can name
+        -- an event that has no sequence yet, so only blanket grants apply.
+        --
+        -- An accepted decision naming an event type the bounded context
+        -- has not registered is refused, as ProcessCommand refuses it.
+}
+
+rule DryRunTriggerCommand {
+    when: DryRunTriggerCommand(token, command_type, payload)
+    requires: token.status = active
+    requires: token.command_type = command_type
+    requires: command_type.rest_trigger_allowed = true
+    requires: command_type.bounded_context.status = active
+    requires: valid_payload(command_type.schema, payload)
+
+    let consistency_tags = derive_tags(command_type, payload)
+    requires:
+        tag_owner_scope_satisfied(
+            consistency_tags, command_type.owner_tag_key, token.scope)
+
+    let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
+    let matching_events =
+        Events where bounded_context = command_type.bounded_context
+            and sequence <= boundary
+            and consistency_tags.any(t => t in tags)
+    let decision = decide(command_type, payload, matching_events)
+
+    ensures:
+        TriggerDryRun(
+            token: token,
+            accepted: decision.accepted,
+            rejection_reason: decision.reason,
+            rejection_kind: decision.kind
+        )
+
+    @guidance
+        -- DryRunCommand's REST counterpart, persisting nothing on the same
+        -- terms, but answering only what TriggerCommand itself would tell
+        -- this token: accepted or not, and a rejection's reason and kind. A
+        -- CommandToken carries no access level - it is a credential an
+        -- admin minted for one command type, not an admin - so neither the
+        -- would-be events nor the matching events are shown (see
+        -- CommandTrigger's TokenScopedToCommandType).
+}
+
 rule FetchCommands {
     when: FetchCommands(access_mapping, command_types, after?, before?, triggered_event?, after_command?)
     requires: access_mapping.status = active
@@ -7739,6 +7849,15 @@ surface CommandSubmission {
         SubmitCommand(
             access_mapping, command_type, payload, idempotency_key?,
             correlation_id?, causation_id?)
+        DryRunCommand(access_mapping, command_type, payload)
+
+    @guarantee DryRunPersistsNothing
+        -- DryRunCommand answers what decide() would say about a command
+        -- right now, and leaves no trace: no Command, no event, no
+        -- sequence number, no encryption key and no idempotency record.
+        -- It requires an admin-level grant, not the write level submission
+        -- needs, since what it shows - the would-be events and the
+        -- matching events - is event content (see rule DryRunCommand).
 
     @guarantee GrantScopedToBoundedContext
         -- A write-level grant only authorises submitting commands for
@@ -7872,6 +7991,13 @@ surface CommandTrigger {
         TriggerCommand(
             token, command_type, payload, idempotency_key?,
             correlation_id?, causation_id?)
+        DryRunTriggerCommand(token, command_type, payload)
+
+    @guarantee DryRunRevealsOnlyTheOutcome
+        -- DryRunTriggerCommand persists nothing, as DryRunCommand doesn't,
+        -- and tells the token no more than a real trigger would: accepted
+        -- or not, and a rejection's reason and kind (see rule
+        -- DryRunTriggerCommand).
 
     @guarantee TokenScopedToCommandType
         -- A token only authorises triggering the one CommandType it was

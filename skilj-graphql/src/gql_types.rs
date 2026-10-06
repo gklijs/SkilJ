@@ -945,6 +945,44 @@ pub fn submit_command_payload_object() -> Object {
     ))
 }
 
+/// `dryRunCommand`'s response (`rule DryRunCommand`, Codeberg issue #47):
+/// what `decide()` would say about a command right now. Admin-only, so
+/// unlike `SubmitCommandPayload` it always carries the matching events,
+/// accepted or not.
+pub struct DryRunCommandResult {
+    pub accepted: bool,
+    pub rejection_reason: Option<String>,
+    pub rejection_kind: Option<String>,
+    /// Empty on a rejection. Each one's payload already rendered
+    /// (`event_store::render_would_be_event`).
+    pub events: Vec<skilj_core::event_store::WouldBeEvent>,
+    /// Rendered and scoped as `SubmitCommandPayload.matchingEvents`.
+    pub matching_events: Vec<skilj_core::event_store::Event>,
+    pub matching_events_truncated: bool,
+}
+
+pub fn dry_run_command_payload_object() -> Object {
+    gql_object!(DryRunCommandResult => "DryRunCommandPayload" {
+        scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
+        scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_reason.clone()),
+        scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
+        list "events": TypeRef::named_nn_list_nn("WouldBeEvent") => |r| r.events.clone(),
+        list "matchingEvents": TypeRef::named_nn_list_nn("MatchingEvent") => |r| r.matching_events.clone(),
+        scalar "matchingEventsTruncated": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.matching_events_truncated),
+    })
+}
+
+/// An event a dry-run's `decide()` would emit - `MatchingEvent` without a
+/// sequence, since it has none.
+pub fn would_be_event_object() -> Object {
+    use skilj_core::event_store::WouldBeEvent;
+
+    gql_object!(WouldBeEvent => "WouldBeEvent" {
+        scalar "eventTypeName": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.event_type.name.clone()),
+        scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.payload.clone()),
+    })
+}
+
 pub fn encryption_key_status_name(status: EncryptionKeyStatus) -> &'static str {
     match status {
         EncryptionKeyStatus::Active => "ACTIVE",

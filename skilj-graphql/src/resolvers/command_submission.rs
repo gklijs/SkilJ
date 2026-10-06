@@ -28,11 +28,12 @@
 
 use super::{not_found, require_caller};
 use crate::error::to_graphql_error;
-use crate::gql_types::SubmitCommandResult;
+use crate::gql_types::{DryRunCommandResult, SubmitCommandResult};
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::ErrorExtensions;
 use chrono::Utc;
+use skilj_core::access_control::RoleAccessMapping;
 
 fn insufficient_role_error(required: &str) -> async_graphql::Error {
     async_graphql::Error::new(format!(
@@ -201,48 +202,8 @@ pub fn submit_command_field() -> Field {
                     skilj_core::db::SubmitCommandOutcome::Rejected {
                         matching_events, ..
                     } if access_mapping.level == skilj_core::access_control::AccessLevel::Admin => {
-                        let (visible, truncated) = skilj_core::event_store::visible_matching_events(
-                            &access_mapping,
-                            matching_events,
-                            state.max_events_per_read,
-                        );
-                        let mut data_keys = std::collections::HashMap::new();
-                        for e in &visible {
-                            super::resolve_read_data_keys(
-                                &state.pool,
-                                &bounded_context_name,
-                                &e.event_type.sensitive_fields,
-                                &e.payload,
-                                &access_mapping,
-                                state.encryption_master_key.as_ref(),
-                                &mut data_keys,
-                            )
-                            .await?;
-                        }
-                        let grants = super::load_private_field_grants(
-                            &state.pool,
-                            &bounded_context_name,
-                            &access_mapping.role,
-                        )
-                        .await?;
-                        let resolve = |sk: &str, sv: &str| {
-                            data_keys
-                                .get(&(sk.to_string(), sv.to_string()))
-                                .cloned()
-                                .flatten()
-                        };
-                        let rendered = visible
-                            .into_iter()
-                            .map(|e| skilj_core::event_store::Event {
-                                payload: skilj_core::event_store::render_event(
-                                    &e,
-                                    &access_mapping,
-                                    &resolve,
-                                    &grants,
-                                ),
-                                ..e
-                            })
-                            .collect();
+                        let (rendered, truncated) =
+                            render_matching_events(state, &access_mapping, matching_events).await?;
                         (Some(rendered), Some(truncated))
                     }
                     _ => (None, None),
@@ -330,5 +291,193 @@ pub fn submit_command_field() -> Field {
     .argument(InputValue::new(
         "causationId",
         TypeRef::named(TypeRef::STRING),
+    ))
+}
+
+/// A command's matching events as an admin-level caller is shown them,
+/// on a `submitCommand` rejection and on every `dryRunCommand`: served the
+/// way queryEvents serves them (docs/architecture.md §118) - only within
+/// the caller's owner scope, at most `max_events_per_read` (the latest),
+/// each rendered: sensitive fields decrypted only where granted, private
+/// fields redacted unless entitled. `true` alongside when events within
+/// scope were left out for the cap.
+async fn render_matching_events(
+    state: &GraphqlState,
+    access_mapping: &RoleAccessMapping,
+    matching_events: &[skilj_core::event_store::Event],
+) -> async_graphql::Result<(Vec<skilj_core::event_store::Event>, bool)> {
+    let bounded_context_name = &access_mapping.bounded_context.name;
+    let (visible, truncated) = skilj_core::event_store::visible_matching_events(
+        access_mapping,
+        matching_events,
+        state.max_events_per_read,
+    );
+    let mut data_keys = std::collections::HashMap::new();
+    for e in &visible {
+        super::resolve_read_data_keys(
+            &state.pool,
+            bounded_context_name,
+            &e.event_type.sensitive_fields,
+            &e.payload,
+            access_mapping,
+            state.encryption_master_key.as_ref(),
+            &mut data_keys,
+        )
+        .await?;
+    }
+    let grants =
+        super::load_private_field_grants(&state.pool, bounded_context_name, &access_mapping.role)
+            .await?;
+    let resolve = |sk: &str, sv: &str| {
+        data_keys
+            .get(&(sk.to_string(), sv.to_string()))
+            .cloned()
+            .flatten()
+    };
+    let rendered = visible
+        .into_iter()
+        .map(|e| skilj_core::event_store::Event {
+            payload: skilj_core::event_store::render_event(&e, access_mapping, &resolve, &grants),
+            ..e
+        })
+        .collect();
+    Ok((rendered, truncated))
+}
+
+/// `dryRunCommand(boundedContext: String!, commandTypeName: String!, payload: String!): DryRunCommandPayload!`,
+/// `rule DryRunCommand` (Codeberg issue #47). What `submitCommand` would
+/// decide for this payload right now, with nothing persisted: no command,
+/// no event, no sequence, no encryption key, no idempotency record (see
+/// `skilj_core::db::dry_run_command`). A query, not a mutation, for that
+/// reason.
+///
+/// Admin level, not the write level `submitCommand` needs: the would-be
+/// events `decide()` emits can carry the history it read, and the
+/// matching events are event content (`MatchingEventsRequiresAdminLevel`).
+/// The same `#[requires_role]` check as `submitCommand` applies, before
+/// `decide()` runs.
+pub fn dry_run_command_field() -> Field {
+    Field::new(
+        "dryRunCommand",
+        TypeRef::named_nn("DryRunCommandPayload"),
+        |ctx| {
+            FieldFuture::new(async move {
+                let caller = require_caller(&ctx)?;
+                let state = ctx.data::<GraphqlState>()?;
+                let bounded_context_name =
+                    ctx.args.try_get("boundedContext")?.string()?.to_string();
+                let command_type_name = ctx.args.try_get("commandTypeName")?.string()?.to_string();
+                let payload = ctx.args.try_get("payload")?.string()?.to_string();
+
+                // Any active mapping, any level, as for submitCommand:
+                // authorise_command_dry_run returns its own precise
+                // InsufficientAccessLevel for one below admin.
+                let access_mapping = skilj_core::db::get_active_role_access_mapping(
+                    &state.pool,
+                    &caller.id,
+                    &bounded_context_name,
+                )
+                .await
+                .map_err(to_graphql_error)?
+                .ok_or_else(|| {
+                    to_graphql_error(skilj_core::access_control::Error::GrantNotActive)
+                })?;
+
+                let command_type = skilj_core::db::get_command_type(
+                    &state.pool,
+                    &bounded_context_name,
+                    &command_type_name,
+                )
+                .await
+                .map_err(to_graphql_error)?
+                .ok_or_else(|| not_found("CommandType", &command_type_name))?;
+
+                let authorised = skilj_core::event_store::authorise_command_dry_run(
+                    &access_mapping,
+                    &command_type,
+                    payload,
+                )
+                .map_err(to_graphql_error)?;
+
+                match state
+                    .dispatcher
+                    .required_role(&bounded_context_name, &command_type_name)
+                {
+                    None => return Err(no_decider_registered_error()),
+                    Some(Some(required)) if required != caller.name => {
+                        return Err(insufficient_role_error(required))
+                    }
+                    Some(_) => {}
+                }
+
+                let dry_run = skilj_core::db::dry_run_command(
+                    &state.pool,
+                    state.dispatcher.as_ref(),
+                    state.snapshot_dispatcher.as_ref(),
+                    &state.event_cache,
+                    &authorised.command_type,
+                    &authorised.payload,
+                    &authorised.client_id,
+                    state.encryption_master_key.as_ref(),
+                )
+                .await
+                .map_err(to_graphql_error)?;
+
+                let (matching_events, matching_events_truncated) =
+                    render_matching_events(state, &access_mapping, &dry_run.matching_events)
+                        .await?;
+                let result = match dry_run.decision {
+                    skilj_core::db::DryRunDecision::Accepted { events } => {
+                        let grants = super::load_private_field_grants(
+                            &state.pool,
+                            &bounded_context_name,
+                            &access_mapping.role,
+                        )
+                        .await?;
+                        DryRunCommandResult {
+                            accepted: true,
+                            rejection_reason: None,
+                            rejection_kind: None,
+                            events: events
+                                .into_iter()
+                                .map(|e| skilj_core::event_store::WouldBeEvent {
+                                    payload: skilj_core::event_store::render_would_be_event(
+                                        &e,
+                                        &access_mapping,
+                                        &grants,
+                                    ),
+                                    ..e
+                                })
+                                .collect(),
+                            matching_events,
+                            matching_events_truncated,
+                        }
+                    }
+                    skilj_core::db::DryRunDecision::Rejected { reason, kind } => {
+                        DryRunCommandResult {
+                            accepted: false,
+                            rejection_reason: Some(reason),
+                            rejection_kind: Some(kind),
+                            events: Vec::new(),
+                            matching_events,
+                            matching_events_truncated,
+                        }
+                    }
+                };
+                Ok(Some(FieldValue::owned_any(result)))
+            })
+        },
+    )
+    .argument(InputValue::new(
+        "boundedContext",
+        TypeRef::named_nn(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "commandTypeName",
+        TypeRef::named_nn(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "payload",
+        TypeRef::named_nn(TypeRef::STRING),
     ))
 }

@@ -1106,3 +1106,80 @@ fn command_trigger_refuses_an_overlong_idempotency_key() {
         assert_eq!(events.len(), 0);
     });
 }
+
+/// Codeberg issue #47, `rule DryRunTriggerCommand`: `POST
+/// /v1/commands/dry-run` answers what a trigger with this token would
+/// decide - and only that - while writing nothing. Both outcomes, then
+/// a real trigger to show the dry-runs used up nothing: the first real
+/// event still gets the first sequence, and no command row exists from
+/// before it.
+#[test]
+fn command_dry_run_answers_the_outcome_only_and_persists_nothing() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, credential, pool, bc_name, _, _) = setup().await;
+        let router = skilj.rest_router();
+
+        let post = |uri: &'static str, body: &'static str| {
+            let router = router.clone();
+            let credential = credential.clone();
+            async move {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap();
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                )
+            }
+        };
+
+        let (status, json) = post("/v1/commands/dry-run", r#"{"payload":{"amount":20}}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!({ "accepted": true }));
+
+        let (status, json) = post("/v1/commands/dry-run", r#"{"payload":{"amount":5000}}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "accepted": false,
+                "rejectionReason": "insufficient funds",
+                "rejectionKind": "insufficient_funds",
+            })
+        );
+
+        assert!(db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db::list_commands_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let (status, json) = post("/v1/commands/trigger", r#"{"payload":{"amount":20}}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["triggeredEventSequences"], serde_json::json!([0]));
+        assert_eq!(
+            db::list_commands_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The schema is checked as for a trigger.
+        let (status, _) = post("/v1/commands/dry-run", r#"{"payload":{"amount":"x"}}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    });
+}

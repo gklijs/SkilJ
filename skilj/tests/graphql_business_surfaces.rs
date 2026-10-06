@@ -567,6 +567,113 @@ impl CommandType for CloseCase {
     }
 }
 
+// --- a ledger for `dryRunCommand` (Codeberg issue #47): credits tagged by
+// account, capped at 100 per account, so `decide()` reads history. Each
+// credit names its holder, whose name is a sensitive field, and carries an
+// `own`-kind private memo. `CreditGhost` decides an event type nobody
+// registered.
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct LedgerCreditPayload {
+    account_id: String,
+    holder_id: String,
+    holder_name: String,
+    memo: String,
+    amount: i64,
+}
+
+fn account_tag() -> Vec<TagMapping> {
+    vec![TagMapping {
+        key: "account".into(),
+        field: "account_id".into(),
+    }]
+}
+
+struct LedgerCredited;
+
+impl EventType for LedgerCredited {
+    type Payload = LedgerCreditPayload;
+    const NAME: &'static str = "LedgerCredited";
+    fn tag_mappings() -> Vec<TagMapping> {
+        account_tag()
+    }
+    fn sensitive_fields() -> Vec<skilj_core::shared::SensitiveField> {
+        vec![skilj_core::shared::SensitiveField {
+            field: "holder_name".to_string(),
+            subject_key: "holder".to_string(),
+            subject_field: "holder_id".to_string(),
+        }]
+    }
+    fn private_fields() -> Vec<skilj_core::shared::PrivateField> {
+        vec![skilj_core::shared::PrivateField {
+            field: "memo".to_string(),
+            kind: skilj_core::shared::PrivateFieldKind::Own,
+            team: None,
+            addressee_field: None,
+        }]
+    }
+}
+
+enum LedgerEvent {
+    LedgerCredited(LedgerCreditPayload),
+}
+
+impl BoundedContextEvent for LedgerEvent {
+    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
+        match event.event_type.name.as_str() {
+            "LedgerCredited" => {
+                Some(serde_json::from_str(&event.payload).map(LedgerEvent::LedgerCredited))
+            }
+            _ => None,
+        }
+    }
+}
+
+struct CreditLedger;
+
+impl CommandType for CreditLedger {
+    type Payload = LedgerCreditPayload;
+    type Event = LedgerEvent;
+    const NAME: &'static str = "CreditLedger";
+    fn tag_mappings() -> Vec<TagMapping> {
+        account_tag()
+    }
+    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
+        let balance: i64 = matching_events
+            .iter()
+            .map(|LedgerEvent::LedgerCredited(c)| c.amount)
+            .sum();
+        if balance + payload.amount > 100 {
+            return CommandDecision::Rejected {
+                reason: format!("balance {balance} would pass 100"),
+                kind: "over_limit".to_string(),
+            };
+        }
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "LedgerCredited".to_string(),
+                payload: serde_json::to_value(payload).unwrap(),
+            }],
+        }
+    }
+}
+
+struct CreditGhost;
+
+impl CommandType for CreditGhost {
+    type Payload = LedgerCreditPayload;
+    type Event = LedgerEvent;
+    const NAME: &'static str = "CreditGhost";
+    fn decide(_payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "GhostCredited".to_string(),
+                payload: serde_json::json!({}),
+            }],
+        }
+    }
+}
+
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
 
 struct TestDb {
@@ -2605,5 +2712,285 @@ fn submit_command_refuses_an_overlong_idempotency_key() {
             .await
             .unwrap();
         assert_eq!(events.len(), 0);
+    });
+}
+
+const DRY_RUN_COMMAND_QUERY: &str = "\
+    query($bc: String!, $name: String!, $payload: String!) { \
+        dryRunCommand(boundedContext: $bc, commandTypeName: $name, payload: $payload) { \
+            accepted rejectionReason rejectionKind \
+            events { eventTypeName payload } \
+            matchingEvents { sequence eventTypeName payload } \
+            matchingEventsTruncated \
+        } \
+    }";
+
+fn ledger_credit(account: &str, holder: &str, amount: i64) -> String {
+    json!({
+        "account_id": account,
+        "holder_id": holder,
+        "holder_name": "Ada",
+        "memo": "for rent",
+        "amount": amount,
+    })
+    .to_string()
+}
+
+fn with_ledger_types(builder: skilj::SkiljBuilder) -> skilj::SkiljBuilder {
+    builder
+        .event_type::<LedgerCredited>()
+        .command_type::<CreditLedger>()
+        .command_type::<CreditGhost>()
+}
+
+fn with_ledger(builder: skilj::SkiljBuilder) -> skilj::SkiljBuilder {
+    with_ledger_types(builder).encryption_master_key(
+        skilj_core::encryption::EncryptionMasterKey::from_bytes([7u8; 32]),
+    )
+}
+
+/// Codeberg issue #47, `rule DryRunCommand`: what `decide()` would say,
+/// with the would-be events and the matching events, rendered under the
+/// read rules - and nothing persisted. One real credit of 60 first, so the
+/// dry-runs have history to decide from.
+#[test]
+fn dry_run_command_shows_the_decision_and_persists_nothing() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, admin_role) = setup_with(with_ledger).await;
+        let router = skilj.graphql_router().await.unwrap();
+        let account = unique_name("account");
+
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "name": "CreditLedger", "payload": ledger_credit(&account, "h1", 60) }),
+        )
+        .await;
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true, "{response:?}");
+        let events_before = skilj_core::db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        let commands_before = skilj_core::db::list_commands_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+
+        // Accepted, for a holder with no encryption key yet. The caller
+        // (can_read_sensitive: false) isn't that holder, so the sensitive
+        // name is null - there's no ciphertext to show. The memo is
+        // `own`-kind and the would-be event would be the caller's own.
+        let new_holder = unique_name("holder");
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            DRY_RUN_COMMAND_QUERY,
+            json!({ "bc": bc_name, "name": "CreditLedger", "payload": ledger_credit(&account, &new_holder, 30) }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "unexpected errors: {response:?}");
+        let dry_run = &response["data"]["dryRunCommand"];
+        assert_eq!(dry_run["accepted"], true);
+        assert!(dry_run["rejectionKind"].is_null());
+        let events = dry_run["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["eventTypeName"], "LedgerCredited");
+        let payload: serde_json::Value =
+            serde_json::from_str(events[0]["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["amount"], 30);
+        assert_eq!(payload["memo"], "for rent");
+        assert!(payload["holder_name"].is_null(), "{payload}");
+        let matching = dry_run["matchingEvents"].as_array().unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0]["sequence"], events_before[0].sequence);
+        assert_eq!(dry_run["matchingEventsTruncated"], false);
+
+        // The caller is the holder: granted, so the name is shown.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            DRY_RUN_COMMAND_QUERY,
+            json!({
+                "bc": bc_name,
+                "name": "CreditLedger",
+                "payload": ledger_credit(&account, &admin_role.external_subject, 30),
+            }),
+        )
+        .await;
+        let payload: serde_json::Value = serde_json::from_str(
+            response["data"]["dryRunCommand"]["events"][0]["payload"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["holder_name"], "Ada", "{response:?}");
+
+        // Rejected: decide() read the 60 already credited.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            DRY_RUN_COMMAND_QUERY,
+            json!({ "bc": bc_name, "name": "CreditLedger", "payload": ledger_credit(&account, "h1", 50) }),
+        )
+        .await;
+        let dry_run = &response["data"]["dryRunCommand"];
+        assert_eq!(dry_run["accepted"], false, "{response:?}");
+        assert_eq!(dry_run["rejectionKind"], "over_limit");
+        assert_eq!(dry_run["rejectionReason"], "balance 60 would pass 100");
+        assert_eq!(dry_run["events"], json!([]));
+        assert_eq!(dry_run["matchingEvents"].as_array().unwrap().len(), 1);
+
+        // Nothing was written: no event, no command, no key for the new
+        // holder.
+        let events_after = skilj_core::db::list_events_for_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap();
+        assert_eq!(events_after.len(), events_before.len());
+        assert_eq!(
+            skilj_core::db::list_commands_for_bounded_context(&pool, &bc_name)
+                .await
+                .unwrap()
+                .len(),
+            commands_before.len()
+        );
+        assert!(
+            skilj_core::db::get_active_encryption_key(&pool, &bc_name, "holder", &new_holder)
+                .await
+                .unwrap()
+                .is_none(),
+            "a dry-run must not provision an encryption key"
+        );
+
+        // And the real submission still decides from the same history.
+        let response = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({ "bc": bc_name, "name": "CreditLedger", "payload": ledger_credit(&account, "h1", 30) }),
+        )
+        .await;
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true, "{response:?}");
+        assert_eq!(
+            response["data"]["submitCommand"]["triggeredEventSequences"],
+            json!([events_before.last().unwrap().sequence + 1])
+        );
+    });
+}
+
+/// `dryRunCommand` refuses what `submitCommand` refuses, plus a caller
+/// below admin level: a write-level caller may submit but not dry-run.
+#[test]
+fn dry_run_command_requires_admin_level_and_the_command_types_checks() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, admin_jwt, _admin_role) = setup_with(with_ledger).await;
+        let router = skilj.graphql_router().await.unwrap();
+        let account = unique_name("account");
+        let error_code = |response: &serde_json::Value| {
+            response["errors"][0]["extensions"]["code"]
+                .as_str()
+                .unwrap_or_else(|| panic!("expected an error: {response:?}"))
+                .to_string()
+        };
+
+        let write_subject = unique_name("write-only");
+        let write_role = Role {
+            id: generate_token_id(),
+            external_subject: write_subject.clone(),
+            name: "WriteOnly".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &write_role).await.unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: write_role,
+                bounded_context: skilj_core::db::get_bounded_context(&pool, &bc_name)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                level: AccessLevel::Write,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let write_jwt = sign_jwt(&write_subject);
+        let credit = json!({ "bc": bc_name, "name": "CreditLedger", "payload": ledger_credit(&account, "h1", 10) });
+
+        let response =
+            graphql_request(&router, Some(&write_jwt), DRY_RUN_COMMAND_QUERY, credit.clone()).await;
+        assert_eq!(error_code(&response), "insufficient_access_level");
+        // The same caller may submit it.
+        let response =
+            graphql_request(&router, Some(&write_jwt), SUBMIT_COMMAND_MUTATION, credit).await;
+        assert_eq!(response["data"]["submitCommand"]["accepted"], true, "{response:?}");
+
+        // #[requires_role("treasury_officer")], and this Role is "Admin".
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            DRY_RUN_COMMAND_QUERY,
+            json!({ "bc": bc_name, "name": "CloseAccount", "payload": "{}" }),
+        )
+        .await;
+        assert_eq!(error_code(&response), "insufficient_role");
+
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            DRY_RUN_COMMAND_QUERY,
+            json!({ "bc": bc_name, "name": "CreditLedger", "payload": r#"{"amount":"x"}"# }),
+        )
+        .await;
+        assert_eq!(error_code(&response), "payload_does_not_match_schema");
+
+        // An accepted decision naming an unregistered event type fails, as
+        // a real submission would.
+        let response = graphql_request(
+            &router,
+            Some(&admin_jwt),
+            DRY_RUN_COMMAND_QUERY,
+            json!({ "bc": bc_name, "name": "CreditGhost", "payload": ledger_credit(&account, "h1", 1) }),
+        )
+        .await;
+        assert_eq!(error_code(&response), "unregistered_event_type");
+    });
+}
+
+/// Without an `encryption_master_key`, a submission whose events have a
+/// sensitive field to encrypt fails before writing, and a dry-run says so
+/// rather than promising an acceptance the submission can't deliver.
+#[test]
+fn dry_run_command_fails_like_the_submission_without_a_master_key() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, _pool, bc_name, jwt, _admin_role) = setup_with(with_ledger_types).await;
+        let router = skilj.graphql_router().await.unwrap();
+        let variables = json!({
+            "bc": bc_name,
+            "name": "CreditLedger",
+            "payload": ledger_credit(&unique_name("account"), "h1", 10),
+        });
+        for query in [SUBMIT_COMMAND_MUTATION, DRY_RUN_COMMAND_QUERY] {
+            let response = graphql_request(&router, Some(&jwt), query, variables.clone()).await;
+            assert_eq!(
+                response["errors"][0]["extensions"]["code"], "encryption_master_key_not_configured",
+                "{response:?}"
+            );
+        }
     });
 }

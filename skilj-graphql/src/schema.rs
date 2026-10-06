@@ -166,6 +166,7 @@ async fn build(
         .field(resolvers::event_query::epoch_field())
         .field(resolvers::snapshot_query::inspect_snapshot_field())
         .field(resolvers::command_query::fetch_commands_field())
+        .field(resolvers::command_submission::dry_run_command_field())
         .field(resolvers::private_field_grant_management::list_private_field_grants_field())
         .field(resolvers::parked_deliveries::parked_deliveries_field())
         .field(resolvers::projection_query::schema_field());
@@ -262,6 +263,8 @@ async fn build(
     .register(gql_types::inspected_event_object())
     .register(gql_types::inspected_snapshot_object())
     .register(gql_types::submit_command_payload_object())
+    .register(gql_types::dry_run_command_payload_object())
+    .register(gql_types::would_be_event_object())
     .register(gql_types::encryption_key_object())
     .register(gql_types::encryption_key_status_enum())
     .register(gql_types::parked_delivery_object())

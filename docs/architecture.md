@@ -1327,6 +1327,7 @@ GET  /v1/events                 -- EventFetch's FetchEvents (EventReadToken, cli
 GET  /v1/events/consume         -- EventFetch's ConsumeEvents (EventReadToken, server-tracked)
 POST /v1/events/consume/ack     -- EventFetch's AcknowledgeEvents (EventReadToken, manual_ack only)
 POST /v1/commands/trigger       -- CommandTrigger (CommandToken)
+POST /v1/commands/dry-run       -- CommandTrigger's DryRunTriggerCommand (CommandToken, §185)
 ```
 
 Presenting the wrong token variant at a route is a 403, not a 404 — the
@@ -1367,6 +1368,12 @@ POST /v1/commands/trigger
   { "payload": {...} }
   -> 200 { "accepted": true, "triggeredEventSequences": [44, 45] }
   -> 200 { "accepted": false, "rejectionReason": "...", "rejectionKind": "insufficient_funds" }
+
+POST /v1/commands/dry-run
+  { "payload": {...} }
+  -> 200 { "accepted": true }
+  -> 200 { "accepted": false, "rejectionReason": "...", "rejectionKind": "insufficient_funds" }
+  # What a trigger would decide right now; nothing is written (§185).
 ```
 
 `filter=field:op:value`, repeatable, was picked over a single
@@ -11200,3 +11207,22 @@ Codeberg issue #46. skilj shares the application's own Postgres (§2.2), but `do
 **Result** (table in `docs/performance.md`). An idle `Skilj` costs nothing outside noise (up to 7% between identical runs here). A command on its own account costs the neighbour about as much as 3 pgbench transactions, roughly linearly: -3 to -5.5% TPS at 100 commands/s, -8% at 250, -18 to -20% flat out at ~540. With 32 callers, skilj gets ~630 commands/s, barely more than with 8, while pgbench's p99 triples. Commands on one hot account cost ~27 pgbench transactions each, since each reads and folds the account's whole history (the case §19's `Snapshot` covers).
 
 **Not measured.** pgbench and skilj shared the same 22 cores here. On a dedicated database server only the Postgres-side part of the cost would remain. Async projections and subscriptions weren't running in the loaded phases, apart from what `Skilj` starts on its own. Their cost comes on top, at the catch-up rates in §182.
+
+<a id="command-dry-run"></a>
+## 185. Command dry-run: what would this command decide right now?
+
+Codeberg issue #47. `decide()` is pure (§1.1), so asking what it would say costs only the read a submission does first. `db::resolve_command_submission` already is that read: snapshot resolution, the tag-indexed matching events, one `decide()`. `db::dry_run_command` runs it and stops. It takes no lock, uses no sequence, provisions no encryption key, and neither looks up nor records an idempotency key. Spec: `rule DryRunCommand`, `rule DryRunTriggerCommand`, and the `DryRunPersistsNothing`/`DryRunRevealsOnlyTheOutcome` guarantees on `CommandSubmission`/`CommandTrigger`.
+
+**GraphQL: `dryRunCommand(boundedContext, commandTypeName, payload)`, a query, Admin level only** (user choice). `submitCommand` needs Write, but a dry-run shows what `decide()` would emit, and that can carry the history it read (a balance, a status). The reasoning is §118's for matching events, so the same level applies. It returns `accepted`, `rejectionReason`/`rejectionKind`, `events` (`eventTypeName`, `payload`), and `matchingEvents`/`matchingEventsTruncated` on acceptance and rejection alike, scoped and rendered as `submitCommand`'s (the rendering is now one helper, `render_matching_events`). Authorisation is `authorise_command_dry_run`: the Admin check, then `authorise_command_submission`'s checks (archived context, schema, owner scope). `#[requires_role]` is checked before `decide()`, as for `submitCommand`.
+
+A would-be event has never been encrypted, so `render_would_be_event` can't render it like a stored one. A sensitive field the caller is granted (`can_read_sensitive`, or the caller is the subject) is shown as `decide()` wrote it. One it isn't granted is `null`, where a stored event would show ciphertext. Private fields are redacted by the same entitlement test as `render_event`. The would-be event carries the caller as `client_id`, as `process_command` would, so an `Own` field is the caller's. No per-record `PrivateFieldGrant` can match an event that has no sequence yet; blanket grants still apply.
+
+**REST: `POST /v1/commands/dry-run`, outcome only** (user choice). REST has no roles: a `CommandToken` is a credential an admin minted for one command type and carries no access level. The route authorises as `/v1/commands/trigger` does (`authorise_command_trigger`) and answers `accepted` and a rejection's reason and kind, which is what a real trigger already tells the token. It takes no `Idempotency-Key` and no correlation ids, since nothing is stored for them to label.
+
+**Fails where the submission would.** An accepted decision naming an unregistered event type fails with `unregistered_event_type`, as `process_command` does. One with a sensitive field to encrypt, in the command or an event, fails with `encryption_master_key_not_configured` when no master key is set, as the submission's key warm-up does. The key itself is never looked up. Without that check, a deployment missing its master key would get "accepted" from the dry-run and an error from the submission.
+
+**What "right now" means.** There is no re-check under the lock, so an event committed after the dry-run can make the real submission decide differently. The same is true between any two submissions.
+
+Tests: `dry_run_command_shows_the_decision_and_persists_nothing`, `dry_run_command_requires_admin_level_and_the_command_types_checks` and `dry_run_command_fails_like_the_submission_without_a_master_key` (`skilj/tests/graphql_business_surfaces.rs`) cover a history-dependent acceptance and rejection, the sensitive field nulled and shown, the `Own` memo, no command/event/key written, the next real submission getting the next sequence, the Write-level refusal, `insufficient_role`, schema and unregistered-type errors, and the missing master key. `command_dry_run_answers_the_outcome_only_and_persists_nothing` (`skilj/tests/command_trigger.rs`) checks the REST body field for field and that the first real trigger still gets sequence 0. The conformance transcript (§179) gained `dry_run_accepted`, `dry_run_rejected`, `dry_run_payload_off_schema` and `dry_run_archived`, all agreeing across the two surfaces. They run before `read_all`, which shows no events were added.
+
+**Not done.** No TUI or inspector action yet. Both can call `dryRunCommand`.

@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Command dry-runs (docs/architecture.md §185, Codeberg issue #47): what
+  a command would decide right now, with nothing persisted - no command,
+  event, sequence number, encryption key or idempotency record. GraphQL's
+  `dryRunCommand` query is Admin-only and returns the would-be events,
+  rendered under the read rules, and the matching events. `POST
+  /v1/commands/dry-run` takes the command's own `CommandToken` and
+  answers only `accepted` and a rejection's reason and kind.
+
+- `skilj/tests/coresident_pgbench.rs`, a benchmark of what an application
+  sharing skilj's Postgres loses (docs/architecture.md §184, Codeberg
+  issue #46), with results in docs/performance.md.
+
 - A conformance suite across GraphQL and REST (docs/architecture.md
   §179, Codeberg issue #43): `skilj/tests/conformance.rs` runs the same
   command submissions and event reads over both tracks, compares each
