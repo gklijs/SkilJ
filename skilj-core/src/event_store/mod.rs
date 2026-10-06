@@ -143,6 +143,16 @@ impl BoundedContext {
     /// archived carries `status: Active` for good, and `==` against the
     /// archived context a reader holds now says it belongs to another one
     /// (docs/architecture.md §179).
+    ///
+    /// The name alone, on purpose. Every other field but `created_at` can
+    /// change while the context stays the same one: `status` on archiving,
+    /// `template` when it's set or its template is deleted, and
+    /// `created_by` embeds a whole `Role` whose own `status` changes on
+    /// revocation. `created_at` would tell two lives of a reused name
+    /// apart, but deleting a context already removes its mappings and
+    /// tokens and the event cache drops its events (§95). And a copy
+    /// built in Rust holds nanoseconds where one read back from Postgres
+    /// holds microseconds, so the same context could compare unequal.
     pub fn same_as(&self, other: &BoundedContext) -> bool {
         self.name == other.name
     }
@@ -225,7 +235,9 @@ impl EventType {
     /// context. See [`BoundedContext::same_as`] - and a copy of an
     /// `EventType` goes stale sooner still, since `schedule_position`/
     /// `last_fired_at` move on every scheduled fire and a re-registration
-    /// can change everything else.
+    /// can change everything else. A re-registered type, new schema
+    /// version included, is still the same type: that's how a schema
+    /// evolves.
     pub fn same_as(&self, other: &EventType) -> bool {
         self.name == other.name && self.bounded_context.same_as(&other.bounded_context)
     }
