@@ -192,6 +192,15 @@ pub async fn embedded_database_url(database_name: &str) -> Option<String> {
     Some(server.settings().url(database_name))
 }
 
+/// The directory holding the embedded server's own client programs
+/// (`pgbench`, `psql`), or [`None`] if this process hasn't started one -
+/// with `DATABASE_URL` set, it never does. For benchmarks that drive the
+/// server with those programs rather than through sqlx.
+pub async fn embedded_binary_dir() -> Option<std::path::PathBuf> {
+    let server = EMBEDDED.get()?.as_ref()?.lock().await;
+    Some(server.settings().binary_dir())
+}
+
 async fn start() -> Option<Mutex<PostgreSQL>> {
     let mut server = PostgreSQL::default();
     if let Err(e) = server.setup().await {

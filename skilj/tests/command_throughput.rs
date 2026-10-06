@@ -23,101 +23,18 @@
 //! batches were and where the time inside the lock went. See
 //! docs/performance.md and docs/architecture.md §178 for the numbers.
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use chrono::{SubsecRound, Utc};
-use http_body_util::BodyExt;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use skilj::{CommandType, EventType, Skilj};
-use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, RoleStatus};
-use skilj_core::bootstrap::ContextCreator;
-use skilj_core::db::{self, Pool};
-use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
-use skilj_core::plugin::BoundedContextEvent;
-use skilj_core::shared::{
-    generate_token_id, generate_token_secret, CommandDecision, EventSpec, TagMapping,
-};
+mod deposit_bench;
+
+use deposit_bench::{deposit, setup, Setup};
+use skilj_core::db;
+use skilj_core::shared::generate_token_id;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer as _;
 
 /// Commands per scenario.
 const COMMANDS: usize = 800;
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct DepositedPayload {
-    account_id: String,
-    amount: i64,
-}
-
-struct Deposited;
-
-impl EventType for Deposited {
-    type Payload = DepositedPayload;
-    const NAME: &'static str = "Deposited";
-    fn tag_mappings() -> Vec<TagMapping> {
-        vec![TagMapping {
-            key: "account".into(),
-            field: "account_id".into(),
-        }]
-    }
-}
-
-enum AccountEvent {
-    Deposited(DepositedPayload),
-}
-
-impl BoundedContextEvent for AccountEvent {
-    fn try_from_event(event: &Event) -> Option<Result<Self, serde_json::Error>> {
-        match event.event_type.name.as_str() {
-            "Deposited" => Some(serde_json::from_str(&event.payload).map(AccountEvent::Deposited)),
-            _ => None,
-        }
-    }
-}
-
-struct Deposit;
-
-impl CommandType for Deposit {
-    type Payload = DepositedPayload;
-    type Event = AccountEvent;
-    const NAME: &'static str = "Deposit";
-    fn rest_trigger_allowed() -> bool {
-        true
-    }
-    fn tag_mappings() -> Vec<TagMapping> {
-        vec![TagMapping {
-            key: "account".into(),
-            field: "account_id".into(),
-        }]
-    }
-    /// A real decision over the account's history: deposits are capped,
-    /// so the balance has to be folded first.
-    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
-        let balance: i64 = matching_events
-            .iter()
-            .map(|AccountEvent::Deposited(d)| d.amount)
-            .sum();
-        if balance + payload.amount > i64::MAX / 2 {
-            return CommandDecision::Rejected {
-                reason: "balance cap".to_string(),
-                kind: "balance_cap".to_string(),
-            };
-        }
-        CommandDecision::Accepted {
-            events: vec![EventSpec {
-                event_type: "Deposited".to_string(),
-                payload: serde_json::json!({
-                    "account_id": payload.account_id,
-                    "amount": payload.amount,
-                }),
-            }],
-        }
-    }
-}
 
 /// What the batcher's `debug` events add up to over one scenario.
 #[derive(Default, Debug, Clone)]
@@ -198,108 +115,6 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BatchStatsLayer {
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
-}
-
-fn now() -> chrono::DateTime<Utc> {
-    Utc::now().trunc_subsecs(6)
-}
-
-struct Setup {
-    router: axum::Router,
-    credential: String,
-}
-
-async fn setup(database_url: String, pool: &Pool) -> Setup {
-    let subject = format!("subject_{}", generate_token_id());
-    let role = Role {
-        id: generate_token_id(),
-        external_subject: subject.clone(),
-        name: "Reconciliation Role".to_string(),
-        superadmin: false,
-        status: RoleStatus::Active,
-        created_at: now(),
-        revoked_at: None,
-    };
-    db::insert_role(pool, &role).await.unwrap();
-    let bc_name = format!("accounts_{}", generate_token_id());
-    let bc = BoundedContext {
-        name: bc_name.clone(),
-        status: BoundedContextStatus::Active,
-        created_at: now(),
-        created_by: ContextCreator::SystemCreator,
-        template: None,
-    };
-    db::insert_bounded_context(pool, &bc).await.unwrap();
-    let mapping = RoleAccessMapping {
-        role,
-        bounded_context: bc,
-        level: AccessLevel::Admin,
-        can_read_sensitive: false,
-        scope: None,
-        status: RoleStatus::Active,
-        created_at: now(),
-        revoked_at: None,
-    };
-    db::insert_role_access_mapping(pool, &mapping)
-        .await
-        .unwrap();
-
-    // The pool of a modest deployment: half of it may lead batches.
-    let (skilj, _) = Skilj::builder(database_url)
-        .pool_options(db::PgPoolOptions::new().max_connections(20))
-        .bounded_context(bc_name.clone())
-        .event_type::<Deposited>()
-        .command_type::<Deposit>()
-        .reconciliation_role(subject)
-        .build()
-        .await
-        .unwrap();
-
-    let command_type = db::get_command_type(pool, &bc_name, "Deposit")
-        .await
-        .unwrap()
-        .unwrap();
-    let token = access_control::create_command_token(
-        &mapping,
-        &command_type,
-        generate_token_id(),
-        generate_token_secret(),
-        None,
-        now(),
-    )
-    .unwrap();
-    db::insert_command_token(pool, &token).await.unwrap();
-
-    let router = skilj.rest_router();
-    // The `Skilj` owns background tasks the router relies on.
-    std::mem::forget(skilj);
-    Setup {
-        router,
-        credential: format!("{}.{}", token.id, token.secret),
-    }
-}
-
-/// Submits one deposit and returns its latency.
-async fn deposit(setup: &Setup, account_id: &str) -> Duration {
-    let body = serde_json::json!({ "payload": { "account_id": account_id, "amount": 1 } });
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/commands/trigger")
-        .header("authorization", format!("Bearer {}", setup.credential))
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let started = Instant::now();
-    let response = setup.router.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
-    started.elapsed()
 }
 
 #[derive(Clone, Copy)]
@@ -395,5 +210,6 @@ fn command_throughput() {
                 }
             }
         }
+        setup.skilj.shutdown(Duration::from_secs(10)).await;
     });
 }

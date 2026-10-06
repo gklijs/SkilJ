@@ -91,6 +91,54 @@ machine as above:
 A projection with `PARTITION_COUNT > 1` uses its own path, which still writes
 each key once per event.
 
+## What a co-resident application loses
+
+skilj is meant to share the application's own Postgres (docs/architecture.md
+§2.2), so the number for a deployment decision is what the application's own
+workload gives up. `skilj/tests/coresident_pgbench.rs` (`#[ignore]`d; `cargo
+test --release -p skilj --test coresident_pgbench -- --ignored --nocapture`,
+`SKILJ_BENCH_SECONDS` per phase, default 30) runs `pgbench`'s default
+TPC-B-like script (`-c 8 -j 4`, scale 10) with its tables in skilj's own
+database: twice alone, then next to a running `Skilj` under each load below,
+then alone again after `Skilj::shutdown`. Commands are the same `Deposit` as
+above, through the in-process router.
+
+Two runs on the same machine and embedded Postgres 18 as above (load average
+7-11). Two identical alone runs differed by up to 7% in TPS, so treat
+anything smaller as noise:
+
+| next to pgbench | skilj commands/s | pgbench TPS | pgbench p50 | pgbench p99 |
+|---|---|---|---|---|
+| alone (baseline) | - | ~9,000 | 0.85 ms | 1.4 ms |
+| skilj running, no commands | - | 0 to -1% | +0-1% | -0-2% |
+| spread, paced at 100/s | 100 | -3 to -5.5% | +1.5-4.5% | +17% |
+| spread, paced at 250/s | 250 | -8% | +8-9% | +10-12% |
+| spread, 8 callers flat out | ~540 | -18 to -20% | +22-25% | +20-25% |
+| spread, 32 callers flat out | ~630 | -29 to -32% | +32-38% | +190-220% |
+| hot, 8 callers flat out | ~46 | -13 to -15% | +15-17% | +15-20% |
+
+What it says:
+
+- An idle `Skilj` costs nothing measurable. Its background loops (projection
+  catch-up, deadlines, cross-instance listener) don't take a share worth
+  noticing from the application.
+- A spread command costs the neighbour about as much as 3 pgbench
+  transactions, at 100/s and flat out alike: per command, skilj reads the
+  command's tag history before the lock, then writes the command, its events
+  and their tags. Budget for that: a bounded context taking 250 commands/s
+  takes ~8% off an application doing 9,000 TPS on the same server.
+- Flat out with 32 callers, the neighbour's p99 roughly triples while
+  skilj's own throughput barely moves from 8 callers. More concurrent callers
+  add contention, not commands. Size the pool and the callers for the rate
+  you need, not for the most the lock can take.
+- A hot key is ~10x as expensive per command (~27 pgbench transactions):
+  every command reads and folds the key's whole history, which grows. This
+  is the case a `Snapshot` (docs/architecture.md §19) is for.
+
+These numbers are for one machine where pgbench and skilj share the CPU as
+well as Postgres. On a server where Postgres has its own cores, the CPU part
+of the cost goes away and the I/O part (WAL, commits) remains.
+
 ## Knobs
 
 All on `SkiljBuilder`:
