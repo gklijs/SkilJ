@@ -25,7 +25,7 @@ use jsonwebtoken::{EncodingKey, Header};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use skilj::{CommandType, EventType, IdpConfig, SigningAlgorithm, Skilj};
+use skilj::{CommandType, EventType, IdpConfig, Projection, SigningAlgorithm, Skilj};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
@@ -123,6 +123,29 @@ impl CommandType for DepositMoney {
                 payload: serde_json::json!({ "amount": payload.amount }),
             }],
         }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct LedgerState {
+    balance: i64,
+}
+
+/// Async, and declared by both instances in
+/// `a_promoted_rebuild_refreshes_the_graphql_schema_on_every_instance` -
+/// only a declaring instance folds and promotes a rebuild (§160).
+struct Ledger;
+
+impl Projection for Ledger {
+    type State = LedgerState;
+    type Event = BankingEvent;
+    const NAME: &'static str = "Ledger";
+    fn consumed_event_types() -> Vec<&'static str> {
+        vec!["MoneyDeposited"]
+    }
+    fn project(state: &mut Self::State, event: &Self::Event, _key: &str) {
+        let BankingEvent::MoneyDeposited(payload) = event;
+        state.balance += payload.amount;
     }
 }
 
@@ -769,5 +792,200 @@ fn same_instance_delivery_is_exactly_once_not_duplicated() {
             "a locally-committed event must reach a same-instance subscriber exactly once, \
              not twice: got a second message {second:?}"
         );
+    });
+}
+
+/// The fields of one GraphQL type, empty when the schema has no such type.
+async fn type_fields(router: &axum::Router, jwt: &str, type_name: &str) -> Vec<String> {
+    let response = graphql_request(
+        router,
+        Some(jwt),
+        "query($t: String!) { __type(name: $t) { fields { name } } }",
+        json!({ "t": type_name }),
+    )
+    .await;
+    response["data"]["__type"]["fields"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|f| f["name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Codeberg #69: `promote_projection_rebuild` swapped in the rebuild's
+/// schema without a `skilj_registration_changed` NOTIFY, so no instance -
+/// not even the one whose catch-up tick promoted it - rebuilt its GraphQL
+/// schema, and a field the rebuild added stayed unknown until a restart.
+/// Either instance's tick may promote; both must pick the new field up.
+#[test]
+fn a_promoted_rebuild_refreshes_the_graphql_schema_on_every_instance() {
+    runtime().block_on(async {
+        let Some(database_url) = test_database_url().await else {
+            return;
+        };
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+
+        let bc_name = unique_name("banking");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: admin_role.clone(),
+                bounded_context: bc.clone(),
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut instances = Vec::new();
+        for _ in 0..2 {
+            let (skilj, report) = Skilj::builder(database_url.clone())
+                .identity_provider(IdpConfig::new(
+                    jwks_url.parse().unwrap(),
+                    TEST_ISSUER,
+                    TEST_AUDIENCE,
+                    SigningAlgorithm::Rs256,
+                ))
+                .bounded_context(bc_name.clone())
+                .event_type::<MoneyDeposited>()
+                .command_type::<DepositMoney>()
+                .projection::<Ledger>()
+                .reconciliation_role(admin_subject.clone())
+                .async_projection_poll_interval(Duration::from_millis(50))
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(report.skipped_no_access, Vec::<String>::new());
+            instances.push(skilj);
+        }
+        let (router_a, _) = serve(&instances[0]).await;
+        let (router_b, _) = serve(&instances[1]).await;
+        let admin_jwt = sign_jwt(&admin_subject);
+        let ledger_type = format!("{bc_name}_Ledger");
+
+        // An event for the rebuild to fold, so it has a position to catch
+        // up to before it is promoted.
+        let response = graphql_request(
+            &router_a,
+            Some(&admin_jwt),
+            DEPOSIT_MONEY_MUTATION,
+            json!({ "bc": bc_name, "payload": json!({ "amount": 5 }).to_string() }),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["submitCommand"]["accepted"], true,
+            "{response:?}"
+        );
+
+        // A changed schema stages a rebuild; the live one stays as it was.
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "LedgerState",
+            "type": "object",
+            "properties": {
+                "balance": { "type": "integer", "format": "int64" },
+                "overdraft": { "type": "integer", "format": "int64" },
+            },
+            "required": ["balance"],
+        })
+        .to_string();
+        let response = graphql_request(
+            &router_a,
+            Some(&admin_jwt),
+            "mutation($bc: String!, $schema: String!) { \
+                registerProjection(boundedContext: $bc, name: \"Ledger\", schema: $schema, \
+                    sync: false, consumedEventTypes: [\"MoneyDeposited\"]) { \
+                    outcome rebuild { status } \
+                } \
+            }",
+            json!({ "bc": bc_name, "schema": schema }),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["registerProjection"]["rebuild"]["status"], "PENDING",
+            "{response:?}"
+        );
+        for router in [&router_a, &router_b] {
+            let fields = type_fields(router, &admin_jwt, &ledger_type).await;
+            assert!(fields.contains(&"balance".to_string()), "{fields:?}");
+            assert!(!fields.contains(&"overdraft".to_string()), "{fields:?}");
+        }
+
+        let response = graphql_request(
+            &router_a,
+            Some(&admin_jwt),
+            "mutation($bc: String!, $name: String!) { \
+                rebuildProjection(boundedContext: $bc, name: $name) { status } \
+            }",
+            json!({ "bc": bc_name, "name": "Ledger" }),
+        )
+        .await;
+        assert_eq!(
+            response["data"]["rebuildProjection"]["status"], "BUILDING",
+            "{response:?}"
+        );
+
+        let mut promoted = false;
+        for _ in 0..100 {
+            let projection = skilj_core::db::get_projection(&pool, &bc_name, "Ledger")
+                .await
+                .unwrap()
+                .unwrap();
+            if projection.schema.contains("overdraft") {
+                promoted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(promoted, "the rebuild was never promoted");
+
+        for (label, router) in [("A", &router_a), ("B", &router_b)] {
+            let mut fields = Vec::new();
+            for _ in 0..50 {
+                fields = type_fields(router, &admin_jwt, &ledger_type).await;
+                if fields.contains(&"overdraft".to_string()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                fields.contains(&"overdraft".to_string()),
+                "instance {label}'s `{ledger_type}` must gain the promoted rebuild's new field \
+                 without a restart: {fields:?}"
+            );
+        }
     });
 }

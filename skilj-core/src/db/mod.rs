@@ -159,10 +159,11 @@ async fn notify_event_appended(pool: &Pool, event: &Event, origin_instance_id: &
 }
 
 /// `crate::cross_instance`'s sending half for the `skilj_registration_changed`
-/// channel - called from the six DB-layer functions that change what the
+/// channel - called from every DB-layer function that changes what the
 /// GraphQL schema needs to expose (`upsert_event_type`/`upsert_command_type`/
-/// `upsert_projection`/`insert_bounded_context`/`update_bounded_context_status`/
-/// `hard_delete_bounded_context`). No payload: which exact type or bounded
+/// `upsert_projection`/`register_new_sync_projection`/
+/// `promote_projection_rebuild`/`insert_bounded_context`/
+/// `update_bounded_context_status`/`hard_delete_bounded_context`). No payload: which exact type or bounded
 /// context changed doesn't matter, every listener reacts identically (a
 /// full schema rebuild) - see `crate::cross_instance`'s own module doc
 /// comment. Same "log and swallow, never propagate" treatment as
@@ -13479,6 +13480,9 @@ pub async fn promote_projection_rebuild(
     .await?;
 
     tx.commit().await?;
+    // The live `schema` just changed, so every instance's GraphQL type
+    // for this projection is stale - this one's included (Codeberg #69).
+    notify_registration_changed(pool).await;
     Ok(true)
 }
 
