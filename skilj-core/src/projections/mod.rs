@@ -228,7 +228,7 @@ pub fn register_projection(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if &access_mapping.bounded_context != bounded_context {
+    if !access_mapping.bounded_context.same_as(bounded_context) {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if bounded_context.status != BoundedContextStatus::Active {
@@ -252,7 +252,7 @@ pub fn register_projection(
     }
     if !consumed_event_types
         .iter()
-        .all(|et| &et.bounded_context == bounded_context)
+        .all(|et| et.bounded_context.same_as(bounded_context))
     {
         return Err(Error::ConsumedEventTypeNotInBoundedContext.into());
     }
@@ -353,7 +353,10 @@ pub fn rebuild_projection(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if access_mapping.bounded_context != projection.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&projection.bounded_context)
+    {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     let Some(staged) = staged else {
@@ -384,7 +387,10 @@ pub fn discard_projection_rebuild(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if access_mapping.bounded_context != projection.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&projection.bounded_context)
+    {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     let Some(staged) = staged else {
@@ -509,7 +515,10 @@ pub fn query_projection(
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
     }
-    if access_mapping.bounded_context != projection.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&projection.bounded_context)
+    {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if access.declares_owner {

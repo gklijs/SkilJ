@@ -398,7 +398,7 @@ pub fn archive_bounded_context(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if &access_mapping.bounded_context != bounded_context {
+    if !access_mapping.bounded_context.same_as(bounded_context) {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if bounded_context.status != BoundedContextStatus::Active {

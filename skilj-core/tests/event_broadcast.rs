@@ -293,3 +293,31 @@ fn subscription_selects_is_the_grant_free_part_of_delivery() {
         event_store::deliver_to_subscriptions(&event(6), &[revoked], |_, _| None, &[]).is_empty()
     );
 }
+
+/// docs/architecture.md §179: a subscription holds the type as it was when
+/// it subscribed. An event committed after the type was re-registered
+/// (or after a scheduled fire moved `last_fired_at`) carries a different
+/// copy of the same type, and is still that type's.
+#[test]
+fn subscription_selects_an_event_whose_type_copy_has_moved_on() {
+    let subscription = Subscription::EventTypeSubscription(Box::new(
+        event_store::create_event_type_subscription(
+            &access_mapping(),
+            &event_type(),
+            Vec::new(),
+            Some(5),
+            &[],
+            timestamp(0),
+        )
+        .unwrap(),
+    ));
+    let mut later = event(6);
+    later.event_type.schema_version += 1;
+    later.event_type.last_fired_at = Some(timestamp(60));
+
+    assert!(event_store::subscription_selects(&subscription, &later));
+    assert_eq!(
+        event_store::deliver_to_subscriptions(&later, &[subscription], |_, _| None, &[]).len(),
+        1
+    );
+}

@@ -35,6 +35,12 @@ no internal dependents either - `skilj-retry` is a dependency of
 other way round -
 the same reason `skilj-tui`/`skilj-inspector` need no entry).
 
+3. Re-record the GraphQL/REST conformance transcript, which pins the
+   version it was recorded against (docs/architecture.md §179):
+   `SKILJ_RECORD_CONFORMANCE=1 cargo test -p skilj --test conformance`.
+   Review its diff: only the first line should change, unless the
+   release changes what either surface answers.
+
 ### Doing this with `cargo-release`
 
 The manual version above is correct but tedious and easy to get wrong

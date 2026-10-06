@@ -1,0 +1,33 @@
+# recorded against skilj 0.0.9
+submit_accepted	graphql	200	{"accepted":true,"correlationId":"conformance","deduplicated":false,"triggeredEventSequences":[0]}
+submit_accepted	rest	200	{"accepted":true,"correlationId":"conformance","deduplicated":false,"triggeredEventSequences":[0]}
+submit_rejected	graphql	200	{"accepted":false,"deduplicated":false,"rejectionKind":"over_limit","rejectionReason":"over the deposit limit"}
+submit_rejected	rest	200	{"accepted":false,"deduplicated":false,"rejectionKind":"over_limit","rejectionReason":"over the deposit limit"}
+submit_with_idempotency_key	graphql	200	{"accepted":true,"correlationId":"conformance","deduplicated":false,"triggeredEventSequences":[1]}
+submit_with_idempotency_key	rest	200	{"accepted":true,"correlationId":"conformance","deduplicated":false,"triggeredEventSequences":[1]}
+submit_idempotent_retry	graphql	200	{"accepted":true,"deduplicated":true,"triggeredEventSequences":[1]}
+submit_idempotent_retry	rest	200	{"accepted":true,"deduplicated":true,"triggeredEventSequences":[1]}
+submit_idempotency_key_reused_for_other_payload	graphql	200	{"accepted":true,"deduplicated":true,"triggeredEventSequences":[1]}
+submit_idempotency_key_reused_for_other_payload	rest	200	{"accepted":true,"deduplicated":true,"triggeredEventSequences":[1]}
+submit_reserved_idempotency_key	graphql	200	{"error":"reserved_idempotency_key_prefix"}
+submit_reserved_idempotency_key	rest	400	{"error":"reserved_idempotency_key_prefix"}
+submit_payload_off_schema	graphql	200	{"error":"payload_does_not_match_schema"}
+submit_payload_off_schema	rest	400	{"error":"payload_does_not_match_schema"}
+submit_payload_missing_field	graphql	200	{"error":"payload_does_not_match_schema"}
+submit_payload_missing_field	rest	400	{"error":"payload_does_not_match_schema"}
+submit_without_credential	graphql	200	{"error":"unauthenticated"}
+submit_without_credential	rest	401	{"error":"missing_credential"}
+read_all	graphql	200	{"events":[{"payload":{"amount":20},"sequence":0},{"payload":{"amount":30},"sequence":1}]}
+read_all	rest	200	{"events":[{"payload":{"amount":20},"sequence":0},{"payload":{"amount":30},"sequence":1}]}
+read_after_first	graphql	200	{"events":[{"payload":{"amount":30},"sequence":1}]}
+read_after_first	rest	200	{"events":[{"payload":{"amount":30},"sequence":1}]}
+read_after_latest	graphql	200	{"events":[]}
+read_after_latest	rest	200	{"events":[]}
+read_after_past_latest	graphql	200	{"events":[]}
+read_after_past_latest	rest	400	{"error":"invalid_request"}
+read_without_credential	graphql	200	{"error":"unauthenticated"}
+read_without_credential	rest	401	{"error":"missing_credential"}
+submit_archived	graphql	200	{"error":"bounded_context_archived"}
+submit_archived	rest	409	{"error":"bounded_context_archived"}
+read_archived	graphql	200	{"events":[{"payload":{"amount":20},"sequence":0},{"payload":{"amount":30},"sequence":1}]}
+read_archived	rest	200	{"events":[{"payload":{"amount":20},"sequence":0},{"payload":{"amount":30},"sequence":1}]}

@@ -178,6 +178,29 @@ fn fetch_events_succeeds_and_returns_only_matching_later_events() {
     );
 }
 
+/// docs/architecture.md §179: an event names its type and bounded context
+/// by identity. The copies it carries are snapshots - from the event
+/// cache, taken before the context was archived or the type's scheduled
+/// fire moved `last_fired_at` - and the token holds today's. Compared
+/// whole, they used to say every such event belonged to another type.
+#[test]
+fn fetch_events_matches_an_event_whose_type_snapshot_is_stale() {
+    let then = event_type(true);
+    let mut now = then.clone();
+    now.bounded_context.status = BoundedContextStatus::Archived;
+    now.last_fired_at = Some(timestamp(60));
+    now.schema_version += 1;
+    let t = token(TokenStatus::Active, now.clone());
+    let events = vec![event(then, 0), event(now, 1)];
+
+    let result = event_store::fetch_events(&t, &events, &[], None, None).unwrap();
+
+    assert_eq!(
+        result.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
 #[test]
 fn fetch_events_with_no_after_sequence_starts_from_the_beginning() {
     let et = event_type(true);

@@ -17,6 +17,8 @@ cargo test --workspace
 
 The CI pipeline (`scripts/ci-test.sh`, which runs `cargo test --workspace -- --nocapture`) additionally checks that no Postgres-backed tests silently skip. It runs against a `postgres` service container via `DATABASE_URL`, falling back to a Postgres inside the CI step's own container when that service doesn't answer (docs/architecture.md §166). `bash scripts/ci-test.sh` reproduces that setup and run by hand.
 
+`skilj/tests/conformance.rs` compares what GraphQL and REST answer against the checked-in `skilj/tests/fixtures/conformance.transcript`, and against each other (docs/architecture.md §179). When a change to either surface is intended, re-record it with `SKILJ_RECORD_CONFORMANCE=1 cargo test -p skilj --test conformance` and review the diff; a deliberate difference between the surfaces goes in the test's `DIVERGENCES` catalogue with its reason.
+
 Some integration tests require external services:
 - **Postgres** — `skilj-core`, `skilj`, `skilj-inspector` and `skilj-demo` integration tests use `DATABASE_URL` when it is set, and otherwise fall back to `postgresql_embedded`. Set `DATABASE_URL` to a real Postgres to avoid embedded-server issues. `DATABASE_URL` supplies the server, not the database: every test binary drops and recreates a named database of its own on it (docs/architecture.md §167), so the role needs `CREATEDB`.
 - **Kafka** (`skilj-kafka`), **AMQP** (`skilj-amqp`), **NATS** (`skilj-nats`), **Temporal** (`skilj-temporal`) — these tests use `testcontainers-modules` and need a reachable Docker daemon. They skip gracefully if Docker is unavailable.

@@ -136,6 +136,18 @@ pub struct BoundedContext {
     pub template: Option<Box<BoundedContext>>,
 }
 
+impl BoundedContext {
+    /// Whether `other` is the same bounded context, by name. `==` compares
+    /// two copies field by field, and a copy is a snapshot of when it was
+    /// loaded: an event the event cache took in before its context was
+    /// archived carries `status: Active` for good, and `==` against the
+    /// archived context a reader holds now says it belongs to another one
+    /// (docs/architecture.md §179).
+    pub fn same_as(&self, other: &BoundedContext) -> bool {
+        self.name == other.name
+    }
+}
+
 /// See `enum MissedOccurrencePolicy`. No `Default` impl, deliberately -
 /// see that type's own doc comment on why this library never picks one
 /// on a bounded context's behalf.
@@ -208,6 +220,17 @@ pub struct EventType {
     pub event_read_allowed: bool,
 }
 
+impl EventType {
+    /// Whether `other` is the same event type: same name, same bounded
+    /// context. See [`BoundedContext::same_as`] - and a copy of an
+    /// `EventType` goes stale sooner still, since `schedule_position`/
+    /// `last_fired_at` move on every scheduled fire and a re-registration
+    /// can change everything else.
+    pub fn same_as(&self, other: &EventType) -> bool {
+        self.name == other.name && self.bounded_context.same_as(&other.bounded_context)
+    }
+}
+
 /// See `entity CommandType`. `command_tokens` (a relationship
 /// projection, not a stored field - the same treatment `EventType`'s
 /// `*_tokens` relationships get) is omitted.
@@ -227,6 +250,14 @@ pub struct CommandType {
     /// for `Command.payload` instead of `Event.payload`.
     pub private_fields: Vec<PrivateField>,
     pub rest_trigger_allowed: bool,
+}
+
+impl CommandType {
+    /// Whether `other` is the same command type - see
+    /// [`EventType::same_as`].
+    pub fn same_as(&self, other: &CommandType) -> bool {
+        self.name == other.name && self.bounded_context.same_as(&other.bounded_context)
+    }
 }
 
 /// See `entity EncryptionKey`'s `status` field/transition graph.
@@ -2147,7 +2178,8 @@ pub fn render_event(
         resolve_data_key,
     );
     redact_unentitled_private_fields(event, &decrypted, access_mapping, grants, |g| {
-        g.bounded_context == event.bounded_context && g.event_sequence == Some(event.sequence)
+        g.bounded_context.same_as(&event.bounded_context)
+            && g.event_sequence == Some(event.sequence)
     })
 }
 
@@ -2170,7 +2202,7 @@ pub fn render_command(
         resolve_data_key,
     );
     redact_unentitled_private_fields(command, &decrypted, access_mapping, grants, |g| {
-        g.bounded_context == command.bounded_context
+        g.bounded_context.same_as(&command.bounded_context)
             && g.command_id.as_deref() == Some(command.id.as_str())
     })
 }
@@ -2357,7 +2389,7 @@ pub fn register_event_type(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if &access_mapping.bounded_context != bounded_context {
+    if !access_mapping.bounded_context.same_as(bounded_context) {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if bounded_context.status != BoundedContextStatus::Active {
@@ -2520,7 +2552,7 @@ pub fn register_command_type(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if &access_mapping.bounded_context != bounded_context {
+    if !access_mapping.bounded_context.same_as(bounded_context) {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if bounded_context.status != BoundedContextStatus::Active {
@@ -2623,7 +2655,7 @@ pub fn forget_subject(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if access_mapping.bounded_context != key.bounded_context {
+    if !access_mapping.bounded_context.same_as(&key.bounded_context) {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if key.status != EncryptionKeyStatus::Active {
@@ -2743,7 +2775,7 @@ pub fn query_events_select(
     }
     if !event_types
         .iter()
-        .all(|et| et.bounded_context == access_mapping.bounded_context)
+        .all(|et| et.bounded_context.same_as(&access_mapping.bounded_context))
     {
         return Err(Error::EventTypeNotInBoundedContext.into());
     }
@@ -2752,8 +2784,10 @@ pub fn query_events_select(
     let after = after_sequence.unwrap_or(-1);
     Ok(bounded_context_events
         .iter()
-        .filter(|e| e.bounded_context == access_mapping.bounded_context)
-        .filter(|e| event_types.is_empty() || event_types.contains(&e.event_type))
+        .filter(|e| e.bounded_context.same_as(&access_mapping.bounded_context))
+        .filter(|e| {
+            event_types.is_empty() || event_types.iter().any(|et| et.same_as(&e.event_type))
+        })
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
         .filter(|e| e.sequence > after)
         // Codeberg issue #18 - "show me everything in this transaction",
@@ -2815,7 +2849,7 @@ pub fn count_events(
     }
     if !event_types
         .iter()
-        .all(|et| et.bounded_context == access_mapping.bounded_context)
+        .all(|et| et.bounded_context.same_as(&access_mapping.bounded_context))
     {
         return Err(Error::EventTypeNotInBoundedContext.into());
     }
@@ -2823,8 +2857,10 @@ pub fn count_events(
 
     Ok(bounded_context_events
         .iter()
-        .filter(|e| e.bounded_context == access_mapping.bounded_context)
-        .filter(|e| event_types.is_empty() || event_types.contains(&e.event_type))
+        .filter(|e| e.bounded_context.same_as(&access_mapping.bounded_context))
+        .filter(|e| {
+            event_types.is_empty() || event_types.iter().any(|et| et.same_as(&e.event_type))
+        })
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
         .filter(|e| {
             correlation_id.is_none_or(|id| e.metadata.correlation_id.as_deref() == Some(id))
@@ -2862,7 +2898,10 @@ pub fn inspect_event(
     if access_mapping.level != AccessLevel::Admin {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if access_mapping.bounded_context != event.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&event.bounded_context)
+    {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if !event_owner_scope_satisfied(event, access_mapping.scope.as_deref()) {
@@ -2965,21 +3004,25 @@ pub fn fetch_commands_select(
     }
     if !command_types
         .iter()
-        .all(|ct| ct.bounded_context == access_mapping.bounded_context)
+        .all(|ct| ct.bounded_context.same_as(&access_mapping.bounded_context))
     {
         return Err(Error::CommandTypeNotInBoundedContext.into());
     }
-    if triggered_event.is_some_and(|te| te.bounded_context != access_mapping.bounded_context) {
+    if triggered_event
+        .is_some_and(|te| !te.bounded_context.same_as(&access_mapping.bounded_context))
+    {
         return Err(Error::TriggeredEventNotInBoundedContext.into());
     }
-    if after_command.is_some_and(|c| c.bounded_context != access_mapping.bounded_context) {
+    if after_command.is_some_and(|c| !c.bounded_context.same_as(&access_mapping.bounded_context)) {
         return Err(Error::AfterCommandNotInBoundedContext.into());
     }
 
     Ok(bounded_context_commands
         .iter()
-        .filter(|c| c.bounded_context == access_mapping.bounded_context)
-        .filter(|c| command_types.is_empty() || command_types.contains(&c.command_type))
+        .filter(|c| c.bounded_context.same_as(&access_mapping.bounded_context))
+        .filter(|c| {
+            command_types.is_empty() || command_types.iter().any(|ct| ct.same_as(&c.command_type))
+        })
         .filter(|c| after.is_none_or(|a| c.metadata.created_at >= a))
         .filter(|c| before.is_none_or(|b| c.metadata.created_at <= b))
         .filter(|c| {
@@ -3023,7 +3066,7 @@ pub fn create_all_events_subscription(
     }
     if !event_types
         .iter()
-        .all(|et| et.bounded_context == access_mapping.bounded_context)
+        .all(|et| et.bounded_context.same_as(&access_mapping.bounded_context))
     {
         return Err(Error::EventTypeNotInBoundedContext.into());
     }
@@ -3031,7 +3074,7 @@ pub fn create_all_events_subscription(
     let starting_point = from_sequence.unwrap_or_else(|| {
         bounded_context_events
             .iter()
-            .filter(|e| e.bounded_context == access_mapping.bounded_context)
+            .filter(|e| e.bounded_context.same_as(&access_mapping.bounded_context))
             .map(|e| e.sequence)
             .max()
             .unwrap_or(-1)
@@ -3059,7 +3102,10 @@ pub fn create_event_type_subscription(
     if access_mapping.status != RoleStatus::Active {
         return Err(crate::access_control::Error::GrantNotActive.into());
     }
-    if access_mapping.bounded_context != event_type.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&event_type.bounded_context)
+    {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if event_type.bounded_context.status != BoundedContextStatus::Active {
@@ -3072,7 +3118,7 @@ pub fn create_event_type_subscription(
     let starting_point = from_sequence.unwrap_or_else(|| {
         bounded_context_events
             .iter()
-            .filter(|e| e.bounded_context == event_type.bounded_context)
+            .filter(|e| e.bounded_context.same_as(&event_type.bounded_context))
             .map(|e| e.sequence)
             .max()
             .unwrap_or(-1)
@@ -3152,14 +3198,17 @@ pub fn deliver_to_subscriptions(
 /// (docs/architecture.md §85); `deliver_to_subscriptions` still applies
 /// it together with the grant's status and owner scope.
 pub fn subscription_selects(subscription: &Subscription, event: &Event) -> bool {
-    subscription.bounded_context() == &event.bounded_context
+    subscription
+        .bounded_context()
+        .same_as(&event.bounded_context)
         && subscription.starting_sequence() < event.sequence
         && match subscription {
             Subscription::AllEventsSubscription(a) => {
-                a.event_types.is_empty() || a.event_types.contains(&event.event_type)
+                a.event_types.is_empty()
+                    || a.event_types.iter().any(|et| et.same_as(&event.event_type))
             }
             Subscription::EventTypeSubscription(e) => {
-                e.event_type == event.event_type && matches_filters(event, &e.filters)
+                e.event_type.same_as(&event.event_type) && matches_filters(event, &e.filters)
             }
         }
 }
@@ -3322,8 +3371,8 @@ pub fn fetch_events_page(
     let after = after_sequence.unwrap_or(-1);
     Ok(events
         .iter()
-        .filter(|e| e.bounded_context == read_type.bounded_context)
-        .filter(|e| &e.event_type == read_type)
+        .filter(|e| e.bounded_context.same_as(&read_type.bounded_context))
+        .filter(|e| e.event_type.same_as(read_type))
         .filter(|e| e.sequence > after)
         .filter(|e| matches_filters(e, filters))
         // Codeberg issue #18 - the REST-side counterpart to
@@ -3407,8 +3456,8 @@ pub fn consume_events(
     // after `position` was examined.
     let scanned_through = events
         .iter()
-        .filter(|e| e.bounded_context == token.event_type.bounded_context)
-        .filter(|e| e.event_type == token.event_type)
+        .filter(|e| e.bounded_context.same_as(&token.event_type.bounded_context))
+        .filter(|e| e.event_type.same_as(&token.event_type))
         .filter(|e| e.sequence > position)
         .map(|e| e.sequence)
         .max();
@@ -3443,8 +3492,8 @@ pub fn initial_consume_position<'a>(
     let read_type = &token.event_type;
     let qualifying = history
         .into_iter()
-        .filter(|e| e.bounded_context == read_type.bounded_context)
-        .filter(|e| &e.event_type == read_type)
+        .filter(|e| e.bounded_context.same_as(&read_type.bounded_context))
+        .filter(|e| e.event_type.same_as(read_type))
         .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()));
     match token.start_from {
         EventReadStartPosition::Beginning => -1,
@@ -3549,8 +3598,8 @@ pub fn consume_events_page(
     } else {
         events
             .iter()
-            .filter(|e| e.bounded_context == read_type.bounded_context)
-            .filter(|e| &e.event_type == read_type)
+            .filter(|e| e.bounded_context.same_as(&read_type.bounded_context))
+            .filter(|e| e.event_type.same_as(read_type))
             .filter(|e| e.sequence > position)
             .filter(|e| matches_filters(e, filters))
             .filter(|e| event_owner_scope_satisfied(e, token.scope.as_deref()))
@@ -4121,7 +4170,10 @@ pub fn authorise_command_submission(
     ) {
         return Err(crate::access_control::Error::InsufficientAccessLevel.into());
     }
-    if access_mapping.bounded_context != command_type.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&command_type.bounded_context)
+    {
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     if command_type.bounded_context.status != BoundedContextStatus::Active {

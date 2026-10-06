@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A conformance suite across GraphQL and REST (docs/architecture.md
+  §179, Codeberg issue #43): `skilj/tests/conformance.rs` runs the same
+  command submissions and event reads over both tracks, compares each
+  outcome with a checked-in transcript, and requires the two tracks to
+  agree unless the scenario is catalogued as a deliberate divergence
+  with its reason.
+
 - `build()` warns for every projection that consumes an event type with
   private fields: they reach `project()` unredacted, and whatever of
   them a projection keeps in its state, every reader of that projection
@@ -54,6 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged (docs/architecture.md §171, Codeberg issue #40).
 
 ### Fixed
+
+- Reads of an archived bounded context served no events, over GraphQL
+  and REST, whenever the event cache held them; the history is retained
+  and is served again. Cached events also stopped matching their own
+  type after it was re-registered or, for a scheduled type, after each
+  fire, and a live subscription stopped delivering a type's new events
+  after a re-registration. Rules now compare bounded contexts and types
+  by name, not by every field of a copy loaded at another time
+  (docs/architecture.md §179).
 
 - A command's re-check under the bounded context's lock started at the
   last event its consistency tags already had - for a new key, the start

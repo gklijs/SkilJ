@@ -1036,7 +1036,10 @@ pub fn grant_private_field_access_for_event(
         return Err(Error::RoleNotActive.into());
     }
     if let Some(event) = event {
-        if event.bounded_context != access_mapping.bounded_context {
+        if !event
+            .bounded_context
+            .same_as(&access_mapping.bounded_context)
+        {
             return Err(Error::PrivateFieldRecordWrongBoundedContext.into());
         }
         if !crate::event_store::is_default_private_reader(event, &access_mapping.role) {
@@ -1073,7 +1076,10 @@ pub fn grant_private_field_access_for_command(
         return Err(Error::RoleNotActive.into());
     }
     if let Some(command) = command {
-        if command.bounded_context != access_mapping.bounded_context {
+        if !command
+            .bounded_context
+            .same_as(&access_mapping.bounded_context)
+        {
             return Err(Error::PrivateFieldRecordWrongBoundedContext.into());
         }
         if !crate::event_store::is_default_private_reader(command, &access_mapping.role) {
@@ -1282,7 +1288,10 @@ pub fn create_external_event_token(
 ) -> crate::error::Result<ExternalEventToken> {
     require_active_admin(access_mapping)?;
     let scope = scope_for_minted_token(access_mapping, scope)?;
-    if access_mapping.bounded_context != event_type.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&event_type.bounded_context)
+    {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
 
@@ -1309,7 +1318,10 @@ pub fn create_direct_creation_token(
 ) -> crate::error::Result<DirectCreationToken> {
     require_active_admin(access_mapping)?;
     let scope = scope_for_minted_token(access_mapping, scope)?;
-    if access_mapping.bounded_context != event_type.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&event_type.bounded_context)
+    {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
 
@@ -1367,7 +1379,10 @@ pub fn create_event_read_token(
 ) -> crate::error::Result<EventReadToken> {
     require_active_admin(access_mapping)?;
     let scope = scope_for_minted_token(access_mapping, scope)?;
-    if access_mapping.bounded_context != event_type.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&event_type.bounded_context)
+    {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
 
@@ -1417,7 +1432,10 @@ pub fn create_command_token(
 ) -> crate::error::Result<CommandToken> {
     require_active_admin(access_mapping)?;
     let scope = scope_for_minted_token(access_mapping, scope)?;
-    if access_mapping.bounded_context != command_type.bounded_context {
+    if !access_mapping
+        .bounded_context
+        .same_as(&command_type.bounded_context)
+    {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
 
@@ -1442,7 +1460,7 @@ pub fn revoke_token(
     now: chrono::DateTime<chrono::Utc>,
 ) -> crate::error::Result<AccessToken> {
     require_active_admin(access_mapping)?;
-    if &access_mapping.bounded_context != token.scope() {
+    if !access_mapping.bounded_context.same_as(token.scope()) {
         return Err(Error::GrantBoundedContextMismatch.into());
     }
     // docs/architecture.md §92: a scoped admin's reach over tokens is its
