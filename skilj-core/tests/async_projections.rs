@@ -27,6 +27,10 @@ use skilj_core::shared::{generate_token_id, Metadata};
 /// `TransferBalances`), so there's no need to duplicate that here too.
 struct TestDispatcher;
 
+/// An event whose fold always fails - what a projection that can't
+/// handle one event looks like to the catch-up.
+const POISON_AMOUNT: i64 = -999;
+
 impl ProjectionDispatcher for TestDispatcher {
     fn keys(
         &self,
@@ -87,6 +91,12 @@ impl ProjectionDispatcher for TestDispatcher {
                 let payload: serde_json::Value =
                     serde_json::from_str(&event.payload).expect("test payload is always JSON");
                 let amount = payload["amount"].as_i64().unwrap_or(0);
+                if amount == POISON_AMOUNT {
+                    return Some(Err(skilj_core::event_store::Error::PayloadDecodeFailed(
+                        "poison event".to_string(),
+                    )
+                    .into()));
+                }
                 Some(Ok((current + amount).to_string()))
             }
             _ => None,
@@ -1244,6 +1254,112 @@ fn a_cold_start_catch_up_over_a_long_history_spans_ticks() {
                 .await
                 .unwrap(),
             Some((cap + 3).to_string())
+        );
+    });
+}
+
+/// docs/architecture.md §182: catch-up folds a chunk of events per
+/// transaction, but an event whose fold fails mid-chunk doesn't take the
+/// events before it down with it - they commit, the error is returned,
+/// and every later tick stops at the same event without folding anything
+/// twice.
+#[test]
+fn a_failing_event_mid_chunk_keeps_the_progress_before_it() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        let mut last_good = 0;
+        for _ in 0..5 {
+            last_good = insert_plain_event(&pool, &bc, &et, 1).await;
+        }
+        insert_plain_event(&pool, &bc, &et, POISON_AMOUNT).await;
+        for _ in 0..3 {
+            insert_plain_event(&pool, &bc, &et, 1).await;
+        }
+
+        for _ in 0..2 {
+            assert!(
+                db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+                    .await
+                    .is_err(),
+                "the poison event's failure is returned"
+            );
+            let projection = db::get_projection(&pool, &bc.name, "AccountBalance")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(projection.caught_up_to, Some(last_good));
+            assert_eq!(
+                db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                    .await
+                    .unwrap(),
+                Some("5".to_string())
+            );
+        }
+    });
+}
+
+/// docs/architecture.md §182: a rebuild over a history longer than one
+/// chunk replays it across several transactions in one tick, each chunk
+/// starting where the last left off, and promotes with every event folded
+/// exactly once.
+#[test]
+fn a_rebuild_over_several_chunks_folds_every_event_once() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        let existing = seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        for _ in 0..250 {
+            insert_plain_event(&pool, &bc, &et, 1).await;
+        }
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        db::upsert_projection_rebuild(
+            &pool,
+            &ProjectionRebuild {
+                projection: existing.clone(),
+                schema: r#"{"properties":{"total":{"type":"integer"}}}"#.to_string(),
+                schema_version: 2,
+                consumed_event_types: vec![et.clone()],
+                sync: false,
+                caught_up_to: None,
+                status: ProjectionRebuildStatus::Building,
+            },
+        )
+        .await
+        .unwrap();
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+
+        assert!(db::get_projection_rebuild(
+            &pool,
+            &bc.name,
+            "AccountBalance",
+            ProjectionRebuildStatus::Building
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let promoted = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.schema_version, 2);
+        assert_eq!(
+            db::get_projection_state(&pool, &bc.name, "AccountBalance", "")
+                .await
+                .unwrap(),
+            Some("250".to_string())
         );
     });
 }

@@ -11146,3 +11146,39 @@ Codeberg issue #69. Re-registering a projection with a changed schema doesn't ch
 **Fix.** `promote_projection_rebuild` notifies after its commit when it promotes. A deferred promotion (`Ok(false)`) writes nothing and doesn't notify. The doc comment on `notify_registration_changed` now lists all of its callers, `register_new_sync_projection` and `promote_projection_rebuild` included. No other write changes a live projection's `schema`. `@guarantee RegistrationReachesEveryInstance` already promised this: promotion is when a re-registration's schema takes effect, so the spec is unchanged.
 
 Test (`skilj/tests/cross_instance.rs`): `a_promoted_rebuild_refreshes_the_graphql_schema_on_every_instance` runs two instances that both declare an async `Ledger` (only a declaring instance folds or promotes a rebuild, §160). It re-registers `Ledger` with an added `overdraft` field, requires both `{bc}_Ledger` types to still lack it, starts the rebuild, waits for promotion, then requires the field on both instances. Either instance's tick may promote, so the test covers the promoting instance and the other one, whichever is which. Without the fix it fails on instance A, which still has only `balance`.
+
+## 182. Async projection catch-up folds a chunk of events per transaction
+
+Codeberg issue #52: check how async projections apply events, and whether a chunk per transaction would cut commit overhead, as the command batcher (§58) and `deliver_batch` (§154) did.
+
+**What it did.** The unpartitioned path of `catch_up_bounded_context` used one transaction per event. Per event and per projection it locked and re-read the projection row, ran a get-or-create-with-lock for every key the event touched, wrote each key back, stamped `caught_up_to`, and committed. The same applied to every `building` rebuild. The partitioned path (§51) already used one transaction per partition per tick, at up to `MAX_EVENTS_PER_PARTITION_TICK` events.
+
+**Benchmark.** `skilj-core/tests/projection_catch_up_throughput.rs` (`#[ignore]`d) commits 5000 events into a fresh bounded context, registers async projections, and times back-to-back `catch_up_bounded_context` calls until they're caught up. **total** is one key for the whole bounded context, **per-account** is 500 keys, **both** is four projections (two of each). On the embedded Postgres, same machine as §178:
+
+| scenario | before | chunk per transaction | + batched key reads/writes |
+|---|---|---|---|
+| total | ~1,340 events/s | ~67,000 | ~69,000 |
+| per-account | ~1,270 | ~4,200 | ~36,000 |
+| both | ~470 | ~2,100 | ~16,000 |
+
+**Change.** `fold_catch_up_chunk` folds up to `CATCH_UP_EVENTS_PER_TRANSACTION` (100) events in one transaction:
+1. It locks every projection row, then every `building` rebuild row, sorted by name, and re-reads each under its lock. A projection that turned sync or is gone, or a rebuild that was promoted or removed, is left out, as before.
+2. From the locked positions it works out which target folds which event, exactly as the per-event loop did. A live projection folds every event past its position. A rebuild folds an event only if it has processed exactly up to the one before it (§151), and from then on every one.
+3. A rebuild restarted to `caught_up_to = NULL` that folds this chunk has its old `projection_rebuild_state` deleted first, under its lock, as before.
+4. It reads and locks every key the chunk touches with one `INSERT ... SELECT unnest(...) ON CONFLICT DO UPDATE ... RETURNING` per target.
+5. It folds the events in memory, keeping the `as_of_sequence` guard per key (Codeberg #25).
+6. It writes every folded key back with one `UPDATE ... FROM unnest(...)` per target, stamps `caught_up_to`, and commits.
+
+An owner tag sets a key's `owner` from the last event that carried one; a key no event gave an owner keeps the stored one (`COALESCE`), as `apply_projection_fold_update` does.
+
+**Why it's the same.** Every check the per-event loop made against a freshly locked row is made once, under the same lock, and the transaction holds that lock until it commits. Nothing can change the row in between, so checking once is checking every time. The lock order is unchanged (§156): projection rows, then rebuild rows, then state rows. Sorting by name is new. `list_projections_for_bounded_context` has no `ORDER BY`, and two instances' transactions could already take two projection rows in opposite orders when they wrote both.
+
+**A failing event.** With one transaction per event, an event whose `project()` fails left every event before it committed. To keep that, a failed chunk reports how many of its events came before the failing one. `catch_up_bounded_context` folds those again in a transaction of their own, commits, and then returns the error. `project()` is a pure fold, so folding them again is safe. Failures that aren't one event's (the transaction itself, or reading or writing the chunk's rows) retry nothing; the next tick does. Test: `a_failing_event_mid_chunk_keeps_the_progress_before_it` (`skilj-core/tests/async_projections.rs`). It fails without the retry: the projection stays at `None`. `a_rebuild_over_several_chunks_folds_every_event_once` replays 250 events through three chunks in one tick, then checks the promotion and the folded total.
+
+**Cost.** The chunk holds each projection row it folds until it commits. A registration or a promotion of that projection waits for it. Promotion holds the bounded context's sequence lock while it waits, so command writes wait too. At the measured rates a chunk takes about 3 ms for one keyed projection and about 6 ms for four. Before, the wait was one event's transaction, but there were many more of them.
+
+**A lock-order fix.** `fold_event_into_new_projection` folds history into a newly registered sync projection while it's still stored async (§113). It locked state rows before the projection row, the reverse of catch-up and promotion. The catch-up folds the same projection at the same time, so the two could deadlock, and chunks hold the projection row longer. It now locks the projection row first.
+
+**Not changed:**
+- The partitioned path still reads and writes each key once per event, inside its one transaction per partition. Batching those reads and writes would help it the same way.
+- `fold_history_into_new_sync_projection` still commits once per event. It runs once per registration.

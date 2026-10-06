@@ -4428,47 +4428,15 @@ async fn get_or_create_projection_state_for_update(
     Ok((as_of_sequence, state))
 }
 
-/// `get_or_create_projection_state_for_update`'s own twin for
-/// `projection_rebuild_state` - see that function's own doc comment for
-/// the "no-op write, purely to acquire the lock" reasoning and the
-/// returned `as_of_sequence`, both identical here. `status` is always
-/// `'building'` inline, not a parameter - a pending row is never folded
-/// (only `catch_up_bounded_context`'s own `building_rebuilds` walk
-/// reaches this function at all), so there is no other status any real
-/// caller could mean.
-async fn get_or_create_projection_rebuild_state_for_update(
-    executor: impl sqlx::PgExecutor<'_>,
-    schema: &str,
-    projection_name: &str,
-    key: &str,
-    default_state_json: &str,
-) -> crate::error::Result<(i64, String)> {
-    let (as_of_sequence, state): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO {schema}.projection_rebuild_state (projection_name, status, key, state, \
-         updated_at) VALUES ($1, 'building', $2, $3, now()) \
-         ON CONFLICT (projection_name, status, key) DO UPDATE SET \
-         state = {schema}.projection_rebuild_state.state \
-         RETURNING as_of_sequence, state"
-    )))
-    .bind(projection_name)
-    .bind(key)
-    .bind(default_state_json)
-    .fetch_one(executor)
-    .await?;
-    Ok((as_of_sequence, state))
-}
-
 /// Applies one projection fold's `UPDATE ... SET state = ...` - shared by
 /// every "fold one event, persist the new state" call site
-/// (`insert_event_and_update_sync_projections_in_tx`, both of
-/// `catch_up_bounded_context`'s live and rebuild-building loops, and
-/// `fold_history_into_new_sync_projection`), which were four near-identical
-/// copies of the same statement before this pass. `table` is
-/// `"projection_state"` or `"projection_rebuild_state"`; `extra_where` is
-/// appended to the `WHERE` clause verbatim - `""` for the live table,
-/// `" AND status = 'building'"` for the rebuild one, the same
-/// distinction `get_or_create_projection_rebuild_state_for_update`'s own
-/// hard-coded `'building'` already draws.
+/// (`insert_event_and_update_sync_projections_in_tx`, the partitioned
+/// catch-up, and `fold_history_into_new_sync_projection`). The
+/// unpartitioned catch-up folds a chunk of events at once and writes each
+/// key back in one statement of its own (docs/architecture.md §182).
+/// `table` is `"projection_state"` or `"projection_rebuild_state"`;
+/// `extra_where` is appended to the `WHERE` clause verbatim - `""` for the
+/// live table, `" AND status = 'building'"` for the rebuild one.
 ///
 /// Also derives and persists this instance's own `owner` column
 /// alongside `state` - cross-tenant projection read fix
@@ -4487,8 +4455,7 @@ async fn get_or_create_projection_rebuild_state_for_update(
 /// `SET` is correct here without needing a `GREATEST(...)` guard; what
 /// actually makes this safe under two instances racing the same row is
 /// each call site's own new pre-fold check against the value
-/// `get_or_create_projection_state_for_update`/`..._rebuild_state_for_update`
-/// just returned, *before* `dispatcher.project()` is ever called - by the
+/// `get_or_create_projection_state_for_update` just returned, *before* `dispatcher.project()` is ever called - by the
 /// time this function runs, the caller has already decided this event
 /// genuinely hasn't been folded into this row yet.
 #[allow(clippy::too_many_arguments)]
@@ -4503,14 +4470,7 @@ async fn apply_projection_fold_update(
     owner_tag_key: Option<&str>,
     event: &Event,
 ) -> crate::error::Result<()> {
-    let owner = owner_tag_key.and_then(|owner_tag_key| {
-        event
-            .tags
-            .iter()
-            .find(|tag| tag.key == owner_tag_key)
-            .and_then(|tag| tag.value.clone())
-    });
-    match owner {
+    match event_owner(owner_tag_key, event) {
         Some(owner) => {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.{table} SET state = $1, owner = $2, as_of_sequence = $3, \
@@ -4538,6 +4498,20 @@ async fn apply_projection_fold_update(
         }
     }
     Ok(())
+}
+
+/// The owner `event` gives a projection row: the value of its tag keyed
+/// `owner_tag_key`, when it has one with a non-null value - see
+/// [`apply_projection_fold_update`]. Shared with `catch_up_bounded_context`'s
+/// chunked fold (docs/architecture.md §182).
+fn event_owner(owner_tag_key: Option<&str>, event: &Event) -> Option<String> {
+    owner_tag_key.and_then(|owner_tag_key| {
+        event
+            .tags
+            .iter()
+            .find(|tag| tag.key == owner_tag_key)
+            .and_then(|tag| tag.value.clone())
+    })
 }
 
 /// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2" - get-or-create-with-lock for
@@ -4848,8 +4822,8 @@ pub async fn get_projection_rebuild_state(
     key: &str,
 ) -> crate::error::Result<Option<String>> {
     let schema = schema_ident(bounded_context);
-    // Always the `'building'` row - see `get_or_create_projection_rebuild_state_for_update`'s
-    // own doc comment for why no other status is meaningful here.
+    // Always the `'building'` row: a pending rebuild is never folded, so
+    // it has no state of its own.
     let row: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT state FROM {schema}.projection_rebuild_state \
          WHERE projection_name = $1 AND status = 'building' AND key = $2"
@@ -11842,230 +11816,45 @@ pub async fn catch_up_bounded_context(
         .await?
     };
 
-    // The sequence of the bounded context's event just before the one
+    // The sequence of the bounded context's event just before the chunk
     // being folded: `events` is every event after `min_caught_up`, in
-    // order, so a rebuild may fold `event` only if it has processed
-    // exactly up to here (docs/architecture.md §151).
+    // order, so a rebuild may fold an event only if it has processed
+    // exactly up to the one before it (docs/architecture.md §151). A chunk
+    // of events per transaction, not one (§182).
     let mut previous = min_caught_up;
-    for event in &events {
-        let mut tx = pool.begin().await?;
-
-        for projection in &unpartitioned_async_projections {
-            if projection.caught_up_to.unwrap_or(-1) >= event.sequence {
-                continue;
-            }
-
-            // docs/architecture.md §156: the projection row is locked
-            // before any of its state rows, the order promotion
-            // (`promote_projection_rebuild`) takes them in. Taking the
-            // state rows first deadlocked against a concurrent promotion
-            // on another instance. Re-read under the lock, a projection
-            // already past `event`, turned sync or gone since the
-            // snapshot above is left alone.
-            let current: Option<(Option<i64>, bool)> =
-                sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                    "SELECT caught_up_to, sync FROM {schema}.projections \
-                     WHERE name = $1 FOR UPDATE"
-                )))
-                .bind(&projection.name)
-                .fetch_optional(&mut *tx)
-                .await?;
-            match current {
-                Some((caught_up_to, false)) if caught_up_to.unwrap_or(-1) < event.sequence => {}
-                _ => continue,
-            }
-
-            // `Some(vec![])`/`None` both mean zero instances touched -
-            // see `insert_event_and_update_sync_projections`'s own
-            // identical comment.
-            let keys = dispatcher
-                .keys(bounded_context, &projection.name, event)
-                .unwrap_or_default();
-            let default_state_json = dispatcher
-                .default_state(bounded_context, &projection.name)
-                .unwrap_or_default();
-            let owner_tag_key = dispatcher
-                .owner_tag_key(bounded_context, &projection.name)
-                .flatten();
-
-            for key in &keys {
-                // `as_of_sequence` guard (Codeberg issue #25's
-                // investigation finding) - this row's own real, current
-                // position, re-read fresh under this row's lock rather
-                // than trusted from `async_projections`' own function-
-                // entry snapshot above (which two concurrent instances'
-                // calls would each load independently, stale relative to
-                // each other). Proven necessary by a real concurrent
-                // test, not just reasoned about: without this check, two
-                // instances racing this same row both fold the same
-                // event, the second reading the first's already-updated
-                // `state` back as `current_state` and folding again on
-                // top of it.
-                let (as_of_sequence, current_state) = get_or_create_projection_state_for_update(
-                    &mut *tx,
-                    &schema,
-                    &projection.name,
-                    key,
-                    &default_state_json,
-                )
-                .await?;
-                if as_of_sequence >= event.sequence {
-                    continue;
-                }
-
-                let new_state = match dispatcher.project(
+    for chunk in events.chunks(CATCH_UP_EVENTS_PER_TRANSACTION) {
+        let folded = fold_catch_up_chunk(
+            pool,
+            bounded_context,
+            &schema,
+            dispatcher,
+            &unpartitioned_async_projections,
+            &building_rebuilds,
+            chunk,
+            previous,
+        )
+        .await;
+        if let Err(failure) = folded {
+            // A failing event doesn't take the events before it in its
+            // chunk down with it: those commit on their own, as they did
+            // with one transaction per event, and the error is returned.
+            if failure.folded_before > 0 {
+                fold_catch_up_chunk(
+                    pool,
                     bounded_context,
-                    &projection.name,
-                    &current_state,
-                    event,
-                    key,
-                ) {
-                    Some(result) => result?,
-                    None => current_state,
-                };
-
-                apply_projection_fold_update(
-                    &mut *tx,
                     &schema,
-                    "projection_state",
-                    "",
-                    &projection.name,
-                    key,
-                    &new_state,
-                    owner_tag_key,
-                    event,
+                    dispatcher,
+                    &unpartitioned_async_projections,
+                    &building_rebuilds,
+                    &chunk[..failure.folded_before],
+                    previous,
                 )
-                .await?;
+                .await
+                .map_err(|retry| retry.error)?;
             }
-
-            // Never backwards: another instance's concurrent catch-up
-            // may already have moved it further (docs/architecture.md §113).
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {schema}.projections SET caught_up_to = $1 \
-                 WHERE name = $2 AND (caught_up_to IS NULL OR caught_up_to < $1)"
-            )))
-            .bind(event.sequence)
-            .bind(&projection.name)
-            .execute(&mut *tx)
-            .await?;
+            return Err(failure.error);
         }
-
-        for rebuild in &building_rebuilds {
-            if rebuild.caught_up_to.unwrap_or(-1) >= event.sequence {
-                continue;
-            }
-
-            // docs/architecture.md §151: the snapshot above may be stale -
-            // another instance may have folded since, or a
-            // `rebuildProjection` arriving mid-build may have restarted
-            // this rebuild (`caught_up_to` back to NULL, a new
-            // definition). Locked and re-read here, the rebuild is folded
-            // only if it has processed exactly up to `previous`; anything
-            // else waits for the next tick's fresh snapshot. Folding
-            // anyway, a stale instance set a restarted rebuild's
-            // `caught_up_to` past everything before `event` - promoting,
-            // later, state that never saw those events.
-            let current: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT caught_up_to FROM {schema}.projection_rebuilds \
-                 WHERE projection_name = $1 AND status = 'building' FOR UPDATE"
-            )))
-            .bind(&rebuild.projection.name)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((current,)) = current else {
-                // Promoted or gone since the snapshot.
-                continue;
-            };
-            if current.unwrap_or(-1) != previous {
-                continue;
-            }
-            if current.is_none() {
-                // The first fold of this build: state left by a build it
-                // restarted is discarded - under the lock, so no instance
-                // can be folding into it meanwhile. It used to be deleted
-                // at the top of every tick whose (unlocked) snapshot showed
-                // NULL, which could wipe what another instance had just
-                // folded and committed.
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "DELETE FROM {schema}.projection_rebuild_state \
-                     WHERE projection_name = $1 AND status = 'building'"
-                )))
-                .bind(&rebuild.projection.name)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            let keys = dispatcher
-                .keys(bounded_context, &rebuild.projection.name, event)
-                .unwrap_or_default();
-            let default_state_json = dispatcher
-                .default_state(bounded_context, &rebuild.projection.name)
-                .unwrap_or_default();
-            let owner_tag_key = dispatcher
-                .owner_tag_key(bounded_context, &rebuild.projection.name)
-                .flatten();
-
-            for key in &keys {
-                // `as_of_sequence` guard - see the identical comment on
-                // the live-projection loop above; the same cross-instance
-                // race applies here for a `ProjectionRebuild`'s own state.
-                let (as_of_sequence, current_state) =
-                    get_or_create_projection_rebuild_state_for_update(
-                        &mut *tx,
-                        &schema,
-                        &rebuild.projection.name,
-                        key,
-                        &default_state_json,
-                    )
-                    .await?;
-                if as_of_sequence >= event.sequence {
-                    continue;
-                }
-
-                let new_state = match dispatcher.project(
-                    bounded_context,
-                    &rebuild.projection.name,
-                    &current_state,
-                    event,
-                    key,
-                ) {
-                    Some(result) => result?,
-                    None => current_state,
-                };
-
-                apply_projection_fold_update(
-                    &mut *tx,
-                    &schema,
-                    "projection_rebuild_state",
-                    " AND status = 'building'",
-                    &rebuild.projection.name,
-                    key,
-                    &new_state,
-                    owner_tag_key,
-                    event,
-                )
-                .await?;
-            }
-
-            // `AND status = 'building'` - not just `projection_name` -
-            // matters for real now that a coexisting pending row can
-            // share that same `projection_name`: without it, this would
-            // also stamp the pending row's own `caught_up_to`, which
-            // means nothing for a row that is never folded and must stay
-            // `None` until it is promoted or discarded.
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {schema}.projection_rebuilds SET caught_up_to = $1 \
-                 WHERE projection_name = $2 AND status = 'building' \
-                 AND (caught_up_to IS NULL OR caught_up_to < $1)"
-            )))
-            .bind(event.sequence)
-            .bind(&rebuild.projection.name)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        previous = event.sequence;
+        previous = chunk.last().expect("chunks are never empty").sequence;
     }
 
     for rebuild in &building_rebuilds {
@@ -12120,6 +11909,356 @@ pub async fn catch_up_bounded_context(
         .await?;
     }
 
+    Ok(())
+}
+
+/// How many events `catch_up_bounded_context` folds per transaction
+/// (docs/architecture.md §182). One per event paid, per event, a commit,
+/// a lock and re-read of every projection row, and a read and a write of
+/// every key it touched; a chunk pays them once, with each projection's
+/// keys read and written in one statement. Bounded because the chunk's
+/// transaction holds each folded projection's row lock throughout, which
+/// a registration or promotion of that projection waits on.
+const CATCH_UP_EVENTS_PER_TRANSACTION: usize = 100;
+
+/// Why [`fold_catch_up_chunk`] failed, and how many of the chunk's events
+/// came before the one it failed on - `0` when the failure isn't one
+/// event's (the transaction itself, or reading or writing the chunk's
+/// rows).
+struct CatchUpChunkFailure {
+    folded_before: usize,
+    error: crate::error::Error,
+}
+
+/// One key's state while a chunk is folded: read and locked before the
+/// chunk's events are folded into it, written back once after.
+struct CatchUpChunkState {
+    as_of_sequence: i64,
+    state: String,
+    owner: Option<String>,
+    folded: bool,
+}
+
+/// One projection or `building` rebuild a chunk folds into.
+struct CatchUpChunkTarget<'a> {
+    name: &'a str,
+    rebuild: bool,
+    /// `caught_up_to` as read under the row's lock.
+    locked: Option<i64>,
+    /// `caught_up_to` once the chunk is folded.
+    position: Option<i64>,
+    /// Every key the chunk's events touch, in the order first touched.
+    keys: Vec<String>,
+    states: std::collections::HashMap<String, CatchUpChunkState>,
+}
+
+/// Folds `events` - a contiguous run of the bounded context's events,
+/// the first one right after `previous` - into the unpartitioned async
+/// `projections` and the `building` `rebuilds`, in one transaction.
+/// Exactly what folding them one transaction per event did, only
+/// committed together: every check the per-event loop made against a
+/// re-read row is made once, under that row's lock, which the transaction
+/// then holds to the end - so it can't change in between.
+///
+/// Locks are taken in the order the per-event loop took them and
+/// promotion takes them (docs/architecture.md §156): every projection row
+/// first, then every rebuild row, each by name so two instances' chunks
+/// can't take two of them in opposite orders, then their state rows.
+#[allow(clippy::too_many_arguments)]
+async fn fold_catch_up_chunk(
+    pool: &Pool,
+    bounded_context: &str,
+    schema: &str,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    projections: &[&Projection],
+    rebuilds: &[ProjectionRebuild],
+    events: &[Event],
+    previous: i64,
+) -> Result<(), CatchUpChunkFailure> {
+    let mut reached = 0;
+    fold_catch_up_chunk_in_tx(
+        pool,
+        bounded_context,
+        schema,
+        dispatcher,
+        projections,
+        rebuilds,
+        events,
+        previous,
+        &mut reached,
+    )
+    .await
+    .map_err(|error| CatchUpChunkFailure {
+        folded_before: reached,
+        error,
+    })
+}
+
+/// [`fold_catch_up_chunk`]'s body - `reached` is the index of the event
+/// being folded, `0` outside the fold itself.
+#[allow(clippy::too_many_arguments)]
+async fn fold_catch_up_chunk_in_tx(
+    pool: &Pool,
+    bounded_context: &str,
+    schema: &str,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    projections: &[&Projection],
+    rebuilds: &[ProjectionRebuild],
+    events: &[Event],
+    previous: i64,
+    reached: &mut usize,
+) -> crate::error::Result<()> {
+    let Some(chunk_end) = events.last().map(|event| event.sequence) else {
+        return Ok(());
+    };
+    let mut tx = pool.begin().await?;
+    let mut targets: Vec<CatchUpChunkTarget> = Vec::new();
+
+    // Re-read under the lock, a projection already past the chunk, turned
+    // sync or gone since the caller's snapshot is left alone.
+    let mut candidates: Vec<&Projection> = projections
+        .iter()
+        .copied()
+        .filter(|p| p.caught_up_to.unwrap_or(-1) < chunk_end)
+        .collect();
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    for projection in candidates {
+        let current: Option<(Option<i64>, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT caught_up_to, sync FROM {schema}.projections WHERE name = $1 FOR UPDATE"
+        )))
+        .bind(&projection.name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((caught_up_to, false)) = current {
+            targets.push(CatchUpChunkTarget {
+                name: &projection.name,
+                rebuild: false,
+                locked: caught_up_to,
+                position: caught_up_to,
+                keys: Vec::new(),
+                states: std::collections::HashMap::new(),
+            });
+        }
+    }
+
+    // docs/architecture.md §151: a rebuild promoted, gone or restarted
+    // since the caller's snapshot is seen here, under its lock.
+    let mut candidates: Vec<&ProjectionRebuild> = rebuilds
+        .iter()
+        .filter(|r| r.caught_up_to.unwrap_or(-1) < chunk_end)
+        .collect();
+    candidates.sort_by(|a, b| a.projection.name.cmp(&b.projection.name));
+    for rebuild in candidates {
+        let current: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT caught_up_to FROM {schema}.projection_rebuilds \
+             WHERE projection_name = $1 AND status = 'building' FOR UPDATE"
+        )))
+        .bind(&rebuild.projection.name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((caught_up_to,)) = current {
+            targets.push(CatchUpChunkTarget {
+                name: &rebuild.projection.name,
+                rebuild: true,
+                locked: caught_up_to,
+                position: caught_up_to,
+                keys: Vec::new(),
+                states: std::collections::HashMap::new(),
+            });
+        }
+    }
+
+    // Which target folds which event, and with which keys, in the order
+    // the per-event loop folded them. A live projection folds every event
+    // past its position; a rebuild only an event right after what it has
+    // processed (§151) - and from then on every one, since it then has.
+    let mut planned: Vec<(usize, usize, Vec<String>)> = Vec::new();
+    let mut seen: Vec<std::collections::HashSet<String>> =
+        vec![std::collections::HashSet::new(); targets.len()];
+    let mut before = previous;
+    for (index, event) in events.iter().enumerate() {
+        for (slot, target) in targets.iter_mut().enumerate() {
+            let folds = if target.rebuild {
+                target.position.unwrap_or(-1) == before
+            } else {
+                target.position.unwrap_or(-1) < event.sequence
+            };
+            if !folds {
+                continue;
+            }
+            // `Some(vec![])`/`None` both mean zero instances touched -
+            // see `insert_event_and_update_sync_projections`'s own
+            // identical comment.
+            let keys = dispatcher
+                .keys(bounded_context, target.name, event)
+                .unwrap_or_default();
+            for key in &keys {
+                if seen[slot].insert(key.clone()) {
+                    target.keys.push(key.clone());
+                }
+            }
+            planned.push((index, slot, keys));
+            target.position = Some(event.sequence);
+        }
+        before = event.sequence;
+    }
+
+    for target in &mut targets {
+        if target.rebuild && target.locked.is_none() && target.position.is_some() {
+            // The first fold of this build: state left by a build it
+            // restarted is discarded - under the lock, so no instance can
+            // be folding into it meanwhile.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {schema}.projection_rebuild_state \
+                 WHERE projection_name = $1 AND status = 'building'"
+            )))
+            .bind(target.name)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if target.keys.is_empty() {
+            continue;
+        }
+        let default_state_json = dispatcher
+            .default_state(bounded_context, target.name)
+            .unwrap_or_default();
+        // Get-or-create-with-lock, every key at once - see
+        // `get_or_create_projection_state_for_update`.
+        let rows: Vec<(String, i64, String)> = if target.rebuild {
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {schema}.projection_rebuild_state \
+                 (projection_name, status, key, state, updated_at) \
+                 SELECT $1, 'building', key, $3, now() FROM unnest($2::text[]) AS key \
+                 ON CONFLICT (projection_name, status, key) DO UPDATE SET \
+                 state = {schema}.projection_rebuild_state.state \
+                 RETURNING key, as_of_sequence, state"
+            )))
+        } else {
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
+                 SELECT $1, key, $3, now() FROM unnest($2::text[]) AS key \
+                 ON CONFLICT (projection_name, key) DO UPDATE SET \
+                 state = {schema}.projection_state.state \
+                 RETURNING key, as_of_sequence, state"
+            )))
+        }
+        .bind(target.name)
+        .bind(&target.keys)
+        .bind(&default_state_json)
+        .fetch_all(&mut *tx)
+        .await?;
+        target.states = rows
+            .into_iter()
+            .map(|(key, as_of_sequence, state)| {
+                let folded = CatchUpChunkState {
+                    as_of_sequence,
+                    state,
+                    owner: None,
+                    folded: false,
+                };
+                (key, folded)
+            })
+            .collect();
+    }
+
+    for (index, slot, keys) in &planned {
+        *reached = *index;
+        let event = &events[*index];
+        let target = &mut targets[*slot];
+        let owner = event_owner(
+            dispatcher
+                .owner_tag_key(bounded_context, target.name)
+                .flatten(),
+            event,
+        );
+        for key in keys {
+            let entry = target
+                .states
+                .get_mut(key)
+                .expect("every planned key's row was just read");
+            // `as_of_sequence` guard (Codeberg issue #25): another
+            // instance may have folded this row past `event` already.
+            if entry.as_of_sequence >= event.sequence {
+                continue;
+            }
+            if let Some(result) =
+                dispatcher.project(bounded_context, target.name, &entry.state, event, key)
+            {
+                entry.state = result?;
+            }
+            entry.as_of_sequence = event.sequence;
+            if owner.is_some() {
+                entry.owner.clone_from(&owner);
+            }
+            entry.folded = true;
+        }
+    }
+    *reached = 0;
+
+    for target in &targets {
+        let mut keys = Vec::new();
+        let mut states = Vec::new();
+        let mut owners = Vec::new();
+        let mut as_of_sequences = Vec::new();
+        for (key, folded) in target.states.iter().filter(|(_, s)| s.folded) {
+            keys.push(key.as_str());
+            states.push(folded.state.as_str());
+            owners.push(folded.owner.as_deref());
+            as_of_sequences.push(folded.as_of_sequence);
+        }
+        if !keys.is_empty() {
+            // A `NULL` owner leaves the stored one as it is - see
+            // `apply_projection_fold_update`.
+            let (table, extra_where) = if target.rebuild {
+                ("projection_rebuild_state", " AND s.status = 'building'")
+            } else {
+                ("projection_state", "")
+            };
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {schema}.{table} AS s SET state = u.state, \
+                 owner = COALESCE(u.owner, s.owner), as_of_sequence = u.as_of_sequence, \
+                 updated_at = now() \
+                 FROM unnest($2::text[], $3::text[], $4::text[], $5::bigint[]) \
+                 AS u(key, state, owner, as_of_sequence) \
+                 WHERE s.projection_name = $1 AND s.key = u.key{extra_where}"
+            )))
+            .bind(target.name)
+            .bind(&keys)
+            .bind(&states)
+            .bind(&owners)
+            .bind(&as_of_sequences)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if target.position == target.locked {
+            continue;
+        }
+        // Never backwards: another instance's concurrent catch-up may
+        // already have moved it further (docs/architecture.md §113). `AND
+        // status = 'building'`: a coexisting pending row shares the
+        // `projection_name`, and must keep its `caught_up_to` `None` until
+        // it's promoted or discarded.
+        let query = if target.rebuild {
+            format!(
+                "UPDATE {schema}.projection_rebuilds SET caught_up_to = $1 \
+                 WHERE projection_name = $2 AND status = 'building' \
+                 AND (caught_up_to IS NULL OR caught_up_to < $1)"
+            )
+        } else {
+            format!(
+                "UPDATE {schema}.projections SET caught_up_to = $1 \
+                 WHERE name = $2 AND (caught_up_to IS NULL OR caught_up_to < $1)"
+            )
+        };
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(target.position)
+            .bind(target.name)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -13107,6 +13246,18 @@ async fn fold_event_into_new_projection(
 ) -> crate::error::Result<()> {
     let bounded_context = &projection.bounded_context.name;
     let schema = schema_ident(bounded_context);
+    // docs/architecture.md §156: the projection row before any of its
+    // state rows, the order catch-up and promotion take them in. The
+    // projection is stored async while its history is folded, so
+    // catch-up folds it at the same time; taking a state row first could
+    // deadlock against a catch-up chunk holding the projection row
+    // (§182).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {schema}.projections WHERE name = $1 FOR UPDATE"
+    )))
+    .bind(&projection.name)
+    .execute(&mut **tx)
+    .await?;
     let keys = dispatcher
         .keys(bounded_context, &projection.name, event)
         .unwrap_or_default();

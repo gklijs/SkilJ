@@ -73,6 +73,24 @@ commit `0d9c409`): ~45 commands/s at 20 workers, ~58/s at 80, for one shared
 bounded context. A different application's commands, a networked client and
 another machine - not comparable with the in-process figures above.
 
+## Async projection catch-up
+
+`skilj-core/tests/projection_catch_up_throughput.rs` (`#[ignore]`d; `cargo test
+--release -p skilj-core --test projection_catch_up_throughput -- --ignored
+--nocapture`) times how fast async projections catch up on 5000 committed
+events. Catch-up folds 100 events per transaction and reads and writes each
+projection's keys once per chunk (docs/architecture.md §182). On the same
+machine as above:
+
+| projections | events/s (before §182) | events/s |
+|---|---|---|
+| one, a single key | ~1,340 | ~69,000 |
+| one, 500 keys | ~1,270 | ~36,000 |
+| four (two of each) | ~470 | ~16,000 |
+
+A projection with `PARTITION_COUNT > 1` uses its own path, which still writes
+each key once per event.
+
 ## Knobs
 
 All on `SkiljBuilder`:

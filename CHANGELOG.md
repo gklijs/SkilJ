@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Async projection catch-up folds up to 100 events per transaction
+  instead of one, and reads and writes each projection's keys once per
+  chunk instead of once per event: 25-50x faster in the new
+  `projection_catch_up_throughput` benchmark. An event whose fold fails
+  still leaves the events before it committed. A registration or
+  promotion of a projection now waits for the chunk being folded into
+  it, a few milliseconds (docs/architecture.md §182, Codeberg issue
+  #52).
 - `skilj-kafka`'s `run_inbound` dispatches the partitions it is assigned
   concurrently, one message in flight per partition, instead of one
   message at a time for the whole consumer. Messages of one partition
@@ -61,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged (docs/architecture.md §171, Codeberg issue #40).
 
 ### Fixed
+
+- Registering a sync projection over existing history could deadlock
+  against the catch-up folding the same projection: the history fold
+  locked state rows before the projection row. It now takes the
+  projection row first, the order catch-up and promotion use
+  (docs/architecture.md §182).
 
 - Reads of an archived bounded context served no events, over GraphQL
   and REST, whenever the event cache held them; the history is retained
