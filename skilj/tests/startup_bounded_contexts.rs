@@ -10,6 +10,9 @@
 //!
 //! docs/architecture.md §158: startup's schema patches take no table lock
 //! on a bounded context that already has what they add.
+//!
+//! docs/architecture.md §186: `Skilj::build()` refuses a pool the
+//! cross-instance listener would take whole.
 use chrono::{SubsecRound, Utc};
 use skilj::Skilj;
 use skilj_core::bootstrap::ContextCreator;
@@ -471,5 +474,36 @@ fn startup_upgrades_a_v0_0_1_bounded_context_to_the_current_schema() {
             missing.is_empty() && extra.is_empty(),
             "upgraded v0.0.1 schema differs from a fresh one\nmissing: {missing:#?}\nextra: {extra:#?}"
         );
+    });
+}
+
+/// docs/architecture.md §186: the cross-instance listener keeps one pooled
+/// connection for the process's lifetime. With a pool of one, every
+/// request after `build()` waited out the acquire timeout and failed;
+/// `build()` now refuses such a pool instead of starting.
+#[test]
+fn build_refuses_a_pool_the_listener_would_take_whole() {
+    runtime().block_on(async {
+        let Some((database_url, _pool)) = test_database().await else {
+            return;
+        };
+        let _serial = SERIAL.lock().await;
+        for max_connections in [0, 1] {
+            let err = Skilj::builder(database_url.clone())
+                .pool_options(db::PgPoolOptions::new().max_connections(max_connections))
+                .build()
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("a pool of {max_connections} was accepted"));
+            assert!(
+                matches!(
+                    err,
+                    skilj_core::Error::Database(sqlx::Error::Configuration(_))
+                ),
+                "{err}"
+            );
+            assert!(err.to_string().contains("at least 2"), "{err}");
+        }
+        assert_eq!(skilj::MIN_POOL_CONNECTIONS, 2);
     });
 }

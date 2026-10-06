@@ -80,7 +80,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`outbound_cycle`, `OutboundSink`); the bridges' public APIs are
   unchanged (docs/architecture.md §171, Codeberg issue #40).
 
+### Removed
+
+- `SkiljBuilder::pool_options_performance_optimized()`: it sized the pool
+  from the application host's cores, which could give fewer connections
+  than sqlx's default. docs/performance.md now has pool sizing guidance
+  instead (docs/architecture.md §186, Codeberg issue #49). Use
+  `pool_options(...)`.
+
 ### Fixed
+
+- `build()` refuses a pool of fewer than 2 connections
+  (`skilj::MIN_POOL_CONNECTIONS`). The cross-instance listener keeps one
+  connection for good, so with a pool of 1 every request failed after
+  the acquire timeout (docs/architecture.md §186).
 
 - Registering a sync projection over existing history could deadlock
   against the catch-up folding the same projection: the history fold

@@ -11226,3 +11226,22 @@ A would-be event has never been encrypted, so `render_would_be_event` can't rend
 Tests: `dry_run_command_shows_the_decision_and_persists_nothing`, `dry_run_command_requires_admin_level_and_the_command_types_checks` and `dry_run_command_fails_like_the_submission_without_a_master_key` (`skilj/tests/graphql_business_surfaces.rs`) cover a history-dependent acceptance and rejection, the sensitive field nulled and shown, the `Own` memo, no command/event/key written, the next real submission getting the next sequence, the Write-level refusal, `insufficient_role`, schema and unregistered-type errors, and the missing master key. `command_dry_run_answers_the_outcome_only_and_persists_nothing` (`skilj/tests/command_trigger.rs`) checks the REST body field for field and that the first real trigger still gets sequence 0. The conformance transcript (§179) gained `dry_run_accepted`, `dry_run_rejected`, `dry_run_payload_off_schema` and `dry_run_archived`, all agreeing across the two surfaces. They run before `read_all`, which shows no events were added.
 
 **Not done.** No TUI or inspector action yet. Both can call `dryRunCommand`.
+
+<a id="pool-sizing"></a>
+## 186. Pool sizing: a documented budget, not a core count
+
+Codeberg issue #49. `SkiljBuilder::pool_options_performance_optimized()` set `max_connections` to twice the application host's cores and `min_connections` to half that. That count says nothing about the database: on a 2-core container it gave 4 connections, fewer than sqlx's default 10. Its 30s acquire timeout and 10min idle timeout were sqlx's defaults already. **Removed** (user choice), and replaced by a sizing budget in docs/performance.md ("Sizing the connection pool"), built from what skilj itself takes from the pool:
+
+- the cross-instance listener (§83): one connection, held for the process's lifetime;
+- batch leaders: at most half the pool by default (§116/§117), each holding one connection for its batch;
+- cross-context route ticks and parked-delivery retries: each capped at half the pool too;
+- background ticks (async projection catch-up, snapshots, deadlines, retention, the system event scheduler): up to 16 bounded contexts at a time per loop, one connection each at a time. They queue on the fair pool behind requests, so a small pool slows them rather than stalling them;
+- request-time reads.
+
+Nothing that holds a lock waits for a second pooled connection (§116), so those caps make any pool of 2 or more correct; size is a latency question.
+
+**A pool of one is refused.** The listener holds its connection for good, so with `max_connections(1)` every query after `build()` waited out the acquire timeout and failed with `PoolTimedOut` (reproduced: a GraphQL request answered "the server's database connections are all busy" after exactly the 3s timeout the test set). `build()` now returns `Error::configuration(...)` (a `Database(sqlx::Error::Configuration)`) for `max_connections` below `skilj::MIN_POOL_CONNECTIONS` (2), before connecting (user choice, over a warning). Test: `build_refuses_a_pool_the_listener_would_take_whole` (`skilj/tests/startup_bounded_contexts.rs`).
+
+The `pool_options` doc comment said sqlx's default had no timeouts; it has a 30s acquire timeout, a 10min idle timeout and a 30min max lifetime. Corrected.
+
+**Not done.** No measured optimum: §184's benchmark varies callers, not pool size. `BACKGROUND_TASK_CONCURRENCY` stays a fixed 16.

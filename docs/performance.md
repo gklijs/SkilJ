@@ -148,7 +148,44 @@ All on `SkiljBuilder`:
 | `command_batch_max_size(n)` | 256 | Most commands one lock acquisition processes. Larger amortizes more; smaller shortens each lock hold and limits how many commands one failed batch takes down with it. If more than `n` are queued, the same leader keeps processing follow-up batches until the queue is empty. |
 | `command_batch_max_concurrent_leaders(n)` | half of the pool's `max_connections` (min 1) | Caps batch leaders running at once across all bounded contexts. Each leader pins one connection for its batch while still needing others for reads; without a cap, many busy bounded contexts can leave the pool full of leaders waiting on each other. |
 | `command_batch_idle_in_transaction_timeout(d)` | 30s | Postgres kills a leader whose transaction sits idle *between statements* longer than this, releasing the lock. A backstop for genuinely stuck leaders, not a throughput knob. The lock wait itself is not covered. |
-| `pool_options(...)` | sqlx default (10) | Size the pool for your bounded-context count. A rule of thumb: at least 2x the concurrent leaders you expect, plus headroom for request-time reads. |
+| `pool_options(...)` | sqlx default (10 connections, 30s acquire timeout) | See "Sizing the connection pool" below. `build()` refuses fewer than 2 connections. |
+
+## Sizing the connection pool
+
+Every `Skilj` instance has one pool. What skilj itself takes from it
+(docs/architecture.md §186):
+
+| holder | connections |
+|---|---|
+| cross-instance listener | 1, for the process's lifetime |
+| command batch leaders | one each; at most `command_batch_max_concurrent_leaders`, default half the pool |
+| cross-context route ticks | one each; at most half the pool |
+| parked-delivery retries | one each; at most half the pool |
+| background ticks (projection catch-up, snapshots, deadlines, retention, scheduler) | one per bounded context being worked on, up to 16 per loop |
+| GraphQL/REST reads | one per request in flight |
+
+Nothing that holds a lock waits for a second connection, so any pool of 2
+or more is correct; a pool of 1 is refused, because the listener takes it
+whole. The size decides latency:
+
+- Start from the bounded contexts that take commands at the same time:
+  each busy one wants a leader. Give the pool about twice that (leaders
+  need their reads too), plus the request concurrency you expect, plus 1
+  for the listener. sqlx's default of 10 suits a handful of busy bounded
+  contexts.
+- Background ticks queue behind requests on the pool. With many bounded
+  contexts, a pool well under 16 makes catch-up and deadlines slower,
+  not wrong.
+- The limit that matters is the database's. Instances times
+  `max_connections`, plus everything else connected, must stay under
+  Postgres' `max_connections`. Postgres throughput peaks at a small
+  multiple of *its* cores, so past that more connections add waiting, not
+  work (docs/architecture.md §184: more callers added contention, not
+  commands).
+  Size from the database server, never from the application host's cores.
+- `acquire_timeout` (default 30s) is how long a request waits for a
+  connection before failing with "the server's database connections are
+  all busy". Lower it to fail fast; it doesn't add capacity.
 
 ## Observing it
 

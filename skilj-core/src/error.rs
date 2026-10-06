@@ -196,6 +196,14 @@ impl Error {
     pub fn row_not_found() -> Error {
         Error::Database(sqlx::Error::RowNotFound)
     }
+
+    /// Connection options that can't work, refused before connecting -
+    /// `skilj`'s `SkiljBuilder::build()` refusing a pool too small for
+    /// it (docs/architecture.md §186), without `sqlx` as a direct
+    /// dependency of its own.
+    pub fn configuration(message: impl Into<String>) -> Error {
+        Error::Database(sqlx::Error::Configuration(message.into().into()))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -63,6 +63,11 @@ static BACKGROUND_TASK_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// builder option later if a real need for tuning it ever comes up.
 const BACKGROUND_TASK_CONCURRENCY: usize = 16;
 
+/// The smallest pool `SkiljBuilder::build()` accepts: the cross-instance
+/// listener keeps one connection for the process's lifetime, and
+/// everything else needs at least one more (docs/architecture.md §186).
+pub const MIN_POOL_CONNECTIONS: u32 = 2;
+
 /// [`SkiljBuilder::idempotency_key_retention`]'s default: one hour.
 pub const DEFAULT_IDEMPOTENCY_KEY_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
@@ -2020,36 +2025,19 @@ impl SkiljBuilder {
     /// Connection pool sizing/timeouts (`max_connections`,
     /// `min_connections`, `acquire_timeout`, `idle_timeout`, ...) -
     /// `sqlx::postgres::PgPoolOptions`, unset by default (`sqlx`'s own
-    /// bare default: a 10-connection cap, no configured timeouts).
-    /// Worth setting explicitly for real production load: the
-    /// background async-projection/snapshot/scheduler pollers this
-    /// same `.build()` spawns already compete with every foreground
-    /// GraphQL/REST request for whatever this pool provides.
+    /// default: 10 connections, a 30s acquire timeout, 10min idle
+    /// timeout, 30min max lifetime). Worth setting explicitly for real
+    /// production load: the background pollers this same `.build()`
+    /// spawns compete with every foreground GraphQL/REST request for
+    /// whatever this pool provides. docs/performance.md has sizing
+    /// guidance (docs/architecture.md §186).
+    ///
+    /// `max_connections` must be at least [`MIN_POOL_CONNECTIONS`]:
+    /// `.build()` refuses less, because the cross-instance listener
+    /// keeps one connection for the process's lifetime.
     pub fn pool_options(mut self, options: skilj_core::db::PgPoolOptions) -> Self {
         self.pool_options = Some(options);
         self
-    }
-
-    /// Convenience method for production pool settings:
-    /// - `max_connections`: 2x CPU cores (rule of thumb from eventcore-postgres)
-    /// - `min_connections`: half of max (warm pool, avoids connection churn)
-    /// - `acquire_timeout`: 30s (fail fast under contention)
-    /// - `idle_timeout`: 10min (reclaim idle connections)
-    ///
-    /// Override any setting by chaining `.pool_options()` after this:
-    /// `.pool_options_performance_optimized().pool_options(custom_options)`
-    pub fn pool_options_performance_optimized(self) -> Self {
-        use std::thread::available_parallelism;
-        let cpu_count = available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let max_connections = (cpu_count * 2) as u32;
-        let min_connections = (max_connections / 2).max(1);
-        self.pool_options(
-            skilj_core::db::PgPoolOptions::new()
-                .max_connections(max_connections)
-                .min_connections(min_connections)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .idle_timeout(std::time::Duration::from_secs(10 * 60)),
-        )
     }
 
     /// Runs the startup reconciliation loop automatically (§1.5). Returns
@@ -2058,6 +2046,18 @@ impl SkiljBuilder {
     /// Role has no admin access to yet is reported in
     /// `ReconciliationReport`, not an error.
     pub async fn build(self) -> Result<(Skilj, ReconciliationReport), skilj_core::Error> {
+        // docs/architecture.md §186: the cross-instance listener keeps one
+        // connection for good, so a pool of one serves nothing else.
+        if let Some(options) = &self.pool_options {
+            let max_connections = options.get_max_connections();
+            if max_connections < MIN_POOL_CONNECTIONS {
+                return Err(skilj_core::Error::configuration(format!(
+                    "max_connections is {max_connections}, at least \
+                     {MIN_POOL_CONNECTIONS} needed: the cross-instance listener \
+                     keeps one connection for the process's lifetime"
+                )));
+            }
+        }
         let pool = match self.pool_options {
             Some(options) => skilj_core::db::connect_with(&self.database_url, options).await?,
             None => skilj_core::db::connect(&self.database_url).await?,
