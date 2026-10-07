@@ -119,6 +119,14 @@ steps:
       # find it. Its credentials default to postgres/postgres/postgres,
       # which is also what the service is given.
       CI_POSTGRES_HOST: skilj-postgres
+      # Disk, not speed: 110 integration-test binaries, each linking most
+      # of the workspace, filled the runner's disk ("No space left on
+      # device" linking subject_erasure). No run reuses the incremental
+      # cache, and line tables keep file:line in panic backtraces while
+      # dropping the variable/type debug info that is most of each
+      # binary's size.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     commands:
       # skilj-kafka's rdkafka dependency vendors librdkafka from source
       # via the cmake-build feature - `rust:1-bookworm` has a C compiler
