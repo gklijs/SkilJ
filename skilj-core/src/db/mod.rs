@@ -246,8 +246,52 @@ pub async fn connect(database_url: &str) -> Result<Pool, sqlx::Error> {
 /// function's own doc comment for why this exists alongside it.
 #[tracing::instrument(skip_all)]
 pub async fn connect_with(database_url: &str, options: PgPoolOptions) -> Result<Pool, sqlx::Error> {
-    options.connect(database_url).await
+    connect_with_statement_cache(database_url, options, None).await
 }
+
+/// [`connect_with`], with `statement_cache_capacity` (when `Some`)
+/// overriding both the database URL's `statement-cache-capacity`
+/// parameter and sqlx's default (docs/architecture.md §193).
+#[tracing::instrument(skip_all)]
+pub async fn connect_with_statement_cache(
+    database_url: &str,
+    options: PgPoolOptions,
+    statement_cache_capacity: Option<usize>,
+) -> Result<Pool, sqlx::Error> {
+    let mut connect_options: sqlx::postgres::PgConnectOptions = database_url.parse()?;
+    if let Some(capacity) = statement_cache_capacity {
+        connect_options = connect_options.statement_cache_capacity(capacity);
+    }
+    options.connect_with(connect_options).await
+}
+
+/// sqlx's own default for how many prepared statements each connection
+/// keeps (least recently used out).
+pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 100;
+
+/// The statement cache capacity a pool connected with
+/// [`connect_with_statement_cache`] ends up with: `explicit`, else the
+/// database URL's `statement-cache-capacity` parameter, else
+/// [`DEFAULT_STATEMENT_CACHE_CAPACITY`]. sqlx has no getter for it.
+pub fn effective_statement_cache_capacity(database_url: &str, explicit: Option<usize>) -> usize {
+    explicit
+        .or_else(|| {
+            let (_, query) = database_url.split_once('?')?;
+            query.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                (key == "statement-cache-capacity")
+                    .then(|| value.parse().ok())
+                    .flatten()
+            })
+        })
+        .unwrap_or(DEFAULT_STATEMENT_CACHE_CAPACITY)
+}
+
+/// Statements a bounded context needs cached, at least: the command path
+/// alone sends 14-20 distinct statements per bounded context, and
+/// throughput fell 20-40% once the cache held fewer than about 10 per
+/// busy one (docs/architecture.md §193).
+pub const STATEMENT_CACHE_MIN_PER_BOUNDED_CONTEXT: usize = 10;
 
 /// Runs every embedded migration under `skilj-core/migrations/` - see
 /// this module's own doc comment and docs/architecture.md §2.2 for why
@@ -14472,7 +14516,22 @@ pub async fn record_acknowledgement(
 
 #[cfg(test)]
 mod tests {
-    use super::schema_ident;
+    use super::{effective_statement_cache_capacity, schema_ident};
+
+    #[test]
+    fn the_statement_cache_capacity_is_explicit_then_the_urls_then_sqlxs() {
+        let url = "postgres://u@h/d?sslmode=disable&statement-cache-capacity=250";
+        assert_eq!(effective_statement_cache_capacity(url, Some(7)), 7);
+        assert_eq!(effective_statement_cache_capacity(url, None), 250);
+        assert_eq!(
+            effective_statement_cache_capacity("postgres://u@h/d?sslmode=disable", None),
+            100
+        );
+        assert_eq!(
+            effective_statement_cache_capacity("postgres://u@h/d", None),
+            100
+        );
+    }
 
     #[test]
     fn schema_ident_quotes_and_escapes() {

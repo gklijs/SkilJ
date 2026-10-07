@@ -781,6 +781,7 @@ impl Skilj {
             event_broadcast_capacity: 1024,
             event_cache_warm_up_count: 1000,
             pool_options: None,
+            statement_cache_capacity: None,
             // docs/architecture.md §87 - matches
             // `config.idempotency_key_retention` in specs/skilj.allium.
             idempotency_key_retention: Some(DEFAULT_IDEMPOTENCY_KEY_RETENTION),
@@ -963,6 +964,36 @@ pub struct ReconciliationReport {
     /// process registers. Removing a protection deliberately takes the
     /// explicit GraphQL registration mutation.
     pub kept_protections: Vec<String>,
+}
+
+/// docs/architecture.md §193: each bounded context brings its own
+/// schema-qualified statements, so a statement cache well below
+/// [`skilj_core::db::STATEMENT_CACHE_MIN_PER_BOUNDED_CONTEXT`] per active
+/// bounded context evicts hot statements, and every command pays extra
+/// round trips to prepare them again. A warning, not a refusal: only the
+/// bounded contexts that take traffic at the same time need to fit, and
+/// this can't know which those are. Returns whether it warned.
+fn warn_on_small_statement_cache(
+    capacity: usize,
+    bounded_contexts: &[skilj_core::event_store::BoundedContext],
+) -> bool {
+    let active = bounded_contexts
+        .iter()
+        .filter(|bc| bc.status == skilj_core::event_store::BoundedContextStatus::Active)
+        .count();
+    let wanted = active * skilj_core::db::STATEMENT_CACHE_MIN_PER_BOUNDED_CONTEXT;
+    if capacity >= wanted {
+        return false;
+    }
+    tracing::warn!(
+        statement_cache_capacity = capacity,
+        active_bounded_contexts = active,
+        "the statement cache holds {capacity} statements per connection, fewer than \
+         {wanted} for {active} active bounded contexts: hot statements will be evicted \
+         and prepared again; set SkiljBuilder::statement_cache_capacity, or the \
+         database URL's statement-cache-capacity (see docs/performance.md)"
+    );
+    true
 }
 
 /// The protections a type's registration declares, with any the stored
@@ -1583,6 +1614,7 @@ pub struct SkiljBuilder {
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
     pool_options: Option<skilj_core::db::PgPoolOptions>,
+    statement_cache_capacity: Option<usize>,
     idempotency_key_retention: Option<std::time::Duration>,
     deadline_retention: Option<std::time::Duration>,
     application_version: Option<u64>,
@@ -2040,6 +2072,25 @@ impl SkiljBuilder {
         self
     }
 
+    /// How many prepared statements each pooled connection keeps, least
+    /// recently used out. Unset, it's the database URL's
+    /// `statement-cache-capacity` parameter, else sqlx's default of 100
+    /// ([`skilj_core::db::DEFAULT_STATEMENT_CACHE_CAPACITY`]); set, it
+    /// overrides both.
+    ///
+    /// Every bounded context's SQL is its own (schema-qualified), and its
+    /// command path alone sends 14-20 distinct statements. A miss costs
+    /// one extra round trip to prepare and, when the cache is full, one to
+    /// close the evicted statement. Each cached statement also costs
+    /// Postgres memory, about 18 KB per connection. docs/performance.md
+    /// has a sizing rule; `.build()` logs a warning when the active
+    /// bounded contexts clearly outgrow the capacity (docs/architecture.md
+    /// §193).
+    pub fn statement_cache_capacity(mut self, capacity: usize) -> Self {
+        self.statement_cache_capacity = Some(capacity);
+        self
+    }
+
     /// Runs the startup reconciliation loop automatically (§1.5). Returns
     /// `Err` only for a genuine registration rejection (e.g. an
     /// incompatible schema change) - a bounded context the reconciliation
@@ -2058,10 +2109,16 @@ impl SkiljBuilder {
                 )));
             }
         }
-        let pool = match self.pool_options {
-            Some(options) => skilj_core::db::connect_with(&self.database_url, options).await?,
-            None => skilj_core::db::connect(&self.database_url).await?,
-        };
+        let pool = skilj_core::db::connect_with_statement_cache(
+            &self.database_url,
+            self.pool_options.unwrap_or_default(),
+            self.statement_cache_capacity,
+        )
+        .await?;
+        let statement_cache_capacity = skilj_core::db::effective_statement_cache_capacity(
+            &self.database_url,
+            self.statement_cache_capacity,
+        );
         skilj_core::db::migrate(&pool).await?;
         // docs/architecture.md §176: a promotion or restore since the last
         // instance ran is reported, not just survived.
@@ -2152,6 +2209,7 @@ impl SkiljBuilder {
         // consistency, even though every lookup it makes resolves to
         // itself.
         let bounded_contexts_for_warm_up = skilj_core::db::list_bounded_contexts(&pool).await?;
+        warn_on_small_statement_cache(statement_cache_capacity, &bounded_contexts_for_warm_up);
         let template_cache = skilj_core::template_cache::TemplateCache::new();
         template_cache.refresh(&pool).await?;
 
@@ -4222,4 +4280,37 @@ async fn reconcile_projections(
         report.registered.push(key);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::warn_on_small_statement_cache;
+    use skilj_core::bootstrap::ContextCreator;
+    use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
+
+    fn contexts(active: usize, archived: usize) -> Vec<BoundedContext> {
+        (0..active + archived)
+            .map(|i| BoundedContext {
+                name: format!("bc{i}"),
+                status: if i < active {
+                    BoundedContextStatus::Active
+                } else {
+                    BoundedContextStatus::Archived
+                },
+                created_at: chrono::Utc::now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            })
+            .collect()
+    }
+
+    /// docs/architecture.md §193: 10 statements per active bounded
+    /// context; archived ones take no commands and don't count.
+    #[test]
+    fn a_statement_cache_under_ten_per_active_bounded_context_warns() {
+        assert!(!warn_on_small_statement_cache(100, &contexts(10, 50)));
+        assert!(warn_on_small_statement_cache(100, &contexts(11, 0)));
+        assert!(!warn_on_small_statement_cache(400, &contexts(32, 0)));
+        assert!(warn_on_small_statement_cache(400, &contexts(64, 0)));
+    }
 }

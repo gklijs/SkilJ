@@ -11356,3 +11356,29 @@ Codeberg issue #55 asked for deployment tuning notes in one place: `random_page_
 **`enable.idempotence`**, stated accurately: it stops librdkafka's own retries from duplicating a record. It doesn't cover a record the bridge produces again because its acknowledgement to skilj failed, so delivery to Kafka stays at-least-once.
 
 **`random_page_cost` changes no plan skilj uses.** Checked on Postgres 18 with an `events` table shaped like skilj's (same indexes: primary key, `events_by_type`, the `events_by_tags` GIN) holding 500,000 events of 300-byte payloads, 2,000 account tags and 10 branch tags. The plans were the same at the default 4 and at 1.1 for: one tag (GIN bitmap, 250 rows); one tag after a position (`BitmapAnd` with the primary key); a tag matching 10% of the events (still the GIN bitmap); two tags (`BitmapOr`); and the paged per-type read (index-only scan on `events_by_type`). The indexes are already chosen at the default. docs/performance.md says lowering it on SSD is the usual advice for other queries and does skilj no harm, but doesn't present it as a skilj setting.
+
+## 193. The statement cache: measured per bounded context, a knob and a warning
+
+Codeberg issue #56. sqlx prepares every statement and keeps up to `statement_cache_capacity` (default 100) per connection, least recently used out. On a miss, sqlx sends Parse/Describe and waits for the answer before the execute. When the cache is full it also closes the evicted statement and waits for that too (`sqlx-postgres` 0.9, `get_or_prepare`). So a missed statement takes three round trips instead of one. skilj's SQL names each bounded context's schema, so the question was how many statements a bounded context brings and when they stop fitting.
+
+**Counted.** The new ignored benchmark `skilj/tests/statement_cache.rs` records the distinct SQL of every `sqlx::query` event while deposits run. With one bounded context the command path sent 33 distinct statements: 20 of the bounded context's own and 13 shared (roles, `access_token_index`, `bounded_contexts`, `pg_notify`, transaction control, the admin context's background ticks). With 8 it sent 130: 14 per bounded context and 18 shared. The difference is background-tick statements, which only one of the eight happened to run during the window. The other paths (GraphQL queries, projections, subscriptions, snapshots) bring more of their own; this counts only commands. The tag query has one `OR` term per tag, so a command type with more tags adds variants. Lists already use `= ANY($1)`, which keeps one text.
+
+**Measured.** 1,600 deposits from 8 callers, spread round-robin over K bounded contexts, with the capacity set through the URL's `statement-cache-capacity`. Two rounds; the second ran at lower throughput overall (host load), so compare within a round:
+
+| K | 100 | 400 | 1,600 |
+|---|---|---|---|
+| 1 | 883 / 716 | 884 / 732 | 968 / 760 |
+| 8 | 1,491 / 977 | 1,462 / 1,032 | 1,474 / 1,001 |
+| 32 | 994 / 673 | 1,257 / 935 | 1,215 / 897 |
+| 64 | 771 / 523 | 859 / 472 | 975 / 741 |
+
+At 1 and 8 bounded contexts the capacity makes no difference beyond noise. 130 statements exceed 100, but the least-recently-used ones are background ticks, not the hot path. At 32, 100 cost 21-28%. At 64, 1,600 recovered 26-42%, and 400 was not reliably enough. The test runs Postgres on the same host; across a network each extra round trip costs more.
+
+**What a larger cache costs.** Postgres keeps each prepared statement in the server process: 960 statements (64 schemas × 15) took 17.4 MB of `CachedPlanSource`/`CachedPlanQuery`/`CachedPlan` memory after one execution each, about 18 KB a statement. That is per connection: 1,000 statements on a 20-connection pool is roughly 350 MB per instance. So the default stays at sqlx's 100. Raising it automatically would grow server memory with the bounded-context count without anyone choosing that.
+
+**Chosen** (user choice): a knob, a documented sizing rule, and a warning.
+- `SkiljBuilder::statement_cache_capacity(n)` sits next to `pool_options`. `build()` now always connects through `db::connect_with_statement_cache`, which parses the URL into `PgConnectOptions` and applies the capacity when it's set, so it overrides the URL's parameter. Unset, the URL's parameter, which already worked, or sqlx's default applies.
+- docs/performance.md, "Sizing the statement cache": about 20 per bounded context that takes traffic at the same time, plus 20, with the memory cost.
+- `build()` warns when the capacity is under `db::STATEMENT_CACHE_MIN_PER_BOUNDED_CONTEXT` (10) per active bounded context. That is the measured threshold: 32 needed more than 100 and less than 400, and 64 needed more than 400. It is a warning, not a refusal, because many quiet bounded contexts don't need room at once. sqlx has no getter for the capacity, so `db::effective_statement_cache_capacity` resolves it the same way: the knob, then the URL's parameter, then 100.
+
+Tests: `a_statement_cache_capacity_overrides_the_url_and_the_default` (`skilj-core/tests/pool_options.rs`) reads `pg_prepared_statements` on a one-connection pool after four statements: 2 kept with the knob at 2 over a URL saying 3, 3 with only the URL, 4 with neither. Unit tests cover the capacity's resolution order and the warning threshold, including that archived bounded contexts don't count.

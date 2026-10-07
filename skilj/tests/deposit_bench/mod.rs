@@ -247,6 +247,15 @@ pub async fn deposit(setup: &Setup, account_id: &str) -> Duration {
 /// latency.
 #[allow(dead_code)] // command_throughput.rs only
 pub async fn deposit_with(setup: &Setup, credential: &str, account_id: &str) -> Duration {
+    deposit_through(&setup.router, credential, account_id).await
+}
+
+/// [`deposit_with`] through any router.
+pub async fn deposit_through(
+    router: &axum::Router,
+    credential: &str,
+    account_id: &str,
+) -> Duration {
     let body = serde_json::json!({ "payload": { "account_id": account_id, "amount": 1 } });
     let request = Request::builder()
         .method("POST")
@@ -256,7 +265,7 @@ pub async fn deposit_with(setup: &Setup, credential: &str, account_id: &str) -> 
         .body(Body::from(body.to_string()))
         .unwrap();
     let started = Instant::now();
-    let response = setup.router.clone().oneshot(request).await.unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(

@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SkiljBuilder::statement_cache_capacity(n)` (docs/architecture.md §193,
+  Codeberg issue #56): how many prepared statements each pooled
+  connection keeps. Every bounded context brings its own statements, and
+  with 32 or more busy bounded contexts sqlx's default of 100 cost up to
+  a quarter of command throughput. `build()` warns when the capacity is
+  under 10 per active bounded context. Sizing, with the Postgres memory it
+  costs, is in docs/performance.md. The default is unchanged. New:
+  `db::connect_with_statement_cache`,
+  `db::effective_statement_cache_capacity`.
+
 - Deployment settings in docs/performance.md (docs/architecture.md §192,
   Codeberg issue #55). The one that matters is for `skilj-kafka`'s
   producer: `linger.ms=0` takes an outbound mapping from about 165 to about

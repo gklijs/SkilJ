@@ -160,6 +160,7 @@ All on `SkiljBuilder`:
 | `command_batch_max_concurrent_leaders(n)` | half of the pool's `max_connections` (min 1) | Caps batch leaders running at once across all bounded contexts. Each leader pins one connection for its batch while still needing others for reads; without a cap, many busy bounded contexts can leave the pool full of leaders waiting on each other. |
 | `command_batch_idle_in_transaction_timeout(d)` | 30s | Postgres kills a leader whose transaction sits idle *between statements* longer than this, releasing the lock. A backstop for genuinely stuck leaders, not a throughput knob. The lock wait itself is not covered. |
 | `pool_options(...)` | sqlx default (10 connections, 30s acquire timeout) | See "Sizing the connection pool" below. `build()` refuses fewer than 2 connections. |
+| `statement_cache_capacity(n)` | the database URL's `statement-cache-capacity`, else 100 | Prepared statements each connection keeps. See "Sizing the statement cache" below. |
 
 ## Sizing the connection pool
 
@@ -197,6 +198,45 @@ whole. The size decides latency:
 - `acquire_timeout` (default 30s) is how long a request waits for a
   connection before failing with "the server's database connections are
   all busy". Lower it to fail fast; it doesn't add capacity.
+
+## Sizing the statement cache
+
+sqlx prepares every statement skilj sends and keeps up to
+`statement_cache_capacity` of them per connection, least recently used
+out. Each bounded context's SQL names its own schema, so each one brings
+its own statements: the command path alone sends 14-20 distinct ones per
+bounded context, plus about 15 shared by all. A statement that isn't
+cached costs an extra round trip to prepare, and one more to close the
+statement it evicts. Measured with `skilj/tests/statement_cache.rs`
+(`#[ignore]`d; 1,600 deposits from 8 callers spread over the bounded
+contexts, each on its own account, embedded Postgres on the same host,
+two rounds; docs/architecture.md §193):
+
+| bounded contexts | capacity 100 (default) | 400 | 1,600 |
+|---|---|---|---|
+| 1 | 716-883 cmd/s | 732-884 | 760-968 |
+| 8 | 977-1,491 | 1,032-1,462 | 1,001-1,474 |
+| 32 | 673-994 | 935-1,257 | 897-1,215 |
+| 64 | 523-771 | 472-859 | 741-975 |
+
+Up to 8 bounded contexts the default is enough. At 32, 100 cost a quarter
+of the throughput; at 64, 400 wasn't enough either. With Postgres on
+another host each round trip is longer, so a miss costs more than here.
+
+- **Size it at about 20 per bounded context that takes traffic at the same
+  time, plus 20** - more than the command path's 14-20, for the read
+  paths (GraphQL queries, projections, subscriptions) that add their own.
+- **It costs Postgres memory**: each cached statement took about 18 KB in
+  the server process (960 statements, 17.4 MB, after one execution each),
+  per connection. 1,000 statements on a 20-connection pool is roughly
+  350 MB per skilj instance, on top of Postgres' own `work_mem` budget.
+- Set it with `SkiljBuilder::statement_cache_capacity(n)`, or with
+  `statement-cache-capacity=n` in the database URL. The builder wins when
+  both are set.
+- `build()` logs a warning when the capacity is under 10 per active
+  bounded context, where the benchmark lost throughput. It can't know
+  which bounded contexts are busy together, so a deployment with many
+  quiet ones can leave it.
 
 ## Deployment settings
 
