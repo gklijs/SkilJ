@@ -11303,3 +11303,29 @@ A bounded context added by an older instance during a rolling deploy has no coun
 After: the identity read is ~200 µs whatever the number of types (1, 10, 50 and 200 measured the same way), about 40 µs over `SELECT 1`. `command_throughput`'s bounded context has a handful of types, where the saving (~70 µs a read) is within run-to-run noise: hot-snap with one caller ran at 195-197 commands/s with the change and 203-207 without, in the same session.
 
 Tests (`skilj-core/tests/event_cache.rs`): `only_a_changed_registration_changes_the_registrations_stamp` (rewriting an event type and a command type unchanged keeps the stamp; changing the command type moves it), `a_bounded_context_without_the_counter_is_stamped_by_hashing` (drops the counter, requires the hash to track a re-registration, patches it back and requires the counter to). `a_scheduled_fire_does_not_change_the_registrations_stamp` (§180) now checks the trigger's condition.
+
+## 190. Read replicas: not now, and what a design would need
+
+Codeberg issue #53 asked whether read-heavy paths could go to a read replica. **Not now** (no change to the code). Every read that would move has to answer for replication lag, and several of skilj's reads can't run on a standby at all. Checked against a streaming hot standby of the embedded Postgres 18, and against the code.
+
+**What fails on a standby outright.**
+- **The epoch (§176).** `EPOCH_SQL` calls `pg_current_wal_lsn()`, which a standby refuses: `recovery is in progress`. That query is part of `events_table_identity` (so of every cache-served read) and of `GET /v1/events` and the consume endpoint. A standby has no exact replacement. `pg_control_checkpoint()`'s timeline moves only at the next restartpoint, and `pg_stat_wal_receiver.received_tli` is what was received, not what was replayed. Until a standby can name its epoch, its reads can't be stamped with one. A standby still following an old primary's timeline would then serve the lost tail §176 refuses.
+- **`LISTEN`.** `cannot execute LISTEN during recovery`. The cross-instance listener (§83) stays on the primary.
+- Anything that writes in the same transaction as it reads: async projection catch-up and snapshots (§182), the consume cursor and its ack, deadlines, routes, parked-delivery retries, key provisioning. These are not read paths.
+
+**What would read wrong, silently.**
+- **Cross-instance delivery.** `EventAppended` is a pointer (§83): the receiving instance re-reads the event by sequence and treats `Ok(None)` as "already gone" (`skilj/src/lib.rs`). On a lagging replica the notification routinely arrives before the replay, and the event would be dropped for every subscriber on that instance.
+- **`waitForSequence` (§88).** It's refused when it names a sequence above `latest_sequence`. On a replica, a sequence the caller just got from a command would be refused as `wait_for_sequence_not_committed`, instead of waited for.
+- **Sync projections.** They're written in the command's transaction precisely so that a read right after the command sees them. On a replica they'd lag like async ones.
+- **Authentication and grants (§110, §124).** Every request looks up its Role and grants. On a replica, a revoked token or grant would keep working for the lag, and a reconnect after the revocation push closed a connection would authenticate again. That is a security change, not a performance one: these reads stay on the primary.
+- **Erasure.** `forgetSubject` deletes a subject's key on the primary. A replica would decrypt the subject's payloads until the delete replays.
+
+**What would be safe.** The DCB pre-read of a command. The re-check under the sequence lock reads everything after the pre-read's `covered_through` (§178), on the primary, so a stale pre-read still decides correctly. It just moves the lag's worth of events into the re-check, which runs under the lock. Most pre-reads of a busy bounded context are already served by the event cache (§187, §188), so the saving is the cold part.
+
+**What a design would need.**
+1. A second pool (`SkiljBuilder::read_pool`), with each read path opting in. One `Pool` threads through every `db` function today.
+2. **A per-bounded-context gate, not an LSN.** Every event claims its sequence by updating the bounded context's `sequence` row (`next_sequence`), in the transaction that inserts it, and that row lock is held until commit. So a bounded context's commits replay in sequence order. A replica whose `max(sequence)` has reached N therefore holds every event up to N in that bounded context. A read that names a position (`after`, `fromSequence`, `waitForSequence`, an `EventAppended` pointer) would wait for the replica to reach it, or go to the primary after a short bound. A read that names none (`queryEvents` without `afterSequence`, an async projection's state) would be served as stale as the replica.
+3. An epoch a standby can name, or a rule that a replica's reads are only served while its timeline matches the primary's, checked on every `Resync`.
+4. Which reads go where, decided per path and documented as an advertised guarantee (§177), with the conformance transcript (§179) recording any read whose freshness changes.
+
+**Why not now.** Nothing shows the primary's read load is the limit. The measured costs are the sequence lock and `persist` (§184, §187, §188), which stay on the primary whatever happens to reads, and the event cache already takes the hot reads off Postgres. A replica would be the answer to a measured read bottleneck: many subscribers catching up, or heavy `queryEvents`/projection traffic. Not to command throughput.
