@@ -198,6 +198,52 @@ whole. The size decides latency:
   connection before failing with "the server's database connections are
   all busy". Lower it to fail fast; it doesn't add capacity.
 
+## Deployment settings
+
+Settings outside skilj that change how it performs (docs/architecture.md
+§192).
+
+**Postgres.**
+
+- Size the pool from the database server (above). Instances times
+  `max_connections`, plus everything else connected, must stay under
+  Postgres' own `max_connections`.
+- `random_page_cost`: skilj's hot queries don't depend on it. With 500,000
+  events, the plans for the tag reads (one tag, several tags, a tag after a
+  position, and a tag matching 10% of the events) and for the paged
+  per-type read were the same at the default 4 and at 1.1: GIN bitmap
+  scans and the primary-key or `events_by_type` index throughout. Lowering
+  it on SSD or NVMe storage is the usual advice for other queries, and
+  does skilj no harm.
+
+**Kafka producer (`skilj-kafka` outbound).** The producer is yours to
+configure; `run_outbound` produces one record at a time and waits for it
+before the next (docs/architecture.md §169), so:
+
+- **Set `linger.ms=0`.** librdkafka's default of 5 ms is spent waiting for
+  a second record that never comes, on every event. Measured with
+  `producer_settings_throughput` (`skilj-kafka/tests/kafka_bridge.rs`,
+  `#[ignore]`d; 500 events of ~600 bytes through `produce_once`, local
+  broker, two rounds):
+
+  | producer settings | events/s per mapping |
+  |---|---|
+  | librdkafka defaults (`linger.ms=5`) | 165-168 |
+  | `linger.ms=0` | 2,113-2,138 |
+  | `enable.idempotence` + `lz4`, `linger.ms=5` | 141-160 |
+  | `enable.idempotence` + `lz4` + `linger.ms=0` | 1,802-2,141 |
+
+  To go past one mapping's rate, split the event type across partitioned
+  mappings (`OutboundMapping::partition`).
+- `enable.idempotence=true` stops librdkafka's own retries from writing a
+  record twice. It doesn't cover a record the bridge produces again after
+  its acknowledgement to skilj failed, so delivery to Kafka stays
+  at-least-once, and consumers must tolerate duplicates.
+- `compression.type`: each batch is one record, so compression works one
+  payload at a time. `lz4`, `snappy` and `gzip` are built in. `zstd` needs
+  rdkafka's `zstd` feature in your own `Cargo.toml`; without it, creating
+  the producer fails.
+
 ## Observing it
 
 - OpenTelemetry histogram `skilj.command_batch.size` (per bounded context) - the

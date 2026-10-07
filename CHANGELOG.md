@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Deployment settings in docs/performance.md (docs/architecture.md §192,
+  Codeberg issue #55). The one that matters is for `skilj-kafka`'s
+  producer: `linger.ms=0` takes an outbound mapping from about 165 to about
+  2,000 events/s, because the bridge produces one record at a time. A
+  benchmark, `producer_settings_throughput`, is in
+  `skilj-kafka/tests/kafka_bridge.rs`.
+
 - A checked-in copy of what `skilj-codegen` generates for skilj-demo's
   `banking.skilj.toml` (docs/architecture.md §191, Codeberg issue #54),
   compared by `skilj-demo/tests/generated_code.rs`, so a change to the
@@ -110,6 +117,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pool_options(...)`.
 
 ### Fixed
+
+- `skilj-kafka`'s producer example set `compression.type=zstd`, which
+  fails at producer creation with this crate's build of librdkafka
+  ("libzstd not available at build time"). It now uses `lz4` and
+  `linger.ms=0`, and the docs say how to get zstd (docs/architecture.md
+  §192).
 
 - `build()` refuses a pool of fewer than 2 connections
   (`skilj::MIN_POOL_CONNECTIONS`). The cross-instance listener keeps one

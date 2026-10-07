@@ -115,14 +115,26 @@
 //! would ever fetch it again. With one record in flight per mapping,
 //! per-key order in Kafka holds without any producer setting.
 //!
-//! What the caller's own `ClientConfig` still decides:
+//! What the caller's own `ClientConfig` still decides
+//! (docs/architecture.md §192, measured in docs/performance.md):
 //!
+//! - **`linger.ms=0`.** librdkafka waits `linger.ms` (default 5) for
+//!   more records before sending a batch. With one record in flight there
+//!   is never a second one to wait for, so every event pays the full
+//!   wait: about 165 events/s per mapping at the default against about
+//!   2,000 at 0, against a local broker.
 //! - `enable.idempotence=true` stops the *producer's own* internal
 //!   retries from writing a record twice. It does not deduplicate a
 //!   record this crate sends again because its acknowledgement to skilj
 //!   failed - delivery to Kafka is at-least-once either way.
-//! - `compression.type` (`snappy`, `lz4` or `zstd`) is worth setting for
-//!   JSON payloads; what it saves depends on the payloads.
+//! - `compression.type`: every batch holds one record, so each payload is
+//!   compressed on its own; whether that pays depends on the payload
+//!   size. `lz4`, `snappy` and `gzip` work with this crate's build of
+//!   librdkafka. `zstd` needs rdkafka's `zstd` feature, which this crate
+//!   doesn't enable: without it, creating the producer fails with
+//!   "libzstd not available at build time". Add
+//!   `rdkafka = { version = "0.39", features = ["zstd"] }` to your own
+//!   dependencies to get it.
 //!
 //! ```rust,no_run
 //! use rdkafka::producer::FutureProducer;
@@ -130,8 +142,9 @@
 //!
 //! let producer: FutureProducer = ClientConfig::new()
 //!     .set("bootstrap.servers", "localhost:9092")
+//!     .set("linger.ms", "0")
 //!     .set("enable.idempotence", "true")
-//!     .set("compression.type", "zstd")
+//!     .set("compression.type", "lz4")
 //!     .create()
 //!     .expect("producer creation failed");
 //! ```

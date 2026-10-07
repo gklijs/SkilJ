@@ -1748,3 +1748,99 @@ fn a_non_json_message_is_parked_at_once_with_its_raw_content() {
         assert!(mock_state.external_requests.lock().unwrap().is_empty());
     });
 }
+
+/// Benchmark, not a check (docs/architecture.md §192): `produce_once`
+/// produces one record at a time and waits for it, so the producer's
+/// `linger.ms` is paid on every event rather than amortized over a
+/// batch. Runs 500 events, with a ~600-byte JSON payload, through
+/// `produce_once` against the mock skilj server for each producer
+/// configuration and prints events/s. Run it with
+/// `cargo test --release -p skilj-kafka --test kafka_bridge
+/// producer_settings_throughput -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark; run explicitly"]
+fn producer_settings_throughput() {
+    runtime().block_on(async {
+        let Some(bootstrap_servers) = test_kafka().await else {
+            return;
+        };
+        let configs: &[(&str, &[(&str, &str)])] = &[
+            ("librdkafka defaults (linger.ms=5)", &[]),
+            ("linger.ms=0", &[("linger.ms", "0")]),
+            (
+                "idempotence + lz4 (linger.ms=5)",
+                &[("enable.idempotence", "true"), ("compression.type", "lz4")],
+            ),
+            (
+                "idempotence + lz4 + linger.ms=0",
+                &[
+                    ("enable.idempotence", "true"),
+                    ("compression.type", "lz4"),
+                    ("linger.ms", "0"),
+                ],
+            ),
+        ];
+        const EVENTS: i64 = 500;
+        let filler = "x".repeat(500);
+        for round in 1..=2 {
+            for (name, settings) in configs {
+                let topic = unique_topic("bench");
+                create_topic(bootstrap_servers, &topic).await;
+                let mock_state = MockSkiljState::default();
+                let skilj_base_url = serve_mock_skilj(mock_state.clone()).await;
+                let token = "read-token".to_string();
+                let events: VecDeque<Value> = (1..=EVENTS)
+                    .map(|sequence| {
+                        json!({
+                            "sequence": sequence,
+                            "eventType": "OrderPlaced",
+                            "payload": { "orderId": format!("o-{sequence}"), "note": filler },
+                            "tags": [{ "key": "order", "value": format!("o-{}", sequence % 10) }],
+                            "metadata": { "correlationId": null, "causationId": null },
+                        })
+                    })
+                    .collect();
+                enqueue(&mock_state, &token, "OrderPlaced", events);
+
+                let mut config = ClientConfig::new();
+                config
+                    .set("bootstrap.servers", bootstrap_servers)
+                    .set("message.timeout.ms", "10000");
+                for (key, value) in *settings {
+                    config.set(*key, *value);
+                }
+                let producer: FutureProducer = config.create().unwrap();
+                let mapping = OutboundMapping {
+                    event_type: "OrderPlaced".to_string(),
+                    credential: token,
+                    topic,
+                    key_tag_key: Some("order".to_string()),
+                    partition: None,
+                };
+                let http = skilj_kafka::http_client();
+                let retry_policy = skilj_retry::RetryPolicy::default();
+                let mut retry_state = None;
+                let started = std::time::Instant::now();
+                let mut produced = 0;
+                while produced < EVENTS as usize {
+                    produced += produce_once(
+                        &http,
+                        &skilj_base_url,
+                        &producer,
+                        &mapping,
+                        &retry_policy,
+                        &mut retry_state,
+                    )
+                    .await
+                    .unwrap();
+                }
+                let elapsed = started.elapsed();
+                println!(
+                    "round {round}: {name}: {EVENTS} events in {:.2}s, {:.0} events/s",
+                    elapsed.as_secs_f64(),
+                    EVENTS as f64 / elapsed.as_secs_f64()
+                );
+            }
+        }
+    });
+}
