@@ -15,7 +15,10 @@
 //! - **spread**: every command on its own account - `decide()` sees an
 //!   empty history, the cheapest case;
 //! - **hot**: every command on one account - `decide()` folds that
-//!   account's whole history, which grows as the run goes.
+//!   account's whole history, which grows as the run goes;
+//! - **hot-snap**: every command on one account, through `DepositFast`,
+//!   which decides from a `Balance` snapshot plus the events since it
+//!   (docs/architecture.md §19, §188).
 //!
 //! Besides throughput and latency, it collects the command batcher's own
 //! `debug` events (`command batch leader lock wait`, `command batch phase
@@ -25,7 +28,7 @@
 
 mod deposit_bench;
 
-use deposit_bench::{deposit, setup, Setup};
+use deposit_bench::{deposit, deposit_with, setup, Setup};
 use skilj_core::db;
 use skilj_core::shared::generate_token_id;
 use std::sync::{Arc, Mutex};
@@ -121,6 +124,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 enum Workload {
     Spread,
     Hot,
+    HotSnapshot,
 }
 
 /// `COMMANDS` deposits from `workers` concurrent callers. Prints one row.
@@ -136,9 +140,14 @@ async fn scenario(setup: &Setup, stats: &BatchStatsLayer, workload: Workload, wo
             for n in 0..per_worker {
                 let account = match workload {
                     Workload::Spread => format!("{run}-{worker}-{n}"),
-                    Workload::Hot => format!("{run}-hot"),
+                    Workload::Hot | Workload::HotSnapshot => format!("{run}-hot"),
                 };
-                latencies.push(deposit(setup, &account).await);
+                latencies.push(match workload {
+                    Workload::HotSnapshot => {
+                        deposit_with(setup, &setup.fast_credential, &account).await
+                    }
+                    _ => deposit(setup, &account).await,
+                });
             }
             latencies
         }
@@ -154,12 +163,13 @@ async fn scenario(setup: &Setup, stats: &BatchStatsLayer, workload: Workload, wo
     let s = stats.0.lock().unwrap().clone();
     let per_command = |us: u64| us as f64 / s.commands.max(1) as f64;
     println!(
-        "{:<6} {:>3} workers {:>6.0} cmd/s  p50 {:>6.1} ms  p99 {:>6.1} ms | batch {:>5.1}  \
+        "{:<8} {:>3} workers {:>6.0} cmd/s  p50 {:>6.1} ms  p99 {:>6.1} ms | batch {:>5.1}  \
          lock wait {:>6.1} ms | per cmd in lock: decide {:>5.0} us (delta query {:>5.0} us, {:>3.0}%)  \
          seq {:>4.0} us  persist {:>5.0} us  commit {:>5.0} us",
         match workload {
             Workload::Spread => "spread",
             Workload::Hot => "hot",
+            Workload::HotSnapshot => "hot-snap",
         },
         workers,
         latencies.len() as f64 / elapsed.as_secs_f64(),
@@ -204,7 +214,7 @@ fn command_throughput() {
 
         for round in 1..=2 {
             println!("--- round {round} ({COMMANDS} commands each) ---");
-            for workload in [Workload::Spread, Workload::Hot] {
+            for workload in [Workload::Spread, Workload::Hot, Workload::HotSnapshot] {
                 for workers in [1, 8, 32, 80] {
                     scenario(&setup, &stats, workload, workers).await;
                 }

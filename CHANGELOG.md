@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A command deciding from a snapshot reads the events since the
+  snapshot from the event cache, when the cache still holds them,
+  instead of always from Postgres once the bounded context outgrew the
+  cache. Tag-filtered event queries with an `after` position benefit the
+  same way (docs/architecture.md §188, Codeberg issue #51).
+
 - A command's DCB pre-read is cheaper in a bounded context with more
   events than the event cache holds (1000 by default): once the cache's
   window no longer reaches back to the first event, the pre-read goes

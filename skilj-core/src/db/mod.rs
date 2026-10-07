@@ -6800,16 +6800,10 @@ pub async fn list_events_for_bounded_context_matching_tags_cached(
     after_sequence: Option<i64>,
 ) -> crate::error::Result<(Vec<Event>, i64)> {
     match cache
-        .try_events_matching_tags(pool, bounded_context, tags)
+        .try_events_matching_tags(pool, bounded_context, tags, after_sequence.unwrap_or(-1))
         .await?
     {
-        Some((events, covered_through)) => Ok((
-            events
-                .into_iter()
-                .filter(|e| e.sequence > after_sequence.unwrap_or(-1))
-                .collect(),
-            covered_through,
-        )),
+        Some(served) => Ok(served),
         None => {
             let covered_through = latest_sequence(pool, bounded_context).await?.unwrap_or(-1);
             let events = list_events_for_bounded_context_matching_tags(

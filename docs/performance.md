@@ -30,9 +30,10 @@ Consequences:
 /v1/commands/trigger` on the in-process router (no network) into one bounded
 context, from 1, 8, 32 or 80 concurrent callers, and reads the command
 batcher's own `debug` events to report batch size, lock wait and where the
-time inside the lock goes. Two workloads: **spread** (every command on its own
-account, so `decide()` sees an empty history) and **hot** (every command on
-one account, whose history grows as the run goes).
+time inside the lock goes. Three workloads: **spread** (every command on its
+own account, so `decide()` sees an empty history), **hot** (every command on
+one account, whose history grows as the run goes) and **hot-snap** (hot, but
+deciding from a snapshot, docs/architecture.md §19).
 
 Measured on a 22-core development machine against the embedded Postgres 18,
 shared with other work - the load average moved between 6 and 15 during the
@@ -68,6 +69,10 @@ What the profile says:
   callers. It now goes straight to Postgres, which raised spread
   throughput by roughly a quarter in one back-to-back run
   (docs/architecture.md §187). The table above predates that.
+- **hot-snap**, the hot workload deciding from a `Balance` snapshot
+  (§19), reads only the events since the snapshot, usually from the event
+  cache (§188): 216-221 commands/s with one caller, 260-340 from 8 callers
+  up, against 48-134 for plain hot.
 - **Hot** is bounded by the account's history, which every command carries
   into the lock and folds: `decide` takes ~1 ms even with nothing new to
   re-check, and the consistency boundary is computed over the same history

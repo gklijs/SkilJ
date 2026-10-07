@@ -643,7 +643,7 @@ fn a_tag_read_serves_the_matching_events_complete_through_the_whole_window() {
         let cache = EventCache::new(1000);
         cache.warm(&pool, &bc.name).await.unwrap();
         let (events, covered_through) = cache
-            .try_events_matching_tags(&pool, &bc.name, &[account("a")])
+            .try_events_matching_tags(&pool, &bc.name, &[account("a")], -1)
             .await
             .unwrap()
             .expect("the window holds the whole history");
@@ -654,7 +654,7 @@ fn a_tag_read_serves_the_matching_events_complete_through_the_whole_window() {
         assert_eq!(covered_through, last.sequence);
 
         let (events, covered_through) = cache
-            .try_events_matching_tags(&pool, &bc.name, &[account("nobody")])
+            .try_events_matching_tags(&pool, &bc.name, &[account("nobody")], -1)
             .await
             .unwrap()
             .unwrap();
@@ -690,7 +690,7 @@ fn a_tag_read_past_the_windows_first_event_misses_without_a_round_trip() {
 
         assert_eq!(
             cache
-                .try_events_matching_tags(&own_pool, &bc.name, &[account("a")])
+                .try_events_matching_tags(&own_pool, &bc.name, &[account("a")], -1)
                 .await
                 .unwrap(),
             None
@@ -699,5 +699,72 @@ fn a_tag_read_past_the_windows_first_event_misses_without_a_round_trip() {
             .try_events_after(&own_pool, &bc.name, 3)
             .await
             .is_err());
+    });
+}
+
+/// docs/architecture.md §188 (Codeberg #51): a command deciding from a
+/// snapshot only needs the events after the snapshot's `as_of_sequence`,
+/// which a window that no longer reaches the first event can still hold.
+/// It used to miss whenever the window didn't reach the start, so a
+/// long-lived bounded context's snapshot commands always read Postgres.
+#[test]
+fn a_tag_read_after_a_position_is_served_by_a_window_that_holds_it() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let mut events = Vec::new();
+        for i in 0..6 {
+            let id = if i % 2 == 0 { "a" } else { "b" };
+            events.push(
+                insert_tagged_event_bypassing_cache(&pool, &bc, &et, vec![account(id)]).await,
+            );
+        }
+        // Holds sequences 2-5.
+        let cache = EventCache::new(4);
+        cache.warm(&pool, &bc.name).await.unwrap();
+        let read = |after: i64| {
+            let cache = cache.clone();
+            let pool = pool.clone();
+            let name = bc.name.clone();
+            async move {
+                cache
+                    .try_events_matching_tags(&pool, &name, &[account("a")], after)
+                    .await
+                    .unwrap()
+                    .map(|(events, covered_through)| {
+                        (
+                            events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+                            covered_through,
+                        )
+                    })
+            }
+        };
+
+        assert_eq!(
+            read(events[1].sequence).await,
+            Some((
+                vec![events[2].sequence, events[4].sequence],
+                events[5].sequence
+            )),
+            "from the window's own first event"
+        );
+        assert_eq!(
+            read(events[2].sequence).await,
+            Some((vec![events[4].sequence], events[5].sequence))
+        );
+        assert_eq!(
+            read(events[5].sequence).await,
+            Some((Vec::new(), events[5].sequence)),
+            "nothing since"
+        );
+        assert_eq!(
+            read(events[0].sequence).await,
+            None,
+            "needs an evicted event"
+        );
+        assert_eq!(read(-1).await, None, "needs the whole history");
     });
 }

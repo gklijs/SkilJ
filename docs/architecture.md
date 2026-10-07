@@ -11261,3 +11261,18 @@ After both fixes, the cache's share of a pre-read that misses is 0-2 µs. The tw
 Tests (`skilj-core/tests/event_cache.rs`): `a_tag_read_serves_the_matching_events_complete_through_the_whole_window`, and `a_tag_read_past_the_windows_first_event_misses_without_a_round_trip`, which warms through a pool, closes the pool, and expects a clean miss rather than a connection error. That test fails on the old code.
 
 **Not done.** Serving tag reads from a window that doesn't reach the start (snapshots, a `covered_from` position) is #51.
+
+## 188. Event cache tag reads after a snapshot's position
+
+Codeberg issue #51 asked whether a command deciding from a snapshot (§19) benefits from the event cache, and whether a window that doesn't reach back to the first event could serve it. It didn't benefit: `resolve_command_submission` passed the snapshot's `as_of_sequence` to `list_events_for_bounded_context_matching_tags_cached`, but the cache half always read from `-1` and filtered afterwards. So once a bounded context outgrew the cache's capacity (1000 events by default), every snapshot command missed. Since §187 the miss is free, but the read still went to Postgres.
+
+`EventCache::try_events_matching_tags` now takes `after_sequence`, and serves the read whenever the window holds everything after it (`after_sequence >= covers_from - 1`, the same coverage rule `try_events_after` has always used). The §187 shortcut is generalised the same way: a window stamped with a table whose first event is already past `after_sequence + 1` misses without freshening. Freshening only moves the first event forward, so it could only ever produce the same miss. `covered_through` is still the window's highest sequence. The events the caller gets are the ones the Postgres fallback would give, so the re-check under the lock (§178) is unchanged. `QueryEvents`/`CountEvents` with a `tags` filter and an `after` position go through the same function and benefit the same way.
+
+A snapshot lags the head by about one `snapshot_poll_interval` (500ms by default). A bounded context would need more than ~2000 commits a second to push its snapshots' positions out of a 1000-event window. A cold snapshot (`as_of_sequence: -1`) still needs the whole history, so it misses until catch-up writes it.
+
+Measured with a new **hot-snap** workload in `skilj/tests/command_throughput.rs`: `DepositFast`, the same deposit deciding from a `Balance` snapshot, all on one account. Temporary counters, since removed, showed 0 cache hits out of 800 pre-reads before the change, and 511-778 after. The misses are each scenario's first few hundred milliseconds, before the new account's snapshot exists. With one caller the pre-read fell from ~1.7-2.2 ms to ~0.5 ms, and throughput rose from 168-182 to 216-221 commands/s. From 8 callers up, throughput stayed at 260-340 commands/s, bound by the re-check under the lock and `persist`. For comparison, the non-snapshot hot workload stays at 48-134 commands/s.
+
+Tests (`skilj-core/tests/event_cache.rs`): `a_tag_read_after_a_position_is_served_by_a_window_that_holds_it`, and `a_tag_read_past_the_windows_first_event_misses_without_a_round_trip`, extended: a read after a position the window can't reach misses on a closed pool, while one it can serve tries to freshen and fails.
+
+**Not done.** A hit still pays `freshen`'s round trip (`events_table_identity`, ~0.5 ms with one caller), most of it hashing the bounded context's type registrations into the stamp (§180) on every read. Tracked as Codeberg #78.
+

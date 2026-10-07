@@ -455,34 +455,36 @@ impl EventCache {
         }
     }
 
-    /// Whether `bounded_context`'s window has already let go of its first
-    /// event, so it can't serve a read from the beginning however it is
-    /// freshened: freshening only appends and evicts, and a refill takes
-    /// the most recent `capacity` events of a log already longer than
-    /// that. The exception is a refill onto another table (§95/§176), which
-    /// needs a window stamped with one, so a window only `append` has
-    /// touched never counts.
-    async fn has_evicted_the_beginning(&self, bounded_context: &str) -> bool {
+    /// Whether `bounded_context`'s window has already let go of the events
+    /// just after `after_sequence`, so it can't serve a read from there
+    /// however it is freshened: freshening only appends and evicts, and a
+    /// refill takes the most recent `capacity` events of a log already
+    /// longer than that, so the window's first event only ever moves on.
+    /// The exception is a refill onto another table (§95/§176), which needs
+    /// a window stamped with one, so a window only `append` has touched
+    /// never counts.
+    async fn has_evicted_past(&self, bounded_context: &str, after_sequence: i64) -> bool {
         let contexts = self.contexts.read().await;
-        contexts
-            .get(bounded_context)
-            .is_some_and(|w| w.table.is_some() && w.covers_from().is_some_and(|front| front > 0))
+        contexts.get(bounded_context).is_some_and(|w| {
+            w.table.is_some()
+                && w.covers_from()
+                    .is_some_and(|front| front - 1 > after_sequence)
+        })
     }
 
     /// [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 1" fix -
     /// `db::list_events_for_bounded_context_matching_tags_cached`'s own
-    /// cache-first half. Delegates the actual coverage check to
-    /// `try_events_after(pool, bounded_context, -1)` rather than
-    /// duplicating it - the "does this window cover from the very
-    /// beginning" question is identical either way, only what's done
-    /// with a hit differs: here, filtered by `tags` (the same union
-    /// semantics `consistency_boundary_and_matching_events` already
-    /// uses) before returning, so a caller gets the same already-
-    /// tag-scoped shape whether this was served from cache or fell
-    /// through to the tag-indexed Postgres query. `Ok(None)` is a
-    /// coverage miss, identical convention to every other method here -
-    /// the caller falls back to
-    /// `db::list_events_for_bounded_context_matching_tags`.
+    /// cache-first half: the events after `after_sequence` carrying any
+    /// of `tags` (the same union semantics
+    /// `consistency_boundary_and_matching_events` already uses), so a
+    /// caller gets the same already-tag-scoped shape whether this was
+    /// served from cache or fell through to the tag-indexed Postgres
+    /// query. `after_sequence` is `-1` for a command's whole history, or
+    /// its snapshot's `as_of_sequence`: a window that no longer reaches
+    /// the start can still serve the events since a recent snapshot
+    /// (docs/architecture.md §188). `Ok(None)` is a coverage miss,
+    /// identical convention to every other method here - the caller falls
+    /// back to `db::list_events_for_bounded_context_matching_tags`.
     ///
     /// Alongside the events, the position they are complete through: the
     /// highest sequence the window held, matching or not (`-1` when there
@@ -494,16 +496,18 @@ impl EventCache {
         pool: &Pool,
         bounded_context: &str,
         tags: &[Tag],
+        after_sequence: i64,
     ) -> crate::error::Result<Option<(Vec<Event>, i64)>> {
-        // A window that has evicted sequence 0 misses here whatever
-        // `freshen` does, so its round trip is skipped. Only a miss can come
-        // of skipping it: a window that ends up stale this way (its bounded
-        // context recreated) keeps sending these reads to Postgres until any
-        // other read freshens it (docs/architecture.md §187).
-        if self.has_evicted_the_beginning(bounded_context).await {
+        // A window that has already evicted what this read needs misses
+        // whatever `freshen` does, so its round trip is skipped. Only a
+        // miss can come of skipping it: a window that ends up stale this
+        // way (its bounded context recreated) keeps sending these reads to
+        // Postgres until any other read freshens it (docs/architecture.md
+        // §187).
+        if self.has_evicted_past(bounded_context, after_sequence).await {
             return Ok(None);
         }
-        self.try_events_where(pool, bounded_context, -1, |e| {
+        self.try_events_where(pool, bounded_context, after_sequence, |e| {
             tags.iter().any(|t| e.tags.contains(t))
         })
         .await
