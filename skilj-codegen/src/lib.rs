@@ -40,6 +40,13 @@
 //! also defines the `decide_*` functions. See
 //! `skilj-demo/build.rs`/`skilj-demo/src/banking.rs` for the real,
 //! working example.
+//!
+//! **Reviewing what it generates.** Code written to `$OUT_DIR` never
+//! shows up in a diff. `skilj-demo/tests/generated_code.rs` compares the
+//! `$OUT_DIR` file against a checked-in copy, so a change to the
+//! `.skilj.toml` or to this crate shows up as a diff of that copy
+//! (docs/architecture.md §191). A consumer can do the same in a few
+//! lines.
 
 mod emit;
 mod spec;

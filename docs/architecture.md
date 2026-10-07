@@ -11329,3 +11329,18 @@ Codeberg issue #53 asked whether read-heavy paths could go to a read replica. **
 4. Which reads go where, decided per path and documented as an advertised guarantee (§177), with the conformance transcript (§179) recording any read whose freshness changes.
 
 **Why not now.** Nothing shows the primary's read load is the limit. The measured costs are the sequence lock and `persist` (§184, §187, §188), which stay on the primary whatever happens to reads, and the event cache already takes the hot reads off Postgres. A replica would be the answer to a measured read bottleneck: many subscribers catching up, or heavy `queryEvents`/projection traffic. Not to command throughput.
+
+## 191. Generated code is checked in as a copy, and `build.rs` stays
+
+Codeberg issue #54. `skilj-codegen` runs from `build.rs` and writes to `OUT_DIR` (§17), so neither a `.skilj.toml` change nor a generator change shows up in a review diff. kafgres checks its generated code in and verifies it in CI. Most of the churn here is the generator: five commits touched `skilj-codegen`, one touched `banking.skilj.toml`.
+
+**Options weighed** (user choice):
+- *Check the generated file in and compile it, dropping `build.rs`* (kafgres' way). The diff shows, but a consumer has to remember to regenerate, which is what §17 chose `build.rs` to avoid, and the copy can go stale between a change and the check.
+- *Document only.*
+- *Keep `build.rs`, and check in a copy that a test compares against.* Chosen. The compiled code is still generated on every build and can't drift. The copy is there for review.
+
+**How.** `skilj-demo/tests/generated_code.rs` `include_str!`s the `OUT_DIR` file `build.rs` wrote, so it compares exactly the code `banking.rs` compiles, and requires it to equal `skilj-demo/tests/fixtures/banking_generated.rs` line by line. On a difference it fails with the differing lines. Re-recording works the way §179's transcript does: `SKILJ_RECORD_GENERATED=1 cargo test -p skilj-demo --test generated_code`, then review the diff. A change to `skilj-codegen` rebuilds the build script, which reruns it, so a generator change reaches the test without touching the `.skilj.toml`. Checked both ways: a tampered copy fails, and so does a generator that prepends a line.
+
+The copy sits under `tests/fixtures/`. No target reaches it, so it isn't compiled, and `cargo fmt` leaves `prettyplease`'s formatting alone.
+
+`skilj-codegen`'s crate docs point consumers at the test as a pattern to copy. The generator itself is unchanged: it emits no "do not edit" header, because nothing compiles the copy.

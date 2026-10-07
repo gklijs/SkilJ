@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A checked-in copy of what `skilj-codegen` generates for skilj-demo's
+  `banking.skilj.toml` (docs/architecture.md §191, Codeberg issue #54),
+  compared by `skilj-demo/tests/generated_code.rs`, so a change to the
+  spec or the generator shows up in review. Re-record with
+  `SKILJ_RECORD_GENERATED=1`.
+
 - Command dry-runs (docs/architecture.md §185, Codeberg issue #47): what
   a command would decide right now, with nothing persisted - no command,
   event, sequence number, encryption key or idempotency record. GraphQL's

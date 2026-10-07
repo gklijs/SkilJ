@@ -5,7 +5,9 @@
 //! build`'s own `build.rs` contract) - the issue's own preferred
 //! default over a separate "did you remember to re-run the generator"
 //! CLI step, so the generated code can never drift out of sync with the
-//! `.skilj.toml` file it came from.
+//! `.skilj.toml` file it came from. `tests/generated_code.rs` keeps a
+//! checked-in copy of the output, so changes to it show up in review
+//! (docs/architecture.md §191).
 //!
 //! `courses.rs` has no `.skilj.toml` counterpart and isn't touched by
 //! this - it stays fully hand-written, deliberately (see `banking.rs`'s

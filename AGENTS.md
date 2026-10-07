@@ -21,6 +21,8 @@ CONTRIBUTING.md's "What the tests do and don't verify" lists which guarantees ho
 
 `skilj/tests/conformance.rs` compares what GraphQL and REST answer against the checked-in `skilj/tests/fixtures/conformance.transcript`, and against each other (docs/architecture.md §179). When a change to either surface is intended, re-record it with `SKILJ_RECORD_CONFORMANCE=1 cargo test -p skilj --test conformance` and review the diff; a deliberate difference between the surfaces goes in the test's `DIVERGENCES` catalogue with its reason.
 
+`skilj-demo/tests/generated_code.rs` compares what `skilj-codegen` generates for `skilj-demo/src/banking.skilj.toml` against the checked-in `skilj-demo/tests/fixtures/banking_generated.rs` (docs/architecture.md §191). After an intended change to either, re-record it with `SKILJ_RECORD_GENERATED=1 cargo test -p skilj-demo --test generated_code` and review the diff.
+
 Some integration tests require external services:
 - **Postgres** — `skilj-core`, `skilj`, `skilj-inspector` and `skilj-demo` integration tests use `DATABASE_URL` when it is set, and otherwise fall back to `postgresql_embedded`. Set `DATABASE_URL` to a real Postgres to avoid embedded-server issues. `DATABASE_URL` supplies the server, not the database: every test binary drops and recreates a named database of its own on it (docs/architecture.md §167), so the role needs `CREATEDB`.
 - **Kafka** (`skilj-kafka`), **AMQP** (`skilj-amqp`), **NATS** (`skilj-nats`), **Temporal** (`skilj-temporal`) — these tests use `testcontainers-modules` and need a reachable Docker daemon. They skip gracefully if Docker is unavailable.
