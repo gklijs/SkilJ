@@ -11274,5 +11274,32 @@ Measured with a new **hot-snap** workload in `skilj/tests/command_throughput.rs`
 
 Tests (`skilj-core/tests/event_cache.rs`): `a_tag_read_after_a_position_is_served_by_a_window_that_holds_it`, and `a_tag_read_past_the_windows_first_event_misses_without_a_round_trip`, extended: a read after a position the window can't reach misses on a closed pool, while one it can serve tries to freshen and fails.
 
-**Not done.** A hit still pays `freshen`'s round trip (`events_table_identity`, ~0.5 ms with one caller), most of it hashing the bounded context's type registrations into the stamp (§180) on every read. Tracked as Codeberg #78.
+**Not done.** A hit still pays `freshen`'s round trip (`events_table_identity`, ~0.5 ms with one caller), most of it hashing the bounded context's type registrations into the stamp (§180) on every read. Tracked as Codeberg #78. Done in §189.
 
+## 189. The registrations stamp is a counter, not a hash
+
+Codeberg issue #78, left open by §188. Every cache-served read first runs `events_table_identity` (§95, §176, §180), and since §180 that round trip also hashed every `event_types` and `command_types` row of the bounded context into the `RegistrationsStamp`. Measured on embedded Postgres, 1000 calls each, release build, types with a 40-field schema:
+
+| registered types | identity read | without the stamp | `SELECT 1` |
+|---|---|---|---|
+| 1 | 261 µs | 192 µs | 172 µs |
+| 10 | 311 µs | 190 µs | 154 µs |
+| 50 | 734 µs | 243 µs | 182 µs |
+| 200 | 1.84 ms | 219 µs | 162 µs |
+
+So the stamp was most of the read's cost from a few dozen types up, paid on every read while registrations almost never change. (`to_jsonb` builds the whole row, schema text included, before the hash drops it.)
+
+**Options weighed.**
+- *Invalidate on the registration-change `NOTIFY` (§181) and skip the stamp otherwise.* The round trip stays anyway, for the latest sequence and the table identity, so it saves no more than the counter. And it gives up what the per-read check guarantees: a notification arrives some time after the commit, and a lost listener connection loses them.
+- *Bump a counter in the upsert functions.* Every write path would have to remember it, as with the call-site option §180 rejected.
+- *A counter bumped by triggers.* Chosen.
+
+**Fix.** Each bounded context gets a one-row `registrations_generation` table and four row triggers (`db::ensure_registrations_generation`): an insert or delete on `event_types` or `command_types` increments the counter, and so does an update that changes the row. For `event_types` the update trigger's condition leaves out `schedule_position`/`last_fired_at`, as the hash did, so a scheduled fire doesn't count. A re-registration that writes the row back unchanged, as every startup does, doesn't count either. `events_table_identity` reads the counter in the same round trip, in place of the hash. The trigger fires in the registering transaction, so a reader sees the new registrations and the new counter together or neither, the same as the hash. It is stricter than the hash in one way: changing a declaration and changing it back is two increments, where the hash came back to its old value. That costs one needless reload.
+
+The counter is created at provisioning, and on every `build()` for a bounded context from before this. The patch checks each step first and skips what's there (§158): `CREATE TRIGGER` takes a lock that blocks writes, and replacing the function on every start would fail when two instances start together. All of it runs as one statement batch, so as one transaction: nothing reads the counter before its triggers exist. The v0.0.1 upgrade test (§159) now compares triggers too, and fails without the patch.
+
+A bounded context added by an older instance during a rolling deploy has no counter until some newer instance restarts. `events_table_identity` falls back to the hash when the table is missing (`42P01`), so such a context is served as before rather than failing. A recreated bounded context's counter starts again at 0, but its table OID differs (§95). A promoted standby can be behind on the counter, but its epoch differs (§176).
+
+After: the identity read is ~200 µs whatever the number of types (1, 10, 50 and 200 measured the same way), about 40 µs over `SELECT 1`. `command_throughput`'s bounded context has a handful of types, where the saving (~70 µs a read) is within run-to-run noise: hot-snap with one caller ran at 195-197 commands/s with the change and 203-207 without, in the same session.
+
+Tests (`skilj-core/tests/event_cache.rs`): `only_a_changed_registration_changes_the_registrations_stamp` (rewriting an event type and a command type unchanged keeps the stamp; changing the command type moves it), `a_bounded_context_without_the_counter_is_stamped_by_hashing` (drops the counter, requires the hash to track a re-registration, patches it back and requires the counter to). `a_scheduled_fire_does_not_change_the_registrations_stamp` (§180) now checks the trigger's condition.

@@ -929,6 +929,7 @@ async fn provision_bounded_context_schema(
 
     // docs/architecture.md §104 - after every table it touches exists.
     add_registration_version_columns(&mut **tx, bounded_context).await?;
+    ensure_registrations_generation(&mut **tx, bounded_context).await?;
     Ok(())
 }
 
@@ -1945,6 +1946,86 @@ pub async fn ensure_external_message_keys_table<'e>(
             PRIMARY KEY (adapter_id, message_key)
         );
         {index}"
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `registrations_generation`: one counter row per bounded context,
+/// incremented by triggers whenever an `event_types`/`command_types` row
+/// is inserted, deleted or changed. It's what [`events_table_identity`]
+/// reads as the [`RegistrationsStamp`], instead of hashing every
+/// registration on every cache read (docs/architecture.md §189). An
+/// update that only moves `schedule_position`/`last_fired_at` - a
+/// scheduled fire - doesn't count, and neither does a re-registration
+/// that writes the row back unchanged, as every instance's startup does.
+///
+/// Created at provisioning and on every `build()`; each step is skipped
+/// when already there, since `CREATE TRIGGER` takes a lock that blocks
+/// writes to the table (§158), and replacing the function on every start
+/// fails when two instances start at once. One multi-statement query, so one
+/// transaction: no reader sees the counter before its triggers exist.
+#[tracing::instrument(skip_all)]
+pub async fn ensure_registrations_generation<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let triggers = [
+        (
+            "event_types",
+            "event_types_bump_registrations_generation",
+            "AFTER INSERT OR DELETE",
+            "",
+        ),
+        (
+            "event_types",
+            "event_types_change_bumps_registrations_generation",
+            "AFTER UPDATE",
+            " WHEN ((to_jsonb(OLD) - 'schedule_position' - 'last_fired_at') \
+             IS DISTINCT FROM (to_jsonb(NEW) - 'schedule_position' - 'last_fired_at'))",
+        ),
+        (
+            "command_types",
+            "command_types_bump_registrations_generation",
+            "AFTER INSERT OR DELETE",
+            "",
+        ),
+        (
+            "command_types",
+            "command_types_change_bumps_registrations_generation",
+            "AFTER UPDATE",
+            " WHEN (OLD.* IS DISTINCT FROM NEW.*)",
+        ),
+    ]
+    .map(|(table, name, events, when)| {
+        format!(
+            "DO $patch$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_trigger \
+             WHERE tgrelid = to_regclass({}) AND tgname = {}) THEN \
+             CREATE TRIGGER {name} {events} ON {schema}.{table} FOR EACH ROW{when} \
+             EXECUTE FUNCTION {schema}.bump_registrations_generation(); END IF; END $patch$",
+            sql_literal(&format!("{schema}.{table}")),
+            sql_literal(name)
+        )
+    })
+    .join(";\n");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.registrations_generation (
+            id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+            generation BIGINT NOT NULL
+        );
+        INSERT INTO {schema}.registrations_generation (generation) VALUES (0)
+            ON CONFLICT (id) DO NOTHING;
+        DO $patch$ BEGIN IF to_regprocedure({function}) IS NULL THEN
+            CREATE FUNCTION {schema}.bump_registrations_generation() RETURNS trigger
+                LANGUAGE plpgsql AS $bump$ BEGIN
+                    UPDATE {schema}.registrations_generation SET generation = generation + 1;
+                    RETURN NULL;
+                END $bump$;
+        END IF; END $patch$;
+        {triggers}",
+        function = sql_literal(&format!("{schema}.bump_registrations_generation()"))
     )))
     .execute(executor)
     .await?;
@@ -5653,13 +5734,6 @@ pub async fn next_sequence_batch<'e>(
     Ok(((last - count + 1)..=last).collect())
 }
 
-/// The highest `sequence` currently committed in a bounded context -
-/// `None` when it has no events at all yet. `catch_up_bounded_context`'s
-/// own cheap first check every poll tick, so a quiet context (nothing
-/// since the last tick) costs one small aggregate query, not a full event
-/// reload - `list_events_for_bounded_context_from` only ever runs once
-/// this comes back higher than everything that still needs catching up.
-#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 /// The identity of `bounded_context`'s `events` table (its OID) together
 /// with [`latest_sequence`], in one round trip. Hard-deleting a bounded
 /// context drops its schema and frees the name for reuse, and recreating
@@ -5675,24 +5749,41 @@ pub async fn next_sequence_batch<'e>(
 /// The same round trip also stamps the bounded context's type
 /// registrations ([`RegistrationsStamp`]), so the event cache notices a
 /// re-registration - by any instance - before serving events that carry
-/// copies of the old one (docs/architecture.md §180).
+/// copies of the old one (docs/architecture.md §180). The stamp is
+/// `registrations_generation`'s counter (§189); a bounded context without
+/// one - provisioned by an older instance mid rolling deploy, and not yet
+/// patched by a restart - is stamped by hashing its registrations instead.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn events_table_identity(
     pool: &Pool,
     bounded_context: &str,
 ) -> crate::error::Result<EventsTableState> {
     let schema = schema_ident(bounded_context);
-    let (oid, max, epoch, registrations): (i64, Option<i64>, String, String) =
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let identity = |registrations: String| {
+        format!(
             "SELECT '{schema}.events'::regclass::oid::bigint, \
-                    (SELECT MAX(sequence) FROM {schema}.events), {EPOCH_SQL}, \
-                    (SELECT md5(coalesce(string_agg((to_jsonb(t) - 'schema' \
-                        - 'schedule_position' - 'last_fired_at')::text, ',' ORDER BY t.name), '')) \
-                     FROM {schema}.event_types t) \
-                    || (SELECT md5(coalesce(string_agg((to_jsonb(c) - 'schema')::text, ',' \
-                        ORDER BY c.name), '')) FROM {schema}.command_types c)"
-        )))
-        .fetch_one(pool)
-        .await?;
+                    (SELECT MAX(sequence) FROM {schema}.events), {EPOCH_SQL}, ({registrations})"
+        )
+    };
+    let counted = sqlx::query_as(sqlx::AssertSqlSafe(identity(format!(
+        "SELECT 'g' || generation FROM {schema}.registrations_generation"
+    ))))
+    .fetch_one(pool)
+    .await;
+    let (oid, max, epoch, registrations): (i64, Option<i64>, String, String) = match counted {
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => {
+            sqlx::query_as(sqlx::AssertSqlSafe(identity(format!(
+                "SELECT (SELECT md5(coalesce(string_agg((to_jsonb(t) - 'schema' \
+                    - 'schedule_position' - 'last_fired_at')::text, ',' ORDER BY t.name), '')) \
+                 FROM {schema}.event_types t) \
+                || (SELECT md5(coalesce(string_agg((to_jsonb(c) - 'schema')::text, ',' \
+                    ORDER BY c.name), '')) FROM {schema}.command_types c)"
+            ))))
+            .fetch_one(pool)
+            .await?
+        }
+        counted => counted?,
+    };
     Ok(EventsTableState {
         table: TableIdentity {
             oid,
@@ -5713,13 +5804,13 @@ pub struct EventsTableState {
 }
 
 /// A fingerprint of a bounded context's `EventType`/`CommandType`
-/// registrations as they stand: it changes whenever a declaration does
-/// (`private_fields`, `owner_tag_key`, `tag_mappings`, ...) and only then.
-/// A schema change shows through `schema_version`, so the schema text
-/// itself isn't hashed; a scheduled fire moves only `schedule_position`/
-/// `last_fired_at`, which are left out so firing doesn't look like a
-/// re-registration (docs/architecture.md §180). Compared for equality,
-/// never parsed.
+/// registrations: it changes whenever a declaration does
+/// (`private_fields`, `owner_tag_key`, `tag_mappings`, ...). A scheduled
+/// fire moves only `schedule_position`/`last_fired_at`, which don't count,
+/// so firing doesn't look like a re-registration (docs/architecture.md
+/// §180). Normally `registrations_generation`'s counter (§189), else a hash
+/// of the registrations - see [`events_table_identity`]. Compared for
+/// equality, never parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrationsStamp(String);
 
@@ -5833,6 +5924,13 @@ pub async fn record_epoch(
     Ok(previous.and_then(|(previous,)| previous).map(Epoch))
 }
 
+/// The highest `sequence` currently committed in a bounded context -
+/// `None` when it has no events at all yet. `catch_up_bounded_context`'s
+/// own cheap first check every poll tick, so a quiet context (nothing
+/// since the last tick) costs one small aggregate query, not a full event
+/// reload - `list_events_for_bounded_context_from` only ever runs once
+/// this comes back higher than everything that still needs catching up.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn latest_sequence(
     pool: &Pool,
     bounded_context: &str,

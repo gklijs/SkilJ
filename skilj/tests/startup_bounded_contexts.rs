@@ -376,8 +376,9 @@ fn reconciliation_runs_on_a_patched_bounded_context() {
     });
 }
 
-/// Every column (with its type, nullability and default), index and
-/// constraint of `bounded_context`'s schema, as sorted text lines.
+/// Every column (with its type, nullability and default), index,
+/// constraint and trigger of `bounded_context`'s schema, as sorted text
+/// lines.
 async fn schema_shape(pool: &Pool, bounded_context: &str) -> Vec<String> {
     let schema = format!("bc_{bounded_context}");
     let mut shape: Vec<String> =
@@ -423,14 +424,28 @@ async fn schema_shape(pool: &Pool, bounded_context: &str) -> Vec<String> {
             format!("constraint {table}.{name} {}", def.replace(&schema, "bc"))
         }),
     );
+    shape.extend(
+        sqlx::query_as::<_, (String,)>(
+            "SELECT pg_get_triggerdef(t.oid) FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND NOT t.tgisinternal",
+        )
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(def,)| format!("trigger {}", def.replace(&schema, "bc"))),
+    );
     shape.sort();
     shape
 }
 
 /// docs/architecture.md §159: a bounded context provisioned by skilj
 /// v0.0.1 - the oldest release - comes out of the current version's
-/// startup with the same columns, indexes and constraints as one
-/// provisioned today.
+/// startup with the same columns, indexes, constraints and triggers as
+/// one provisioned today.
 /// Every table or column added since needs its startup patch; this is
 /// what notices one that's missing.
 #[test]

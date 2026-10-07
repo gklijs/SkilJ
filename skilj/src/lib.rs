@@ -2346,6 +2346,10 @@ impl SkiljBuilder {
                             pool, &bc.name,
                         )
                         .await?;
+                        // docs/architecture.md §189: the counter the event
+                        // cache stamps registrations with, instead of
+                        // hashing them on every read.
+                        skilj_core::db::ensure_registrations_generation(pool, &bc.name).await?;
                         // Last: it reads `events` as the patches above
                         // leave it - a bounded context from before
                         // `metadata_correlation_id`/`metadata_causation_id`

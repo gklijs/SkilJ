@@ -15,7 +15,7 @@ use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{
-    BoundedContext, BoundedContextStatus, Event, EventOrigin, EventType,
+    BoundedContext, BoundedContextStatus, CommandType, Event, EventOrigin, EventType,
 };
 use skilj_core::shared::{generate_token_id, Metadata, PrivateField, PrivateFieldKind, Tag};
 
@@ -100,6 +100,22 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
     };
     db::upsert_event_type(pool, &et).await.unwrap();
     et
+}
+
+async fn seed_command_type(pool: &Pool, bc: &BoundedContext) -> CommandType {
+    let ct = CommandType {
+        bounded_context: bc.clone(),
+        name: "ShipOrder".to_string(),
+        schema: r#"{"properties":{}}"#.to_string(),
+        schema_version: 1,
+        tag_mappings: Vec::new(),
+        owner_tag_key: None,
+        sensitive_fields: Vec::new(),
+        private_fields: Vec::new(),
+        rest_trigger_allowed: true,
+    };
+    db::upsert_command_type(pool, &ct).await.unwrap();
+    ct
 }
 
 /// Inserts one real, committed row directly - bypassing `EventCache`
@@ -575,7 +591,8 @@ fn a_re_registration_applies_to_events_already_cached() {
 }
 
 /// The registrations stamp the cache compares on every read leaves out
-/// what a scheduled fire moves, so a type firing every second doesn't
+/// what a scheduled fire moves (§180, through the counter's trigger
+/// condition since §189), so a type firing every second doesn't
 /// make the cache reload its registrations on every read (§180).
 #[test]
 fn a_scheduled_fire_does_not_change_the_registrations_stamp() {
@@ -618,6 +635,83 @@ fn a_scheduled_fire_does_not_change_the_registrations_stamp() {
         .unwrap();
         let reregistered = db::events_table_identity(&pool, &bc.name).await.unwrap();
         assert_ne!(after.registrations, reregistered.registrations);
+    });
+}
+
+/// docs/architecture.md §189: the stamp is `registrations_generation`'s
+/// counter. Writing a registration back unchanged - every instance's
+/// startup does - leaves it alone; a changed `CommandType` moves it as a
+/// changed `EventType` does.
+#[test]
+fn only_a_changed_registration_changes_the_registrations_stamp() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc).await;
+        let before = db::events_table_identity(&pool, &bc.name).await.unwrap();
+
+        db::upsert_event_type(&pool, &et).await.unwrap();
+        db::upsert_command_type(&pool, &ct).await.unwrap();
+        let rewritten = db::events_table_identity(&pool, &bc.name).await.unwrap();
+        assert_eq!(before.registrations, rewritten.registrations);
+
+        db::upsert_command_type(
+            &pool,
+            &CommandType {
+                rest_trigger_allowed: !ct.rest_trigger_allowed,
+                ..ct
+            },
+        )
+        .await
+        .unwrap();
+        let changed = db::events_table_identity(&pool, &bc.name).await.unwrap();
+        assert_ne!(rewritten.registrations, changed.registrations);
+    });
+}
+
+/// docs/architecture.md §189: a bounded context without the counter -
+/// provisioned by an older instance during a rolling deploy - is stamped
+/// by hashing its registrations, as before the counter, until a startup
+/// patches the counter in.
+#[test]
+fn a_bounded_context_without_the_counter_is_stamped_by_hashing() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc).await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE \"bc_{0}\".registrations_generation; \
+             DROP FUNCTION \"bc_{0}\".bump_registrations_generation() CASCADE",
+            bc.name
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let hashed = db::events_table_identity(&pool, &bc.name).await.unwrap();
+        db::upsert_event_type(
+            &pool,
+            &EventType {
+                event_read_allowed: !et.event_read_allowed,
+                ..et.clone()
+            },
+        )
+        .await
+        .unwrap();
+        let rehashed = db::events_table_identity(&pool, &bc.name).await.unwrap();
+        assert_ne!(hashed.registrations, rehashed.registrations);
+
+        db::ensure_registrations_generation(&pool, &bc.name)
+            .await
+            .unwrap();
+        let counted = db::events_table_identity(&pool, &bc.name).await.unwrap();
+        db::upsert_event_type(&pool, &et).await.unwrap();
+        let recounted = db::events_table_identity(&pool, &bc.name).await.unwrap();
+        assert_ne!(counted.registrations, recounted.registrations);
     });
 }
 
