@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `command_throughput.rs` can add a network round trip between skilj and
+  Postgres (`SKILJ_BENCH_LATENCY_MS`), run several instances on one bounded
+  context (`SKILJ_BENCH_INSTANCES`) and set the commands per scenario
+  (`SKILJ_BENCH_COMMANDS`). docs/performance.md has the figures at +1 ms
+  (docs/architecture.md §196).
+
 - `/graphql` as an Apollo Federation v2 subgraph, for Apollo Router (2
   and the 3.0 preview), Hive Router or Gateway, Cosmo, or schema
   stitching to compose into a larger graph (docs/architecture.md §194):

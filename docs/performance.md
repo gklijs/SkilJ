@@ -84,6 +84,38 @@ commit `0d9c409`): ~45 commands/s at 20 workers, ~58/s at 80, for one shared
 bounded context. A different application's commands, a networked client and
 another machine - not comparable with the in-process figures above.
 
+## With a network round trip
+
+The figures above talk to Postgres in-process, where a round trip costs
+almost nothing, so they hide what each statement under the batch lock
+costs a deployment whose database is across a network.
+`SKILJ_BENCH_LATENCY_MS` puts a TCP proxy between skilj and Postgres that
+adds that round trip, and `SKILJ_BENCH_INSTANCES` runs several instances
+on the one bounded context:
+
+```sh
+SKILJ_BENCH_LATENCY_MS=1 SKILJ_BENCH_INSTANCES=3 SKILJ_BENCH_COMMANDS=400 \
+  cargo test --release -p skilj --test command_throughput -- --ignored --nocapture
+```
+
+At +1 ms, 400 commands per scenario, commands/s at 80 callers, two
+rounds each, before and after docs/architecture.md §196 (a batch decided
+and written as a set):
+
+| workload | before, 1 instance | after, 1 instance | before, 3 instances | after, 3 instances |
+|---|---|---|---|---|
+| spread | 36-42 | 76-77 | 48 | 166-178 |
+| hot | 31 | 77-80 | 31-32 | 105 |
+| hot-snap | 35-36 | 64-67 | 33 | 107-112 |
+
+Before, writing a batch cost about 15 ms per command (15 round trips), so
+a batch's lock hold grew with its size. After, it is about 11.6 ms per
+batch whatever its size. Several instances now add throughput, where
+before they mostly split the work into smaller batches queueing for the
+same lock. A single caller still takes about 100 ms per command at +1
+ms, and most of that is round trips outside the batch lock: the next
+thing to measure.
+
 ## Async projection catch-up
 
 `skilj-core/tests/projection_catch_up_throughput.rs` (`#[ignore]`d; `cargo test
