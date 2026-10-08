@@ -95,6 +95,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Behaviour change:** without `SkiljBuilder::pool_options(...)`, the pool
+  no longer pings a connection each time it is taken (sqlx's
+  `test_before_acquire`). Most statements before the batch lock go straight
+  to the pool, so that ping cost a round trip each: at 1 ms to Postgres, one
+  caller's command went from 36 to about 26 ms. After a database restart or
+  failover, each idle pooled connection now fails one statement before it is
+  replaced. New: `skilj::default_pool_options()`; pass `PgPoolOptions::new()`
+  to `pool_options` to have the ping back (docs/architecture.md §196).
+
 - Five fewer round trips per command: a committed batch notifies other
   instances of all its events in one statement instead of one per event
   before answering its callers; the batch lock statement sets the idle

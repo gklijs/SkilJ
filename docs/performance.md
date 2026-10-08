@@ -220,6 +220,14 @@ whole. The size decides latency:
 - Background ticks queue behind requests on the pool. With many bounded
   contexts, a pool well under 16 makes catch-up and deadlines slower,
   not wrong.
+- skilj's default pool (`skilj::default_pool_options()`) doesn't ping a
+  connection when it is taken from the pool, which sqlx otherwise does:
+  most statements before the batch lock go straight to the pool, so the
+  ping cost a round trip each - about 10 ms per command at 1 ms to
+  Postgres. Options given to `pool_options(...)` are used as given, so
+  start from `default_pool_options()` to keep that. The cost: after a
+  database restart or failover, each idle pooled connection fails one
+  statement before it is replaced (docs/architecture.md §196).
 - The limit that matters is the database's. Instances times
   `max_connections`, plus everything else connected, must stay under
   Postgres' `max_connections`. Postgres throughput peaks at a small

@@ -235,10 +235,12 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
     let build = || async {
         Skilj::builder(database_url.clone())
             .pool_options(
-                db::PgPoolOptions::new()
+                // skilj's defaults, unless `SKILJ_BENCH_TEST_BEFORE_ACQUIRE=true`
+                // asks for sqlx's acquire ping back (docs/architecture.md §196).
+                skilj::default_pool_options()
                     .max_connections(20)
                     .test_before_acquire(
-                        std::env::var("SKILJ_BENCH_TEST_BEFORE_ACQUIRE").as_deref() != Ok("false"),
+                        std::env::var("SKILJ_BENCH_TEST_BEFORE_ACQUIRE").as_deref() == Ok("true"),
                     ),
             )
             .bounded_context(bc_name.clone())

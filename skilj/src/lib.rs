@@ -68,6 +68,26 @@ const BACKGROUND_TASK_CONCURRENCY: usize = 16;
 /// everything else needs at least one more (docs/architecture.md §186).
 pub const MIN_POOL_CONNECTIONS: u32 = 2;
 
+/// The connection pool a `Skilj` gets when [`SkiljBuilder::pool_options`]
+/// isn't called: sqlx's defaults, except that a connection is not pinged
+/// every time it is taken from the pool (`test_before_acquire(false)`).
+///
+/// sqlx pings a connection both when it is taken and when it is given
+/// back. skilj sends most of a command's reads straight to the pool, so
+/// the first ping cost a round trip per statement: at 1 ms to Postgres,
+/// one caller's command went from 36 to about 26 ms without it. The ping
+/// on return still runs, so a connection that broke while in use never
+/// goes back into the pool. What is given up: a connection that breaks
+/// while idle in the pool - the database restarted or failed over, a
+/// network path dropped it - fails the first statement sent on it,
+/// instead of being replaced before use. After a restart that is at most
+/// one failed request per pooled connection. With the user's choice
+/// (docs/architecture.md §196). Pass `PgPoolOptions::new()` to
+/// [`SkiljBuilder::pool_options`] to have the ping back.
+pub fn default_pool_options() -> skilj_core::db::PgPoolOptions {
+    skilj_core::db::PgPoolOptions::new().test_before_acquire(false)
+}
+
 /// [`SkiljBuilder::idempotency_key_retention`]'s default: 48 hours, long
 /// enough to outlast a broker or bridge outage over a weekend
 /// (docs/architecture.md §195).
@@ -2141,6 +2161,12 @@ impl SkiljBuilder {
     /// `max_connections` must be at least [`MIN_POOL_CONNECTIONS`]:
     /// `.build()` refuses less, because the cross-instance listener
     /// keeps one connection for the process's lifetime.
+    ///
+    /// Unset, the pool is [`default_pool_options`], which turns off sqlx's
+    /// `test_before_acquire`. The options passed here are used as given,
+    /// so start from [`default_pool_options`] to keep that, or from
+    /// `PgPoolOptions::new()` to have every connection pinged as it is
+    /// taken (docs/architecture.md §196).
     pub fn pool_options(mut self, options: skilj_core::db::PgPoolOptions) -> Self {
         self.pool_options = Some(options);
         self
@@ -2191,7 +2217,7 @@ impl SkiljBuilder {
         let graphql_federation = self.graphql_federation.map(Arc::new);
         let pool = skilj_core::db::connect_with_statement_cache(
             &self.database_url,
-            self.pool_options.unwrap_or_default(),
+            self.pool_options.unwrap_or_else(default_pool_options),
             self.statement_cache_capacity,
         )
         .await?;
@@ -4372,6 +4398,18 @@ async fn reconcile_projections(
 #[cfg(test)]
 mod tests {
     use super::warn_on_small_statement_cache;
+
+    /// docs/architecture.md §196: the default pool doesn't ping a connection
+    /// as it is taken; everything else is sqlx's default.
+    #[test]
+    fn the_default_pool_skips_the_acquire_ping() {
+        let options = super::default_pool_options();
+        assert!(!options.get_test_before_acquire());
+        assert_eq!(
+            options.get_max_connections(),
+            skilj_core::db::PgPoolOptions::new().get_max_connections()
+        );
+    }
     use skilj_core::bootstrap::ContextCreator;
     use skilj_core::event_store::{BoundedContext, BoundedContextStatus};
 
