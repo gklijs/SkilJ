@@ -234,7 +234,13 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
     // The pool of a modest deployment: half of it may lead batches.
     let build = || async {
         Skilj::builder(database_url.clone())
-            .pool_options(db::PgPoolOptions::new().max_connections(20))
+            .pool_options(
+                db::PgPoolOptions::new()
+                    .max_connections(20)
+                    .test_before_acquire(
+                        std::env::var("SKILJ_BENCH_TEST_BEFORE_ACQUIRE").as_deref() != Ok("false"),
+                    ),
+            )
             .bounded_context(bc_name.clone())
             .event_type::<Deposited>()
             .command_type::<Deposit>()
@@ -327,7 +333,10 @@ pub async fn deposit_through(
 /// answer take `round_trip` longer, as across a network
 /// (docs/architecture.md §196). Delays are scheduled per chunk, not
 /// served one after another, so a stream of chunks keeps its throughput
-/// and only gains latency. Returns `database_url` pointed at the proxy.
+/// and only gains latency. Plain threads and `std::thread::sleep`, not
+/// tokio: tokio's timer ticks in whole milliseconds, which turned a 0.5 ms
+/// delay into 1-2 ms and a "1 ms" round trip into about 3.5. Returns
+/// `database_url` pointed at the proxy.
 #[allow(dead_code)] // command_throughput.rs only
 pub async fn latency_proxy(database_url: &str, round_trip: Duration) -> String {
     let (prefix, rest) = database_url
@@ -335,59 +344,59 @@ pub async fn latency_proxy(database_url: &str, round_trip: Duration) -> String {
         .expect("a DATABASE_URL with user@host");
     let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
     let upstream = authority.to_string();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let local = listener.local_addr().unwrap();
     let one_way = round_trip / 2;
-    tokio::spawn(async move {
-        loop {
-            let Ok((client, _)) = listener.accept().await else {
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else {
                 return;
             };
-            let upstream = upstream.clone();
-            tokio::spawn(async move {
-                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
-                    return;
-                };
-                let _ = client.set_nodelay(true);
-                let _ = server.set_nodelay(true);
-                let (client_read, client_write) = client.into_split();
-                let (server_read, server_write) = server.into_split();
-                tokio::spawn(delayed_copy(client_read, server_write, one_way));
-                tokio::spawn(delayed_copy(server_read, client_write, one_way));
-            });
+            let Ok(server) = std::net::TcpStream::connect(&upstream) else {
+                continue;
+            };
+            let _ = client.set_nodelay(true);
+            let _ = server.set_nodelay(true);
+            let (client_out, server_out) =
+                (client.try_clone().unwrap(), server.try_clone().unwrap());
+            delayed_copy(client, server_out, one_way);
+            delayed_copy(server, client_out, one_way);
         }
     });
     format!("{prefix}@{local}{path}")
 }
 
-/// Copies `from` to `to`, each chunk `delay` after it was read.
-async fn delayed_copy(
-    mut from: tokio::net::tcp::OwnedReadHalf,
-    mut to: tokio::net::tcp::OwnedWriteHalf,
-    delay: Duration,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (sender, mut receiver) =
-        tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
-    tokio::spawn(async move {
-        while let Some((due, chunk)) = receiver.recv().await {
-            tokio::time::sleep_until(due).await;
-            if to.write_all(&chunk).await.is_err() {
+/// Copies `from` to `to` on two threads of its own, each chunk `delay`
+/// after it was read.
+fn delayed_copy(mut from: std::net::TcpStream, mut to: std::net::TcpStream, delay: Duration) {
+    use std::io::{Read, Write};
+    let (sender, receiver) = std::sync::mpsc::channel::<(Instant, Vec<u8>)>();
+    std::thread::spawn(move || {
+        while let Ok((due, chunk)) = receiver.recv() {
+            let now = Instant::now();
+            if due > now {
+                std::thread::sleep(due - now);
+            }
+            if to.write_all(&chunk).is_err() {
                 return;
             }
         }
-        let _ = to.shutdown().await;
+        let _ = to.shutdown(std::net::Shutdown::Write);
     });
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        match from.read(&mut buffer).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                let due = tokio::time::Instant::now() + delay;
-                if sender.send((due, buffer[..n].to_vec())).is_err() {
-                    return;
+    std::thread::spawn(move || {
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            match from.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if sender
+                        .send((Instant::now() + delay, buffer[..n].to_vec()))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
-    }
+    });
 }
