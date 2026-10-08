@@ -33,10 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(token), None) => TokenSource::fixed(token.clone()),
         (None, None) => unreachable!("clap requires --token or --token-command"),
     };
-    let client = Arc::new(Client::with_token_source(
-        args.endpoint.clone(),
-        token.clone(),
-    ));
+    let client = Arc::new(
+        Client::with_token_source(args.endpoint.clone(), token.clone())
+            .with_prefix(args.graphql_prefix.clone()),
+    );
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
@@ -95,6 +95,7 @@ fn spawn_live_events_subscription(
     let mut rx = graphql::spawn_live_events(
         ws_endpoint,
         token,
+        args.graphql_prefix.clone(),
         args.bounded_context.clone(),
         std::time::Duration::from_millis(500),
         std::time::Duration::from_secs(30),

@@ -1,0 +1,434 @@
+enum BankAccessLevel @inaccessible {
+	READ
+	WRITE
+	ADMIN
+}
+
+union BankAccessToken @inaccessible = BankExternalEventToken | BankDirectCreationToken | BankEventReadToken | BankCommandToken
+
+enum BankAccessTokenStatus {
+	ACTIVE
+	REVOKED
+}
+
+type BankBoundedContext @inaccessible {
+	name: String!
+	status: BankBoundedContextStatus!
+	createdAt: String!
+	createdBy: BankContextCreator!
+	accessMappings: [BankRoleAccessMapping!]!
+}
+
+enum BankBoundedContextStatus @inaccessible {
+	ACTIVE
+	ARCHIVED
+}
+
+type BankCommandToken @inaccessible {
+	id: ID!
+	secret: String!
+	status: BankAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+	scope: String
+	commandType: BankCommandType!
+}
+
+type BankCommandType @inaccessible {
+	name: String!
+	schema: String!
+	schemaVersion: Int!
+	tagMappings: [BankTagMapping!]!
+	ownerTagKey: String
+	sensitiveFields: [BankSensitiveField!]!
+	restTriggerAllowed: Boolean!
+	privateFields: [BankPrivateField!]!
+}
+
+type BankContextCreator @inaccessible {
+	kind: String!
+	role: BankRole
+}
+
+type BankCreatedSuperadmin @inaccessible {
+	id: ID!
+	name: String!
+	externalSubject: String!
+}
+
+type BankDirectCreationToken @inaccessible {
+	id: ID!
+	secret: String!
+	status: BankAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+	scope: String
+	eventType: BankEventType!
+}
+
+type BankDryRunCommandPayload @inaccessible {
+	accepted: Boolean!
+	rejectionReason: String
+	rejectionKind: String
+	events: [BankWouldBeEvent!]!
+	matchingEvents: [BankMatchingEvent!]!
+	matchingEventsTruncated: Boolean!
+}
+
+type BankEncryptionKey @inaccessible {
+	subjectKey: String!
+	subjectValue: String!
+	status: BankEncryptionKeyStatus!
+	createdAt: String!
+	destroyedAt: String
+}
+
+enum BankEncryptionKeyStatus @inaccessible {
+	ACTIVE
+	DESTROYED
+}
+
+type BankEventMeta @inaccessible {
+	createdAt: String!
+	correlationId: String
+	causationId: String
+	origin: BankEventOrigin!
+}
+
+type BankEventOrigin @inaccessible {
+	kind: String!
+	sourceContent: String
+	sourceContext: String
+	triggeringCommandType: BankCommandType
+	triggeringCommandPayload: String
+}
+
+enum BankEventReadStartPosition @inaccessible {
+	BEGINNING
+	LATEST
+	AT_SEQUENCE
+	AT_TIME
+}
+
+type BankEventReadToken @inaccessible {
+	id: ID!
+	secret: String!
+	status: BankAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+	scope: String
+	eventType: BankEventType!
+	startFrom: BankEventReadStartPosition!
+	startAtSequence: Int
+	startAtTime: String
+}
+
+type BankEventType {
+	name: String!
+	schema: String!
+	schemaVersion: Int!
+	tagMappings: [BankTagMapping!]!
+	ownerTagKey: String
+	sensitiveFields: [BankSensitiveField!]!
+	externalCreationAllowed: Boolean!
+	directCreationAllowed: Boolean!
+	systemTriggeredAllowed: Boolean!
+	systemTriggeredSchedule: String
+	missedOccurrencePolicy: BankMissedOccurrencePolicy
+	schedulePosition: String
+	lastFiredAt: String
+	eventReadAllowed: Boolean!
+	privateFields: [BankPrivateField!]!
+}
+
+type BankExternalEventToken @inaccessible {
+	id: ID!
+	secret: String!
+	status: BankAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+	scope: String
+	eventType: BankEventType!
+}
+
+input BankFilterInput {
+	field: String!
+	operator: BankFilterOperator!
+	value: String!
+}
+
+enum BankFilterOperator {
+	EQUALS
+	CONTAINS
+	IS_LIKE
+	GREATER_THAN
+	LESS_THAN
+	NEAR
+	SIMILAR_COLOR
+	IN_SUBNET
+	IN
+}
+
+type BankInspectedEvent @inaccessible {
+	event: BankEventMeta!
+	renderedPayload: String!
+}
+
+type BankInspectedSnapshot @inaccessible {
+	tagKey: String!
+	tagValue: String!
+	version: Int!
+	asOfSequence: Int!
+	state: String!
+	updatedAt: String!
+}
+
+type BankMatchingEvent {
+	sequence: Int!
+	eventTypeName: String!
+	payload: String!
+}
+
+enum BankMissedOccurrencePolicy {
+	SKIP
+	FIRE_ONCE
+	REPLAY_BACKLOG
+}
+
+type BankParkedDelivery @inaccessible {
+	id: String!
+	source: String!
+	kind: BankParkedDeliveryKind!
+	identifier: String!
+	accessTokenId: String
+	targetBoundedContext: String
+	targetCommandType: String
+	requestJson: String!
+	error: String!
+	attemptCount: Int!
+	firstFailedAt: String!
+	lastFailedAt: String!
+	cursor: String!
+}
+
+enum BankParkedDeliveryKind @inaccessible {
+	CROSS_CONTEXT_ROUTE
+	EXTERNAL_EVENT
+	COMMAND_TRIGGER
+	DEADLINE
+}
+
+type BankPrivateField {
+	field: String!
+	kind: BankPrivateFieldKind!
+	team: String
+	addresseeField: String
+}
+
+type BankPrivateFieldGrant {
+	id: ID!
+	grantor: BankRole!
+	grantee: BankRole!
+	eventSequence: Int
+	commandId: ID
+	status: BankAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+}
+
+input BankPrivateFieldInput @inaccessible {
+	field: String! @inaccessible
+	kind: BankPrivateFieldKind! @inaccessible
+	team: String @inaccessible
+	addresseeField: String @inaccessible
+}
+
+enum BankPrivateFieldKind {
+	OWN
+	TEAM
+	ADDRESSED
+}
+
+type BankProjection {
+	name: String!
+	schema: String!
+	schemaVersion: Int!
+	consumedEventTypes: [BankEventType!]!
+	sync: Boolean!
+	caughtUpTo: Int
+	pendingRebuild: BankProjectionRebuild
+	buildingRebuild: BankProjectionRebuild
+}
+
+type BankProjectionRebuild {
+	schema: String!
+	schemaVersion: Int!
+	consumedEventTypes: [BankEventType!]!
+	sync: Boolean!
+	caughtUpTo: Int
+	status: BankProjectionRebuildStatus!
+}
+
+enum BankProjectionRebuildStatus {
+	PENDING
+	BUILDING
+}
+
+type BankProjectionRegistrationResult @inaccessible {
+	outcome: String!
+	projection: BankProjection
+	rebuild: BankProjectionRebuild
+}
+
+union BankProjectionResult = Bankfed_published_AccountBalance
+
+type BankQueriedCommand @inaccessible {
+	id: String!
+	createdAt: String!
+	payload: String!
+}
+
+type BankQueriedEvent {
+	sequence: Int!
+	payload: String!
+}
+
+type BankRole {
+	id: ID!
+	externalSubject: String!
+	name: String!
+	superadmin: Boolean!
+	status: BankRoleStatus!
+	createdAt: String!
+	revokedAt: String
+}
+
+type BankRoleAccessMapping @inaccessible {
+	role: BankRole!
+	level: BankAccessLevel!
+	canReadSensitive: Boolean!
+	scope: String
+	status: BankRoleStatus!
+}
+
+enum BankRoleStatus {
+	ACTIVE
+	REVOKED
+}
+
+type BankSensitiveField {
+	field: String!
+	subjectKey: String!
+	subjectField: String!
+}
+
+input BankSensitiveFieldInput @inaccessible {
+	field: String! @inaccessible
+	subjectKey: String! @inaccessible
+	subjectField: String! @inaccessible
+}
+
+type BankSubmitCommandPayload {
+	accepted: Boolean!
+	rejectionReason: String
+	rejectionKind: String
+	deduplicated: Boolean!
+	correlationId: String
+	matchingEventsTruncated: Boolean
+	triggeredEventSequences: [Int]
+	matchingEvents: [BankMatchingEvent]
+}
+
+input BankTagInput @inaccessible {
+	key: String! @inaccessible
+	value: String @inaccessible
+}
+
+type BankTagMapping {
+	key: String!
+	field: String!
+}
+
+input BankTagMappingInput @inaccessible {
+	key: String! @inaccessible
+	field: String! @inaccessible
+}
+
+type BankWouldBeEvent @inaccessible {
+	eventTypeName: String!
+	payload: String!
+}
+
+type Bankfed_published_AccountBalance @key(fields: "projectionKey") {
+	total: Int!
+	projectionKey: String!
+}
+
+type Mutation {
+	bankCreateSuperadmin(bootstrapSecret: String!, name: String!, externalSubject: String!): BankCreatedSuperadmin! @inaccessible
+	bankCreateRole(name: String!, superadmin: Boolean!, externalSubject: String!): BankRole! @inaccessible
+	bankRevokeRole(roleId: ID!): BankRole! @inaccessible
+	bankGrantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: BankAccessLevel!, canReadSensitive: Boolean!, scope: String): BankRoleAccessMapping! @inaccessible
+	bankRevokeRoleAccessMapping(roleId: ID!, boundedContext: String!): BankRoleAccessMapping! @inaccessible
+	bankAddBoundedContext(name: String!): BankBoundedContext! @inaccessible
+	bankCreateBoundedContextFromTemplate(template: String!, name: String!, roleId: ID!, level: BankAccessLevel!, canReadSensitive: Boolean!, scope: String): BankBoundedContext! @inaccessible
+	bankResyncBoundedContextFromTemplate(boundedContext: String!): BankBoundedContext! @inaccessible
+	bankArchiveBoundedContext(name: String!): BankBoundedContext! @inaccessible
+	bankDeleteBoundedContext(name: String!): BankBoundedContext! @inaccessible
+	bankRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: BankMissedOccurrencePolicy): BankEventType! @inaccessible
+	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!): BankCommandType! @inaccessible
+	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): BankProjectionRegistrationResult! @inaccessible
+	bankRebuildProjection(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
+	bankDiscardProjectionRebuild(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
+	bankRetryParkedDelivery(boundedContext: String!, id: String!): BankParkedDelivery! @inaccessible
+	bankDiscardParkedDelivery(boundedContext: String!, id: String!): BankParkedDelivery! @inaccessible
+	bankCreateExternalEventToken(boundedContext: String!, eventTypeName: String!, scope: String): BankExternalEventToken! @inaccessible
+	bankCreateDirectCreationToken(boundedContext: String!, eventTypeName: String!, scope: String): BankDirectCreationToken! @inaccessible
+	bankCreateEventReadToken(boundedContext: String!, eventTypeName: String!, scope: String, startFrom: BankEventReadStartPosition, startAtSequence: Int, startAtTime: String): BankEventReadToken! @inaccessible
+	bankCreateCommandToken(boundedContext: String!, commandTypeName: String!, scope: String): BankCommandToken! @inaccessible
+	bankRevokeToken(tokenId: ID!): BankAccessToken! @inaccessible
+	bankSubmitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): BankSubmitCommandPayload!
+	bankForgetSubject(boundedContext: String!, subjectKey: String!, subjectValue: String!): BankEncryptionKey! @inaccessible
+	bankGrantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int): BankPrivateFieldGrant!
+	bankGrantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID): BankPrivateFieldGrant!
+	bankRevokePrivateFieldAccess(boundedContext: String!, grantId: ID!): BankPrivateFieldGrant!
+}
+
+type Query {
+	bankBoundedContexts: [BankBoundedContext!]! @inaccessible
+	bankProjections(boundedContext: String!): [BankProjection!]! @inaccessible
+	bankScheduledEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible
+	bankEventTypes(boundedContext: String!): [BankEventType!]! @inaccessible
+	bankCommandTypes(boundedContext: String!): [BankCommandType!]! @inaccessible
+	bankQueryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [BankTagInput!], afterSequence: Int, correlationId: String): [BankQueriedEvent!]! @inaccessible
+	bankCountEvents(boundedContext: String!, eventTypes: [String!]!, tags: [BankTagInput!], correlationId: String): Int! @inaccessible
+	bankInspectEvent(boundedContext: String!, sequence: Int!): BankInspectedEvent! @inaccessible
+	bankEpoch: String!
+	bankInspectSnapshot(boundedContext: String!, snapshotName: String!, tagValue: String!): BankInspectedSnapshot @inaccessible
+	bankFetchCommands(boundedContext: String!, commandTypes: [String!]!, afterCommandId: String, after: String, before: String, triggeredEvent: Int, correlationId: String): [BankQueriedCommand!]! @inaccessible
+	bankDryRunCommand(boundedContext: String!, commandTypeName: String!, payload: String!): BankDryRunCommandPayload! @inaccessible
+	bankListPrivateFieldGrants(boundedContext: String!, grantorRoleId: ID): [BankPrivateFieldGrant!]!
+	bankParkedDeliveries(boundedContext: String!, after: String): [BankParkedDelivery!]! @inaccessible
+	bankProjectionSchema(boundedContext: String!, name: String!): BankProjection
+	bankProjection(boundedContext: String!, name: String!, key: String, waitForSequence: Int): BankProjectionResult!
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+extend schema @link(
+	url: "https://specs.apollo.dev/federation/v2.5",
+	import: ["@key", "@tag", "@shareable", "@inaccessible", "@override", "@external", "@provides", "@requires", "@composeDirective", "@interfaceObject", "@requiresScopes"]
+)
+
+
+type Subscription {
+	bankAllEvents(boundedContext: String!, eventTypes: [String!], fromSequence: Int, epoch: String): BankQueriedEvent!
+	bankEventsByType(boundedContext: String!, eventType: String!, filters: [BankFilterInput!], fromSequence: Int, epoch: String): BankQueriedEvent!
+	bankProjectionUpdates(boundedContext: String!, name: String!, key: String): BankProjectionResult!
+}

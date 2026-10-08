@@ -160,6 +160,7 @@ async fn an_expired_token_on_the_live_feed_is_refreshed_and_the_feed_resumes() {
     let mut rx = spawn_live_events(
         ws_endpoint,
         token.clone(),
+        String::new(),
         "banking".to_string(),
         // Long enough that a reconnect only arrives in time if it
         // skipped the backoff, as an expiry should.

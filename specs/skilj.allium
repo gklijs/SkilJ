@@ -8933,7 +8933,10 @@ surface FederatedSubgraph {
         -- projection instance looked up by its key on a router's behalf is
         -- the same QueryProjection a caller makes directly, with no
         -- wait_for_sequence: a router composing entities has no sequence
-        -- to name.
+        -- to name. Publishing decides what the description names, never
+        -- what a grant reaches: a surface that takes a bounded context by
+        -- name serves an unpublished one, a tenant included, through a
+        -- router exactly as it does directly, to a caller granted on it.
 
     @guarantee DescriptionFollowsRegistration
         -- What the description holds for a published bounded context

@@ -165,7 +165,7 @@ fn a_bounded_context_deleted_during_a_schema_build_is_skipped() {
         let built = delete_while_waiting(&pool, &name, "projections", {
             let pool = pool.clone();
             async move {
-                skilj_graphql::projection_types::build(&pool, None)
+                skilj_graphql::projection_types::build(&pool, None, &Default::default(), false)
                     .await
                     .map(|_| ())
             }

@@ -51,6 +51,7 @@ use super::{
     distinct_names, not_found, parse_filters, require_read_mapping, resolve_read_data_keys,
 };
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{
     FieldValue, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
@@ -130,8 +131,8 @@ pub(crate) async fn revocation_closes_connection(
 }
 
 /// `allEvents(boundedContext: String!, eventTypes: [String!], fromSequence: Int): QueriedEvent!`
-pub fn all_events_field() -> SubscriptionField {
-    SubscriptionField::new("allEvents", TypeRef::named_nn("QueriedEvent"), |ctx| {
+pub fn all_events_field(n: &Naming) -> SubscriptionField {
+    SubscriptionField::new(n.root("allEvents"), TypeRef::named_nn(n.ty("QueriedEvent")), |ctx| {
         SubscriptionFieldFuture::new(async move {
             let state = ctx.data::<GraphqlState>()?.clone();
             let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
@@ -323,8 +324,8 @@ pub fn all_events_field() -> SubscriptionField {
 }
 
 /// `eventsByType(boundedContext: String!, eventType: String!, filters: [FilterInput!], fromSequence: Int): QueriedEvent!`
-pub fn events_by_type_field() -> SubscriptionField {
-    SubscriptionField::new("eventsByType", TypeRef::named_nn("QueriedEvent"), |ctx| {
+pub fn events_by_type_field(n: &Naming) -> SubscriptionField {
+    SubscriptionField::new(n.root("eventsByType"), TypeRef::named_nn(n.ty("QueriedEvent")), |ctx| {
         SubscriptionFieldFuture::new(async move {
             let state = ctx.data::<GraphqlState>()?.clone();
             let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
@@ -489,7 +490,7 @@ pub fn events_by_type_field() -> SubscriptionField {
     ))
     .argument(InputValue::new(
         "filters",
-        TypeRef::named_nn_list("FilterInput"),
+        TypeRef::named_nn_list(n.ty("FilterInput")),
     ))
     .argument(InputValue::new(
         "fromSequence",

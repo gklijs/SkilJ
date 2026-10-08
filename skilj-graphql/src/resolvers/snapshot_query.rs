@@ -12,6 +12,7 @@
 use super::{not_found, require_admin_mapping};
 use crate::error::to_graphql_error;
 use crate::gql_types::InspectedSnapshotData;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
@@ -46,10 +47,10 @@ use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef
 /// inspecting a snapshot wants to see what's really there, including a
 /// stale one still waiting for the next catch-up tick to overwrite it;
 /// only the decision path needs to distrust it.
-pub fn inspect_snapshot_field() -> Field {
+pub fn inspect_snapshot_field(n: &Naming) -> Field {
     Field::new(
-        "inspectSnapshot",
-        TypeRef::named("InspectedSnapshot"),
+        n.root("inspectSnapshot"),
+        TypeRef::named(n.ty("InspectedSnapshot")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;

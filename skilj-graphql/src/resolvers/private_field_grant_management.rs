@@ -14,6 +14,7 @@
 
 use super::{not_found, require_read_mapping};
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
@@ -21,10 +22,10 @@ use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef
 /// `eventSequence` omitted mints a blanket grant (see `value PrivateField`'s
 /// own doc comment on what that reaches); named, a per-record one,
 /// checked against `is_default_private_reader`.
-pub fn grant_private_field_access_for_event_field() -> Field {
+pub fn grant_private_field_access_for_event_field(n: &Naming) -> Field {
     Field::new(
-        "grantPrivateFieldAccessForEvent",
-        TypeRef::named_nn("PrivateFieldGrant"),
+        n.root("grantPrivateFieldAccessForEvent"),
+        TypeRef::named_nn(n.ty("PrivateFieldGrant")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -91,10 +92,10 @@ pub fn grant_private_field_access_for_event_field() -> Field {
 /// `grantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID): PrivateFieldGrant!` -
 /// same shape and reasoning as `grantPrivateFieldAccessForEvent` above,
 /// checked against a `Command` instead of an `Event`.
-pub fn grant_private_field_access_for_command_field() -> Field {
+pub fn grant_private_field_access_for_command_field(n: &Naming) -> Field {
     Field::new(
-        "grantPrivateFieldAccessForCommand",
-        TypeRef::named_nn("PrivateFieldGrant"),
+        n.root("grantPrivateFieldAccessForCommand"),
+        TypeRef::named_nn(n.ty("PrivateFieldGrant")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -159,10 +160,10 @@ pub fn grant_private_field_access_for_command_field() -> Field {
 /// only the `Role` that made the grant may end it, not the grantee and
 /// not an admin (see `access_control::revoke_private_field_access`'s own
 /// doc comment).
-pub fn revoke_private_field_access_field() -> Field {
+pub fn revoke_private_field_access_field(n: &Naming) -> Field {
     Field::new(
-        "revokePrivateFieldAccess",
-        TypeRef::named_nn("PrivateFieldGrant"),
+        n.root("revokePrivateFieldAccess"),
+        TypeRef::named_nn(n.ty("PrivateFieldGrant")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -207,10 +208,10 @@ pub fn revoke_private_field_access_field() -> Field {
 /// available to anyone; naming a *different* grantor requires
 /// `access_mapping.level = admin` - the compliance/oversight half (see
 /// `access_control::list_private_field_grants`'s own doc comment).
-pub fn list_private_field_grants_field() -> Field {
+pub fn list_private_field_grants_field(n: &Naming) -> Field {
     Field::new(
-        "listPrivateFieldGrants",
-        TypeRef::named_nn_list_nn("PrivateFieldGrant"),
+        n.root("listPrivateFieldGrants"),
+        TypeRef::named_nn_list_nn(n.ty("PrivateFieldGrant")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;

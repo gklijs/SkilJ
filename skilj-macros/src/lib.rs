@@ -297,11 +297,14 @@ impl Parse for GqlField {
     }
 }
 
-/// `gql_object!(RustType => "GraphQLName" { field, field, ... })` - the
-/// full invocation `gql_object!` itself parses into.
+/// `gql_object!(RustType => name_expr { field, field, ... })` - the
+/// full invocation `gql_object!` itself parses into. `name_expr` is any
+/// expression `Object::new` accepts: a string literal, or the
+/// `n.ty("Role")` every one in `skilj-graphql` uses, so the type gets the
+/// schema's name prefix (docs/architecture.md §194).
 struct GqlObjectInput {
     rust_type: Type,
-    gql_name: LitStr,
+    gql_name: Expr,
     fields: syn::punctuated::Punctuated<GqlField, Token![,]>,
 }
 
@@ -309,7 +312,9 @@ impl Parse for GqlObjectInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let rust_type: Type = input.parse()?;
         input.parse::<Token![=>]>()?;
-        let gql_name: LitStr = input.parse()?;
+        // Without eager braces, so `n.ty("Role") { ... }` stops before the
+        // field list instead of reading it as part of the expression.
+        let gql_name = Expr::parse_without_eager_brace(input)?;
         let content;
         braced!(content in input);
         let fields = content.parse_terminated(GqlField::parse, Token![,])?;
@@ -330,12 +335,12 @@ impl Parse for GqlObjectInput {
 /// unaffected; only the repetitive body is generated.
 ///
 /// ```ignore
-/// pub fn role_object() -> Object {
-///     gql_object!(Role => "Role" {
+/// pub fn role_object(n: &Naming) -> Object {
+///     gql_object!(Role => n.ty("Role") {
 ///         scalar "id": TypeRef::named_nn(TypeRef::ID) => |r| Value::from(r.id.clone()),
 ///         scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |r| optional_timestamp(r.revoked_at),
-///         object "role": TypeRef::named_nn("Role") => |m| Some(m.role.clone()),
-///         list "tagMappings": TypeRef::named_nn_list_nn("TagMapping") => |et| et.tag_mappings.clone(),
+///         object "role": TypeRef::named_nn(n.ty("Role")) => |m| Some(m.role.clone()),
+///         list "tagMappings": TypeRef::named_nn_list_nn(n.ty("TagMapping")) => |et| et.tag_mappings.clone(),
 ///     })
 /// }
 /// ```

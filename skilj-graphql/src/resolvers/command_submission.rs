@@ -29,6 +29,7 @@
 use super::{not_found, require_caller};
 use crate::error::to_graphql_error;
 use crate::gql_types::{DryRunCommandResult, SubmitCommandResult};
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::ErrorExtensions;
@@ -48,10 +49,10 @@ fn no_decider_registered_error() -> async_graphql::Error {
 }
 
 /// `submitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): SubmitCommandPayload!`
-pub fn submit_command_field() -> Field {
+pub fn submit_command_field(n: &Naming) -> Field {
     Field::new(
-        "submitCommand",
-        TypeRef::named_nn("SubmitCommandPayload"),
+        n.root("submitCommand"),
+        TypeRef::named_nn(n.ty("SubmitCommandPayload")),
         |ctx| {
             FieldFuture::new(async move {
                 let caller = require_caller(&ctx)?;
@@ -356,10 +357,10 @@ async fn render_matching_events(
 /// matching events are event content (`MatchingEventsRequiresAdminLevel`).
 /// The same `#[requires_role]` check as `submitCommand` applies, before
 /// `decide()` runs.
-pub fn dry_run_command_field() -> Field {
+pub fn dry_run_command_field(n: &Naming) -> Field {
     Field::new(
-        "dryRunCommand",
-        TypeRef::named_nn("DryRunCommandPayload"),
+        n.root("dryRunCommand"),
+        TypeRef::named_nn(n.ty("DryRunCommandPayload")),
         |ctx| {
             FieldFuture::new(async move {
                 let caller = require_caller(&ctx)?;

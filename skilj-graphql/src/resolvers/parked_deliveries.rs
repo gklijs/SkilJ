@@ -21,6 +21,7 @@
 
 use super::{not_found, require_admin_mapping};
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::ErrorExtensions;
@@ -278,10 +279,10 @@ async fn redrive_parked_delivery(
 }
 
 /// `parkedDeliveries(boundedContext: String!, after: String): [ParkedDelivery!]!`
-pub fn parked_deliveries_field() -> Field {
+pub fn parked_deliveries_field(n: &Naming) -> Field {
     Field::new(
-        "parkedDeliveries",
-        TypeRef::named_nn_list_nn("ParkedDelivery"),
+        n.root("parkedDeliveries"),
+        TypeRef::named_nn_list_nn(n.ty("ParkedDelivery")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -369,10 +370,10 @@ pub fn parked_deliveries_field() -> Field {
 /// failure, the row stays parked with its `error`/`attemptCount`/
 /// `lastFailedAt` updated, and this mutation returns a GraphQL error
 /// carrying that same failure.
-pub fn retry_parked_delivery_field() -> Field {
+pub fn retry_parked_delivery_field(n: &Naming) -> Field {
     Field::new(
-        "retryParkedDelivery",
-        TypeRef::named_nn("ParkedDelivery"),
+        n.root("retryParkedDelivery"),
+        TypeRef::named_nn(n.ty("ParkedDelivery")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -458,10 +459,10 @@ pub fn retry_parked_delivery_field() -> Field {
 /// `discardParkedDelivery(boundedContext: String!, id: String!): ParkedDelivery!`,
 /// returning the just-discarded row - same "hand back what's gone"
 /// treatment `discardProjectionRebuild` already uses.
-pub fn discard_parked_delivery_field() -> Field {
+pub fn discard_parked_delivery_field(n: &Naming) -> Field {
     Field::new(
-        "discardParkedDelivery",
-        TypeRef::named_nn("ParkedDelivery"),
+        n.root("discardParkedDelivery"),
+        TypeRef::named_nn(n.ty("ParkedDelivery")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;

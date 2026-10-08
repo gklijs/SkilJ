@@ -10,6 +10,7 @@
 use super::{not_found, require_read_mapping};
 use crate::error::to_graphql_error;
 use crate::gql_types::ProjectionWithRebuild;
+use crate::naming::Naming;
 use crate::projection_types::graphql_type_name;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
@@ -110,7 +111,7 @@ pub(crate) async fn fetch_projection_result(
     name: &str,
     key: &str,
     wait_for_sequence: Option<i64>,
-) -> async_graphql::Result<(serde_json::Value, String)> {
+) -> async_graphql::Result<(crate::projection_types::ProjectionInstance, String)> {
     // `team_only` is a plain in-memory `ProjectionDispatcher` lookup, no
     // DB round trip - checked first and rejected outright before any of
     // the DB work below runs, rather than waiting for `query_projection`'s
@@ -228,7 +229,15 @@ pub(crate) async fn fetch_projection_result(
     let value: serde_json::Value = serde_json::from_str(&result)
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
 
-    Ok((value, graphql_type_name(bounded_context_name, name)))
+    Ok((
+        crate::projection_types::ProjectionInstance {
+            key: key.to_string(),
+            state: value,
+        },
+        state
+            .naming
+            .ty(&graphql_type_name(bounded_context_name, name)),
+    ))
 }
 
 /// [`crate::projection_types::AdmittedProjections::require`], except that
@@ -254,42 +263,47 @@ pub(crate) async fn require_admitted(
     Err(refused)
 }
 
-pub fn field() -> Field {
-    Field::new("projection", TypeRef::named_nn("ProjectionResult"), |ctx| {
-        FieldFuture::new(async move {
-            let state = ctx.data::<GraphqlState>()?;
-            let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
-            let access_mapping =
-                require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
-            let name = ctx.args.try_get("name")?.string()?.to_string();
-            require_admitted(&ctx, state, &bounded_context_name, &name).await?;
-            let key = ctx
-                .args
-                .get("key")
-                .filter(|v| !v.is_null())
-                .map(|v| v.string().map(str::to_string))
-                .transpose()?
-                .unwrap_or_default();
-            let wait_for_sequence = ctx
-                .args
-                .get("waitForSequence")
-                .filter(|v| !v.is_null())
-                .map(|v| v.i64())
-                .transpose()?;
+pub fn field(n: &Naming) -> Field {
+    Field::new(
+        n.root("projection"),
+        TypeRef::named_nn(n.ty("ProjectionResult")),
+        |ctx| {
+            FieldFuture::new(async move {
+                let state = ctx.data::<GraphqlState>()?;
+                let bounded_context_name =
+                    ctx.args.try_get("boundedContext")?.string()?.to_string();
+                let access_mapping =
+                    require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                let name = ctx.args.try_get("name")?.string()?.to_string();
+                require_admitted(&ctx, state, &bounded_context_name, &name).await?;
+                let key = ctx
+                    .args
+                    .get("key")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?
+                    .unwrap_or_default();
+                let wait_for_sequence = ctx
+                    .args
+                    .get("waitForSequence")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.i64())
+                    .transpose()?;
 
-            let (value, type_name) = fetch_projection_result(
-                state,
-                &access_mapping,
-                &bounded_context_name,
-                &name,
-                &key,
-                wait_for_sequence,
-            )
-            .await?;
+                let (value, type_name) = fetch_projection_result(
+                    state,
+                    &access_mapping,
+                    &bounded_context_name,
+                    &name,
+                    &key,
+                    wait_for_sequence,
+                )
+                .await?;
 
-            Ok(Some(FieldValue::owned_any(value).with_type(type_name)))
-        })
-    })
+                Ok(Some(FieldValue::owned_any(value).with_type(type_name)))
+            })
+        },
+    )
     .argument(InputValue::new(
         "boundedContext",
         TypeRef::named_nn(TypeRef::STRING),
@@ -300,6 +314,56 @@ pub fn field() -> Field {
         "waitForSequence",
         TypeRef::named(TypeRef::INT),
     ))
+}
+
+/// `_entities` (docs/architecture.md §194): the projection instances a
+/// router names by type and `projectionKey`, each looked up as
+/// `projection(boundedContext, name, key)` would be for the same caller,
+/// with every check that field makes (`@guarantee PublishingGrantsNothing`)
+/// and no `waitForSequence`. One representation that is refused, or names
+/// a type that isn't a projection, fails the whole answer with its error:
+/// async-graphql's dynamic schema has no `null` for one item of a list of
+/// union values.
+pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> FieldFuture<'_> {
+    FieldFuture::new(async move {
+        let state = ctx.data::<GraphqlState>()?;
+        let representations = ctx.args.try_get("representations")?.list()?;
+        let mut values = Vec::with_capacity(representations.len());
+        for representation in representations.iter() {
+            values.push(resolve_entity(&ctx, state, representation).await?);
+        }
+        Ok(Some(FieldValue::list(values)))
+    })
+}
+
+async fn resolve_entity<'a>(
+    ctx: &async_graphql::dynamic::ResolverContext<'_>,
+    state: &GraphqlState,
+    representation: async_graphql::dynamic::ValueAccessor<'_>,
+) -> async_graphql::Result<FieldValue<'a>> {
+    let representation = representation.object()?;
+    let type_name = representation.try_get("__typename")?.string()?;
+    let key = representation
+        .try_get(crate::federation::PROJECTION_KEY_FIELD)?
+        .string()?
+        .to_string();
+    let (bounded_context_name, name) = ctx
+        .data::<crate::projection_types::AdmittedProjections>()
+        .ok()
+        .and_then(|admitted| admitted.by_type_name(type_name))
+        .cloned()
+        .ok_or_else(|| not_found("Projection type", type_name))?;
+    let access_mapping = require_read_mapping(ctx, &state.pool, &bounded_context_name).await?;
+    let (instance, type_name) = fetch_projection_result(
+        state,
+        &access_mapping,
+        &bounded_context_name,
+        &name,
+        &key,
+        None,
+    )
+    .await?;
+    Ok(FieldValue::owned_any(instance).with_type(type_name))
 }
 
 /// `projectionSchema(boundedContext: String!, name: String!): Projection` -
@@ -331,41 +395,46 @@ pub fn field() -> Field {
 /// field while `projection` itself refuses it - `TeamGatedWhenDeclared`'s
 /// own "invisible, not merely unreadable" promise would otherwise hold
 /// for one field and not the other on the same surface.
-pub fn schema_field() -> Field {
-    Field::new("projectionSchema", TypeRef::named("Projection"), |ctx| {
-        FieldFuture::new(async move {
-            let state = ctx.data::<GraphqlState>()?;
-            let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
-            let access_mapping =
-                require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
-            let name = ctx.args.try_get("name")?.string()?.to_string();
+pub fn schema_field(n: &Naming) -> Field {
+    Field::new(
+        n.root("projectionSchema"),
+        TypeRef::named(n.ty("Projection")),
+        |ctx| {
+            FieldFuture::new(async move {
+                let state = ctx.data::<GraphqlState>()?;
+                let bounded_context_name =
+                    ctx.args.try_get("boundedContext")?.string()?.to_string();
+                let access_mapping =
+                    require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                let name = ctx.args.try_get("name")?.string()?.to_string();
 
-            let team_only = state
-                .projection_dispatcher
-                .team_only(&bounded_context_name, &name)
-                .flatten();
-            if !skilj_core::access_control::role_matches_required_team(
-                &access_mapping.role,
-                team_only,
-            ) {
-                return Err(to_graphql_error(
-                    skilj_core::access_control::Error::NotOnRequiredTeam,
-                ));
-            }
+                let team_only = state
+                    .projection_dispatcher
+                    .team_only(&bounded_context_name, &name)
+                    .flatten();
+                if !skilj_core::access_control::role_matches_required_team(
+                    &access_mapping.role,
+                    team_only,
+                ) {
+                    return Err(to_graphql_error(
+                        skilj_core::access_control::Error::NotOnRequiredTeam,
+                    ));
+                }
 
-            let projection =
-                skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)
-                    .await
-                    .map_err(to_graphql_error)?
-                    .ok_or_else(|| not_found("Projection", &name))?;
+                let projection =
+                    skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)
+                        .await
+                        .map_err(to_graphql_error)?
+                        .ok_or_else(|| not_found("Projection", &name))?;
 
-            Ok(Some(FieldValue::owned_any(ProjectionWithRebuild {
-                projection,
-                pending_rebuild: None,
-                building_rebuild: None,
-            })))
-        })
-    })
+                Ok(Some(FieldValue::owned_any(ProjectionWithRebuild {
+                    projection,
+                    pending_rebuild: None,
+                    building_rebuild: None,
+                })))
+            })
+        },
+    )
     .argument(InputValue::new(
         "boundedContext",
         TypeRef::named_nn(TypeRef::STRING),

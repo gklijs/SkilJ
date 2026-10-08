@@ -6,14 +6,15 @@
 use super::{load_bounded_context_with_mappings, not_found, require_superadmin};
 use crate::error::to_graphql_error;
 use crate::gql_types::BoundedContextWithMappings;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, TypeRef};
 
 /// `boundedContexts: [BoundedContext!]!`
-pub fn field() -> Field {
+pub fn field(n: &Naming) -> Field {
     Field::new(
-        "boundedContexts",
-        TypeRef::named_nn_list_nn("BoundedContext"),
+        n.root("boundedContexts"),
+        TypeRef::named_nn_list_nn(n.ty("BoundedContext")),
         |ctx| {
             FieldFuture::new(async move {
                 let caller = require_superadmin(&ctx)?;

@@ -209,6 +209,10 @@ far as a test exercises them, and some aren't checked at all
   `UniqueReadCursorPerToken` in `skilj-core/tests/event_fetch_surface.rs`.
 - **The template**: `scripts/check-template.sh` generates it and builds
   it, but doesn't run it.
+- **Federation composition**: `skilj/tests/graphql_federation.rs` checks
+  what `/graphql` publishes as a subgraph and records it, and
+  `scripts/check-federation-composition.sh` composes that with Apollo's
+  and Hive's composition (§194).
 
 **By nothing.**
 - **SQL at compile time.** No `sqlx::query!`. Every statement is
@@ -218,6 +222,10 @@ far as a test exercises them, and some aren't checked at all
   statement runs. The Postgres suites, and the skip guard that makes
   sure they actually ran, are the only check on SQL. Nothing measures
   coverage either, so no one knows which statements no test reaches.
+- **Real routers in CI.** `scripts/federation-smoke.sh` runs skilj-demo
+  behind Apollo Router and Hive Router, but downloads them, so it runs by
+  hand only. Apollo Router's subscriptions need GraphOS, so only Hive
+  Router's are exercised (§194).
 - **The broker bridges in CI.** The Kafka, AMQP, NATS and Temporal tests
   need Docker. The CI image has none, so they skip on every run, and the
   skip guard ignores their notes on purpose. Run them by hand (above)

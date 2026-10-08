@@ -95,7 +95,7 @@ banking and courses) if you want to see more before committing.
 |---|---|
 | [`skilj`](skilj) | The main library - start here. A thin facade over `skilj-core`/`skilj-graphql`/`skilj-rest`. |
 | [`skilj-core`](skilj-core) | The domain engine: events, commands, projections, and persistence. No web framework dependency. |
-| [`skilj-graphql`](skilj-graphql) | The GraphQL surface - usable on its own if you don't need REST. |
+| [`skilj-graphql`](skilj-graphql) | The GraphQL surface - usable on its own if you don't need REST, and optionally an Apollo Federation subgraph for Apollo Router, Hive Router or Cosmo to compose (docs/architecture.md §194). |
 | [`skilj-rest`](skilj-rest) | The REST surface - authenticated routes for agents and automated callers. |
 | [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file instead of hand-writing it. |
 | [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a terminal console (GraphQL client) for browsing and operating a running deployment. |

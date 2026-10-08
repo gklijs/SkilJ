@@ -63,9 +63,10 @@ use async_graphql::{ErrorExtensions, Name, Value};
 use serde_json::Map;
 use skilj_core::db::{self, Pool};
 
-/// The GraphQL type name one registered projection's state renders as -
-/// shared by `build` (which registers it) and `resolvers::projection_query`
-/// (which tags its `FieldValue` with it), so both always agree. Bounded
+/// The GraphQL type name one registered projection's state renders as,
+/// before the schema's name prefix (docs/architecture.md §194) - shared by
+/// `build` (which registers it) and `resolvers::projection_query` (which
+/// tags its `FieldValue` with it), so both always agree. Bounded
 /// context names are already constrained to a safe identifier pattern
 /// (`bootstrap::valid_bounded_context_name`); projection names aren't,
 /// and `_` in either part makes the result ambiguous - `build` rejects a
@@ -73,6 +74,14 @@ use skilj_core::db::{self, Pool};
 /// and [`AdmittedProjections`] keeps the resolvers from rendering one.
 pub fn graphql_type_name(bounded_context: &str, projection_name: &str) -> String {
     format!("{bounded_context}_{projection_name}")
+}
+
+/// What a projection type's own fields resolve against: one instance's
+/// key and its decoded state. Nested shapes below it resolve against
+/// their part of `state` directly.
+pub struct ProjectionInstance {
+    pub key: String,
+    pub state: serde_json::Value,
 }
 
 /// Every registered projection's generated `Object` (including any
@@ -89,12 +98,23 @@ pub fn graphql_type_name(bounded_context: &str, projection_name: &str) -> String
 /// the other projection's type, since [`graphql_type_name`] gives both the
 /// same name.
 #[derive(Default)]
-pub struct AdmittedProjections(std::collections::HashSet<(String, String)>);
+pub struct AdmittedProjections {
+    pairs: std::collections::HashSet<(String, String)>,
+    /// Each admitted projection by its (prefixed) type name, for
+    /// `_entities`, whose representations name only the type.
+    by_type: std::collections::HashMap<String, (String, String)>,
+}
 
 impl AdmittedProjections {
+    /// The `(bounded_context, projection)` the type `type_name` was
+    /// generated for, if it was admitted.
+    pub fn by_type_name(&self, type_name: &str) -> Option<&(String, String)> {
+        self.by_type.get(type_name)
+    }
+
     pub fn require(&self, bounded_context: &str, projection: &str) -> async_graphql::Result<()> {
         if self
-            .0
+            .pairs
             .contains(&(bounded_context.to_string(), projection.to_string()))
         {
             return Ok(());
@@ -113,10 +133,12 @@ impl AdmittedProjections {
 pub async fn build(
     pool: &Pool,
     visible: Option<&std::collections::BTreeSet<String>>,
+    naming: &crate::naming::Naming,
+    federated: bool,
 ) -> skilj_core::error::Result<Option<(Vec<Object>, Vec<Enum>, Union, AdmittedProjections)>> {
     let mut objects = Vec::new();
     let mut enums: Vec<Enum> = Vec::new();
-    let mut union = Union::new("ProjectionResult");
+    let mut union = Union::new(naming.ty("ProjectionResult"));
     let mut any = false;
     let mut taken_type_names = std::collections::HashSet::new();
     let mut admitted = AdmittedProjections::default();
@@ -132,7 +154,7 @@ pub async fn build(
             Err(err) => return Err(err),
         };
         for projection in projections {
-            let type_name = graphql_type_name(&bc.name, &projection.name);
+            let type_name = naming.ty(&graphql_type_name(&bc.name, &projection.name));
             let Some(root): Option<serde_json::Value> =
                 serde_json::from_str(&projection.schema).ok()
             else {
@@ -153,7 +175,8 @@ pub async fn build(
                 0,
                 &mut extra,
                 &mut projection_enums,
-            ) else {
+            )
+            .map(|object| if federated { keyed(object) } else { object }) else {
                 tracing::warn!(
                     bounded_context = bc.name,
                     projection = projection.name,
@@ -175,13 +198,17 @@ pub async fn build(
                 );
                 continue;
             }
-            union = union.possible_type(type_name);
+            union = union.possible_type(type_name.clone());
             objects.push(object);
             objects.extend(extra);
             enums.extend(projection_enums);
             admitted
-                .0
+                .pairs
                 .insert((bc.name.clone(), projection.name.clone()));
+            admitted.by_type.insert(
+                type_name.clone(),
+                (bc.name.clone(), projection.name.clone()),
+            );
             any = true;
         }
     }
@@ -190,6 +217,25 @@ pub async fn build(
         return Ok(None);
     }
     Ok(Some((objects, enums, union, admitted)))
+}
+
+/// `object`, a projection's type, as a federation entity keyed by the
+/// instance key (docs/architecture.md §194): `_entities` looks an instance
+/// up by it, the way `projection(key:)` does.
+fn keyed(object: Object) -> Object {
+    use crate::federation::PROJECTION_KEY_FIELD;
+    object
+        .field(Field::new(
+            PROJECTION_KEY_FIELD,
+            TypeRef::named_nn(TypeRef::STRING),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let instance = ctx.parent_value.try_downcast_ref::<ProjectionInstance>()?;
+                    Ok(Some(FieldValue::value(instance.key.clone())))
+                })
+            },
+        ))
+        .key(PROJECTION_KEY_FIELD)
 }
 
 /// Claims every GraphQL type name one projection generates, all or
@@ -266,6 +312,12 @@ fn object_from_schema_value(
 
     let mut object = Object::new(type_name.to_string());
     let mut field_names = std::collections::HashSet::new();
+    // The federation entity key (docs/architecture.md §194), reserved
+    // whether or not this schema is a subgraph, so turning federation on
+    // never changes which of a state's fields its type has.
+    if depth == 0 {
+        field_names.insert(crate::federation::PROJECTION_KEY_FIELD.to_string());
+    }
     for (field_name, field_schema) in properties {
         // Same silent-overwrite hazard as `admit_type_names`, one level
         // down: `total_amount` and `totalAmount` both become
@@ -488,7 +540,13 @@ fn build_field(
                 ) {
                     extra_objects.push(nested_object);
                     let ty = wrap(nullable, nested_type_name, false);
-                    return dynamic_field(gql_name, ty, json_key, FieldKind::NestedObject);
+                    return dynamic_field(
+                        gql_name,
+                        ty,
+                        json_key,
+                        FieldKind::NestedObject,
+                        depth == 0,
+                    );
                 }
                 if let Some(values) = enum_values_from_schema(def_schema) {
                     // Namespaced by parent+field, same as `nested_type_name`
@@ -505,7 +563,7 @@ fn build_field(
                         extra_enums.push(enum_type);
                     }
                     let ty = wrap(nullable, enum_type_name, false);
-                    return dynamic_field(gql_name, ty, json_key, FieldKind::Enum);
+                    return dynamic_field(gql_name, ty, json_key, FieldKind::Enum, depth == 0);
                 }
             }
         }
@@ -521,26 +579,44 @@ fn build_field(
             .and_then(scalar_kind_and_name)
         {
             let ty = wrap(nullable, scalar_name.to_string(), true);
-            return dynamic_field(gql_name, ty, json_key, FieldKind::ScalarList(kind));
+            return dynamic_field(
+                gql_name,
+                ty,
+                json_key,
+                FieldKind::ScalarList(kind),
+                depth == 0,
+            );
         }
     } else if let Some(type_str) = type_value.and_then(json_type_str) {
         if let Some((kind, scalar_name)) = scalar_kind_and_name(type_str) {
             let ty = wrap(nullable, scalar_name.to_string(), false);
-            return dynamic_field(gql_name, ty, json_key, FieldKind::Scalar(kind));
+            return dynamic_field(gql_name, ty, json_key, FieldKind::Scalar(kind), depth == 0);
         }
     }
 
     // Unsupported shape - opaque JSON fallback, not a panic.
     let ty = wrap(nullable, TypeRef::STRING.to_string(), false);
-    dynamic_field(gql_name, ty, json_key, FieldKind::OpaqueJson)
+    dynamic_field(gql_name, ty, json_key, FieldKind::OpaqueJson, depth == 0)
 }
 
-fn dynamic_field(gql_name: String, ty: TypeRef, json_key: String, kind: FieldKind) -> Field {
+fn dynamic_field(
+    gql_name: String,
+    ty: TypeRef,
+    json_key: String,
+    kind: FieldKind,
+    top_level: bool,
+) -> Field {
     Field::new(gql_name, ty, move |ctx| {
         let json_key = json_key.clone();
         let kind = kind.clone();
         FieldFuture::new(async move {
-            let parent = ctx.parent_value.try_downcast_ref::<serde_json::Value>()?;
+            let parent = if top_level {
+                &ctx.parent_value
+                    .try_downcast_ref::<ProjectionInstance>()?
+                    .state
+            } else {
+                ctx.parent_value.try_downcast_ref::<serde_json::Value>()?
+            };
             Ok(render_field(parent.get(&json_key), &kind))
         })
     })
@@ -639,7 +715,12 @@ mod tests {
             TypeRef::named_nn(type_name),
             move |_ctx| {
                 let state = state.clone();
-                FieldFuture::new(async move { Ok(Some(FieldValue::owned_any(state))) })
+                FieldFuture::new(async move {
+                    Ok(Some(FieldValue::owned_any(ProjectionInstance {
+                        key: String::new(),
+                        state,
+                    })))
+                })
             },
         ));
 
@@ -830,7 +911,12 @@ mod tests {
                 TypeRef::named_nn("Orders_OrderState"),
                 move |_ctx| {
                     let state = state.clone();
-                    FieldFuture::new(async move { Ok(Some(FieldValue::owned_any(state))) })
+                    FieldFuture::new(async move {
+                        Ok(Some(FieldValue::owned_any(ProjectionInstance {
+                            key: String::new(),
+                            state,
+                        })))
+                    })
                 },
             ));
             let mut builder = Schema::build(query_object.type_name(), None, None)

@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `/graphql` as an Apollo Federation v2 subgraph, for Apollo Router (2
+  and the 3.0 preview), Hive Router or Gateway, Cosmo, or schema
+  stitching to compose into a larger graph (docs/architecture.md §194):
+  `SkiljBuilder::graphql_federation(FederationOptions::new().prefix("ledger").publish("banking"))`.
+  Every type and root field gets the prefix. Only the published bounded
+  contexts, never one made from a template, are in the description a
+  router composes (`_service`, or `Skilj::federation_sdl()` for a deploy
+  pipeline), and only the surfaces a grant faces at read or write level;
+  the admin surface stays callable directly and is `@inaccessible`.
+  Projection types are entities keyed by `projectionKey`, resolved through
+  `_entities` under the caller's own grant. skilj-tui has
+  `--graphql-prefix`, and skilj-demo's server `SKILJ_FEDERATION_PREFIX`.
+  CI composes the published description with Apollo's and Hive's
+  composition; `scripts/federation-smoke.sh` runs it behind real routers.
+
 - `SkiljBuilder::statement_cache_capacity(n)` (docs/architecture.md §193,
   Codeberg issue #56): how many prepared statements each pooled
   connection keeps. Every bounded context brings its own statements, and
@@ -73,6 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal. `skilj_bridge::ack` takes the epoch (breaking).
 
 ### Changed
+
+- A projection state field named `projection_key` (GraphQL `projectionKey`)
+  is now left out of its projection's GraphQL type, with a warning: the
+  name is reserved for the federation entity key, federated or not, so
+  turning federation on never changes a type's fields (docs/architecture.md
+  §194). In `skilj-graphql`, the type and field builders in `gql_types` and
+  `resolvers` take a `&Naming`, `GraphqlState` has `naming` and
+  `federation`, `projection_types::build` takes the naming and whether the
+  schema is federated, and a projection type's fields resolve against a
+  `ProjectionInstance` rather than the bare state. skilj-tui's
+  `graphql::spawn_live_events` takes the server's name prefix.
 
 - A command deciding from a snapshot reads the events since the
   snapshot from the event cache, when the cache still holds them,

@@ -1,0 +1,15 @@
+{
+  "name": "skilj-federation-checks",
+  "private": true,
+  "description": "Composition checks and router smoke test for skilj as a federation subgraph (docs/architecture.md §194).",
+  "type": "module",
+  "dependencies": {
+    "@apollo/composition": "2.14.4",
+    "@apollo/subgraph": "2.15.1",
+    "@theguild/federation-composition": "0.27.0",
+    "graphql": "16.14.2",
+    "graphql-tag": "2.12.7",
+    "graphql-ws": "6.3.0",
+    "ws": "8.22.0"
+  }
+}

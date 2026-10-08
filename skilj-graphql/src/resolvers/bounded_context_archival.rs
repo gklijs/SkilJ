@@ -9,13 +9,14 @@
 
 use super::{load_bounded_context_with_mappings, not_found, require_caller};
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
-pub fn field() -> Field {
+pub fn field(n: &Naming) -> Field {
     Field::new(
-        "archiveBoundedContext",
-        TypeRef::named_nn("BoundedContext"),
+        n.root("archiveBoundedContext"),
+        TypeRef::named_nn(n.ty("BoundedContext")),
         |ctx| {
             FieldFuture::new(async move {
                 let caller = require_caller(&ctx)?;

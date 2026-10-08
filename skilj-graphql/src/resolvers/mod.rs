@@ -431,6 +431,7 @@ pub fn not_found(entity: &str, key: &str) -> async_graphql::Error {
 /// doc comment.
 macro_rules! create_type_token_field {
     (
+        $n:expr,
         $field_name:literal,
         $return_type:literal,
         $type_arg_name:literal,
@@ -440,8 +441,8 @@ macro_rules! create_type_token_field {
         $insert_fn:path
     ) => {
         ::async_graphql::dynamic::Field::new(
-            $field_name,
-            ::async_graphql::dynamic::TypeRef::named_nn($return_type),
+            $n.root($field_name),
+            ::async_graphql::dynamic::TypeRef::named_nn($n.ty($return_type)),
             |ctx| {
                 ::async_graphql::dynamic::FieldFuture::new(async move {
                     let state = ctx.data::<$crate::GraphqlState>()?;

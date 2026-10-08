@@ -118,6 +118,7 @@ async fn a_subscription_the_server_ends_is_resumed_from_the_last_sequence() {
     let mut rx = spawn_live_events(
         ws_endpoint,
         "test-jwt".to_string(),
+        String::new(),
         "banking".to_string(),
         Duration::from_millis(10),
         Duration::from_millis(50),
@@ -177,6 +178,7 @@ async fn a_refused_resume_starts_again_from_now() {
         let mut rx = spawn_live_events(
             ws_endpoint,
             "test-jwt".to_string(),
+            String::new(),
             "banking".to_string(),
             Duration::from_millis(10),
             Duration::from_millis(50),

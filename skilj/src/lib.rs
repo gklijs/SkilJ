@@ -141,6 +141,7 @@ pub use skilj_core::plugin::{
     requires_role, CancelDeadline, CommandType, CrossContextRoute, EventType, Projection,
     ScheduleDeadline, Snapshot, DEFAULT_BOUNDED_CONTEXT,
 };
+pub use skilj_graphql::federation::FederationOptions;
 pub use skilj_graphql::limits::GraphqlLimits;
 /// See `skilj_macros::auto_register`'s own doc comment - unlike
 /// `requires_role` above, this one is facade-specific (its expansion
@@ -288,6 +289,10 @@ pub struct Skilj {
     max_events_per_read: usize,
     /// See `SkiljBuilder::graphql_limits`.
     graphql_limits: skilj_graphql::limits::GraphqlLimits,
+    /// See `SkiljBuilder::graphql_federation`; `naming` is its prefix's,
+    /// checked by `.build()`.
+    graphql_federation: Option<Arc<skilj_graphql::federation::FederationOptions>>,
+    graphql_naming: skilj_graphql::naming::Naming,
     /// `protect_sensitive_fields`'s own envelope-encryption master key -
     /// see `SkiljBuilder::encryption_master_key`'s own doc comment.
     /// `None` when never configured - fine as long as no bounded context
@@ -772,6 +777,7 @@ impl Skilj {
             read_cursor_checkout_lease: std::time::Duration::from_secs(5 * 60),
             max_events_per_read: skilj_core::event_store::DEFAULT_MAX_EVENTS_PER_READ,
             graphql_limits: skilj_graphql::limits::GraphqlLimits::default(),
+            graphql_federation: None,
             // Codeberg issue #36's own recommendation #3 - matches
             // `command_batcher::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT`.
             command_batch_idle_in_transaction_timeout: std::time::Duration::from_secs(30),
@@ -906,6 +912,19 @@ impl Skilj {
     pub async fn graphql_router(&self) -> skilj_core::error::Result<axum::Router> {
         skilj_graphql::router(Arc::clone(&self.schema_registry), self.graphql_state()).await
     }
+    /// The description a router composes when `/graphql` is a federation
+    /// subgraph ([`SkiljBuilder::graphql_federation`], docs/architecture.md
+    /// §194): federation SDL for the published bounded contexts, the same
+    /// text `_service { sdl }` answers with. For a deploy pipeline to hand
+    /// `rover subgraph publish --schema` or `hive schema:publish`. `None`
+    /// when `/graphql` isn't a subgraph.
+    pub async fn federation_sdl(&self) -> skilj_core::error::Result<Option<String>> {
+        Ok(self
+            .schema_registry
+            .published_sdl(&self.graphql_state())
+            .await?
+            .map(|sdl| sdl.to_string()))
+    }
 
     /// `GraphqlState`'s one real constructor - `graphql_router()`'s own
     /// call site, plus `.build()`'s (to build the initial
@@ -938,8 +957,38 @@ impl Skilj {
             event_cache: self.event_cache.clone(),
             template_cache: self.template_cache.clone(),
             command_batcher: self.command_batcher.clone(),
+            naming: self.graphql_naming.clone(),
+            federation: self.graphql_federation.clone(),
         }
     }
+}
+
+/// Warns about each bounded context `options` publishes that the
+/// published description leaves out (docs/architecture.md §194): one
+/// that doesn't exist (yet), or one made from a template (`@guarantee
+/// TenantsAreNeverPublished`). A warning, not a refusal: a tenant can
+/// also be created after startup, and is left out just the same.
+async fn warn_unpublishable(
+    pool: &skilj_core::db::Pool,
+    options: &skilj_graphql::federation::FederationOptions,
+) -> Result<(), skilj_core::Error> {
+    let existing = skilj_core::db::list_bounded_contexts(pool).await?;
+    for name in options.published() {
+        match existing.iter().find(|bc| &bc.name == name) {
+            None => tracing::warn!(
+                bounded_context = name.as_str(),
+                "published to the federation supergraph, but no such bounded context exists \
+                 (yet) - left out of the published description until it does"
+            ),
+            Some(bc) if bc.template.is_some() => tracing::warn!(
+                bounded_context = name.as_str(),
+                "published to the federation supergraph, but made from a template - tenants are \
+                 never published (docs/architecture.md §194), so it is left out"
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// What `Skilj::builder().build()` did on this startup: which bounded
@@ -1607,6 +1656,7 @@ pub struct SkiljBuilder {
     read_cursor_checkout_lease: std::time::Duration,
     max_events_per_read: usize,
     graphql_limits: skilj_graphql::limits::GraphqlLimits,
+    graphql_federation: Option<skilj_graphql::federation::FederationOptions>,
     command_batch_idle_in_transaction_timeout: std::time::Duration,
     command_batch_max_size: usize,
     command_batch_max_concurrent_leaders: Option<usize>,
@@ -1899,6 +1949,28 @@ impl SkiljBuilder {
         self
     }
 
+    /// Makes `/graphql` an Apollo Federation v2 subgraph, for Apollo
+    /// Router, Hive Router or Gateway, Cosmo, or schema stitching to
+    /// compose into a larger graph (docs/architecture.md §194). Every type
+    /// and root field gets `options`' prefix, so set one whenever another
+    /// subgraph might use the same names, a second skilj service
+    /// included. Only the bounded contexts `options` publishes are in the
+    /// description a router composes ([`Skilj::federation_sdl`], or
+    /// `_service`), never one made from a template, and only the surfaces
+    /// a grant faces at read or write level: the admin surface stays
+    /// callable here and is `@inaccessible` there. Requests through a
+    /// router are authorised exactly as direct ones.
+    ///
+    /// `.build()` refuses an invalid prefix, and warns about a published
+    /// bounded context that doesn't exist or was made from a template.
+    pub fn graphql_federation(
+        mut self,
+        options: skilj_graphql::federation::FederationOptions,
+    ) -> Self {
+        self.graphql_federation = Some(options);
+        self
+    }
+
     /// A batch leader's own `SET LOCAL idle_in_transaction_session_timeout`,
     /// on the transaction holding the bounded-context lock for the whole
     /// batch it's processing - `skilj_core::command_batcher::CommandBatcher
@@ -2109,6 +2181,12 @@ impl SkiljBuilder {
                 )));
             }
         }
+        // docs/architecture.md §194.
+        let graphql_naming = match &self.graphql_federation {
+            Some(options) => options.naming().map_err(skilj_core::Error::configuration)?,
+            None => skilj_graphql::naming::Naming::default(),
+        };
+        let graphql_federation = self.graphql_federation.map(Arc::new);
         let pool = skilj_core::db::connect_with_statement_cache(
             &self.database_url,
             self.pool_options.unwrap_or_default(),
@@ -2518,9 +2596,14 @@ impl SkiljBuilder {
                 event_cache: event_cache.clone(),
                 template_cache: template_cache.clone(),
                 command_batcher: command_batcher.clone(),
+                naming: graphql_naming.clone(),
+                federation: graphql_federation.clone(),
             })
             .await?,
         );
+        if let Some(options) = &graphql_federation {
+            warn_unpublishable(&pool, options).await?;
+        }
 
         let background = Background::new();
         let skilj = Skilj {
@@ -2536,6 +2619,8 @@ impl SkiljBuilder {
             read_cursor_checkout_lease,
             max_events_per_read,
             graphql_limits,
+            graphql_federation,
+            graphql_naming,
             encryption_master_key,
             event_broadcaster,
             revocation_broadcaster,

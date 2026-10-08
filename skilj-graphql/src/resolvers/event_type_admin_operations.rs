@@ -4,11 +4,13 @@
 
 use super::{create_type_token_field, not_found, parse_event_read_start_position, parse_rfc3339};
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
-pub fn create_external_event_token_field() -> Field {
+pub fn create_external_event_token_field(n: &Naming) -> Field {
     create_type_token_field!(
+        n,
         "createExternalEventToken",
         "ExternalEventToken",
         "eventTypeName",
@@ -18,8 +20,9 @@ pub fn create_external_event_token_field() -> Field {
         skilj_core::db::insert_external_event_token
     )
 }
-pub fn create_direct_creation_token_field() -> Field {
+pub fn create_direct_creation_token_field(n: &Naming) -> Field {
     create_type_token_field!(
+        n,
         "createDirectCreationToken",
         "DirectCreationToken",
         "eventTypeName",
@@ -47,10 +50,10 @@ pub fn create_direct_creation_token_field() -> Field {
 /// unvalidated at this layer; the three-way exclusivity with `startFrom`
 /// is `create_event_read_token`'s own guard, rendered here through the
 /// same `to_graphql_error` every other rejection already goes through.
-pub fn create_event_read_token_field() -> Field {
+pub fn create_event_read_token_field(n: &Naming) -> Field {
     Field::new(
-        "createEventReadToken",
-        TypeRef::named_nn("EventReadToken"),
+        n.root("createEventReadToken"),
+        TypeRef::named_nn(n.ty("EventReadToken")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -121,7 +124,7 @@ pub fn create_event_read_token_field() -> Field {
     .argument(InputValue::new("scope", TypeRef::named(TypeRef::STRING)))
     .argument(InputValue::new(
         "startFrom",
-        TypeRef::named("EventReadStartPosition"),
+        TypeRef::named(n.ty("EventReadStartPosition")),
     ))
     .argument(InputValue::new(
         "startAtSequence",

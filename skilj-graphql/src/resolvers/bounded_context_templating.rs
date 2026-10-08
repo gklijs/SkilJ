@@ -27,6 +27,7 @@
 
 use super::{load_bounded_context_with_mappings, not_found, require_superadmin};
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use skilj_core::access_control::{AccessLevel, Role, RoleAccessMapping, RoleStatus};
@@ -288,10 +289,10 @@ async fn finish_creating_tenant(
 /// doc comment for why that matters (`UniqueActiveGrantPerRoleAndContext`
 /// means a follow-up `grantRoleAccessMapping` couldn't rescope this same
 /// grant afterward).
-pub fn create_bounded_context_from_template_field() -> Field {
+pub fn create_bounded_context_from_template_field(n: &Naming) -> Field {
     Field::new(
-        "createBoundedContextFromTemplate",
-        TypeRef::named_nn("BoundedContext"),
+        n.root("createBoundedContextFromTemplate"),
+        TypeRef::named_nn(n.ty("BoundedContext")),
         |ctx| {
             FieldFuture::new(async move {
                 let caller = require_superadmin(&ctx)?;
@@ -413,7 +414,10 @@ pub fn create_bounded_context_from_template_field() -> Field {
     ))
     .argument(InputValue::new("name", TypeRef::named_nn(TypeRef::STRING)))
     .argument(InputValue::new("roleId", TypeRef::named_nn(TypeRef::ID)))
-    .argument(InputValue::new("level", TypeRef::named_nn("AccessLevel")))
+    .argument(InputValue::new(
+        "level",
+        TypeRef::named_nn(n.ty("AccessLevel")),
+    ))
     .argument(InputValue::new(
         "canReadSensitive",
         TypeRef::named_nn(TypeRef::BOOLEAN),
@@ -422,10 +426,10 @@ pub fn create_bounded_context_from_template_field() -> Field {
 }
 
 /// `resyncBoundedContextFromTemplate(boundedContext: String!): BoundedContext!`
-pub fn resync_bounded_context_from_template_field() -> Field {
+pub fn resync_bounded_context_from_template_field(n: &Naming) -> Field {
     Field::new(
-        "resyncBoundedContextFromTemplate",
-        TypeRef::named_nn("BoundedContext"),
+        n.root("resyncBoundedContextFromTemplate"),
+        TypeRef::named_nn(n.ty("BoundedContext")),
         |ctx| {
             FieldFuture::new(async move {
                 let caller = require_superadmin(&ctx)?;

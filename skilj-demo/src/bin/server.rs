@@ -6,7 +6,9 @@
 //! `curl` at the printed examples, or a GraphQL client at `/graphql`.
 //!
 //! Needs `DATABASE_URL` pointing at a real Postgres (`PORT` optionally
-//! overrides the default `8080`). Every run is safe to repeat against the
+//! overrides the default `8080`). `SKILJ_FEDERATION_PREFIX` makes
+//! `/graphql` a federation subgraph under that prefix, publishing both
+//! bounded contexts (docs/architecture.md §194). Every run is safe to repeat against the
 //! same database: bounded contexts are only created if they don't exist
 //! yet, and each run mints its own fresh admin `Role` and `CommandToken`s
 //! rather than reusing a previous run's.
@@ -432,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let jwks_url = serve_local_jwks().await;
-    let (skilj, report) = skilj_demo::register(Skilj::builder(database_url))
+    let mut builder = skilj_demo::register(Skilj::builder(database_url))
         .reconciliation_role(external_subject)
         .identity_provider(IdpConfig::new(
             jwks_url
@@ -441,9 +443,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             TEST_ISSUER,
             TEST_AUDIENCE,
             SigningAlgorithm::Rs256,
-        ))
-        .build()
-        .await?;
+        ));
+    // docs/architecture.md §194: with `SKILJ_FEDERATION_PREFIX` set,
+    // `/graphql` is a federation subgraph publishing both bounded contexts
+    // under that prefix, for a router to compose (`_service { sdl }`).
+    if let Ok(prefix) = std::env::var("SKILJ_FEDERATION_PREFIX") {
+        let mut options = skilj::FederationOptions::new().prefix(prefix);
+        for name in BOUNDED_CONTEXTS {
+            options = options.publish(*name);
+        }
+        builder = builder.graphql_federation(options);
+    }
+    let (skilj, report) = builder.build().await?;
     tracing::info!(registered = ?report.registered, "reconciliation complete");
     if !report.skipped_no_access.is_empty() {
         tracing::warn!(

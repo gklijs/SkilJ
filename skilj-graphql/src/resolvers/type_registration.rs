@@ -24,6 +24,7 @@ use super::{
 };
 use crate::error::to_graphql_error;
 use crate::gql_types::{ProjectionRegistrationResult, ProjectionWithRebuild};
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use skilj_core::projections::{ProjectionRebuildStatus, ProjectionRegistration};
@@ -36,82 +37,90 @@ use skilj_core::projections::{ProjectionRebuildStatus, ProjectionRegistration};
 /// before this argument existed) means no owner dimension, unaffected by
 /// any grant's `scope` regardless of its value. Validated by
 /// `valid_owner_tag_key` - see `RegisterEventType` in specs/skilj.allium.
-pub fn register_event_type_field() -> Field {
-    Field::new("registerEventType", TypeRef::named_nn("EventType"), |ctx| {
-        FieldFuture::new(async move {
-            let state = ctx.data::<GraphqlState>()?;
-            let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
-            let access_mapping =
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
-            let name = ctx.args.try_get("name")?.string()?.to_string();
-            let schema = ctx.args.try_get("schema")?.string()?.to_string();
-            let tag_mappings = parse_tag_mappings(&ctx.args.try_get("tagMappings")?)?;
-            let owner_tag_key = ctx
-                .args
-                .get("ownerTagKey")
-                .filter(|v| !v.is_null())
-                .map(|v| v.string().map(str::to_string))
-                .transpose()?;
-            let sensitive_fields = parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
-            let private_fields = parse_private_fields(&ctx.args.try_get("privateFields")?)?;
-            let external_creation_allowed =
-                ctx.args.try_get("externalCreationAllowed")?.boolean()?;
-            let direct_creation_allowed = ctx.args.try_get("directCreationAllowed")?.boolean()?;
-            let system_triggered_allowed = ctx.args.try_get("systemTriggeredAllowed")?.boolean()?;
-            let event_read_allowed = ctx.args.try_get("eventReadAllowed")?.boolean()?;
-            let system_triggered_schedule = ctx
-                .args
-                .get("systemTriggeredSchedule")
-                .filter(|v| !v.is_null())
-                .map(|v| v.string().map(str::to_string))
-                .transpose()?;
-            let missed_occurrence_policy = match ctx
-                .args
-                .get("missedOccurrencePolicy")
-                .filter(|v| !v.is_null())
-            {
-                Some(v) => Some(parse_missed_occurrence_policy(v.enum_name()?)),
-                None => None,
-            };
+pub fn register_event_type_field(n: &Naming) -> Field {
+    Field::new(
+        n.root("registerEventType"),
+        TypeRef::named_nn(n.ty("EventType")),
+        |ctx| {
+            FieldFuture::new(async move {
+                let state = ctx.data::<GraphqlState>()?;
+                let bounded_context_name =
+                    ctx.args.try_get("boundedContext")?.string()?.to_string();
+                let access_mapping =
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                let name = ctx.args.try_get("name")?.string()?.to_string();
+                let schema = ctx.args.try_get("schema")?.string()?.to_string();
+                let tag_mappings = parse_tag_mappings(&ctx.args.try_get("tagMappings")?)?;
+                let owner_tag_key = ctx
+                    .args
+                    .get("ownerTagKey")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
+                let sensitive_fields =
+                    parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
+                let private_fields = parse_private_fields(&ctx.args.try_get("privateFields")?)?;
+                let external_creation_allowed =
+                    ctx.args.try_get("externalCreationAllowed")?.boolean()?;
+                let direct_creation_allowed =
+                    ctx.args.try_get("directCreationAllowed")?.boolean()?;
+                let system_triggered_allowed =
+                    ctx.args.try_get("systemTriggeredAllowed")?.boolean()?;
+                let event_read_allowed = ctx.args.try_get("eventReadAllowed")?.boolean()?;
+                let system_triggered_schedule = ctx
+                    .args
+                    .get("systemTriggeredSchedule")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
+                let missed_occurrence_policy = match ctx
+                    .args
+                    .get("missedOccurrencePolicy")
+                    .filter(|v| !v.is_null())
+                {
+                    Some(v) => Some(parse_missed_occurrence_policy(v.enum_name()?)),
+                    None => None,
+                };
 
-            let bounded_context =
-                skilj_core::db::get_bounded_context(&state.pool, &bounded_context_name)
-                    .await
-                    .map_err(to_graphql_error)?
-                    .ok_or_else(|| not_found("BoundedContext", &bounded_context_name))?;
-            let existing =
-                skilj_core::db::get_event_type(&state.pool, &bounded_context_name, &name)
+                let bounded_context =
+                    skilj_core::db::get_bounded_context(&state.pool, &bounded_context_name)
+                        .await
+                        .map_err(to_graphql_error)?
+                        .ok_or_else(|| not_found("BoundedContext", &bounded_context_name))?;
+                let existing =
+                    skilj_core::db::get_event_type(&state.pool, &bounded_context_name, &name)
+                        .await
+                        .map_err(to_graphql_error)?;
+
+                let registration = skilj_core::event_store::register_event_type(
+                    &access_mapping,
+                    &bounded_context,
+                    name,
+                    schema,
+                    tag_mappings,
+                    owner_tag_key,
+                    sensitive_fields,
+                    private_fields,
+                    external_creation_allowed,
+                    direct_creation_allowed,
+                    system_triggered_allowed,
+                    system_triggered_schedule,
+                    missed_occurrence_policy,
+                    event_read_allowed,
+                    existing.as_ref(),
+                    chrono::Utc::now(),
+                )
+                .map_err(to_graphql_error)?;
+                skilj_core::db::upsert_event_type(&state.pool, registration.event_type())
                     .await
                     .map_err(to_graphql_error)?;
 
-            let registration = skilj_core::event_store::register_event_type(
-                &access_mapping,
-                &bounded_context,
-                name,
-                schema,
-                tag_mappings,
-                owner_tag_key,
-                sensitive_fields,
-                private_fields,
-                external_creation_allowed,
-                direct_creation_allowed,
-                system_triggered_allowed,
-                system_triggered_schedule,
-                missed_occurrence_policy,
-                event_read_allowed,
-                existing.as_ref(),
-                chrono::Utc::now(),
-            )
-            .map_err(to_graphql_error)?;
-            skilj_core::db::upsert_event_type(&state.pool, registration.event_type())
-                .await
-                .map_err(to_graphql_error)?;
-
-            Ok(Some(FieldValue::owned_any(
-                registration.event_type().clone(),
-            )))
-        })
-    })
+                Ok(Some(FieldValue::owned_any(
+                    registration.event_type().clone(),
+                )))
+            })
+        },
+    )
     .argument(InputValue::new(
         "boundedContext",
         TypeRef::named_nn(TypeRef::STRING),
@@ -123,7 +132,7 @@ pub fn register_event_type_field() -> Field {
     ))
     .argument(InputValue::new(
         "tagMappings",
-        TypeRef::named_nn_list_nn("TagMappingInput"),
+        TypeRef::named_nn_list_nn(n.ty("TagMappingInput")),
     ))
     .argument(InputValue::new(
         "ownerTagKey",
@@ -131,11 +140,11 @@ pub fn register_event_type_field() -> Field {
     ))
     .argument(InputValue::new(
         "sensitiveFields",
-        TypeRef::named_nn_list_nn("SensitiveFieldInput"),
+        TypeRef::named_nn_list_nn(n.ty("SensitiveFieldInput")),
     ))
     .argument(InputValue::new(
         "privateFields",
-        TypeRef::named_nn_list_nn("PrivateFieldInput"),
+        TypeRef::named_nn_list_nn(n.ty("PrivateFieldInput")),
     ))
     .argument(InputValue::new(
         "externalCreationAllowed",
@@ -159,7 +168,7 @@ pub fn register_event_type_field() -> Field {
     ))
     .argument(InputValue::new(
         "missedOccurrencePolicy",
-        TypeRef::named("MissedOccurrencePolicy"),
+        TypeRef::named(n.ty("MissedOccurrencePolicy")),
     ))
 }
 
@@ -169,10 +178,10 @@ pub fn register_event_type_field() -> Field {
 /// `ownerTagKey`, identical role for `CommandType`/`FetchCommands`
 /// (cross-tenant read fix, docs/architecture.md's own write-up of these
 /// passes).
-pub fn register_command_type_field() -> Field {
+pub fn register_command_type_field(n: &Naming) -> Field {
     Field::new(
-        "registerCommandType",
-        TypeRef::named_nn("CommandType"),
+        n.root("registerCommandType"),
+        TypeRef::named_nn(n.ty("CommandType")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -238,7 +247,7 @@ pub fn register_command_type_field() -> Field {
     ))
     .argument(InputValue::new(
         "tagMappings",
-        TypeRef::named_nn_list_nn("TagMappingInput"),
+        TypeRef::named_nn_list_nn(n.ty("TagMappingInput")),
     ))
     .argument(InputValue::new(
         "ownerTagKey",
@@ -246,11 +255,11 @@ pub fn register_command_type_field() -> Field {
     ))
     .argument(InputValue::new(
         "sensitiveFields",
-        TypeRef::named_nn_list_nn("SensitiveFieldInput"),
+        TypeRef::named_nn_list_nn(n.ty("SensitiveFieldInput")),
     ))
     .argument(InputValue::new(
         "privateFields",
-        TypeRef::named_nn_list_nn("PrivateFieldInput"),
+        TypeRef::named_nn_list_nn(n.ty("PrivateFieldInput")),
     ))
     .argument(InputValue::new(
         "restTriggerAllowed",
@@ -259,10 +268,10 @@ pub fn register_command_type_field() -> Field {
 }
 
 /// `registerProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): ProjectionRegistrationResult!`
-pub fn register_projection_field() -> Field {
+pub fn register_projection_field(n: &Naming) -> Field {
     Field::new(
-        "registerProjection",
-        TypeRef::named_nn("ProjectionRegistrationResult"),
+        n.root("registerProjection"),
+        TypeRef::named_nn(n.ty("ProjectionRegistrationResult")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -411,10 +420,10 @@ pub fn register_projection_field() -> Field {
 }
 
 /// `rebuildProjection(boundedContext: String!, name: String!): ProjectionRebuild!`
-pub fn rebuild_projection_field() -> Field {
+pub fn rebuild_projection_field(n: &Naming) -> Field {
     Field::new(
-        "rebuildProjection",
-        TypeRef::named_nn("ProjectionRebuild"),
+        n.root("rebuildProjection"),
+        TypeRef::named_nn(n.ty("ProjectionRebuild")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -467,10 +476,10 @@ pub fn rebuild_projection_field() -> Field {
 /// `discardProjectionRebuild(boundedContext: String!, name: String!): ProjectionRebuild!`,
 /// returning the just-discarded row (see `discard_projection_rebuild`'s
 /// own doc comment for why it hands that back rather than `()`).
-pub fn discard_projection_rebuild_field() -> Field {
+pub fn discard_projection_rebuild_field(n: &Naming) -> Field {
     Field::new(
-        "discardProjectionRebuild",
-        TypeRef::named_nn("ProjectionRebuild"),
+        n.root("discardProjectionRebuild"),
+        TypeRef::named_nn(n.ty("ProjectionRebuild")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -523,10 +532,10 @@ pub fn discard_projection_rebuild_field() -> Field {
 /// `projections(boundedContext: String!): [Projection!]!` - satisfies
 /// `TypeRegistration`'s own `exposes: for projection in
 /// bounded_context.projections`.
-pub fn projections_field() -> Field {
+pub fn projections_field(n: &Naming) -> Field {
     Field::new(
-        "projections",
-        TypeRef::named_nn_list_nn("Projection"),
+        n.root("projections"),
+        TypeRef::named_nn_list_nn(n.ty("Projection")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -582,10 +591,10 @@ pub fn projections_field() -> Field {
 /// genuinely different shape (it layers a per-projection rebuild-status
 /// lookup on top) and is left as its own hand-written body.
 macro_rules! list_for_bounded_context_field {
-    ($field_name:literal, $return_type:literal, $list_fn:path) => {
+    ($n:expr, $field_name:literal, $return_type:literal, $list_fn:path) => {
         Field::new(
-            $field_name,
-            TypeRef::named_nn_list_nn($return_type),
+            $n.root($field_name),
+            TypeRef::named_nn_list_nn($n.ty($return_type)),
             |ctx| {
                 FieldFuture::new(async move {
                     let state = ctx.data::<GraphqlState>()?;
@@ -617,8 +626,9 @@ macro_rules! list_for_bounded_context_field {
 /// `lastFiredAt`, `schedulePosition`, all already on `EventType` itself -
 /// see `gql_types::event_type_object` - so this is only ever the
 /// filtered listing, nothing new on the type).
-pub fn scheduled_event_types_field() -> Field {
+pub fn scheduled_event_types_field(n: &Naming) -> Field {
     list_for_bounded_context_field!(
+        n,
         "scheduledEventTypes",
         "EventType",
         skilj_core::db::list_scheduled_event_types
@@ -632,8 +642,9 @@ pub fn scheduled_event_types_field() -> Field {
 /// `scheduledEventTypes` above only ever returns the scheduled subset).
 /// `db::list_event_types_for_bounded_context` is the identical query
 /// unfiltered - same `AdminAccess` gate, same shape.
-pub fn event_types_field() -> Field {
+pub fn event_types_field(n: &Naming) -> Field {
     list_for_bounded_context_field!(
+        n,
         "eventTypes",
         "EventType",
         skilj_core::db::list_event_types_for_bounded_context
@@ -644,8 +655,9 @@ pub fn event_types_field() -> Field {
 /// `CommandType`'s own equivalent of `event_types_field` immediately
 /// above, satisfying `exposes: for command_type in
 /// bounded_context.command_types`.
-pub fn command_types_field() -> Field {
+pub fn command_types_field(n: &Naming) -> Field {
     list_for_bounded_context_field!(
+        n,
         "commandTypes",
         "CommandType",
         skilj_core::db::list_command_types_for_bounded_context

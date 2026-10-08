@@ -5,6 +5,7 @@
 
 use super::{load_bounded_context_with_mappings, not_found, require_superadmin};
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
@@ -14,10 +15,10 @@ use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef
 /// CASCADE` removes the schema, and the registry row itself is gone
 /// too), so the response is built from what was there right before the
 /// irreversible act, not a fresh read after it.
-pub fn field() -> Field {
+pub fn field(n: &Naming) -> Field {
     Field::new(
-        "deleteBoundedContext",
-        TypeRef::named_nn("BoundedContext"),
+        n.root("deleteBoundedContext"),
+        TypeRef::named_nn(n.ty("BoundedContext")),
         |ctx| {
             FieldFuture::new(async move {
                 let caller = require_superadmin(&ctx)?;

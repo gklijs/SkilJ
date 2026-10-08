@@ -35,4 +35,11 @@ pub struct Args {
     /// [docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console).
     #[arg(long, env = "SKILJ_BOUNDED_CONTEXT")]
     pub bounded_context: String,
+
+    /// The name prefix of a skilj whose `/graphql` is a federation
+    /// subgraph (`FederationOptions::prefix`, docs/architecture.md §194).
+    /// Point this console at skilj itself, not at a router: the admin
+    /// operations it uses are kept out of the supergraph.
+    #[arg(long, env = "SKILJ_GRAPHQL_PREFIX", default_value = "")]
+    pub graphql_prefix: String,
 }

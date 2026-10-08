@@ -23,6 +23,7 @@
 //! construction - see `BoundedContextWithMappings`), so no nested field
 //! here ever needs `ctx.data::<Pool>()` for itself.
 
+use crate::naming::Naming;
 use async_graphql::dynamic::{
     Enum, Field, FieldFuture, FieldValue, InputObject, InputValue, Object, ResolverContext,
     TypeRef, Union,
@@ -127,21 +128,21 @@ pub fn bounded_context_status_name(status: BoundedContextStatus) -> &'static str
 /// `enum RoleStatus`. `parse_role_status`/etc. below have no counterpart
 /// yet - Phase 1 never takes a status as a mutation argument, only ever
 /// returns one.
-pub fn role_status_enum() -> async_graphql::dynamic::Enum {
-    async_graphql::dynamic::Enum::new("RoleStatus")
+pub fn role_status_enum(n: &Naming) -> async_graphql::dynamic::Enum {
+    async_graphql::dynamic::Enum::new(n.ty("RoleStatus"))
         .item("ACTIVE")
         .item("REVOKED")
 }
 
-pub fn access_level_enum() -> async_graphql::dynamic::Enum {
-    async_graphql::dynamic::Enum::new("AccessLevel")
+pub fn access_level_enum(n: &Naming) -> async_graphql::dynamic::Enum {
+    async_graphql::dynamic::Enum::new(n.ty("AccessLevel"))
         .item("READ")
         .item("WRITE")
         .item("ADMIN")
 }
 
-pub fn bounded_context_status_enum() -> async_graphql::dynamic::Enum {
-    async_graphql::dynamic::Enum::new("BoundedContextStatus")
+pub fn bounded_context_status_enum(n: &Naming) -> async_graphql::dynamic::Enum {
+    async_graphql::dynamic::Enum::new(n.ty("BoundedContextStatus"))
         .item("ACTIVE")
         .item("ARCHIVED")
 }
@@ -151,8 +152,8 @@ pub fn bounded_context_status_enum() -> async_graphql::dynamic::Enum {
 /// missedOccurrencePolicy`'s own output type below. See
 /// `resolvers::parse_missed_occurrence_policy` for the input-side
 /// mapping and `missed_occurrence_policy_name` for the output-side one.
-pub fn missed_occurrence_policy_enum() -> async_graphql::dynamic::Enum {
-    async_graphql::dynamic::Enum::new("MissedOccurrencePolicy")
+pub fn missed_occurrence_policy_enum(n: &Naming) -> async_graphql::dynamic::Enum {
+    async_graphql::dynamic::Enum::new(n.ty("MissedOccurrencePolicy"))
         .item("SKIP")
         .item("FIRE_ONCE")
         .item("REPLAY_BACKLOG")
@@ -172,8 +173,8 @@ pub fn missed_occurrence_policy_name(policy: MissedOccurrencePolicy) -> &'static
 /// pass). See `resolvers::parse_event_read_start_position` for the
 /// input-side mapping and `event_read_start_position_name` for the
 /// output-side one.
-pub fn event_read_start_position_enum() -> Enum {
-    Enum::new("EventReadStartPosition")
+pub fn event_read_start_position_enum(n: &Naming) -> Enum {
+    Enum::new(n.ty("EventReadStartPosition"))
         .item("BEGINNING")
         .item("LATEST")
         .item("AT_SEQUENCE")
@@ -193,13 +194,13 @@ pub fn event_read_start_position_name(position: EventReadStartPosition) -> &'sta
 /// (resolved separately, per surface, the same "caller resolves it, not
 /// a stored field" treatment every relationship projection gets
 /// elsewhere in this codebase).
-pub fn role_object() -> Object {
-    gql_object!(Role => "Role" {
+pub fn role_object(n: &Naming) -> Object {
+    gql_object!(Role => n.ty("Role") {
         scalar "id": TypeRef::named_nn(TypeRef::ID) => |r| Value::from(r.id.clone()),
         scalar "externalSubject": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.external_subject.clone()),
         scalar "name": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.name.clone()),
         scalar "superadmin": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.superadmin),
-        scalar "status": TypeRef::named_nn("RoleStatus") => |r| Value::from(role_status_name(r.status)),
+        scalar "status": TypeRef::named_nn(n.ty("RoleStatus")) => |r| Value::from(role_status_name(r.status)),
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.created_at.to_rfc3339()),
         scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |r| optional_timestamp(r.revoked_at),
     })
@@ -210,8 +211,8 @@ pub fn role_object() -> Object {
 /// the created Role's own id, name and external_subject". A dedicated
 /// type rather than reusing `Role` so that guarantee is structural, not
 /// a convention a resolver could accidentally violate by returning more.
-pub fn created_superadmin_object() -> Object {
-    gql_object!(Role => "CreatedSuperadmin" {
+pub fn created_superadmin_object(n: &Naming) -> Object {
+    gql_object!(Role => n.ty("CreatedSuperadmin") {
         scalar "id": TypeRef::named_nn(TypeRef::ID) => |r| Value::from(r.id.clone()),
         scalar "name": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.name.clone()),
         scalar "externalSubject": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.external_subject.clone()),
@@ -222,13 +223,13 @@ pub fn created_superadmin_object() -> Object {
 /// this object appears it's already nested under the bounded context it
 /// belongs to (see `surface BoundedContextDirectory`'s own `exposes`
 /// list, which never repeats it either).
-pub fn role_access_mapping_object() -> Object {
-    gql_object!(RoleAccessMapping => "RoleAccessMapping" {
-        object "role": TypeRef::named_nn("Role") => |m| Some(m.role.clone()),
-        scalar "level": TypeRef::named_nn("AccessLevel") => |m| Value::from(access_level_name(m.level)),
+pub fn role_access_mapping_object(n: &Naming) -> Object {
+    gql_object!(RoleAccessMapping => n.ty("RoleAccessMapping") {
+        object "role": TypeRef::named_nn(n.ty("Role")) => |m| Some(m.role.clone()),
+        scalar "level": TypeRef::named_nn(n.ty("AccessLevel")) => |m| Value::from(access_level_name(m.level)),
         scalar "canReadSensitive": TypeRef::named_nn(TypeRef::BOOLEAN) => |m| Value::from(m.can_read_sensitive),
         scalar "scope": TypeRef::named(TypeRef::STRING) => |m| optional_string(m.scope.clone()),
-        scalar "status": TypeRef::named_nn("RoleStatus") => |m| Value::from(role_status_name(m.status)),
+        scalar "status": TypeRef::named_nn(n.ty("RoleStatus")) => |m| Value::from(role_status_name(m.status)),
     })
 }
 
@@ -236,15 +237,15 @@ pub fn role_access_mapping_object() -> Object {
 /// variant tag (the same "the enum variant tag is the field" treatment
 /// the Rust side already gives it - see `ContextCreator`'s own doc
 /// comment); `role` is present only for `SUPERADMIN`.
-pub fn context_creator_object() -> Object {
-    gql_object!(ContextCreator => "ContextCreator" {
+pub fn context_creator_object(n: &Naming) -> Object {
+    gql_object!(ContextCreator => n.ty("ContextCreator") {
         scalar "kind": TypeRef::named_nn(TypeRef::STRING) => |c| {
             Value::from(match c {
                 ContextCreator::SuperadminCreator { .. } => "SUPERADMIN",
                 ContextCreator::SystemCreator => "SYSTEM",
             })
         },
-        object "role": TypeRef::named("Role") => |c| match c {
+        object "role": TypeRef::named(n.ty("Role")) => |c| match c {
             ContextCreator::SuperadminCreator { role } => Some(role.clone()),
             ContextCreator::SystemCreator => None,
         },
@@ -264,15 +265,15 @@ pub struct BoundedContextWithMappings {
 
 /// `entity BoundedContext`, plus the `access_mappings` relationship
 /// `surface BoundedContextDirectory`'s own `exposes` list asks for.
-pub fn bounded_context_object() -> Object {
-    gql_object!(BoundedContextWithMappings => "BoundedContext" {
+pub fn bounded_context_object(n: &Naming) -> Object {
+    gql_object!(BoundedContextWithMappings => n.ty("BoundedContext") {
         scalar "name": TypeRef::named_nn(TypeRef::STRING) => |bc| Value::from(bc.context.name.clone()),
-        scalar "status": TypeRef::named_nn("BoundedContextStatus") => |bc| {
+        scalar "status": TypeRef::named_nn(n.ty("BoundedContextStatus")) => |bc| {
             Value::from(bounded_context_status_name(bc.context.status))
         },
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |bc| Value::from(bc.context.created_at.to_rfc3339()),
-        object "createdBy": TypeRef::named_nn("ContextCreator") => |bc| Some(bc.context.created_by.clone()),
-        list "accessMappings": TypeRef::named_nn_list_nn("RoleAccessMapping") => |bc| bc.access_mappings.clone(),
+        object "createdBy": TypeRef::named_nn(n.ty("ContextCreator")) => |bc| Some(bc.context.created_by.clone()),
+        list "accessMappings": TypeRef::named_nn_list_nn(n.ty("RoleAccessMapping")) => |bc| bc.access_mappings.clone(),
     })
 }
 
@@ -288,8 +289,8 @@ pub fn access_token_status_name(status: TokenStatus) -> &'static str {
     }
 }
 
-pub fn access_token_status_enum() -> Enum {
-    Enum::new("AccessTokenStatus")
+pub fn access_token_status_enum(n: &Naming) -> Enum {
+    Enum::new(n.ty("AccessTokenStatus"))
         .item("ACTIVE")
         .item("REVOKED")
 }
@@ -301,8 +302,8 @@ pub fn projection_rebuild_status_name(status: ProjectionRebuildStatus) -> &'stat
     }
 }
 
-pub fn projection_rebuild_status_enum() -> Enum {
-    Enum::new("ProjectionRebuildStatus")
+pub fn projection_rebuild_status_enum(n: &Naming) -> Enum {
+    Enum::new(n.ty("ProjectionRebuildStatus"))
         .item("PENDING")
         .item("BUILDING")
 }
@@ -311,31 +312,31 @@ pub fn projection_rebuild_status_enum() -> Enum {
 /// `registerEventType`/`registerCommandType`'s own arguments) mirrors it
 /// field-for-field, plain scalars only - no bridge needed between the two
 /// beyond `resolvers::type_registration`'s own parsing.
-pub fn tag_mapping_object() -> Object {
-    gql_object!(TagMapping => "TagMapping" {
+pub fn tag_mapping_object(n: &Naming) -> Object {
+    gql_object!(TagMapping => n.ty("TagMapping") {
         scalar "key": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.key.clone()),
         scalar "field": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.field.clone()),
     })
 }
 
-pub fn tag_mapping_input() -> InputObject {
-    InputObject::new("TagMappingInput")
+pub fn tag_mapping_input(n: &Naming) -> InputObject {
+    InputObject::new(n.ty("TagMappingInput"))
         .field(InputValue::new("key", TypeRef::named_nn(TypeRef::STRING)))
         .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
 }
 
 /// `value SensitiveField`. See `tag_mapping_object`'s own doc comment -
 /// same input/output split.
-pub fn sensitive_field_object() -> Object {
-    gql_object!(SensitiveField => "SensitiveField" {
+pub fn sensitive_field_object(n: &Naming) -> Object {
+    gql_object!(SensitiveField => n.ty("SensitiveField") {
         scalar "field": TypeRef::named_nn(TypeRef::STRING) => |s| Value::from(s.field.clone()),
         scalar "subjectKey": TypeRef::named_nn(TypeRef::STRING) => |s| Value::from(s.subject_key.clone()),
         scalar "subjectField": TypeRef::named_nn(TypeRef::STRING) => |s| Value::from(s.subject_field.clone()),
     })
 }
 
-pub fn sensitive_field_input() -> InputObject {
-    InputObject::new("SensitiveFieldInput")
+pub fn sensitive_field_input(n: &Naming) -> InputObject {
+    InputObject::new(n.ty("SensitiveFieldInput"))
         .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
         .field(InputValue::new(
             "subjectKey",
@@ -348,8 +349,8 @@ pub fn sensitive_field_input() -> InputObject {
 }
 
 /// `enum PrivateFieldKind`.
-pub fn private_field_kind_enum() -> Enum {
-    Enum::new("PrivateFieldKind")
+pub fn private_field_kind_enum(n: &Naming) -> Enum {
+    Enum::new(n.ty("PrivateFieldKind"))
         .item("OWN")
         .item("TEAM")
         .item("ADDRESSED")
@@ -365,21 +366,21 @@ fn private_field_kind_name(kind: PrivateFieldKind) -> &'static str {
 
 /// `value PrivateField`. See `tag_mapping_object`'s own doc comment -
 /// same input/output split.
-pub fn private_field_object() -> Object {
-    gql_object!(PrivateField => "PrivateField" {
+pub fn private_field_object(n: &Naming) -> Object {
+    gql_object!(PrivateField => n.ty("PrivateField") {
         scalar "field": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.field.clone()),
-        scalar "kind": TypeRef::named_nn("PrivateFieldKind") => |p| Value::from(private_field_kind_name(p.kind)),
+        scalar "kind": TypeRef::named_nn(n.ty("PrivateFieldKind")) => |p| Value::from(private_field_kind_name(p.kind)),
         scalar "team": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.team.clone()),
         scalar "addresseeField": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.addressee_field.clone()),
     })
 }
 
-pub fn private_field_input() -> InputObject {
-    InputObject::new("PrivateFieldInput")
+pub fn private_field_input(n: &Naming) -> InputObject {
+    InputObject::new(n.ty("PrivateFieldInput"))
         .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
         .field(InputValue::new(
             "kind",
-            TypeRef::named_nn("PrivateFieldKind"),
+            TypeRef::named_nn(n.ty("PrivateFieldKind")),
         ))
         .field(InputValue::new("team", TypeRef::named(TypeRef::STRING)))
         .field(InputValue::new(
@@ -395,17 +396,17 @@ pub fn private_field_input() -> InputObject {
 /// `command_id` identity fields - see `access_control::PrivateFieldGrant`'s
 /// own doc comment for why those stand in for the spec's `event: Event?`/
 /// `command: Command?`.
-pub fn private_field_grant_object() -> Object {
-    gql_object!(PrivateFieldGrant => "PrivateFieldGrant" {
+pub fn private_field_grant_object(n: &Naming) -> Object {
+    gql_object!(PrivateFieldGrant => n.ty("PrivateFieldGrant") {
         scalar "id": TypeRef::named_nn(TypeRef::ID) => |g| Value::from(g.id.clone()),
-        object "grantor": TypeRef::named_nn("Role") => |g| Some(g.grantor.clone()),
-        object "grantee": TypeRef::named_nn("Role") => |g| Some(g.grantee.clone()),
+        object "grantor": TypeRef::named_nn(n.ty("Role")) => |g| Some(g.grantor.clone()),
+        object "grantee": TypeRef::named_nn(n.ty("Role")) => |g| Some(g.grantee.clone()),
         scalar "eventSequence": TypeRef::named(TypeRef::INT) => |g| match g.event_sequence {
             Some(seq) => Value::from(seq),
             None => Value::Null,
         },
         scalar "commandId": TypeRef::named(TypeRef::ID) => |g| optional_string(g.command_id.clone()),
-        scalar "status": TypeRef::named_nn("AccessTokenStatus") => |g| Value::from(access_token_status_name(g.status)),
+        scalar "status": TypeRef::named_nn(n.ty("AccessTokenStatus")) => |g| Value::from(access_token_status_name(g.status)),
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |g| Value::from(g.created_at.to_rfc3339()),
         scalar "revokedAt": TypeRef::named(TypeRef::STRING) => |g| optional_timestamp(g.revoked_at),
     })
@@ -415,14 +416,14 @@ pub fn private_field_grant_object() -> Object {
 /// (`*_tokens`) - the same "caller resolves it, not a stored field"
 /// treatment every relationship projection gets elsewhere in this
 /// codebase.
-pub fn event_type_object() -> Object {
-    gql_object!(EventType => "EventType" {
+pub fn event_type_object(n: &Naming) -> Object {
+    gql_object!(EventType => n.ty("EventType") {
         scalar "name": TypeRef::named_nn(TypeRef::STRING) => |et| Value::from(et.name.clone()),
         scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |et| Value::from(et.schema.clone()),
         scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |et| Value::from(et.schema_version),
-        list "tagMappings": TypeRef::named_nn_list_nn("TagMapping") => |et| et.tag_mappings.clone(),
+        list "tagMappings": TypeRef::named_nn_list_nn(n.ty("TagMapping")) => |et| et.tag_mappings.clone(),
         scalar "ownerTagKey": TypeRef::named(TypeRef::STRING) => |et| optional_string(et.owner_tag_key.clone()),
-        list "sensitiveFields": TypeRef::named_nn_list_nn("SensitiveField") => |et| et.sensitive_fields.clone(),
+        list "sensitiveFields": TypeRef::named_nn_list_nn(n.ty("SensitiveField")) => |et| et.sensitive_fields.clone(),
         scalar "externalCreationAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.external_creation_allowed),
         scalar "directCreationAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.direct_creation_allowed),
         scalar "systemTriggeredAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.system_triggered_allowed),
@@ -430,43 +431,43 @@ pub fn event_type_object() -> Object {
             Some(s) => Value::from(s.clone()),
             None => Value::Null,
         },
-        scalar "missedOccurrencePolicy": TypeRef::named("MissedOccurrencePolicy") => |et| match et.missed_occurrence_policy {
+        scalar "missedOccurrencePolicy": TypeRef::named(n.ty("MissedOccurrencePolicy")) => |et| match et.missed_occurrence_policy {
             Some(policy) => Value::from(missed_occurrence_policy_name(policy)),
             None => Value::Null,
         },
         scalar "schedulePosition": TypeRef::named(TypeRef::STRING) => |et| optional_timestamp(et.schedule_position),
         scalar "lastFiredAt": TypeRef::named(TypeRef::STRING) => |et| optional_timestamp(et.last_fired_at),
         scalar "eventReadAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |et| Value::from(et.event_read_allowed),
-        list "privateFields": TypeRef::named_nn_list_nn("PrivateField") => |et| et.private_fields.clone(),
+        list "privateFields": TypeRef::named_nn_list_nn(n.ty("PrivateField")) => |et| et.private_fields.clone(),
     })
 }
 
 /// `entity CommandType`, same treatment as `event_type_object` above.
-pub fn command_type_object() -> Object {
-    gql_object!(CommandType => "CommandType" {
+pub fn command_type_object(n: &Naming) -> Object {
+    gql_object!(CommandType => n.ty("CommandType") {
         scalar "name": TypeRef::named_nn(TypeRef::STRING) => |ct| Value::from(ct.name.clone()),
         scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |ct| Value::from(ct.schema.clone()),
         scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |ct| Value::from(ct.schema_version),
-        list "tagMappings": TypeRef::named_nn_list_nn("TagMapping") => |ct| ct.tag_mappings.clone(),
+        list "tagMappings": TypeRef::named_nn_list_nn(n.ty("TagMapping")) => |ct| ct.tag_mappings.clone(),
         scalar "ownerTagKey": TypeRef::named(TypeRef::STRING) => |ct| optional_string(ct.owner_tag_key.clone()),
-        list "sensitiveFields": TypeRef::named_nn_list_nn("SensitiveField") => |ct| ct.sensitive_fields.clone(),
+        list "sensitiveFields": TypeRef::named_nn_list_nn(n.ty("SensitiveField")) => |ct| ct.sensitive_fields.clone(),
         scalar "restTriggerAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |ct| Value::from(ct.rest_trigger_allowed),
-        list "privateFields": TypeRef::named_nn_list_nn("PrivateField") => |ct| ct.private_fields.clone(),
+        list "privateFields": TypeRef::named_nn_list_nn(n.ty("PrivateField")) => |ct| ct.private_fields.clone(),
     })
 }
 
 /// `entity ProjectionRebuild`.
-pub fn projection_rebuild_object() -> Object {
-    gql_object!(ProjectionRebuild => "ProjectionRebuild" {
+pub fn projection_rebuild_object(n: &Naming) -> Object {
+    gql_object!(ProjectionRebuild => n.ty("ProjectionRebuild") {
         scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.schema.clone()),
         scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |r| Value::from(r.schema_version),
-        list "consumedEventTypes": TypeRef::named_nn_list_nn("EventType") => |r| r.consumed_event_types.clone(),
+        list "consumedEventTypes": TypeRef::named_nn_list_nn(n.ty("EventType")) => |r| r.consumed_event_types.clone(),
         scalar "sync": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.sync),
         scalar "caughtUpTo": TypeRef::named(TypeRef::INT) => |r| match r.caught_up_to {
             Some(seq) => Value::from(seq),
             None => Value::Null,
         },
-        scalar "status": TypeRef::named_nn("ProjectionRebuildStatus") => |r| Value::from(projection_rebuild_status_name(r.status)),
+        scalar "status": TypeRef::named_nn(n.ty("ProjectionRebuildStatus")) => |r| Value::from(projection_rebuild_status_name(r.status)),
     })
 }
 
@@ -493,19 +494,19 @@ pub struct ProjectionWithRebuild {
     pub building_rebuild: Option<ProjectionRebuild>,
 }
 
-pub fn projection_object() -> Object {
-    gql_object!(ProjectionWithRebuild => "Projection" {
+pub fn projection_object(n: &Naming) -> Object {
+    gql_object!(ProjectionWithRebuild => n.ty("Projection") {
         scalar "name": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.projection.name.clone()),
         scalar "schema": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.projection.schema.clone()),
         scalar "schemaVersion": TypeRef::named_nn(TypeRef::INT) => |p| Value::from(p.projection.schema_version),
-        list "consumedEventTypes": TypeRef::named_nn_list_nn("EventType") => |p| p.projection.consumed_event_types.clone(),
+        list "consumedEventTypes": TypeRef::named_nn_list_nn(n.ty("EventType")) => |p| p.projection.consumed_event_types.clone(),
         scalar "sync": TypeRef::named_nn(TypeRef::BOOLEAN) => |p| Value::from(p.projection.sync),
         scalar "caughtUpTo": TypeRef::named(TypeRef::INT) => |p| match p.projection.caught_up_to {
             Some(seq) => Value::from(seq),
             None => Value::Null,
         },
-        object "pendingRebuild": TypeRef::named("ProjectionRebuild") => |p| p.pending_rebuild.clone(),
-        object "buildingRebuild": TypeRef::named("ProjectionRebuild") => |p| p.building_rebuild.clone(),
+        object "pendingRebuild": TypeRef::named(n.ty("ProjectionRebuild")) => |p| p.pending_rebuild.clone(),
+        object "buildingRebuild": TypeRef::named(n.ty("ProjectionRebuild")) => |p| p.building_rebuild.clone(),
     })
 }
 
@@ -521,11 +522,11 @@ pub struct ProjectionRegistrationResult {
     pub rebuild: Option<ProjectionRebuild>,
 }
 
-pub fn projection_registration_result_object() -> Object {
-    gql_object!(ProjectionRegistrationResult => "ProjectionRegistrationResult" {
+pub fn projection_registration_result_object(n: &Naming) -> Object {
+    gql_object!(ProjectionRegistrationResult => n.ty("ProjectionRegistrationResult") {
         scalar "outcome": TypeRef::named_nn(TypeRef::STRING) => |r| Value::from(r.outcome),
-        object "projection": TypeRef::named("Projection") => |r| r.projection.clone(),
-        object "rebuild": TypeRef::named("ProjectionRebuild") => |r| r.rebuild.clone(),
+        object "projection": TypeRef::named(n.ty("Projection")) => |r| r.projection.clone(),
+        object "rebuild": TypeRef::named(n.ty("ProjectionRebuild")) => |r| r.rebuild.clone(),
     })
 }
 
@@ -541,8 +542,8 @@ pub fn parked_delivery_kind_name(kind: skilj_core::db::ParkedDeliveryKind) -> &'
     }
 }
 
-pub fn parked_delivery_kind_enum() -> Enum {
-    Enum::new("ParkedDeliveryKind")
+pub fn parked_delivery_kind_enum(n: &Naming) -> Enum {
+    Enum::new(n.ty("ParkedDeliveryKind"))
         .item("CROSS_CONTEXT_ROUTE")
         .item("EXTERNAL_EVENT")
         .item("COMMAND_TRIGGER")
@@ -559,11 +560,11 @@ pub fn parked_delivery_kind_enum() -> Enum {
 /// `kind: CROSS_CONTEXT_ROUTE`/`DEADLINE`; `accessTokenId` only for `EXTERNAL_EVENT`/
 /// `COMMAND_TRIGGER` - see `ParkedDeliveryKind`'s own doc comment for the
 /// full split.
-pub fn parked_delivery_object() -> Object {
-    gql_object!(skilj_core::db::ParkedDelivery => "ParkedDelivery" {
+pub fn parked_delivery_object(n: &Naming) -> Object {
+    gql_object!(skilj_core::db::ParkedDelivery => n.ty("ParkedDelivery") {
         scalar "id": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.id.clone()),
         scalar "source": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.source.clone()),
-        scalar "kind": TypeRef::named_nn("ParkedDeliveryKind") => |d| Value::from(parked_delivery_kind_name(d.kind)),
+        scalar "kind": TypeRef::named_nn(n.ty("ParkedDeliveryKind")) => |d| Value::from(parked_delivery_kind_name(d.kind)),
         scalar "identifier": TypeRef::named_nn(TypeRef::STRING) => |d| Value::from(d.identifier.clone()),
         scalar "accessTokenId": TypeRef::named(TypeRef::STRING) => |d| optional_string(d.access_token_id.clone()),
         scalar "targetBoundedContext": TypeRef::named(TypeRef::STRING) => |d| optional_string(d.target_bounded_context.clone()),
@@ -596,8 +597,8 @@ pub fn parked_delivery_object() -> Object {
 /// four" reasoning `[§26](../../docs/architecture.md#admin-read-back-owner-tag-key)`'s own admin read-back fix already applied to
 /// `owner_tag_key`.
 macro_rules! token_object {
-    ($object_name:literal, $rust_type:ty, $scoped_field_name:literal, $scoped_type:literal, $scoped_accessor:expr) => {
-        Object::new($object_name)
+    ($n:expr, $object_name:literal, $rust_type:ty, $scoped_field_name:literal, $scoped_type:literal, $scoped_accessor:expr) => {
+        Object::new($n.ty($object_name))
             .field(scalar_field(
                 "id",
                 TypeRef::named_nn(TypeRef::ID),
@@ -610,7 +611,7 @@ macro_rules! token_object {
             ))
             .field(scalar_field(
                 "status",
-                TypeRef::named_nn("AccessTokenStatus"),
+                TypeRef::named_nn($n.ty("AccessTokenStatus")),
                 |t: &$rust_type| Value::from(access_token_status_name(t.status)),
             ))
             .field(scalar_field(
@@ -630,14 +631,15 @@ macro_rules! token_object {
             ))
             .field(object_field(
                 $scoped_field_name,
-                TypeRef::named_nn($scoped_type),
+                TypeRef::named_nn($n.ty($scoped_type)),
                 $scoped_accessor,
             ))
     };
 }
 
-pub fn external_event_token_object() -> Object {
+pub fn external_event_token_object(n: &Naming) -> Object {
     token_object!(
+        n,
         "ExternalEventToken",
         ExternalEventToken,
         "eventType",
@@ -646,8 +648,9 @@ pub fn external_event_token_object() -> Object {
     )
 }
 
-pub fn direct_creation_token_object() -> Object {
+pub fn direct_creation_token_object(n: &Naming) -> Object {
     token_object!(
+        n,
         "DirectCreationToken",
         DirectCreationToken,
         "eventType",
@@ -660,8 +663,9 @@ pub fn direct_creation_token_object() -> Object {
 /// appended directly rather than folded into the macro since it's the
 /// only one of the four token kinds that has it (`EventReadToken.
 /// start_from`'s own doc comment).
-pub fn event_read_token_object() -> Object {
+pub fn event_read_token_object(n: &Naming) -> Object {
     token_object!(
+        n,
         "EventReadToken",
         EventReadToken,
         "eventType",
@@ -670,7 +674,7 @@ pub fn event_read_token_object() -> Object {
     )
     .field(scalar_field(
         "startFrom",
-        TypeRef::named_nn("EventReadStartPosition"),
+        TypeRef::named_nn(n.ty("EventReadStartPosition")),
         |t: &EventReadToken| Value::from(event_read_start_position_name(t.start_from)),
     ))
     .field(scalar_field(
@@ -688,8 +692,9 @@ pub fn event_read_token_object() -> Object {
     ))
 }
 
-pub fn command_token_object() -> Object {
+pub fn command_token_object(n: &Naming) -> Object {
     token_object!(
+        n,
         "CommandToken",
         CommandToken,
         "commandType",
@@ -704,20 +709,20 @@ pub fn command_token_object() -> Object {
 /// type: the one place this crate needs to hand back "any `AccessToken`
 /// variant" polymorphically, mirroring why `access_control::AccessToken`
 /// exists as its own Rust type in the first place.
-pub fn access_token_union() -> Union {
-    Union::new("AccessToken")
-        .possible_type("ExternalEventToken")
-        .possible_type("DirectCreationToken")
-        .possible_type("EventReadToken")
-        .possible_type("CommandToken")
+pub fn access_token_union(n: &Naming) -> Union {
+    Union::new(n.ty("AccessToken"))
+        .possible_type(n.ty("ExternalEventToken"))
+        .possible_type(n.ty("DirectCreationToken"))
+        .possible_type(n.ty("EventReadToken"))
+        .possible_type(n.ty("CommandToken"))
 }
 
 // ---------------------------------------------------------------------
 // Phase 3 additions: EventQuery, CommandQuery, CommandSubmission.
 // ---------------------------------------------------------------------
 
-pub fn tag_input() -> InputObject {
-    InputObject::new("TagInput")
+pub fn tag_input(n: &Naming) -> InputObject {
+    InputObject::new(n.ty("TagInput"))
         .field(InputValue::new("key", TypeRef::named_nn(TypeRef::STRING)))
         .field(InputValue::new("value", TypeRef::named(TypeRef::STRING)))
 }
@@ -727,8 +732,8 @@ pub fn tag_input() -> InputObject {
 /// rendered payload, see that function's own doc comment for why the
 /// sequence travels with it now), so `(i64, String)` is this object's
 /// parent value directly - no wrapper struct needed.
-pub fn queried_event_object() -> Object {
-    gql_object!((i64, String) => "QueriedEvent" {
+pub fn queried_event_object(n: &Naming) -> Object {
+    gql_object!((i64, String) => n.ty("QueriedEvent") {
         scalar "sequence": TypeRef::named_nn(TypeRef::INT) => |e| Value::from(e.0),
         scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.1.clone()),
     })
@@ -738,8 +743,8 @@ pub fn queried_event_object() -> Object {
 /// `id` is the command's own `Command.id` - what a caller passes back as
 /// `afterCommandId` to get the next page (rule `FetchCommands`'
 /// `after_command`).
-pub fn queried_command_object() -> Object {
-    gql_object!((String, String, String) => "QueriedCommand" {
+pub fn queried_command_object(n: &Naming) -> Object {
+    gql_object!((String, String, String) => n.ty("QueriedCommand") {
         scalar "id": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.0.clone()),
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.1.clone()),
         scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |c| Value::from(c.2.clone()),
@@ -754,10 +759,10 @@ pub fn queried_command_object() -> Object {
 /// Deliberately narrow - `sequence`/`eventTypeName`/`payload` only,
 /// enough to actually debug a conflict without inventing a bigger wire
 /// type than the issue asks for.
-pub fn matching_event_object() -> Object {
+pub fn matching_event_object(n: &Naming) -> Object {
     use skilj_core::event_store::Event;
 
-    gql_object!(Event => "MatchingEvent" {
+    gql_object!(Event => n.ty("MatchingEvent") {
         scalar "sequence": TypeRef::named_nn(TypeRef::INT) => |e| Value::from(e.sequence),
         scalar "eventTypeName": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.event_type.name.clone()),
         scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.payload.clone()),
@@ -769,10 +774,10 @@ pub fn matching_event_object() -> Object {
 /// Phase 1, not a GraphQL union: nothing here needs the return type
 /// itself to vary structurally the way `TokenRevocation`'s `AccessToken`
 /// does.
-pub fn event_origin_object() -> Object {
+pub fn event_origin_object(n: &Naming) -> Object {
     use skilj_core::event_store::EventOrigin;
 
-    gql_object!(EventOrigin => "EventOrigin" {
+    gql_object!(EventOrigin => n.ty("EventOrigin") {
         scalar "kind": TypeRef::named_nn(TypeRef::STRING) => |o| {
             Value::from(match o {
                 EventOrigin::ExternalTriggered { .. } => "EXTERNAL_TRIGGERED",
@@ -793,7 +798,7 @@ pub fn event_origin_object() -> Object {
             }
             _ => Value::Null,
         },
-        object "triggeringCommandType": TypeRef::named("CommandType") => |o| match o {
+        object "triggeringCommandType": TypeRef::named(n.ty("CommandType")) => |o| match o {
             EventOrigin::CommandTriggered { command } => Some(command.command_type.clone()),
             _ => None,
         },
@@ -814,16 +819,16 @@ fn optional_string(s: Option<String>) -> Value {
 /// `InspectEvent`'s own `exposes:` list - `event.metadata.created_at`,
 /// `event.origin` - nothing more. The parent value is a plain
 /// `event_store::Event` directly; no wrapper struct needed.
-pub fn event_meta_object() -> Object {
+pub fn event_meta_object(n: &Naming) -> Object {
     use skilj_core::event_store::Event;
 
-    gql_object!(Event => "EventMeta" {
+    gql_object!(Event => n.ty("EventMeta") {
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.metadata.created_at.to_rfc3339()),
         // Codeberg issue #18. `correlationId` is null only for a record
         // written before this field existed.
         scalar "correlationId": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.metadata.correlation_id.clone()),
         scalar "causationId": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.metadata.causation_id.clone()),
-        object "origin": TypeRef::named_nn("EventOrigin") => |e| Some(e.origin.clone()),
+        object "origin": TypeRef::named_nn(n.ty("EventOrigin")) => |e| Some(e.origin.clone()),
     })
 }
 
@@ -835,9 +840,9 @@ pub struct InspectedEventData {
     pub rendered_payload: String,
 }
 
-pub fn inspected_event_object() -> Object {
-    gql_object!(InspectedEventData => "InspectedEvent" {
-        object "event": TypeRef::named_nn("EventMeta") => |i| Some(i.event.clone()),
+pub fn inspected_event_object(n: &Naming) -> Object {
+    gql_object!(InspectedEventData => n.ty("InspectedEvent") {
+        object "event": TypeRef::named_nn(n.ty("EventMeta")) => |i| Some(i.event.clone()),
         scalar "renderedPayload": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.rendered_payload.clone()),
     })
 }
@@ -858,8 +863,8 @@ pub struct InspectedSnapshotData {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub fn inspected_snapshot_object() -> Object {
-    gql_object!(InspectedSnapshotData => "InspectedSnapshot" {
+pub fn inspected_snapshot_object(n: &Naming) -> Object {
+    gql_object!(InspectedSnapshotData => n.ty("InspectedSnapshot") {
         scalar "tagKey": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.tag_key.clone()),
         scalar "tagValue": TypeRef::named_nn(TypeRef::STRING) => |i| Value::from(i.tag_value.clone()),
         scalar "version": TypeRef::named_nn(TypeRef::INT) => |i| Value::from(i.version),
@@ -901,7 +906,7 @@ pub struct SubmitCommandResult {
     pub correlation_id: Option<String>,
 }
 
-pub fn submit_command_payload_object() -> Object {
+pub fn submit_command_payload_object(n: &Naming) -> Object {
     // `triggeredEventSequences` is a nullable *list of scalars*, and
     // `matchingEvents` a nullable *list of objects* -
     // `scalar_field`/`object_field`/`list_field` (and so `gql_object!`
@@ -909,7 +914,7 @@ pub fn submit_command_payload_object() -> Object {
     // non-null list of nested objects; neither shape fits, so both stay
     // hand-written `Field::new(...)`s, appended after the macro-generated
     // ones below.
-    gql_object!(SubmitCommandResult => "SubmitCommandPayload" {
+    gql_object!(SubmitCommandResult => n.ty("SubmitCommandPayload") {
         scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
         scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_reason.clone()),
         scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
@@ -933,7 +938,7 @@ pub fn submit_command_payload_object() -> Object {
     ))
     .field(Field::new(
         "matchingEvents",
-        TypeRef::named_list("MatchingEvent"),
+        TypeRef::named_list(n.ty("MatchingEvent")),
         |ctx: ResolverContext| {
             FieldFuture::new(async move {
                 let parent = ctx.parent_value.try_downcast_ref::<SubmitCommandResult>()?;
@@ -961,23 +966,23 @@ pub struct DryRunCommandResult {
     pub matching_events_truncated: bool,
 }
 
-pub fn dry_run_command_payload_object() -> Object {
-    gql_object!(DryRunCommandResult => "DryRunCommandPayload" {
+pub fn dry_run_command_payload_object(n: &Naming) -> Object {
+    gql_object!(DryRunCommandResult => n.ty("DryRunCommandPayload") {
         scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
         scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_reason.clone()),
         scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
-        list "events": TypeRef::named_nn_list_nn("WouldBeEvent") => |r| r.events.clone(),
-        list "matchingEvents": TypeRef::named_nn_list_nn("MatchingEvent") => |r| r.matching_events.clone(),
+        list "events": TypeRef::named_nn_list_nn(n.ty("WouldBeEvent")) => |r| r.events.clone(),
+        list "matchingEvents": TypeRef::named_nn_list_nn(n.ty("MatchingEvent")) => |r| r.matching_events.clone(),
         scalar "matchingEventsTruncated": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.matching_events_truncated),
     })
 }
 
 /// An event a dry-run's `decide()` would emit - `MatchingEvent` without a
 /// sequence, since it has none.
-pub fn would_be_event_object() -> Object {
+pub fn would_be_event_object(n: &Naming) -> Object {
     use skilj_core::event_store::WouldBeEvent;
 
-    gql_object!(WouldBeEvent => "WouldBeEvent" {
+    gql_object!(WouldBeEvent => n.ty("WouldBeEvent") {
         scalar "eventTypeName": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.event_type.name.clone()),
         scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.payload.clone()),
     })
@@ -990,8 +995,8 @@ pub fn encryption_key_status_name(status: EncryptionKeyStatus) -> &'static str {
     }
 }
 
-pub fn encryption_key_status_enum() -> Enum {
-    Enum::new("EncryptionKeyStatus")
+pub fn encryption_key_status_enum(n: &Naming) -> Enum {
+    Enum::new(n.ty("EncryptionKeyStatus"))
         .item("ACTIVE")
         .item("DESTROYED")
 }
@@ -1001,11 +1006,11 @@ pub fn encryption_key_status_enum() -> Enum {
 /// gives its own `bounded_context` field) and any key material - that
 /// never crosses this boundary at all, see `skilj_core::encryption`'s own
 /// doc comment.
-pub fn encryption_key_object() -> Object {
-    gql_object!(EncryptionKey => "EncryptionKey" {
+pub fn encryption_key_object(n: &Naming) -> Object {
+    gql_object!(EncryptionKey => n.ty("EncryptionKey") {
         scalar "subjectKey": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.subject_key.clone()),
         scalar "subjectValue": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.subject_value.clone()),
-        scalar "status": TypeRef::named_nn("EncryptionKeyStatus") => |k| Value::from(encryption_key_status_name(k.status)),
+        scalar "status": TypeRef::named_nn(n.ty("EncryptionKeyStatus")) => |k| Value::from(encryption_key_status_name(k.status)),
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |k| Value::from(k.created_at.to_rfc3339()),
         scalar "destroyedAt": TypeRef::named(TypeRef::STRING) => |k| optional_timestamp(k.destroyed_at),
     })
@@ -1016,8 +1021,8 @@ pub fn encryption_key_object() -> Object {
 /// shape (matching `CreateEventTypeSubscription`'s own signature
 /// faithfully) and real behaviour end to end now that `matches_filters`/
 /// `valid_filters` are real.
-pub fn filter_operator_enum() -> Enum {
-    Enum::new("FilterOperator")
+pub fn filter_operator_enum(n: &Naming) -> Enum {
+    Enum::new(n.ty("FilterOperator"))
         .item("EQUALS")
         .item("CONTAINS")
         .item("IS_LIKE")
@@ -1029,12 +1034,12 @@ pub fn filter_operator_enum() -> Enum {
         .item("IN")
 }
 
-pub fn filter_input() -> InputObject {
-    InputObject::new("FilterInput")
+pub fn filter_input(n: &Naming) -> InputObject {
+    InputObject::new(n.ty("FilterInput"))
         .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
         .field(InputValue::new(
             "operator",
-            TypeRef::named_nn("FilterOperator"),
+            TypeRef::named_nn(n.ty("FilterOperator")),
         ))
         .field(InputValue::new("value", TypeRef::named_nn(TypeRef::STRING)))
 }

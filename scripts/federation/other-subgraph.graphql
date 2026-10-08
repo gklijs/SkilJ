@@ -1,0 +1,29 @@
+# Another team's subgraph, composed next to two skilj services in
+# scripts/check-federation-composition.sh. It uses the names skilj's
+# schema has without a prefix, on purpose: with the prefix, nothing of
+# skilj's may collide with them (docs/architecture.md §194).
+extend schema @link(url: "https://specs.apollo.dev/federation/v2.5", import: ["@key"])
+
+type Query {
+  roles: [Role!]!
+  epoch: Int!
+  projection(name: String!): String
+}
+
+type Mutation {
+  submitCommand(name: String!): Boolean!
+  createRole(name: String!): Role!
+}
+
+type Role @key(fields: "id") {
+  id: ID!
+  title: String!
+}
+
+type EventType {
+  id: ID!
+}
+
+input FilterInput {
+  q: String
+}

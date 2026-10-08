@@ -6,6 +6,7 @@ use super::{
 };
 use crate::error::to_graphql_error;
 use crate::gql_types::InspectedEventData;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use skilj_core::shared::Tag;
@@ -33,10 +34,10 @@ fn parse_tags(
 }
 
 /// `queryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [TagInput!], afterSequence: Int, correlationId: String): [QueriedEvent!]!`
-pub fn query_events_field() -> Field {
+pub fn query_events_field(n: &Naming) -> Field {
     Field::new(
-        "queryEvents",
-        TypeRef::named_nn_list_nn("QueriedEvent"),
+        n.root("queryEvents"),
+        TypeRef::named_nn_list_nn(n.ty("QueriedEvent")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;
@@ -174,7 +175,10 @@ pub fn query_events_field() -> Field {
         "eventTypes",
         TypeRef::named_nn_list_nn(TypeRef::STRING),
     ))
-    .argument(InputValue::new("tags", TypeRef::named_nn_list("TagInput")))
+    .argument(InputValue::new(
+        "tags",
+        TypeRef::named_nn_list(n.ty("TagInput")),
+    ))
     .argument(InputValue::new(
         "afterSequence",
         TypeRef::named(TypeRef::INT),
@@ -186,89 +190,96 @@ pub fn query_events_field() -> Field {
 }
 
 /// `countEvents(boundedContext: String!, eventTypes: [String!]!, tags: [TagInput!], correlationId: String): Int!`
-pub fn count_events_field() -> Field {
-    Field::new("countEvents", TypeRef::named_nn(TypeRef::INT), |ctx| {
-        FieldFuture::new(async move {
-            let state = ctx.data::<GraphqlState>()?;
-            let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
-            let access_mapping =
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+pub fn count_events_field(n: &Naming) -> Field {
+    Field::new(
+        n.root("countEvents"),
+        TypeRef::named_nn(TypeRef::INT),
+        |ctx| {
+            FieldFuture::new(async move {
+                let state = ctx.data::<GraphqlState>()?;
+                let bounded_context_name =
+                    ctx.args.try_get("boundedContext")?.string()?.to_string();
+                let access_mapping =
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
 
-            let mut event_types = Vec::new();
-            for name in distinct_names(&ctx.args.try_get("eventTypes")?)? {
-                let et = skilj_core::db::get_event_type(&state.pool, &bounded_context_name, &name)
-                    .await
-                    .map_err(to_graphql_error)?
-                    .ok_or_else(|| not_found("EventType", &name))?;
-                event_types.push(et);
-            }
-            let tags = parse_tags(ctx.args.get("tags"))?;
-            skilj_core::event_store::valid_query_tags(tags.as_deref()).map_err(to_graphql_error)?;
-            let correlation_id = ctx
-                .args
-                .get("correlationId")
-                .filter(|v| !v.is_null())
-                .and_then(|v| v.string().ok())
-                .map(|s| s.to_string());
-
-            // See `query_events_field`'s own identical comment - same
-            // §19 "Problem 1" fix, same tags-supplied-or-not branch.
-            // An aggregate over everything matching (rule `CountEvents`
-            // is deliberately not paged), but never loaded whole: a
-            // non-empty `tags` filter uses the tag index (already
-            // narrowed); otherwise history is walked a chunk at a time and
-            // the rule's own pure count summed per chunk - it runs at
-            // least once, so its validation errors still surface.
-            let count_in = |events: &[skilj_core::event_store::Event]| {
-                skilj_core::event_store::count_events(
-                    &access_mapping,
-                    &event_types,
-                    tags.as_deref(),
-                    correlation_id.as_deref(),
-                    events,
-                )
-            };
-            let count = match tags.as_deref() {
-                Some(wanted) if !wanted.is_empty() => {
-                    let mut total = 0;
-                    skilj_core::db::for_each_tagged_event_chunk(
-                        &state.pool,
-                        &bounded_context_name,
-                        wanted,
-                        -1,
-                        state.max_events_per_read,
-                        |chunk| {
-                            total += count_in(chunk)?;
-                            Ok(true)
-                        },
-                    )
-                    .await
-                    .map_err(to_graphql_error)?;
-                    total
+                let mut event_types = Vec::new();
+                for name in distinct_names(&ctx.args.try_get("eventTypes")?)? {
+                    let et =
+                        skilj_core::db::get_event_type(&state.pool, &bounded_context_name, &name)
+                            .await
+                            .map_err(to_graphql_error)?
+                            .ok_or_else(|| not_found("EventType", &name))?;
+                    event_types.push(et);
                 }
-                _ => {
-                    let mut total = 0;
-                    skilj_core::db::for_each_event_chunk(
-                        &state.pool,
-                        &state.event_cache,
-                        &bounded_context_name,
-                        None,
-                        -1,
-                        state.max_events_per_read,
-                        |chunk| {
-                            total += count_in(chunk)?;
-                            Ok(true)
-                        },
-                    )
-                    .await
+                let tags = parse_tags(ctx.args.get("tags"))?;
+                skilj_core::event_store::valid_query_tags(tags.as_deref())
                     .map_err(to_graphql_error)?;
-                    total
-                }
-            };
+                let correlation_id = ctx
+                    .args
+                    .get("correlationId")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| v.string().ok())
+                    .map(|s| s.to_string());
 
-            Ok(Some(async_graphql::Value::from(count)))
-        })
-    })
+                // See `query_events_field`'s own identical comment - same
+                // §19 "Problem 1" fix, same tags-supplied-or-not branch.
+                // An aggregate over everything matching (rule `CountEvents`
+                // is deliberately not paged), but never loaded whole: a
+                // non-empty `tags` filter uses the tag index (already
+                // narrowed); otherwise history is walked a chunk at a time and
+                // the rule's own pure count summed per chunk - it runs at
+                // least once, so its validation errors still surface.
+                let count_in = |events: &[skilj_core::event_store::Event]| {
+                    skilj_core::event_store::count_events(
+                        &access_mapping,
+                        &event_types,
+                        tags.as_deref(),
+                        correlation_id.as_deref(),
+                        events,
+                    )
+                };
+                let count = match tags.as_deref() {
+                    Some(wanted) if !wanted.is_empty() => {
+                        let mut total = 0;
+                        skilj_core::db::for_each_tagged_event_chunk(
+                            &state.pool,
+                            &bounded_context_name,
+                            wanted,
+                            -1,
+                            state.max_events_per_read,
+                            |chunk| {
+                                total += count_in(chunk)?;
+                                Ok(true)
+                            },
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
+                        total
+                    }
+                    _ => {
+                        let mut total = 0;
+                        skilj_core::db::for_each_event_chunk(
+                            &state.pool,
+                            &state.event_cache,
+                            &bounded_context_name,
+                            None,
+                            -1,
+                            state.max_events_per_read,
+                            |chunk| {
+                                total += count_in(chunk)?;
+                                Ok(true)
+                            },
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
+                        total
+                    }
+                };
+
+                Ok(Some(async_graphql::Value::from(count)))
+            })
+        },
+    )
     .argument(InputValue::new(
         "boundedContext",
         TypeRef::named_nn(TypeRef::STRING),
@@ -277,7 +288,10 @@ pub fn count_events_field() -> Field {
         "eventTypes",
         TypeRef::named_nn_list_nn(TypeRef::STRING),
     ))
-    .argument(InputValue::new("tags", TypeRef::named_nn_list("TagInput")))
+    .argument(InputValue::new(
+        "tags",
+        TypeRef::named_nn_list(n.ty("TagInput")),
+    ))
     .argument(InputValue::new(
         "correlationId",
         TypeRef::named(TypeRef::STRING),
@@ -285,77 +299,82 @@ pub fn count_events_field() -> Field {
 }
 
 /// `inspectEvent(boundedContext: String!, sequence: Int!): InspectedEvent!`
-pub fn inspect_event_field() -> Field {
-    Field::new("inspectEvent", TypeRef::named_nn("InspectedEvent"), |ctx| {
-        FieldFuture::new(async move {
-            let state = ctx.data::<GraphqlState>()?;
-            let bounded_context_name = ctx.args.try_get("boundedContext")?.string()?.to_string();
-            let access_mapping =
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
-            let sequence = ctx.args.try_get("sequence")?.i64()?;
+pub fn inspect_event_field(n: &Naming) -> Field {
+    Field::new(
+        n.root("inspectEvent"),
+        TypeRef::named_nn(n.ty("InspectedEvent")),
+        |ctx| {
+            FieldFuture::new(async move {
+                let state = ctx.data::<GraphqlState>()?;
+                let bounded_context_name =
+                    ctx.args.try_get("boundedContext")?.string()?.to_string();
+                let access_mapping =
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                let sequence = ctx.args.try_get("sequence")?.i64()?;
 
-            let event = skilj_core::db::get_event_by_sequence_cached(
-                &state.pool,
-                &state.event_cache,
-                &bounded_context_name,
-                sequence,
-            )
-            .await
-            .map_err(to_graphql_error)?
-            .ok_or_else(|| not_found("Event", &sequence.to_string()))?;
+                let event = skilj_core::db::get_event_by_sequence_cached(
+                    &state.pool,
+                    &state.event_cache,
+                    &bounded_context_name,
+                    sequence,
+                )
+                .await
+                .map_err(to_graphql_error)?
+                .ok_or_else(|| not_found("Event", &sequence.to_string()))?;
 
-            let mut data_keys = std::collections::HashMap::new();
-            resolve_read_data_keys(
-                &state.pool,
-                &bounded_context_name,
-                &event.event_type.sensitive_fields,
-                &event.payload,
-                &access_mapping,
-                state.encryption_master_key.as_ref(),
-                &mut data_keys,
-            )
-            .await?;
-            // And for the originating command's payload, rendered too.
-            if let skilj_core::event_store::EventOrigin::CommandTriggered { command } =
-                &event.origin
-            {
+                let mut data_keys = std::collections::HashMap::new();
                 resolve_read_data_keys(
                     &state.pool,
                     &bounded_context_name,
-                    &command.command_type.sensitive_fields,
-                    &command.payload,
+                    &event.event_type.sensitive_fields,
+                    &event.payload,
                     &access_mapping,
                     state.encryption_master_key.as_ref(),
                     &mut data_keys,
                 )
                 .await?;
-            }
+                // And for the originating command's payload, rendered too.
+                if let skilj_core::event_store::EventOrigin::CommandTriggered { command } =
+                    &event.origin
+                {
+                    resolve_read_data_keys(
+                        &state.pool,
+                        &bounded_context_name,
+                        &command.command_type.sensitive_fields,
+                        &command.payload,
+                        &access_mapping,
+                        state.encryption_master_key.as_ref(),
+                        &mut data_keys,
+                    )
+                    .await?;
+                }
 
-            let private_field_grants = super::load_private_field_grants(
-                &state.pool,
-                &bounded_context_name,
-                &access_mapping.role,
-            )
-            .await?;
-            let inspected = skilj_core::event_store::inspect_event(
-                &access_mapping,
-                &event,
-                |sk, sv| {
-                    data_keys
-                        .get(&(sk.to_string(), sv.to_string()))
-                        .cloned()
-                        .flatten()
-                },
-                &private_field_grants,
-            )
-            .map_err(to_graphql_error)?;
+                let private_field_grants = super::load_private_field_grants(
+                    &state.pool,
+                    &bounded_context_name,
+                    &access_mapping.role,
+                )
+                .await?;
+                let inspected = skilj_core::event_store::inspect_event(
+                    &access_mapping,
+                    &event,
+                    |sk, sv| {
+                        data_keys
+                            .get(&(sk.to_string(), sv.to_string()))
+                            .cloned()
+                            .flatten()
+                    },
+                    &private_field_grants,
+                )
+                .map_err(to_graphql_error)?;
 
-            Ok(Some(FieldValue::owned_any(InspectedEventData {
-                event: inspected.event,
-                rendered_payload: inspected.rendered_payload,
-            })))
-        })
-    })
+                Ok(Some(FieldValue::owned_any(InspectedEventData {
+                    event: inspected.event,
+                    rendered_payload: inspected.rendered_payload,
+                })))
+            })
+        },
+    )
     .argument(InputValue::new(
         "boundedContext",
         TypeRef::named_nn(TypeRef::STRING),
@@ -369,8 +388,8 @@ pub fn inspect_event_field() -> Field {
 /// one. After a failover or restore it differs, and such a resubscription
 /// is refused with `epoch_changed` instead of silently skipping events
 /// whose sequences the new history reused. Any authenticated caller.
-pub fn epoch_field() -> Field {
-    Field::new("epoch", TypeRef::named_nn(TypeRef::STRING), |ctx| {
+pub fn epoch_field(n: &Naming) -> Field {
+    Field::new(n.root("epoch"), TypeRef::named_nn(TypeRef::STRING), |ctx| {
         FieldFuture::new(async move {
             require_caller(&ctx)?;
             let state = ctx.data::<GraphqlState>()?;

@@ -14,14 +14,15 @@ use super::{
     distinct_names, not_found, parse_rfc3339, require_admin_mapping, resolve_read_data_keys,
 };
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 
 /// `fetchCommands(boundedContext: String!, commandTypes: [String!]!, after: String, before: String, triggeredEvent: Int, correlationId: String): [String!]!`
-pub fn fetch_commands_field() -> Field {
+pub fn fetch_commands_field(n: &Naming) -> Field {
     Field::new(
-        "fetchCommands",
-        TypeRef::named_nn_list_nn("QueriedCommand"),
+        n.root("fetchCommands"),
+        TypeRef::named_nn_list_nn(n.ty("QueriedCommand")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;

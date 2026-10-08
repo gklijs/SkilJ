@@ -8,8 +8,10 @@
 
 pub mod auth;
 mod error;
+pub mod federation;
 pub mod gql_types;
 pub mod limits;
+pub mod naming;
 pub mod projection_types;
 pub mod resolvers;
 pub mod schema;
@@ -134,6 +136,13 @@ pub struct GraphqlState {
     /// wide batcher, not a second one that would only ever coalesce
     /// this surface's own traffic against itself.
     pub command_batcher: skilj_core::command_batcher::CommandBatcher,
+    /// The prefix every type and root field of the schema gets
+    /// (docs/architecture.md §194) - read at build time, and by the
+    /// resolvers that name a type at run time (a union member, say).
+    pub naming: naming::Naming,
+    /// Set when `/graphql` is a federation subgraph (docs/architecture.md
+    /// §194): what it publishes. `naming` is its prefix's.
+    pub federation: Option<Arc<federation::FederationOptions>>,
 }
 
 /// Mounts a fresh `axum::Router` at `/graphql` against an already-built
@@ -275,6 +284,21 @@ async fn execute_as(
     caller: Option<skilj_core::access_control::Role>,
     mut request: async_graphql::Request,
 ) -> async_graphql::Response {
+    // docs/architecture.md §194: a subgraph's `_service` is the published
+    // description, whoever asks - not the caller's own schema.
+    if state.federation.is_some()
+        && federation::is_service_request(&request.query, request.operation_name.as_deref())
+    {
+        return match registry.published_sdl(state).await {
+            Ok(sdl) => {
+                let sdl = sdl.map(|sdl| sdl.to_string()).unwrap_or_default();
+                federation::service_schema(sdl).execute(request).await
+            }
+            Err(e) => async_graphql::Response::from_errors(vec![
+                error::to_graphql_error(e).into_server_error(async_graphql::Pos::default())
+            ]),
+        };
+    }
     let schema = match registry.for_caller(state, caller.as_ref()).await {
         Ok(schema) => schema,
         Err(e) => {

@@ -4,6 +4,7 @@
 //! `@guidance`: "the one surface with no Role-based actor behind it").
 
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use async_graphql::ErrorExtensions;
@@ -12,10 +13,10 @@ use skilj_core::shared::generate_token_id;
 /// `createSuperadmin(bootstrapSecret: String!, name: String!, externalSubject: String!): CreatedSuperadmin!`,
 /// see `gql_types::created_superadmin_object`'s own doc comment for why
 /// the return type is deliberately narrower than the full `Role`.
-pub fn field() -> Field {
+pub fn field(n: &Naming) -> Field {
     Field::new(
-        "createSuperadmin",
-        TypeRef::named_nn("CreatedSuperadmin"),
+        n.root("createSuperadmin"),
+        TypeRef::named_nn(n.ty("CreatedSuperadmin")),
         |ctx| {
             FieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?;

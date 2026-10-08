@@ -44,6 +44,7 @@
 use super::projection_query::fetch_projection_result;
 use super::{not_found, require_read_mapping};
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{
     FieldValue, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
@@ -51,10 +52,10 @@ use async_graphql::dynamic::{
 use tokio::sync::broadcast::error::RecvError;
 
 /// `projectionUpdates(boundedContext: String!, name: String!, key: String): ProjectionResult!`
-pub fn projection_updates_field() -> SubscriptionField {
+pub fn projection_updates_field(n: &Naming) -> SubscriptionField {
     SubscriptionField::new(
-        "projectionUpdates",
-        TypeRef::named_nn("ProjectionResult"),
+        n.root("projectionUpdates"),
+        TypeRef::named_nn(n.ty("ProjectionResult")),
         |ctx| {
             SubscriptionFieldFuture::new(async move {
                 let state = ctx.data::<GraphqlState>()?.clone();

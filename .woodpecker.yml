@@ -98,6 +98,14 @@ steps:
       # (docs/architecture.md §105).
       - scripts/check-template.sh
 
+  - name: check-federation-composition
+    image: node:22-bookworm-slim
+    commands:
+      # Composes the federation descriptions skilj publishes, as recorded
+      # by skilj/tests/graphql_federation.rs, with Apollo's and Hive's
+      # composition next to another subgraph (docs/architecture.md §194).
+      - scripts/check-federation-composition.sh
+
   - name: fmt
     image: rust:1-bookworm
     commands:

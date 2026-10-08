@@ -121,6 +121,8 @@ pub struct Client {
     http: reqwest::Client,
     endpoint: reqwest::Url,
     token: TokenSource,
+    /// See [`Client::with_prefix`].
+    prefix: String,
 }
 
 impl Client {
@@ -136,7 +138,17 @@ impl Client {
             http: reqwest::Client::new(),
             endpoint,
             token,
+            prefix: String::new(),
         }
+    }
+
+    /// For a skilj whose `/graphql` is a federation subgraph with a name
+    /// prefix (docs/architecture.md §194): every request's root fields
+    /// are sent prefixed, aliased back to their own names so responses
+    /// read the same ([`with_prefix`]).
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
     }
 
     /// Runs one query or mutation, returning the response's `data` on
@@ -145,7 +157,7 @@ impl Client {
     /// expired token among others) is retried once with a refreshed
     /// token, when the token source can refresh.
     pub async fn request(&self, query: &str, variables: Value) -> Result<Value, ClientError> {
-        let body = json!({ "query": query, "variables": variables });
+        let body = json!({ "query": with_prefix(query, &self.prefix), "variables": variables });
         let token = self.token.current().await;
         let result = self.send(&body, &token).await;
         match result {
@@ -171,6 +183,85 @@ impl Client {
         let parsed: Value = response.json().await.map_err(ClientError::Http)?;
         extract_data(parsed)
     }
+}
+
+/// `document`, one of this crate's own operations, with each of its root
+/// fields renamed the way a skilj with name prefix `prefix` names them
+/// (docs/architecture.md §194: `ledger` turns `queryEvents` into
+/// `ledgerQueryEvents`), and aliased back to its own name, so the
+/// response has the keys it would have without a prefix. Unchanged when
+/// `prefix` is empty. A root field is a name at the top level of the
+/// operation's selection set; `__typename`, fragments and anything inside
+/// arguments or a nested selection are left alone. Only meant for the
+/// documents written in this crate, which use no fragments at the top
+/// level.
+pub fn with_prefix(document: &str, prefix: &str) -> String {
+    if prefix.is_empty() {
+        return document.to_string();
+    }
+    let mut out = String::with_capacity(document.len() + 64);
+    let mut chars = document.char_indices().peekable();
+    let (mut braces, mut parens) = (0usize, 0usize);
+    let mut in_string = false;
+    while let Some((i, c)) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some((_, escaped)) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            '(' => parens += 1,
+            ')' => parens = parens.saturating_sub(1),
+            _ => {}
+        }
+        let starts_name = (c.is_ascii_alphabetic() || c == '_')
+            && !document[..i]
+                .ends_with(|p: char| p.is_ascii_alphanumeric() || p == '_' || p == '$');
+        if braces == 1 && parens == 0 && starts_name {
+            let end = document[i..]
+                .find(|n: char| !(n.is_ascii_alphanumeric() || n == '_'))
+                .map_or(document.len(), |len| i + len);
+            let name = &document[i..end];
+            let rest = document[end..].trim_start();
+            if !name.starts_with("__") && name != "on" && !rest.starts_with(':') {
+                let mut first = prefix.chars();
+                let lower: String = first
+                    .next()
+                    .map(|f| f.to_ascii_lowercase())
+                    .into_iter()
+                    .chain(first)
+                    .collect();
+                let mut field = name.chars();
+                let upper: String = field
+                    .next()
+                    .map(|f| f.to_ascii_uppercase())
+                    .into_iter()
+                    .chain(field)
+                    .collect();
+                if document[..i].trim_end().ends_with(':') {
+                    // Already aliased: only the field is renamed.
+                    out.push_str(&format!("{lower}{upper}"));
+                } else {
+                    out.push_str(&format!("{name}: {lower}{upper}"));
+                }
+                while chars.peek().is_some_and(|(j, _)| *j < end) {
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Whether the server refused the token itself, rather than the
@@ -272,8 +363,13 @@ pub const LIVE_EVENTS_IN_EPOCH_QUERY: &str =
 /// The server's current database epoch (`{ epoch }`), or `None` when it
 /// can't be had - a server from before §176 has no such field, and the
 /// feed then resumes without one, as it always did.
-async fn fetch_epoch(ws_endpoint: reqwest::Url, token: String) -> Option<String> {
-    let mut rx = spawn_subscription(ws_endpoint, token, "{ epoch }".to_string(), json!({}));
+async fn fetch_epoch(ws_endpoint: reqwest::Url, token: String, prefix: &str) -> Option<String> {
+    let mut rx = spawn_subscription(
+        ws_endpoint,
+        token,
+        with_prefix("{ epoch }", prefix),
+        json!({}),
+    );
     match rx.recv().await? {
         Ok(data) => data
             .get("epoch")
@@ -301,6 +397,9 @@ async fn fetch_epoch(ws_endpoint: reqwest::Url, token: String) -> Option<String>
 /// reads the server's epoch first and resumes in it. Ends only when the
 /// receiver is dropped.
 ///
+/// `prefix` is the server's name prefix, as [`Client::with_prefix`]
+/// takes it; empty for none.
+///
 /// When the server closes the connection because the token expired, or
 /// refuses `connection_init`, the token is refreshed first if `token`
 /// can be (docs/architecture.md §137); after an expiry the reconnect is
@@ -308,6 +407,7 @@ async fn fetch_epoch(ws_endpoint: reqwest::Url, token: String) -> Option<String>
 pub fn spawn_live_events(
     ws_endpoint: reqwest::Url,
     token: impl Into<TokenSource>,
+    prefix: String,
     bounded_context: String,
     initial_delay: std::time::Duration,
     max_delay: std::time::Duration,
@@ -323,7 +423,7 @@ pub fn spawn_live_events(
             // Starting from now: the epoch the sequences about to arrive
             // are read in, sent back with the last of them on a resume.
             if last_sequence.is_none() {
-                epoch = fetch_epoch(ws_endpoint.clone(), used_token.clone()).await;
+                epoch = fetch_epoch(ws_endpoint.clone(), used_token.clone(), &prefix).await;
             }
             let (query, variables) = match &epoch {
                 Some(epoch) => (
@@ -338,7 +438,7 @@ pub fn spawn_live_events(
             let mut inner = spawn_subscription(
                 ws_endpoint.clone(),
                 used_token.clone(),
-                query.to_string(),
+                with_prefix(query, &prefix),
                 variables,
             );
             let mut expired = false;
@@ -551,5 +651,41 @@ async fn recv_json(ws: &mut WsStream) -> Result<Value, ClientError> {
                 "unexpected websocket message: {other:?}"
             ))),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_prefix;
+
+    #[test]
+    fn root_fields_are_prefixed_and_aliased_back() {
+        assert_eq!(with_prefix("{ epoch }", ""), "{ epoch }");
+        assert_eq!(with_prefix("{ epoch }", "ledger"), "{ epoch: ledgerEpoch }");
+        assert_eq!(
+            with_prefix(
+                "query($bc: String!) { eventTypes(boundedContext: $bc) { name schema } }",
+                "Ledger"
+            ),
+            "query($bc: String!) { eventTypes: ledgerEventTypes(boundedContext: $bc) { name schema } }"
+        );
+        assert_eq!(
+            with_prefix(
+                "mutation($p: String!) { submitCommand(boundedContext: \"x\", payload: $p) { \
+                 accepted } __typename }",
+                "ledger"
+            ),
+            "mutation($p: String!) { submitCommand: ledgerSubmitCommand(boundedContext: \"x\", \
+             payload: $p) { accepted } __typename }"
+        );
+        assert_eq!(
+            with_prefix(
+                "query { projection(name: \"a\") { __typename ... on X { total } } }",
+                "ledger"
+            ),
+            "query { projection: ledgerProjection(name: \"a\") { __typename ... on X { total } } }"
+        );
+        // Already aliased: the alias is kept, the field renamed.
+        assert_eq!(with_prefix("{ e: epoch }", "ledger"), "{ e: ledgerEpoch }");
     }
 }

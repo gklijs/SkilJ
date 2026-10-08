@@ -1,0 +1,434 @@
+enum LedgerAccessLevel @inaccessible {
+	READ
+	WRITE
+	ADMIN
+}
+
+union LedgerAccessToken @inaccessible = LedgerExternalEventToken | LedgerDirectCreationToken | LedgerEventReadToken | LedgerCommandToken
+
+enum LedgerAccessTokenStatus {
+	ACTIVE
+	REVOKED
+}
+
+type LedgerBoundedContext @inaccessible {
+	name: String!
+	status: LedgerBoundedContextStatus!
+	createdAt: String!
+	createdBy: LedgerContextCreator!
+	accessMappings: [LedgerRoleAccessMapping!]!
+}
+
+enum LedgerBoundedContextStatus @inaccessible {
+	ACTIVE
+	ARCHIVED
+}
+
+type LedgerCommandToken @inaccessible {
+	id: ID!
+	secret: String!
+	status: LedgerAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+	scope: String
+	commandType: LedgerCommandType!
+}
+
+type LedgerCommandType @inaccessible {
+	name: String!
+	schema: String!
+	schemaVersion: Int!
+	tagMappings: [LedgerTagMapping!]!
+	ownerTagKey: String
+	sensitiveFields: [LedgerSensitiveField!]!
+	restTriggerAllowed: Boolean!
+	privateFields: [LedgerPrivateField!]!
+}
+
+type LedgerContextCreator @inaccessible {
+	kind: String!
+	role: LedgerRole
+}
+
+type LedgerCreatedSuperadmin @inaccessible {
+	id: ID!
+	name: String!
+	externalSubject: String!
+}
+
+type LedgerDirectCreationToken @inaccessible {
+	id: ID!
+	secret: String!
+	status: LedgerAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+	scope: String
+	eventType: LedgerEventType!
+}
+
+type LedgerDryRunCommandPayload @inaccessible {
+	accepted: Boolean!
+	rejectionReason: String
+	rejectionKind: String
+	events: [LedgerWouldBeEvent!]!
+	matchingEvents: [LedgerMatchingEvent!]!
+	matchingEventsTruncated: Boolean!
+}
+
+type LedgerEncryptionKey @inaccessible {
+	subjectKey: String!
+	subjectValue: String!
+	status: LedgerEncryptionKeyStatus!
+	createdAt: String!
+	destroyedAt: String
+}
+
+enum LedgerEncryptionKeyStatus @inaccessible {
+	ACTIVE
+	DESTROYED
+}
+
+type LedgerEventMeta @inaccessible {
+	createdAt: String!
+	correlationId: String
+	causationId: String
+	origin: LedgerEventOrigin!
+}
+
+type LedgerEventOrigin @inaccessible {
+	kind: String!
+	sourceContent: String
+	sourceContext: String
+	triggeringCommandType: LedgerCommandType
+	triggeringCommandPayload: String
+}
+
+enum LedgerEventReadStartPosition @inaccessible {
+	BEGINNING
+	LATEST
+	AT_SEQUENCE
+	AT_TIME
+}
+
+type LedgerEventReadToken @inaccessible {
+	id: ID!
+	secret: String!
+	status: LedgerAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+	scope: String
+	eventType: LedgerEventType!
+	startFrom: LedgerEventReadStartPosition!
+	startAtSequence: Int
+	startAtTime: String
+}
+
+type LedgerEventType {
+	name: String!
+	schema: String!
+	schemaVersion: Int!
+	tagMappings: [LedgerTagMapping!]!
+	ownerTagKey: String
+	sensitiveFields: [LedgerSensitiveField!]!
+	externalCreationAllowed: Boolean!
+	directCreationAllowed: Boolean!
+	systemTriggeredAllowed: Boolean!
+	systemTriggeredSchedule: String
+	missedOccurrencePolicy: LedgerMissedOccurrencePolicy
+	schedulePosition: String
+	lastFiredAt: String
+	eventReadAllowed: Boolean!
+	privateFields: [LedgerPrivateField!]!
+}
+
+type LedgerExternalEventToken @inaccessible {
+	id: ID!
+	secret: String!
+	status: LedgerAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+	scope: String
+	eventType: LedgerEventType!
+}
+
+input LedgerFilterInput {
+	field: String!
+	operator: LedgerFilterOperator!
+	value: String!
+}
+
+enum LedgerFilterOperator {
+	EQUALS
+	CONTAINS
+	IS_LIKE
+	GREATER_THAN
+	LESS_THAN
+	NEAR
+	SIMILAR_COLOR
+	IN_SUBNET
+	IN
+}
+
+type LedgerInspectedEvent @inaccessible {
+	event: LedgerEventMeta!
+	renderedPayload: String!
+}
+
+type LedgerInspectedSnapshot @inaccessible {
+	tagKey: String!
+	tagValue: String!
+	version: Int!
+	asOfSequence: Int!
+	state: String!
+	updatedAt: String!
+}
+
+type LedgerMatchingEvent {
+	sequence: Int!
+	eventTypeName: String!
+	payload: String!
+}
+
+enum LedgerMissedOccurrencePolicy {
+	SKIP
+	FIRE_ONCE
+	REPLAY_BACKLOG
+}
+
+type LedgerParkedDelivery @inaccessible {
+	id: String!
+	source: String!
+	kind: LedgerParkedDeliveryKind!
+	identifier: String!
+	accessTokenId: String
+	targetBoundedContext: String
+	targetCommandType: String
+	requestJson: String!
+	error: String!
+	attemptCount: Int!
+	firstFailedAt: String!
+	lastFailedAt: String!
+	cursor: String!
+}
+
+enum LedgerParkedDeliveryKind @inaccessible {
+	CROSS_CONTEXT_ROUTE
+	EXTERNAL_EVENT
+	COMMAND_TRIGGER
+	DEADLINE
+}
+
+type LedgerPrivateField {
+	field: String!
+	kind: LedgerPrivateFieldKind!
+	team: String
+	addresseeField: String
+}
+
+type LedgerPrivateFieldGrant {
+	id: ID!
+	grantor: LedgerRole!
+	grantee: LedgerRole!
+	eventSequence: Int
+	commandId: ID
+	status: LedgerAccessTokenStatus!
+	createdAt: String!
+	revokedAt: String
+}
+
+input LedgerPrivateFieldInput @inaccessible {
+	field: String! @inaccessible
+	kind: LedgerPrivateFieldKind! @inaccessible
+	team: String @inaccessible
+	addresseeField: String @inaccessible
+}
+
+enum LedgerPrivateFieldKind {
+	OWN
+	TEAM
+	ADDRESSED
+}
+
+type LedgerProjection {
+	name: String!
+	schema: String!
+	schemaVersion: Int!
+	consumedEventTypes: [LedgerEventType!]!
+	sync: Boolean!
+	caughtUpTo: Int
+	pendingRebuild: LedgerProjectionRebuild
+	buildingRebuild: LedgerProjectionRebuild
+}
+
+type LedgerProjectionRebuild {
+	schema: String!
+	schemaVersion: Int!
+	consumedEventTypes: [LedgerEventType!]!
+	sync: Boolean!
+	caughtUpTo: Int
+	status: LedgerProjectionRebuildStatus!
+}
+
+enum LedgerProjectionRebuildStatus {
+	PENDING
+	BUILDING
+}
+
+type LedgerProjectionRegistrationResult @inaccessible {
+	outcome: String!
+	projection: LedgerProjection
+	rebuild: LedgerProjectionRebuild
+}
+
+union LedgerProjectionResult = Ledgerfed_published_AccountBalance
+
+type LedgerQueriedCommand @inaccessible {
+	id: String!
+	createdAt: String!
+	payload: String!
+}
+
+type LedgerQueriedEvent {
+	sequence: Int!
+	payload: String!
+}
+
+type LedgerRole {
+	id: ID!
+	externalSubject: String!
+	name: String!
+	superadmin: Boolean!
+	status: LedgerRoleStatus!
+	createdAt: String!
+	revokedAt: String
+}
+
+type LedgerRoleAccessMapping @inaccessible {
+	role: LedgerRole!
+	level: LedgerAccessLevel!
+	canReadSensitive: Boolean!
+	scope: String
+	status: LedgerRoleStatus!
+}
+
+enum LedgerRoleStatus {
+	ACTIVE
+	REVOKED
+}
+
+type LedgerSensitiveField {
+	field: String!
+	subjectKey: String!
+	subjectField: String!
+}
+
+input LedgerSensitiveFieldInput @inaccessible {
+	field: String! @inaccessible
+	subjectKey: String! @inaccessible
+	subjectField: String! @inaccessible
+}
+
+type LedgerSubmitCommandPayload {
+	accepted: Boolean!
+	rejectionReason: String
+	rejectionKind: String
+	deduplicated: Boolean!
+	correlationId: String
+	matchingEventsTruncated: Boolean
+	triggeredEventSequences: [Int]
+	matchingEvents: [LedgerMatchingEvent]
+}
+
+input LedgerTagInput @inaccessible {
+	key: String! @inaccessible
+	value: String @inaccessible
+}
+
+type LedgerTagMapping {
+	key: String!
+	field: String!
+}
+
+input LedgerTagMappingInput @inaccessible {
+	key: String! @inaccessible
+	field: String! @inaccessible
+}
+
+type LedgerWouldBeEvent @inaccessible {
+	eventTypeName: String!
+	payload: String!
+}
+
+type Ledgerfed_published_AccountBalance @key(fields: "projectionKey") {
+	total: Int!
+	projectionKey: String!
+}
+
+type Mutation {
+	ledgerCreateSuperadmin(bootstrapSecret: String!, name: String!, externalSubject: String!): LedgerCreatedSuperadmin! @inaccessible
+	ledgerCreateRole(name: String!, superadmin: Boolean!, externalSubject: String!): LedgerRole! @inaccessible
+	ledgerRevokeRole(roleId: ID!): LedgerRole! @inaccessible
+	ledgerGrantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: LedgerAccessLevel!, canReadSensitive: Boolean!, scope: String): LedgerRoleAccessMapping! @inaccessible
+	ledgerRevokeRoleAccessMapping(roleId: ID!, boundedContext: String!): LedgerRoleAccessMapping! @inaccessible
+	ledgerAddBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
+	ledgerCreateBoundedContextFromTemplate(template: String!, name: String!, roleId: ID!, level: LedgerAccessLevel!, canReadSensitive: Boolean!, scope: String): LedgerBoundedContext! @inaccessible
+	ledgerResyncBoundedContextFromTemplate(boundedContext: String!): LedgerBoundedContext! @inaccessible
+	ledgerArchiveBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
+	ledgerDeleteBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
+	ledgerRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: LedgerMissedOccurrencePolicy): LedgerEventType! @inaccessible
+	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!): LedgerCommandType! @inaccessible
+	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): LedgerProjectionRegistrationResult! @inaccessible
+	ledgerRebuildProjection(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
+	ledgerDiscardProjectionRebuild(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
+	ledgerRetryParkedDelivery(boundedContext: String!, id: String!): LedgerParkedDelivery! @inaccessible
+	ledgerDiscardParkedDelivery(boundedContext: String!, id: String!): LedgerParkedDelivery! @inaccessible
+	ledgerCreateExternalEventToken(boundedContext: String!, eventTypeName: String!, scope: String): LedgerExternalEventToken! @inaccessible
+	ledgerCreateDirectCreationToken(boundedContext: String!, eventTypeName: String!, scope: String): LedgerDirectCreationToken! @inaccessible
+	ledgerCreateEventReadToken(boundedContext: String!, eventTypeName: String!, scope: String, startFrom: LedgerEventReadStartPosition, startAtSequence: Int, startAtTime: String): LedgerEventReadToken! @inaccessible
+	ledgerCreateCommandToken(boundedContext: String!, commandTypeName: String!, scope: String): LedgerCommandToken! @inaccessible
+	ledgerRevokeToken(tokenId: ID!): LedgerAccessToken! @inaccessible
+	ledgerSubmitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): LedgerSubmitCommandPayload!
+	ledgerForgetSubject(boundedContext: String!, subjectKey: String!, subjectValue: String!): LedgerEncryptionKey! @inaccessible
+	ledgerGrantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int): LedgerPrivateFieldGrant!
+	ledgerGrantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID): LedgerPrivateFieldGrant!
+	ledgerRevokePrivateFieldAccess(boundedContext: String!, grantId: ID!): LedgerPrivateFieldGrant!
+}
+
+type Query {
+	ledgerBoundedContexts: [LedgerBoundedContext!]! @inaccessible
+	ledgerProjections(boundedContext: String!): [LedgerProjection!]! @inaccessible
+	ledgerScheduledEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible
+	ledgerEventTypes(boundedContext: String!): [LedgerEventType!]! @inaccessible
+	ledgerCommandTypes(boundedContext: String!): [LedgerCommandType!]! @inaccessible
+	ledgerQueryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [LedgerTagInput!], afterSequence: Int, correlationId: String): [LedgerQueriedEvent!]! @inaccessible
+	ledgerCountEvents(boundedContext: String!, eventTypes: [String!]!, tags: [LedgerTagInput!], correlationId: String): Int! @inaccessible
+	ledgerInspectEvent(boundedContext: String!, sequence: Int!): LedgerInspectedEvent! @inaccessible
+	ledgerEpoch: String!
+	ledgerInspectSnapshot(boundedContext: String!, snapshotName: String!, tagValue: String!): LedgerInspectedSnapshot @inaccessible
+	ledgerFetchCommands(boundedContext: String!, commandTypes: [String!]!, afterCommandId: String, after: String, before: String, triggeredEvent: Int, correlationId: String): [LedgerQueriedCommand!]! @inaccessible
+	ledgerDryRunCommand(boundedContext: String!, commandTypeName: String!, payload: String!): LedgerDryRunCommandPayload! @inaccessible
+	ledgerListPrivateFieldGrants(boundedContext: String!, grantorRoleId: ID): [LedgerPrivateFieldGrant!]!
+	ledgerParkedDeliveries(boundedContext: String!, after: String): [LedgerParkedDelivery!]! @inaccessible
+	ledgerProjectionSchema(boundedContext: String!, name: String!): LedgerProjection
+	ledgerProjection(boundedContext: String!, name: String!, key: String, waitForSequence: Int): LedgerProjectionResult!
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+extend schema @link(
+	url: "https://specs.apollo.dev/federation/v2.5",
+	import: ["@key", "@tag", "@shareable", "@inaccessible", "@override", "@external", "@provides", "@requires", "@composeDirective", "@interfaceObject", "@requiresScopes"]
+)
+
+
+type Subscription {
+	ledgerAllEvents(boundedContext: String!, eventTypes: [String!], fromSequence: Int, epoch: String): LedgerQueriedEvent!
+	ledgerEventsByType(boundedContext: String!, eventType: String!, filters: [LedgerFilterInput!], fromSequence: Int, epoch: String): LedgerQueriedEvent!
+	ledgerProjectionUpdates(boundedContext: String!, name: String!, key: String): LedgerProjectionResult!
+}

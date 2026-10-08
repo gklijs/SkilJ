@@ -8,6 +8,7 @@
 
 use super::{require_admin_mapping, require_caller};
 use crate::error::to_graphql_error;
+use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
 use skilj_core::access_control::AccessToken;
@@ -71,42 +72,47 @@ async fn resolve_token(
 /// `AccessToken` union (`gql_types::access_token_union`), tagged via
 /// `FieldValue::with_type` per variant, the same pattern
 /// `async_graphql::dynamic::Field`'s own doc example uses.
-pub fn revoke_token_field() -> Field {
-    Field::new("revokeToken", TypeRef::named_nn("AccessToken"), |ctx| {
-        FieldFuture::new(async move {
-            let state = ctx.data::<GraphqlState>()?;
-            let token_id = ctx.args.try_get("tokenId")?.string()?.to_string();
+pub fn revoke_token_field(n: &Naming) -> Field {
+    Field::new(
+        n.root("revokeToken"),
+        TypeRef::named_nn(n.ty("AccessToken")),
+        |ctx| {
+            FieldFuture::new(async move {
+                let state = ctx.data::<GraphqlState>()?;
+                let token_id = ctx.args.try_get("tokenId")?.string()?.to_string();
 
-            // Authenticated before the token is looked up (§142).
-            require_caller(&ctx)?;
-            let (token, bounded_context_name) = resolve_token(&state.pool, &token_id).await?;
-            let access_mapping =
-                require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                // Authenticated before the token is looked up (§142).
+                require_caller(&ctx)?;
+                let (token, bounded_context_name) = resolve_token(&state.pool, &token_id).await?;
+                let access_mapping =
+                    require_admin_mapping(&ctx, &state.pool, &bounded_context_name).await?;
 
-            let revoked = skilj_core::access_control::revoke_token(
-                &access_mapping,
-                &token,
-                chrono::Utc::now(),
-            )
-            .map_err(to_graphql_error)?;
-            skilj_core::db::revoke_access_token(&state.pool, &token_id, chrono::Utc::now())
-                .await
+                let revoked = skilj_core::access_control::revoke_token(
+                    &access_mapping,
+                    &token,
+                    chrono::Utc::now(),
+                )
                 .map_err(to_graphql_error)?;
+                skilj_core::db::revoke_access_token(&state.pool, &token_id, chrono::Utc::now())
+                    .await
+                    .map_err(to_graphql_error)?;
 
-            let field_value = match revoked {
-                AccessToken::ExternalEventToken(t) => {
-                    FieldValue::owned_any(t).with_type("ExternalEventToken")
-                }
-                AccessToken::DirectCreationToken(t) => {
-                    FieldValue::owned_any(t).with_type("DirectCreationToken")
-                }
-                AccessToken::EventReadToken(t) => {
-                    FieldValue::owned_any(t).with_type("EventReadToken")
-                }
-                AccessToken::CommandToken(t) => FieldValue::owned_any(t).with_type("CommandToken"),
-            };
-            Ok(Some(field_value))
-        })
-    })
+                let field_value =
+                    match revoked {
+                        AccessToken::ExternalEventToken(t) => FieldValue::owned_any(t)
+                            .with_type(state.naming.ty("ExternalEventToken")),
+                        AccessToken::DirectCreationToken(t) => FieldValue::owned_any(t)
+                            .with_type(state.naming.ty("DirectCreationToken")),
+                        AccessToken::EventReadToken(t) => {
+                            FieldValue::owned_any(t).with_type(state.naming.ty("EventReadToken"))
+                        }
+                        AccessToken::CommandToken(t) => {
+                            FieldValue::owned_any(t).with_type(state.naming.ty("CommandToken"))
+                        }
+                    };
+                Ok(Some(field_value))
+            })
+        },
+    )
     .argument(InputValue::new("tokenId", TypeRef::named_nn(TypeRef::ID)))
 }
