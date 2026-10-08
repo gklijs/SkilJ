@@ -11379,6 +11379,61 @@ At 1 and 8 bounded contexts the capacity makes no difference beyond noise. 130 s
 **Chosen** (user choice): a knob, a documented sizing rule, and a warning.
 - `SkiljBuilder::statement_cache_capacity(n)` sits next to `pool_options`. `build()` now always connects through `db::connect_with_statement_cache`, which parses the URL into `PgConnectOptions` and applies the capacity when it's set, so it overrides the URL's parameter. Unset, the URL's parameter, which already worked, or sqlx's default applies.
 - docs/performance.md, "Sizing the statement cache": about 20 per bounded context that takes traffic at the same time, plus 20, with the memory cost.
-- `build()` warns when the capacity is under `db::STATEMENT_CACHE_MIN_PER_BOUNDED_CONTEXT` (10) per active bounded context. That is the measured threshold: 32 needed more than 100 and less than 400, and 64 needed more than 400. It is a warning, not a refusal, because many quiet bounded contexts don't need room at once. sqlx has no getter for the capacity, so `db::effective_statement_cache_capacity` resolves it the same way: the knob, then the URL's parameter, then 100.
+- `build()` warns when the capacity is under `db::STATEMENT_CACHE_MIN_PER_BOUNDED_CONTEXT` (10) per active bounded context. That is the measured threshold: 32 needed more than 100 and less than 400, and 64 needed more than 400. It is a warning, not a refusal, because many quiet bounded contexts don't need room at once. sqlx has no getter for the capacity, so `db::effective_statement_cache_capacity` resolves it the same way: the knob, then the URL's parameter (its last occurrence, as sqlx reads them in order), then 100.
 
 Tests: `a_statement_cache_capacity_overrides_the_url_and_the_default` (`skilj-core/tests/pool_options.rs`) reads `pg_prepared_statements` on a one-connection pool after four statements: 2 kept with the knob at 2 over a URL saying 3, 3 with only the URL, 4 with neither. Unit tests cover the capacity's resolution order and the warning threshold, including that archived bounded contexts don't count.
+
+<a id="graphql-federation"></a>
+## 194. GraphQL federation: a subgraph of published bounded contexts, tenants later
+
+A decision record, no code yet. The question was how a skilj-based application joins a larger GraphQL API: Apollo Federation, schema stitching, Apollo Router 3. Researched October 2026.
+
+**The landscape.**
+- *Apollo Router 3.0* is in preview (v3.0.0-preview.0, October 3 2026): a new query planner, circuit breaking, Redis rate limiting, and Federation 3. Federation 3 includes every v2 feature, and composition upgrades a subgraph that declares v2 automatically. Router v1 reached end of life on March 31 2026.
+- *The Apollo Federation v2 subgraph spec* is what every current router reads: Apollo Router 2 and 3, Hive Router (Rust, MIT, federated subscriptions since April 2026), Hive Gateway, Cosmo (Apache 2.0).
+- *The GraphQL Foundation's Composite Schemas spec*, renamed "GraphQL Federation Spec" in September 2026, resolves entities through `@lookup` on ordinary query fields instead of `_entities`. It is still preliminary.
+- *Schema stitching* (graphql-tools) is a JavaScript gateway and consumes federation subgraphs as they are (`federationToStitchingSDL`).
+
+So skilj targets the Federation v2 subgraph spec, and keeps typed lookup fields so `@lookup` costs little later.
+
+**What async-graphql 7.2.1 gives.** The dynamic schema has `enable_federation`, `entity_resolver`, `key`, `shareable`, `inaccessible`, `tags` and `override_from`, and serves `_service`/`_entities`, linking federation v2.5. Two gaps:
+- The schema text it exports for federation leaves out the `Subscription` type (`registry/export_sdl.rs`: `federation_subscription` is never set for a dynamic schema). A router would never route `allEvents`, `eventsByType` or `projectionUpdates` to skilj. Either skilj writes the subscription type into the text itself, or async-graphql gains the static schema's `enable_subscription_in_federation`.
+- `@authenticated` is not in its import list; `@requiresScopes` is.
+
+**Why the schema doesn't compose today.**
+1. *Generic names.* The root fields `projection`, `epoch`, `queryEvents`, `submitCommand`, `createRole` and the types `Role`, `BoundedContext`, `EventType`, `Projection`, `FilterInput`, `AccessToken` will meet differently shaped namesakes in other subgraphs. Two skilj-based services can't compose at all. `@shareable` root fields would let the router treat two different stores as interchangeable.
+2. *The admin surface.* Bootstrap, roles, tokens, parked deliveries and erasure don't belong in a company-wide graph.
+3. *Schemas per caller (§138).* A supergraph is one static schema, composed in CI from published schema text. An anonymous `_service` would get the schema without projections.
+4. *Tenants.* A bounded context made from a template gets its own `{bc}_{projection}` types. Published, that is one type per tenant: a recomposition per tenant created, and every tenant's name in front of every router client, which is what §138 closed.
+5. *Runtime registration.* A projection registered at runtime reaches the supergraph only when someone republishes the schema and composes again.
+6. *No entities.* Nothing lets skilj contribute fields to another subgraph's types, the main reason to federate.
+
+**Chosen (user choice): a builder option, not a second endpoint.** `SkiljBuilder::graphql_federation(options)` turns `/graphql` into a subgraph:
+- `_service` returns the schema for the bounded contexts the options publish, whoever asks. Publishing names those bounded contexts to anyone who can fetch the text, so it is the operator's choice, made in deployed configuration. Queries still run against the caller's own schema (§138). The router validates against the supergraph and forwards the caller's credential, and skilj answers what that caller may see, exactly as for a direct request.
+- Only the surfaces a grant faces at read or write level are published: projections, event subscriptions, command submission, private-field sharing. A listed bounded context that is a tenant is left out, and `build()` warns rather than refuses (user choice): a tenant can appear after startup anyway, through `createBoundedContextFromTemplate`, so a refusal at startup would catch only some of the cases. Everything faced by an admin grant, a superadmin or the bootstrap secret is marked `@inaccessible`: callable directly, absent from the supergraph.
+- A prefix applies to every root field and type, so neither another subgraph's `Role` nor a second skilj service collides. skilj-tui calls admin fields by name, so it would learn the prefix (`--graphql-prefix`). The CI composition test below checks whether unprefixed `@inaccessible` admin fields compose. If they do, admin fields could keep their names and the TUI needs no flag.
+- `Skilj::federation_sdl()` writes the schema text for `rover subgraph publish --schema` or `hive schema:publish` in a deploy pipeline. That is the recommended practice, rather than the router fetching `_service` at runtime. Ideally it builds from the process's own registrations, without a database.
+- Published projections become entities: `@key(fields: "key")` with a `key: String!` field, resolved by `_entities` through the same per-key lookup and checks as `projection`, plus a typed lookup field per projection.
+
+**Tenants: how supergraphs do it.** In every pattern found, the tenant is data and the supergraph is one schema for all of them:
+- *Tenant in the token.* The router validates the JWT and forwards it, or copies a tenant claim into a header, and each subgraph scopes to it. Simple, but tooling can't tell tenants apart, and a caller working across tenants needs a token per tenant.
+- *A `Tenant` entity.* `type Tenant @key(fields: "id")`, often owned by an account service. Subgraphs contribute fields to it, and tenant-scoped entities carry the tenant in their key. The tenant becomes part of the contract between subgraphs.
+- *Contracts and feature flags* (Apollo, Hive and Cosmo contracts, Cosmo feature flags) filter or swap parts of the schema per audience or rollout. One per tenant brings back a schema per tenant.
+- *Tenant-specific extras* go through a generic shape (Shopify metafields, Plain tenant fields), never through per-tenant types.
+- *Cells.* For data residency, a router and supergraph per region, which for skilj is a deployment per cell.
+
+**Options for templated bounded contexts.**
+- *A. One type per template, the tenant per request.* The supergraph doesn't change as tenants come and go, and names no tenant. But a tenant that drifted from its template (the spec lets it register and evolve on its own) no longer fits the shared type, types only one tenant registered are unreachable, the tenant has to come from somewhere, and the template is itself a bounded context with data.
+- *B. Tenants stay out.* Only bounded contexts not made from a template, listed by the operator, are published. Nothing new to specify, nothing leaks, and A can follow without breaking anything. Multi-tenant deployments get no federation yet.
+- *C. Each tenant published with its own types.* What the schema does today. Rejected: a CI pipeline behind a runtime mutation, tenant names in the supergraph, and a supergraph that grows with every tenant.
+
+**Chosen: B now, a refined A later.** The refined A follows the `Tenant` entity pattern. skilj contributes fields per template projection to a `Tenant @key(fields: "id")` (owned by another subgraph, or by skilj when none does), and the projection entities' keys include the tenant (`@key(fields: "tenant { id } key")`). A tenant ID maps to a bounded context, by default by name. A tenant whose projection is still compatible with the template's is served typed. A drifted projection, or one only the tenant registered, answers through a generic field returning its state as JSON, never through a type of its own. skilj's grants stay the check whatever tenant a query names. These are open questions in `specs/skilj.allium`, beside the new `surface FederatedSubgraph`.
+
+**Router notes for the docs.**
+- In passthrough mode, Apollo Router opens a websocket to the subgraph per subscription and puts the client's `Authorization` header into the `connection_init` payload. `auth::resolve_role_from_connection_init` already reads it there.
+- The router merges identical subscriptions from different clients. Its key includes the headers it sends the subgraph, so `Authorization` must never be listed in `ignored_headers`, or one caller's subscription could be served to another.
+- Order of change: register in the subgraph and publish before a client uses a type, and stop using a type before it is removed; `rover subgraph check` in CI catches the reverse.
+
+**Tests, when built.** In CI, compose and serve through both Hive Router and Apollo's Rover and Router (user choice); Rover needs `APOLLO_ELV2_LICENSE=accept`, and the Router runs from a local supergraph file with no GraphOS account. Cases: two skilj subgraphs composed side by side; a query; an `_entities` lookup; a subscription through each router, checking that `Authorization` reaches `connection_init`; and a non-superadmin's query of a bounded context it has no grant on, answered as for one that doesn't exist.
+
+Sources: [GraphOS Router 3.0](https://www.apollographql.com/blog/introducing-graphos-router-3-0), [Router PR #10283, Federation v3.0](https://github.com/apollographql/router/pull/10283), [Router subscription configuration](https://www.apollographql.com/docs/graphos/routing/operations/subscriptions/configuration), [Composite Schemas spec](https://graphql.github.io/composite-schemas-spec/draft/), [Hive Router subscriptions](https://the-guild.dev/graphql/hive/product-updates/2026-04-14-hive-router-subscriptions), [GraphQL Tools v8](https://the-guild.dev/graphql/hive/blog/graphql-tools-v8), [WunderGraph: multi-tenant federated schema design](https://wundergraph.com/blog/graphql-schema-design-multi-tenant-federated-graph), [Apollo contracts](https://www.apollographql.com/docs/graphos/delivery/contracts/), [Cosmo schema contracts](https://wundergraph.com/cosmo/federation/schema-contracts), [Shopify metafield definitions](https://shopify.dev/apps/metafields/definitions).

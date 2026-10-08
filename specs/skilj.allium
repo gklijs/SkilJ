@@ -96,7 +96,10 @@
 --   - The GraphQL wire contract itself, beyond identity resolution and
 --     the surfaces specified here: how a Projection.schema becomes a
 --     concrete GraphQL type, field and argument naming, paging and error
---     shape are all still deferred to a later, more detailed pass
+--     shape are all still deferred to a later, more detailed pass. So is
+--     the shape of the federation subgraph description surface
+--     FederatedSubgraph hands a router: what it names is specified there,
+--     how it is spelled is not
 --   - The external IdP trust configuration values themselves - JWKS
 --     endpoint, issuer, expected audience, signing algorithm, and which
 --     claim carries the subject (default "sub"). Resolved as runtime/library
@@ -8861,11 +8864,122 @@ surface PrivateFieldGrantManagement {
         -- exclusions).
 }
 
+surface FederatedSubgraph {
+    facing access_mapping: ReadAccess
+    context projection: Projection
+        where bounded_context = access_mapping.bounded_context
+            and bounded_context.template = null
+            and published_to_supergraph(bounded_context)
+
+    exposes:
+        projection.name
+        projection.schema
+        projection.schema_version
+
+    provides:
+        QueryProjection(access_mapping, projection, key?)
+
+    related:
+        ProjectionQuery(projection)
+
+    @guarantee PublishedScopeIsTheOperatorsChoice
+        -- A deployment may describe itself to a supergraph - a composed
+        -- GraphQL API spanning several services, put together and served by
+        -- a router outside SkilJ. Which bounded contexts that description
+        -- names is decided in deployed configuration only
+        -- (published_to_supergraph is that list, a black box here), with no
+        -- registration surface and nothing an admin can change at runtime,
+        -- the same register as a projection's owner tag key. It is never
+        -- derived from which bounded contexts exist or from any caller's
+        -- grants. The description is handed to whoever asks for it, with
+        -- or without a credential, because a router composes it ahead of
+        -- any request: naming a bounded context there is the operator
+        -- choosing to reveal that it exists, which is exactly what
+        -- BoundedContextDirectory otherwise keeps to superadmins. A
+        -- deployment that publishes nothing describes nothing, and serves
+        -- every surface exactly as it does without this one.
+
+    @guarantee TenantsAreNeverPublished
+        -- A bounded context created from a template is never named in the
+        -- description, even when the deployed list names it: tenants come
+        -- and go at runtime, through BoundedContextTemplating, while a
+        -- supergraph is composed ahead of time, and publishing one would
+        -- name every tenant to every client of the router. A tenant stays
+        -- fully reachable through every other surface. The template itself
+        -- is an ordinary bounded context and may be published. A context
+        -- whose template was deleted is an ordinary untemplated one from
+        -- then on (see rule DeleteBoundedContext), and may be published
+        -- from then on too.
+
+    @guarantee OnlyGrantFacingSurfacesArePublished
+        -- The description covers only the surfaces a grant faces at read
+        -- or write level - this one's projections, EventSubscription,
+        -- CommandSubmission and PrivateFieldGrantManagement - for the
+        -- published bounded contexts. Surfaces faced by an admin grant, by
+        -- a superadmin or by the bootstrap secret are never in it. They
+        -- stay callable directly, by the same callers as before, and are
+        -- simply absent from what a router composes.
+
+    @guarantee PublishingGrantsNothing
+        -- A request that reaches SkilJ through a router is authorised
+        -- exactly as a direct one: the caller is the Role its own
+        -- credential resolves to, the router forwards that credential
+        -- rather than standing in for it, and every guarantee of the
+        -- surface the request lands on holds unchanged -
+        -- GrantScopedToBoundedContext, GrantScopedToOwnerWhenDeclared,
+        -- TeamGatedWhenDeclared, SensitiveFieldsStayProtected. A bounded
+        -- context the caller has no grant on answers exactly as one that
+        -- does not exist, whether or not the description names it. A
+        -- projection instance looked up by its key on a router's behalf is
+        -- the same QueryProjection a caller makes directly, with no
+        -- wait_for_sequence: a router composing entities has no sequence
+        -- to name.
+
+    @guarantee DescriptionFollowsRegistration
+        -- What the description holds for a published bounded context
+        -- follows its registrations, on every instance, exactly as the
+        -- schema a caller is served does (see TypeRegistration's
+        -- RegistrationReachesEveryInstance). That the supergraph follows
+        -- too is not something SkilJ can promise: the composition belongs
+        -- to whoever runs the router, and a new projection is reachable
+        -- through it from the moment the operator republishes the
+        -- description, not before.
+
+    @guidance
+        -- The description is a federation subgraph: Apollo Federation v2,
+        -- which Apollo Router 2 and 3, Hive Router and Gateway, Cosmo and
+        -- schema stitching all compose. Turning it on is a builder choice
+        -- rather than a second endpoint. Its wire shape - the name prefix
+        -- that keeps a second SkilJ service or another subgraph's types
+        -- from colliding, the entity key a projection instance is looked
+        -- up by, how the surfaces left out are hidden from the router -
+        -- stays deferred with the rest of the GraphQL wire contract (see
+        -- the scope header's exclusions, and docs/architecture.md §194).
+        --
+        -- Tenants are left out on purpose, not forgotten: how a
+        -- supergraph should reach them is the subject of the open
+        -- questions at the end of this file.
+}
+
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
 
--- None. What a deleted template leaves behind, the question templated
+-- Reaching templated bounded contexts through a supergraph (surface
+-- FederatedSubgraph leaves every tenant out, see TenantsAreNeverPublished).
+-- The direction taken, the way supergraphs commonly serve tenants: the
+-- tenant is data, never a type of its own - one Tenant entity the
+-- supergraph shares, with each template's projections reached through it
+-- and typed once per template, not once per tenant. What that still leaves
+-- open:
+
+open question "Tenant identity - how does a tenant named in a supergraph request map to the bounded context it stands for: by name, or by a deployed mapping?"
+open question "Drifted tenants - a tenant can register and evolve on its own after it was stamped out; when its projection no longer matches its template's, is it answered through the template's type, through a generic untyped answer, or not at all?"
+open question "Tenant-only projections - is a projection a tenant registered itself, which its template does not declare, reachable through a supergraph at all, and if so how?"
+open question "The template's own data - is a template, itself an ordinary bounded context, one of its own tenants in a supergraph, or left out?"
+open question "Supergraph-side authorisation - should the description also tell a router which grants a field needs, so it can refuse early, given that SkilJ's own grants stay the check either way?"
+
+-- Earlier questions, answered: What a deleted template leaves behind, the question templated
 -- tenants arrived with, is answered where the deletion itself happens
 -- rather than here: DeleteBoundedContext clears the template link on
 -- every context templated from the one it ends, so each of them becomes
