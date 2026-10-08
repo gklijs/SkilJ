@@ -2179,3 +2179,70 @@ fn a_batch_written_as_a_set_links_its_events_and_records_its_keys() {
         }
     });
 }
+
+/// docs/architecture.md §196: the batch re-checks every stale read with
+/// one query over all their tags, and each command keeps only its own
+/// part. Orders "A" and "C" ship concurrently before the batch locks; of
+/// three commands read before that, the ones for "A" and "C" see their
+/// own conflict and are rejected with it alone, and "B", whose tag the
+/// shared query also covered, is accepted.
+#[test]
+fn one_recheck_per_batch_gives_each_command_only_its_own_conflicts() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let command = |order: &str| {
+            let payload = format!(r#"{{"order_id":"{order}"}}"#);
+            let decision = dispatcher
+                .dispatch(&bc.name, &ct.name, &payload, &[])
+                .unwrap()
+                .unwrap();
+            batched(
+                &ct,
+                &payload,
+                decision,
+                vec![Tag {
+                    key: "order".to_string(),
+                    value: Some(order.to_string()),
+                }],
+            )
+        };
+        let batch = vec![command("A"), command("B"), command("C")];
+        insert_concurrent_event(&pool, &bc, &et, "A").await;
+        insert_concurrent_event(&pool, &bc, &et, "C").await;
+
+        let results = db::submit_command_batch(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            &bc.name,
+            batch,
+        )
+        .await
+        .unwrap();
+        let outcomes: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+        for (outcome, order) in outcomes.iter().zip(["A", "B", "C"]) {
+            match (order, outcome) {
+                ("B", SubmitCommandOutcome::Accepted { events, .. }) => {
+                    assert_eq!(events[0].sequence, 2)
+                }
+                (
+                    _,
+                    SubmitCommandOutcome::Rejected {
+                        matching_events, ..
+                    },
+                ) if order != "B" => {
+                    assert_eq!(matching_events.len(), 1, "{order}");
+                    assert_eq!(matching_events[0].tags[0].value.as_deref(), Some(order));
+                }
+                (order, other) => panic!("unexpected outcome for {order}: {other:?}"),
+            }
+        }
+    });
+}

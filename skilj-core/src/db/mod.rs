@@ -8051,6 +8051,96 @@ pub async fn broadcast_appended_events(
     }
 }
 
+/// Where a command's re-check under the lock starts: where its optimistic
+/// read is complete through, when the caller knows that, else the highest
+/// event the read holds (or the snapshot's position, when it holds none) -
+/// the larger of the two, since a read from Postgres can hold an event
+/// above the position it reports (docs/architecture.md §178).
+fn recheck_from(
+    bounded_context_events: &[Event],
+    snapshot_as_of: Option<i64>,
+    covered_through: Option<i64>,
+) -> i64 {
+    let original_highest = bounded_context_events
+        .iter()
+        .map(|e| e.sequence)
+        .max()
+        .unwrap_or_else(|| snapshot_as_of.unwrap_or(-1));
+    covered_through.map_or(original_highest, |c| c.max(original_highest))
+}
+
+/// The re-checks of every command in `batch` whose read is older than
+/// the lock, as one tag query (docs/architecture.md §196): over the union
+/// of their consistency tags, from the lowest position any of them starts
+/// at, up to `locked_highest`. Each command then keeps its own part in
+/// memory - the events past its own position matching its own tags -
+/// which is exactly what its own query would have returned, through the
+/// same tag index. `None` when no command needs a re-check.
+///
+/// The tag list is padded, repeating its last tag, to a power of two: the
+/// query's text has one `OR` term per tag, and a batch's union varies in
+/// size, so unpadded it would be a new prepared statement for nearly
+/// every batch.
+async fn batch_recheck_delta(
+    conn: &mut sqlx::PgConnection,
+    batch: &[BatchedCommand],
+    locked_highest: i64,
+) -> crate::error::Result<Option<Vec<Event>>> {
+    let mut from: Option<i64> = None;
+    let mut tags: Vec<Tag> = Vec::new();
+    for item in batch {
+        let covered = recheck_from(
+            &item.bounded_context_events,
+            item.snapshot.as_ref().map(|s| s.as_of_sequence),
+            item.covered_through,
+        );
+        if covered >= locked_highest || item.consistency_tags.is_empty() {
+            continue;
+        }
+        from = Some(from.map_or(covered, |f| f.min(covered)));
+        for tag in &item.consistency_tags {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+    }
+    let (Some(from), Some(first)) = (from, batch.first()) else {
+        return Ok(None);
+    };
+    let padded = tags.len().next_power_of_two();
+    let last = tags
+        .last()
+        .cloned()
+        .expect("a command needing a re-check has tags");
+    tags.resize(padded, last);
+    let mut known = std::collections::HashMap::new();
+    for item in batch {
+        for (name, event_type) in &item.event_types_by_name {
+            known
+                .entry(name.clone())
+                .or_insert_with(|| event_type.clone());
+        }
+    }
+    let started = std::time::Instant::now();
+    let mut events = list_events_for_bounded_context_matching_tags_with_bc(
+        conn,
+        &first.command_type.bounded_context,
+        &tags,
+        Some(from),
+        Some(&known),
+        None,
+    )
+    .await?;
+    events.retain(|e| e.sequence <= locked_highest);
+    tracing::debug!(
+        bounded_context = %first.command_type.bounded_context.name,
+        delta_query_us = started.elapsed().as_micros(),
+        delta_rows = events.len(),
+        "command decide delta query"
+    );
+    Ok(Some(events))
+}
+
 /// Idempotency keys claimed by commands earlier in the same batch, by
 /// `(command type, client id, key)`, with the sequences their events got
 /// - see [`decide_command_in_tx`].
@@ -8126,14 +8216,10 @@ async fn decide_command_in_tx(
     mut event_types_by_name: std::collections::HashMap<String, EventType>,
     covered_through: Option<i64>,
     batch_idempotency_keys: Option<&BatchIdempotencyKeys>,
+    batch_delta: Option<&[Event]>,
 ) -> crate::error::Result<DecideOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
-    let original_highest = bounded_context_events
-        .iter()
-        .map(|e| e.sequence)
-        .max()
-        .unwrap_or_else(|| snapshot.as_ref().map(|s| s.as_of_sequence).unwrap_or(-1));
 
     // Codeberg issue #12: a cached prior answer, not a new decision -
     // checked as early as possible, right after the lock that makes this
@@ -8205,8 +8291,25 @@ async fn decide_command_in_tx(
     // larger of the two: a read from Postgres can hold an event above the
     // position it reports (it saw a later commit), and nothing it holds
     // must come back as new.
-    let covered = covered_through.map_or(original_highest, |c| c.max(original_highest));
-    let mut delta = if locked_highest > covered {
+    let covered = recheck_from(
+        bounded_context_events,
+        snapshot.as_ref().map(|s| s.as_of_sequence),
+        covered_through,
+    );
+    let mut delta = if let Some(batch_delta) = batch_delta {
+        // docs/architecture.md §196: the batch read every command's
+        // re-check range in one query, over all their tags - this
+        // command's part of it.
+        batch_delta
+            .iter()
+            .filter(|e| {
+                e.sequence > covered
+                    && e.sequence <= locked_highest
+                    && consistency_tags.iter().any(|t| e.tags.contains(t))
+            })
+            .cloned()
+            .collect()
+    } else if locked_highest > covered {
         // `command_type.bounded_context` is already this exact row -
         // every command a `CommandBatcher` batch ever holds shares one
         // bounded context (the queue is keyed on it), so there is never
@@ -8576,6 +8679,7 @@ async fn submit_one_command_in_tx(
         extra_committed_events,
         event_types_by_name,
         covered_through,
+        None,
         None,
     )
     .await?
@@ -9078,6 +9182,7 @@ async fn write_command_batch_as_set(
     let mut highest_assigned = locked_highest;
 
     let decide_started = std::time::Instant::now();
+    let batch_delta = batch_recheck_delta(tx, batch, locked_highest).await?;
     for (index, item) in batch.iter().enumerate() {
         let decided = decide_command_in_tx(
             tx,
@@ -9099,6 +9204,7 @@ async fn write_command_batch_as_set(
             item.event_types_by_name.clone(),
             item.covered_through,
             Some(&claimed),
+            Some(batch_delta.as_deref().unwrap_or(&[])),
         )
         .await;
         let AcceptedDecision {
@@ -9586,6 +9692,7 @@ async fn commit_command_batch_per_command(
             &extra_committed_events,
             item.event_types_by_name,
             item.covered_through,
+            None,
             None,
         )
         .await;

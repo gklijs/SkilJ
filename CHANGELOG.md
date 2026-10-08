@@ -89,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A command batch re-checks its commands' reads with one tag query over
+  all their consistency tags, instead of one query per command under the
+  bounded context's lock (docs/architecture.md §196).
+
 - A command batch is decided first and then written as a set: one
   multi-row insert each for its commands, events, encryption-key links and
   idempotency keys, and one sequence update, instead of several statements
