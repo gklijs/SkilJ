@@ -2083,3 +2083,99 @@ fn an_event_the_read_already_holds_above_its_position_is_not_counted_twice() {
         );
     });
 }
+
+/// docs/architecture.md §196: a batch is written as a set - its events
+/// numbered in memory and inserted together with their commands and
+/// idempotency keys. Every event names the command that triggered it, the
+/// sequence moves once by exactly what was used, and a key recorded this
+/// way is found by a later batch.
+#[test]
+fn a_batch_written_as_a_set_links_its_events_and_records_its_keys() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let command = |order: &str, key: Option<&str>| {
+            let payload = format!(r#"{{"order_id":"{order}"}}"#);
+            let decision = dispatcher
+                .dispatch(&bc.name, &ct.name, &payload, &[])
+                .unwrap()
+                .unwrap();
+            let mut item = batched(
+                &ct,
+                &payload,
+                decision,
+                vec![Tag {
+                    key: "order".to_string(),
+                    value: Some(order.to_string()),
+                }],
+            );
+            item.idempotency_key = key.map(str::to_string);
+            item
+        };
+
+        let results = db::submit_command_batch(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            &bc.name,
+            vec![
+                command("B", Some("key-b")),
+                command("C", None),
+                command("D", None),
+            ],
+        )
+        .await
+        .unwrap();
+        let mut accepted = Vec::new();
+        for result in results {
+            match result.unwrap() {
+                SubmitCommandOutcome::Accepted { command, events } => {
+                    assert_eq!(events.len(), 1);
+                    accepted.push((command.id.clone(), events[0].sequence));
+                }
+                other => panic!("expected every command to be accepted, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            accepted.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(db::next_sequence(&pool, &bc.name).await.unwrap(), 3);
+
+        let events = db::list_events_for_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        for (event, (command_id, sequence)) in events.iter().zip(&accepted) {
+            assert_eq!(event.sequence, *sequence);
+            match &event.origin {
+                EventOrigin::CommandTriggered { command } => {
+                    assert_eq!(&command.id, command_id, "event {sequence}")
+                }
+                other => panic!("expected a command-triggered event, got {other:?}"),
+            }
+        }
+
+        let results = db::submit_command_batch(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            &bc.name,
+            vec![command("B", Some("key-b"))],
+        )
+        .await
+        .unwrap();
+        match results.into_iter().next().unwrap().unwrap() {
+            SubmitCommandOutcome::Deduplicated {
+                triggered_event_sequences,
+            } => assert_eq!(triggered_event_sequences, vec![0]),
+            other => panic!("expected the repeated key to deduplicate, got {other:?}"),
+        }
+    });
+}

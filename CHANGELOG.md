@@ -89,6 +89,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A command batch is decided first and then written as a set: one
+  multi-row insert each for its commands, events, encryption-key links and
+  idempotency keys, and one sequence update, instead of several statements
+  per command under the bounded context's lock. A batch that fails that
+  way is replayed one command at a time, as before (docs/architecture.md
+  §196).
+
 - A command no longer copies its consistency tags' whole history twice
   while its batch holds the bounded context's lock: the consistency
   boundary is a plain maximum, and the history is only extended when the

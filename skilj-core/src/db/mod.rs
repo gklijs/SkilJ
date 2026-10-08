@@ -7196,6 +7196,22 @@ pub async fn insert_event_and_update_sync_projections_in_tx(
         .await?;
     }
 
+    fold_event_into_sync_projections_in_tx(tx, event, dispatcher, sync_projections).await
+}
+
+/// The sync-projection half of [`insert_event_and_update_sync_projections_in_tx`]:
+/// folds `event`, already inserted on `tx`, into every one of
+/// `sync_projections`. Split out so a batch written as a set
+/// (docs/architecture.md §196) can insert its events first and fold them
+/// after, in sequence order.
+async fn fold_event_into_sync_projections_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    sync_projections: &[String],
+) -> crate::error::Result<()> {
+    let bounded_context = &event.bounded_context.name;
+    let schema = schema_ident(bounded_context);
     for projection_name in sync_projections {
         // `Some(vec![])` - registered, but this event's type isn't
         // consumed - falls through to an empty loop below: zero instances
@@ -8035,6 +8051,11 @@ pub async fn broadcast_appended_events(
     }
 }
 
+/// Idempotency keys claimed by commands earlier in the same batch, by
+/// `(command type, client id, key)`, with the sequences their events got
+/// - see [`decide_command_in_tx`].
+type BatchIdempotencyKeys = std::collections::HashMap<(String, String, String), Vec<i64>>;
+
 /// What [`decide_command_in_tx`] settles on for a command whose decision
 /// was `Accepted` - everything [`finish_accepted_command_in_tx`] needs to
 /// actually write it, once sequence numbers are available. Kept as its
@@ -8104,6 +8125,7 @@ async fn decide_command_in_tx(
     extra_committed_events: &[Event],
     mut event_types_by_name: std::collections::HashMap<String, EventType>,
     covered_through: Option<i64>,
+    batch_idempotency_keys: Option<&BatchIdempotencyKeys>,
 ) -> crate::error::Result<DecideOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
@@ -8125,9 +8147,26 @@ async fn decide_command_in_tx(
     // still-uncommitted batch claimed: that command's savepoint was
     // released into this same transaction.
     if let Some(key) = idempotency_key {
-        if let Some(triggered_event_sequences) =
-            lookup_idempotency_key(&mut *conn, &schema, &command_type.name, client_id, key).await?
-        {
+        // A key an earlier command in this batch claimed, when the batch
+        // decides everything before writing anything (docs/architecture.md
+        // §196) - not in the table yet.
+        let claimed = batch_idempotency_keys.and_then(|claimed| {
+            claimed
+                .get(&(
+                    command_type.name.clone(),
+                    client_id.to_string(),
+                    key.to_string(),
+                ))
+                .cloned()
+        });
+        let triggered = match claimed {
+            Some(sequences) => Some(sequences),
+            None => {
+                lookup_idempotency_key(&mut *conn, &schema, &command_type.name, client_id, key)
+                    .await?
+            }
+        };
+        if let Some(triggered_event_sequences) = triggered {
             return Ok(DecideOutcome::Terminal(
                 SubmitCommandOutcome::Deduplicated {
                     triggered_event_sequences,
@@ -8309,6 +8348,59 @@ async fn decide_command_in_tx(
     }))
 }
 
+/// protect_sensitive_fields' own pre-resolution step, for the command's
+/// own payload *and* every final event spec's - see
+/// `resolve_encryption_keys`'s own doc comment. `resolved` arrived already
+/// warmed up, before the lock, for `initial_decision`'s own payloads;
+/// what's left is only what a redispatch newly needs. That is provisioned
+/// on `conn`, the lock holder's own connection, not the pool
+/// (docs/architecture.md §117): this transaction holds the bounded
+/// context's `sequence` lock, and every other writer to it waits on that
+/// lock holding a pooled connection.
+///
+/// Every distinct `(subject_key, subject_value)` still needed is gathered
+/// up front and deduped (against itself and `resolved`), so no subject is
+/// provisioned twice.
+async fn provision_missing_encryption_keys(
+    conn: &mut sqlx::PgConnection,
+    command_type: &CommandType,
+    payload: &str,
+    event_specs: &[crate::shared::EventSpec],
+    event_types_by_name: &std::collections::HashMap<String, EventType>,
+    resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<()> {
+    let mut needed_subjects: Vec<(String, String)> =
+        crate::event_store::sensitive_field_subjects(&command_type.sensitive_fields, payload);
+    for spec in event_specs {
+        if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
+            needed_subjects.extend(crate::event_store::sensitive_field_subjects(
+                &event_type.sensitive_fields,
+                &spec.payload.to_string(),
+            ));
+        }
+    }
+    needed_subjects.retain(|pair| !resolved.contains_key(pair));
+    needed_subjects.sort();
+    needed_subjects.dedup();
+
+    if !needed_subjects.is_empty() {
+        let master_key = encryption_master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+        for subject in needed_subjects {
+            let provisioned = get_or_create_encryption_key_on(
+                &mut *conn,
+                command_type.bounded_context.clone(),
+                &subject.0,
+                &subject.1,
+                master_key,
+            )
+            .await?;
+            resolved.insert(subject, provisioned);
+        }
+    }
+    Ok(())
+}
+
 /// The write half of what used to be one `submit_one_command_in_tx` -
 /// everything [`decide_command_in_tx`] couldn't do without real sequence
 /// numbers in hand. `sequences` is exactly `decided.event_specs.len()`
@@ -8342,47 +8434,16 @@ async fn finish_accepted_command_in_tx(
     } = decided;
     let mut sequences = sequences.into_iter();
 
-    // protect_sensitive_fields' own pre-resolution step, for the
-    // command's own payload *and* every final event spec's - see
-    // `resolve_encryption_keys`'s own doc comment. `resolved` arrived
-    // already warmed up, before the lock, for `initial_decision`'s own
-    // payloads; what's left is only what a redispatch newly needs. That
-    // is provisioned here on `tx`, not the pool (docs/architecture.md
-    // §117): this transaction holds the bounded context's `sequence`
-    // lock, and every other writer to it waits on that lock holding a
-    // pooled connection.
-    //
-    // Every distinct `(subject_key, subject_value)` still needed is
-    // gathered up front and deduped (against itself and `resolved`), so
-    // no subject is provisioned twice.
-    let mut needed_subjects: Vec<(String, String)> =
-        crate::event_store::sensitive_field_subjects(&command_type.sensitive_fields, payload);
-    for spec in &event_specs {
-        if let Some(event_type) = event_types_by_name.get(&spec.event_type) {
-            needed_subjects.extend(crate::event_store::sensitive_field_subjects(
-                &event_type.sensitive_fields,
-                &spec.payload.to_string(),
-            ));
-        }
-    }
-    needed_subjects.retain(|pair| !resolved.contains_key(pair));
-    needed_subjects.sort();
-    needed_subjects.dedup();
-
-    if !needed_subjects.is_empty() {
-        let master_key = encryption_master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
-        for subject in needed_subjects {
-            let provisioned = get_or_create_encryption_key_on(
-                tx,
-                command_type.bounded_context.clone(),
-                &subject.0,
-                &subject.1,
-                master_key,
-            )
-            .await?;
-            resolved.insert(subject, provisioned);
-        }
-    }
+    provision_missing_encryption_keys(
+        tx,
+        command_type,
+        payload,
+        &event_specs,
+        &event_types_by_name,
+        &mut resolved,
+        encryption_master_key,
+    )
+    .await?;
 
     let result = crate::event_store::process_command_at_boundary(
         crate::shared::generate_token_id(),
@@ -8515,6 +8576,7 @@ async fn submit_one_command_in_tx(
         extra_committed_events,
         event_types_by_name,
         covered_through,
+        None,
     )
     .await?
     {
@@ -8881,6 +8943,606 @@ pub async fn commit_command_batch(
         "command batch committed"
     );
 
+    let batch_len = batch.len();
+    // docs/architecture.md §196: decided and written as a set first, in a
+    // savepoint. Anything failing there - a statement, or a sync
+    // projection refusing an event - rolls the savepoint back and the
+    // batch is replayed one command at a time, each in its own savepoint,
+    // which isolates the failure to its command as before.
+    let as_set = {
+        let mut savepoint = tx.begin().await?;
+        match write_command_batch_as_set(
+            &mut savepoint,
+            dispatcher,
+            projection_dispatcher,
+            encryption_master_key,
+            &batch,
+            locked_highest,
+            &sync_projections,
+        )
+        .await
+        {
+            Ok(written) => {
+                savepoint.commit().await?;
+                Some(written)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    bounded_context = %bounded_context_name,
+                    batch_size = batch_len,
+                    error = %e,
+                    "command batch not written as a set - replaying it one command at a time"
+                );
+                savepoint.rollback().await?;
+                None
+            }
+        }
+    };
+    let (results, timing) = match as_set {
+        Some(written) => written,
+        None => {
+            commit_command_batch_per_command(
+                &mut tx,
+                dispatcher,
+                projection_dispatcher,
+                encryption_master_key,
+                &bounded_context_name,
+                locked_highest,
+                &sync_projections,
+                batch,
+            )
+            .await?
+        }
+    };
+
+    let commit_started = std::time::Instant::now();
+    tx.commit().await?;
+    let commit_elapsed = commit_started.elapsed();
+
+    tracing::debug!(
+        bounded_context = %bounded_context_name,
+        batch_size = batch_len,
+        as_set = timing.as_set,
+        decide_us = timing.decide.as_micros(),
+        sequence_us = timing.sequence.as_micros(),
+        persist_us = timing.persist.as_micros(),
+        commit_us = commit_elapsed.as_micros(),
+        "command batch phase timing"
+    );
+
+    Ok(results)
+}
+
+/// Where a batch's time under the lock went, for `commit_command_batch`'s
+/// one timing line per batch (Codeberg issue #32, round four).
+#[derive(Default)]
+struct BatchPhaseTiming {
+    /// Whether the batch was written as a set (docs/architecture.md §196)
+    /// rather than one command at a time.
+    as_set: bool,
+    decide: std::time::Duration,
+    sequence: std::time::Duration,
+    persist: std::time::Duration,
+}
+
+/// One accepted command of a batch written as a set, built in memory
+/// before anything is written (docs/architecture.md §196).
+struct PlannedCommand {
+    /// Its position in the batch, where its result goes.
+    index: usize,
+    command: Command,
+    events: Vec<Event>,
+    command_key_ids: Vec<i64>,
+    event_key_ids: Vec<Vec<i64>>,
+    idempotency_key: Option<String>,
+    now: DateTime<Utc>,
+}
+
+/// `commit_command_batch`'s set path (docs/architecture.md §196): decides
+/// every command in `batch` first, in order, without writing anything
+/// but the encryption keys a redispatch newly needs, then writes every
+/// accepted command with a handful of multi-row statements instead of
+/// several statements per command.
+///
+/// Deciding first needs nothing written: a later command sees an earlier
+/// one's events through `extra_committed_events`, as in the per-command
+/// path, and its idempotency key through `claimed` instead of the table.
+/// The events get their sequence numbers in memory, from right after
+/// `locked_highest` - the lock is held, so nothing else takes one - and
+/// `{schema}.sequence` moves once by however many were used. A command
+/// whose decision or construction fails takes none, so the sequence stays
+/// gapless with no [`SequencePool`] to recycle draws.
+///
+/// `Err` means the batch couldn't be written this way; the caller rolls
+/// back the savepoint `tx` is and replays the batch one command at a time.
+/// A command's own failure to decide is not that: it is that command's
+/// result, as it would be in the per-command path.
+#[allow(clippy::too_many_arguments)]
+async fn write_command_batch_as_set(
+    tx: &mut Transaction<'_, Postgres>,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    batch: &[BatchedCommand],
+    locked_highest: i64,
+    sync_projections: &[String],
+) -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> {
+    let mut timing = BatchPhaseTiming {
+        as_set: true,
+        ..BatchPhaseTiming::default()
+    };
+    let mut results: Vec<Option<BatchedCommandResult>> = Vec::with_capacity(batch.len());
+    let mut planned: Vec<PlannedCommand> = Vec::new();
+    let mut extra_committed_events: Vec<Event> = Vec::new();
+    let mut claimed: BatchIdempotencyKeys = std::collections::HashMap::new();
+    let mut highest_assigned = locked_highest;
+
+    let decide_started = std::time::Instant::now();
+    for (index, item) in batch.iter().enumerate() {
+        let decided = decide_command_in_tx(
+            tx,
+            dispatcher,
+            &item.command_type,
+            &item.payload,
+            &item.client_id,
+            &item.bounded_context_events,
+            &item.consistency_tags,
+            &item.matching_events,
+            item.initial_decision.clone(),
+            item.snapshot.as_ref().map(|s| SnapshotContext {
+                state_json: &s.state_json,
+                as_of_sequence: s.as_of_sequence,
+            }),
+            item.idempotency_key.as_deref(),
+            locked_highest,
+            &extra_committed_events,
+            item.event_types_by_name.clone(),
+            item.covered_through,
+            Some(&claimed),
+        )
+        .await;
+        let AcceptedDecision {
+            event_specs,
+            consistency_boundary,
+            event_types_by_name,
+        } = match decided {
+            Ok(DecideOutcome::Terminal(outcome)) => {
+                results.push(Some(Ok(outcome)));
+                continue;
+            }
+            Ok(DecideOutcome::Accepted(decided)) => decided,
+            Err(e) => {
+                results.push(Some(Err(e)));
+                continue;
+            }
+        };
+
+        let mut resolved = item.resolved.clone();
+        provision_missing_encryption_keys(
+            tx,
+            &item.command_type,
+            &item.payload,
+            &event_specs,
+            &event_types_by_name,
+            &mut resolved,
+            encryption_master_key,
+        )
+        .await?;
+
+        let mut assigned = highest_assigned;
+        let processed = crate::event_store::process_command_at_boundary(
+            crate::shared::generate_token_id(),
+            &item.command_type,
+            &item.payload,
+            &item.client_id,
+            item.correlation_id.as_deref(),
+            item.causation_id.as_deref(),
+            consistency_boundary,
+            crate::shared::CommandDecision::Accepted {
+                events: event_specs,
+            },
+            |name| event_types_by_name.get(name).cloned(),
+            || {
+                assigned += 1;
+                assigned
+            },
+            item.now,
+            |subject_key, subject_value| {
+                let (key, _, data_key) = resolved
+                    .get(&(subject_key.to_string(), subject_value.to_string()))
+                    .expect(
+                        "provision_missing_encryption_keys resolved every subject \
+                         sensitive_field_subjects named",
+                    );
+                (key.clone(), data_key.clone())
+            },
+        );
+        let result = match processed {
+            Ok(result) => result,
+            Err(e) => {
+                results.push(Some(Err(e)));
+                continue;
+            }
+        };
+        highest_assigned = assigned;
+
+        if let Some(key) = &item.idempotency_key {
+            claimed.insert(
+                (
+                    item.command_type.name.clone(),
+                    item.client_id.clone(),
+                    key.clone(),
+                ),
+                result.events.iter().map(|e| e.sequence).collect(),
+            );
+        }
+        extra_committed_events.extend(result.events.iter().cloned());
+        results.push(None);
+        planned.push(PlannedCommand {
+            index,
+            command_key_ids: encryption_key_ids(&result.command.encryption_keys, &resolved),
+            event_key_ids: result
+                .events
+                .iter()
+                .map(|event| encryption_key_ids(&event.encryption_keys, &resolved))
+                .collect(),
+            command: result.command,
+            events: result.events,
+            idempotency_key: item.idempotency_key.clone(),
+            now: item.now,
+        });
+    }
+    timing.decide = decide_started.elapsed();
+
+    let persist_started = std::time::Instant::now();
+    if let Some(first) = batch.first() {
+        write_planned_commands(
+            tx,
+            &first.command_type.bounded_context.name,
+            &planned,
+            highest_assigned - locked_highest,
+            projection_dispatcher,
+            sync_projections,
+        )
+        .await?;
+    }
+    timing.persist = persist_started.elapsed();
+
+    for planned in planned {
+        COMMANDS_PROCESSED.add(
+            1,
+            &[
+                KeyValue::new(
+                    "bounded_context",
+                    planned.command.bounded_context.name.clone(),
+                ),
+                KeyValue::new("command_type", planned.command.command_type.name.clone()),
+                KeyValue::new("outcome", "accepted"),
+            ],
+        );
+        results[planned.index] = Some(Ok(SubmitCommandOutcome::Accepted {
+            command: Box::new(planned.command),
+            events: planned.events,
+        }));
+    }
+    Ok((
+        results
+            .into_iter()
+            .map(|result| result.expect("every accepted command was written above"))
+            .collect(),
+        timing,
+    ))
+}
+
+/// Writes every command `write_command_batch_as_set` planned: the
+/// sequence, then one multi-row `INSERT` each for the commands, their
+/// events, both encryption-key link tables and the idempotency keys,
+/// then the sync projections, event by event in sequence order. A few
+/// round trips per batch, where the per-command path makes several per
+/// command (docs/architecture.md §196).
+async fn write_planned_commands(
+    tx: &mut Transaction<'_, Postgres>,
+    bounded_context: &str,
+    planned: &[PlannedCommand],
+    sequences_used: i64,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    sync_projections: &[String],
+) -> crate::error::Result<()> {
+    if planned.is_empty() {
+        return Ok(());
+    }
+    let schema = schema_ident(bounded_context);
+    if sequences_used > 0 {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.sequence SET next_value = next_value + $1"
+        )))
+        .bind(sequences_used)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let commands: Vec<&Command> = planned.iter().map(|p| &p.command).collect();
+    let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}) \
+         SELECT external_id, command_type_name, payload, metadata_type, metadata_version, \
+                client_id, created_at, correlation_id, causation_id, consistency_tags::jsonb, \
+                consistency_boundary \
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::text[], \
+                     $7::timestamptz[], $8::text[], $9::text[], $10::text[], $11::bigint[]) \
+              AS u(external_id, command_type_name, payload, metadata_type, metadata_version, \
+                   client_id, created_at, correlation_id, causation_id, consistency_tags, \
+                   consistency_boundary) \
+         RETURNING id, external_id"
+    )))
+    .bind(commands.iter().map(|c| c.id.as_str()).collect::<Vec<_>>())
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.command_type.name.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.payload.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.metadata.r#type.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.metadata.version)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.metadata.client_id.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.metadata.created_at)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.metadata.correlation_id.as_deref())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.metadata.causation_id.as_deref())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| {
+                serde_json::to_string(&c.consistency_tags).expect("Tag serialisation is infallible")
+            })
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| c.consistency_boundary)
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let ids: std::collections::HashMap<String, i64> = rows
+        .into_iter()
+        .map(|(id, external_id)| (external_id, id))
+        .collect();
+    let command_id = |command: &Command| {
+        *ids.get(&command.id)
+            .expect("every inserted command came back from RETURNING")
+    };
+
+    let events: Vec<(&Event, i64)> = planned
+        .iter()
+        .flat_map(|p| {
+            let id = command_id(&p.command);
+            p.events.iter().map(move |event| (event, id))
+        })
+        .collect();
+    if !events.is_empty() {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.events (sequence, event_type_name, payload, metadata_type, \
+             metadata_version, metadata_client_id, metadata_created_at, metadata_correlation_id, \
+             metadata_causation_id, tags, origin_kind, origin_source_content, \
+             origin_source_context, origin_command_id) \
+             SELECT sequence, event_type_name, payload, metadata_type, metadata_version, \
+                    client_id, created_at, correlation_id, causation_id, tags::jsonb, \
+                    'command_triggered', NULL, NULL, command_id \
+             FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[], $5::bigint[], \
+                         $6::text[], $7::timestamptz[], $8::text[], $9::text[], $10::text[], \
+                         $11::bigint[]) \
+                  AS u(sequence, event_type_name, payload, metadata_type, metadata_version, \
+                       client_id, created_at, correlation_id, causation_id, tags, command_id)"
+        )))
+        .bind(events.iter().map(|(e, _)| e.sequence).collect::<Vec<_>>())
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| e.event_type.name.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| e.payload.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| e.metadata.r#type.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| e.metadata.version)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| e.metadata.client_id.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| e.metadata.created_at)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| e.metadata.correlation_id.as_deref())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| e.metadata.causation_id.as_deref())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            events
+                .iter()
+                .map(|(e, _)| {
+                    serde_json::to_string(&e.tags).expect("Tag serialisation is infallible")
+                })
+                .collect::<Vec<_>>(),
+        )
+        .bind(events.iter().map(|(_, id)| *id).collect::<Vec<_>>())
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let (key_commands, command_keys): (Vec<i64>, Vec<i64>) = planned
+        .iter()
+        .flat_map(|p| {
+            let id = command_id(&p.command);
+            p.command_key_ids.iter().map(move |key| (id, *key))
+        })
+        .unzip();
+    if !key_commands.is_empty() {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.command_encryption_keys (command_id, encryption_key_id) \
+             SELECT * FROM unnest($1::bigint[], $2::bigint[])"
+        )))
+        .bind(&key_commands)
+        .bind(&command_keys)
+        .execute(&mut **tx)
+        .await?;
+    }
+    let (key_events, event_keys): (Vec<i64>, Vec<i64>) = planned
+        .iter()
+        .flat_map(|p| {
+            p.events
+                .iter()
+                .zip(&p.event_key_ids)
+                .flat_map(|(event, keys)| keys.iter().map(move |key| (event.sequence, *key)))
+        })
+        .unzip();
+    if !key_events.is_empty() {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.event_encryption_keys (event_sequence, encryption_key_id) \
+             SELECT * FROM unnest($1::bigint[], $2::bigint[])"
+        )))
+        .bind(&key_events)
+        .bind(&event_keys)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let keyed: Vec<(&PlannedCommand, &str)> = planned
+        .iter()
+        .filter_map(|p| p.idempotency_key.as_deref().map(|key| (p, key)))
+        .collect();
+    if !keyed.is_empty() {
+        // `triggered_event_sequences` is an array per row, which `unnest`
+        // can't take as an array of arrays of different lengths - so each
+        // row's goes as a JSON array.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.idempotency_keys \
+             (command_type_name, client_id, idempotency_key, triggered_event_sequences, created_at) \
+             SELECT command_type_name, client_id, idempotency_key, \
+                    ARRAY(SELECT jsonb_array_elements_text(sequences::jsonb)::bigint), created_at \
+             FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::timestamptz[]) \
+                  AS u(command_type_name, client_id, idempotency_key, sequences, created_at)"
+        )))
+        .bind(
+            keyed
+                .iter()
+                .map(|(p, _)| p.command.command_type.name.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            keyed
+                .iter()
+                .map(|(p, _)| p.command.metadata.client_id.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(keyed.iter().map(|(_, key)| *key).collect::<Vec<_>>())
+        .bind(
+            keyed
+                .iter()
+                .map(|(p, _)| {
+                    serde_json::to_string(
+                        &p.events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+                    )
+                    .expect("a list of numbers serialises")
+                })
+                .collect::<Vec<_>>(),
+        )
+        .bind(keyed.iter().map(|(p, _)| p.now).collect::<Vec<_>>())
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    if !sync_projections.is_empty() {
+        for (event, _) in &events {
+            fold_event_into_sync_projections_in_tx(
+                tx,
+                event,
+                projection_dispatcher,
+                sync_projections,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `commit_command_batch`'s per-command path: every command in `batch`, in
+/// order, decided and written in its own savepoint, so a command that
+/// fails rolls back alone. Since docs/architecture.md §196 it is the
+/// fallback for a batch that couldn't be written as a set.
+#[allow(clippy::too_many_arguments)]
+async fn commit_command_batch_per_command(
+    tx: &mut Transaction<'static, Postgres>,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    bounded_context_name: &str,
+    locked_highest: i64,
+    sync_projections: &[String],
+    batch: Vec<BatchedCommand>,
+) -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> {
     // Per-phase wall-clock accumulators (Codeberg issue #32,
     // round four investigation) - the batch-size histogram above already
     // ruled out "batches aren't forming large enough to amortise" as the
@@ -8906,7 +9568,7 @@ pub async fn commit_command_batch(
         // error is a Rust `Err`, not a statement, and stays per-command.
         let decide_started = std::time::Instant::now();
         let decide_result = decide_command_in_tx(
-            &mut tx,
+            tx,
             dispatcher,
             &item.command_type,
             &item.payload,
@@ -8924,6 +9586,7 @@ pub async fn commit_command_batch(
             &extra_committed_events,
             item.event_types_by_name,
             item.covered_through,
+            None,
         )
         .await;
         decide_total += decide_started.elapsed();
@@ -8951,8 +9614,8 @@ pub async fn commit_command_batch(
         let sequence_started = std::time::Instant::now();
         let sequence_result = sequence_pool
             .take(
-                &mut tx,
-                &bounded_context_name,
+                tx,
+                bounded_context_name,
                 decided.event_specs.len() as i64,
                 refill_hint,
             )
@@ -8986,7 +9649,7 @@ pub async fn commit_command_batch(
             encryption_master_key,
             item.now,
             item.idempotency_key.as_deref(),
-            &sync_projections,
+            sync_projections,
             sequences,
             decided,
             item.resolved,
@@ -9032,24 +9695,17 @@ pub async fn commit_command_batch(
         }
     }
 
-    sequence_pool
-        .shrink_back(&mut tx, &bounded_context_name)
-        .await?;
-    let commit_started = std::time::Instant::now();
-    tx.commit().await?;
-    let commit_elapsed = commit_started.elapsed();
+    sequence_pool.shrink_back(tx, bounded_context_name).await?;
 
-    tracing::debug!(
-        bounded_context = %bounded_context_name,
-        batch_size = batch_len,
-        decide_us = decide_total.as_micros(),
-        sequence_us = sequence_total.as_micros(),
-        persist_us = persist_total.as_micros(),
-        commit_us = commit_elapsed.as_micros(),
-        "command batch phase timing"
-    );
-
-    Ok(results)
+    Ok((
+        results,
+        BatchPhaseTiming {
+            as_set: false,
+            decide: decide_total,
+            sequence: sequence_total,
+            persist: persist_total,
+        },
+    ))
 }
 
 /// [`begin_command_batch_leader_tx`] immediately followed by
