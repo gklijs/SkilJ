@@ -96,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redelivered messages' events twice. Set `idempotency_key_retention` to
   keep the old window.
 
-- A projection state field named `projection_key` (GraphQL `projectionKey`)
+- **Breaking:** a projection state field named `projection_key` (GraphQL `projectionKey`)
   is now left out of its projection's GraphQL type, with a warning: the
   name is reserved for the federation entity key, federated or not, so
   turning federation on never changes a type's fields (docs/architecture.md
