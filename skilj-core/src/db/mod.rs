@@ -2012,6 +2012,13 @@ pub async fn ensure_external_message_keys_table<'e>(
 /// writes to the table (§158), and replacing the function on every start
 /// fails when two instances start at once. One multi-statement query, so one
 /// transaction: no reader sees the counter before its triggers exist.
+///
+/// The existence checks and the creates aren't atomic on their own: two
+/// instances starting together against a bounded context from before the
+/// counter both saw the function missing, and the second `CREATE` failed
+/// its `build()` (docs/architecture.md §195). So the query first takes a
+/// transaction-scoped advisory lock keyed by the schema; a second instance
+/// waits for the first to commit and then finds everything there.
 #[tracing::instrument(skip_all)]
 pub async fn ensure_registrations_generation<'e>(
     executor: impl sqlx::PgExecutor<'e>,
@@ -2057,7 +2064,8 @@ pub async fn ensure_registrations_generation<'e>(
     })
     .join(";\n");
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS {schema}.registrations_generation (
+        "SELECT pg_advisory_xact_lock(hashtext({lock_key})::bigint);
+        CREATE TABLE IF NOT EXISTS {schema}.registrations_generation (
             id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
             generation BIGINT NOT NULL
         );
@@ -2071,7 +2079,8 @@ pub async fn ensure_registrations_generation<'e>(
                 END $bump$;
         END IF; END $patch$;
         {triggers}",
-        function = sql_literal(&format!("{schema}.bump_registrations_generation()"))
+        function = sql_literal(&format!("{schema}.bump_registrations_generation()")),
+        lock_key = sql_literal(&format!("skilj_registrations_generation:{schema}"))
     )))
     .execute(executor)
     .await?;

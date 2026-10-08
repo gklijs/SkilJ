@@ -161,6 +161,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Instances starting together against a bounded context from before the
+  registrations counter (docs/architecture.md §189) could fail `build()`
+  on a duplicate `CREATE`. It is now patched in under an advisory lock
+  (§195).
+
 - `skilj-kafka`'s producer example set `compression.type=zstd`, which
   fails at producer creation with this crate's build of librdkafka
   ("libzstd not available at build time"). It now uses `lz4` and

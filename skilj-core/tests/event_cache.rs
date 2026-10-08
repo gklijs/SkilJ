@@ -719,6 +719,43 @@ fn a_bounded_context_without_the_counter_is_stamped_by_hashing() {
 /// matching events, and says it is complete through the window's highest
 /// sequence - matching or not - which is where a command's re-check under
 /// the lock starts (§178).
+/// docs/architecture.md §195: instances starting together against a
+/// bounded context from before the counter all patch it in, rather than
+/// all but one failing on a duplicate `CREATE FUNCTION`/`CREATE TRIGGER`.
+#[test]
+fn concurrent_startups_all_patch_in_the_counter() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        for _ in 0..5 {
+            let bc = seed_bounded_context(&pool).await;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP TABLE \"bc_{0}\".registrations_generation; \
+                 DROP FUNCTION \"bc_{0}\".bump_registrations_generation() CASCADE",
+                bc.name
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+            let startups = (0..8).map(|_| db::ensure_registrations_generation(&pool, &bc.name));
+            for result in futures_util::future::join_all(startups).await {
+                result.unwrap();
+            }
+            let triggers: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_trigger WHERE tgname LIKE '%registrations_generation' \
+                 AND tgrelid IN (to_regclass($1), to_regclass($2))",
+            )
+            .bind(format!("\"bc_{}\".event_types", bc.name))
+            .bind(format!("\"bc_{}\".command_types", bc.name))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(triggers, 4);
+        }
+    });
+}
+
 #[test]
 fn a_tag_read_serves_the_matching_events_complete_through_the_whole_window() {
     runtime().block_on(async {
