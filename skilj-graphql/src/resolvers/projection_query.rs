@@ -328,42 +328,47 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
     FieldFuture::new(async move {
         let state = ctx.data::<GraphqlState>()?;
         let representations = ctx.args.try_get("representations")?.list()?;
+        // A router sends many instances of one type at once: the caller's
+        // grant on each bounded context is looked up once, not per
+        // instance.
+        let mut mappings: std::collections::HashMap<String, RoleAccessMapping> =
+            std::collections::HashMap::new();
         let mut values = Vec::with_capacity(representations.len());
         for representation in representations.iter() {
-            values.push(resolve_entity(&ctx, state, representation).await?);
+            let representation = representation.object()?;
+            let type_name = representation.try_get("__typename")?.string()?;
+            let key = representation
+                .try_get(crate::federation::PROJECTION_KEY_FIELD)?
+                .string()?
+                .to_string();
+            let (bounded_context_name, name) = ctx
+                .data::<crate::projection_types::AdmittedProjections>()
+                .ok()
+                .and_then(|admitted| admitted.by_type_name(type_name))
+                .cloned()
+                .ok_or_else(|| not_found("Projection type", type_name))?;
+            let access_mapping = match mappings.get(&bounded_context_name) {
+                Some(mapping) => mapping.clone(),
+                None => {
+                    let mapping =
+                        require_read_mapping(&ctx, &state.pool, &bounded_context_name).await?;
+                    mappings.insert(bounded_context_name.clone(), mapping.clone());
+                    mapping
+                }
+            };
+            let (instance, type_name) = fetch_projection_result(
+                state,
+                &access_mapping,
+                &bounded_context_name,
+                &name,
+                &key,
+                None,
+            )
+            .await?;
+            values.push(FieldValue::owned_any(instance).with_type(type_name));
         }
         Ok(Some(FieldValue::list(values)))
     })
-}
-
-async fn resolve_entity<'a>(
-    ctx: &async_graphql::dynamic::ResolverContext<'_>,
-    state: &GraphqlState,
-    representation: async_graphql::dynamic::ValueAccessor<'_>,
-) -> async_graphql::Result<FieldValue<'a>> {
-    let representation = representation.object()?;
-    let type_name = representation.try_get("__typename")?.string()?;
-    let key = representation
-        .try_get(crate::federation::PROJECTION_KEY_FIELD)?
-        .string()?
-        .to_string();
-    let (bounded_context_name, name) = ctx
-        .data::<crate::projection_types::AdmittedProjections>()
-        .ok()
-        .and_then(|admitted| admitted.by_type_name(type_name))
-        .cloned()
-        .ok_or_else(|| not_found("Projection type", type_name))?;
-    let access_mapping = require_read_mapping(ctx, &state.pool, &bounded_context_name).await?;
-    let (instance, type_name) = fetch_projection_result(
-        state,
-        &access_mapping,
-        &bounded_context_name,
-        &name,
-        &key,
-        None,
-    )
-    .await?;
-    Ok(FieldValue::owned_any(instance).with_type(type_name))
 }
 
 /// `projectionSchema(boundedContext: String!, name: String!): Projection` -

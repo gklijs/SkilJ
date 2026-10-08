@@ -57,7 +57,19 @@ pub struct SchemaRegistry {
     scoped: std::sync::Mutex<ScopedSchemas>,
     /// The published description (docs/architecture.md §194), with the
     /// generation it was built under.
-    published: std::sync::Mutex<Option<(u64, Arc<String>)>>,
+    published: std::sync::Mutex<Option<(u64, Arc<PublishedDescription>)>>,
+    /// Held while the published description is built, so concurrent
+    /// requests after a rebuild wait for one build instead of each
+    /// making their own.
+    publishing: tokio::sync::Mutex<()>,
+}
+
+/// What a router composes when `/graphql` is a federation subgraph
+/// (docs/architecture.md §194), and the one-field schema that answers
+/// `_service` with it.
+pub struct PublishedDescription {
+    pub sdl: Arc<String>,
+    pub service: Schema,
 }
 
 impl SchemaRegistry {
@@ -73,6 +85,7 @@ impl SchemaRegistry {
             generation: AtomicU64::new(0),
             scoped: Default::default(),
             published: Default::default(),
+            publishing: Default::default(),
         })
     }
 
@@ -98,6 +111,16 @@ impl SchemaRegistry {
             }
             None => BTreeSet::new(),
         };
+        self.scoped(state, visible).await
+    }
+
+    /// The schema with only `visible`'s projection types, cached per set
+    /// until the next [`rebuild`](SchemaRegistry::rebuild).
+    async fn scoped(
+        &self,
+        state: &GraphqlState,
+        visible: BTreeSet<String>,
+    ) -> skilj_core::error::Result<Arc<Schema>> {
         let generation = self.generation.load(Ordering::Acquire);
         if let Some((built_at, schema)) = self.scoped.lock().unwrap().get(&visible) {
             if *built_at == generation {
@@ -122,20 +145,32 @@ impl SchemaRegistry {
     /// `state.federation` publishes, leaving out any made from a template
     /// (`@guarantee TenantsAreNeverPublished`) or no longer there, as
     /// federation SDL. The same for every caller, credential or not.
-    /// `None` when `/graphql` isn't a subgraph. Cached until the next
-    /// [`rebuild`](SchemaRegistry::rebuild).
-    pub async fn published_sdl(
+    /// `None` when `/graphql` isn't a subgraph. Built once per
+    /// [`rebuild`](SchemaRegistry::rebuild), from the scoped schema a
+    /// caller granted on exactly those bounded contexts is served.
+    pub async fn published(
         &self,
         state: &GraphqlState,
-    ) -> skilj_core::error::Result<Option<Arc<String>>> {
+    ) -> skilj_core::error::Result<Option<Arc<PublishedDescription>>> {
         let Some(options) = &state.federation else {
             return Ok(None);
         };
+        let cached = |generation| {
+            self.published
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(built_at, _)| *built_at == generation)
+                .map(|(_, published)| published.clone())
+        };
         let generation = self.generation.load(Ordering::Acquire);
-        if let Some((built_at, sdl)) = &*self.published.lock().unwrap() {
-            if *built_at == generation {
-                return Ok(Some(sdl.clone()));
-            }
+        if let Some(published) = cached(generation) {
+            return Ok(Some(published));
+        }
+        let _building = self.publishing.lock().await;
+        let generation = self.generation.load(Ordering::Acquire);
+        if let Some(published) = cached(generation) {
+            return Ok(Some(published));
         }
         let visible: BTreeSet<String> = skilj_core::db::list_bounded_contexts(&state.pool)
             .await?
@@ -143,12 +178,24 @@ impl SchemaRegistry {
             .filter(|bc| bc.template.is_none() && options.published().contains(&bc.name))
             .map(|bc| bc.name)
             .collect();
-        let schema = build(state.clone(), Some(&visible)).await?;
+        let schema = self.scoped(state, visible).await?;
         let sdl = Arc::new(crate::federation::published_sdl(&schema));
+        let published = Arc::new(PublishedDescription {
+            service: crate::federation::service_schema(sdl.clone()),
+            sdl,
+        });
         if self.generation.load(Ordering::Acquire) == generation {
-            *self.published.lock().unwrap() = Some((generation, sdl.clone()));
+            *self.published.lock().unwrap() = Some((generation, published.clone()));
         }
-        Ok(Some(sdl))
+        Ok(Some(published))
+    }
+
+    /// [`published`](SchemaRegistry::published)'s SDL alone.
+    pub async fn published_sdl(
+        &self,
+        state: &GraphqlState,
+    ) -> skilj_core::error::Result<Option<Arc<String>>> {
+        Ok(self.published(state).await?.map(|p| p.sdl.clone()))
     }
 
     /// Rebuilds from scratch and atomically swaps in the result. `state`

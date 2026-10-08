@@ -286,14 +286,15 @@ async fn execute_as(
 ) -> async_graphql::Response {
     // docs/architecture.md §194: a subgraph's `_service` is the published
     // description, whoever asks - not the caller's own schema.
+    // The substring check first: parsing every request a second time just
+    // to find the rare `_service` one would cost every query.
     if state.federation.is_some()
+        && request.query.contains("_service")
         && federation::is_service_request(&request.query, request.operation_name.as_deref())
     {
-        return match registry.published_sdl(state).await {
-            Ok(sdl) => {
-                let sdl = sdl.map(|sdl| sdl.to_string()).unwrap_or_default();
-                federation::service_schema(sdl).execute(request).await
-            }
+        return match registry.published(state).await {
+            Ok(Some(published)) => published.service.execute(request).await,
+            Ok(None) => unreachable!("published() is Some whenever federation is set"),
             Err(e) => async_graphql::Response::from_errors(vec![
                 error::to_graphql_error(e).into_server_error(async_graphql::Pos::default())
             ]),

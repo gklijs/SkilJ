@@ -244,7 +244,6 @@ struct Deployment {
     jwks_url: String,
     // Kept alive for their background tasks while the routers are used.
     services: Vec<(&'static str, Skilj, axum::Router)>,
-    pool: Pool,
     /// Read access to [`PUBLISHED`] only.
     reader_jwt: String,
     /// Write access to [`PUBLISHED`] only.
@@ -340,7 +339,6 @@ async fn deploy() -> Option<Deployment> {
         database_url,
         jwks_url,
         services,
-        pool,
         reader_jwt: sign_jwt(&reader.external_subject),
         writer_jwt: sign_jwt(&writer.external_subject),
         stranger_jwt: sign_jwt(&stranger.external_subject),
@@ -636,6 +634,5 @@ fn an_invalid_prefix_is_refused() {
         .err()
         .expect("an invalid prefix must be refused");
         assert!(refused.to_string().contains("led-ger"), "{refused}");
-        let _ = &deployment.pool;
     });
 }

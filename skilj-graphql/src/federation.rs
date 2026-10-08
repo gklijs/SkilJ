@@ -114,6 +114,18 @@ pub fn unreachable_from_published(sdl: &str, naming: &Naming) -> Result<HashSet<
             types.insert(ty.node.name.node.to_string(), &ty.node.kind);
         }
     }
+    // Every object an interface-typed field can return, by interface.
+    let mut implementers: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, kind) in &types {
+        if let TypeKind::Object(object) = kind {
+            for interface in &object.implements {
+                implementers
+                    .entry(interface.node.to_string())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+    }
     let published: HashSet<String> = PUBLISHED_ROOT_FIELDS
         .iter()
         .map(|name| naming.root(name))
@@ -158,7 +170,15 @@ pub fn unreachable_from_published(sdl: &str, naming: &Naming) -> Result<HashSet<
             Some(TypeKind::Interface(interface)) => {
                 for field in &interface.fields {
                     pending.push(base_name(&field.node.ty.node.base));
+                    pending.extend(
+                        field
+                            .node
+                            .arguments
+                            .iter()
+                            .map(|arg| base_name(&arg.node.ty.node.base)),
+                    );
                 }
+                pending.extend(implementers.get(&name).into_iter().flatten().cloned());
             }
             Some(TypeKind::Union(union)) => {
                 pending.extend(union.members.iter().map(|m| m.node.to_string()));
@@ -265,16 +285,26 @@ pub fn is_service_request(query: &str, operation_name: Option<&str>) -> bool {
         })
 }
 
+/// How deep, and how many fields, a `_service` request may select: enough
+/// for `{ _service { sdl __typename } __typename }`. Anyone may send one,
+/// credential or not, and each `sdl` it selects is a copy of the whole
+/// description, so aliasing it many times over in one request is refused
+/// rather than answered (docs/architecture.md §72).
+const SERVICE_MAX_DEPTH: usize = 3;
+const SERVICE_MAX_COMPLEXITY: usize = 4;
+
 /// A schema of one field, `_service { sdl }`, answering with `sdl` - so a
 /// `_service` request gets the published description whoever sends it,
 /// with the caller's aliases, `__typename` and variables handled by
-/// ordinary execution.
-pub fn service_schema(sdl: String) -> Schema {
+/// ordinary execution, within a depth of 3 and a complexity of 4.
+pub fn service_schema(sdl: std::sync::Arc<String>) -> Schema {
     let service =
         Object::new("_Service").field(Field::new("sdl", TypeRef::named(TypeRef::STRING), |ctx| {
             FieldFuture::new(async move {
-                let sdl = ctx.parent_value.try_downcast_ref::<String>()?;
-                Ok(Some(FieldValue::value(sdl.clone())))
+                let sdl = ctx
+                    .parent_value
+                    .try_downcast_ref::<std::sync::Arc<String>>()?;
+                Ok(Some(FieldValue::value(sdl.as_str())))
             })
         }));
     let query = Object::new("Query").field(Field::new(
@@ -288,6 +318,8 @@ pub fn service_schema(sdl: String) -> Schema {
     Schema::build("Query", None, None)
         .register(service)
         .register(query)
+        .limit_depth(SERVICE_MAX_DEPTH)
+        .limit_complexity(SERVICE_MAX_COMPLEXITY)
         .finish()
         .expect("a fixed two-type schema")
 }
@@ -295,6 +327,34 @@ pub fn service_schema(sdl: String) -> Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_service_schema_answers_once_and_refuses_many_copies() {
+        let schema = service_schema(std::sync::Arc::new("type Query { a: Int }".to_string()));
+        let response = schema
+            .execute("query SubgraphIntrospectQuery { _service { sdl __typename } __typename }")
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data,
+            async_graphql::value!({
+                "_service": { "sdl": "type Query { a: Int }", "__typename": "_Service" },
+                "__typename": "Query",
+            })
+        );
+        let aliased = (0..10)
+            .map(|i| format!("a{i}: sdl"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let response = schema
+            .execute(format!("{{ _service {{ {aliased} }} }}"))
+            .await;
+        assert!(
+            !response.errors.is_empty(),
+            "aliasing sdl ten times must be refused"
+        );
+        assert_eq!(response.data, async_graphql::Value::Null);
+    }
 
     #[test]
     fn a_service_request_is_only_service_and_typename() {
@@ -360,5 +420,28 @@ mod tests {
             hidden,
             ["LedgerBoundedContext", "LedgerRole", "LedgerRoleInput"]
         );
+    }
+
+    #[test]
+    fn an_interface_reaches_its_implementers_and_its_arguments() {
+        let naming = Naming::default();
+        let sdl = r#"
+            type Query {
+                epoch: String!
+                projectionSchema: Shape
+                queryEvents: [Admin!]!
+            }
+            interface Shape { area(unit: Unit): Int }
+            type Square implements Shape { area(unit: Unit): Int }
+            type Circle implements Shape { area(unit: Unit): Int }
+            enum Unit { CM }
+            type Admin { id: ID! }
+        "#;
+        let mut hidden: Vec<_> = unreachable_from_published(sdl, &naming)
+            .unwrap()
+            .into_iter()
+            .collect();
+        hidden.sort();
+        assert_eq!(hidden, ["Admin"]);
     }
 }
