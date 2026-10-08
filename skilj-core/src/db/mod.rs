@@ -12226,6 +12226,15 @@ struct CatchUpChunkTarget<'a> {
 /// promotion takes them (docs/architecture.md §156): every projection row
 /// first, then every rebuild row, each by name so two instances' chunks
 /// can't take two of them in opposite orders, then their state rows.
+///
+/// `FOR NO KEY UPDATE`, not `FOR UPDATE` (docs/architecture.md §195): it
+/// still excludes another chunk and a promotion, but not the `KEY SHARE`
+/// a sync projection's state insert takes on its projection row through
+/// the foreign key. A row the caller saw as async may have turned sync
+/// by the time it is locked, and a `FOR UPDATE` kept on it to the end of
+/// the chunk stalled every write folding into it, under the sequence
+/// lock. Promotion doesn't wait for a chunk either; see
+/// [`promote_projection_rebuild`].
 #[allow(clippy::too_many_arguments)]
 async fn fold_catch_up_chunk(
     pool: &Pool,
@@ -12286,7 +12295,8 @@ async fn fold_catch_up_chunk_in_tx(
     candidates.sort_by(|a, b| a.name.cmp(&b.name));
     for projection in candidates {
         let current: Option<(Option<i64>, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT caught_up_to, sync FROM {schema}.projections WHERE name = $1 FOR UPDATE"
+            "SELECT caught_up_to, sync FROM {schema}.projections WHERE name = $1 \
+             FOR NO KEY UPDATE"
         )))
         .bind(&projection.name)
         .fetch_optional(&mut *tx)
@@ -12313,7 +12323,7 @@ async fn fold_catch_up_chunk_in_tx(
     for rebuild in candidates {
         let current: Option<(Option<i64>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT caught_up_to FROM {schema}.projection_rebuilds \
-             WHERE projection_name = $1 AND status = 'building' FOR UPDATE"
+             WHERE projection_name = $1 AND status = 'building' FOR NO KEY UPDATE"
         )))
         .bind(&rebuild.projection.name)
         .fetch_optional(&mut *tx)
@@ -13648,6 +13658,21 @@ pub async fn register_new_sync_projection(
         .flatten();
 
     let mut tx = pool.begin().await?;
+    if needs_history_fold {
+        // docs/architecture.md §195: the hidden async row is one a catch-up
+        // chunk folds into and holds for a whole chunk. Wait for it before
+        // the sequence lock, not under it, where every write to the
+        // bounded context would wait too. Nothing takes the sequence lock
+        // and then waits on this row: live writes fold only sync
+        // projections, and promotion doesn't wait.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT 1 FROM {}.projections WHERE name = $1 FOR NO KEY UPDATE",
+            schema_ident(bounded_context)
+        )))
+        .bind(&projection.name)
+        .execute(&mut *tx)
+        .await?;
+    }
     let locked_highest = lock_bounded_context_sequence(&mut tx, bounded_context).await?;
     // With the lock held no event can commit, so this sees the complete
     // tail. Read on `tx` itself: every writer to this bounded context now
@@ -13722,6 +13747,9 @@ pub async fn register_new_sync_projection(
     Ok(stored)
 }
 
+/// SQLSTATE `lock_not_available`: a `NOWAIT` lock found its row taken.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
 /// Promotes a `building` `ProjectionRebuild` that has caught up to its
 /// bounded context's latest committed sequence - `catch_up_bounded_context`'s
 /// own last step for each rebuild it walks. One transaction: the rebuild's
@@ -13781,6 +13809,32 @@ pub async fn promote_projection_rebuild(
     // `RebuildProjection` trigger, unrelated to whichever build just
     // finished.
     let building = projection_rebuild_status_to_str(ProjectionRebuildStatus::Building);
+
+    // docs/architecture.md §195: a catch-up chunk holds these rows for up
+    // to `CATCH_UP_EVENTS_PER_TRANSACTION` events. Waiting for it here,
+    // with the sequence lock held, stalled every write to the bounded
+    // context for that long. So take them without waiting, in the
+    // chunk's order, and defer to the next tick when one is busy - the
+    // same `false` as a rebuild that isn't caught up yet.
+    for lock in [
+        format!("SELECT 1 FROM {schema}.projections WHERE name = $1 FOR UPDATE NOWAIT"),
+        format!(
+            "SELECT 1 FROM {schema}.projection_rebuilds \
+             WHERE projection_name = $1 AND status = 'building' FOR UPDATE NOWAIT"
+        ),
+    ] {
+        match sqlx::query(sqlx::AssertSqlSafe(lock))
+            .bind(projection_name)
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(LOCK_NOT_AVAILABLE) => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     let rebuild_row: ProjectionRebuildRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PROJECTION_REBUILD_COLUMNS} FROM {schema}.projection_rebuilds \

@@ -755,6 +755,76 @@ fn promotion_defers_instead_of_stranding_an_event_committed_after_the_fold_pass(
     });
 }
 
+/// docs/architecture.md §195: a catch-up chunk holds the projection row
+/// for its whole run. Promotion takes the bounded context's sequence lock
+/// first, so waiting there for the chunk stalled every write. It defers
+/// instead, and promotes on a later call once the row is free.
+#[test]
+fn promotion_defers_instead_of_waiting_for_a_catch_up_chunk() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_event_type(&pool, &bc, "MoneyDeposited").await;
+        let existing = seed_async_projection(&pool, &bc, "AccountBalance", vec![et.clone()]).await;
+        let seq = insert_plain_event(&pool, &bc, &et, 20).await;
+        db::upsert_projection_rebuild(
+            &pool,
+            &ProjectionRebuild {
+                projection: existing,
+                schema: r#"{"properties":{"total":{"type":"integer"}}}"#.to_string(),
+                schema_version: 2,
+                consumed_event_types: vec![et.clone()],
+                sync: true,
+                caught_up_to: Some(seq),
+                status: ProjectionRebuildStatus::Building,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Held the way `fold_catch_up_chunk` holds it.
+        let schema = format!("\"bc_{}\"", bc.name);
+        let mut chunk = pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT 1 FROM {schema}.projections WHERE name = 'AccountBalance' FOR NO KEY UPDATE"
+        )))
+        .execute(&mut *chunk)
+        .await
+        .unwrap();
+
+        let promoted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db::promote_projection_rebuild(&pool, &bc.name, "AccountBalance"),
+        )
+        .await
+        .expect("promotion waited for the chunk")
+        .unwrap();
+        assert!(
+            !promoted,
+            "promotion must defer while a chunk holds the row"
+        );
+        // Writes go on meanwhile: the promotion let go of the sequence lock.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            insert_plain_event(&pool, &bc, &et, 1),
+        )
+        .await
+        .expect("a write waited behind the promotion");
+
+        chunk.commit().await.unwrap();
+        db::catch_up_bounded_context(&pool, &bc.name, &TestDispatcher)
+            .await
+            .unwrap();
+        let projection = db::get_projection(&pool, &bc.name, "AccountBalance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(projection.sync, "promoted once the row was free");
+    });
+}
+
 /// The same finding, proven under a genuine concurrent race rather than
 /// a hand-sequenced one - `tokio::join!`, the same real-concurrency
 /// pattern `admin_context_bootstrap.rs`'s own

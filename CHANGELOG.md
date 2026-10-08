@@ -161,6 +161,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A projection rebuild's promotion, or a new sync projection's
+  registration, no longer waits for another instance's catch-up chunk
+  while holding the bounded context's sequence lock, which stalled every
+  write to it for the chunk's length (docs/architecture.md §195).
+
 - `POST /v1/events/external` ignores an `Idempotency-Key` header when the
   body has a `dedupe` cursor, as 0.0.9 did, instead of refusing the request
   with `dedupe_and_idempotency_key`: gateways add the header to every POST
