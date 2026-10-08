@@ -58,6 +58,10 @@
 //! watermark: a released or unsettled message comes back after
 //! deliveries the link already holds, and with competing consumers in
 //! any order, so a per-group watermark would drop it as already seen.
+//! A key skilj would refuse - over 255 characters, or starting with
+//! `skilj-` - is sent as its SHA-256 instead
+//! (`skilj_bridge::wire_idempotency_key`, [§195](../../docs/architecture.md#review-since-0-0-9)),
+//! for the message and its parked-delivery report alike.
 //! [`InboundAction::Trigger`] uses `message-id`
 //! (when present) as `Idempotency-Key` ([§21](../../docs/architecture.md#optional-idempotency-key-submission)) - a broader, more commonly
 //! populated standard property (most senders set it, often to a UUID),

@@ -161,6 +161,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The bridges no longer redeliver a message forever when its
+  `Idempotency-Key` is longer than 255 characters or starts with `skilj-`:
+  such a key is sent as `bridge-sha256:<hex>` instead, on the message and
+  its parked-delivery report (docs/architecture.md §195). New:
+  `skilj_bridge::wire_idempotency_key`.
+
 - Instances starting together against a bounded context from before the
   registrations counter (docs/architecture.md §189) could fail `build()`
   on a duplicate `CREATE`. It is now patched in under an advisory lock

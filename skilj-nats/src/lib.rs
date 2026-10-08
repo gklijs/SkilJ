@@ -67,6 +67,10 @@
 //! sender populated one) as `Idempotency-Key` - omitted, never
 //! fabricated, when absent, the same "omitting it is always fine"
 //! register every other bridge in this workspace already has.
+//! A key skilj would refuse - over 255 characters, or starting with
+//! `skilj-` - is sent as its SHA-256 instead
+//! (`skilj_bridge::wire_idempotency_key`, [§195](../../docs/architecture.md#review-since-0-0-9)),
+//! for the message and its parked-delivery report alike.
 //!
 //! # Dead-letter/parking (Codeberg issue #21)
 //!

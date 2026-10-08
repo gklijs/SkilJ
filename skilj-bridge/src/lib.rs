@@ -245,11 +245,40 @@ impl InboundAction {
     }
 }
 
+/// The most characters skilj accepts in an `Idempotency-Key`
+/// (`skilj_core::event_store::MAX_IDEMPOTENCY_KEY_CHARS`, mirrored: this
+/// crate speaks the wire protocol only).
+const MAX_IDEMPOTENCY_KEY_CHARS: usize = 255;
+
+/// The prefix skilj's own internally derived idempotency keys start with
+/// (cross-context routes, deadlines, parked redrives); skilj refuses a
+/// caller's key bearing one of them.
+const RESERVED_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-";
+
+/// `key` as an inbound request sends it: unchanged, unless skilj would
+/// refuse it - longer than 255 characters, or in skilj's own `skilj-`
+/// namespace - in which case `bridge-sha256:` and the SHA-256 of `key` in
+/// hex. Still one fixed string per message, so redeliveries are still
+/// deduplicated. Before, such a key was refused on ingestion and on the
+/// parked-delivery report alike, so its message was redelivered forever
+/// (docs/architecture.md §195).
+pub fn wire_idempotency_key(key: &str) -> std::borrow::Cow<'_, str> {
+    use sha2::Digest;
+    if key.chars().count() <= MAX_IDEMPOTENCY_KEY_CHARS
+        && !key.starts_with(RESERVED_IDEMPOTENCY_KEY_PREFIX)
+    {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let digest = sha2::Sha256::digest(key.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::borrow::Cow::Owned(format!("bridge-sha256:{hex}"))
+}
+
 /// Sends an inbound message's request `body` for `mapping` - `POST
 /// /v1/events/external` for `Record`, `POST /v1/commands/trigger` for
 /// `Trigger`, either with `idempotency_key` as its `Idempotency-Key`
 /// header (an external event's per-message key, docs/architecture.md
-/// §175). A `Trigger` rejection is a `200 { accepted: false, ... }`, not
+/// §175), through [`wire_idempotency_key`]. A `Trigger` rejection is a `200 { accepted: false, ... }`, not
 /// an error: the message was delivered and decided upon, which is all a
 /// bridge promises.
 pub async fn post_inbound(
@@ -264,7 +293,7 @@ pub async fn post_inbound(
         InboundAction::Trigger { .. } => http.post(format!("{skilj_base_url}/v1/commands/trigger")),
     };
     let request = match idempotency_key {
-        Some(key) => request.header("Idempotency-Key", key),
+        Some(key) => request.header("Idempotency-Key", wire_idempotency_key(key).as_ref()),
         None => request,
     };
     let response = request
@@ -282,7 +311,8 @@ pub async fn post_inbound(
 /// context from the presented token). `source` names the bridge
 /// (`"kafka-inbound"`, ...), `identifier` the message within it.
 /// `request` is the exact body that kept failing and `idempotency_key`
-/// the header it was sent with, both stored so a later
+/// the key it was sent with (through [`wire_idempotency_key`], as
+/// [`post_inbound`] sends it), both stored so a later
 /// `retryParkedDelivery` redrives the identical request.
 #[allow(clippy::too_many_arguments)]
 pub async fn report_parked_delivery(
@@ -308,7 +338,7 @@ pub async fn report_parked_delivery(
             "attemptCount": attempt_count,
             "firstFailedAt": first_failed_at.to_rfc3339(),
             "request": request,
-            "idempotencyKey": idempotency_key,
+            "idempotencyKey": idempotency_key.map(wire_idempotency_key),
         }))
         .send()
         .await?;
@@ -689,6 +719,30 @@ mod tests {
             r#"{"code":"database_error","message":"x"}"#
         ));
         assert!(!another_instance_refusal("Bad Gateway"));
+    }
+
+    /// docs/architecture.md §195: a key skilj accepts goes out as it is;
+    /// one it would refuse goes out as a fixed hash skilj accepts.
+    #[test]
+    fn only_a_key_skilj_would_refuse_is_hashed() {
+        for key in ["orders:42", &"x".repeat(255), "skiljx-1"] {
+            assert_eq!(wire_idempotency_key(key), key);
+        }
+        let long = "é".repeat(256);
+        for key in [
+            long.as_str(),
+            "skilj-deadline:1",
+            "skilj-cross-context-route:r:1",
+        ] {
+            let sent = wire_idempotency_key(key);
+            assert!(sent.starts_with("bridge-sha256:"), "{sent}");
+            assert_eq!(sent.len(), "bridge-sha256:".len() + 64);
+            assert_eq!(sent, wire_idempotency_key(key), "deterministic");
+        }
+        assert_ne!(
+            wire_idempotency_key(&"a".repeat(300)),
+            wire_idempotency_key(&"b".repeat(300))
+        );
     }
 
     #[test]
