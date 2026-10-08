@@ -5912,7 +5912,16 @@ impl std::fmt::Display for Epoch {
 /// name: it changes the moment a standby is promoted, where
 /// `pg_control_checkpoint()`'s only changes at the next checkpoint. Valid
 /// on a primary only, which is the only server skilj talks to.
-const EPOCH_SQL: &str = "(SELECT system_identifier::text FROM pg_control_system()) \
+///
+/// `pg_control_system()` reads `global/pg_control` under `ControlFileLock`
+/// on every call, and this runs on every event-cache freshen, so the
+/// system identifier is kept in a session setting the first time and read
+/// from there after (docs/architecture.md §195): it can't change for one
+/// session, which is always connected to the same server. `nullif` because
+/// `DISCARD ALL` (a pooler's reset) leaves the setting empty, not unset.
+const EPOCH_SQL: &str = "coalesce(nullif(current_setting('skilj.system_identifier', true), ''), \
+     set_config('skilj.system_identifier', \
+         (SELECT system_identifier::text FROM pg_control_system()), false)) \
      || '-' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)";
 
 /// The database's current [`Epoch`] - on a transaction's connection, the

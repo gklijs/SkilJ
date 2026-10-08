@@ -715,10 +715,40 @@ fn a_bounded_context_without_the_counter_is_stamped_by_hashing() {
     });
 }
 
-/// docs/architecture.md §187 (Codeberg #50): a tag read returns only the
-/// matching events, and says it is complete through the window's highest
-/// sequence - matching or not - which is where a command's re-check under
-/// the lock starts (§178).
+/// docs/architecture.md §195: the epoch keeps the system identifier in a
+/// session setting after the first read. It is the same as reading
+/// `pg_control_system()` directly, also after a pooler's reset
+/// empties the setting.
+#[test]
+fn the_session_cached_epoch_matches_the_control_file() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let mut conn = pool.acquire().await.unwrap();
+        let (direct,): (String,) = sqlx::query_as(
+            "SELECT (SELECT system_identifier::text FROM pg_control_system()) \
+             || '-' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                db::current_epoch(&mut *conn).await.unwrap().as_str(),
+                direct
+            );
+        }
+        // The part of a pooler's `DISCARD ALL` that empties the setting
+        // (all of it would also drop this connection's prepared statements).
+        sqlx::query("RESET ALL").execute(&mut *conn).await.unwrap();
+        assert_eq!(
+            db::current_epoch(&mut *conn).await.unwrap().as_str(),
+            direct
+        );
+    });
+}
+
 /// docs/architecture.md §195: instances starting together against a
 /// bounded context from before the counter all patch it in, rather than
 /// all but one failing on a duplicate `CREATE FUNCTION`/`CREATE TRIGGER`.
@@ -756,6 +786,10 @@ fn concurrent_startups_all_patch_in_the_counter() {
     });
 }
 
+/// docs/architecture.md §187 (Codeberg #50): a tag read returns only the
+/// matching events, and says it is complete through the window's highest
+/// sequence - matching or not - which is where a command's re-check under
+/// the lock starts (§178).
 #[test]
 fn a_tag_read_serves_the_matching_events_complete_through_the_whole_window() {
     runtime().block_on(async {
