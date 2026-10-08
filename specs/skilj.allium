@@ -2301,6 +2301,8 @@ rule CreateExternalEvent {
     -- where the watermark costs one number per partition, which is why
     -- both exist, and an adapter supplies one or the other, never both:
     -- the guard below refuses a submission naming both as malformed.
+    -- (Over REST the header is ignored when the body names a cursor, so
+    -- that surface never names both.)
     --
     -- Scoped to the adapter, as the watermark is and for the same
     -- reason, and kept for config.idempotency_key_retention like a

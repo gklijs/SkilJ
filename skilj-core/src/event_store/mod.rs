@@ -641,7 +641,9 @@ pub enum Error {
 
     /// An external event naming both a `dedupe` cursor and an
     /// `Idempotency-Key` - specs/skilj.allium's `rule CreateExternalEvent`
-    /// takes one or the other (docs/architecture.md §175).
+    /// takes one or the other (docs/architecture.md §175). Raised for a
+    /// parked-delivery report naming both; `POST /v1/events/external`
+    /// ignores the header when there is a cursor instead (§195).
     #[error("an external event takes either a dedupe cursor or an idempotency key, not both")]
     DedupeAndIdempotencyKey,
 

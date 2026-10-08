@@ -161,6 +161,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `POST /v1/events/external` ignores an `Idempotency-Key` header when the
+  body has a `dedupe` cursor, as 0.0.9 did, instead of refusing the request
+  with `dedupe_and_idempotency_key`: gateways add the header to every POST
+  (docs/architecture.md §195).
+
 - The bridges no longer redeliver a message forever when its
   `Idempotency-Key` is longer than 255 characters or starts with `skilj-`:
   such a key is sent as `bridge-sha256:<hex>` instead, on the message and

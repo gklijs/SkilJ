@@ -1969,10 +1969,18 @@ fn retrying_a_parked_external_event_whose_keyed_original_committed_is_deduplicat
 
         let mut with_cursor = original.clone();
         with_cursor["dedupe"] = json!({ "partitionKey": "ORDERS", "sequence": 10 });
-        let (status, refused) =
+        // docs/architecture.md §195: with a cursor, the header is ignored -
+        // the cursor creates the event and recognises its redelivery,
+        // whatever key a gateway put on either request.
+        let (status, with_both) =
             post("/v1/events/external", Some("ORDERS:10"), with_cursor.clone()).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(refused["code"], "dedupe_and_idempotency_key", "{refused}");
+        assert_eq!(status, StatusCode::CREATED, "{with_both}");
+        assert_eq!(with_both["redelivered"], false);
+        let long_key: &'static str = Box::leak("k".repeat(300).into_boxed_str());
+        let (status, again) =
+            post("/v1/events/external", Some(long_key), with_cursor.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{again}");
+        assert_eq!(again["redelivered"], true);
 
         let report = |request: serde_json::Value| {
             json!({
@@ -2004,7 +2012,11 @@ fn retrying_a_parked_external_event_whose_keyed_original_committed_is_deduplicat
         let events = db::list_events_for_bounded_context(&pool, &bc_name)
             .await
             .unwrap();
-        assert_eq!(events.len(), 1, "the keyed original must not be created twice");
+        assert_eq!(
+            events.len(),
+            2,
+            "the keyed original must not be created twice, beside the cursor's one"
+        );
         assert!(db::list_parked_deliveries(&pool, &bc_name)
             .await
             .unwrap()

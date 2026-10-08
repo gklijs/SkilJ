@@ -705,20 +705,27 @@ async fn post_events_external(
     let token = resolve_token::<ExternalEventToken>(&state, &credential).await?;
     // docs/architecture.md §175: the per-message alternative to `dedupe`,
     // for a source that redelivers out of order. Same header, same limits
-    // as on `POST /v1/commands/trigger`.
+    // as on `POST /v1/commands/trigger`. A body `dedupe` cursor wins and the
+    // header is ignored, as before §175: gateways and HTTP clients add an
+    // `Idempotency-Key` to every POST, and refusing those broke producers
+    // that send a cursor (§195).
     let idempotency_key = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok());
-    event_store::reject_reserved_idempotency_key(idempotency_key)?;
     let dedupe = match (&body.dedupe, idempotency_key) {
-        (Some(_), Some(_)) => {
-            return Err(
-                skilj_core::error::Error::from(event_store::Error::DedupeAndIdempotencyKey).into(),
-            )
+        (Some(d), key) => {
+            if key.is_some() {
+                tracing::debug!(
+                    "ignoring the Idempotency-Key header of an external event with a dedupe cursor"
+                );
+            }
+            Some(db::ExternalEventDedupe::Watermark(db::DedupeCursor {
+                partition_key: &d.partition_key,
+                sequence: d.sequence,
+            }))
         }
-        (Some(d), None) => Some(db::ExternalEventDedupe::Watermark(db::DedupeCursor {
-            partition_key: &d.partition_key,
-            sequence: d.sequence,
-        })),
-        (None, Some(key)) => Some(db::ExternalEventDedupe::Key(key)),
+        (None, Some(key)) => {
+            event_store::reject_reserved_idempotency_key(Some(key))?;
+            Some(db::ExternalEventDedupe::Key(key))
+        }
         (None, None) => None,
     };
     let payload = serde_json::to_string(&body.payload)
