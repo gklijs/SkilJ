@@ -9621,15 +9621,185 @@ async fn write_planned_commands(
     }
 
     if !sync_projections.is_empty() {
-        for (event, _) in &events {
-            fold_event_into_sync_projections_in_tx(
-                tx,
-                event,
-                projection_dispatcher,
-                sync_projections,
-            )
+        let events: Vec<&Event> = events.iter().map(|(event, _)| *event).collect();
+        fold_events_into_sync_projections_in_tx(
+            tx,
+            bounded_context,
+            &events,
+            projection_dispatcher,
+            sync_projections,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Folds a batch's `events`, already inserted on `tx` and in sequence
+/// order, into every one of `sync_projections` at once - what folding
+/// them one by one with [`fold_event_into_sync_projections_in_tx`] does,
+/// with a few statements per projection instead of two per key per event
+/// (docs/architecture.md §196), the way the async catch-up folds a chunk
+/// (§182): every row the events touch is read and locked in one
+/// statement, the events are folded into them in memory, in order, each
+/// row is written back in one statement, and `caught_up_to` moves once.
+async fn fold_events_into_sync_projections_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    bounded_context: &str,
+    events: &[&Event],
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    sync_projections: &[String],
+) -> crate::error::Result<()> {
+    let Some(last) = events.last() else {
+        return Ok(());
+    };
+    let schema = schema_ident(bounded_context);
+    for projection_name in sync_projections {
+        // As in `fold_event_into_sync_projections_in_tx`: a projection
+        // this instance doesn't declare can't be folded here, and a write
+        // that it consumes is refused (docs/architecture.md §160).
+        let Some(default_state_json) = dispatcher.default_state(bounded_context, projection_name)
+        else {
+            let mut types: Vec<&str> = events.iter().map(|e| e.event_type.name.as_str()).collect();
+            types.sort_unstable();
+            types.dedup();
+            let consumes: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT EXISTS (SELECT 1 FROM {schema}.projection_consumed_event_types \
+                 WHERE projection_name = $1 AND event_type_name = ANY($2))"
+            )))
+            .bind(projection_name)
+            .bind(&types)
+            .fetch_one(&mut **tx)
             .await?;
+            if consumes {
+                return Err(crate::event_store::Error::SyncProjectionNotDeclared(
+                    projection_name.clone(),
+                )
+                .into());
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
+            )))
+            .bind(last.sequence)
+            .bind(projection_name)
+            .execute(&mut **tx)
+            .await?;
+            continue;
+        };
+        let owner_tag_key = dispatcher
+            .owner_tag_key(bounded_context, projection_name)
+            .flatten();
+
+        let mut touched: Vec<(&Event, Vec<String>)> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for event in events {
+            let event_keys = dispatcher
+                .keys(bounded_context, projection_name, event)
+                .unwrap_or_default();
+            for key in &event_keys {
+                if seen.insert(key.clone()) {
+                    keys.push(key.clone());
+                }
+            }
+            if !event_keys.is_empty() {
+                touched.push((event, event_keys));
+            }
         }
+
+        if !keys.is_empty() {
+            // Get-or-create-with-lock, every key at once - see
+            // `get_or_create_projection_state_for_update`.
+            let rows: Vec<(String, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
+                 SELECT $1, key, $3, now() FROM unnest($2::text[]) AS key \
+                 ON CONFLICT (projection_name, key) DO UPDATE SET \
+                 state = {schema}.projection_state.state \
+                 RETURNING key, as_of_sequence, state"
+            )))
+            .bind(projection_name)
+            .bind(&keys)
+            .bind(&default_state_json)
+            .fetch_all(&mut **tx)
+            .await?;
+            let mut states: std::collections::HashMap<String, CatchUpChunkState> = rows
+                .into_iter()
+                .map(|(key, as_of_sequence, state)| {
+                    (
+                        key,
+                        CatchUpChunkState {
+                            as_of_sequence,
+                            state,
+                            owner: None,
+                            folded: false,
+                        },
+                    )
+                })
+                .collect();
+
+            for (event, event_keys) in &touched {
+                let owner = event_owner(owner_tag_key, event);
+                for key in event_keys {
+                    let entry = states
+                        .get_mut(key)
+                        .expect("every touched key's row was just read");
+                    if entry.as_of_sequence >= event.sequence {
+                        continue;
+                    }
+                    if let Some(result) = dispatcher.project(
+                        bounded_context,
+                        projection_name,
+                        &entry.state,
+                        event,
+                        key,
+                    ) {
+                        entry.state = result?;
+                    }
+                    entry.as_of_sequence = event.sequence;
+                    if owner.is_some() {
+                        entry.owner.clone_from(&owner);
+                    }
+                    entry.folded = true;
+                }
+            }
+
+            let mut folded_keys = Vec::new();
+            let mut folded_states = Vec::new();
+            let mut owners = Vec::new();
+            let mut as_of_sequences = Vec::new();
+            for (key, folded) in states.iter().filter(|(_, s)| s.folded) {
+                folded_keys.push(key.as_str());
+                folded_states.push(folded.state.as_str());
+                owners.push(folded.owner.as_deref());
+                as_of_sequences.push(folded.as_of_sequence);
+            }
+            if !folded_keys.is_empty() {
+                // A `NULL` owner leaves the stored one as it is - see
+                // `apply_projection_fold_update`.
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {schema}.projection_state AS s SET state = u.state, \
+                     owner = COALESCE(u.owner, s.owner), as_of_sequence = u.as_of_sequence, \
+                     updated_at = now() \
+                     FROM unnest($2::text[], $3::text[], $4::text[], $5::bigint[]) \
+                     AS u(key, state, owner, as_of_sequence) \
+                     WHERE s.projection_name = $1 AND s.key = u.key"
+                )))
+                .bind(projection_name)
+                .bind(&folded_keys)
+                .bind(&folded_states)
+                .bind(&owners)
+                .bind(&as_of_sequences)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.projections SET caught_up_to = $1 WHERE name = $2"
+        )))
+        .bind(last.sequence)
+        .bind(projection_name)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }

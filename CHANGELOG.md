@@ -89,6 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A command batch folds its events into each sync projection at once: the
+  rows they touch are locked and read in one statement, folded in memory and
+  written back in one, instead of two statements per key per event
+  (docs/architecture.md §196).
+
 - A command batch re-checks its commands' reads with one tag query over
   all their consistency tags, instead of one query per command under the
   bounded context's lock (docs/architecture.md §196).

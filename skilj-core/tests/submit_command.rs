@@ -151,6 +151,11 @@ impl ProjectionDispatcher for TestProjectionDispatcher {
     ) -> Option<Vec<String>> {
         match projection_name {
             "Poisonable" => Some(vec![String::new()]),
+            "ShipCount" => Some(if _event.event_type.name == "OrderShipped" {
+                vec![String::new()]
+            } else {
+                Vec::new()
+            }),
             _ => None,
         }
     }
@@ -171,13 +176,14 @@ impl ProjectionDispatcher for TestProjectionDispatcher {
                 .into()))
             }
             "Poisonable" => Some(Ok(state_json.to_string())),
+            "ShipCount" => Some(Ok((state_json.parse::<i64>().unwrap() + 1).to_string())),
             _ => None,
         }
     }
 
     fn default_state(&self, _bounded_context: &str, projection_name: &str) -> Option<String> {
         match projection_name {
-            "Poisonable" => Some("0".to_string()),
+            "Poisonable" | "ShipCount" => Some("0".to_string()),
             _ => None,
         }
     }
@@ -189,6 +195,7 @@ impl ProjectionDispatcher for TestProjectionDispatcher {
     ) -> Option<Option<&'static str>> {
         match projection_name {
             "Poisonable" => Some(None),
+            "ShipCount" => Some(Some("order")),
             _ => None,
         }
     }
@@ -199,7 +206,7 @@ impl ProjectionDispatcher for TestProjectionDispatcher {
         projection_name: &str,
     ) -> Option<Option<&'static str>> {
         match projection_name {
-            "Poisonable" => Some(None),
+            "Poisonable" | "ShipCount" => Some(None),
             _ => None,
         }
     }
@@ -2244,5 +2251,86 @@ fn one_recheck_per_batch_gives_each_command_only_its_own_conflicts() {
                 (order, other) => panic!("unexpected outcome for {order}: {other:?}"),
             }
         }
+    });
+}
+
+/// docs/architecture.md §196: a batch folds its events into a sync
+/// projection at once - one row read and locked, the events folded in
+/// order, written back once. Three orders ship in one batch into one
+/// counting row: it counts three, takes the last event's owner and
+/// position, and the projection is caught up to the last event.
+#[test]
+fn a_batch_folds_its_events_into_a_sync_projection_at_once() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let et = seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        db::upsert_projection(
+            &pool,
+            &Projection {
+                bounded_context: bc.clone(),
+                name: "ShipCount".to_string(),
+                schema: r#"{"properties":{}}"#.to_string(),
+                schema_version: 1,
+                consumed_event_types: vec![et.clone()],
+                sync: true,
+                caught_up_to: None,
+            },
+        )
+        .await
+        .unwrap();
+        let dispatcher = TestCommandDispatcher::new();
+        let command = |order: &str| {
+            let payload = format!(r#"{{"order_id":"{order}"}}"#);
+            let decision = dispatcher
+                .dispatch(&bc.name, &ct.name, &payload, &[])
+                .unwrap()
+                .unwrap();
+            batched(
+                &ct,
+                &payload,
+                decision,
+                vec![Tag {
+                    key: "order".to_string(),
+                    value: Some(order.to_string()),
+                }],
+            )
+        };
+
+        let results = db::submit_command_batch(
+            &pool,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            &bc.name,
+            vec![command("B"), command("C"), command("D")],
+        )
+        .await
+        .unwrap();
+        assert!(results
+            .iter()
+            .all(|r| matches!(r, Ok(SubmitCommandOutcome::Accepted { .. }))));
+
+        let (state, owner, as_of): (String, Option<String>, i64) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT state, owner, as_of_sequence FROM \"bc_{}\".projection_state \
+                 WHERE projection_name = 'ShipCount' AND key = ''",
+                bc.name
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), owner.as_deref(), as_of),
+            ("3", Some("D"), 2)
+        );
+        let projection = db::get_projection(&pool, &bc.name, "ShipCount")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.caught_up_to, Some(2));
     });
 }
