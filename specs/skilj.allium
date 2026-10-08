@@ -1803,7 +1803,9 @@ default SystemCreator skilj = { }
 -- that hands a position back together with the epoch it was read in is
 -- refused when the epoch is no longer current, rather than served from a
 -- sequence that now means something else. One that sends no epoch is
--- served as before.
+-- served as before. Over REST, the cursor a fetch hands out carries its
+-- epoch, so a caller passing that cursor back as after_sequence sends
+-- the epoch with it without asking.
 --
 -- next_sequence(bounded_context), used below in CreateExternalEvent,
 -- CreateDirectEvent and ProcessCommand, and the consistency-boundary

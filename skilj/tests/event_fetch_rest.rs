@@ -221,6 +221,16 @@ async fn deposit(router: &axum::Router, credential: &str, amount: i64) {
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
+/// The sequence a `GET /v1/events` response's `nextCursor`
+/// (`"{sequence}@{epoch}"`, docs/architecture.md §195) points at, checking
+/// that the cursor's epoch is the response's own.
+fn cursor_sequence(page: &serde_json::Value) -> String {
+    let cursor = page["nextCursor"].as_str().expect("a nextCursor");
+    let (sequence, epoch) = cursor.split_once('@').expect("a cursor with an epoch");
+    assert_eq!(Some(epoch), page["epoch"].as_str(), "{cursor}");
+    sequence.to_string()
+}
+
 #[test]
 fn get_events_filter_param_narrows_results_for_real_over_rest() {
     runtime().block_on(async {
@@ -1259,15 +1269,15 @@ fn reads_serve_bounded_pages_and_continue_where_they_stopped() {
             .to_string();
         let page = get_json(&router, &reader, "/v1/events?filter=amount:in:1").await;
         assert_eq!(amounts(&page), vec![1]);
-        assert_eq!(page["nextCursor"].as_str(), Some(newest.as_str()));
+        assert_eq!(cursor_sequence(&page), newest);
         let page = get_json(&router, &reader, "/v1/events?filter=amount:in:99").await;
         assert_eq!(amounts(&page), Vec::<i64>::new());
-        assert_eq!(page["nextCursor"].as_str(), Some(newest.as_str()));
+        assert_eq!(cursor_sequence(&page), newest);
         // A full page stops at its last event: what follows wasn't examined.
         let page = get_json(&router, &reader, "/v1/events?filter=amount:in:1,2,3,4").await;
         assert_eq!(amounts(&page), vec![1, 2, 3]);
         let third = page["events"][2]["sequence"].as_i64().unwrap().to_string();
-        assert_eq!(page["nextCursor"].as_str(), Some(third.as_str()));
+        assert_eq!(cursor_sequence(&page), third);
 
         // An auto-advance consumer's cursor passes over them too: after a
         // poll matching nothing, an unfiltered poll has nothing left.
@@ -1662,6 +1672,11 @@ fn a_failover_refuses_old_cursors_and_the_cache_drops_the_lost_events() {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
         assert_eq!(refused["code"], "epoch_changed");
+        // docs/architecture.md §195: the cursor alone is enough - it
+        // carries the epoch it was read in.
+        let (status, refused) = get_events(&router, &read, &format!("after={old_cursor}")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "epoch_changed");
 
         let (status, now) = get_events(&router, &read, "").await;
         assert_eq!(status, StatusCode::OK, "{now}");
@@ -1711,6 +1726,27 @@ fn positions_from_another_epoch_are_refused() {
             get_events(&router, &read, &format!("after={cursor}&epoch={epoch}")).await;
         assert_eq!(status, StatusCode::OK, "{same}");
         assert_eq!(same["epoch"], epoch.as_str());
+
+        // docs/architecture.md §195: the cursor carries its epoch, so it
+        // is checked without `epoch`; a bare sequence, as before, is not.
+        assert_eq!(cursor, format!("{}@{epoch}", cursor_sequence(&page)));
+        let (status, same) = get_events(&router, &read, &format!("after={cursor}")).await;
+        assert_eq!(status, StatusCode::OK, "{same}");
+        let sequence_only = cursor_sequence(&page);
+        let (status, refused) = get_events(
+            &router,
+            &read,
+            &format!("after={sequence_only}@elsewhere-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "epoch_changed");
+        let (status, same) = get_events(&router, &read, &format!("after={sequence_only}")).await;
+        assert_eq!(status, StatusCode::OK, "{same}");
+        for malformed in ["abc", "1@", "@x"] {
+            let (status, refused) = get_events(&router, &read, &format!("after={malformed}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{malformed}: {refused}");
+        }
 
         let consumed = get_json(&router, &read, "/v1/events/consume?mode=manual").await;
         assert_eq!(consumed["epoch"], epoch.as_str());

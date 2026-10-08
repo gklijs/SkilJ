@@ -89,6 +89,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `GET /v1/events`' `nextCursor` is now
+  `"{sequence}@{epoch}"`, so a client that passes it back as `after` is
+  refused with `409 epoch_changed` after a failover without sending
+  `epoch` itself (docs/architecture.md §195). `after` still accepts a bare
+  sequence, unchecked as before. A client that parsed `nextCursor` as a
+  number must treat it as an opaque string.
+
 - `DEFAULT_IDEMPOTENCY_KEY_RETENTION` is now 48 hours instead of one hour
   (docs/architecture.md §195). It also governs the per-message keys NATS
   and AMQP `Record` messages and keyed parked redrives are deduplicated by

@@ -478,9 +478,11 @@ impl From<&Event> for EventDto {
 #[serde(rename_all = "camelCase")]
 struct EventsResponse {
     events: Vec<EventDto>,
+    /// `"{sequence}@{epoch}"` - see [`events_cursor`].
     next_cursor: Option<String>,
     // docs/architecture.md §176: the database epoch `next_cursor` was
-    // read in - sent back as `epoch` with it.
+    // read in, also inside the cursor since §195 - for a client that keeps
+    // the two apart, or acknowledges with it.
     epoch: String,
     event_type_name: String,
     event_type_schema: String,
@@ -504,14 +506,46 @@ struct ConsumeResponse {
 struct EventsQuery {
     #[serde(default)]
     filter: Vec<String>,
-    after: Option<i64>,
+    // A `nextCursor` this route returned, `"{sequence}@{epoch}"`, or a bare
+    // sequence - see [`parse_after`].
+    after: Option<String>,
     // docs/architecture.md §176: the `epoch` the response carrying `after`
-    // as its `nextCursor` came with.
+    // as its `nextCursor` came with. Since §195 the cursor carries it too.
     epoch: Option<String>,
     // Codeberg issue #18 - "show me everything in this transaction",
     // the REST-side counterpart to `queryEvents`'s own `correlationId`
     // GraphQL argument.
     correlation_id: Option<String>,
+}
+
+/// `GET /v1/events`' `nextCursor`: the position and the database epoch it
+/// was read in, `"{sequence}@{epoch}"` (docs/architecture.md §195). A
+/// client that passes it back as `after` has its position checked against
+/// the epoch without sending `epoch` itself - before, only one that did
+/// was protected from a failover.
+fn events_cursor(sequence: i64, epoch: &db::Epoch) -> String {
+    format!("{sequence}@{epoch}")
+}
+
+/// `after` as [`events_cursor`] writes it, or a bare sequence as before
+/// §195 (a checkpoint kept from an older response, or one a client
+/// counted itself), which carries no epoch.
+fn parse_after(raw: &str) -> Result<(i64, Option<&str>), RestError> {
+    let (sequence, epoch) = match raw.split_once('@') {
+        Some((sequence, epoch)) => (sequence, Some(epoch)),
+        None => (raw, None),
+    };
+    let sequence = sequence.parse::<i64>().map_err(|_| {
+        RestError::InvalidRequest(format!(
+            "after {raw:?} is not a cursor - pass a nextCursor this route returned, or a sequence"
+        ))
+    })?;
+    if epoch.is_some_and(str::is_empty) {
+        return Err(RestError::InvalidRequest(format!(
+            "after {raw:?} names no epoch after its '@'"
+        )));
+    }
+    Ok((sequence, epoch))
 }
 
 #[derive(Deserialize)]
@@ -824,10 +858,15 @@ async fn get_events(
     // A cursor from another database epoch is refused whatever its value:
     // after a failover the log may end before it, or have reused it for
     // other events since (docs/architecture.md §176).
+    let (after, cursor_epoch) = match query.after.as_deref().map(parse_after).transpose()? {
+        Some((after, cursor_epoch)) => (Some(after), cursor_epoch),
+        None => (None, None),
+    };
     let (latest, epoch) =
         db::latest_sequence_and_epoch(&state.pool, &token.event_type.bounded_context.name).await?;
     db::require_epoch(query.epoch.as_deref(), &epoch)?;
-    if let Some(after) = query.after {
+    db::require_epoch(cursor_epoch, &epoch)?;
+    if let Some(after) = after {
         let latest = latest.unwrap_or(-1);
         if after > latest {
             return Err(RestError::InvalidRequest(format!(
@@ -843,14 +882,14 @@ async fn get_events(
         &state.event_cache,
         &token.event_type.bounded_context.name,
         Some(&token.event_type.name),
-        query.after.unwrap_or(-1),
+        after.unwrap_or(-1),
         state.max_events_per_read,
         |chunk, remaining| {
             event_store::fetch_events_page(
                 &token,
                 chunk,
                 &filters,
-                query.after,
+                after,
                 query.correlation_id.as_deref(),
                 remaining,
             )
@@ -870,8 +909,8 @@ async fn get_events(
         last_served
     };
     let next_cursor = next_position
-        .or(query.after)
-        .map(|sequence| sequence.to_string());
+        .or(after)
+        .map(|sequence| events_cursor(sequence, &epoch));
     // A failover during the read would hand out a cursor from the old
     // history under the new epoch.
     db::require_epoch(Some(epoch.as_str()), &db::current_epoch(&state.pool).await?)?;
