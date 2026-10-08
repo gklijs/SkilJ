@@ -271,13 +271,15 @@ pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 100;
 
 /// The statement cache capacity a pool connected with
 /// [`connect_with_statement_cache`] ends up with: `explicit`, else the
-/// database URL's `statement-cache-capacity` parameter, else
+/// database URL's last `statement-cache-capacity` parameter, else
 /// [`DEFAULT_STATEMENT_CACHE_CAPACITY`]. sqlx has no getter for it.
 pub fn effective_statement_cache_capacity(database_url: &str, explicit: Option<usize>) -> usize {
     explicit
         .or_else(|| {
             let (_, query) = database_url.split_once('?')?;
-            query.split('&').find_map(|pair| {
+            // sqlx applies the parameters in order, so a repeated one's
+            // last value is what the pool gets.
+            query.rsplit('&').find_map(|pair| {
                 let (key, value) = pair.split_once('=')?;
                 (key == "statement-cache-capacity")
                     .then(|| value.parse().ok())
@@ -14523,6 +14525,10 @@ mod tests {
         let url = "postgres://u@h/d?sslmode=disable&statement-cache-capacity=250";
         assert_eq!(effective_statement_cache_capacity(url, Some(7)), 7);
         assert_eq!(effective_statement_cache_capacity(url, None), 250);
+        assert_eq!(
+            effective_statement_cache_capacity(&format!("{url}&statement-cache-capacity=3"), None),
+            3
+        );
         assert_eq!(
             effective_statement_cache_capacity("postgres://u@h/d?sslmode=disable", None),
             100
