@@ -1414,16 +1414,7 @@ pub async fn delete_expired_idempotency_keys(
     cutoff: DateTime<Utc>,
     batch: i64,
 ) -> crate::error::Result<u64> {
-    let schema = schema_ident(bounded_context);
-    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DELETE FROM {schema}.idempotency_keys WHERE ctid IN ( \
-             SELECT ctid FROM {schema}.idempotency_keys WHERE created_at < $1 LIMIT $2)"
-    )))
-    .bind(cutoff)
-    .bind(batch)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    delete_expired_keys(pool, bounded_context, "idempotency_keys", cutoff, batch).await
 }
 
 /// [`delete_expired_idempotency_keys`]' twin for `external_message_keys`
@@ -1434,10 +1425,29 @@ pub async fn delete_expired_external_message_keys(
     cutoff: DateTime<Utc>,
     batch: i64,
 ) -> crate::error::Result<u64> {
+    delete_expired_keys(
+        pool,
+        bounded_context,
+        "external_message_keys",
+        cutoff,
+        batch,
+    )
+    .await
+}
+
+/// The batched delete both key tables share. `table` is one of the two
+/// names above, never caller input.
+async fn delete_expired_keys(
+    pool: &Pool,
+    bounded_context: &str,
+    table: &'static str,
+    cutoff: DateTime<Utc>,
+    batch: i64,
+) -> crate::error::Result<u64> {
     let schema = schema_ident(bounded_context);
     let result = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DELETE FROM {schema}.external_message_keys WHERE ctid IN ( \
-             SELECT ctid FROM {schema}.external_message_keys WHERE created_at < $1 LIMIT $2)"
+        "DELETE FROM {schema}.{table} WHERE ctid IN ( \
+             SELECT ctid FROM {schema}.{table} WHERE created_at < $1 LIMIT $2)"
     )))
     .bind(cutoff)
     .bind(batch)

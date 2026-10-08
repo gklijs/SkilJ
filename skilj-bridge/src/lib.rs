@@ -127,10 +127,7 @@ impl SkiljError {
         match self {
             SkiljError::SkiljStatus { status, body } => {
                 *status == reqwest::StatusCode::CONFLICT
-                    && serde_json::from_str::<serde_json::Value>(body)
-                        .ok()
-                        .and_then(|v| v.get("code").and_then(|c| c.as_str().map(str::to_string)))
-                        .is_some_and(|code| code == "epoch_changed")
+                    && error_code(body).as_deref() == Some("epoch_changed")
             }
             _ => false,
         }
@@ -143,14 +140,17 @@ impl SkiljError {
 /// [`skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY`] without spending an
 /// attempt, and never parked (docs/architecture.md §161).
 pub fn another_instance_refusal(body: &str) -> bool {
+    error_code(body).is_some_and(|code| skilj_retry::another_instance_can_do_it(&code))
+}
+
+/// The `code` of a skilj error response `body`, when it is skilj's JSON
+/// error shape.
+fn error_code(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|body| {
-            body["code"]
-                .as_str()
-                .map(skilj_retry::another_instance_can_do_it)
-        })
-        .unwrap_or(false)
+        .ok()?
+        .get("code")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// `Err(SkiljStatus)` for a non-success response, with its body.
