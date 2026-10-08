@@ -98,23 +98,25 @@ SKILJ_BENCH_LATENCY_MS=1 SKILJ_BENCH_INSTANCES=3 SKILJ_BENCH_COMMANDS=400 \
   cargo test --release -p skilj --test command_throughput -- --ignored --nocapture
 ```
 
-At +1 ms, 400 commands per scenario, commands/s at 80 callers, two
-rounds each, before and after docs/architecture.md §196 (a batch decided
-and written as a set):
+At +1 ms, 400 commands per scenario, commands/s, two rounds each, before
+docs/architecture.md §196 (main) and after it (a batch decided and
+written as a set, five fewer round trips per command, and no
+`test_before_acquire` ping):
 
-| workload | before, 1 instance | after, 1 instance | before, 3 instances | after, 3 instances |
-|---|---|---|---|---|
-| spread | 36-42 | 76-77 | 48 | 166-178 |
-| hot | 31 | 77-80 | 31-32 | 105 |
-| hot-snap | 35-36 | 64-67 | 33 | 107-112 |
+| workload | callers | before, 1 instance | after, 1 instance | before, 3 instances | after, 3 instances |
+|---|---|---|---|---|---|
+| spread | 1 | 21-23 | 38-44 | 20-21 | 38-39 |
+| spread | 80 | 72-77 | 365-487 | 93-96 | 435-471 |
+| hot | 80 | 54-56 | 136-155 | 50-51 | 127-135 |
+| hot-snap | 80 | 59 | 153-163 | 55 | 114-147 |
 
-Before, writing a batch cost about 15 ms per command (15 round trips), so
-a batch's lock hold grew with its size. After, it is about 11.6 ms per
-batch whatever its size. Several instances now add throughput, where
-before they mostly split the work into smaller batches queueing for the
-same lock. A single caller still takes about 100 ms per command at +1
-ms, and most of that is round trips outside the batch lock: the next
-thing to measure.
+Before, writing a batch cost about one round trip per statement per
+command under the lock, so a batch's lock hold grew with its size. After,
+it is a fixed handful per batch. A single caller's command takes about
+25 ms at +1 ms, against about 45 before; `skilj/tests/command_round_trips.rs`
+lists the statements one command sends. With the batch this cheap, one
+instance comes close to the bounded context's ceiling, and three add
+little.
 
 ## Async projection catch-up
 
