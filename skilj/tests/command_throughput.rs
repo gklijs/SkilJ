@@ -28,7 +28,7 @@
 
 mod deposit_bench;
 
-use deposit_bench::{deposit, deposit_with, setup, Setup};
+use deposit_bench::{deposit_through, latency_proxy, setup_instances, Setup};
 use skilj_core::db;
 use skilj_core::shared::generate_token_id;
 use std::sync::{Arc, Mutex};
@@ -36,8 +36,16 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer as _;
 
-/// Commands per scenario.
+/// Commands per scenario, unless `SKILJ_BENCH_COMMANDS` says otherwise.
 const COMMANDS: usize = 800;
+
+/// A whole-number environment setting, or `default`.
+fn env_setting(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.parse().unwrap_or_else(|_| panic!("{name}={value:?}")))
+        .unwrap_or(default)
+}
 
 /// What the batcher's `debug` events add up to over one scenario.
 #[derive(Default, Debug, Clone)]
@@ -128,9 +136,15 @@ enum Workload {
 }
 
 /// `COMMANDS` deposits from `workers` concurrent callers. Prints one row.
-async fn scenario(setup: &Setup, stats: &BatchStatsLayer, workload: Workload, workers: usize) {
+async fn scenario(
+    setup: &Setup,
+    stats: &BatchStatsLayer,
+    workload: Workload,
+    workers: usize,
+    commands: usize,
+) {
     let run = generate_token_id();
-    let per_worker = COMMANDS / workers;
+    let per_worker = (commands / workers).max(1);
     *stats.0.lock().unwrap() = BatchStats::default();
     let started = Instant::now();
     let tasks = (0..workers).map(|worker| {
@@ -142,12 +156,12 @@ async fn scenario(setup: &Setup, stats: &BatchStatsLayer, workload: Workload, wo
                     Workload::Spread => format!("{run}-{worker}-{n}"),
                     Workload::Hot | Workload::HotSnapshot => format!("{run}-hot"),
                 };
-                latencies.push(match workload {
-                    Workload::HotSnapshot => {
-                        deposit_with(setup, &setup.fast_credential, &account).await
-                    }
-                    _ => deposit(setup, &account).await,
-                });
+                let credential = match workload {
+                    Workload::HotSnapshot => &setup.fast_credential,
+                    _ => &setup.credential,
+                };
+                latencies
+                    .push(deposit_through(setup.router_for(worker), credential, &account).await);
             }
             latencies
         }
@@ -207,19 +221,37 @@ fn command_throughput() {
         };
         let pool = db::connect(&database_url).await.unwrap();
         db::migrate(&pool).await.unwrap();
-        let setup = setup(database_url, &pool).await;
+        // docs/architecture.md §196: the in-process router makes every
+        // round trip to Postgres nearly free, which understates what a
+        // per-command statement costs a deployment whose database is
+        // across a network. `SKILJ_BENCH_LATENCY_MS` adds that round trip
+        // between skilj and Postgres; `SKILJ_BENCH_INSTANCES` runs several
+        // instances on the one bounded context, each with its own batcher.
+        let latency_ms = env_setting("SKILJ_BENCH_LATENCY_MS", 0);
+        let instances = env_setting("SKILJ_BENCH_INSTANCES", 1);
+        let commands = env_setting("SKILJ_BENCH_COMMANDS", COMMANDS);
+        let skilj_url = if latency_ms > 0 {
+            latency_proxy(&database_url, Duration::from_millis(latency_ms as u64)).await
+        } else {
+            database_url
+        };
+        let setup = setup_instances(skilj_url, &pool, instances).await;
+        println!(
+            "round trip to Postgres +{latency_ms} ms, {instances} instance(s), \
+             {commands} commands per scenario"
+        );
 
         // Warm-up: caches, prepared statements, pool connections.
-        scenario(&setup, &stats, Workload::Spread, 8).await;
+        scenario(&setup, &stats, Workload::Spread, 8, commands).await;
 
         for round in 1..=2 {
-            println!("--- round {round} ({COMMANDS} commands each) ---");
+            println!("--- round {round} ---");
             for workload in [Workload::Spread, Workload::Hot, Workload::HotSnapshot] {
                 for workers in [1, 8, 32, 80] {
-                    scenario(&setup, &stats, workload, workers).await;
+                    scenario(&setup, &stats, workload, workers, commands).await;
                 }
             }
         }
-        setup.skilj.shutdown(Duration::from_secs(10)).await;
+        setup.shutdown().await;
     });
 }

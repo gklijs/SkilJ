@@ -156,6 +156,11 @@ pub struct Setup {
     /// Owns the background tasks `router` relies on.
     pub skilj: Skilj,
     pub router: axum::Router,
+    /// More instances on the same database and bounded context, for
+    /// `command_throughput.rs`' `SKILJ_BENCH_INSTANCES`: each with its own
+    /// command batcher, as separate processes would be.
+    #[allow(dead_code)] // command_throughput.rs only
+    pub others: Vec<(Skilj, axum::Router)>,
     /// `Deposit`'s token.
     pub credential: String,
     /// `DepositFast`'s token.
@@ -163,7 +168,35 @@ pub struct Setup {
     pub fast_credential: String,
 }
 
+#[allow(dead_code)] // coresident_pgbench.rs only
 pub async fn setup(database_url: String, pool: &Pool) -> Setup {
+    setup_instances(database_url, pool, 1).await
+}
+
+impl Setup {
+    /// The router a caller numbered `worker` submits through: callers are
+    /// spread over the instances round-robin.
+    #[allow(dead_code)] // command_throughput.rs only
+    pub fn router_for(&self, worker: usize) -> &axum::Router {
+        match worker % (self.others.len() + 1) {
+            0 => &self.router,
+            n => &self.others[n - 1].1,
+        }
+    }
+
+    /// Shuts every instance down.
+    #[allow(dead_code)] // command_throughput.rs only
+    pub async fn shutdown(self) {
+        for (skilj, _) in self.others {
+            skilj.shutdown(Duration::from_secs(10)).await;
+        }
+        self.skilj.shutdown(Duration::from_secs(10)).await;
+    }
+}
+
+/// [`setup`], with `instances` `Skilj` instances on `database_url`, all
+/// serving the one bounded context.
+pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize) -> Setup {
     let subject = format!("subject_{}", generate_token_id());
     let role = Role {
         id: generate_token_id(),
@@ -199,17 +232,27 @@ pub async fn setup(database_url: String, pool: &Pool) -> Setup {
         .unwrap();
 
     // The pool of a modest deployment: half of it may lead batches.
-    let (skilj, _) = Skilj::builder(database_url)
-        .pool_options(db::PgPoolOptions::new().max_connections(20))
-        .bounded_context(bc_name.clone())
-        .event_type::<Deposited>()
-        .command_type::<Deposit>()
-        .command_type::<DepositFast>()
-        .snapshot::<Balance>()
-        .reconciliation_role(subject)
-        .build()
-        .await
-        .unwrap();
+    let build = || async {
+        Skilj::builder(database_url.clone())
+            .pool_options(db::PgPoolOptions::new().max_connections(20))
+            .bounded_context(bc_name.clone())
+            .event_type::<Deposited>()
+            .command_type::<Deposit>()
+            .command_type::<DepositFast>()
+            .snapshot::<Balance>()
+            .reconciliation_role(subject.clone())
+            .build()
+            .await
+            .unwrap()
+            .0
+    };
+    let skilj = build().await;
+    let mut others = Vec::new();
+    for _ in 1..instances.max(1) {
+        let other = build().await;
+        let router = other.rest_router();
+        others.push((other, router));
+    }
 
     let mut credentials = Vec::new();
     for name in ["Deposit", "DepositFast"] {
@@ -233,19 +276,21 @@ pub async fn setup(database_url: String, pool: &Pool) -> Setup {
     Setup {
         router: skilj.rest_router(),
         skilj,
+        others,
         fast_credential: credentials.pop().unwrap(),
         credential: credentials.pop().unwrap(),
     }
 }
 
 /// Submits one deposit and returns its latency.
+#[allow(dead_code)] // coresident_pgbench.rs only
 pub async fn deposit(setup: &Setup, account_id: &str) -> Duration {
     deposit_with(setup, &setup.credential, account_id).await
 }
 
 /// Submits one deposit with `credential`'s command and returns its
 /// latency.
-#[allow(dead_code)] // command_throughput.rs only
+#[allow(dead_code)] // coresident_pgbench.rs only, through `deposit`
 pub async fn deposit_with(setup: &Setup, credential: &str, account_id: &str) -> Duration {
     deposit_through(&setup.router, credential, account_id).await
 }
@@ -275,4 +320,74 @@ pub async fn deposit_through(
         String::from_utf8_lossy(&bytes)
     );
     started.elapsed()
+}
+
+/// A TCP proxy in front of `database_url`'s server that delays every
+/// chunk by half of `round_trip` in each direction, so a request and its
+/// answer take `round_trip` longer, as across a network
+/// (docs/architecture.md §196). Delays are scheduled per chunk, not
+/// served one after another, so a stream of chunks keeps its throughput
+/// and only gains latency. Returns `database_url` pointed at the proxy.
+#[allow(dead_code)] // command_throughput.rs only
+pub async fn latency_proxy(database_url: &str, round_trip: Duration) -> String {
+    let (prefix, rest) = database_url
+        .split_once('@')
+        .expect("a DATABASE_URL with user@host");
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let upstream = authority.to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    let one_way = round_trip / 2;
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    return;
+                };
+                let _ = client.set_nodelay(true);
+                let _ = server.set_nodelay(true);
+                let (client_read, client_write) = client.into_split();
+                let (server_read, server_write) = server.into_split();
+                tokio::spawn(delayed_copy(client_read, server_write, one_way));
+                tokio::spawn(delayed_copy(server_read, client_write, one_way));
+            });
+        }
+    });
+    format!("{prefix}@{local}{path}")
+}
+
+/// Copies `from` to `to`, each chunk `delay` after it was read.
+async fn delayed_copy(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    delay: Duration,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    tokio::spawn(async move {
+        while let Some((due, chunk)) = receiver.recv().await {
+            tokio::time::sleep_until(due).await;
+            if to.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
+        let _ = to.shutdown().await;
+    });
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match from.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let due = tokio::time::Instant::now() + delay;
+                if sender.send((due, buffer[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
