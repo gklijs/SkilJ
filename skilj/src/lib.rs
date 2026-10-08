@@ -68,9 +68,11 @@ const BACKGROUND_TASK_CONCURRENCY: usize = 16;
 /// everything else needs at least one more (docs/architecture.md §186).
 pub const MIN_POOL_CONNECTIONS: u32 = 2;
 
-/// [`SkiljBuilder::idempotency_key_retention`]'s default: one hour.
+/// [`SkiljBuilder::idempotency_key_retention`]'s default: 48 hours, long
+/// enough to outlast a broker or bridge outage over a weekend
+/// (docs/architecture.md §195).
 pub const DEFAULT_IDEMPOTENCY_KEY_RETENTION: std::time::Duration =
-    std::time::Duration::from_secs(60 * 60);
+    std::time::Duration::from_secs(48 * 60 * 60);
 
 /// How often the idempotency-key retention task runs at most; a key
 /// outlives its retention by at most about this much. A shorter
@@ -2056,7 +2058,7 @@ impl SkiljBuilder {
     /// this window after it was first accepted gets the original outcome
     /// back; after it, the key is deleted and a submission bearing it is
     /// processed as a new command. Defaults to
-    /// [`DEFAULT_IDEMPOTENCY_KEY_RETENTION`] (one hour). A key is kept for
+    /// [`DEFAULT_IDEMPOTENCY_KEY_RETENTION`] (48 hours). A key is kept for
     /// *at least* this long - a background task deletes expired keys
     /// about once a minute (or once per `retention`, if shorter), starting
     /// `min(retention, 1 hour)` after the instance starts, so recovery

@@ -89,6 +89,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `DEFAULT_IDEMPOTENCY_KEY_RETENTION` is now 48 hours instead of one hour
+  (docs/architecture.md §195). It also governs the per-message keys NATS
+  and AMQP `Record` messages and keyed parked redrives are deduplicated by
+  (§175), so at one hour a bridge outage of more than an hour created
+  redelivered messages' events twice. Set `idempotency_key_retention` to
+  keep the old window.
+
 - A projection state field named `projection_key` (GraphQL `projectionKey`)
   is now left out of its projection's GraphQL type, with a warning: the
   name is reserved for the federation entity key, federated or not, so

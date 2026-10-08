@@ -15,7 +15,7 @@ stable across every retry of that one invocation, unique across every other invo
 in a different workflow run. Put together: an Activity that calls skilj passes that same
 composed string as skilj's idempotency key, and Temporal's own at-least-once Activity retry
 becomes safe for free - within the key's retention. skilj remembers a key for
-`SkiljBuilder::idempotency_key_retention` (default one hour, [§87](architecture.md)), so an
+`SkiljBuilder::idempotency_key_retention` (default 48 hours, [§87](architecture.md)), so an
 Activity whose retries can span longer (a long schedule-to-close timeout) needs a longer retention,
 or a retry after the window is applied as a new command.
 

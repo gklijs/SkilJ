@@ -1740,7 +1740,7 @@ entity PrivateFieldGrant {
 config {
     read_cursor_checkout_lease: Duration = 5.minutes
     max_events_per_read: Integer = 1000
-    idempotency_key_retention: Duration = 1.hour
+    idempotency_key_retention: Duration = 48.hours
     max_query_tags: Integer = 32
 }
 
