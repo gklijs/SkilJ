@@ -89,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A command no longer copies its consistency tags' whole history twice
+  while its batch holds the bounded context's lock: the consistency
+  boundary is a plain maximum, and the history is only extended when the
+  re-check under the lock found something (docs/architecture.md §196).
+  New: `event_store::consistency_boundary`.
+
 - **Breaking:** `GET /v1/events`' `nextCursor` is now
   `"{sequence}@{epoch}"`, so a client that passes it back as `after` is
   refused with `409 epoch_changed` after a failover without sending

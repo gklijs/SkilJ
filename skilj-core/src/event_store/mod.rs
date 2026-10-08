@@ -4353,6 +4353,23 @@ pub fn consistency_boundary_and_matching_events(
     (boundary, matching)
 }
 
+/// The boundary half of [`consistency_boundary_and_matching_events`]
+/// alone: the highest sequence among the events matching
+/// `consistency_tags`, without copying them. Every accepted command needs
+/// it, under the bounded context's lock, and copying a hot key's whole
+/// history just to take a maximum cost a deep copy per command there
+/// (docs/architecture.md §196).
+pub fn consistency_boundary(
+    bounded_context_events: &[Event],
+    consistency_tags: &[Tag],
+) -> Option<i64> {
+    bounded_context_events
+        .iter()
+        .filter(|e| consistency_tags.iter().any(|t| e.tags.contains(t)))
+        .map(|e| e.sequence)
+        .max()
+}
+
 /// What `process_command` produced - the caller (the eventual sqlx-backed
 /// persistence layer) stores `command` and every one of `events` in one
 /// transaction, alongside updating whichever sync projections consume
@@ -4422,6 +4439,45 @@ pub fn process_command(
     bounded_context_events: &[Event],
     decision: CommandDecision,
     resolve_event_type: impl Fn(&str) -> Option<EventType>,
+    next_sequence: impl FnMut() -> i64,
+    now: chrono::DateTime<chrono::Utc>,
+    resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
+) -> crate::error::Result<ProcessCommandResult> {
+    let boundary = consistency_boundary(
+        bounded_context_events,
+        &derive_tags(&command_type.tag_mappings, payload),
+    );
+    process_command_at_boundary(
+        id,
+        command_type,
+        payload,
+        client_id,
+        correlation_id,
+        causation_id,
+        boundary,
+        decision,
+        resolve_event_type,
+        next_sequence,
+        now,
+        resolve_key,
+    )
+}
+
+/// [`process_command`] with the command's consistency boundary already
+/// known - [`consistency_boundary`] over the events its decision saw - so
+/// a caller holding the bounded context's lock needn't hand over (or
+/// copy) that history (docs/architecture.md §196).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_command_at_boundary(
+    id: String,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+    consistency_boundary: Option<i64>,
+    decision: CommandDecision,
+    resolve_event_type: impl Fn(&str) -> Option<EventType>,
     mut next_sequence: impl FnMut() -> i64,
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
@@ -4463,8 +4519,6 @@ pub fn process_command(
     let causation_id = causation_id.filter(|id| !id.is_empty()).map(str::to_string);
 
     let consistency_tags = derive_tags(&command_type.tag_mappings, payload);
-    let (consistency_boundary, _matching_events) =
-        consistency_boundary_and_matching_events(bounded_context_events, &consistency_tags);
 
     let protected = protect_sensitive_fields(&command_type.sensitive_fields, payload, &resolve_key);
     let command = Command {

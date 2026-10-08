@@ -11486,3 +11486,17 @@ Looked at and left: `GET /v1/events` reads the latest sequence and epoch before 
 **`nextCursor` carries the epoch.** §176 made the epoch check opt-in: a position is checked only when the client sends the epoch it was read in back with it. A client written before §176, or one that only keeps `nextCursor`, went on being served from a stale position after a failover. With the user's choice, `GET /v1/events`' `nextCursor` is now `"{sequence}@{epoch}"`, so a client that passes it back as `after` - which is what the docs have always told clients to do - is checked without sending anything else. `after` still takes a bare sequence, unchecked as before, for checkpoints kept from older responses and positions a client counted itself; `epoch=` still works beside either, and both are checked when both are given. A malformed `after` is `400 invalid_request` from skilj rather than axum's query rejection. The response's separate `epoch` field stays.
 
 Not changed: an acknowledgement names an event's `sequence`, and a subscription's `fromSequence` is one too, so neither has a cursor to carry the epoch; both stay opt-in, and every client in this workspace (the bridges, skilj-temporal, skilj-tui) already sends it. GraphQL's `queryEvents` hands out no cursor. The `nextCursor` format change breaks a client that parsed it as a number; the changelog says so. `rule FetchEvents` is unchanged, since a cursor maps onto its `after_sequence` and `epoch`. Tests (`skilj/tests/event_fetch_rest.rs`): `a_failover_refuses_old_cursors_and_the_cache_drops_the_lost_events` refuses a cursor from before a real promotion with no `epoch` parameter; `positions_from_another_epoch_are_refused` covers a cursor alone, a bare sequence, a cursor naming another epoch, and malformed values.
+
+<a id="batch-write-path"></a>
+## 196. The command batch's time under the lock
+
+A batch leader holds the bounded context's sequence lock while it decides and writes every queued command (§59, §178). docs/performance.md's figures put 0.6-1.7 ms of that lock time on each command for the spread workload, and 4.7-8.4 ms for hot. That is per command, not per batch, so group commit (§59) only amortises the lock acquisition and the final commit. Six changes, in the order the user chose.
+
+**No copies of the history under the lock.** `decide_command_in_tx` copied the command's whole pre-lock history (`bounded_context_events.to_vec()`) for every command, to hand it to `process_command`. `process_command` then copied every matching event again in `consistency_boundary_and_matching_events`, only to take the maximum sequence as the command's consistency boundary. For a hot key that is two deep copies of its whole history per command, under the lock. Now:
+
+- `event_store::consistency_boundary` computes the boundary as a plain maximum over the matching events, with no copy.
+- `process_command_at_boundary` takes the boundary instead of the history. `process_command` keeps its signature and delegates to it.
+- `decide_command_in_tx` builds an extended history only when the delta re-check found something, which is the one case where the decider runs again, and takes the boundary from that run.
+- The matching events a rejection reports are copied only for a rejection.
+
+The boundary is the same value as before: the highest matching sequence over the pre-lock read, raised by the delta's.

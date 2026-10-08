@@ -8043,7 +8043,10 @@ pub async fn broadcast_appended_events(
 /// in between the two calls.
 struct AcceptedDecision {
     event_specs: Vec<crate::shared::EventSpec>,
-    final_bounded_context_events: Vec<Event>,
+    /// The command's consistency boundary: the highest sequence among the
+    /// events its final decision saw that match its consistency tags
+    /// (docs/architecture.md §196).
+    consistency_boundary: Option<i64>,
     event_types_by_name: std::collections::HashMap<String, EventType>,
 }
 
@@ -8134,13 +8137,17 @@ async fn decide_command_in_tx(
     }
 
     let mut final_decision = initial_decision;
-    let mut final_bounded_context_events = bounded_context_events.to_vec();
-    // Codeberg issue #7: starts as the caller's own pre-lock set,
-    // overwritten below only if a DCB conflict forced a redispatch -
+    // docs/architecture.md §196: no copy of the history unless a conflict
+    // below needs an extended one. The boundary is a plain maximum, raised
+    // by the delta's.
+    let mut consistency_boundary =
+        crate::event_store::consistency_boundary(bounded_context_events, consistency_tags);
+    // Codeberg issue #7: `None` is the caller's own pre-lock set,
+    // replaced below only if a DCB conflict forced a redispatch -
     // whichever one actually produced `final_decision` is the one a
     // rejection reports (see `SubmitCommandOutcome::Rejected`'s own doc
-    // comment).
-    let mut final_matching_events = matching_events.to_vec();
+    // comment). Copied only for a rejection.
+    let mut final_matching_events: Option<Vec<Event>> = None;
 
     // Something committed between the caller's own optimistic read and
     // this lock - either before the lock (`locked_highest >
@@ -8210,13 +8217,16 @@ async fn decide_command_in_tx(
     );
 
     if !delta.is_empty() {
-        final_bounded_context_events.extend(delta);
-        final_bounded_context_events.sort_by_key(|e| e.sequence);
-        let (_boundary, redispatch_matching_events) =
+        let mut extended = Vec::with_capacity(bounded_context_events.len() + delta.len());
+        extended.extend_from_slice(bounded_context_events);
+        extended.extend(delta);
+        extended.sort_by_key(|e| e.sequence);
+        let (boundary, redispatch_matching_events) =
             crate::event_store::consistency_boundary_and_matching_events(
-                &final_bounded_context_events,
+                &extended,
                 consistency_tags,
             );
+        consistency_boundary = boundary;
         // docs/architecture.md §19: a snapshot-accelerated initial
         // decision redispatches through `dispatch_from_snapshot`
         // again too, not the ordinary `dispatch` - the snapshot's
@@ -8249,7 +8259,7 @@ async fn decide_command_in_tx(
                 Some(Ok(d)) => d,
             },
         };
-        final_matching_events = redispatch_matching_events;
+        final_matching_events = Some(redispatch_matching_events);
     }
 
     let event_specs = match final_decision {
@@ -8265,7 +8275,7 @@ async fn decide_command_in_tx(
             return Ok(DecideOutcome::Terminal(SubmitCommandOutcome::Rejected {
                 reason,
                 kind,
-                matching_events: final_matching_events,
+                matching_events: final_matching_events.unwrap_or_else(|| matching_events.to_vec()),
             }));
         }
         crate::shared::CommandDecision::Accepted { events } => events,
@@ -8294,7 +8304,7 @@ async fn decide_command_in_tx(
 
     Ok(DecideOutcome::Accepted(AcceptedDecision {
         event_specs,
-        final_bounded_context_events,
+        consistency_boundary,
         event_types_by_name,
     }))
 }
@@ -8327,7 +8337,7 @@ async fn finish_accepted_command_in_tx(
     let schema = schema_ident(&bounded_context_name);
     let AcceptedDecision {
         event_specs,
-        final_bounded_context_events,
+        consistency_boundary,
         event_types_by_name,
     } = decided;
     let mut sequences = sequences.into_iter();
@@ -8374,14 +8384,14 @@ async fn finish_accepted_command_in_tx(
         }
     }
 
-    let result = crate::event_store::process_command(
+    let result = crate::event_store::process_command_at_boundary(
         crate::shared::generate_token_id(),
         command_type,
         payload,
         client_id,
         correlation_id,
         causation_id,
-        &final_bounded_context_events,
+        consistency_boundary,
         crate::shared::CommandDecision::Accepted {
             events: event_specs,
         },
