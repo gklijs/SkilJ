@@ -138,6 +138,41 @@ fn record_event_appended(event: &Event) {
 /// liveliness signal - a missed notification self-heals via the same
 /// DB-backed catch-up path a same-process lagged subscriber already
 /// takes, per `@guarantee DeliverySpansInstances` in specs/skilj.allium.
+/// [`notify_event_appended`] for many events in one statement - one
+/// round trip for a whole command batch instead of one per event, sent
+/// before the batch's callers get their answers (docs/architecture.md
+/// §196). Each notification carries the same payload as one sent alone.
+async fn notify_events_appended(pool: &Pool, events: &[&Event], origin_instance_id: &str) {
+    match events {
+        [] => return,
+        [event] => return notify_event_appended(pool, event, origin_instance_id).await,
+        _ => {}
+    }
+    let payloads: Vec<String> = events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "bounded_context": event.bounded_context.name,
+                "sequence": event.sequence,
+                "origin_instance_id": origin_instance_id,
+            })
+            .to_string()
+        })
+        .collect();
+    if let Err(err) =
+        sqlx::query("SELECT pg_notify('skilj_events', payload) FROM unnest($1::text[]) AS payload")
+            .bind(&payloads)
+            .execute(pool)
+            .await
+    {
+        tracing::warn!(
+            error = %err,
+            "NOTIFY skilj_events failed - other instances may miss these events' live push \
+             until their next poll-based read"
+        );
+    }
+}
+
 async fn notify_event_appended(pool: &Pool, event: &Event, origin_instance_id: &str) {
     let payload = serde_json::json!({
         "bounded_context": event.bounded_context.name,
@@ -2899,7 +2934,17 @@ pub async fn get_bounded_context(
     else {
         return Ok(None);
     };
+    hydrate_bounded_context(pool, row).await.map(Some)
+}
 
+/// A `bounded_contexts` row as a [`BoundedContext`]: its creating role and
+/// its template, when it has them, read in. Shared by
+/// [`get_bounded_context`] and [`get_command_type`], which reads the row
+/// in the same statement as the command type.
+async fn hydrate_bounded_context(
+    pool: &Pool,
+    row: BoundedContextRow,
+) -> crate::error::Result<BoundedContext> {
     let role = match &row.created_by_role_id {
         Some(role_id) => Some(get_role(pool, role_id).await?.expect(
             "bounded_contexts.created_by_role_id references a roles row that no longer exists",
@@ -2925,7 +2970,7 @@ pub async fn get_bounded_context(
             .map(Box::new),
         None => None,
     };
-    Ok(Some(bounded_context_from_row(row, role, template)))
+    Ok(bounded_context_from_row(row, role, template))
 }
 
 /// Every `BoundedContext` this engine currently knows of - the
@@ -3564,17 +3609,47 @@ pub async fn get_command_type(
     bounded_context: &str,
     name: &str,
 ) -> crate::error::Result<Option<CommandType>> {
-    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
-        return Ok(None);
-    };
+    use sqlx::{FromRow, Row};
+    // The bounded context's row and the command type's in one statement
+    // (docs/architecture.md §196): every command resolves its type this
+    // way before the lock, and they were two round trips.
     let schema = schema_ident(bounded_context);
-    let row: Option<CommandTypeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COMMAND_TYPE_COLUMNS} FROM {schema}.command_types WHERE name = $1"
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT bc.name AS bc_name, bc.status AS bc_status, bc.created_at AS bc_created_at, \
+         bc.created_by_kind AS bc_created_by_kind, \
+         bc.created_by_role_id AS bc_created_by_role_id, bc.template AS bc_template, \
+         {} FROM bounded_contexts bc JOIN {schema}.command_types ct ON ct.name = $2 \
+         WHERE bc.name = $1",
+        COMMAND_TYPE_COLUMNS
+            .split(", ")
+            .map(|column| format!("ct.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
     )))
+    .bind(bounded_context)
     .bind(name)
     .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|r| r.into_domain(bc)))
+    .await;
+    let row = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => return Ok(None),
+        // The schema is gone with a hard-deleted bounded context, which
+        // reads as no such command type, as it did when the bounded
+        // context's row was read first.
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let bc_row = BoundedContextRow {
+        name: row.try_get("bc_name")?,
+        status: row.try_get("bc_status")?,
+        created_at: row.try_get("bc_created_at")?,
+        created_by_kind: row.try_get("bc_created_by_kind")?,
+        created_by_role_id: row.try_get("bc_created_by_role_id")?,
+        template: row.try_get("bc_template")?,
+    };
+    let command_type_row = CommandTypeRow::from_row(&row)?;
+    let bc = hydrate_bounded_context(pool, bc_row).await?;
+    Ok(Some(command_type_row.into_domain(bc)))
 }
 
 // --- EncryptionKey ---
@@ -7975,8 +8050,11 @@ pub async fn warm_up_event_types_and_encryption_keys(
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 event_types_by_name.entry(spec.event_type.clone())
             {
+                // `command_type` already carries the bounded context's
+                // row, read moments ago (docs/architecture.md §196).
                 if let Some(et) =
-                    get_event_type(pool, bounded_context_name, &spec.event_type).await?
+                    get_event_type_with_bc(pool, &command_type.bounded_context, &spec.event_type)
+                        .await?
                 {
                     entry.insert(et);
                 }
@@ -8040,15 +8118,33 @@ pub async fn broadcast_appended_events(
     event_cache: &crate::event_cache::EventCache,
     outcome: &SubmitCommandOutcome,
 ) {
-    let SubmitCommandOutcome::Accepted { events, .. } = outcome else {
-        return;
-    };
-    for event in events {
+    broadcast_appended_batch(pool, broadcaster, event_cache, std::iter::once(outcome)).await;
+}
+
+/// [`broadcast_appended_events`] for every outcome of a committed batch at
+/// once: each event is published and cached as before, and the other
+/// instances are notified of all of them in one statement rather than one
+/// round trip per event, which the batch's callers used to wait out
+/// before getting their answers (docs/architecture.md §196).
+pub async fn broadcast_appended_batch<'a>(
+    pool: &Pool,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    outcomes: impl IntoIterator<Item = &'a SubmitCommandOutcome>,
+) {
+    let events: Vec<&Event> = outcomes
+        .into_iter()
+        .flat_map(|outcome| match outcome {
+            SubmitCommandOutcome::Accepted { events, .. } => events.as_slice(),
+            _ => &[],
+        })
+        .collect();
+    for event in &events {
         broadcaster.publish(event);
         record_event_appended(event);
-        notify_event_appended(pool, event, broadcaster.instance_id()).await;
         event_cache.append(event).await;
     }
+    notify_events_appended(pool, &events, broadcaster.instance_id()).await;
 }
 
 /// Where a command's re-check under the lock starts: where its optimistic
@@ -8473,6 +8569,33 @@ async fn provision_missing_encryption_keys(
     resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
     encryption_master_key: Option<&EncryptionMasterKey>,
 ) -> crate::error::Result<()> {
+    let needed_subjects = missing_encryption_subjects(
+        command_type,
+        payload,
+        event_specs,
+        event_types_by_name,
+        resolved,
+    );
+    provision_encryption_subjects(
+        conn,
+        command_type,
+        needed_subjects,
+        resolved,
+        encryption_master_key,
+    )
+    .await
+}
+
+/// The `(subject_key, subject_value)` pairs `command_type`'s payload and
+/// `event_specs` need a key for that `resolved` doesn't have yet - what
+/// [`provision_missing_encryption_keys`] provisions.
+fn missing_encryption_subjects(
+    command_type: &CommandType,
+    payload: &str,
+    event_specs: &[crate::shared::EventSpec],
+    event_types_by_name: &std::collections::HashMap<String, EventType>,
+    resolved: &std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+) -> Vec<(String, String)> {
     let mut needed_subjects: Vec<(String, String)> =
         crate::event_store::sensitive_field_subjects(&command_type.sensitive_fields, payload);
     for spec in event_specs {
@@ -8486,7 +8609,17 @@ async fn provision_missing_encryption_keys(
     needed_subjects.retain(|pair| !resolved.contains_key(pair));
     needed_subjects.sort();
     needed_subjects.dedup();
+    needed_subjects
+}
 
+/// Provisions a key for each of `needed_subjects` on `conn` into `resolved`.
+async fn provision_encryption_subjects(
+    conn: &mut sqlx::PgConnection,
+    command_type: &CommandType,
+    needed_subjects: Vec<(String, String)>,
+    resolved: &mut std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<()> {
     if !needed_subjects.is_empty() {
         let master_key = encryption_master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
         for subject in needed_subjects {
@@ -8832,15 +8965,26 @@ pub async fn begin_command_batch_leader_tx(
     idle_in_transaction_session_timeout: Option<std::time::Duration>,
 ) -> crate::error::Result<CommandBatchLeaderTx> {
     let mut tx = pool.begin().await?;
-    if let Some(timeout) = idle_in_transaction_session_timeout {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SET LOCAL idle_in_transaction_session_timeout = '{}ms'",
-            timeout.as_millis()
-        )))
-        .execute(&mut *tx)
-        .await?;
-    }
-    let locked_highest = lock_bounded_context_sequence(&mut tx, bounded_context_name).await?;
+    // The timeout rides on the lock statement itself, as `set_config(...,
+    // true)` - `SET LOCAL`'s function form - rather than a statement of
+    // its own (docs/architecture.md §196). Evaluated as the row is read,
+    // possibly before the lock wait ends, which changes nothing: the
+    // timeout only counts time the session is idle, never a statement
+    // waiting on a lock.
+    let schema = schema_ident(bounded_context_name);
+    let (locked_highest,): (i64,) = match idle_in_transaction_session_timeout {
+        Some(timeout) => {
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT next_value FROM {schema}.sequence \
+                 WHERE set_config('idle_in_transaction_session_timeout', $1, true) IS NOT NULL \
+                 FOR UPDATE"
+            )))
+            .bind(format!("{}ms", timeout.as_millis()))
+            .fetch_one(&mut *tx)
+            .await?
+        }
+        None => (lock_bounded_context_sequence(&mut tx, bounded_context_name).await?,),
+    };
     let sync_projections = sync_projection_names(&mut tx, bounded_context_name).await?;
     Ok(CommandBatchLeaderTx {
         tx,
@@ -9053,33 +9197,35 @@ pub async fn commit_command_batch(
     // projection refusing an event - rolls the savepoint back and the
     // batch is replayed one command at a time, each in its own savepoint,
     // which isolates the failure to its command as before.
-    let as_set = {
-        let mut savepoint = tx.begin().await?;
-        match write_command_batch_as_set(
-            &mut savepoint,
-            dispatcher,
-            projection_dispatcher,
-            encryption_master_key,
-            &batch,
-            locked_highest,
-            &sync_projections,
-        )
-        .await
-        {
-            Ok(written) => {
-                savepoint.commit().await?;
-                Some(written)
+    let mut savepoint = AsSetSavepoint::default();
+    let as_set = match write_command_batch_as_set(
+        &mut tx,
+        &mut savepoint,
+        dispatcher,
+        projection_dispatcher,
+        encryption_master_key,
+        &batch,
+        locked_highest,
+        &sync_projections,
+    )
+    .await
+    {
+        Ok(written) => Some(written),
+        Err(e) => {
+            tracing::debug!(
+                bounded_context = %bounded_context_name,
+                batch_size = batch_len,
+                error = %e,
+                "command batch not written as a set - replaying it one command at a time"
+            );
+            if savepoint.open {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ROLLBACK TO SAVEPOINT {AS_SET_SAVEPOINT}"
+                )))
+                .execute(&mut *tx)
+                .await?;
             }
-            Err(e) => {
-                tracing::debug!(
-                    bounded_context = %bounded_context_name,
-                    batch_size = batch_len,
-                    error = %e,
-                    "command batch not written as a set - replaying it one command at a time"
-                );
-                savepoint.rollback().await?;
-                None
-            }
+            None
         }
     };
     let (results, timing) = match as_set {
@@ -9129,6 +9275,42 @@ struct BatchPhaseTiming {
     persist: std::time::Duration,
 }
 
+/// The savepoint the set path writes under, so a failed write rolls back
+/// to before it and the batch is replayed one command at a time.
+const AS_SET_SAVEPOINT: &str = "skilj_batch_as_set";
+
+/// Whether the set path has opened [`AS_SET_SAVEPOINT`] yet. It is opened
+/// with the first write, in the same round trip, and never released:
+/// `COMMIT` keeps what was written under it, and a batch that writes
+/// nothing - every command rejected or deduplicated - never opens it
+/// (docs/architecture.md §196).
+#[derive(Default)]
+struct AsSetSavepoint {
+    open: bool,
+}
+
+impl AsSetSavepoint {
+    /// `statement` - a plain statement with no parameters, or none - run in
+    /// the same round trip as opening the savepoint, if it isn't open yet.
+    async fn write(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+        statement: Option<String>,
+    ) -> crate::error::Result<()> {
+        let sql = match (self.open, statement) {
+            (true, None) => return Ok(()),
+            (true, Some(statement)) => statement,
+            (false, None) => format!("SAVEPOINT {AS_SET_SAVEPOINT}"),
+            (false, Some(statement)) => format!("SAVEPOINT {AS_SET_SAVEPOINT}; {statement}"),
+        };
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&mut **tx)
+            .await?;
+        self.open = true;
+        Ok(())
+    }
+}
+
 /// One accepted command of a batch written as a set, built in memory
 /// before anything is written (docs/architecture.md §196).
 struct PlannedCommand {
@@ -9164,6 +9346,7 @@ struct PlannedCommand {
 #[allow(clippy::too_many_arguments)]
 async fn write_command_batch_as_set(
     tx: &mut Transaction<'_, Postgres>,
+    savepoint: &mut AsSetSavepoint,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     encryption_master_key: Option<&EncryptionMasterKey>,
@@ -9224,16 +9407,24 @@ async fn write_command_batch_as_set(
         };
 
         let mut resolved = item.resolved.clone();
-        provision_missing_encryption_keys(
-            tx,
+        let needed_subjects = missing_encryption_subjects(
             &item.command_type,
             &item.payload,
             &event_specs,
             &event_types_by_name,
-            &mut resolved,
-            encryption_master_key,
-        )
-        .await?;
+            &resolved,
+        );
+        if !needed_subjects.is_empty() {
+            savepoint.write(tx, None).await?;
+            provision_encryption_subjects(
+                tx,
+                &item.command_type,
+                needed_subjects,
+                &mut resolved,
+                encryption_master_key,
+            )
+            .await?;
+        }
 
         let mut assigned = highest_assigned;
         let processed = crate::event_store::process_command_at_boundary(
@@ -9304,6 +9495,7 @@ async fn write_command_batch_as_set(
     if let Some(first) = batch.first() {
         write_planned_commands(
             tx,
+            savepoint,
             &first.command_type.bounded_context.name,
             &planned,
             highest_assigned - locked_highest,
@@ -9348,6 +9540,7 @@ async fn write_command_batch_as_set(
 /// command (docs/architecture.md §196).
 async fn write_planned_commands(
     tx: &mut Transaction<'_, Postgres>,
+    savepoint: &mut AsSetSavepoint,
     bounded_context: &str,
     planned: &[PlannedCommand],
     sequences_used: i64,
@@ -9358,14 +9551,17 @@ async fn write_planned_commands(
         return Ok(());
     }
     let schema = schema_ident(bounded_context);
-    if sequences_used > 0 {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE {schema}.sequence SET next_value = next_value + $1"
-        )))
-        .bind(sequences_used)
-        .execute(&mut **tx)
+    // The savepoint opens in the same round trip as the first write. A
+    // plain statement for that, so `sequences_used` - a count this
+    // function computed, never caller input - is inlined.
+    savepoint
+        .write(
+            tx,
+            (sequences_used > 0).then(|| {
+                format!("UPDATE {schema}.sequence SET next_value = next_value + {sequences_used}")
+            }),
+        )
         .await?;
-    }
 
     let commands: Vec<&Command> = planned.iter().map(|p| &p.command).collect();
     let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(

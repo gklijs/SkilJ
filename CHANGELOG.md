@@ -95,6 +95,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Five fewer round trips per command: a committed batch notifies other
+  instances of all its events in one statement instead of one per event
+  before answering its callers; the batch lock statement sets the idle
+  timeout itself; the batch's savepoint opens with its first write and is
+  never released; and a command type is read with its bounded context in
+  one statement. At +1 ms to Postgres, one caller went from 46 to 36 ms per
+  command (docs/architecture.md §196). New:
+  `db::broadcast_appended_batch`.
+
 - A command batch folds its events into each sync projection at once: the
   rows they touch are locked and read in one statement, folded in memory and
   written back in one, instead of two statements per key per event

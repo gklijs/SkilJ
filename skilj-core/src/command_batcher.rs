@@ -530,15 +530,13 @@ impl CommandBatcher {
                     // Every accepted command's own events, across the
                     // whole batch, broadcast together once the shared
                     // commit has actually succeeded.
-                    for outcome in results.iter().flatten() {
-                        crate::db::broadcast_appended_events(
-                            pool,
-                            broadcaster,
-                            event_cache,
-                            outcome,
-                        )
-                        .await;
-                    }
+                    crate::db::broadcast_appended_batch(
+                        pool,
+                        broadcaster,
+                        event_cache,
+                        results.iter().flatten(),
+                    )
+                    .await;
                     let mut results = results.into_iter();
                     if first_pass {
                         own_result = Some(results.next().expect(
