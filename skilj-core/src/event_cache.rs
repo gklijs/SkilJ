@@ -67,7 +67,7 @@
 //! `Registrations` (docs/architecture.md §180).
 
 use crate::db::Pool;
-use crate::event_store::{CommandType, Event, EventOrigin, EventType};
+use crate::event_store::{Command, CommandType, Event, EventOrigin, EventType};
 use crate::shared::Tag;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -109,23 +109,51 @@ impl Registrations {
     /// `event` with its own type, and its originating command's, replaced
     /// by the current registration. A name not registered here (a command
     /// from another bounded context) keeps the copy it has.
+    ///
+    /// Built field by field, so only the copy that is served gets cloned:
+    /// cloning the whole event first and then overwriting its type cloned
+    /// every type twice, on every read the cache serves
+    /// (docs/architecture.md §195).
     fn current(&self, event: &Event) -> Event {
-        let mut event = event.clone();
-        if let Some(et) = self.event_types.get(&event.event_type.name) {
-            event.event_type = et.clone();
-        }
-        if let EventOrigin::CommandTriggered { command } = &mut event.origin {
-            if command
-                .command_type
-                .bounded_context
-                .same_as(&event.bounded_context)
+        let origin = match &event.origin {
+            EventOrigin::CommandTriggered { command }
+                if command
+                    .command_type
+                    .bounded_context
+                    .same_as(&event.bounded_context) =>
             {
-                if let Some(ct) = self.command_types.get(&command.command_type.name) {
-                    command.command_type = ct.clone();
+                match self.command_types.get(&command.command_type.name) {
+                    Some(ct) => EventOrigin::CommandTriggered {
+                        command: Box::new(Command {
+                            id: command.id.clone(),
+                            bounded_context: command.bounded_context.clone(),
+                            command_type: ct.clone(),
+                            payload: command.payload.clone(),
+                            metadata: command.metadata.clone(),
+                            encryption_keys: command.encryption_keys.clone(),
+                            consistency_tags: command.consistency_tags.clone(),
+                            consistency_boundary: command.consistency_boundary,
+                        }),
+                    },
+                    None => event.origin.clone(),
                 }
             }
+            origin => origin.clone(),
+        };
+        Event {
+            bounded_context: event.bounded_context.clone(),
+            event_type: self
+                .event_types
+                .get(&event.event_type.name)
+                .unwrap_or(&event.event_type)
+                .clone(),
+            payload: event.payload.clone(),
+            metadata: event.metadata.clone(),
+            sequence: event.sequence,
+            tags: event.tags.clone(),
+            encryption_keys: event.encryption_keys.clone(),
+            origin,
         }
-        event
     }
 }
 

@@ -6967,15 +6967,24 @@ pub async fn list_events_for_bounded_context_matching_tags_cached(
     {
         Some(served) => Ok(served),
         None => {
-            let covered_through = latest_sequence(pool, bounded_context).await?.unwrap_or(-1);
-            let events = list_events_for_bounded_context_matching_tags(
-                pool,
-                bounded_context,
+            // Both before the tag query, alongside each other: the latest
+            // sequence used to cost a round trip of its own ahead of the
+            // bounded context's lookup, on every miss (docs/architecture.md
+            // §195).
+            let (covered_through, bc) = futures_util::try_join!(
+                latest_sequence(pool, bounded_context),
+                require_bounded_context(pool, bounded_context),
+            )?;
+            let events = list_events_for_bounded_context_matching_tags_with_bc(
+                &mut *pool.acquire().await?,
+                &bc,
                 tags,
                 after_sequence,
+                None,
+                None,
             )
             .await?;
-            Ok((events, covered_through))
+            Ok((events, covered_through.unwrap_or(-1)))
         }
     }
 }
