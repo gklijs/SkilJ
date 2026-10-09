@@ -22,6 +22,9 @@
 //! service test in this workspace already uses (`DATABASE_URL`-then-
 //! embedded-Postgres-then-skip), if that download can't reach the
 //! network in a given environment.
+//! `SKILJ_TEMPORAL_TEST_SERVER=/path/to/temporal-test-server` runs that
+//! binary instead of downloading one; the Java SDK's GitHub releases
+//! publish it too (`temporal-test-server_<version>_linux_amd64.tar.gz`).
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -51,16 +54,23 @@ async fn start_temporal() -> Option<temporalio_sdk_core::ephemeral_server::Ephem
         EphemeralExe, EphemeralExeVersion, TestServerConfig,
     };
 
-    let cache_dir = dirs_cache_dir();
-    let config = TestServerConfig {
-        exe: EphemeralExe::CachedDownload {
+    // `SKILJ_TEMPORAL_TEST_SERVER` names a `temporal-test-server` binary to
+    // run instead of downloading one - for a network that blocks
+    // temporal.download. It is also published with the Java SDK's GitHub
+    // releases (`temporal-test-server_<version>_linux_amd64.tar.gz`).
+    let exe = match std::env::var("SKILJ_TEMPORAL_TEST_SERVER") {
+        Ok(path) => EphemeralExe::ExistingPath(path),
+        Err(_) => EphemeralExe::CachedDownload {
             version: EphemeralExeVersion::SDKDefault {
                 sdk_name: "sdk-rust".to_string(),
                 sdk_version: "0.1.0".to_string(),
             },
-            dest_dir: Some(cache_dir),
+            dest_dir: Some(dirs_cache_dir()),
             ttl: Some(std::time::Duration::from_secs(60 * 60 * 24 * 15)),
         },
+    };
+    let config = TestServerConfig {
+        exe,
         port: None,
         extra_args: Vec::new(),
     };
@@ -72,7 +82,7 @@ async fn start_temporal() -> Option<temporalio_sdk_core::ephemeral_server::Ephem
         Err(e) => {
             eprintln!(
                 "skipping: starting the ephemeral Temporal test server failed \
-                 (no network egress to download it, most likely): {e}"
+                 (no network egress to download it, most likely): {e:?}"
             );
             None
         }

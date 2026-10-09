@@ -27,7 +27,8 @@ CONTRIBUTING.md's "What the tests do and don't verify" lists which guarantees ho
 
 Some integration tests require external services:
 - **Postgres** — `skilj-core`, `skilj`, `skilj-inspector` and `skilj-demo` integration tests use `DATABASE_URL` when it is set, and otherwise fall back to `postgresql_embedded`. Set `DATABASE_URL` to a real Postgres to avoid embedded-server issues. `DATABASE_URL` supplies the server, not the database: every test binary drops and recreates a named database of its own on it (docs/architecture.md §167), so the role needs `CREATEDB`.
-- **Kafka** (`skilj-kafka`), **AMQP** (`skilj-amqp`), **NATS** (`skilj-nats`), **Temporal** (`skilj-temporal`) — these tests use `testcontainers-modules` and need a reachable Docker daemon. They skip gracefully if Docker is unavailable.
+- **Kafka** (`skilj-kafka`), **AMQP** (`skilj-amqp`), **NATS** (`skilj-nats`) — these tests use `testcontainers-modules` and need a reachable Docker daemon. They skip gracefully if Docker is unavailable.
+- **Temporal** (`skilj-temporal`) — downloads Temporal's test server from temporal.download on first run and skips if it can't. Where that host is blocked, set `SKILJ_TEMPORAL_TEST_SERVER` to a `temporal-test-server` binary; the Java SDK's GitHub releases publish it (`temporal-test-server_<version>_linux_amd64.tar.gz`).
 
 ## Lint
 
