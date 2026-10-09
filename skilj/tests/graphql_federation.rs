@@ -582,6 +582,29 @@ fn entities_resolve_through_the_callers_own_grant() {
             "{response}"
         );
 
+        // docs/architecture.md §197: a page is read at once, and answered
+        // in the router's order - a repeated key twice, and an instance
+        // with no state yet with the projection's default.
+        let unknown = unique_name("account");
+        let response = entities(json!([
+            { "__typename": type_name, "projectionKey": other_account },
+            { "__typename": type_name, "projectionKey": account },
+            { "__typename": type_name, "projectionKey": unknown },
+            { "__typename": type_name, "projectionKey": other_account },
+        ]))
+        .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(
+            response["data"]["_entities"],
+            json!([
+                { "__typename": type_name, "projectionKey": other_account, "total": 5 },
+                { "__typename": type_name, "projectionKey": account, "total": 42 },
+                { "__typename": type_name, "projectionKey": unknown, "total": 0 },
+                { "__typename": type_name, "projectionKey": other_account, "total": 5 },
+            ]),
+            "{response}"
+        );
+
         let response = entities(json!([
             { "__typename": type_name, "projectionKey": account },
             { "__typename": "LedgerRole", "projectionKey": account },

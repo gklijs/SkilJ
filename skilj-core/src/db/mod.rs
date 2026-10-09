@@ -5085,6 +5085,31 @@ pub async fn get_projection_state_and_owner(
     Ok(row)
 }
 
+/// [`get_projection_state_and_owner`] for many `keys` of one projection in
+/// one statement - federation's `_entities` resolves a router's whole page
+/// of instances at once (docs/architecture.md §197). Keys with no row are
+/// absent from the map.
+pub async fn get_projection_states_and_owners(
+    pool: &Pool,
+    bounded_context: &str,
+    projection_name: &str,
+    keys: &[String],
+) -> crate::error::Result<std::collections::HashMap<String, (String, Option<String>)>> {
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT key, state, owner FROM {schema}.projection_state \
+         WHERE projection_name = $1 AND key = ANY($2)"
+    )))
+    .bind(projection_name)
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(key, state, owner)| (key, (state, owner)))
+        .collect())
+}
+
 /// A building `ProjectionRebuild`'s own materialised state, JSON-encoded,
 /// for one instance/`key`. `None` when either nothing is staged at all
 /// or a staged rebuild hasn't reached this key yet (`catch_up_bounded_context`

@@ -79,6 +79,7 @@ pub fn graphql_type_name(bounded_context: &str, projection_name: &str) -> String
 /// What a projection type's own fields resolve against: one instance's
 /// key and its decoded state. Nested shapes below it resolve against
 /// their part of `state` directly.
+#[derive(Clone)]
 pub struct ProjectionInstance {
     pub key: String,
     pub state: serde_json::Value,

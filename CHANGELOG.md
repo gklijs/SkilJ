@@ -128,6 +128,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   docs/performance.md has the figures (docs/architecture.md §197). New
   benchmark: `skilj-core/tests/snapshot_catch_up_throughput.rs`.
 
+- Fewer round trips before the batch lock: a token's bounded context is
+  remembered after its first read (its status is still read every time),
+  and a bounded context is read with its creating role and template in one
+  statement instead of up to four (docs/architecture.md §199). New:
+  `db::get_projection_states_and_owners`.
+
+- Federation's `_entities` reads a page of instances of one projection
+  with one grant check and one statement for their rows, instead of
+  per instance (docs/architecture.md §199).
+
 - **Behaviour change:** without `SkiljBuilder::pool_options(...)`, the pool
   no longer pings a connection each time it is taken (sqlx's
   `test_before_acquire`). Most statements before the batch lock go straight

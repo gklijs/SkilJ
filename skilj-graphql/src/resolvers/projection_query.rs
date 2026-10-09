@@ -174,6 +174,40 @@ pub(crate) async fn fetch_projection_result(
     )
     .await
     .map_err(to_graphql_error)?;
+    projection_instance(
+        state,
+        access_mapping,
+        &projection,
+        bounded_context_name,
+        name,
+        key,
+        wait_for_sequence,
+        caught_up,
+        team_only,
+        stored,
+    )
+    .await
+}
+
+/// One projection instance as `projection(...)` answers it, from its
+/// stored `(state, owner)` row (`None` when it has none): the default
+/// state for a missing row, sensitive fields decrypted for a granted
+/// caller, and `query_projection`'s access checks. Shared by
+/// [`fetch_projection_result`] and `_entities`, which reads a whole page
+/// of rows at once (docs/architecture.md §197).
+#[allow(clippy::too_many_arguments)]
+async fn projection_instance(
+    state: &GraphqlState,
+    access_mapping: &RoleAccessMapping,
+    projection: &skilj_core::projections::Projection,
+    bounded_context_name: &str,
+    name: &str,
+    key: &str,
+    wait_for_sequence: Option<i64>,
+    caught_up: bool,
+    team_only: Option<&str>,
+    stored: Option<(String, Option<String>)>,
+) -> async_graphql::Result<(crate::projection_types::ProjectionInstance, String)> {
     // Cross-tenant projection read fix (docs/architecture.md's own
     // write-up of this pass): `instance_owner` is this row's own `owner`
     // column, `None` for a row that doesn't exist yet - the same "no
@@ -213,7 +247,7 @@ pub(crate) async fn fetch_projection_result(
 
     let result = skilj_core::projections::query_projection(
         access_mapping,
-        &projection,
+        projection,
         key,
         wait_for_sequence,
         caught_up,
@@ -328,12 +362,11 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
     FieldFuture::new(async move {
         let state = ctx.data::<GraphqlState>()?;
         let representations = ctx.args.try_get("representations")?.list()?;
-        // A router sends many instances of one type at once: the caller's
-        // grant on each bounded context is looked up once, not per
-        // instance.
-        let mut mappings: std::collections::HashMap<String, RoleAccessMapping> =
-            std::collections::HashMap::new();
-        let mut values = Vec::with_capacity(representations.len());
+        // A router sends a page of instances at once, mostly of one type:
+        // each projection's grant, registration and team check are read
+        // once, and its instances' rows in one statement
+        // (docs/architecture.md §197), not each per instance.
+        let mut wanted: Vec<(String, String, String)> = Vec::with_capacity(representations.len());
         for representation in representations.iter() {
             let representation = representation.object()?;
             let type_name = representation.try_get("__typename")?.string()?;
@@ -347,6 +380,28 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
                 .and_then(|admitted| admitted.by_type_name(type_name))
                 .cloned()
                 .ok_or_else(|| not_found("Projection type", type_name))?;
+            wanted.push((bounded_context_name, name, key));
+        }
+
+        let mut mappings: std::collections::HashMap<String, RoleAccessMapping> =
+            std::collections::HashMap::new();
+        let mut answers: std::collections::HashMap<
+            (String, String, String),
+            (crate::projection_types::ProjectionInstance, String),
+        > = std::collections::HashMap::new();
+        let mut groups: Vec<((String, String), Vec<String>)> = Vec::new();
+        for (bounded_context_name, name, key) in &wanted {
+            let group = (bounded_context_name.clone(), name.clone());
+            match groups.iter_mut().find(|(g, _)| *g == group) {
+                Some((_, keys)) => {
+                    if !keys.contains(key) {
+                        keys.push(key.clone());
+                    }
+                }
+                None => groups.push((group, vec![key.clone()])),
+            }
+        }
+        for ((bounded_context_name, name), keys) in groups {
             let access_mapping = match mappings.get(&bounded_context_name) {
                 Some(mapping) => mapping.clone(),
                 None => {
@@ -356,15 +411,55 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
                     mapping
                 }
             };
-            let (instance, type_name) = fetch_projection_result(
-                state,
-                &access_mapping,
+            let team_only = state
+                .projection_dispatcher
+                .team_only(&bounded_context_name, &name)
+                .flatten();
+            if !skilj_core::access_control::role_matches_required_team(
+                &access_mapping.role,
+                team_only,
+            ) {
+                return Err(to_graphql_error(
+                    skilj_core::access_control::Error::NotOnRequiredTeam,
+                ));
+            }
+            let projection =
+                skilj_core::db::get_projection(&state.pool, &bounded_context_name, &name)
+                    .await
+                    .map_err(to_graphql_error)?
+                    .ok_or_else(|| not_found("Projection", &name))?;
+            let mut stored = skilj_core::db::get_projection_states_and_owners(
+                &state.pool,
                 &bounded_context_name,
                 &name,
-                &key,
-                None,
+                &keys,
             )
-            .await?;
+            .await
+            .map_err(to_graphql_error)?;
+            for key in keys {
+                let answer = projection_instance(
+                    state,
+                    &access_mapping,
+                    &projection,
+                    &bounded_context_name,
+                    &name,
+                    &key,
+                    None,
+                    true,
+                    team_only,
+                    stored.remove(&key),
+                )
+                .await?;
+                answers.insert((bounded_context_name.clone(), name.clone(), key), answer);
+            }
+        }
+
+        let mut values = Vec::with_capacity(wanted.len());
+        for want in &wanted {
+            let (instance, type_name) = answers
+                .get(want)
+                .cloned()
+                .expect("every wanted instance was answered above");
             values.push(FieldValue::owned_any(instance).with_type(type_name));
         }
         Ok(Some(FieldValue::list(values)))
