@@ -9,7 +9,9 @@
 #
 # Local only, not part of CI: it downloads Rover (and Rover's supergraph
 # plugin) and three router binaries into target/federation-smoke/, which
-# means accepting the Elastic License 2.0 Apollo's tools are under.
+# means accepting the Elastic License 2.0 Apollo's tools are under. When
+# rover.apollo.dev can't be reached, it composes with @apollo/composition
+# from npm instead (scripts/federation/supergraph.mjs).
 #
 # Needs DATABASE_URL naming a Postgres database skilj-demo may use (its
 # server is safe to run again against the same one), Node.js with npm,
@@ -40,9 +42,17 @@ wait_for() { # url
 }
 
 # --- tools ---
+# Rover comes from rover.apollo.dev, which some networks block. Without
+# it, a subgraph's SDL is read with a plain `_service` query and the
+# supergraph composed by scripts/federation/supergraph.mjs, with the same
+# composition library from npm.
 if [[ ! -x "$bin/rover" ]]; then
-    curl -sSfL https://rover.apollo.dev/tar/rover/x86_64-unknown-linux-gnu/latest | tar xz -C "$work"
-    mv "$work/dist/rover" "$bin/rover"
+    if curl -sSfL https://rover.apollo.dev/tar/rover/x86_64-unknown-linux-gnu/latest | tar xz -C "$work" 2>/dev/null \
+        && [[ -x "$work/dist/rover" ]]; then
+        mv "$work/dist/rover" "$bin/rover"
+    else
+        echo "federation-smoke: no Rover (rover.apollo.dev unreachable) - composing with @apollo/composition" >&2
+    fi
 fi
 for v in "${apollo_routers[@]}"; do
     if [[ ! -x "$bin/router-$v" ]]; then
@@ -76,8 +86,17 @@ for account in ${accounts//,/ }; do
 done
 
 # --- composition, through skilj's own `_service` ---
-"$bin/rover" subgraph introspect http://127.0.0.1:18080/graphql > "$work/demo.graphql"
-"$bin/rover" subgraph introspect http://127.0.0.1:18081 > "$work/accounts.graphql"
+introspect() { # url
+    if [[ -x "$bin/rover" ]]; then
+        "$bin/rover" subgraph introspect "$1"
+    else
+        curl -sSf "$1" -H 'content-type: application/json' \
+            -d '{"query":"query SubgraphIntrospectQuery { _service { sdl } }"}' |
+            node -e 'let b="";process.stdin.on("data",d=>b+=d).on("end",()=>process.stdout.write(JSON.parse(b).data._service.sdl))'
+    fi
+}
+introspect http://127.0.0.1:18080/graphql > "$work/demo.graphql"
+introspect http://127.0.0.1:18081 > "$work/accounts.graphql"
 cat > "$work/supergraph.yaml" <<YAML
 federation_version: =2.11.2
 subgraphs:
@@ -90,8 +109,14 @@ subgraphs:
     schema:
       file: $work/accounts.graphql
 YAML
-APOLLO_ROVER_ALLOW_AUTOMATIC_DOWNLOAD=true "$bin/rover" supergraph compose \
-    --config "$work/supergraph.yaml" --elv2-license accept > "$work/supergraph.graphql"
+if [[ -x "$bin/rover" ]]; then
+    APOLLO_ROVER_ALLOW_AUTOMATIC_DOWNLOAD=true "$bin/rover" supergraph compose \
+        --config "$work/supergraph.yaml" --elv2-license accept > "$work/supergraph.graphql"
+else
+    (cd "$root/scripts/federation" && node supergraph.mjs \
+        "demo=$work/demo.graphql=http://127.0.0.1:18080/graphql" \
+        "accounts=$work/accounts.graphql=http://127.0.0.1:18081") > "$work/supergraph.graphql"
+fi
 
 smoke() { # http-url ws-url
     (cd "$root/scripts/federation" && ACCOUNT_IDS="$accounts" node smoke.mjs "$1" "$2" "$jwt")
