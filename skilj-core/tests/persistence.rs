@@ -618,6 +618,50 @@ fn round_trips_a_command_token() {
     });
 }
 
+/// docs/architecture.md §197: which bounded context holds a token is
+/// remembered after its first read, but only the location - a token
+/// revoked after that reads as revoked, and once its bounded context is
+/// hard-deleted, as gone.
+#[test]
+fn a_remembered_token_location_never_hides_a_revocation_or_a_deletion() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let ct = seed_command_type(&pool, &bc).await;
+        let token = CommandToken {
+            id: generate_token_id(),
+            secret: generate_token_secret(),
+            status: TokenStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+            command_type: ct,
+            scope: None,
+        };
+        db::insert_command_token(&pool, &token).await.unwrap();
+        let first = db::get_command_token(&pool, &token.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status, TokenStatus::Active);
+
+        db::revoke_access_token(&pool, &token.id, test_now())
+            .await
+            .unwrap();
+        let revoked = db::get_command_token(&pool, &token.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revoked.status, TokenStatus::Revoked);
+
+        db::hard_delete_bounded_context(&pool, &bc.name)
+            .await
+            .unwrap();
+        assert_eq!(db::get_command_token(&pool, &token.id).await.unwrap(), None);
+    });
+}
+
 #[test]
 fn round_trips_a_revoked_event_read_token() {
     runtime().block_on(async {

@@ -2994,57 +2994,93 @@ async fn require_command(
         .ok_or_else(crate::error::Error::row_not_found)
 }
 
+/// The columns that read a `bounded_contexts` row hydrated in one
+/// statement (docs/architecture.md §197), from
+/// [`HYDRATED_BOUNDED_CONTEXT_FROM`]: the row as `bc_*`, its creating role
+/// as `r_*`, its template as `t_*` and the template's creating role as
+/// `tr_*`. A template is never itself templated
+/// (`TemplateIsNeverItselfTemplated`), so that is the whole
+/// `BoundedContext`. Read back with [`hydrated_bounded_context`].
+fn hydrated_bounded_context_columns() -> String {
+    let aliased = |columns: &str, alias: &str| {
+        columns
+            .split(", ")
+            .map(|column| format!("{alias}.{column} AS {alias}_{column}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    [
+        aliased(BOUNDED_CONTEXT_COLUMNS, "bc"),
+        aliased(ROLE_COLUMNS, "r"),
+        aliased(BOUNDED_CONTEXT_COLUMNS, "t"),
+        aliased(ROLE_COLUMNS, "tr"),
+    ]
+    .join(", ")
+}
+
+/// The joins [`hydrated_bounded_context_columns`] reads from; `bc` is the
+/// bounded context itself.
+const HYDRATED_BOUNDED_CONTEXT_FROM: &str = "bounded_contexts bc \
+     LEFT JOIN roles r ON r.id = bc.created_by_role_id \
+     LEFT JOIN bounded_contexts t ON t.name = bc.template \
+     LEFT JOIN roles tr ON tr.id = t.created_by_role_id";
+
+/// The [`BoundedContext`] a [`hydrated_bounded_context_columns`] row holds.
+fn hydrated_bounded_context(row: &sqlx::postgres::PgRow) -> crate::error::Result<BoundedContext> {
+    use sqlx::Row;
+    let bounded_context = |alias: &str| -> Result<Option<BoundedContextRow>, sqlx::Error> {
+        let Some(name) = row.try_get::<Option<String>, _>(format!("{alias}_name").as_str())? else {
+            return Ok(None);
+        };
+        Ok(Some(BoundedContextRow {
+            name,
+            status: row.try_get(format!("{alias}_status").as_str())?,
+            created_at: row.try_get(format!("{alias}_created_at").as_str())?,
+            created_by_kind: row.try_get(format!("{alias}_created_by_kind").as_str())?,
+            created_by_role_id: row.try_get(format!("{alias}_created_by_role_id").as_str())?,
+            template: row.try_get(format!("{alias}_template").as_str())?,
+        }))
+    };
+    let role = |alias: &str| -> Result<Option<Role>, sqlx::Error> {
+        let Some(id) = row.try_get::<Option<String>, _>(format!("{alias}_id").as_str())? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            RoleRow {
+                id,
+                external_subject: row.try_get(format!("{alias}_external_subject").as_str())?,
+                name: row.try_get(format!("{alias}_name").as_str())?,
+                superadmin: row.try_get(format!("{alias}_superadmin").as_str())?,
+                status: row.try_get(format!("{alias}_status").as_str())?,
+                created_at: row.try_get(format!("{alias}_created_at").as_str())?,
+                revoked_at: row.try_get(format!("{alias}_revoked_at").as_str())?,
+            }
+            .into_domain(),
+        ))
+    };
+    let template_role = role("tr")?;
+    let template = bounded_context("t")?
+        .map(|template| Box::new(bounded_context_from_row(template, template_role, None)));
+    let own = bounded_context("bc")?.expect("a hydrated row always has its own bounded context");
+    Ok(bounded_context_from_row(own, role("r")?, template))
+}
+
 #[tracing::instrument(skip_all, fields(name = %name))]
 pub async fn get_bounded_context(
     pool: &Pool,
     name: &str,
 ) -> crate::error::Result<Option<BoundedContext>> {
-    let Some(row): Option<BoundedContextRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {BOUNDED_CONTEXT_COLUMNS} FROM bounded_contexts WHERE name = $1"
+    // Its role and template in the same statement (docs/architecture.md
+    // §197): read one after another they were up to four round trips, on
+    // nearly every request.
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {} FROM {HYDRATED_BOUNDED_CONTEXT_FROM} WHERE bc.name = $1",
+        hydrated_bounded_context_columns()
     )))
     .bind(name)
     .fetch_optional(pool)
-    .await?
-    else {
-        return Ok(None);
-    };
-    hydrate_bounded_context(pool, row).await.map(Some)
-}
-
-/// A `bounded_contexts` row as a [`BoundedContext`]: its creating role and
-/// its template, when it has them, read in. Shared by
-/// [`get_bounded_context`] and [`get_command_type`], which reads the row
-/// in the same statement as the command type.
-async fn hydrate_bounded_context(
-    pool: &Pool,
-    row: BoundedContextRow,
-) -> crate::error::Result<BoundedContext> {
-    let role = match &row.created_by_role_id {
-        Some(role_id) => Some(get_role(pool, role_id).await?.expect(
-            "bounded_contexts.created_by_role_id references a roles row that no longer exists",
-        )),
-        None => None,
-    };
-    // Invariant TemplateIsNeverItselfTemplated: a template's own `template`
-    // is always `None`, so this recursion is at most one level deep - it
-    // can never loop.
-    //
-    // Ultra-review bug_006: this template row and the tenant row above
-    // are two separate `SELECT`s, no shared transaction - a real,
-    // legitimate race (the template gets deleted, and its own
-    // `ON DELETE SET NULL` cascade fires, between the two) means this
-    // recursive lookup can genuinely return `None` even though the
-    // outer row's own snapshot still said `Some(template_name)`. Treated
-    // as `None` here rather than an `.expect()` panic: that's exactly
-    // the state a fresh re-read of the same tenant would show anyway,
-    // once the delete has committed.
-    let template = match &row.template {
-        Some(template_name) => Box::pin(get_bounded_context(pool, template_name))
-            .await?
-            .map(Box::new),
-        None => None,
-    };
-    Ok(bounded_context_from_row(row, role, template))
+    .await?;
+    row.as_ref().map(hydrated_bounded_context).transpose()
 }
 
 /// Every `BoundedContext` this engine currently knows of - the
@@ -3683,17 +3719,15 @@ pub async fn get_command_type(
     bounded_context: &str,
     name: &str,
 ) -> crate::error::Result<Option<CommandType>> {
-    use sqlx::{FromRow, Row};
-    // The bounded context's row and the command type's in one statement
-    // (docs/architecture.md §196): every command resolves its type this
-    // way before the lock, and they were two round trips.
+    use sqlx::FromRow;
+    // The command type with its bounded context, hydrated, in one
+    // statement (docs/architecture.md §196, §197): every command resolves
+    // its type this way before the lock.
     let schema = schema_ident(bounded_context);
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT bc.name AS bc_name, bc.status AS bc_status, bc.created_at AS bc_created_at, \
-         bc.created_by_kind AS bc_created_by_kind, \
-         bc.created_by_role_id AS bc_created_by_role_id, bc.template AS bc_template, \
-         {} FROM bounded_contexts bc JOIN {schema}.command_types ct ON ct.name = $2 \
-         WHERE bc.name = $1",
+        "SELECT {}, {} FROM {HYDRATED_BOUNDED_CONTEXT_FROM} \
+         JOIN {schema}.command_types ct ON ct.name = $2 WHERE bc.name = $1",
+        hydrated_bounded_context_columns(),
         COMMAND_TYPE_COLUMNS
             .split(", ")
             .map(|column| format!("ct.{}", column.trim()))
@@ -3713,17 +3747,8 @@ pub async fn get_command_type(
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let bc_row = BoundedContextRow {
-        name: row.try_get("bc_name")?,
-        status: row.try_get("bc_status")?,
-        created_at: row.try_get("bc_created_at")?,
-        created_by_kind: row.try_get("bc_created_by_kind")?,
-        created_by_role_id: row.try_get("bc_created_by_role_id")?,
-        template: row.try_get("bc_template")?,
-    };
-    let command_type_row = CommandTypeRow::from_row(&row)?;
-    let bc = hydrate_bounded_context(pool, bc_row).await?;
-    Ok(Some(command_type_row.into_domain(bc)))
+    let bc = hydrated_bounded_context(&row)?;
+    Ok(Some(CommandTypeRow::from_row(&row)?.into_domain(bc)))
 }
 
 // --- EncryptionKey ---
@@ -15682,22 +15707,94 @@ async fn fetch_access_token_row(
     pool: &Pool,
     id: &str,
 ) -> crate::error::Result<Option<AccessTokenRow>> {
+    // docs/architecture.md §197: a token never moves to another bounded
+    // context, so which one holds it is remembered, and every REST request
+    // after a token's first reads its row in one round trip instead of
+    // two. Only the location is remembered, never the row: status and
+    // revocation are read every time. A remembered location with no row
+    // (the token or its bounded context deleted since) is forgotten and
+    // the index read again, so a stale entry corrects itself.
+    if let Some(bounded_context) = remembered_token_context(id) {
+        match read_access_token_columns(pool, &bounded_context, id).await {
+            Ok(Some(columns)) => {
+                return Ok(Some(AccessTokenRow {
+                    columns,
+                    bounded_context,
+                }))
+            }
+            Ok(None) => forget_token_context(id),
+            Err(crate::error::Error::Database(sqlx::Error::Database(e)))
+                if e.code().as_deref() == Some("42P01") =>
+            {
+                forget_token_context(id)
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let Some(bounded_context) = resolve_token_bounded_context(pool, id).await? else {
         return Ok(None);
     };
-    let schema = schema_ident(&bounded_context);
-    let columns: Option<AccessTokenColumns> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let columns = read_access_token_columns(pool, &bounded_context, id).await?;
+    if columns.is_some() {
+        remember_token_context(id, &bounded_context);
+    }
+    Ok(columns.map(|columns| AccessTokenRow {
+        columns,
+        bounded_context,
+    }))
+}
+
+/// One token's own row from `bounded_context`'s schema.
+async fn read_access_token_columns(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+) -> crate::error::Result<Option<AccessTokenColumns>> {
+    let schema = schema_ident(bounded_context);
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, kind, secret, status, created_at, revoked_at, event_type_name, \
          command_type_name, scope, start_from, start_at_sequence, start_at_time \
          FROM {schema}.access_tokens WHERE id = $1"
     )))
     .bind(id)
     .fetch_optional(pool)
-    .await?;
-    Ok(columns.map(|columns| AccessTokenRow {
-        columns,
-        bounded_context,
-    }))
+    .await?)
+}
+
+/// How many token locations [`fetch_access_token_row`] remembers before it
+/// starts over - a bound on memory, not a tuning knob: a forgotten
+/// location only costs the index read again.
+const REMEMBERED_TOKEN_CONTEXTS: usize = 10_000;
+
+/// Token id -> the bounded context whose schema holds it.
+fn token_contexts() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static CONTEXTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    CONTEXTS.get_or_init(Default::default)
+}
+
+fn remembered_token_context(id: &str) -> Option<String> {
+    token_contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned()
+}
+
+fn remember_token_context(id: &str, bounded_context: &str) {
+    let mut contexts = token_contexts().lock().unwrap_or_else(|e| e.into_inner());
+    if contexts.len() >= REMEMBERED_TOKEN_CONTEXTS {
+        contexts.clear();
+    }
+    contexts.insert(id.to_string(), bounded_context.to_string());
+}
+
+fn forget_token_context(id: &str) {
+    token_contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
 }
 
 /// See `AccessTokenKind`'s own doc comment - the one lookup `skilj-rest`'s
