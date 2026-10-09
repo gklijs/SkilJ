@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too, about four times faster than through the GIN index on long
   histories.
 
+- `scripts/load-demo.py` drives a running skilj-demo with N concurrent REST
+  clients and then checks Postgres: no gap in the event sequence, one event
+  per accepted command, and the projection agreeing (docs/architecture.md
+  §199).
+
 - `command_throughput.rs` can add a network round trip between skilj and
   Postgres (`SKILJ_BENCH_LATENCY_MS`), run several instances on one bounded
   context (`SKILJ_BENCH_INSTANCES`) and set the commands per scenario
