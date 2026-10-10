@@ -33,7 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[[command_type.query]]` tables. skilj-demo's `OpenCourse` uses one.
   A snapshot's refold after a `VERSION` bump reads through `event_tags`
   too, about four times faster than through the GIN index on long
-  histories.
+  histories. A bounded context an older instance adds during a rolling
+  deploy gets the table and the column from the first newer instance to
+  meet it; adding the column no longer locks command reads during the
+  backfill (docs/architecture.md §200).
 
 - `scripts/load-demo.py` drives a running skilj-demo with N concurrent REST
   clients and then checks Postgres: no gap in the event sequence, one event

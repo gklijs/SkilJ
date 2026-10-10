@@ -317,8 +317,12 @@ value QueryItem {
     -- ANY, is the deliberate difference from the default tag match: an
     -- item naming two tags reads the events where both facts hold at
     -- once. latest plays no part here - it narrows what a decision is
-    -- handed, not what an event matching the item is.
-    matches(e): (event_types.count = 0 or e.event_type.name in event_types)
+    -- handed, not what an event matching the item is. An item naming
+    -- neither types nor tags matches nothing: a declaration can't hold
+    -- one (invariant ConsistencyQueryIsWellFormed), and derive_query
+    -- yields one only for an item no event can match.
+    matches(e): (event_types.count > 0 or tags.count > 0)
+        and (event_types.count = 0 or e.event_type.name in event_types)
         and tags.all(t => t in e.tags)
 }
 
@@ -2147,7 +2151,12 @@ default SystemCreator skilj = { }
 -- exactly the register derive_tags is, and is derive_tags underneath, so
 -- every case of the derive_tags contract above - an absent field
 -- deriving Tag(key, null), a list deriving one tag per distinct element -
--- holds for an item's tags unchanged. Since every item's tag_mappings are
+-- holds for an item's tags unchanged. One case is the item's own: a
+-- tag_mapping deriving no tag at all (its field a list holding only
+-- non-scalars) leaves an item whose tags no event can carry, since an
+-- item requires every one, and that item resolves with no event_types
+-- and no tags, matching nothing - not with the tag dropped, which would
+-- match more than declared. Since every item's tag_mappings are
 -- among the type's own (see invariant ConsistencyQueryIsWellFormed), every tag any item
 -- derives is in consistency_tags too. It yields the empty list for a type
 -- declaring no consistency_query.

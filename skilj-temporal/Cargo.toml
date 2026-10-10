@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "../README.md"
+readme = "README.md"
 description = "A bridge between skilj's own event stream and Temporal, correlating a running Temporal workflow execution to a skilj bounded context's own DCB tags. See docs/architecture.md §34."
 
 [dependencies]
