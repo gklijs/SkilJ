@@ -943,3 +943,110 @@ fn a_failing_event_mid_chunk_keeps_the_progress_before_it() {
         assert_eq!(state.balance, 7);
     });
 }
+
+/// `insert_money_event` with the event's tags given in full, so one event
+/// can carry several values of the snapshot's tag key.
+async fn insert_tagged_event(
+    pool: &Pool,
+    bc: &BoundedContext,
+    et: &EventType,
+    tags: Vec<Tag>,
+    amount: i64,
+) -> i64 {
+    let seq = db::next_sequence(pool, &bc.name).await.unwrap();
+    let e = Event {
+        bounded_context: bc.clone(),
+        event_type: et.clone(),
+        payload: serde_json::json!({ "amount": amount }).to_string(),
+        metadata: Metadata {
+            r#type: et.name.clone(),
+            version: et.schema_version,
+            client_id: "test".to_string(),
+            created_at: test_now(),
+            correlation_id: None,
+            causation_id: None,
+        },
+        sequence: seq,
+        tags,
+        encryption_keys: Vec::new(),
+        origin: EventOrigin::DirectlyCreated,
+    };
+    db::insert_event(pool, &e, None).await.unwrap();
+    seq
+}
+
+/// A `VERSION` bump refolds a row over its whole history, read a page of
+/// 1000 events at a time from `event_tags`, one row per tag. Here every
+/// event carries two values of the snapshot's key - a transfer between
+/// two accounts - so the history has twice as many tag rows as events.
+/// Counting rows ended the paging after the first page, and the rows were
+/// marked current while missing the rest. An event folds into the first
+/// value of the key it carries, as the per-chunk fold always did, so each
+/// account holds the events that list it first.
+#[test]
+fn a_version_bump_refolds_every_page_when_events_carry_two_values() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let transferred = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let a = unique_name("account");
+        let b = unique_name("account");
+        let at = |version| TestSnapshotDispatcher {
+            tag_key: "account",
+            version,
+        };
+        for i in 0..1200 {
+            let tags = if i % 2 == 0 {
+                vec![tag("account", &a), tag("account", &b)]
+            } else {
+                vec![tag("account", &b), tag("account", &a)]
+            };
+            insert_tagged_event(&pool, &bc, &transferred, tags, 1).await;
+        }
+        for _ in 0..3 {
+            db::catch_up_snapshots(&pool, &bc.name, &at(1))
+                .await
+                .unwrap();
+        }
+
+        insert_tagged_event(
+            &pool,
+            &bc,
+            &transferred,
+            vec![tag("account", &a), tag("account", &b)],
+            1,
+        )
+        .await;
+        let last = insert_tagged_event(
+            &pool,
+            &bc,
+            &transferred,
+            vec![tag("account", &b), tag("account", &a)],
+            1,
+        )
+        .await;
+        for _ in 0..3 {
+            db::catch_up_snapshots(&pool, &bc.name, &at(2))
+                .await
+                .unwrap();
+        }
+
+        for account in [&a, &b] {
+            let resolved = db::resolve_snapshot_context(
+                &pool,
+                &bc.name,
+                &at(2),
+                "Balance",
+                &[tag("account", account)],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+            assert_eq!(state.balance, 601, "every event listing it first");
+            assert!(resolved.as_of_sequence >= last - 1);
+        }
+    });
+}

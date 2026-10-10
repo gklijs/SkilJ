@@ -14669,6 +14669,9 @@ async fn fold_snapshots_chunk(
 /// its btree hands back each value's sequences in order, where the GIN
 /// index on `events.tags` rebuilt and sorted every value's whole bitmap
 /// for each page - about four times slower for 100 values of 500 events.
+/// The page is of distinct sequences: `event_tags` has a row per tag, so
+/// an event carrying two of the values has two, and a limit on rows
+/// returned a short page before the end, which ended the paging early.
 /// A
 /// fold that fails sets `reached` to the first of the value's chunk
 /// events at or after the failing one: the event at which the per-event
@@ -14715,7 +14718,7 @@ async fn refold_snapshot_histories(
              metadata_client_id, metadata_created_at, metadata_correlation_id, \
              metadata_causation_id, tags, origin_kind, origin_source_content, \
              origin_source_context, origin_command_id FROM {schema}.events \
-             WHERE sequence IN (SELECT sequence FROM {schema}.event_tags \
+             WHERE sequence IN (SELECT DISTINCT sequence FROM {schema}.event_tags \
                  WHERE tag_key = $1 AND tag_value = ANY($2) \
                  AND sequence > $3 AND sequence <= $4 ORDER BY sequence LIMIT $5) \
              ORDER BY sequence"
