@@ -39,7 +39,9 @@ use skilj_core::event_store::{
     EventType, MissedOccurrencePolicy,
 };
 use skilj_core::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
-use skilj_core::shared::{PrivateField, PrivateFieldKind, SensitiveField, TagMapping};
+use skilj_core::shared::{
+    PrivateField, PrivateFieldKind, QueryItemMapping, SensitiveField, TagMapping,
+};
 use skilj_macros::gql_object;
 
 /// A scalar (or nullable-scalar) field resolved synchronously from the
@@ -454,6 +456,65 @@ pub fn command_type_object(n: &Naming) -> Object {
         scalar "restTriggerAllowed": TypeRef::named_nn(TypeRef::BOOLEAN) => |ct| Value::from(ct.rest_trigger_allowed),
         list "privateFields": TypeRef::named_nn_list_nn(n.ty("PrivateField")) => |ct| ct.private_fields.clone(),
     })
+    .field(command_type_consistency_query_field(n))
+}
+
+/// `CommandType.consistencyQuery` (docs/architecture.md §198): the query
+/// as the answering instance has the command type compiled - it isn't
+/// registered, so it comes from the dispatcher, not the loaded row.
+/// Empty when the command type declares none, or this instance doesn't
+/// deploy it.
+fn command_type_consistency_query_field(n: &Naming) -> Field {
+    Field::new(
+        "consistencyQuery",
+        TypeRef::named_nn_list_nn(n.ty("QueryItemMapping")),
+        |ctx: ResolverContext| {
+            FieldFuture::new(async move {
+                let command_type = ctx.parent_value.try_downcast_ref::<CommandType>()?;
+                let state = ctx.data::<crate::GraphqlState>()?;
+                let query = state
+                    .dispatcher
+                    .consistency_query(&command_type.bounded_context.name, &command_type.name)
+                    .unwrap_or_default();
+                Ok(Some(FieldValue::list(
+                    query.into_iter().map(FieldValue::owned_any),
+                )))
+            })
+        },
+    )
+}
+
+/// `value QueryItemMapping`: one item of a command type's consistency
+/// query. `latest` is null for every match, else how many of the newest.
+pub fn query_item_mapping_object(n: &Naming) -> Object {
+    Object::new(n.ty("QueryItemMapping"))
+        .field(Field::new(
+            "eventTypes",
+            TypeRef::named_nn_list_nn(TypeRef::STRING),
+            |ctx: ResolverContext| {
+                FieldFuture::new(async move {
+                    let item = ctx.parent_value.try_downcast_ref::<QueryItemMapping>()?;
+                    Ok(Some(FieldValue::list(
+                        item.event_types
+                            .iter()
+                            .map(|t| FieldValue::value(Value::from(t.clone()))),
+                    )))
+                })
+            },
+        ))
+        .field(list_field(
+            "tagMappings",
+            TypeRef::named_nn_list_nn(n.ty("TagMapping")),
+            |item: &QueryItemMapping| item.tag_mappings.clone(),
+        ))
+        .field(scalar_field(
+            "latest",
+            TypeRef::named(TypeRef::INT),
+            |item: &QueryItemMapping| match item.latest {
+                Some(count) => Value::from(count),
+                None => Value::Null,
+            },
+        ))
 }
 
 /// `entity ProjectionRebuild`.

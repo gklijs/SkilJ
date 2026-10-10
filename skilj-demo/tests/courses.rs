@@ -354,3 +354,44 @@ fn concurrent_enrollments_for_the_last_seat_are_serialized_correctly() {
         );
     });
 }
+
+/// docs/architecture.md §198: `OpenCourse` declares a consistency query -
+/// only the course's `CourseOpened` - so reopening a course with
+/// enrollments is still refused, and the dispatcher reports the query
+/// `commandTypes` shows.
+#[test]
+fn opening_an_open_course_is_refused_through_its_query() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, pool, mappings) = setup().await;
+        let mapping = mapping_for(&mappings, BOUNDED_CONTEXT);
+        let router = skilj.rest_router();
+        let course = unique_name("course");
+        let open = mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "OpenCourse").await;
+        let enroll =
+            mint_command_token(&pool, mapping, BOUNDED_CONTEXT, "EnrollStudentInCourse").await;
+
+        let opening = serde_json::json!({ "course_id": course, "capacity": 5 });
+        assert!(accepted(&trigger(&router, &open, opening.clone()).await));
+        let response = trigger(
+            &router,
+            &enroll,
+            serde_json::json!({ "student_id": unique_name("student"), "course_id": course }),
+        )
+        .await;
+        assert!(accepted(&response));
+
+        let response = trigger(&router, &open, opening).await;
+        assert_eq!(rejection_kind(&response), "course_already_open");
+
+        let query = skilj
+            .command_dispatcher()
+            .consistency_query(BOUNDED_CONTEXT, "OpenCourse")
+            .expect("OpenCourse is deployed here");
+        assert_eq!(query.len(), 1);
+        assert_eq!(query[0].event_types, vec!["CourseOpened".to_string()]);
+        assert_eq!(query[0].latest, Some(1));
+    });
+}

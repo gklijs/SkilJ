@@ -16,9 +16,10 @@
 //!   folds into the same row;
 //! - **per-account**: keyed by the event's account, `ACCOUNTS` of them;
 //! - **both**: the two above, plus a copy of each - four projections
-//!   walked by the same tick.
+//!   walked by the same tick;
+//! - **partitioned**: per-account, with `PARTITION_COUNT` 4.
 //!
-//! See docs/architecture.md §182 for the numbers.
+//! See docs/architecture.md §182 and §197 for the numbers.
 
 use chrono::{SubsecRound, Utc};
 use skilj_core::bootstrap::ContextCreator;
@@ -42,7 +43,7 @@ impl ProjectionDispatcher for BenchDispatcher {
     fn keys(&self, _bc: &str, projection_name: &str, event: &Event) -> Option<Vec<String>> {
         match projection_name {
             "Total" | "TotalCopy" => Some(vec![String::new()]),
-            "PerAccount" | "PerAccountCopy" => {
+            "PerAccount" | "PerAccountCopy" | "Partitioned" => {
                 let payload: serde_json::Value = serde_json::from_str(&event.payload).ok()?;
                 Some(vec![payload["account"].as_str()?.to_string()])
             }
@@ -69,9 +70,13 @@ impl ProjectionDispatcher for BenchDispatcher {
     fn default_state(&self, _bc: &str, projection_name: &str) -> Option<String> {
         matches!(
             projection_name,
-            "Total" | "TotalCopy" | "PerAccount" | "PerAccountCopy"
+            "Total" | "TotalCopy" | "PerAccount" | "PerAccountCopy" | "Partitioned"
         )
         .then(|| "0".to_string())
+    }
+
+    fn partition_count(&self, _bc: &str, projection_name: &str) -> Option<u32> {
+        (projection_name == "Partitioned").then_some(4)
     }
 
     fn owner_tag_key(&self, bc: &str, projection_name: &str) -> Option<Option<&'static str>> {
@@ -237,6 +242,7 @@ fn async_projection_catch_up_throughput() {
                 &["Total", "TotalCopy", "PerAccount", "PerAccountCopy"],
             )
             .await;
+            scenario(&pool, "partitioned", &["Partitioned"]).await;
         }
     });
 }

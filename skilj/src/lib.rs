@@ -439,6 +439,20 @@ impl CommandDispatcher for Dispatcher {
         Some(registered.snapshot_name)
     }
 
+    fn consistency_query(
+        &self,
+        bounded_context: &str,
+        command_type: &str,
+    ) -> Option<Vec<skilj_core::shared::QueryItemMapping>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        let registered = self
+            .command_types
+            .get(&(bounded_context, command_type.to_string()))?;
+        Some(registered.consistency_query.clone())
+    }
+
     fn dispatch_from_snapshot(
         &self,
         bounded_context: &str,
@@ -1292,6 +1306,9 @@ struct RegisteredCommandType {
     /// unchanged - read back by `Dispatcher::snapshot_name`, the same
     /// "outer/inner `Option`" convention `required_role` already uses.
     snapshot_name: Option<&'static str>,
+    /// `CommandType::consistency_query()`'s value, read back by
+    /// `Dispatcher::consistency_query` (docs/architecture.md §198).
+    consistency_query: Vec<skilj_core::shared::QueryItemMapping>,
     /// Called by `Dispatcher::dispatch` (this module's own
     /// `CommandDispatcher` implementer), reached from `skilj-rest`'s
     /// `CommandTrigger` route through the `Arc<dyn CommandDispatcher>`
@@ -1302,6 +1319,73 @@ struct RegisteredCommandType {
     /// instead of it when `snapshot_name` is `Some` and the caller's own
     /// derived tags matched.
     decide_from_snapshot: DecideFromSnapshotFn,
+}
+
+/// What `build()` refuses in a command type's `consistency_query()`
+/// (docs/architecture.md §198): an event type its bounded context doesn't
+/// register in this builder, a tag mapping that isn't one of its own
+/// `tag_mappings()`, an item with neither types nor tags (it would match
+/// every event), an item keeping the last 0 matches, and a query together
+/// with `snapshot()`, which folds by
+/// tag and knows nothing of the query.
+fn validate_consistency_queries(
+    command_types: &HashMap<(String, String), RegisteredCommandType>,
+    event_types: &HashMap<(String, String), RegisteredEventType>,
+) -> Result<(), skilj_core::Error> {
+    let mut names: Vec<&(String, String)> = command_types.keys().collect();
+    names.sort();
+    for key in names {
+        let (bounded_context, name) = key;
+        let registered = &command_types[key];
+        if registered.consistency_query.is_empty() {
+            continue;
+        }
+        let refuse = |why: String| {
+            Err(skilj_core::Error::configuration(format!(
+                "command type {name} in bounded context {bounded_context}: {why}"
+            )))
+        };
+        if registered.snapshot_name.is_some() {
+            return refuse(
+                "declares both consistency_query() and snapshot(); a snapshot folds by \
+                 tag and can't stand in for a query"
+                    .to_string(),
+            );
+        }
+        for item in &registered.consistency_query {
+            if item.event_types.is_empty() && item.tag_mappings.is_empty() {
+                return refuse(
+                    "a consistency_query() item names neither event types nor tags, so it \
+                     would match every event"
+                        .to_string(),
+                );
+            }
+            if item.latest == Some(0) {
+                return refuse(
+                    "a consistency_query() item keeps the last 0 matching events; \
+                     leave latest unset for every match"
+                        .to_string(),
+                );
+            }
+            for event_type in &item.event_types {
+                if !event_types.contains_key(&(bounded_context.clone(), event_type.clone())) {
+                    return refuse(format!(
+                        "consistency_query() names event type {event_type}, which isn't \
+                         registered in this bounded context"
+                    ));
+                }
+            }
+            for mapping in &item.tag_mappings {
+                if !registered.tag_mappings.contains(mapping) {
+                    return refuse(format!(
+                        "consistency_query() tag {} (field {}) isn't one of its tag_mappings()",
+                        mapping.key, mapping.field
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `T: 'static` (beyond `CommandType` itself) is what lets the returned
@@ -1319,6 +1403,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
         rest_trigger_allowed: T::rest_trigger_allowed(),
         required_role: T::required_role(),
         snapshot_name: T::snapshot(),
+        consistency_query: T::consistency_query(),
         decide: Box::new(|payload_json, raw_events| {
             let payload: T::Payload = serde_json::from_str(payload_json)
                 .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
@@ -2209,6 +2294,8 @@ impl SkiljBuilder {
                 )));
             }
         }
+        // docs/architecture.md §198.
+        validate_consistency_queries(&self.command_types, &self.event_types)?;
         // docs/architecture.md §194.
         let graphql_naming = match &self.graphql_federation {
             Some(options) => options.naming().map_err(skilj_core::Error::configuration)?,
@@ -2514,6 +2601,10 @@ impl SkiljBuilder {
                         // cache stamps registrations with, instead of
                         // hashing them on every read.
                         skilj_core::db::ensure_registrations_generation(pool, &bc.name).await?;
+                        // docs/architecture.md §198: the per-tag index a
+                        // consistency query's typed items read, and the
+                        // column a command's query is recorded in.
+                        skilj_core::db::ensure_event_tags_index(pool, &bc.name).await?;
                         // Last: it reads `events` as the patches above
                         // leave it - a bounded context from before
                         // `metadata_correlation_id`/`metadata_causation_id`

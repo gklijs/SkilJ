@@ -128,11 +128,13 @@
 --     a webhook, ship or compensate): excluded by design, not an
 --     oversight. decide()'s own synchronous, no-I/O contract already
 --     rules it out structurally, and it is a different problem from the
---     one DCB tagging solves - a command deriving more than one tag
---     already lets decide() check several facts in one synchronous,
---     same-database transaction (see the note above rule ProcessCommand
---     on consistency_tags/matching_events), replacing the classic
---     saga/process-manager need for exactly that case, never for a
+--     one DCB tagging solves - a command deriving more than one tag, or
+--     declaring a consistency query of several items, already lets
+--     decide() check several facts in one synchronous, same-database
+--     transaction (see rule ProcessCommand and the consistency query
+--     note above the rules on consistency_tags/matching_events),
+--     replacing the classic saga/process-manager need for exactly that
+--     case, never for a
 --     process that cannot be one transaction at all. What
 --     is in scope, and already built, is the one piece such a process
 --     from outside SkilJ actually needs: an idempotency key on command
@@ -239,13 +241,16 @@ value TagMapping {
                                  -- What a shared key buys is that reach across types, at one value of
                                  -- the key - not a boundary over every value of it. There is no
                                  -- type-wide, valueless form of tag, and the derive_tags note above
-                                 -- the rules says why that is settled rather than missing.
+                                 -- the rules says why that is settled rather than missing (a
+                                 -- consistency query item naming no tags reaches a whole type; a tag
+                                 -- never does - see the same note).
                                  --
                                  -- Keys are plain strings: no namespace prefix, no central registry.
                                  -- None is needed, because every place a tag key is read partitions
                                  -- by bounded context before comparing anything. ProcessCommand's
-                                 -- matching_events reads only Events where bounded_context =
-                                 -- command_type.bounded_context; DynamicConsistencyBoundaryHonoured
+                                 -- matching_events reads only Events of
+                                 -- command_type.bounded_context (query_matching_events);
+                                 -- DynamicConsistencyBoundaryHonoured
                                  -- requires e.bounded_context = c.bounded_context; matches_filters is
                                  -- only ever reached through an EventType, which belongs to exactly
                                  -- one bounded context (FetchEvents, DeliverToSubscriptions); and
@@ -268,6 +273,53 @@ value TagMapping {
                                  -- deeper, and never a nested-object-typed field itself, since
                                  -- there is no tag whose value is a whole address (see the
                                  -- payload schema shape note above entity CommandType).
+}
+
+-- One item of a command type's DCB consistency query (dcb.events), as
+-- declared on the CommandType: which event types it reads, which of the
+-- command's own tag mappings scope it, and how many of the most recent
+-- matching events are wanted. It exists because tag_mappings alone can only
+-- say "every event in this context carrying any of these tags", so a
+-- decider that needs "the latest lifecycle event for this company" and
+-- "whether a TicketCreated exists for this ticket id" was handed every
+-- ticket the company ever filed and replayed it on every command. The
+-- query lets a command type ask for what it decides from, and nothing
+-- more. latest bounds an item to its n most recent matches because a
+-- decision often needs the last few events rather than one or all (at
+-- most 3 open tickets per requester, the last 5 failed logins). See
+-- CommandType.consistency_query for how items combine, and the
+-- consistency query note above the rules for what they read.
+value QueryItemMapping {
+    event_types: Set<String>     -- EventType names in the command type's own bounded context;
+                                 -- empty means any event type
+    tag_mappings: Set<TagMapping> -- drawn from the command type's own tag_mappings (see rule
+                                 -- invariant ConsistencyQueryIsWellFormed), never a mapping of their own: the
+                                 -- tags an item scopes by are always a subset of the
+                                 -- command's consistency_tags, which is what owner scoping
+                                 -- reads. Empty means the item is unscoped by tag, and is
+                                 -- then only ever valid with at least one event type
+    latest: Integer?             -- null: every event matching this item; n: only the n matching
+                                 -- events with the highest sequences (fewer when fewer match).
+                                 -- At least 1 when set (see invariant ConsistencyQueryIsWellFormed)
+}
+
+-- A QueryItemMapping resolved against one command's payload: its
+-- tag_mappings replaced by the Tags derive_query derives from them (see
+-- the consistency query note above the rules). This is the form
+-- a decision is actually made against and the form a Command records.
+value QueryItem {
+    event_types: Set<String>
+    tags: Set<Tag>
+    latest: Integer?
+
+    -- The DCB item match: the event is of one of the item's types (or the
+    -- item names none) AND carries every one of the item's tags. ALL, not
+    -- ANY, is the deliberate difference from the default tag match: an
+    -- item naming two tags reads the events where both facts hold at
+    -- once. latest plays no part here - it narrows what a decision is
+    -- handed, not what an event matching the item is.
+    matches(e): (event_types.count = 0 or e.event_type.name in event_types)
+        and tags.all(t => t in e.tags)
 }
 
 value EventSpec {
@@ -749,6 +801,42 @@ entity CommandType {
     -- consistency_tags from its own payload, using the same shared keys
     -- events are tagged with, so the two are directly comparable.
     tag_mappings: Set<TagMapping>
+
+    -- The DCB consistency query this type's commands are decided with:
+    -- a list of items OR'd together - an event matches the query when it
+    -- matches any one item (see QueryItem.matches). Empty is the default,
+    -- what every command type declaring none holds; it means exactly the
+    -- tag match this library always made, consistency_tags.any(t => t in
+    -- e.tags) over every event type with latest null - equivalently,
+    -- one item per derived tag. (Per derived tag rather than per mapping:
+    -- a list-valued mapping derives several tags, and the default matches
+    -- an event carrying any one of them, where a single item over that
+    -- mapping would require all of them.)
+    --
+    -- Every item's tag_mappings are a subset of tag_mappings above, never
+    -- declarations of their own (see invariant
+    -- ConsistencyQueryIsWellFormed), so consistency_tags remains the union
+    -- of every tag a command can be scoped by and remains the one field
+    -- owner scoping reads.
+    --
+    -- Unlike every field above, this is not registration state. It is
+    -- part of the deployed declaration: compiled into the instance
+    -- alongside decide() and read from the same build, the register the
+    -- summary behind surface SnapshotInspection and decide() itself are
+    -- in. RegisterCommandType neither takes nor stores it, so it is never
+    -- compared across registrations and is not additive-only. Two
+    -- instances in a rolling deploy may each decide this type's commands
+    -- with their own query, and that is the point rather than a gap: a
+    -- query belongs with the decide() that reads its result, and an
+    -- instance pairing its decide() with another build's query is the one
+    -- mismatch that could hand a decider events it did not ask for.
+    -- Nothing is stranded by a query changing between deploys either:
+    -- each Command records the query it was decided with
+    -- (Command.consistency_query), which is what
+    -- DynamicConsistencyBoundaryHonoured judges it by. Read here as "this
+    -- type's query as the instance deciding (or answering) has it
+    -- deployed".
+    consistency_query: List<QueryItemMapping>
 
     -- Names which of this type's own tag_mappings keys above is its
     -- "owner" dimension, in the identical shape and with the identical
@@ -1325,8 +1413,9 @@ entity Command {
                                             -- CommandType.sensitive_fields)
 
     -- Dynamic consistency boundary: the tags this command's decision was
-    -- based on, and the highest Event.sequence observed among events
-    -- matching those tags at decision time. consistency_boundary is null
+    -- based on, and the highest Event.sequence observed among the events
+    -- its decision was handed (matching those tags, or its
+    -- consistency_query below when it has one). consistency_boundary is null
     -- when the command does not use a consistency boundary;
     -- consistency_tags is not, and never is. It is
     -- derive_tags(command_type, payload) on every command this library
@@ -1336,8 +1425,28 @@ entity Command {
     -- boundary - and therefore the field a command's owner value is read
     -- from (see rule FetchCommands' guidance on
     -- command_owner_scope_satisfied).
+    --
+    -- consistency_query is the query the decision was made with -
+    -- derive_query(command_type, payload), stored alongside
+    -- consistency_tags - and empty when the command type declares none,
+    -- in which case the default tag match over consistency_tags is what
+    -- was used (see CommandType.consistency_query). It is recorded on the
+    -- command rather than re-read from the type because the type's query
+    -- may change later, and DynamicConsistencyBoundaryHonoured must judge
+    -- each command by the query it was actually decided with.
+    -- consistency_boundary is then the highest sequence among the events
+    -- that query handed decide().
     consistency_tags: Set<Tag>
+    consistency_query: List<QueryItem>
     consistency_boundary: Integer?
+
+    -- Whether an event falls inside this command's consistency query -
+    -- any item, regardless of its latest. The default (an empty query)
+    -- is the tag match over consistency_tags; see
+    -- CommandType.consistency_query.
+    in_consistency_query(e):
+        (consistency_query.count = 0 and consistency_tags.any(t => t in e.tags))
+            or consistency_query.any(i => i.matches(e))
 
     -- Events produced by this command, stored in the same transaction.
     triggered_events: CommandTriggered with command = this
@@ -1964,31 +2073,38 @@ default SystemCreator skilj = { }
 -- Two consequences of the list case are worth naming rather than leaving
 -- to be rediscovered, and both fall out of Event.tags and
 -- Command.consistency_tags already being Set<Tag>:
---   - ANY-match comes for free. The consistency-boundary match in
---     ProcessCommand is consistency_tags.any(t => t in tags), i.e. "does
---     any tag in one set appear in the other". A list-valued field
---     contributing one tag per element therefore matches when any element
---     matches, with no rule-level change at all - the semantics people
---     usually want from a multi-valued tag are what the existing set
---     membership already does.
+--   - ANY-match comes for free under the default query. The default
+--     consistency-boundary match (a command type declaring no
+--     consistency_query - see the consistency query note below) is
+--     consistency_tags.any(t => t in tags), i.e. "does any tag in one set
+--     appear in the other". A list-valued field contributing one tag per
+--     element therefore matches when any element matches, with no
+--     rule-level change at all - the semantics people usually want from a
+--     multi-valued tag are what the existing set membership already does.
+--     A declared QueryItem is the opposite on purpose: it matches an event
+--     carrying ALL of its tags, so a list-valued mapping inside an item
+--     requires every element. A command type wanting "any element" there
+--     declares the default, or one item per value it can foresee.
 --   - Duplicate elements collapse. Two equal elements produce two equal
 --     Tags, and a Set holds one - so a list is effectively deduplicated
 --     for tagging purposes, again with nothing extra specified.
 --
--- A consistency boundary is therefore always scoped to values, never to
--- a type as a whole, and that is settled rather than an omission. There
--- is no tag meaning "every event of this type, whatever the value", and
--- the shape of the mechanism is what rules it out: matching_events in
--- ProcessCommand is always consistency_tags.any(t => t in tags), and
--- consistency_tags is always derive_tags over the submitting command's
--- own payload. A boundary can only ever name values the submitter
--- itself supplied, and no payload field has a value that could mean
--- "match regardless of value". Nor is there a second read path to
--- compensate: a bounded context's decide() is handed matching_events
--- and nothing else. This library's own rules can check history
--- unscoped - CreateSuperadmin's `not exists Role{superadmin: true,
--- status: active}` is exactly that - but that is a rule in this file,
--- not something a plugged-in decider can reach for.
+-- A tag is therefore always scoped to values, never to a type as a
+-- whole, and that is settled rather than an omission. There is no tag
+-- meaning "every event of this type, whatever the value": consistency_tags
+-- is always derive_tags over the submitting command's own payload, so a
+-- tag can only ever name values the submitter itself supplied, and no
+-- payload field has a value that could mean "match regardless of value".
+-- Reach across a type as a whole is a different thing, and since the
+-- consistency query (see the note below) it exists - but as a property
+-- of a query item, never of a tag: an item naming event types and no tag
+-- mappings matches every event of those types in the bounded context.
+-- That is deliberate, and it is the only unscoped read a decider gets.
+-- There is still no second read path beside it: a bounded context's
+-- decide() is handed matching_events and nothing else. This library's
+-- own rules can check history unscoped - CreateSuperadmin's `not exists
+-- Role{superadmin: true, status: active}` is exactly that - but that is
+-- a rule in this file, not something a plugged-in decider can reach for.
 --
 -- The requirements that look like they need a type-wide read generally
 -- do not. A balance check spanning every deposit and withdrawal on an
@@ -2001,21 +2117,85 @@ default SystemCreator skilj = { }
 -- actually want. Spanning event types is what a shared key buys (see
 -- TagMapping.key); spanning every value of a key is a different thing.
 --
--- What is genuinely unavailable is the cross-instance form: "500
--- attendees across every workshop combined" rather than 30 per
--- workshop, or "100 withdrawals a day system-wide" rather than per
--- account. No such requirement has been identified, and it is not being
--- provided speculatively, because the cost would be structural rather
--- than incidental. Tag matching is fast precisely because Event.tags
--- and Command.consistency_tags are stored separately and indexed (see
--- the overlap constraint in the note above RegisterEventType) and
--- because the per-bounded-context event cache primarily serves
--- tag-scoped lookups (see the performance guidance in ProcessCommand).
--- An unscoped read has no tag to narrow by, so neither the index nor
--- the cache can serve it: it would scan a type's whole history on every
--- submission, bounded by neither - the exact cost both exist to avoid.
--- Should such a requirement ever turn up, it wants a mechanism designed
--- for it, not a wildcard value smuggled into Tag.
+-- The cross-instance form - "500 attendees across every workshop
+-- combined" rather than 30 per workshop, or "100 withdrawals a day
+-- system-wide" rather than per account - is what a tagless item reaches,
+-- and its cost is structural rather than incidental. Tag matching is
+-- fast precisely because Event.tags and Command.consistency_tags are
+-- stored separately and indexed (see the overlap constraint in the note
+-- above RegisterEventType) and because the per-bounded-context event
+-- cache primarily serves tag-scoped lookups (see the performance
+-- guidance in ProcessCommand). A tagless item has no tag to narrow by,
+-- so neither the index nor the cache narrows it: with latest null it
+-- hands decide() a type's whole history on every submission, bounded by
+-- neither - the exact cost both exist to avoid. With latest = n it is a
+-- bounded read of at most n events. A command type declaring one with
+-- latest null is choosing that cost; nothing here refuses it, and
+-- nothing smuggles a wildcard value into Tag to provide it either.
+--
+-- The consistency query (dcb.events), resolved. A command type may
+-- declare consistency_query in its deployed declaration, beside its
+-- decide() and never through registration (see
+-- CommandType.consistency_query): a list
+-- of QueryItemMappings, OR'd together. Empty is the default and changes
+-- nothing about what is described above.
+--
+-- derive_query(command_type, payload) resolves it against one payload:
+-- one QueryItem per declared QueryItemMapping, in order, with the same
+-- event_types and latest and with tags = derive_tags applied to just
+-- that item's tag_mappings over this payload. It is a black box in
+-- exactly the register derive_tags is, and is derive_tags underneath, so
+-- every case of the derive_tags contract above - an absent field
+-- deriving Tag(key, null), a list deriving one tag per distinct element -
+-- holds for an item's tags unchanged. Since every item's tag_mappings are
+-- among the type's own (see invariant ConsistencyQueryIsWellFormed), every tag any item
+-- derives is in consistency_tags too. It yields the empty list for a type
+-- declaring no consistency_query.
+--
+-- query_matching_events(bounded_context, consistency_tags, query) is what
+-- every decision is handed - ProcessCommand's, DryRunCommand's and
+-- DryRunTriggerCommand's alike, which is why it is named once here
+-- rather than spelled out three times. A black box only because the
+-- per-item "latest" does not fit a single Events-where expression; its
+-- contract is exact. Over the Events of that bounded context:
+--   - query empty (the default): every event e with
+--     consistency_tags.any(t => t in e.tags) - exactly the match this
+--     library always made.
+--   - otherwise, the union of: for each item with latest null, every
+--     event e with item.matches(e); for each item with latest = n, only
+--     the n events with the highest sequences among those with
+--     item.matches(e) - fewer when fewer match, none when nothing does.
+--     "Latest" is per item, not per event type - an item naming three
+--     types with latest = 1 yields one event, not three; one item per
+--     type gives the latest of each.
+-- The result is in sequence order and holds each event once, however
+-- many items it matches. Its highest sequence is the command's
+-- consistency_boundary, as before. An item's latest narrows only what
+-- decide() is handed, never what the command conflicts with:
+-- DynamicConsistencyBoundaryHonoured reads Command.in_consistency_query,
+-- which is any item regardless of its latest, so an event committed
+-- after the boundary that would have entered the item's newest n is a
+-- conflict exactly as it should be.
+--
+-- A narrower query is also a narrower conflict, and that is the point,
+-- not a side effect. An event carrying one of the command's tags but
+-- matching none of its items was never something decide() looked at, so
+-- it is no longer something that can invalidate the decision either: a
+-- helpdesk CreateTicket scoped by company and reading only the company's
+-- latest lifecycle event and its own ticket id's TicketCreated is not
+-- refused because an unrelated ticket of the same company was filed in
+-- between. The obligation this puts on a command type is that its query
+-- names everything its decide() depends on - a fact left out of the
+-- query is a fact a concurrent command can change unseen.
+--
+-- How the implementation serves it - reading the query from the
+-- compiled command type, the same place decide() comes from, and serving
+-- typed items through a per-tag index - is the same register as the
+-- Postgres and indexing notes elsewhere here, and changes nothing above.
+-- One limit of the implementation is worth stating where it bites: a
+-- snapshot summary (see the ProcessCommand note on it) is never used for
+-- a command type with a non-empty consistency_query; that combination is
+-- refused when the application is built.
 --
 -- Reading events - the Events collections read by FetchEvents and
 -- ProcessCommand below - is served by an in-memory cache of the most
@@ -3820,19 +4000,23 @@ rule ProcessCommand {
     requires: valid_correlation_id(correlation_id)
     requires: valid_correlation_id(causation_id)
 
+    -- What the decision reads: the command type's consistency query
+    -- resolved against this payload, or the default tag match over
+    -- consistency_tags when the type declares none - see the consistency
+    -- query note above the rules for both black boxes. boundary is the
+    -- highest sequence among what decide() is handed, as it always was.
     let consistency_tags = derive_tags(command_type, payload)
-    let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
+    let consistency_query = derive_query(command_type, payload)
     let matching_events =
-        Events where bounded_context = command_type.bounded_context
-            and sequence <= boundary
-            and consistency_tags.any(t => t in tags)
+        query_matching_events(command_type.bounded_context, consistency_tags, consistency_query)
+    let boundary = highest_sequence(matching_events)
 
     -- decide() is the plugged-in, bounded-context-specific decider (e.g.
     -- "is there enough balance to withdraw"). This library only owns the
     -- read/decide/commit shape, not the business logic itself. boundary
     -- and matching_events are evaluated fresh at commit time (see the
     -- Postgres locking note above the rules), so decide() always sees
-    -- complete, current data for its tags - there is no separate staler
+    -- complete, current data for its query - there is no separate staler
     -- state to reconcile against.
     --
     -- Its contract is the whole of CommandDecision: on acceptance, the
@@ -3851,7 +4035,8 @@ rule ProcessCommand {
     -- into - the same register in which it never says how
     -- protect_sensitive_fields encrypts, or how next_sequence takes its
     -- Postgres lock. Every other black box in this file (project(),
-    -- read_projection, render_event, render_command, derive_tags, valid_filters,
+    -- read_projection, render_event, render_command, derive_tags, derive_query,
+    -- query_matching_events, valid_filters,
     -- valid_tag_mappings, valid_sensitive_fields, valid_payload, next_sequence,
     -- scheduled_payload, next_occurrence_after, generate_token_secret,
     -- tag_owner_scope_satisfied, valid_correlation_id, generate_id) is
@@ -3869,7 +4054,12 @@ rule ProcessCommand {
     -- one exists, is scoped to a single one of consistency_tags' own keys
     -- (never their union - a command deriving more than one tag simply has
     -- no such summary to draw on, and computes matching_events the first
-    -- way instead) and is versioned: a summary computed under a
+    -- way instead) and is never used at all by a command type declaring
+    -- a non-empty consistency_query, whose items an implementation would
+    -- otherwise have to reconcile with a single-key summary (the
+    -- combination is refused when the application is built, so it never
+    -- arises at run time - see the consistency query note above the
+    -- rules). It is versioned: a summary computed under a
     -- superseded definition is never trusted as current, treated instead
     -- as if none exists yet. See surface SnapshotInspection for the one
     -- place this summary is itself observable - nowhere else does its
@@ -3912,6 +4102,7 @@ rule ProcessCommand {
             },
             encryption_keys: protected.encryption_keys,
             consistency_tags: consistency_tags,
+            consistency_query: consistency_query,
             consistency_boundary: boundary
         )
         for spec in decision.events:
@@ -3940,13 +4131,17 @@ rule ProcessCommand {
         -- holding the per-bounded-context lock, then take the lock only
         -- to fetch whatever events arrived after boundary (not a full
         -- re-scan) and call decide() again immediately with the
-        -- complete set if anything new showed up. A conflict is a
+        -- complete set if anything new showed up - where, for an item
+        -- with latest = n, the newer matches join its selection and the
+        -- item again keeps only its newest n, so the set handed over is
+        -- exactly query_matching_events at that moment. A conflict is a
         -- staleness signal, not an automatic rejection - only the final,
         -- fresh decision determines accepted/rejected. Either way the
         -- rule's own requires/ensures above is what must hold at commit.
         --
         -- The in-memory event cache helps here too, since a consistency
-        -- boundary typically spans recent events for a tag: matching_events
+        -- boundary typically spans recent events for a tag (and a
+        -- bounded item's newest n are usually recent): matching_events
         -- can often be assembled without a Postgres round trip, and the
         -- under-lock step reads only what arrived after boundary. This
         -- changes nothing about what matching_events contains - a boundary
@@ -4004,11 +4199,9 @@ rule DryRunCommand {
             consistency_tags, command_type.owner_tag_key, access_mapping.scope)
 
     -- Exactly what ProcessCommand would decide from, and the same decide().
-    let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
+    let consistency_query = derive_query(command_type, payload)
     let matching_events =
-        Events where bounded_context = command_type.bounded_context
-            and sequence <= boundary
-            and consistency_tags.any(t => t in tags)
+        query_matching_events(command_type.bounded_context, consistency_tags, consistency_query)
     let decision = decide(command_type, payload, matching_events)
 
     let shown = last_by_sequence(
@@ -4072,11 +4265,9 @@ rule DryRunTriggerCommand {
         tag_owner_scope_satisfied(
             consistency_tags, command_type.owner_tag_key, token.scope)
 
-    let boundary = highest_sequence(command_type.bounded_context, consistency_tags)
+    let consistency_query = derive_query(command_type, payload)
     let matching_events =
-        Events where bounded_context = command_type.bounded_context
-            and sequence <= boundary
-            and consistency_tags.any(t => t in tags)
+        query_matching_events(command_type.bounded_context, consistency_tags, consistency_query)
     let decision = decide(command_type, payload, matching_events)
 
     ensures:
@@ -4238,7 +4429,7 @@ rule FetchCommands {
 -- AllEventsSubscription.event_types and FetchCommands.command_types, and
 -- checked the same way: every named type must belong to the grant's own
 -- bounded context. tags matches an event's own derived tags with the
--- ANY-match semantics the consistency boundary in ProcessCommand already
+-- ANY-match semantics the default consistency boundary in ProcessCommand
 -- uses (see the derive_tags note above the rules), and reuses Tag
 -- unchanged: a tag key is shared across event types by design, which is
 -- what makes it the right narrowing here where event_types may name
@@ -6628,15 +6819,27 @@ invariant SyncProjectionNeverLags {
 }
 
 invariant DynamicConsistencyBoundaryHonoured {
-    -- A command decides based on events matching its consistency_tags,
+    -- A command decides based on events matching its consistency query,
     -- up to consistency_boundary (the highest sequence observed at
-    -- decision time). Any event with a matching tag and a higher
+    -- decision time). Any event matching that query with a higher
     -- sequence must be one of this command's own triggered events -
     -- never a foreign event that slipped in between the command's read
     -- and its commit.
+    --
+    -- "Matching the query" is Command.in_consistency_query: any item,
+    -- regardless of its latest, or the default tag match over
+    -- consistency_tags when the command recorded no query - so for every
+    -- command decided before consistency queries existed this is the
+    -- very check it always was. An item with latest set still conflicts
+    -- on every newer match, since that match would have entered its
+    -- newest n.
+    -- And an event carrying one of the command's tags but matching none
+    -- of its items does not conflict: a narrower query is a narrower
+    -- conflict, deliberately (see the consistency query note above the
+    -- rules).
     for c in Commands:
         for e in Events:
-            (e.bounded_context = c.bounded_context and c.consistency_tags.any(t => t in e.tags)
+            (e.bounded_context = c.bounded_context and c.in_consistency_query(e)
                 and e.sequence > c.consistency_boundary)
                 implies e in c.triggered_events
 }
@@ -6679,6 +6882,50 @@ invariant CommandConsistencyTagsMatchDeclaredMappings {
     for c in Commands:
         for tag in c.consistency_tags:
             c.command_type.tag_mappings.any(m => m.key = tag.key)
+}
+
+invariant ConsistencyQueryIsWellFormed {
+    -- A command type's consistency query is deployed declaration, not
+    -- registration state (see CommandType.consistency_query), so its
+    -- validity is not a registration check: the deploying process refuses
+    -- to start with a command type whose query breaks any of these, the
+    -- same way it refuses a query combined with a snapshot summary (see
+    -- the consistency query note above the rules). Four conditions, each
+    -- for its own reason:
+    --
+    -- Every event type an item names is an EventType of the command
+    -- type's own bounded context. A name nothing carries would make the
+    -- item silently match nothing - a decider told "no TicketCreated
+    -- exists" when the truth is that it asked for a type that is not
+    -- there. It holds once the instance's reconciliation pass has run,
+    -- for the reason ConsistencyTagKeysAreDeclared does: EventTypes are
+    -- registered before CommandTypes (see the note above
+    -- RegisterEventType).
+    --
+    -- Every item tag mapping is one of the type's own tag_mappings, so
+    -- consistency_tags stays the union of every tag a command can be
+    -- scoped by, and owner scoping - which reads consistency_tags alone -
+    -- sees every tag any item reads. The sensitive and private overlap
+    -- checks in rule RegisterCommandType therefore cover item mappings
+    -- too, with nothing restated for them.
+    --
+    -- Every item names at least one event type or at least one tag
+    -- mapping. An item with neither matches every event in the bounded
+    -- context, which is no consistency boundary at all - it would turn
+    -- every concurrent command in the context into a conflict, or with
+    -- latest set hand decide() whatever happened to be committed last. A
+    -- tag-less item naming event types stays allowed, with or without
+    -- latest (see the note on type-wide reads above the rules).
+    --
+    -- And an item's latest, when set, is at least 1: latest = 0 would be
+    -- an item that reads nothing yet still conflicts on every match,
+    -- which no decider could mean.
+    for ct in CommandTypes:
+        for q in ct.consistency_query:
+            q.event_types.all(n => ct.bounded_context.event_types.any(et => et.name = n))
+                and q.tag_mappings.all(m => m in ct.tag_mappings)
+                and (q.event_types.count > 0 or q.tag_mappings.count > 0)
+                and (q.latest = null or q.latest >= 1)
 }
 
 invariant SystemTriggeredClientIdIsSystem {
@@ -8193,6 +8440,13 @@ surface TypeRegistration {
             command_type.schema
             command_type.schema_version
             command_type.tag_mappings
+            -- The consistency query as the answering instance has it
+            -- deployed, not as registered - nothing registers it (see
+            -- CommandType.consistency_query). Empty when the type declares
+            -- none, or when the answering instance does not deploy this
+            -- command type at all; another instance in a rolling deploy
+            -- may answer differently.
+            command_type.consistency_query
             command_type.owner_tag_key
             command_type.sensitive_fields
             command_type.private_fields

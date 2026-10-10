@@ -132,6 +132,7 @@ impl Registrations {
                             metadata: command.metadata.clone(),
                             encryption_keys: command.encryption_keys.clone(),
                             consistency_tags: command.consistency_tags.clone(),
+                            consistency_query: command.consistency_query.clone(),
                             consistency_boundary: command.consistency_boundary,
                         }),
                     },
@@ -537,6 +538,26 @@ impl EventCache {
         }
         self.try_events_where(pool, bounded_context, after_sequence, |e| {
             tags.iter().any(|t| e.tags.contains(t))
+        })
+        .await
+    }
+
+    /// [`Self::try_events_matching_tags`] for a consistency query
+    /// (docs/architecture.md §198): every event in the window after
+    /// `after_sequence` matching any item of `query`, however many of its
+    /// matches an item keeps - the caller selects the last ones from it.
+    pub async fn try_events_matching_query(
+        &self,
+        pool: &Pool,
+        bounded_context: &str,
+        query: &[crate::shared::QueryItem],
+        after_sequence: i64,
+    ) -> crate::error::Result<Option<(Vec<Event>, i64)>> {
+        if self.has_evicted_past(bounded_context, after_sequence).await {
+            return Ok(None);
+        }
+        self.try_events_where(pool, bounded_context, after_sequence, |e| {
+            crate::event_store::query_matches(query, e)
         })
         .await
     }

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use skilj::{auto_register, CommandType, EventType, Projection};
 use skilj_core::event_store::Event;
 use skilj_core::plugin::BoundedContextEvent;
-use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
+use skilj_core::shared::{CommandDecision, EventSpec, QueryItemMapping, TagMapping};
 
 pub const BOUNDED_CONTEXT: &str = "courses";
 
@@ -214,6 +214,15 @@ impl CommandType for OpenCourse {
     const NAME: &'static str = "OpenCourse";
     fn tag_mappings() -> Vec<TagMapping> {
         course_tag()
+    }
+    /// Whether the course is open is all `decide()` needs: the course's
+    /// `CourseOpened`, not every enrollment that carries its tag too
+    /// (docs/architecture.md §198). An enrollment committed meanwhile
+    /// isn't a conflict either.
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::types(&["CourseOpened"])
+            .tagged(course_tag())
+            .latest()]
     }
     fn rest_trigger_allowed() -> bool {
         true

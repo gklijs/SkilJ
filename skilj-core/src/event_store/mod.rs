@@ -20,8 +20,8 @@ use crate::access_control::{
 use crate::encryption::DataKey;
 use crate::error::SkiljRejection;
 use crate::shared::{
-    CommandDecision, Filter, FilterOperator, Metadata, PrivateField, PrivateFieldKind,
-    SensitiveField, Tag, TagMapping,
+    CommandDecision, Filter, FilterOperator, Metadata, PrivateField, PrivateFieldKind, QueryItem,
+    QueryItemMapping, SensitiveField, Tag, TagMapping,
 };
 
 // The in-memory per-bounded-context event cache the spec describes
@@ -328,6 +328,11 @@ pub struct Command {
     pub metadata: Metadata,
     pub encryption_keys: Vec<EncryptionKey>,
     pub consistency_tags: Vec<Tag>,
+    /// The consistency query this command was decided with, derived from
+    /// its payload (docs/architecture.md §198). Empty for a command type
+    /// that declares none: then it was decided with the default, one item
+    /// per `consistency_tags` entry (`effective_query`).
+    pub consistency_query: Vec<QueryItem>,
     /// `None` exactly when `highest_sequence` over this command's own
     /// `consistency_tags`-matching events returns `None` - which covers
     /// both "this command type declares no `tag_mappings`, so DCB is not
@@ -4370,6 +4375,115 @@ pub fn consistency_boundary(
         .max()
 }
 
+impl QueryItem {
+    /// Whether `event` matches this item: one of its types (any type when
+    /// it names none), carrying every one of its tags.
+    pub fn matches(&self, event: &Event) -> bool {
+        (self.event_types.is_empty() || self.event_types.contains(&event.event_type.name))
+            && self.tags.iter().all(|tag| event.tags.contains(tag))
+    }
+}
+
+/// `CommandType::consistency_query` derived from `payload` (docs/architecture.md
+/// §198): one [`QueryItem`] per mapping, its tags by [`derive_tags`]. Empty for a
+/// command type that declares none - see [`effective_query`].
+pub fn derive_query(mappings: &[QueryItemMapping], payload: &str) -> Vec<QueryItem> {
+    mappings
+        .iter()
+        .map(|mapping| QueryItem {
+            event_types: mapping.event_types.iter().map(|t| t.to_string()).collect(),
+            tags: derive_tags(&mapping.tag_mappings, payload),
+            latest: mapping.latest,
+        })
+        .collect()
+}
+
+/// The query a command is decided with: its own `consistency_query`, or,
+/// when it declares none, the default - one item per consistency tag, any
+/// event type, every match. The default selects exactly the events
+/// carrying any of `consistency_tags`, as before queries existed.
+pub fn effective_query(
+    consistency_query: &[QueryItem],
+    consistency_tags: &[Tag],
+) -> Vec<QueryItem> {
+    if !consistency_query.is_empty() {
+        return consistency_query.to_vec();
+    }
+    consistency_tags
+        .iter()
+        .map(|tag| QueryItem {
+            event_types: Vec::new(),
+            tags: vec![tag.clone()],
+            latest: None,
+        })
+        .collect()
+}
+
+/// Whether `event` matches any item of `query` - what a re-check under
+/// the lock counts as a conflict, however many of its matches an item
+/// keeps.
+pub fn query_matches(query: &[QueryItem], event: &Event) -> bool {
+    query.iter().any(|item| item.matches(event))
+}
+
+/// Which of `events` (in sequence order) `query` selects: every match of
+/// an item, or for an item with `latest` only its last that many.
+fn query_selection(query: &[QueryItem], events: &[Event]) -> Vec<bool> {
+    if query.iter().all(|item| item.latest.is_none()) {
+        return events.iter().map(|e| query_matches(query, e)).collect();
+    }
+    let mut keep = vec![false; events.len()];
+    for item in query {
+        if let Some(count) = item.latest {
+            let mut found = 0;
+            for (index, event) in events.iter().enumerate().rev() {
+                if found >= count {
+                    break;
+                }
+                if item.matches(event) {
+                    keep[index] = true;
+                    found += 1;
+                }
+            }
+        } else {
+            for (index, event) in events.iter().enumerate() {
+                if !keep[index] && item.matches(event) {
+                    keep[index] = true;
+                }
+            }
+        }
+    }
+    keep
+}
+
+/// `matching_events`: the events of `events` (in sequence order) that
+/// `query` selects, in order, each once.
+pub fn select_matching_events(query: &[QueryItem], events: &[Event]) -> Vec<Event> {
+    query_selection(query, events)
+        .into_iter()
+        .zip(events)
+        .filter(|(keep, _)| *keep)
+        .map(|(_, event)| event.clone())
+        .collect()
+}
+
+/// The consistency boundary: the highest sequence `query` selects from
+/// `events`, without copying them.
+pub fn query_boundary(query: &[QueryItem], events: &[Event]) -> Option<i64> {
+    if query.iter().all(|item| item.latest.is_none()) {
+        return events
+            .iter()
+            .filter(|e| query_matches(query, e))
+            .map(|e| e.sequence)
+            .max();
+    }
+    query_selection(query, events)
+        .into_iter()
+        .zip(events)
+        .filter_map(|(keep, event)| keep.then_some(event.sequence))
+        .max()
+}
+
 /// What `process_command` produced - the caller (the eventual sqlx-backed
 /// persistence layer) stores `command` and every one of `events` in one
 /// transaction, alongside updating whichever sync projections consume
@@ -4454,6 +4568,7 @@ pub fn process_command(
         client_id,
         correlation_id,
         causation_id,
+        Vec::new(),
         boundary,
         decision,
         resolve_event_type,
@@ -4475,6 +4590,7 @@ pub(crate) fn process_command_at_boundary(
     client_id: &str,
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
+    consistency_query: Vec<QueryItem>,
     consistency_boundary: Option<i64>,
     decision: CommandDecision,
     resolve_event_type: impl Fn(&str) -> Option<EventType>,
@@ -4536,6 +4652,7 @@ pub(crate) fn process_command_at_boundary(
         },
         encryption_keys: protected.encryption_keys,
         consistency_tags,
+        consistency_query,
         consistency_boundary,
     };
 

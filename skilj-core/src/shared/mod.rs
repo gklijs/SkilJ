@@ -95,6 +95,82 @@ pub struct TagMapping {
     pub field: FieldPath,
 }
 
+/// One item of a command type's consistency query (docs/architecture.md
+/// §198, `value QueryItemMapping` in specs/skilj.allium), declared by
+/// `CommandType::consistency_query`. Derived per command into a
+/// [`QueryItem`], as a [`TagMapping`] is into a [`Tag`]. An event matches
+/// the item when its type is one of `event_types` (any type when empty)
+/// and it carries every tag `tag_mappings` derives. `latest`, when set,
+/// asks for only that many matching events, those with the highest
+/// sequences; `None` for every match.
+///
+/// ```
+/// # use skilj_core::shared::{QueryItemMapping, TagMapping};
+/// let company = TagMapping { key: "company".into(), field: "company_id".into() };
+/// // The company's latest lifecycle event, whatever kind it is.
+/// let status = QueryItemMapping::types(&["CompanySignedUp", "CompanyExpired"])
+///     .tagged(vec![company])
+///     .latest();
+/// assert_eq!(status.latest, Some(1));
+/// // The requester's last three tickets.
+/// let recent = QueryItemMapping::types(&["TicketCreated"]).last(3);
+/// assert_eq!(recent.latest, Some(3));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct QueryItemMapping {
+    pub event_types: Vec<String>,
+    pub tag_mappings: Vec<TagMapping>,
+    pub latest: Option<u32>,
+}
+
+impl QueryItemMapping {
+    /// An item matching these event types, every match, no tags yet.
+    pub fn types(event_types: &[&str]) -> Self {
+        Self {
+            event_types: event_types.iter().map(|t| t.to_string()).collect(),
+            tag_mappings: Vec::new(),
+            latest: None,
+        }
+    }
+
+    /// An item matching any event type carrying these tags.
+    pub fn tags(tag_mappings: Vec<TagMapping>) -> Self {
+        Self {
+            event_types: Vec::new(),
+            tag_mappings,
+            latest: None,
+        }
+    }
+
+    /// Also requires these tags.
+    pub fn tagged(mut self, tag_mappings: Vec<TagMapping>) -> Self {
+        self.tag_mappings.extend(tag_mappings);
+        self
+    }
+
+    /// Only the matching event with the highest sequence: `last(1)`.
+    pub fn latest(self) -> Self {
+        self.last(1)
+    }
+
+    /// Only the `count` matching events with the highest sequences.
+    /// `build()` refuses 0.
+    pub fn last(mut self, count: u32) -> Self {
+        self.latest = Some(count);
+        self
+    }
+}
+
+/// A [`QueryItemMapping`] derived from one command's payload - `value
+/// QueryItem` in specs/skilj.allium, recorded on `Command.consistency_query`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct QueryItem {
+    pub event_types: Vec<String>,
+    pub tags: Vec<Tag>,
+    /// See [`QueryItemMapping::latest`].
+    pub latest: Option<u32>,
+}
+
 /// `subject_field` is never encrypted - it's the plaintext identifier the
 /// `EncryptionKey` is looked up or derived by. Only `field` is what gets
 /// swapped for ciphertext (at the leaf, for a dotted path - see

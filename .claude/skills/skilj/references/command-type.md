@@ -115,6 +115,42 @@ A command with no `tag_mappings` at all always sees `matching_events: []`
 - there's no shared tag to scope by, so nothing before it is considered
 "matching."
 
+### Narrowing it: `consistency_query()`
+
+By default `matching_events` is *every* event carrying any of the
+command's tags. When `decide()` only needs some of them, declare a
+consistency query (DCB's query items; docs/architecture.md §198):
+
+```rust
+fn tag_mappings() -> Vec<TagMapping> { vec![company(), ticket()] }
+fn consistency_query() -> Vec<QueryItemMapping> {
+    vec![
+        // The company's latest lifecycle event, whichever kind it is.
+        QueryItemMapping::types(&["CompanySignedUp", "CompanyActivated", "CompanyExpired"])
+            .tagged(vec![company()])
+            .latest(),
+        // Whether this ticket id was used.
+        QueryItemMapping::types(&["TicketCreated"]).tagged(vec![ticket()]),
+    ]
+}
+```
+
+- An item matches events of its types (any type if it names none) that
+  carry **all** of its tags; items are OR'd. `.latest()` keeps only the
+  item's newest match - only right when `decide()` really only needs the
+  last one (a status where the last event wins). `.last(n)` keeps the n
+  newest, for a decision over the last few (at most 3 open tickets, the
+  last 5 failed logins).
+- The query is also the conflict check: an event matching no item no
+  longer makes the command decide again. So every fact `decide()`
+  depends on must be in the query, or a concurrent command can change it
+  unnoticed.
+- `build()` refuses an item's event type that isn't registered in the
+  same bounded context, an item tag that isn't one of `tag_mappings()`,
+  an item with neither types nor tags, `last(0)`, and a query together with
+  `snapshot()`. Reach for a query before a `Snapshot`: it reads a few
+  index entries instead of a growing history, and needs no catch-up.
+
 ## The `Event` associated type
 
 ```rust

@@ -27,6 +27,12 @@ skilj-bridge.workspace = true
 # Service Bus both require TLS (`amqps://`) in any real deployment.
 fe2o3-amqp = { version = "0.18", features = ["rustls"] }
 fe2o3-amqp-types = "0.18"
+# Not used directly: a cap on fe2o3-amqp's own tokio-util. tokio-util
+# 0.7.20 makes `FramedWrite::poll_close(cx).map_err(Into::into)` in
+# fe2o3-amqp 0.18.2's transport ambiguous (E0283), so fe2o3-amqp stops
+# compiling. Cargo.lock isn't committed, so CI resolves the newest
+# tokio-util on every run. Lift the cap once fe2o3-amqp builds against it.
+tokio-util = ">=0.7, <0.7.20"
 
 [lib]
 name = "skilj_amqp"

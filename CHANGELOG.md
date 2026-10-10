@@ -10,6 +10,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A command type can declare a consistency query, DCB's query items:
+  `CommandType::consistency_query()` returns `QueryItemMapping`s, each
+  naming event types and tags (all of which an event must carry), and
+  optionally how many of the newest matches it needs (`.latest()` for
+  one, `.last(n)` for n) (docs/architecture.md §198). `decide()`
+  then gets only what the query selects, and only an event matching the
+  query conflicts with the command. The default, no query, is unchanged:
+  every event carrying any of the command's tags. Typed items read a new
+  per-bounded-context `event_tags` table, kept by a trigger on `events`
+  and backfilled on the first `build()`, so finding a company's latest
+  lifecycle event no longer reads every event with the company's tag.
+  `build()` refuses an item naming an event type the bounded context
+  doesn't register, a tag that isn't one of the command type's
+  `tag_mappings()`, an item with neither types nor tags, `last(0)`, and a query
+  together with `snapshot()`. Each command records its query in
+  `commands.consistency_query`. New: `QueryItemMapping`, `QueryItem`,
+  `CommandDispatcher::consistency_query` (defaulted),
+  `db::ensure_event_tags_index`, `db::list_events_matching_query_cached`.
+  GraphQL `CommandType.consistencyQuery` shows the query as the answering
+  instance has it compiled, and skilj-codegen generates one from
+  `[[command_type.query]]` tables. skilj-demo's `OpenCourse` uses one.
+  A snapshot's refold after a `VERSION` bump reads through `event_tags`
+  too, about four times faster than through the GIN index on long
+  histories.
+
 - `command_throughput.rs` can add a network round trip between skilj and
   Postgres (`SKILJ_BENCH_LATENCY_MS`), run several instances on one bounded
   context (`SKILJ_BENCH_INSTANCES`) and set the commands per scenario
@@ -94,6 +119,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal. `skilj_bridge::ack` takes the epoch (breaking).
 
 ### Changed
+
+- Snapshot catch-up folds 100 events per transaction, reading and writing
+  each row once per chunk instead of once per event, and refolds the rows a
+  `Snapshot::VERSION` bump reset with one history read for all of them. A
+  partitioned async projection's catch-up reads and writes each key once per
+  tick instead of once per event. Both several times faster;
+  docs/performance.md has the figures (docs/architecture.md §197). New
+  benchmark: `skilj-core/tests/snapshot_catch_up_throughput.rs`.
 
 - **Behaviour change:** without `SkiljBuilder::pool_options(...)`, the pool
   no longer pings a connection each time it is taken (sqlx's

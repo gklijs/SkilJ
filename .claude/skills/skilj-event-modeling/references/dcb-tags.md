@@ -89,6 +89,13 @@ step like this.
   sketching the event/command's own data in step 1/2 of the main
   workflow - if it doesn't exist yet, that's a gap in the payload sketch
   to fix first, not a tag to note anyway.
+- **A decision may need only some events with a tag, or only the
+  last.** "Is this company still active?" needs the company's latest
+  lifecycle event, not every ticket it ever filed, even though both carry
+  the company's tag. Note that per command: which event types it needs
+  under each tag, and whether only the latest counts. It becomes a
+  consistency query (DCB query items) in the `skilj` skill, and it also
+  narrows what conflicts with the command.
 - **Not every field is a tag.** Tagging is deliberately opt-in and
   narrow - only fields another command's own decision genuinely needs to
   match on. A field nothing else ever needs to see by isn't a tag

@@ -133,8 +133,29 @@ machine as above:
 | one, 500 keys | ~1,270 | ~36,000 |
 | four (two of each) | ~470 | ~16,000 |
 
-A projection with `PARTITION_COUNT > 1` uses its own path, which still writes
-each key once per event.
+A projection with `PARTITION_COUNT > 1` (4 here) reads and writes each key
+once per partition per tick (docs/architecture.md §197): ~3,700-4,300 events/s
+before, ~49,000-53,000 after.
+
+## Snapshot catch-up
+
+`skilj-core/tests/snapshot_catch_up_throughput.rs` (`#[ignore]`d; `cargo test
+--release -p skilj-core --test snapshot_catch_up_throughput -- --ignored
+--nocapture`) times how fast a `Snapshot` catches up on 5000 committed events.
+Like projection catch-up, it folds 100 events per transaction and reads and
+writes each row once per chunk; a row reset by a `Snapshot::VERSION` bump is
+refolded from its history with one read for every such row in the chunk
+(docs/architecture.md §197). On the same machine:
+
+| snapshot | events/s (before §197) | events/s |
+|---|---|---|
+| one tag value | ~1,600 | ~74,000-79,000 |
+| 500 tag values | ~1,000 | ~41,000-45,000 |
+| 500 tag values, `PARTITION_COUNT` 4 | ~1,600 | ~52,000 |
+| 500 tag values, refolded after a `VERSION` bump | ~750 | ~37,000 |
+
+The refold reads the reset rows' histories through `event_tags` (docs/architecture.md
+§198), which keeps each tag value's events in sequence order.
 
 ## What a co-resident application loses
 

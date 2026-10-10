@@ -362,6 +362,7 @@ fn static_types(n: &Naming) -> Vec<Type> {
         gql_types::private_field_grant_object(n).into(),
         gql_types::event_type_object(n).into(),
         gql_types::command_type_object(n).into(),
+        gql_types::query_item_mapping_object(n).into(),
         gql_types::projection_object(n).into(),
         gql_types::projection_rebuild_object(n).into(),
         gql_types::projection_registration_result_object(n).into(),

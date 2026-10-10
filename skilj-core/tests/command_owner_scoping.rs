@@ -100,6 +100,7 @@ fn command(id: &str, ct: &CommandType, company: Option<&str>) -> Command {
             }],
             None => Vec::new(),
         },
+        consistency_query: Vec::new(),
         consistency_boundary: None,
     }
 }

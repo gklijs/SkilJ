@@ -6,7 +6,9 @@
 //! shouldn't depend on that module happening to have the right `use`
 //! statements in scope.
 
-use crate::spec::{BoundedContextSpec, CommandTypeSpec, EventTypeSpec, FieldSpec, FieldType};
+use crate::spec::{
+    BoundedContextSpec, CommandTypeSpec, EventTypeSpec, FieldSpec, FieldType, QueryItemSpec,
+};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::BTreeMap;
@@ -84,6 +86,44 @@ fn tag_mappings_fn(tags: &BTreeMap<String, String>) -> Option<TokenStream> {
     })
 }
 
+/// `None` when `query` is empty - the trait's own default (no query)
+/// covers that, as `tag_mappings_fn` does for no tags. Each item's tags
+/// are looked up in the command type's own `tags`; `spec::validate` has
+/// already refused one that isn't there.
+fn consistency_query_fn(
+    query: &[QueryItemSpec],
+    tags: &BTreeMap<String, String>,
+) -> Option<TokenStream> {
+    if query.is_empty() {
+        return None;
+    }
+    let items = query.iter().map(|item| {
+        let event_types = &item.event_types;
+        let tag_mappings = item.tags.iter().map(|key| {
+            let field = &tags[key];
+            quote! { ::skilj_core::shared::TagMapping { key: #key.to_string(), field: #field.to_string() } }
+        });
+        let latest = match item.latest {
+            Some(count) => quote! { Some(#count) },
+            None => quote! { None },
+        };
+        quote! {
+            ::skilj_core::shared::QueryItemMapping {
+                event_types: Vec::from([#(#event_types.to_string()),*]),
+                tag_mappings: Vec::from([#(#tag_mappings),*]),
+                latest: #latest,
+            }
+        }
+    });
+    // `Vec::from([...])`, not `vec![...]`: prettyplease leaves a macro's
+    // tokens unformatted, and this is read in review (§191).
+    Some(quote! {
+        fn consistency_query() -> Vec<::skilj_core::shared::QueryItemMapping> {
+            Vec::from([#(#items),*])
+        }
+    })
+}
+
 fn emit_event_type(event: &EventTypeSpec) -> TokenStream {
     let (payload_ident, payload_tokens) = payload_struct(&event.name, &event.fields);
     let marker_ident = format_ident!("{}", event.name);
@@ -117,6 +157,7 @@ fn emit_command_type(command: &CommandTypeSpec, event_enum_ident: &syn::Ident) -
     let marker_ident = format_ident!("{}", command.name);
     let name_lit = &command.name;
     let tag_fn = tag_mappings_fn(&command.tags);
+    let query_fn = consistency_query_fn(&command.query, &command.tags);
     let rest_fn = command.rest_trigger_allowed.then(|| {
         quote! {
             fn rest_trigger_allowed() -> bool { true }
@@ -135,6 +176,7 @@ fn emit_command_type(command: &CommandTypeSpec, event_enum_ident: &syn::Ident) -
             type Event = #event_enum_ident;
             const NAME: &'static str = #name_lit;
             #tag_fn
+            #query_fn
             #rest_fn
             fn decide(
                 payload: &Self::Payload,

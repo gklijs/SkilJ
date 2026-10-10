@@ -43,6 +43,7 @@ type BankCommandType @inaccessible {
 	sensitiveFields: [BankSensitiveField!]!
 	restTriggerAllowed: Boolean!
 	privateFields: [BankPrivateField!]!
+	consistencyQuery: [BankQueryItemMapping!]!
 }
 
 type BankContextCreator @inaccessible {
@@ -291,6 +292,12 @@ type BankQueriedCommand @inaccessible {
 type BankQueriedEvent {
 	sequence: Int!
 	payload: String!
+}
+
+type BankQueryItemMapping @inaccessible {
+	eventTypes: [String!]!
+	tagMappings: [BankTagMapping!]!
+	latest: Int
 }
 
 type BankRole {

@@ -3,7 +3,9 @@
 //! reasoning behind this shape.
 
 use crate::event_store::{Event, MissedOccurrencePolicy};
-use crate::shared::{CommandDecision, PrivateField, SensitiveField, Tag, TagMapping};
+use crate::shared::{
+    CommandDecision, PrivateField, QueryItemMapping, SensitiveField, Tag, TagMapping,
+};
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -231,6 +233,28 @@ pub trait CommandType {
     }
 
     fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision;
+
+    /// Which events `decide()` receives, and which later events conflict
+    /// with it (docs/architecture.md §198, the DCB query model). Each item
+    /// matches events of its types (any type when it names none) that
+    /// carry all of its tags; `matching_events` is every event matching
+    /// any item, in sequence order, except that an item with `latest`
+    /// contributes only that many of its matches, the newest
+    /// (`QueryItemMapping::latest()` for one, `last(n)` for n).
+    ///
+    /// Empty (the default) means one item per `tag_mappings()` entry, any
+    /// type, every match: every event carrying any of the command's tags,
+    /// as before queries existed. A narrower query reads less, and also
+    /// conflicts less: an event carrying the command's tag but matching
+    /// no item no longer makes it decide again.
+    ///
+    /// `build()` refuses a query naming an event type its bounded context
+    /// doesn't register in the same builder, a tag mapping that isn't one
+    /// of `tag_mappings()`, an item with neither types nor tags, and a
+    /// query together with `snapshot()`.
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        Vec::new()
+    }
 
     /// Opt-in accelerator for `decide()` against a large tag-scoped
     /// history ([docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2") - names the
@@ -693,6 +717,18 @@ pub trait CommandDispatcher: Send + Sync {
         bounded_context: &str,
         command_type: &str,
     ) -> Option<Option<&'static str>>;
+
+    /// The registered command type's own `CommandType::consistency_query()`
+    /// (docs/architecture.md §198) - `None` when the pair isn't
+    /// registered, or for a dispatcher that predates queries; either reads
+    /// as the default query.
+    fn consistency_query(
+        &self,
+        _bounded_context: &str,
+        _command_type: &str,
+    ) -> Option<Vec<QueryItemMapping>> {
+        None
+    }
 
     /// The registered command type's own `CommandType::snapshot()` -
     /// same outer/inner `Option` convention as `required_role`. Meant to

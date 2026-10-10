@@ -231,3 +231,95 @@ fn a_raw_identifier_field_is_plain_type_on_the_wire_and_in_the_schema() {
     let schema = serde_json::to_value(schemars::schema_for!(Payload)).unwrap();
     assert!(schema["properties"].get("type").is_some(), "{schema}");
 }
+
+const HELPDESK_TOML: &str = r#"
+bounded_context = "helpdesk"
+
+[[event_type]]
+name = "CompanySignedUp"
+fields = [{ name = "company_id", type = "string" }]
+tags = { company = "company_id" }
+
+[[event_type]]
+name = "TicketCreated"
+fields = [
+    { name = "company_id", type = "string" },
+    { name = "ticket_id", type = "string" },
+]
+tags = { company = "company_id", ticket = "ticket_id" }
+
+[[command_type]]
+name = "CreateTicket"
+fields = [
+    { name = "company_id", type = "string" },
+    { name = "ticket_id", type = "string" },
+]
+tags = { company = "company_id", ticket = "ticket_id" }
+
+[[command_type.query]]
+event_types = ["CompanySignedUp"]
+tags = ["company"]
+latest = 1
+
+[[command_type.query]]
+event_types = ["TicketCreated"]
+tags = ["ticket"]
+"#;
+
+/// docs/architecture.md §198: `[[command_type.query]]` items become a
+/// `consistency_query()` override, each tag looked up in the command
+/// type's own `tags`.
+#[test]
+fn a_command_type_query_becomes_a_consistency_query_override() {
+    let output = skilj_codegen::generate(HELPDESK_TOML).unwrap();
+    assert!(
+        output.contains("fn consistency_query() -> Vec<::skilj_core::shared::QueryItemMapping>")
+    );
+    assert!(output.contains(r#"event_types: Vec::from(["CompanySignedUp".to_string()])"#));
+    assert!(output.contains("latest: Some(1u32)"));
+    assert!(output.contains("latest: None"));
+    assert!(output.contains(r#"field: "ticket_id".to_string()"#));
+}
+
+#[test]
+fn a_command_type_without_a_query_gets_no_override() {
+    let output = skilj_codegen::generate(BANKING_TOML).unwrap();
+    assert!(!output.contains("fn consistency_query"));
+}
+
+#[test]
+fn an_unusable_query_item_is_a_named_problem() {
+    let problems = invalid(
+        r#"
+bounded_context = "helpdesk"
+
+[[event_type]]
+name = "TicketCreated"
+fields = [{ name = "ticket_id", type = "string" }]
+
+[[command_type]]
+name = "CreateTicket"
+fields = [{ name = "ticket_id", type = "string" }]
+tags = { ticket = "ticket_id" }
+
+[[command_type.query]]
+event_types = ["CompanySignedUp"]
+tags = ["company"]
+latest = 0
+
+[[command_type.query]]
+"#,
+    );
+    let expected = [
+        "query item 1 names event type \"CompanySignedUp\", which this file doesn't declare",
+        "query item 1 names tag \"company\", which isn't one of the command type's tags",
+        "query item 1 keeps the last 0 matches",
+        "query item 2 names neither event types nor tags",
+    ];
+    for expected in expected {
+        assert!(
+            problems.iter().any(|p| p.contains(expected)),
+            "missing {expected:?} in {problems:?}"
+        );
+    }
+}

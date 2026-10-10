@@ -952,7 +952,10 @@ fn event_types_and_command_types_list_every_registered_type() {
             &router,
             Some(&jwt),
             "query($bc: String!) { \
-                commandTypes(boundedContext: $bc) { name schemaVersion ownerTagKey restTriggerAllowed } \
+                commandTypes(boundedContext: $bc) { \
+                    name schemaVersion ownerTagKey restTriggerAllowed \
+                    consistencyQuery { eventTypes tagMappings { key } latest } \
+                } \
             }",
             json!({ "bc": bc_name }),
         )
@@ -968,5 +971,8 @@ fn event_types_and_command_types_list_every_registered_type() {
         // as null, not just the set one eventTypes just covered above.
         assert!(command_types[0]["ownerTagKey"].is_null());
         assert_eq!(command_types[0]["restTriggerAllowed"], true);
+        // Registered over GraphQL, compiled nowhere: no consistency query
+        // here (docs/architecture.md §198), so `[]`.
+        assert_eq!(command_types[0]["consistencyQuery"], json!([]));
     });
 }

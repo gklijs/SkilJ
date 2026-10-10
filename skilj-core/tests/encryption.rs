@@ -290,6 +290,7 @@ fn command_with_real_ciphertext(data_key: &encryption::DataKey) -> Command {
         },
         encryption_keys: Vec::new(),
         consistency_tags: Vec::new(),
+        consistency_query: Vec::new(),
         consistency_boundary: None,
     }
 }

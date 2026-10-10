@@ -783,3 +783,163 @@ fn a_version_bump_never_leaves_a_partitioned_row_missing_history() {
         );
     });
 }
+
+/// docs/architecture.md §197: one tick folds up to 1000 events, 100 per
+/// transaction. 250 events over seven accounts - new ones and ones a
+/// previous tick already holds - take three chunks, and every row must
+/// end with each of its events folded exactly once, as of its last one.
+#[test]
+fn a_chunked_catch_up_folds_every_event_once_across_chunks() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let dispatcher = TestSnapshotDispatcher {
+            tag_key: "account",
+            version: 1,
+        };
+        let accounts: Vec<String> = (0..7).map(|_| unique_name("account")).collect();
+        for account in &accounts[..3] {
+            insert_money_event(&pool, &bc, &deposited, "account", account, 1000).await;
+        }
+        db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+            .await
+            .unwrap();
+
+        let mut last = std::collections::HashMap::new();
+        for i in 0..250 {
+            let account = &accounts[i % accounts.len()];
+            let seq = insert_money_event(&pool, &bc, &deposited, "account", account, 1).await;
+            last.insert(account.clone(), seq);
+        }
+        db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+            .await
+            .unwrap();
+
+        for (i, account) in accounts.iter().enumerate() {
+            let resolved = db::resolve_snapshot_context(
+                &pool,
+                &bc.name,
+                &dispatcher,
+                "Balance",
+                &[tag("account", account)],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+            let deposits = (250 / accounts.len() + usize::from(i < 250 % accounts.len())) as i64;
+            let opening = if i < 3 { 1000 } else { 0 };
+            assert_eq!(state.balance, opening + deposits, "balance of account {i}");
+            assert_eq!(
+                resolved.as_of_sequence, last[account],
+                "position of account {i}"
+            );
+        }
+    });
+}
+
+/// `TestSnapshotDispatcher`, failing to fold any `Poison` event.
+struct PoisonedTestSnapshotDispatcher(TestSnapshotDispatcher);
+
+impl SnapshotDispatcher for PoisonedTestSnapshotDispatcher {
+    fn snapshot_names(&self, bounded_context: &str) -> Vec<&'static str> {
+        self.0.snapshot_names(bounded_context)
+    }
+
+    fn tag_key(&self, bounded_context: &str, snapshot_name: &str) -> Option<&'static str> {
+        self.0.tag_key(bounded_context, snapshot_name)
+    }
+
+    fn owner_tag_key(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+    ) -> Option<Option<&'static str>> {
+        self.0.owner_tag_key(bounded_context, snapshot_name)
+    }
+
+    fn version(&self, bounded_context: &str, snapshot_name: &str) -> Option<u64> {
+        self.0.version(bounded_context, snapshot_name)
+    }
+
+    fn fold(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+        state_json: &str,
+        event: &Event,
+    ) -> Option<skilj_core::error::Result<String>> {
+        if event.event_type.name == "Poison" {
+            return Some(Err(skilj_core::event_store::Error::PayloadDecodeFailed(
+                "poison".to_string(),
+            )
+            .into()));
+        }
+        self.0
+            .fold(bounded_context, snapshot_name, state_json, event)
+    }
+
+    fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String> {
+        self.0.default_state(bounded_context, snapshot_name)
+    }
+}
+
+/// docs/architecture.md §197: with one transaction per event, an event
+/// whose fold fails left every event before it committed. A chunk keeps
+/// that: the events before the failing one are folded again on their
+/// own and committed, and the error is returned.
+#[test]
+fn a_failing_event_mid_chunk_keeps_the_progress_before_it() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let poison = seed_event_type(&pool, &bc, "Poison", "account").await;
+        let dispatcher = PoisonedTestSnapshotDispatcher(TestSnapshotDispatcher {
+            tag_key: "account",
+            version: 1,
+        });
+        let account = unique_name("account");
+        let other = unique_name("account");
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 10).await;
+        insert_money_event(&pool, &bc, &deposited, "account", &other, 7).await;
+        let before = insert_money_event(&pool, &bc, &deposited, "account", &account, 5).await;
+        insert_money_event(&pool, &bc, &poison, "account", &account, 0).await;
+        insert_money_event(&pool, &bc, &deposited, "account", &account, 1).await;
+
+        db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+            .await
+            .expect_err("the poison event fails its fold");
+
+        let resolved = db::resolve_snapshot_context(
+            &pool,
+            &bc.name,
+            &dispatcher,
+            "Balance",
+            &[tag("account", &account)],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+        assert_eq!(state.balance, 15);
+        assert_eq!(resolved.as_of_sequence, before);
+        let resolved = db::resolve_snapshot_context(
+            &pool,
+            &bc.name,
+            &dispatcher,
+            "Balance",
+            &[tag("account", &other)],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+        assert_eq!(state.balance, 7);
+    });
+}

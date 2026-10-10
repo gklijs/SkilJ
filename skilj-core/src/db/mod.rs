@@ -43,7 +43,7 @@ use crate::event_store::{
     ReadCursor, WouldBeEvent,
 };
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
-use crate::shared::{Metadata, PrivateField, SensitiveField, Tag, TagMapping};
+use crate::shared::{Metadata, PrivateField, QueryItem, SensitiveField, Tag, TagMapping};
 use chrono::{DateTime, Utc};
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::KeyValue;
@@ -599,7 +599,8 @@ async fn provision_bounded_context_schema(
             metadata_correlation_id TEXT,
             metadata_causation_id TEXT,
             consistency_tags JSONB NOT NULL DEFAULT '[]',
-            consistency_boundary BIGINT
+            consistency_boundary BIGINT,
+            consistency_query JSONB NOT NULL DEFAULT '[]'
         )"
     )))
     .execute(&mut **tx)
@@ -1011,6 +1012,7 @@ async fn provision_bounded_context_schema(
     // docs/architecture.md §104 - after every table it touches exists.
     add_registration_version_columns(&mut **tx, bounded_context).await?;
     ensure_registrations_generation(&mut **tx, bounded_context).await?;
+    ensure_event_tags_index(&mut **tx, bounded_context).await?;
     Ok(())
 }
 
@@ -2126,6 +2128,78 @@ pub async fn ensure_registrations_generation<'e>(
         {triggers}",
         function = sql_literal(&format!("{schema}.bump_registrations_generation()")),
         lock_key = sql_literal(&format!("skilj_registrations_generation:{schema}"))
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `event_tags`: one row per tag of every event, `(tag_key, tag_value,
+/// event_type_name, sequence)`, indexed in that order - what a consistency
+/// query item naming event types reads (docs/architecture.md §198). The
+/// GIN index on `events.tags` answers "which events carry this tag", but a
+/// query for the latest event of a few types carrying a company's tag
+/// would still walk every event with that tag; through this index it is a
+/// probe per type, however many other events the tag has.
+///
+/// Filled by a statement-level trigger on `events`, not by skilj's insert
+/// paths, so no writer can leave it incomplete - including an instance of
+/// an older version during a rolling deploy, which knows nothing about it.
+/// Also `commands.consistency_query`, the query a command was decided
+/// with.
+///
+/// Created at provisioning and on every `build()`, under the same kind of
+/// advisory lock as [`ensure_registrations_generation`]. For a bounded
+/// context from before it, the first `build()` creates the table, fills it
+/// from the existing events and creates the trigger in one transaction,
+/// holding a `SHARE ROW EXCLUSIVE` lock on `events` throughout: reads go
+/// on, but no event commits between the backfill and the trigger, where
+/// it would be indexed by neither. Every later `build()` finds it there
+/// and locks nothing (docs/architecture.md §158).
+#[tracing::instrument(skip_all)]
+pub async fn ensure_event_tags_index<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let consistency_query_column = add_columns_patch(
+        &schema,
+        "commands",
+        &["consistency_query"],
+        format!(
+            "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS consistency_query \
+             JSONB NOT NULL DEFAULT '[]'"
+        ),
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SELECT pg_advisory_xact_lock(hashtext({lock_key})::bigint);
+        {consistency_query_column};
+        DO $patch$ BEGIN IF to_regclass({table}) IS NULL THEN
+            LOCK TABLE {schema}.events IN SHARE ROW EXCLUSIVE MODE;
+            CREATE TABLE {schema}.event_tags (
+                tag_key TEXT NOT NULL,
+                tag_value TEXT,
+                event_type_name TEXT NOT NULL,
+                sequence BIGINT NOT NULL
+            );
+            INSERT INTO {schema}.event_tags (tag_key, tag_value, event_type_name, sequence)
+                SELECT t->>'key', t->>'value', e.event_type_name, e.sequence
+                FROM {schema}.events e, jsonb_array_elements(e.tags) t;
+            CREATE INDEX event_tags_lookup ON {schema}.event_tags
+                (tag_key, tag_value, event_type_name, sequence);
+            CREATE FUNCTION {schema}.index_event_tags() RETURNS trigger
+                LANGUAGE plpgsql AS $index$ BEGIN
+                    INSERT INTO {schema}.event_tags (tag_key, tag_value, event_type_name, sequence)
+                        SELECT t->>'key', t->>'value', n.event_type_name, n.sequence
+                        FROM new_events n, jsonb_array_elements(n.tags) t;
+                    RETURN NULL;
+                END $index$;
+            CREATE TRIGGER events_index_tags AFTER INSERT ON {schema}.events
+                REFERENCING NEW TABLE AS new_events
+                FOR EACH STATEMENT EXECUTE FUNCTION {schema}.index_event_tags();
+        END IF; END $patch$",
+        table = sql_literal(&format!("{schema}.event_tags")),
+        lock_key = sql_literal(&format!("skilj_event_tags:{schema}"))
     )))
     .execute(executor)
     .await?;
@@ -4082,6 +4156,7 @@ struct CommandRow {
     metadata_causation_id: Option<String>,
     consistency_tags: Json<Vec<Tag>>,
     consistency_boundary: Option<i64>,
+    consistency_query: Json<Vec<QueryItem>>,
 }
 
 impl CommandRow {
@@ -4111,6 +4186,7 @@ impl CommandRow {
             },
             encryption_keys: Vec::new(),
             consistency_tags: self.consistency_tags.0,
+            consistency_query: self.consistency_query.0,
             consistency_boundary: self.consistency_boundary,
         }
     }
@@ -4153,7 +4229,7 @@ async fn commands_from_rows(
 // command precisely rather than by whole-struct content equality.
 const COMMAND_COLUMNS: &str = "external_id, command_type_name, payload, metadata_type, \
     metadata_version, metadata_client_id, metadata_created_at, metadata_correlation_id, \
-    metadata_causation_id, consistency_tags, consistency_boundary";
+    metadata_causation_id, consistency_tags, consistency_boundary, consistency_query";
 
 /// Insert-only, unlike every `upsert_*` above - re-registration/promotion
 /// don't apply to a `Command`, so every call is a new row, even though it
@@ -4184,7 +4260,7 @@ pub async fn insert_command(
     let schema = schema_ident(&command.bounded_context.name);
     let (id,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id"
     )))
     .bind(&command.id)
     .bind(&command.command_type.name)
@@ -4197,6 +4273,7 @@ pub async fn insert_command(
     .bind(&command.metadata.causation_id)
     .bind(Json(&command.consistency_tags))
     .bind(command.consistency_boundary)
+    .bind(Json(&command.consistency_query))
     .fetch_one(&mut **tx)
     .await?;
 
@@ -4310,6 +4387,7 @@ async fn get_commands_by_ids_with_bc(
                 },
                 encryption_keys: Vec::new(),
                 consistency_tags: row.consistency_tags.0,
+                consistency_query: row.consistency_query.0,
                 consistency_boundary: row.consistency_boundary,
             },
         );
@@ -4336,6 +4414,7 @@ struct CommandRowWithId {
     metadata_causation_id: Option<String>,
     consistency_tags: Json<Vec<Tag>>,
     consistency_boundary: Option<i64>,
+    consistency_query: Json<Vec<QueryItem>>,
 }
 
 /// `get_command_type`'s batched sibling - `get_event_type_with_bc`'s own
@@ -4626,8 +4705,8 @@ async fn upsert_projection_in_tx(
 /// investigation finding - see `apply_projection_fold_update`'s own doc
 /// comment) - every caller needs it immediately after to decide whether
 /// this specific row has already folded the event it's about to fold,
-/// the same shape `get_or_create_snapshot_state_for_update` already
-/// returns for `Snapshot`.
+/// the same shape `fold_snapshot_chunk_in_tx`'s own row lock returns for
+/// `Snapshot`.
 async fn get_or_create_projection_state_for_update(
     executor: impl sqlx::PgExecutor<'_>,
     schema: &str,
@@ -4735,51 +4814,6 @@ fn event_owner(owner_tag_key: Option<&str>, event: &Event) -> Option<String> {
     })
 }
 
-/// [docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2" - get-or-create-with-lock for
-/// one snapshot's own `(snapshot_name, tag_key, tag_value)` row, the
-/// `Snapshot` counterpart to `get_or_create_projection_state_for_update`
-/// above. `version` is the currently-registered `Snapshot::VERSION` -
-/// on a fresh row, seeds it at `-1`/`default_state_json`; on an existing
-/// row whose own stored `snapshot_version` still matches, this is a
-/// no-op write purely to acquire the lock (identical reasoning to the
-/// `Projection` twin); on an existing row at an *older* version, resets
-/// it to `-1`/`default_state_json` at the new version, atomically as
-/// part of acquiring the lock - the "model changed" case
-/// `CommandType::decide_from_snapshot`'s own doc comment describes,
-/// done here rather than as a separate read-then-write (which could
-/// race two concurrent catch-up ticks against the same row).
-async fn get_or_create_snapshot_state_for_update(
-    executor: impl sqlx::PgExecutor<'_>,
-    schema: &str,
-    snapshot_name: &str,
-    tag_key: &str,
-    tag_value: &str,
-    version: u64,
-    default_state_json: &str,
-) -> crate::error::Result<(i64, String)> {
-    let (as_of_sequence, state): (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO {schema}.snapshots \
-            (snapshot_name, tag_key, tag_value, snapshot_version, as_of_sequence, state, updated_at) \
-         VALUES ($1, $2, $3, $4, -1, $5::jsonb, now()) \
-         ON CONFLICT (snapshot_name, tag_key, tag_value) DO UPDATE SET \
-            snapshot_version = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
-                THEN {schema}.snapshots.snapshot_version ELSE $4 END, \
-            as_of_sequence = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
-                THEN {schema}.snapshots.as_of_sequence ELSE -1 END, \
-            state = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
-                THEN {schema}.snapshots.state ELSE $5::jsonb END \
-         RETURNING as_of_sequence, state::text"
-    )))
-    .bind(snapshot_name)
-    .bind(tag_key)
-    .bind(tag_value)
-    .bind(version as i64)
-    .bind(default_state_json)
-    .fetch_one(executor)
-    .await?;
-    Ok((as_of_sequence, state))
-}
-
 /// `(snapshot_version, as_of_sequence, state, updated_at)` -
 /// `get_snapshot_state`'s own return shape, named to satisfy
 /// `clippy::type_complexity` rather than because anything else reuses
@@ -4880,8 +4914,7 @@ pub struct ResolvedSnapshot {
 /// registered one - "model changed", `CommandType::decide_from_snapshot`'s
 /// own doc comment) resolves to `Snapshot::State::default()`,
 /// JSON-encoded, at `as_of_sequence: -1` - the same cold-start shape
-/// `get_or_create_snapshot_state_for_update` gives the background
-/// catch-up task.
+/// `fold_snapshot_chunk_in_tx` gives the background catch-up task.
 pub async fn resolve_snapshot_context(
     pool: &Pool,
     bounded_context: &str,
@@ -4936,7 +4969,7 @@ pub async fn resolve_snapshot_context(
 /// trip to discover it. Plain read, no lock: only used to compute
 /// `catch_up_snapshots`' own starting point for the *next* tick, never
 /// to decide whether a specific write is safe - that's
-/// `get_or_create_snapshot_state_for_update`'s own job, per row.
+/// `fold_snapshot_chunk_in_tx`'s own job, per row.
 async fn list_snapshot_progress_for_bounded_context(
     pool: &Pool,
     bounded_context: &str,
@@ -6383,6 +6416,183 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
     let rows: Vec<EventRowAnyType> = query.fetch_all(&mut *conn).await?;
 
     events_from_rows(conn, bc, rows, known_event_types).await
+}
+
+/// The events of `bc` matching `query`, after `after_sequence` when given,
+/// in sequence order - an item with `latest` contributes only that many
+/// of its matches, the newest (docs/architecture.md §198). One statement, so one snapshot: the
+/// union of one sub-select per item.
+///
+/// An item naming event types and tags is read through `event_tags`: an
+/// index probe on its first tag and its types, each other tag checked on
+/// the event it finds. That is what keeps "the latest lifecycle event of
+/// this company" one probe per type however many other events carry the
+/// company's tag. An item with tags and no types goes through the GIN
+/// index on `events.tags`, as tag reads always have; one with types and no
+/// tags through `events_by_type`.
+///
+/// The statement's text depends only on the shape of `query` - how many
+/// items, which kinds, how many tags, and whether a tag's value is null -
+/// so a command type always sends the same few to the statement cache.
+async fn list_events_matching_query_with_bc(
+    conn: &mut sqlx::PgConnection,
+    bc: &BoundedContext,
+    query: &[QueryItem],
+    after_sequence: Option<i64>,
+    known_event_types: Option<&std::collections::HashMap<String, EventType>>,
+) -> crate::error::Result<Vec<Event>> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = schema_ident(&bc.name);
+    enum Bind {
+        Text(Option<String>),
+        Texts(Vec<String>),
+        Json(String),
+        Sequence(i64),
+    }
+    let mut binds: Vec<Bind> = Vec::new();
+    let param = |binds: &mut Vec<Bind>, bind: Bind| {
+        binds.push(bind);
+        format!("${}", binds.len())
+    };
+    let after =
+        after_sequence.map(|after| format!("{}::bigint", param(&mut binds, Bind::Sequence(after))));
+    let mut selects = Vec::with_capacity(query.len());
+    for item in query {
+        let after_clause = |column: &str| match &after {
+            Some(after) => format!(" AND {column} > {after}"),
+            None => String::new(),
+        };
+        let latest = |binds: &mut Vec<Bind>, column: &str| match item.latest {
+            Some(count) => format!(
+                " ORDER BY {column} DESC LIMIT {}",
+                param(binds, Bind::Sequence(i64::from(count)))
+            ),
+            None => String::new(),
+        };
+        let select = match (item.event_types.is_empty(), item.tags.split_first()) {
+            (false, Some((first, rest))) => {
+                let key = param(&mut binds, Bind::Text(Some(first.key.clone())));
+                let value = match &first.value {
+                    Some(value) => {
+                        format!("= {}", param(&mut binds, Bind::Text(Some(value.clone()))))
+                    }
+                    None => "IS NULL".to_string(),
+                };
+                let types = param(&mut binds, Bind::Texts(item.event_types.clone()));
+                let rest = if rest.is_empty() {
+                    String::new()
+                } else {
+                    let tags = param(
+                        &mut binds,
+                        Bind::Json(
+                            serde_json::to_string(rest).expect("Tag serialisation is infallible"),
+                        ),
+                    );
+                    format!(
+                        " AND EXISTS (SELECT 1 FROM {schema}.events r \
+                         WHERE r.sequence = t.sequence AND r.tags @> {tags}::jsonb)"
+                    )
+                };
+                format!(
+                    "(SELECT t.sequence FROM {schema}.event_tags t \
+                     WHERE t.tag_key = {key} AND t.tag_value {value} \
+                     AND t.event_type_name = ANY({types}::text[]){}{rest}{})",
+                    after_clause("t.sequence"),
+                    latest(&mut binds, "t.sequence"),
+                )
+            }
+            (true, Some(_)) => {
+                let tags = param(
+                    &mut binds,
+                    Bind::Json(
+                        serde_json::to_string(&item.tags).expect("Tag serialisation is infallible"),
+                    ),
+                );
+                format!(
+                    "(SELECT sequence FROM {schema}.events WHERE tags @> {tags}::jsonb{}{})",
+                    after_clause("sequence"),
+                    latest(&mut binds, "sequence"),
+                )
+            }
+            (false, None) => {
+                let types = param(&mut binds, Bind::Texts(item.event_types.clone()));
+                format!(
+                    "(SELECT sequence FROM {schema}.events \
+                     WHERE event_type_name = ANY({types}::text[]){}{})",
+                    after_clause("sequence"),
+                    latest(&mut binds, "sequence"),
+                )
+            }
+            // Refused by `build()`: it would match every event.
+            (true, None) => continue,
+        };
+        selects.push(select);
+    }
+    if selects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
+         metadata_client_id, metadata_created_at, metadata_correlation_id, \
+         metadata_causation_id, tags, origin_kind, origin_source_content, \
+         origin_source_context, origin_command_id FROM {schema}.events \
+         WHERE sequence IN ({}) ORDER BY sequence",
+        selects.join(" UNION ")
+    );
+    let mut statement = sqlx::query_as::<_, EventRowAnyType>(sqlx::AssertSqlSafe(sql));
+    for bind in binds {
+        statement = match bind {
+            Bind::Text(text) => statement.bind(text),
+            Bind::Texts(texts) => statement.bind(texts),
+            Bind::Json(json) => statement.bind(json),
+            Bind::Sequence(sequence) => statement.bind(sequence),
+        };
+    }
+    let rows: Vec<EventRowAnyType> = statement.fetch_all(&mut *conn).await?;
+    events_from_rows(conn, bc, rows, known_event_types).await
+}
+
+/// `list_events_matching_query_with_bc` for a command's read before the
+/// lock: cache first, then Postgres, returning the position the read is
+/// complete through, as [`list_events_for_bounded_context_matching_tags_cached`]
+/// does. The cache serves it only from a window that holds everything
+/// after `after_sequence`, and selects the last matches of items with
+/// `latest` from it the
+/// same way.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_events_matching_query_cached(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    query: &[QueryItem],
+    after_sequence: Option<i64>,
+) -> crate::error::Result<(Vec<Event>, i64)> {
+    match cache
+        .try_events_matching_query(pool, bounded_context, query, after_sequence.unwrap_or(-1))
+        .await?
+    {
+        Some((events, covered_through)) => Ok((
+            crate::event_store::select_matching_events(query, &events),
+            covered_through,
+        )),
+        None => {
+            let (covered_through, bc) = futures_util::try_join!(
+                latest_sequence(pool, bounded_context),
+                require_bounded_context(pool, bounded_context),
+            )?;
+            let events = list_events_matching_query_with_bc(
+                &mut *pool.acquire().await?,
+                &bc,
+                query,
+                after_sequence,
+                None,
+            )
+            .await?;
+            Ok((events, covered_through.unwrap_or(-1)))
+        }
+    }
 }
 
 /// Turns `events` rows of any type from `bc` into [`Event`]s on `conn`,
@@ -8254,6 +8464,9 @@ struct AcceptedDecision {
     /// events its final decision saw that match its consistency tags
     /// (docs/architecture.md §196).
     consistency_boundary: Option<i64>,
+    /// The command type's own query, derived from the payload - recorded
+    /// on the command (docs/architecture.md §198).
+    consistency_query: Vec<QueryItem>,
     event_types_by_name: std::collections::HashMap<String, EventType>,
 }
 
@@ -8358,11 +8571,16 @@ async fn decide_command_in_tx(
     }
 
     let mut final_decision = initial_decision;
+    // docs/architecture.md §198: what the command reads and conflicts on.
+    // Without a query of its own, one item per consistency tag - every
+    // event carrying any of them, as before.
+    let consistency_query = command_consistency_query(dispatcher, command_type, payload);
+    let query = crate::event_store::effective_query(&consistency_query, consistency_tags);
     // docs/architecture.md §196: no copy of the history unless a conflict
     // below needs an extended one. The boundary is a plain maximum, raised
     // by the delta's.
     let mut consistency_boundary =
-        crate::event_store::consistency_boundary(bounded_context_events, consistency_tags);
+        crate::event_store::query_boundary(&query, bounded_context_events);
     // Codeberg issue #7: `None` is the caller's own pre-lock set,
     // replaced below only if a DCB conflict forced a redispatch -
     // whichever one actually produced `final_decision` is the one a
@@ -8392,6 +8610,9 @@ async fn decide_command_in_tx(
         snapshot.as_ref().map(|s| s.as_of_sequence),
         covered_through,
     );
+    // A query item with no tags isn't in the batch's tag query; such a
+    // command re-checks with a query of its own.
+    let batch_delta = batch_delta.filter(|_| query.iter().all(|item| !item.tags.is_empty()));
     let mut delta = if let Some(batch_delta) = batch_delta {
         // docs/architecture.md §196: the batch read every command's
         // re-check range in one query, over all their tags - this
@@ -8401,10 +8622,31 @@ async fn decide_command_in_tx(
             .filter(|e| {
                 e.sequence > covered
                     && e.sequence <= locked_highest
-                    && consistency_tags.iter().any(|t| e.tags.contains(t))
+                    && crate::event_store::query_matches(&query, e)
             })
             .cloned()
             .collect()
+    } else if locked_highest > covered && !consistency_query.is_empty() {
+        // Every event matching any item counts, however many matches the
+        // item keeps: a newer one displaces the oldest the command
+        // decided on.
+        let every_match: Vec<QueryItem> = query
+            .iter()
+            .map(|item| QueryItem {
+                latest: None,
+                ..item.clone()
+            })
+            .collect();
+        let mut result = list_events_matching_query_with_bc(
+            &mut *conn,
+            &command_type.bounded_context,
+            &every_match,
+            Some(covered),
+            Some(&event_types_by_name),
+        )
+        .await?;
+        result.retain(|e| e.sequence <= locked_highest);
+        result
     } else if locked_highest > covered {
         // `command_type.bounded_context` is already this exact row -
         // every command a `CommandBatcher` batch ever holds shares one
@@ -8450,7 +8692,7 @@ async fn decide_command_in_tx(
     delta.extend(
         extra_committed_events
             .iter()
-            .filter(|e| e.sequence > covered && consistency_tags.iter().any(|t| e.tags.contains(t)))
+            .filter(|e| e.sequence > covered && crate::event_store::query_matches(&query, e))
             .cloned(),
     );
 
@@ -8459,12 +8701,11 @@ async fn decide_command_in_tx(
         extended.extend_from_slice(bounded_context_events);
         extended.extend(delta);
         extended.sort_by_key(|e| e.sequence);
-        let (boundary, redispatch_matching_events) =
-            crate::event_store::consistency_boundary_and_matching_events(
-                &extended,
-                consistency_tags,
-            );
-        consistency_boundary = boundary;
+        // The query selects again over the extended history: a newer
+        // match displaces an item's oldest kept one when it keeps a count.
+        let redispatch_matching_events =
+            crate::event_store::select_matching_events(&query, &extended);
+        consistency_boundary = redispatch_matching_events.iter().map(|e| e.sequence).max();
         // docs/architecture.md §19: a snapshot-accelerated initial
         // decision redispatches through `dispatch_from_snapshot`
         // again too, not the ordinary `dispatch` - the snapshot's
@@ -8543,6 +8784,7 @@ async fn decide_command_in_tx(
     Ok(DecideOutcome::Accepted(AcceptedDecision {
         event_specs,
         consistency_boundary,
+        consistency_query,
         event_types_by_name,
     }))
 }
@@ -8666,6 +8908,7 @@ async fn finish_accepted_command_in_tx(
     let AcceptedDecision {
         event_specs,
         consistency_boundary,
+        consistency_query,
         event_types_by_name,
     } = decided;
     let mut sequences = sequences.into_iter();
@@ -8688,6 +8931,7 @@ async fn finish_accepted_command_in_tx(
         client_id,
         correlation_id,
         causation_id,
+        consistency_query,
         consistency_boundary,
         crate::shared::CommandDecision::Accepted {
             events: event_specs,
@@ -9393,6 +9637,7 @@ async fn write_command_batch_as_set(
         let AcceptedDecision {
             event_specs,
             consistency_boundary,
+            consistency_query,
             event_types_by_name,
         } = match decided {
             Ok(DecideOutcome::Terminal(outcome)) => {
@@ -9434,6 +9679,7 @@ async fn write_command_batch_as_set(
             &item.client_id,
             item.correlation_id.as_deref(),
             item.causation_id.as_deref(),
+            consistency_query,
             consistency_boundary,
             crate::shared::CommandDecision::Accepted {
                 events: event_specs,
@@ -9568,12 +9814,13 @@ async fn write_planned_commands(
         "INSERT INTO {schema}.commands ({COMMAND_COLUMNS}) \
          SELECT external_id, command_type_name, payload, metadata_type, metadata_version, \
                 client_id, created_at, correlation_id, causation_id, consistency_tags::jsonb, \
-                consistency_boundary \
+                consistency_boundary, consistency_query::jsonb \
          FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::text[], \
-                     $7::timestamptz[], $8::text[], $9::text[], $10::text[], $11::bigint[]) \
+                     $7::timestamptz[], $8::text[], $9::text[], $10::text[], $11::bigint[], \
+                     $12::text[]) \
               AS u(external_id, command_type_name, payload, metadata_type, metadata_version, \
                    client_id, created_at, correlation_id, causation_id, consistency_tags, \
-                   consistency_boundary) \
+                   consistency_boundary, consistency_query) \
          RETURNING id, external_id"
     )))
     .bind(commands.iter().map(|c| c.id.as_str()).collect::<Vec<_>>())
@@ -9637,6 +9884,15 @@ async fn write_planned_commands(
         commands
             .iter()
             .map(|c| c.consistency_boundary)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        commands
+            .iter()
+            .map(|c| {
+                serde_json::to_string(&c.consistency_query)
+                    .expect("QueryItem serialisation is infallible")
+            })
             .collect::<Vec<_>>(),
     )
     .fetch_all(&mut **tx)
@@ -10219,9 +10475,28 @@ pub struct ResolvedCommandSubmission {
     /// `list_events_for_bounded_context_matching_tags_cached`.
     pub covered_through: i64,
     pub consistency_tags: Vec<Tag>,
+    /// The command type's own consistency query, derived from the payload
+    /// - empty for one that declares none (docs/architecture.md §198).
+    pub consistency_query: Vec<QueryItem>,
     pub matching_events: Vec<Event>,
     pub decision: crate::shared::CommandDecision,
     pub snapshot_context: Option<ResolvedSnapshot>,
+}
+
+/// `CommandType::consistency_query`, as `dispatcher` holds it for
+/// `command_type`, derived from `payload` - empty for a command type that
+/// declares none (docs/architecture.md §198). Derived wherever it's
+/// needed rather than carried: it's a pure function of the two, and the
+/// compiled query is what the compiled `decide()` was written against.
+fn command_consistency_query(
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    command_type: &CommandType,
+    payload: &str,
+) -> Vec<QueryItem> {
+    dispatcher
+        .consistency_query(&command_type.bounded_context.name, &command_type.name)
+        .map(|mappings| crate::event_store::derive_query(&mappings, payload))
+        .unwrap_or_default()
 }
 
 /// The optimistic, unlocked half of `ProcessCommand`'s own "optimistic
@@ -10244,10 +10519,13 @@ pub async fn resolve_command_submission(
 ) -> crate::error::Result<ResolvedCommandSubmission> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let consistency_tags = crate::event_store::derive_tags(&command_type.tag_mappings, payload);
+    let consistency_query = command_consistency_query(dispatcher, command_type, payload);
 
+    // `build()` refuses a snapshot together with a query; a dispatcher
+    // built by hand that has both gets the query.
     let snapshot_context = match dispatcher.snapshot_name(&bounded_context_name, &command_type.name)
     {
-        Some(Some(snapshot_name)) => {
+        Some(Some(snapshot_name)) if consistency_query.is_empty() => {
             resolve_snapshot_context(
                 pool,
                 &bounded_context_name,
@@ -10260,7 +10538,7 @@ pub async fn resolve_command_submission(
         _ => None,
     };
 
-    let (bounded_context_events, covered_through) =
+    let (bounded_context_events, covered_through) = if consistency_query.is_empty() {
         list_events_for_bounded_context_matching_tags_cached(
             pool,
             event_cache,
@@ -10268,10 +10546,20 @@ pub async fn resolve_command_submission(
             &consistency_tags,
             snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
         )
-        .await?;
-    let (_boundary, matching_events) = crate::event_store::consistency_boundary_and_matching_events(
+        .await?
+    } else {
+        list_events_matching_query_cached(
+            pool,
+            event_cache,
+            &bounded_context_name,
+            &consistency_query,
+            None,
+        )
+        .await?
+    };
+    let matching_events = crate::event_store::select_matching_events(
+        &crate::event_store::effective_query(&consistency_query, &consistency_tags),
         &bounded_context_events,
-        &consistency_tags,
     );
 
     let decision = match &snapshot_context {
@@ -10298,6 +10586,7 @@ pub async fn resolve_command_submission(
         bounded_context_events,
         covered_through,
         consistency_tags,
+        consistency_query,
         matching_events,
         decision,
         snapshot_context,
@@ -13561,43 +13850,15 @@ async fn fold_catch_up_chunk_in_tx(
         let default_state_json = dispatcher
             .default_state(bounded_context, target.name)
             .unwrap_or_default();
-        // Get-or-create-with-lock, every key at once - see
-        // `get_or_create_projection_state_for_update`.
-        let rows: Vec<(String, i64, String)> = if target.rebuild {
-            sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "INSERT INTO {schema}.projection_rebuild_state \
-                 (projection_name, status, key, state, updated_at) \
-                 SELECT $1, 'building', key, $3, now() FROM unnest($2::text[]) AS key \
-                 ON CONFLICT (projection_name, status, key) DO UPDATE SET \
-                 state = {schema}.projection_rebuild_state.state \
-                 RETURNING key, as_of_sequence, state"
-            )))
-        } else {
-            sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
-                 SELECT $1, key, $3, now() FROM unnest($2::text[]) AS key \
-                 ON CONFLICT (projection_name, key) DO UPDATE SET \
-                 state = {schema}.projection_state.state \
-                 RETURNING key, as_of_sequence, state"
-            )))
-        }
-        .bind(target.name)
-        .bind(&target.keys)
-        .bind(&default_state_json)
-        .fetch_all(&mut *tx)
+        target.states = lock_chunk_states(
+            &mut tx,
+            schema,
+            target.rebuild,
+            target.name,
+            &target.keys,
+            &default_state_json,
+        )
         .await?;
-        target.states = rows
-            .into_iter()
-            .map(|(key, as_of_sequence, state)| {
-                let folded = CatchUpChunkState {
-                    as_of_sequence,
-                    state,
-                    owner: None,
-                    folded: false,
-                };
-                (key, folded)
-            })
-            .collect();
     }
 
     for (index, slot, keys) in &planned {
@@ -13610,65 +13871,20 @@ async fn fold_catch_up_chunk_in_tx(
                 .flatten(),
             event,
         );
-        for key in keys {
-            let entry = target
-                .states
-                .get_mut(key)
-                .expect("every planned key's row was just read");
-            // `as_of_sequence` guard (Codeberg issue #25): another
-            // instance may have folded this row past `event` already.
-            if entry.as_of_sequence >= event.sequence {
-                continue;
-            }
-            if let Some(result) =
-                dispatcher.project(bounded_context, target.name, &entry.state, event, key)
-            {
-                entry.state = result?;
-            }
-            entry.as_of_sequence = event.sequence;
-            if owner.is_some() {
-                entry.owner.clone_from(&owner);
-            }
-            entry.folded = true;
-        }
+        fold_into_chunk_states(
+            dispatcher,
+            bounded_context,
+            target.name,
+            &mut target.states,
+            keys,
+            event,
+            &owner,
+        )?;
     }
     *reached = 0;
 
     for target in &targets {
-        let mut keys = Vec::new();
-        let mut states = Vec::new();
-        let mut owners = Vec::new();
-        let mut as_of_sequences = Vec::new();
-        for (key, folded) in target.states.iter().filter(|(_, s)| s.folded) {
-            keys.push(key.as_str());
-            states.push(folded.state.as_str());
-            owners.push(folded.owner.as_deref());
-            as_of_sequences.push(folded.as_of_sequence);
-        }
-        if !keys.is_empty() {
-            // A `NULL` owner leaves the stored one as it is - see
-            // `apply_projection_fold_update`.
-            let (table, extra_where) = if target.rebuild {
-                ("projection_rebuild_state", " AND s.status = 'building'")
-            } else {
-                ("projection_state", "")
-            };
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {schema}.{table} AS s SET state = u.state, \
-                 owner = COALESCE(u.owner, s.owner), as_of_sequence = u.as_of_sequence, \
-                 updated_at = now() \
-                 FROM unnest($2::text[], $3::text[], $4::text[], $5::bigint[]) \
-                 AS u(key, state, owner, as_of_sequence) \
-                 WHERE s.projection_name = $1 AND s.key = u.key{extra_where}"
-            )))
-            .bind(target.name)
-            .bind(&keys)
-            .bind(&states)
-            .bind(&owners)
-            .bind(&as_of_sequences)
-            .execute(&mut *tx)
-            .await?;
-        }
+        write_chunk_states(&mut tx, schema, target.rebuild, target.name, &target.states).await?;
 
         if target.position == target.locked {
             continue;
@@ -13698,6 +13914,134 @@ async fn fold_catch_up_chunk_in_tx(
     }
 
     tx.commit().await?;
+    Ok(())
+}
+
+/// Get-or-create-with-lock of every one of `keys` at once, in the order
+/// given - see `get_or_create_projection_state_for_update`. `rebuild`
+/// picks the `building` rebuild's state table instead of the live one.
+async fn lock_chunk_states(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    rebuild: bool,
+    projection_name: &str,
+    keys: &[String],
+    default_state_json: &str,
+) -> crate::error::Result<std::collections::HashMap<String, CatchUpChunkState>> {
+    let rows: Vec<(String, i64, String)> = if rebuild {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.projection_rebuild_state \
+             (projection_name, status, key, state, updated_at) \
+             SELECT $1, 'building', key, $3, now() FROM unnest($2::text[]) AS key \
+             ON CONFLICT (projection_name, status, key) DO UPDATE SET \
+             state = {schema}.projection_rebuild_state.state \
+             RETURNING key, as_of_sequence, state"
+        )))
+    } else {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.projection_state (projection_name, key, state, updated_at) \
+             SELECT $1, key, $3, now() FROM unnest($2::text[]) AS key \
+             ON CONFLICT (projection_name, key) DO UPDATE SET \
+             state = {schema}.projection_state.state \
+             RETURNING key, as_of_sequence, state"
+        )))
+    }
+    .bind(projection_name)
+    .bind(keys)
+    .bind(default_state_json)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(key, as_of_sequence, state)| {
+            let folded = CatchUpChunkState {
+                as_of_sequence,
+                state,
+                owner: None,
+                folded: false,
+            };
+            (key, folded)
+        })
+        .collect())
+}
+
+/// Folds `event` into each of `keys`' states, keeping the
+/// `as_of_sequence` guard (Codeberg issue #25): another instance may have
+/// folded a row past `event` already. `owner` is the one `event` gives
+/// (`event_owner`).
+fn fold_into_chunk_states(
+    dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    bounded_context: &str,
+    projection_name: &str,
+    states: &mut std::collections::HashMap<String, CatchUpChunkState>,
+    keys: &[String],
+    event: &Event,
+    owner: &Option<String>,
+) -> crate::error::Result<()> {
+    for key in keys {
+        let entry = states
+            .get_mut(key)
+            .expect("every planned key's row was just read");
+        if entry.as_of_sequence >= event.sequence {
+            continue;
+        }
+        if let Some(result) =
+            dispatcher.project(bounded_context, projection_name, &entry.state, event, key)
+        {
+            entry.state = result?;
+        }
+        entry.as_of_sequence = event.sequence;
+        if owner.is_some() {
+            entry.owner.clone_from(owner);
+        }
+        entry.folded = true;
+    }
+    Ok(())
+}
+
+/// Writes every folded one of `states` back in one statement. A `NULL`
+/// owner leaves the stored one as it is - see
+/// `apply_projection_fold_update`.
+async fn write_chunk_states(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    rebuild: bool,
+    projection_name: &str,
+    states: &std::collections::HashMap<String, CatchUpChunkState>,
+) -> crate::error::Result<()> {
+    let mut keys = Vec::new();
+    let mut folded_states = Vec::new();
+    let mut owners = Vec::new();
+    let mut as_of_sequences = Vec::new();
+    for (key, folded) in states.iter().filter(|(_, s)| s.folded) {
+        keys.push(key.as_str());
+        folded_states.push(folded.state.as_str());
+        owners.push(folded.owner.as_deref());
+        as_of_sequences.push(folded.as_of_sequence);
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let (table, extra_where) = if rebuild {
+        ("projection_rebuild_state", " AND s.status = 'building'")
+    } else {
+        ("projection_state", "")
+    };
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.{table} AS s SET state = u.state, \
+         owner = COALESCE(u.owner, s.owner), as_of_sequence = u.as_of_sequence, \
+         updated_at = now() \
+         FROM unnest($2::text[], $3::text[], $4::text[], $5::bigint[]) \
+         AS u(key, state, owner, as_of_sequence) \
+         WHERE s.projection_name = $1 AND s.key = u.key{extra_where}"
+    )))
+    .bind(projection_name)
+    .bind(&keys)
+    .bind(&folded_states)
+    .bind(&owners)
+    .bind(&as_of_sequences)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
@@ -13831,63 +14175,51 @@ async fn catch_up_partitioned_projection(
                 continue;
             }
 
-            let mut this_partition_progress = progress.get(&partition_index).copied().unwrap_or(-1);
-            for event in &events {
-                if this_partition_progress >= event.sequence {
-                    continue;
-                }
-                let keys = dispatcher
+            // Every key of this partition read and locked once, folded
+            // in memory, and written once (docs/architecture.md §197), as
+            // the unpartitioned chunk does (§182). Keys are locked in
+            // sorted order. The transaction was already all or nothing.
+            let after = progress.get(&partition_index).copied().unwrap_or(-1);
+            let mut planned: Vec<(&Event, Vec<String>)> = Vec::new();
+            let mut keys: Vec<String> = Vec::new();
+            for event in events.iter().filter(|e| e.sequence > after) {
+                let event_keys: Vec<String> = dispatcher
                     .keys(bounded_context, &projection.name, event)
-                    .unwrap_or_default();
-                for key in &keys {
-                    if partition_for_key(key, partition_count) != partition_index {
-                        continue;
-                    }
-
-                    // Identical guard to the unpartitioned loop above -
-                    // see its own comment. Here it also absorbs any
-                    // hash disagreement between instances (this
-                    // function's own doc comment's "pure work-avoidance
-                    // optimization" point).
-                    let (as_of_sequence, current_state) =
-                        get_or_create_projection_state_for_update(
-                            &mut *tx,
-                            schema,
-                            &projection.name,
-                            key,
-                            &default_state_json,
-                        )
-                        .await?;
-                    if as_of_sequence >= event.sequence {
-                        continue;
-                    }
-
-                    let new_state = match dispatcher.project(
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|key| partition_for_key(key, partition_count) == partition_index)
+                    .collect();
+                if !event_keys.is_empty() {
+                    keys.extend(event_keys.iter().cloned());
+                    planned.push((event, event_keys));
+                }
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            if !keys.is_empty() {
+                let mut states = lock_chunk_states(
+                    &mut tx,
+                    schema,
+                    false,
+                    &projection.name,
+                    &keys,
+                    &default_state_json,
+                )
+                .await?;
+                for (event, event_keys) in &planned {
+                    fold_into_chunk_states(
+                        dispatcher,
                         bounded_context,
                         &projection.name,
-                        &current_state,
+                        &mut states,
+                        event_keys,
                         event,
-                        key,
-                    ) {
-                        Some(result) => result?,
-                        None => current_state,
-                    };
-
-                    apply_projection_fold_update(
-                        &mut *tx,
-                        schema,
-                        "projection_state",
-                        "",
-                        &projection.name,
-                        key,
-                        &new_state,
-                        owner_tag_key,
-                        event,
-                    )
-                    .await?;
+                        &event_owner(owner_tag_key, event),
+                    )?;
                 }
-                this_partition_progress = event.sequence;
+                write_chunk_states(&mut tx, schema, false, &projection.name, &states).await?;
             }
+            let this_partition_progress = after.max(batch_end);
 
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {schema}.projection_partition_progress \
@@ -14024,56 +14356,352 @@ async fn list_projection_partition_progress(
         .collect())
 }
 
-/// A snapshot row's state for `tag_value`, folded from nothing over every
-/// event carrying that tag up to and including `up_to` - what a catch-up
-/// writes into a row `get_or_create_snapshot_state_for_update` has just
-/// created or reset (`as_of_sequence` -1), rather than folding only the
-/// event in hand (docs/architecture.md §152). For a tag value first seen
-/// at `up_to` that's the one event, as before. For a row reset by a
-/// `Snapshot::VERSION` bump - progress already past the tag's earlier
-/// events, which will never be walked again - it's the whole history,
-/// where folding the one event left a row claiming to be current while
-/// missing everything before it. Read through `conn` (the catch-up's own
-/// transaction), a chunk at a time, through the tag index.
+/// One snapshot row's state while a chunk is folded: read and locked
+/// before the chunk's events are folded into it, written back once after
+/// (docs/architecture.md §197).
+struct SnapshotChunkRow {
+    as_of_sequence: i64,
+    state: String,
+    owner: Option<String>,
+    /// The position its tag's history was refolded through, for a row
+    /// created or reset by this chunk - see [`refold_snapshot_histories`].
+    /// The chunk's events up to it are already in `state`.
+    history_through: Option<i64>,
+}
+
+/// Folds the events of `events` past `after` into snapshot `name`'s rows,
+/// on `conn` - the caller's transaction, which it commits. `partition`,
+/// `(index, count)`, keeps only the tag values that hash to that
+/// partition. Exactly what folding them one event at a time did, with
+/// each row read and locked once and written once (docs/architecture.md
+/// §197):
+///
+/// 1. Every tag value the events touch is locked, or created, in one
+///    statement, sorted, so two instances' chunks lock them in the same
+///    order. A row at an older `Snapshot::VERSION` is reset as part of it,
+///    atomically, to the default state at `as_of_sequence` -1 - the
+///    "model changed" case `CommandType::decide_from_snapshot`'s own doc
+///    comment describes.
+/// 2. A row created or reset here (`as_of_sequence` -1) is refolded from
+///    its tag's whole history through its last event in the chunk - one
+///    paged read for every such row at once ([`refold_snapshot_histories`]).
+///    That's what folding the history at its first event and then each
+///    later event did.
+/// 3. The rest are folded in memory, keeping the `as_of_sequence` guard.
+/// 4. Every folded row is written back in one `UPDATE ... FROM unnest`.
+///    A row's owner is the last owner tag a folded event carried; one no
+///    event gave an owner keeps the stored one.
+///
+/// `reached` is set to the index in `events` of the event a failing fold
+/// was folding, and left alone otherwise - see
+/// [`CatchUpChunkFailure`].
 #[allow(clippy::too_many_arguments)]
-async fn fold_snapshot_tag_history(
+async fn fold_snapshot_chunk_in_tx(
+    conn: &mut sqlx::PgConnection,
+    bc: &BoundedContext,
+    schema: &str,
+    dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    name: &str,
+    events: &[Event],
+    after: i64,
+    partition: Option<(u32, u32)>,
+    reached: &mut usize,
+) -> crate::error::Result<()> {
+    let bounded_context = bc.name.as_str();
+    let Some(tag_key) = dispatcher.tag_key(bounded_context, name) else {
+        return Ok(());
+    };
+    let version = dispatcher.version(bounded_context, name).unwrap_or(0);
+    let default_state_json = dispatcher
+        .default_state(bounded_context, name)
+        .unwrap_or_default();
+    let owner_tag_key = dispatcher.owner_tag_key(bounded_context, name).flatten();
+
+    // The events this snapshot folds, with the tag value each one folds
+    // into.
+    let mut planned: Vec<(usize, &str)> = Vec::new();
+    let mut values: Vec<&str> = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        if event.sequence <= after {
+            continue;
+        }
+        let Some(value) = event
+            .tags
+            .iter()
+            .find(|t| t.key == tag_key)
+            .and_then(|t| t.value.as_deref())
+        else {
+            continue;
+        };
+        if let Some((partition_index, partition_count)) = partition {
+            if partition_for_key(value, partition_count) != partition_index {
+                continue;
+            }
+        }
+        planned.push((index, value));
+        values.push(value);
+    }
+    if planned.is_empty() {
+        return Ok(());
+    }
+    values.sort_unstable();
+    values.dedup();
+
+    let locked: Vec<(String, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.snapshots \
+            (snapshot_name, tag_key, tag_value, snapshot_version, as_of_sequence, state, updated_at) \
+         SELECT $1, $2, value, $4, -1, $5::jsonb, now() FROM unnest($3::text[]) AS value \
+         ON CONFLICT (snapshot_name, tag_key, tag_value) DO UPDATE SET \
+            snapshot_version = $4, \
+            as_of_sequence = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
+                THEN {schema}.snapshots.as_of_sequence ELSE -1 END, \
+            state = CASE WHEN {schema}.snapshots.snapshot_version = $4 \
+                THEN {schema}.snapshots.state ELSE $5::jsonb END \
+         RETURNING tag_value, as_of_sequence, state::text"
+    )))
+    .bind(name)
+    .bind(tag_key)
+    .bind(&values)
+    .bind(version as i64)
+    .bind(&default_state_json)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut rows: std::collections::HashMap<String, SnapshotChunkRow> = locked
+        .into_iter()
+        .map(|(value, as_of_sequence, state)| {
+            let row = SnapshotChunkRow {
+                as_of_sequence,
+                state,
+                owner: None,
+                history_through: None,
+            };
+            (value, row)
+        })
+        .collect();
+
+    // A row at -1 is refolded through its last event in the chunk. Each
+    // keeps its events' `(sequence, index)`, in order, to say which event
+    // a failing fold belongs to.
+    let mut refold: std::collections::HashMap<&str, Vec<(i64, usize)>> =
+        std::collections::HashMap::new();
+    for (index, value) in &planned {
+        if rows[*value].as_of_sequence == -1 {
+            refold
+                .entry(*value)
+                .or_default()
+                .push((events[*index].sequence, *index));
+        }
+    }
+    if !refold.is_empty() {
+        refold_snapshot_histories(
+            conn,
+            bc,
+            dispatcher,
+            name,
+            tag_key,
+            &default_state_json,
+            &refold,
+            &mut rows,
+            reached,
+        )
+        .await?;
+    }
+
+    for (index, value) in &planned {
+        let event = &events[*index];
+        let row = rows
+            .get_mut(*value)
+            .expect("every planned value's row was just read");
+        let refolded = row.history_through.is_some_and(|h| event.sequence <= h);
+        if !refolded {
+            // `as_of_sequence` guard (Codeberg issue #25): another
+            // instance may have folded this row past `event` already.
+            if row.as_of_sequence >= event.sequence {
+                continue;
+            }
+            if let Some(result) = dispatcher.fold(bounded_context, name, &row.state, event) {
+                row.state = result.inspect_err(|_| *reached = *index)?;
+            }
+            row.as_of_sequence = event.sequence;
+        }
+        if let Some(owner) = event_owner(owner_tag_key, event) {
+            row.owner = Some(owner);
+        }
+    }
+
+    let mut written_values = Vec::new();
+    let mut states = Vec::new();
+    let mut owners = Vec::new();
+    let mut as_of_sequences = Vec::new();
+    for (value, row) in &rows {
+        written_values.push(value.as_str());
+        states.push(row.state.as_str());
+        owners.push(row.owner.as_deref());
+        as_of_sequences.push(row.as_of_sequence);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.snapshots AS s SET snapshot_version = $3, state = u.state::jsonb, \
+         owner = COALESCE(u.owner, s.owner), as_of_sequence = u.as_of_sequence, \
+         updated_at = now() \
+         FROM unnest($4::text[], $5::text[], $6::text[], $7::bigint[]) \
+         AS u(tag_value, state, owner, as_of_sequence) \
+         WHERE s.snapshot_name = $1 AND s.tag_key = $2 AND s.tag_value = u.tag_value"
+    )))
+    .bind(name)
+    .bind(tag_key)
+    .bind(version as i64)
+    .bind(&written_values)
+    .bind(&states)
+    .bind(&owners)
+    .bind(&as_of_sequences)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Folds `events` - a contiguous run of the bounded context's events -
+/// into every unpartitioned snapshot in `names` that `progress` puts
+/// before its end, and moves their progress to its end, in one
+/// transaction (docs/architecture.md §197). Snapshots go by name, so two
+/// instances' chunks lock their rows in the same order.
+#[allow(clippy::too_many_arguments)]
+async fn fold_snapshots_chunk(
+    pool: &Pool,
+    bc: &BoundedContext,
+    schema: &str,
+    dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    names: &[&str],
+    progress: &std::collections::HashMap<&str, i64>,
+    events: &[Event],
+) -> Result<(), CatchUpChunkFailure> {
+    let mut reached = 0;
+    let folded: crate::error::Result<()> = async {
+        let Some(chunk_end) = events.last().map(|event| event.sequence) else {
+            return Ok(());
+        };
+        let mut sorted: Vec<&str> = names.to_vec();
+        sorted.sort_unstable();
+        let mut tx = pool.begin().await?;
+        for name in sorted {
+            let after = progress.get(name).copied().unwrap_or(-1);
+            if after >= chunk_end {
+                continue;
+            }
+            fold_snapshot_chunk_in_tx(
+                &mut tx,
+                bc,
+                schema,
+                dispatcher,
+                name,
+                events,
+                after,
+                None,
+                &mut reached,
+            )
+            .await?;
+            upsert_snapshot_progress(&mut *tx, schema, name, chunk_end).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    folded.map_err(|error| CatchUpChunkFailure {
+        folded_before: reached,
+        error,
+    })
+}
+
+/// Refolds each row in `refold` - tag value to its chunk events'
+/// `(sequence, index)`, in order - from nothing over every event carrying
+/// that tag value up to and including its last chunk event, into `rows`
+/// (docs/architecture.md §152, §197). One paged read covers every value
+/// at once, instead of one read per value, through `event_tags` (§198):
+/// its btree hands back each value's sequences in order, where the GIN
+/// index on `events.tags` rebuilt and sorted every value's whole bitmap
+/// for each page - about four times slower for 100 values of 500 events.
+/// A
+/// fold that fails sets `reached` to the first of the value's chunk
+/// events at or after the failing one: the event at which the per-event
+/// loop would have reached it, and failed - the first chunk event for
+/// history from before the chunk.
+#[allow(clippy::too_many_arguments)]
+async fn refold_snapshot_histories(
     conn: &mut sqlx::PgConnection,
     bc: &BoundedContext,
     dispatcher: &dyn crate::plugin::SnapshotDispatcher,
-    snapshot_name: &str,
+    name: &str,
     tag_key: &str,
-    tag_value: &str,
     default_state_json: &str,
-    up_to: i64,
-) -> crate::error::Result<String> {
-    const CHUNK: i64 = 1000;
-    let tags = [Tag {
-        key: tag_key.to_string(),
-        value: Some(tag_value.to_string()),
-    }];
-    let mut state = default_state_json.to_string();
+    refold: &std::collections::HashMap<&str, Vec<(i64, usize)>>,
+    rows: &mut std::collections::HashMap<String, SnapshotChunkRow>,
+    reached: &mut usize,
+) -> crate::error::Result<()> {
+    const PAGE: i64 = 1000;
+    let schema = schema_ident(&bc.name);
+    let through_of = |planned: &[(i64, usize)]| {
+        planned
+            .last()
+            .expect("a refolded value has a chunk event")
+            .0
+    };
+    let through_all = refold
+        .values()
+        .map(|planned| through_of(planned))
+        .max()
+        .expect("refold is non-empty");
+    let mut values: Vec<&str> = refold.keys().copied().collect();
+    values.sort_unstable();
+    for (value, planned) in refold {
+        let row = rows.get_mut(*value).expect("every refolded row was read");
+        row.state = default_state_json.to_string();
+        row.as_of_sequence = through_of(planned);
+        row.history_through = Some(through_of(planned));
+    }
+
     let mut after = -1;
     loop {
-        let chunk = list_events_for_bounded_context_matching_tags_with_bc(
-            &mut *conn,
-            bc,
-            &tags,
-            Some(after),
-            None,
-            Some(CHUNK),
-        )
+        let page: Vec<EventRowAnyType> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
+             metadata_client_id, metadata_created_at, metadata_correlation_id, \
+             metadata_causation_id, tags, origin_kind, origin_source_content, \
+             origin_source_context, origin_command_id FROM {schema}.events \
+             WHERE sequence IN (SELECT sequence FROM {schema}.event_tags \
+                 WHERE tag_key = $1 AND tag_value = ANY($2) \
+                 AND sequence > $3 AND sequence <= $4 ORDER BY sequence LIMIT $5) \
+             ORDER BY sequence"
+        )))
+        .bind(tag_key)
+        .bind(&values)
+        .bind(after)
+        .bind(through_all)
+        .bind(PAGE)
+        .fetch_all(&mut *conn)
         .await?;
-        for event in &chunk {
-            if event.sequence > up_to {
-                return Ok(state);
-            }
-            if let Some(result) = dispatcher.fold(&bc.name, snapshot_name, &state, event) {
-                state = result?;
+        let full = page.len() as i64 == PAGE;
+        let page = events_from_rows(&mut *conn, bc, page, None).await?;
+        for event in &page {
+            let Some(value) = event
+                .tags
+                .iter()
+                .find(|t| t.key == tag_key)
+                .and_then(|t| t.value.as_deref())
+            else {
+                continue;
+            };
+            let Some(planned) = refold.get(value) else {
+                continue;
+            };
+            let Some(&(_, index)) = planned.iter().find(|(seq, _)| *seq >= event.sequence) else {
+                continue;
+            };
+            let row = rows.get_mut(value).expect("every refolded row was read");
+            if let Some(result) = dispatcher.fold(&bc.name, name, &row.state, event) {
+                row.state = result.inspect_err(|_| *reached = index)?;
             }
         }
-        match chunk.last() {
-            Some(last) if chunk.len() as i64 == CHUNK => after = last.sequence,
-            _ => return Ok(state),
+        match page.last() {
+            Some(last) if full => after = last.sequence,
+            _ => return Ok(()),
         }
     }
 }
@@ -14162,137 +14790,44 @@ pub async fn catch_up_snapshots(
         .await?
     };
 
-    let bc = match events.first() {
-        Some(_) => Some(require_bounded_context(pool, bounded_context).await?),
-        None => None,
-    };
-    for event in &events {
-        let mut tx = pool.begin().await?;
-
-        for name in &unpartitioned_snapshot_names {
-            if progress[name] >= event.sequence {
-                continue;
-            }
-
-            // `None` (not registered) can't actually happen here -
-            // `name` came from this exact dispatcher's own
-            // `snapshot_names` a moment ago - but treated as "nothing to
-            // do" rather than unwrapped, the same defensive posture
-            // `catch_up_bounded_context` already takes for its own
-            // dispatcher lookups.
-            let Some(tag_key) = dispatcher.tag_key(bounded_context, name) else {
-                continue;
-            };
-            let Some(tag) = event.tags.iter().find(|t| t.key == tag_key) else {
-                continue;
-            };
-            let Some(tag_value) = &tag.value else {
-                continue;
-            };
-            let version = dispatcher.version(bounded_context, name).unwrap_or(0);
-            let default_state_json = dispatcher
-                .default_state(bounded_context, name)
-                .unwrap_or_default();
-
-            let (as_of_sequence, current_state) = get_or_create_snapshot_state_for_update(
-                &mut *tx,
+    // A chunk of events per transaction, not one (docs/architecture.md
+    // §197), as projection catch-up does (§182).
+    if let Some(first) = events.first() {
+        let bc = &first.bounded_context;
+        for chunk in events.chunks(CATCH_UP_EVENTS_PER_TRANSACTION) {
+            let folded = fold_snapshots_chunk(
+                pool,
+                bc,
                 &schema,
-                name,
-                tag_key,
-                tag_value,
-                version,
-                &default_state_json,
+                dispatcher,
+                &unpartitioned_snapshot_names,
+                &progress,
+                chunk,
             )
-            .await?;
-
-            if as_of_sequence >= event.sequence {
-                continue;
+            .await;
+            if let Err(failure) = folded {
+                // A failing event doesn't take the events before it in
+                // its chunk down with it - see `catch_up_bounded_context`.
+                if failure.folded_before > 0 {
+                    fold_snapshots_chunk(
+                        pool,
+                        bc,
+                        &schema,
+                        dispatcher,
+                        &unpartitioned_snapshot_names,
+                        &progress,
+                        &chunk[..failure.folded_before],
+                    )
+                    .await
+                    .map_err(|retry| retry.error)?;
+                }
+                return Err(failure.error);
             }
-
-            let new_state = if as_of_sequence == -1 {
-                // Just created or reset - see `fold_snapshot_tag_history`.
-                fold_snapshot_tag_history(
-                    &mut tx,
-                    bc.as_ref().expect("fetched whenever there are events"),
-                    dispatcher,
-                    name,
-                    tag_key,
-                    tag_value,
-                    &default_state_json,
-                    event.sequence,
-                )
-                .await?
-            } else {
-                match dispatcher.fold(bounded_context, name, &current_state, event) {
-                    Some(result) => result?,
-                    None => current_state,
-                }
-            };
-
-            // Cross-tenant read fix (docs/architecture.md's own
-            // write-up of these passes) - `apply_projection_fold_update`'s
-            // own identical reasoning, for `Snapshot::OWNER_TAG_KEY`
-            // instead of `Projection::OWNER_TAG_KEY`: this event's own
-            // tag under that key (not necessarily `tag_key` itself)
-            // becomes this row's own derived `owner`, when present. An
-            // event lacking it leaves an already-established owner
-            // untouched, so `owner` is only ever included in the SET
-            // list when this event actually supplies one.
-            let owner = dispatcher
-                .owner_tag_key(bounded_context, name)
-                .flatten()
-                .and_then(|owner_tag_key| {
-                    event
-                        .tags
-                        .iter()
-                        .find(|t| t.key == owner_tag_key)
-                        .and_then(|t| t.value.clone())
-                });
-
-            match owner {
-                Some(owner) => {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {schema}.snapshots SET snapshot_version = $1, as_of_sequence = $2, \
-                         state = $3::jsonb, owner = $4, updated_at = now() \
-                         WHERE snapshot_name = $5 AND tag_key = $6 AND tag_value = $7"
-                    )))
-                    .bind(version as i64)
-                    .bind(event.sequence)
-                    .bind(&new_state)
-                    .bind(owner)
-                    .bind(name)
-                    .bind(tag_key)
-                    .bind(tag_value.as_str())
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                None => {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {schema}.snapshots SET snapshot_version = $1, as_of_sequence = $2, \
-                         state = $3::jsonb, updated_at = now() \
-                         WHERE snapshot_name = $4 AND tag_key = $5 AND tag_value = $6"
-                    )))
-                    .bind(version as i64)
-                    .bind(event.sequence)
-                    .bind(&new_state)
-                    .bind(name)
-                    .bind(tag_key)
-                    .bind(tag_value.as_str())
-                    .execute(&mut *tx)
-                    .await?;
-                }
+            let chunk_end = chunk.last().expect("chunks are never empty").sequence;
+            for position in progress.values_mut() {
+                *position = (*position).max(chunk_end);
             }
         }
-
-        for name in &unpartitioned_snapshot_names {
-            if progress[name] >= event.sequence {
-                continue;
-            }
-            upsert_snapshot_progress(&mut *tx, &schema, name, event.sequence).await?;
-            progress.insert(*name, event.sequence);
-        }
-
-        tx.commit().await?;
     }
 
     // Codeberg issue #25 (docs/architecture.md §52) - sequential across
@@ -14382,14 +14917,9 @@ async fn catch_up_partitioned_snapshot(
             .last()
             .expect("just checked events is non-empty")
             .sequence;
-        let Some(tag_key) = dispatcher.tag_key(bounded_context, name) else {
+        if dispatcher.tag_key(bounded_context, name).is_none() {
             return Ok(());
-        };
-        let version = dispatcher.version(bounded_context, name).unwrap_or(0);
-        let default_state_json = dispatcher
-            .default_state(bounded_context, name)
-            .unwrap_or_default();
-        let owner_tag_key = dispatcher.owner_tag_key(bounded_context, name).flatten();
+        }
         let bc = require_bounded_context(pool, bounded_context).await?;
 
         for partition_index in 0..partition_count {
@@ -14414,101 +14944,24 @@ async fn catch_up_partitioned_snapshot(
                 continue;
             }
 
-            let mut this_partition_progress = progress.get(&partition_index).copied().unwrap_or(-1);
-            for event in &events {
-                if this_partition_progress >= event.sequence {
-                    continue;
-                }
-                let tag_value = event
-                    .tags
-                    .iter()
-                    .find(|t| t.key == tag_key)
-                    .and_then(|t| t.value.as_deref());
-                if let Some(tag_value) = tag_value {
-                    if partition_for_key(tag_value, partition_count) == partition_index {
-                        let (as_of_sequence, current_state) =
-                            get_or_create_snapshot_state_for_update(
-                                &mut *tx,
-                                schema,
-                                name,
-                                tag_key,
-                                tag_value,
-                                version,
-                                &default_state_json,
-                            )
-                            .await?;
-                        // Identical guard to the unpartitioned loop
-                        // above - see `catch_up_partitioned_projection`'s
-                        // own comment for why this is what actually
-                        // makes cross-instance racing safe, the
-                        // advisory lock being only an optimization.
-                        if as_of_sequence < event.sequence {
-                            let new_state = if as_of_sequence == -1 {
-                                // See `fold_snapshot_tag_history`.
-                                fold_snapshot_tag_history(
-                                    &mut tx,
-                                    &bc,
-                                    dispatcher,
-                                    name,
-                                    tag_key,
-                                    tag_value,
-                                    &default_state_json,
-                                    event.sequence,
-                                )
-                                .await?
-                            } else {
-                                match dispatcher.fold(bounded_context, name, &current_state, event)
-                                {
-                                    Some(result) => result?,
-                                    None => current_state,
-                                }
-                            };
-                            let owner = owner_tag_key.and_then(|owner_tag_key| {
-                                event
-                                    .tags
-                                    .iter()
-                                    .find(|t| t.key == owner_tag_key)
-                                    .and_then(|t| t.value.clone())
-                            });
-                            match owner {
-                                Some(owner) => {
-                                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                                        "UPDATE {schema}.snapshots SET snapshot_version = $1, \
-                                         as_of_sequence = $2, state = $3::jsonb, owner = $4, \
-                                         updated_at = now() \
-                                         WHERE snapshot_name = $5 AND tag_key = $6 AND tag_value = $7"
-                                    )))
-                                    .bind(version as i64)
-                                    .bind(event.sequence)
-                                    .bind(&new_state)
-                                    .bind(owner)
-                                    .bind(name)
-                                    .bind(tag_key)
-                                    .bind(tag_value)
-                                    .execute(&mut *tx)
-                                    .await?;
-                                }
-                                None => {
-                                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                                        "UPDATE {schema}.snapshots SET snapshot_version = $1, \
-                                         as_of_sequence = $2, state = $3::jsonb, updated_at = now() \
-                                         WHERE snapshot_name = $4 AND tag_key = $5 AND tag_value = $6"
-                                    )))
-                                    .bind(version as i64)
-                                    .bind(event.sequence)
-                                    .bind(&new_state)
-                                    .bind(name)
-                                    .bind(tag_key)
-                                    .bind(tag_value)
-                                    .execute(&mut *tx)
-                                    .await?;
-                                }
-                            }
-                        }
-                    }
-                }
-                this_partition_progress = event.sequence;
-            }
+            // Every event of this partition in one fold, each row read
+            // and written once (docs/architecture.md §197). The
+            // transaction was already all or nothing.
+            let after = progress.get(&partition_index).copied().unwrap_or(-1);
+            let mut reached = 0;
+            fold_snapshot_chunk_in_tx(
+                &mut tx,
+                &bc,
+                schema,
+                dispatcher,
+                name,
+                &events,
+                after,
+                Some((partition_index, partition_count)),
+                &mut reached,
+            )
+            .await?;
+            let this_partition_progress = after.max(batch_end);
 
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {schema}.snapshot_partition_progress \

@@ -1,6 +1,6 @@
 //! The declarative shape a `.skilj.toml` file describes - one bounded
-//! context's event/command *shapes* only (fields, DCB tags,
-//! `rest_trigger_allowed`). Deliberately narrow (Codeberg issue #5's
+//! context's event/command *shapes* only (fields, DCB tags, consistency
+//! queries, `rest_trigger_allowed`). Deliberately narrow (Codeberg issue #5's
 //! own "narrower cut" - see this crate's own root doc comment and
 //! [docs/architecture.md §17](../../docs/architecture.md#event-command-codegen-real)): `decide()` bodies, `sensitive_fields`,
 //! scheduling, `#[requires_role]`, and every `Projection` concept are
@@ -62,6 +62,25 @@ pub struct CommandTypeSpec {
     pub tags: BTreeMap<String, String>,
     #[serde(default)]
     pub rest_trigger_allowed: bool,
+    /// `CommandType::consistency_query()` (docs/architecture.md §198), one
+    /// `[[command_type.query]]` table per item. Empty, the default, is no
+    /// override: every event carrying any of `tags`.
+    #[serde(default)]
+    pub query: Vec<QueryItemSpec>,
+}
+
+/// One consistency query item. `tags` names keys of the command type's
+/// own `tags`, so an item's tag mappings are always among the command
+/// type's, as `build()` requires; `latest` is how many of the newest
+/// matches, every match when absent.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryItemSpec {
+    #[serde(default)]
+    pub event_types: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub latest: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +228,38 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
                 problems.push(format!(
                     "{what}: tag {tag_key:?} maps to field {field:?}, which this type doesn't declare"
                 ));
+            }
+        }
+    }
+    let event_type_names: std::collections::BTreeSet<&str> =
+        spec.event_types.iter().map(|e| e.name.as_str()).collect();
+    for command in &spec.command_types {
+        let what = format!("command_type {:?}", command.name);
+        for (index, item) in command.query.iter().enumerate() {
+            let item_what = format!("{what}: query item {}", index + 1);
+            if item.event_types.is_empty() && item.tags.is_empty() {
+                problems.push(format!(
+                    "{item_what} names neither event types nor tags, so it would match every event"
+                ));
+            }
+            if item.latest == Some(0) {
+                problems.push(format!(
+                    "{item_what} keeps the last 0 matches; leave latest out for every match"
+                ));
+            }
+            for event_type in &item.event_types {
+                if !event_type_names.contains(event_type.as_str()) {
+                    problems.push(format!(
+                        "{item_what} names event type {event_type:?}, which this file doesn't declare"
+                    ));
+                }
+            }
+            for tag in &item.tags {
+                if !command.tags.contains_key(tag) {
+                    problems.push(format!(
+                        "{item_what} names tag {tag:?}, which isn't one of the command type's tags"
+                    ));
+                }
             }
         }
     }

@@ -43,6 +43,7 @@ type LedgerCommandType @inaccessible {
 	sensitiveFields: [LedgerSensitiveField!]!
 	restTriggerAllowed: Boolean!
 	privateFields: [LedgerPrivateField!]!
+	consistencyQuery: [LedgerQueryItemMapping!]!
 }
 
 type LedgerContextCreator @inaccessible {
@@ -291,6 +292,12 @@ type LedgerQueriedCommand @inaccessible {
 type LedgerQueriedEvent {
 	sequence: Int!
 	payload: String!
+}
+
+type LedgerQueryItemMapping @inaccessible {
+	eventTypes: [String!]!
+	tagMappings: [LedgerTagMapping!]!
+	latest: Int
 }
 
 type LedgerRole {
