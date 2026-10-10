@@ -2603,8 +2603,9 @@ impl SkiljBuilder {
                         skilj_core::db::ensure_registrations_generation(pool, &bc.name).await?;
                         // docs/architecture.md §198: the per-tag index a
                         // consistency query's typed items read, and the
-                        // column a command's query is recorded in.
-                        skilj_core::db::ensure_event_tags_index(pool, &bc.name).await?;
+                        // column a command's query is recorded in, each in
+                        // its own transaction (§200).
+                        skilj_core::db::ensure_bounded_context_current(pool, &bc).await?;
                         // Last: it reads `events` as the patches above
                         // leave it - a bounded context from before
                         // `metadata_correlation_id`/`metadata_causation_id`
@@ -2778,6 +2779,20 @@ impl SkiljBuilder {
                                     let poll_pool = poll_pool.clone();
                                     let poll_dispatcher = poll_dispatcher.clone();
                                     contain_panic("async_projection", bc.name.clone(), async move {
+                                        // docs/architecture.md §200: a
+                                        // bounded context an older instance
+                                        // added during a rolling deploy.
+                                        if let Err(e) = skilj_core::db::ensure_bounded_context_current(
+                                            &poll_pool, &bc,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                bounded_context = %bc.name,
+                                                error = %e,
+                                                "bringing a bounded context's schema up to date failed"
+                                            );
+                                        }
                                         if let Err(e) = skilj_core::db::catch_up_bounded_context(
                                             &poll_pool,
                                             &bc.name,

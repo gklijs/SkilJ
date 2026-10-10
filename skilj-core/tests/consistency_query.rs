@@ -547,11 +547,12 @@ fn only_an_event_matching_the_query_conflicts() {
     });
 }
 
-/// A bounded context from before `event_tags` gets it on the next
-/// `ensure_event_tags_index`, with every existing event's tags, and the
-/// trigger indexes every event after that.
+/// A bounded context without `event_tags` and `commands.consistency_query`,
+/// from before them or added by an older instance during a rolling deploy,
+/// gets both from the first command a newer instance submits to it, with every existing event's tags, and the trigger indexes every
+/// event after that (docs/architecture.md §200).
 #[test]
-fn event_tags_are_backfilled_and_then_kept_by_the_trigger() {
+fn a_bounded_context_without_event_tags_gets_them_from_its_first_command() {
     runtime().block_on(async {
         let Some(pool) = test_pool().await else {
             return;
@@ -569,13 +570,11 @@ fn event_tags_are_backfilled_and_then_kept_by_the_trigger() {
         record(&pool, &h.bc, &h.signed_up, "acme", None).await;
         record(&pool, &h.bc, &h.created, "acme", Some("t1")).await;
 
-        db::ensure_event_tags_index(&pool, &h.bc.name)
-            .await
-            .unwrap();
-        db::ensure_event_tags_index(&pool, &h.bc.name)
-            .await
-            .unwrap();
-        record(&pool, &h.bc, &h.created, "acme", Some("t2")).await;
+        let dispatcher = HelpdeskDispatcher::new();
+        assert_eq!(
+            kind(&create_ticket(&pool, &h, &dispatcher, "acme", "t2").await),
+            "accepted"
+        );
 
         let rows: Vec<(String, Option<String>, String, i64)> =
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -604,7 +603,6 @@ fn event_tags_are_backfilled_and_then_kept_by_the_trigger() {
             ]
         );
 
-        let dispatcher = HelpdeskDispatcher::new();
         assert_eq!(
             kind(&create_ticket(&pool, &h, &dispatcher, "acme", "t2").await),
             "ticket_already_exists"

@@ -2145,35 +2145,23 @@ pub async fn ensure_registrations_generation<'e>(
 /// Filled by a statement-level trigger on `events`, not by skilj's insert
 /// paths, so no writer can leave it incomplete - including an instance of
 /// an older version during a rolling deploy, which knows nothing about it.
-/// Also `commands.consistency_query`, the query a command was decided
-/// with.
 ///
-/// Created at provisioning and on every `build()`, under the same kind of
-/// advisory lock as [`ensure_registrations_generation`]. For a bounded
-/// context from before it, the first `build()` creates the table, fills it
-/// from the existing events and creates the trigger in one transaction,
-/// holding a `SHARE ROW EXCLUSIVE` lock on `events` throughout: reads go
-/// on, but no event commits between the backfill and the trigger, where
-/// it would be indexed by neither. Every later `build()` finds it there
-/// and locks nothing (docs/architecture.md §158).
+/// Created at provisioning, and for a bounded context from before it by
+/// [`ensure_bounded_context_current`], under the same kind of advisory
+/// lock as [`ensure_registrations_generation`]. The first time, it creates
+/// the table, fills it from the existing events and creates the trigger in
+/// one transaction, holding a `SHARE ROW EXCLUSIVE` lock on `events`
+/// throughout: reads go on, but no event commits between the backfill and
+/// the trigger, where it would be indexed by neither. Every later call
+/// finds it there and locks nothing (docs/architecture.md §158).
 #[tracing::instrument(skip_all)]
 pub async fn ensure_event_tags_index<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     bounded_context: &str,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
-    let consistency_query_column = add_columns_patch(
-        &schema,
-        "commands",
-        &["consistency_query"],
-        format!(
-            "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS consistency_query \
-             JSONB NOT NULL DEFAULT '[]'"
-        ),
-    );
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "SELECT pg_advisory_xact_lock(hashtext({lock_key})::bigint);
-        {consistency_query_column};
         DO $patch$ BEGIN IF to_regclass({table}) IS NULL THEN
             LOCK TABLE {schema}.events IN SHARE ROW EXCLUSIVE MODE;
             CREATE TABLE {schema}.event_tags (
@@ -2203,6 +2191,73 @@ pub async fn ensure_event_tags_index<'e>(
     )))
     .execute(executor)
     .await?;
+    Ok(())
+}
+
+/// `commands.consistency_query`, the query a command was decided with
+/// (docs/architecture.md §198), for a bounded context from before it. Its
+/// own statement, never in the transaction of
+/// [`ensure_event_tags_index`]'s backfill: adding the column locks
+/// `commands` against reads too, and held through the backfill it stopped
+/// every command read, and every read of a command's events, for as long
+/// as that took (docs/architecture.md §200).
+#[tracing::instrument(skip_all)]
+pub async fn ensure_consistency_query_column<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "commands",
+        &["consistency_query"],
+        format!(
+            "ALTER TABLE {schema}.commands ADD COLUMN IF NOT EXISTS consistency_query \
+             JSONB NOT NULL DEFAULT '[]'"
+        ),
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Bounded contexts, by name and creation time, this process has run
+/// [`ensure_bounded_context_current`] for.
+type CurrentBoundedContexts = std::sync::Mutex<std::collections::HashSet<(String, DateTime<Utc>)>>;
+
+fn current_bounded_contexts() -> &'static CurrentBoundedContexts {
+    static CURRENT: std::sync::OnceLock<CurrentBoundedContexts> = std::sync::OnceLock::new();
+    CURRENT.get_or_init(Default::default)
+}
+
+/// Brings a bounded context's schema up to what this version reads and
+/// writes - [`ensure_consistency_query_column`], then
+/// [`ensure_event_tags_index`], each its own transaction - once per
+/// process. `build()` runs it for every bounded context there is; the
+/// command path and the background catch-up run it for each they touch,
+/// so a bounded context an older instance adds during a rolling deploy,
+/// without either, is brought up to date by the first newer instance to
+/// meet it rather than failing there until one restarts
+/// (docs/architecture.md §200). Keyed by creation time too: a bounded
+/// context deleted and added again under the same name is a new schema.
+pub async fn ensure_bounded_context_current(
+    pool: &Pool,
+    bounded_context: &BoundedContext,
+) -> crate::error::Result<()> {
+    let key = (bounded_context.name.clone(), bounded_context.created_at);
+    if current_bounded_contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+    {
+        return Ok(());
+    }
+    ensure_consistency_query_column(pool, &bounded_context.name).await?;
+    ensure_event_tags_index(pool, &bounded_context.name).await?;
+    current_bounded_contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key);
     Ok(())
 }
 
@@ -10567,6 +10622,10 @@ pub async fn resolve_command_submission(
     command_type: &CommandType,
     payload: &str,
 ) -> crate::error::Result<ResolvedCommandSubmission> {
+    // docs/architecture.md §200: a bounded context an older instance added
+    // during a rolling deploy has no `consistency_query` column for the
+    // command to be written with. Once per process per bounded context.
+    ensure_bounded_context_current(pool, &command_type.bounded_context).await?;
     let bounded_context_name = command_type.bounded_context.name.clone();
     let consistency_tags = crate::event_store::derive_tags(&command_type.tag_mappings, payload);
     let consistency_query = command_consistency_query(dispatcher, command_type, payload);
