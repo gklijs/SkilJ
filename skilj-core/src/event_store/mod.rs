@@ -4377,8 +4377,15 @@ pub fn consistency_boundary(
 
 impl QueryItem {
     /// Whether `event` matches this item: one of its types (any type when
-    /// it names none), carrying every one of its tags.
+    /// it names none), carrying every one of its tags. An item naming
+    /// neither matches nothing, as its read in Postgres selects nothing
+    /// (docs/architecture.md §200): `build()` refuses one, and
+    /// [`derive_query`] derives one only for an item that can match
+    /// nothing.
     pub fn matches(&self, event: &Event) -> bool {
+        if self.event_types.is_empty() && self.tags.is_empty() {
+            return false;
+        }
         (self.event_types.is_empty() || self.event_types.contains(&event.event_type.name))
             && self.tags.iter().all(|tag| event.tags.contains(tag))
     }
@@ -4387,13 +4394,33 @@ impl QueryItem {
 /// `CommandType::consistency_query` derived from `payload` (docs/architecture.md
 /// §198): one [`QueryItem`] per mapping, its tags by [`derive_tags`]. Empty for a
 /// command type that declares none - see [`effective_query`].
+///
+/// An item requires all its tags, so a tag mapping that derives no tag -
+/// its field a list holding only non-scalars; a missing or null field
+/// derives a tag with no value - leaves an item no event can match. It is
+/// derived naming neither types nor tags, which matches nothing from the
+/// cache and from Postgres alike, rather than an item that silently drops
+/// the tag and matches more (docs/architecture.md §200).
 pub fn derive_query(mappings: &[QueryItemMapping], payload: &str) -> Vec<QueryItem> {
     mappings
         .iter()
-        .map(|mapping| QueryItem {
-            event_types: mapping.event_types.iter().map(|t| t.to_string()).collect(),
-            tags: derive_tags(&mapping.tag_mappings, payload),
-            latest: mapping.latest,
+        .map(|mapping| {
+            let underived = mapping
+                .tag_mappings
+                .iter()
+                .any(|m| derive_tags(std::slice::from_ref(m), payload).is_empty());
+            if underived {
+                return QueryItem {
+                    event_types: Vec::new(),
+                    tags: Vec::new(),
+                    latest: mapping.latest,
+                };
+            }
+            QueryItem {
+                event_types: mapping.event_types.iter().map(|t| t.to_string()).collect(),
+                tags: derive_tags(&mapping.tag_mappings, payload),
+                latest: mapping.latest,
+            }
         })
         .collect()
 }

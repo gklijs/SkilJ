@@ -6630,7 +6630,8 @@ async fn list_events_matching_query_with_bc(
                     latest(&mut binds, "sequence"),
                 )
             }
-            // Refused by `build()`: it would match every event.
+            // Matches nothing (`QueryItem::matches`): refused by `build()`,
+            // and derived only for an item no event can match.
             (true, None) => continue,
         };
         selects.push(select);

@@ -10,8 +10,8 @@ use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool, SubmitCommandOutcome};
 use skilj_core::event_cache::EventCache;
 use skilj_core::event_store::{
-    BoundedContext, BoundedContextStatus, CommandType, Event, EventBroadcaster, EventOrigin,
-    EventType,
+    derive_query, query_matches, BoundedContext, BoundedContextStatus, CommandType, Event,
+    EventBroadcaster, EventOrigin, EventType,
 };
 use skilj_core::plugin::{CommandDispatcher, ProjectionDispatcher, SnapshotDispatcher};
 use skilj_core::shared::{
@@ -795,6 +795,41 @@ fn a_batch_rechecks_a_query_its_tag_query_does_not_cover() {
         assert_eq!(
             kind(&results.into_iter().next().unwrap().unwrap()),
             "ticket_already_exists"
+        );
+    });
+}
+
+/// An item requires all its tags. A tag mapping that derives none - its
+/// field a list of non-scalars - leaves an item no event can match, and
+/// it matches nothing in memory as its Postgres read selects nothing;
+/// before, it matched every event from the cache (docs/architecture.md
+/// §200). A list with a scalar still derives its tag.
+#[test]
+fn an_item_whose_tag_derives_nothing_matches_nothing() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let h = seed(&pool).await;
+        record(&pool, &h.bc, &h.signed_up, "acme", None).await;
+        record(&pool, &h.bc, &h.created, "acme", Some("t1")).await;
+        let events = db::list_events_for_bounded_context(&pool, &h.bc.name)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+
+        let mapping = QueryItemMapping::types(&["TicketCreated"]).tagged(vec![TagMapping {
+            key: "ticket".to_string(),
+            field: "ticket_id".to_string(),
+        }]);
+        let underived = derive_query(std::slice::from_ref(&mapping), r#"{"ticket_id":[{}]}"#);
+        assert!(underived[0].event_types.is_empty() && underived[0].tags.is_empty());
+        assert!(events.iter().all(|e| !query_matches(&underived, e)));
+
+        let derived = derive_query(std::slice::from_ref(&mapping), r#"{"ticket_id":["t1"]}"#);
+        assert_eq!(
+            events.iter().filter(|e| query_matches(&derived, e)).count(),
+            1
         );
     });
 }
