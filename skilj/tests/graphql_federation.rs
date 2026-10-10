@@ -582,7 +582,7 @@ fn entities_resolve_through_the_callers_own_grant() {
             "{response}"
         );
 
-        // docs/architecture.md §197: a page is read at once, and answered
+        // docs/architecture.md §199: a page is read at once, and answered
         // in the router's order - a repeated key twice, and an instance
         // with no state yet with the projection's default.
         let unknown = unique_name("account");

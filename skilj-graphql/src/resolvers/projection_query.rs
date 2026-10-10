@@ -194,7 +194,7 @@ pub(crate) async fn fetch_projection_result(
 /// state for a missing row, sensitive fields decrypted for a granted
 /// caller, and `query_projection`'s access checks. Shared by
 /// [`fetch_projection_result`] and `_entities`, which reads a whole page
-/// of rows at once (docs/architecture.md §197).
+/// of rows at once (docs/architecture.md §199).
 #[allow(clippy::too_many_arguments)]
 async fn projection_instance(
     state: &GraphqlState,
@@ -365,7 +365,7 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
         // A router sends a page of instances at once, mostly of one type:
         // each projection's grant, registration and team check are read
         // once, and its instances' rows in one statement
-        // (docs/architecture.md §197), not each per instance.
+        // (docs/architecture.md §199), not each per instance.
         let mut wanted: Vec<(String, String, String)> = Vec::with_capacity(representations.len());
         for representation in representations.iter() {
             let representation = representation.object()?;

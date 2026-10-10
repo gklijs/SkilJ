@@ -618,7 +618,7 @@ fn round_trips_a_command_token() {
     });
 }
 
-/// docs/architecture.md §197: which bounded context holds a token is
+/// docs/architecture.md §199: which bounded context holds a token is
 /// remembered after its first read, but only the location - a token
 /// revoked after that reads as revoked, and once its bounded context is
 /// hard-deleted, as gone.

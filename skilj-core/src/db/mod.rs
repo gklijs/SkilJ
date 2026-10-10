@@ -2995,7 +2995,7 @@ async fn require_command(
 }
 
 /// The columns that read a `bounded_contexts` row hydrated in one
-/// statement (docs/architecture.md §197), from
+/// statement (docs/architecture.md §199), from
 /// [`HYDRATED_BOUNDED_CONTEXT_FROM`]: the row as `bc_*`, its creating role
 /// as `r_*`, its template as `t_*` and the template's creating role as
 /// `tr_*`. A template is never itself templated
@@ -3071,7 +3071,7 @@ pub async fn get_bounded_context(
     name: &str,
 ) -> crate::error::Result<Option<BoundedContext>> {
     // Its role and template in the same statement (docs/architecture.md
-    // §197): read one after another they were up to four round trips, on
+    // §199): read one after another they were up to four round trips, on
     // nearly every request.
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {} FROM {HYDRATED_BOUNDED_CONTEXT_FROM} WHERE bc.name = $1",
@@ -3721,7 +3721,7 @@ pub async fn get_command_type(
 ) -> crate::error::Result<Option<CommandType>> {
     use sqlx::FromRow;
     // The command type with its bounded context, hydrated, in one
-    // statement (docs/architecture.md §196, §197): every command resolves
+    // statement (docs/architecture.md §196, §199): every command resolves
     // its type this way before the lock.
     let schema = schema_ident(bounded_context);
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -5087,7 +5087,7 @@ pub async fn get_projection_state_and_owner(
 
 /// [`get_projection_state_and_owner`] for many `keys` of one projection in
 /// one statement - federation's `_entities` resolves a router's whole page
-/// of instances at once (docs/architecture.md §197). Keys with no row are
+/// of instances at once (docs/architecture.md §199). Keys with no row are
 /// absent from the map.
 pub async fn get_projection_states_and_owners(
     pool: &Pool,
@@ -15732,7 +15732,7 @@ async fn fetch_access_token_row(
     pool: &Pool,
     id: &str,
 ) -> crate::error::Result<Option<AccessTokenRow>> {
-    // docs/architecture.md §197: a token never moves to another bounded
+    // docs/architecture.md §199: a token never moves to another bounded
     // context, so which one holds it is remembered, and every REST request
     // after a token's first reads its row in one round trip instead of
     // two. Only the location is remembered, never the row: status and
