@@ -8715,9 +8715,19 @@ async fn decide_command_in_tx(
         snapshot.as_ref().map(|s| s.as_of_sequence),
         covered_through,
     );
-    // A query item with no tags isn't in the batch's tag query; such a
-    // command re-checks with a query of its own.
-    let batch_delta = batch_delta.filter(|_| query.iter().all(|item| !item.tags.is_empty()));
+    // The batch's tag query is over the commands' consistency tags, from
+    // the command type as stored. It holds every event matching an item
+    // only when the item has one of those tags: an event matching the item
+    // carries all of the item's tags. An item with no tags, or with tags
+    // the stored type no longer maps - a newer instance re-registered it
+    // during a rolling deploy, or an admin did - isn't covered, and such a
+    // command re-checks with a query of its own (docs/architecture.md
+    // §200).
+    let batch_delta = batch_delta.filter(|_| {
+        query
+            .iter()
+            .all(|item| item.tags.iter().any(|tag| consistency_tags.contains(tag)))
+    });
     let mut delta = if let Some(batch_delta) = batch_delta {
         // docs/architecture.md §196: the batch read every command's
         // re-check range in one query, over all their tags - this

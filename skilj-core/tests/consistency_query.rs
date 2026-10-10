@@ -737,3 +737,64 @@ fn an_item_keeps_its_last_n_matches() {
         assert_eq!(dispatcher.calls()[2], vec![tickets[3], newest]);
     });
 }
+
+/// The batch's tag query is over each command's consistency tags, derived
+/// from the command type as stored. When the stored type no longer maps a
+/// tag the compiled query uses - a newer instance re-registered it during
+/// a rolling deploy - the tag query doesn't fetch what that item matches,
+/// and the command re-checks with its own query instead. Here the stored
+/// `CreateTicket` maps the company only, and another company's ticket
+/// with the same id commits between read and lock (docs/architecture.md
+/// §200).
+#[test]
+fn a_batch_rechecks_a_query_its_tag_query_does_not_cover() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let h = seed(&pool).await;
+        record(&pool, &h.bc, &h.signed_up, "acme", None).await;
+        let mut stored = h.create_ticket.clone();
+        stored.tag_mappings.retain(|m| m.key == "company");
+        assert_eq!(stored.tag_mappings.len(), 1);
+        let dispatcher = HelpdeskDispatcher::new();
+        let cache = EventCache::new(1000);
+        let resolved = db::resolve_command_submission(
+            &pool,
+            &dispatcher,
+            &NoSnapshots,
+            &cache,
+            &stored,
+            &payload("t1"),
+        )
+        .await
+        .unwrap();
+        let batch = vec![db::BatchedCommand {
+            command_type: stored.clone(),
+            payload: payload("t1"),
+            client_id: "client".to_string(),
+            correlation_id: None,
+            causation_id: None,
+            bounded_context_events: resolved.bounded_context_events,
+            covered_through: Some(resolved.covered_through),
+            consistency_tags: resolved.consistency_tags,
+            matching_events: resolved.matching_events,
+            initial_decision: resolved.decision,
+            now: test_now(),
+            snapshot: None,
+            idempotency_key: None,
+            event_types_by_name: std::collections::HashMap::new(),
+            resolved: std::collections::HashMap::new(),
+        }];
+        record(&pool, &h.bc, &h.created, "other", Some("t1")).await;
+
+        let results =
+            db::submit_command_batch(&pool, &dispatcher, &NoProjections, None, &h.bc.name, batch)
+                .await
+                .unwrap();
+        assert_eq!(
+            kind(&results.into_iter().next().unwrap().unwrap()),
+            "ticket_already_exists"
+        );
+    });
+}
