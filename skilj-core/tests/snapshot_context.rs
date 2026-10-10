@@ -1050,3 +1050,80 @@ fn a_version_bump_refolds_every_page_when_events_carry_two_values() {
         }
     });
 }
+
+/// A chunk can fail at a later event before an earlier one: a new row's
+/// history is refolded before the other rows are folded, so its failing
+/// event is met first. The run before the later failure then fails again
+/// at the earlier one, and is shortened again, so the events before the
+/// earliest failure still commit (docs/architecture.md §200). Here `a` is
+/// new and fails at index 10, `b` is held and fails at index 5.
+#[test]
+fn the_earliest_of_two_failing_events_bounds_the_committed_progress() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let deposited = seed_event_type(&pool, &bc, "Deposited", "account").await;
+        let poison = seed_event_type(&pool, &bc, "Poison", "account").await;
+        let dispatcher = PoisonedTestSnapshotDispatcher(TestSnapshotDispatcher {
+            tag_key: "account",
+            version: 1,
+        });
+        let a = unique_name("account");
+        let b = unique_name("account");
+        insert_money_event(&pool, &bc, &deposited, "account", &b, 100).await;
+        db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+            .await
+            .unwrap();
+
+        let mut sequences = Vec::new();
+        for (i, (account, event_type)) in [
+            (&b, &deposited),
+            (&a, &deposited),
+            (&b, &deposited),
+            (&a, &deposited),
+            (&b, &deposited),
+            (&b, &poison),
+            (&a, &deposited),
+            (&a, &deposited),
+            (&a, &deposited),
+            (&a, &deposited),
+            (&a, &poison),
+            (&a, &deposited),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sequences.push(
+                insert_money_event(&pool, &bc, event_type, "account", account, i as i64 + 1).await,
+            );
+        }
+
+        db::catch_up_snapshots(&pool, &bc.name, &dispatcher)
+            .await
+            .expect_err("the poison events fail their folds");
+
+        let balance = |account: String| {
+            let pool = pool.clone();
+            let bc = bc.name.clone();
+            let dispatcher = &dispatcher;
+            async move {
+                let resolved = db::resolve_snapshot_context(
+                    &pool,
+                    &bc,
+                    dispatcher,
+                    "Balance",
+                    &[tag("account", &account)],
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
+                (state.balance, resolved.as_of_sequence)
+            }
+        };
+        assert_eq!(balance(b.clone()).await, (100 + 1 + 3 + 5, sequences[4]));
+        assert_eq!(balance(a.clone()).await, (2 + 4, sequences[3]));
+    });
+}

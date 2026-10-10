@@ -13676,19 +13676,27 @@ pub async fn catch_up_bounded_context(
             // A failing event doesn't take the events before it in its
             // chunk down with it: those commit on their own, as they did
             // with one transaction per event, and the error is returned.
-            if failure.folded_before > 0 {
-                fold_catch_up_chunk(
+            // The failure blamed is not always the earliest: a shorter
+            // run can fail again earlier, and is then shortened to that
+            // (docs/architecture.md §200).
+            let mut end = failure.folded_before;
+            while end > 0 {
+                match fold_catch_up_chunk(
                     pool,
                     bounded_context,
                     &schema,
                     dispatcher,
                     &unpartitioned_async_projections,
                     &building_rebuilds,
-                    &chunk[..failure.folded_before],
+                    &chunk[..end],
                     previous,
                 )
                 .await
-                .map_err(|retry| retry.error)?;
+                {
+                    Ok(()) => break,
+                    Err(retry) if retry.folded_before < end => end = retry.folded_before,
+                    Err(retry) => return Err(retry.error),
+                }
             }
             return Err(failure.error);
         }
@@ -14931,18 +14939,26 @@ pub async fn catch_up_snapshots(
             if let Err(failure) = folded {
                 // A failing event doesn't take the events before it in
                 // its chunk down with it - see `catch_up_bounded_context`.
-                if failure.folded_before > 0 {
-                    fold_snapshots_chunk(
+                // Shortened again if a shorter run fails earlier - a
+                // refolded row's history, or another snapshot, can fail
+                // before the event blamed (docs/architecture.md §200).
+                let mut end = failure.folded_before;
+                while end > 0 {
+                    match fold_snapshots_chunk(
                         pool,
                         bc,
                         &schema,
                         dispatcher,
                         &unpartitioned_snapshot_names,
                         &progress,
-                        &chunk[..failure.folded_before],
+                        &chunk[..end],
                     )
                     .await
-                    .map_err(|retry| retry.error)?;
+                    {
+                        Ok(()) => break,
+                        Err(retry) if retry.folded_before < end => end = retry.folded_before,
+                        Err(retry) => return Err(retry.error),
+                    }
                 }
                 return Err(failure.error);
             }
