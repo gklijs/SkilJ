@@ -2353,3 +2353,92 @@ fn a_batch_folds_its_events_into_a_sync_projection_at_once() {
         assert_eq!(projection.caught_up_to, Some(2));
     });
 }
+
+/// The `warn` events a test thread logs, by their fields.
+#[derive(Clone, Default)]
+struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+#[test]
+fn a_slow_decide_again_under_the_lock_warns() {
+    // docs/architecture.md §203: the second command of the batch conflicts
+    // with the first and decides again under the lock, which every other
+    // command in the bounded context waits for. A zero threshold makes
+    // that decide slow; the first command's decide needs no second run.
+    use tracing_subscriber::layer::SubscriberExt;
+    let warnings = Warnings::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_command_type(&pool, &bc, "ShipOrder").await;
+        let dispatcher = TestCommandDispatcher::new();
+        let payload = r#"{"order_id":"A"}"#;
+        let tags = vec![Tag {
+            key: "order".to_string(),
+            value: Some("A".to_string()),
+        }];
+        let decide = || {
+            dispatcher
+                .dispatch(&bc.name, &ct.name, payload, &[])
+                .unwrap()
+                .unwrap()
+        };
+        let batch = vec![
+            batched(&ct, payload, decide(), tags.clone()),
+            batched(&ct, payload, decide(), tags),
+        ];
+        let slow = skilj_core::slow_command::SlowCommandWarnings::default()
+            .with_read(None)
+            .with_decide(Some(std::time::Duration::ZERO));
+        let leader_tx = db::begin_command_batch_leader_tx(&pool, &bc.name, None)
+            .await
+            .unwrap();
+        let results = db::commit_command_batch(
+            leader_tx,
+            &dispatcher,
+            &TestProjectionDispatcher,
+            None,
+            batch,
+            Some(&slow),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            results[1],
+            Ok(SubmitCommandOutcome::Rejected { .. })
+        ));
+        let logged = warnings.0.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains("under_lock=true"), "{}", logged[0]);
+        assert!(logged[0].contains("events_decided_on=1"), "{}", logged[0]);
+        assert!(
+            logged[0].contains("command_type=ShipOrder"),
+            "{}",
+            logged[0]
+        );
+    });
+}

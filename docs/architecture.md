@@ -11764,23 +11764,38 @@ From 8 callers up, time to decide in the lock fell from 594-760 µs a command to
 
 `skilj/tests/consistency_query_build.rs` covers the three refusals and a valid snapshot item. `a_version_bump_refolds_every_page_when_events_carry_two_values` now expects every transfer in both accounts (1202 rather than 601).
 
-## 203. A warning when a command's read is slow
+## 203. Warnings when a command is slow to read or to decide
 
-After §201 and §202 the user asked for the warning on large reads, the third idea from the release check, to depend on time rather than on an event count, with the time configurable and a default taken from the benchmarks. Time is what a caller pays, and it covers what a count can't: one event type with large payloads, a `decide()` that does real work, a read the event cache can't serve.
+After §201 and §202 the user asked for the warning on large reads, the third idea from the release check, to depend on time rather than on an event count, with the time configurable and a default taken from the benchmarks. They then asked for a slow `decide()` to warn as well. Time is what a caller pays, and it covers what a count can't: one event type with large payloads, a `decide()` that does real work, a read the event cache can't serve.
 
-**What is timed.** `resolve_command_submission`, the optimistic half of a command, now measures its read (the snapshot rows and the history, from the cache or Postgres, plus selecting what `decide()` is handed) and `decide()` on it. Both go into `ResolvedCommandSubmission` as `read_time` and `decide_time`, and into a `debug` event, `command optimistic read`, with `events_read`, `read_us` and `decide_us`. `CommandBatcher::decide_and_submit`, the path GraphQL and REST submit through, warns when the two together exceed the threshold. The warning carries the bounded context, the command type, both times, the events read and the threshold. It names the remedies: a `consistency_query()`, a snapshot item (§202), or `QueryItemMapping::nothing()` (§201). The time is wall time, so it includes waiting for a pool connection. With few events read, a slow read points at load, not at history, and the message says so. Commands submitted by routes and deadlines (`decide_and_submit_command`) and dry runs aren't timed against the threshold. They run the same command types the surfaces do, so a type with a long history shows up there.
+**What is timed.**
+- The read before the lock. `resolve_command_submission` measures reading the snapshot rows and the history, from the cache or Postgres, plus selecting what `decide()` is handed (`ResolvedCommandSubmission::read_time`).
+- The first `decide()` on that read (`decide_time`). Both go into a `debug` event, `command optimistic read`, with `events_read`, `read_us` and `decide_us`.
+- A `decide()` again under the lock, after a conflict (§178), timed in `decide_command_in_tx` and logged as `command decide under lock`. This is the one that matters most: every other command in the bounded context waits for it. In the bench, on one hot account with 8 or more callers, nearly every command (781-799 of 800) decided again under the lock.
 
-**At most one per command type per minute.** A slow read is rarely a one-off: every submission of the command type reads the same growing history. So a command type warns at most once a minute, and the next warning reports how many slow reads came in between (`more_slow_reads_since_last_warning`). The count lives in the batcher, per process.
+**Where it warns.** `slow_command::SlowCommandWarnings` holds both thresholds and when each command type last warned. `CommandBatcher` owns one. It checks the read and the first decide in `decide_and_submit`, the path GraphQL and REST submit through, and passes it to `db::commit_command_batch` (a new argument), which checks every decide under the lock. `submit_command`, `submit_command_batch`, and the commands routes and deadlines submit don't check. They run the same command types the surfaces do, so a slow type shows up there anyway.
 
-**The default, 250 ms.** `command_throughput.rs` now also prints, per scenario, the average read before the lock, the average number of events it read, `decide()`'s share, and the slowest read. Two rounds each, in-process with 800 commands per scenario and with a +1 ms round trip with 400:
+- **A slow read** warns with the bounded context, the command type, the time, the events read and the threshold. It names the remedies: a `consistency_query()`, a snapshot item (§202), or `QueryItemMapping::nothing()` (§201). The time is wall time, so it includes waiting for a pool connection. With few events read, a slow read points at load, not at history, and the message says so.
+- **A slow decide** warns with the time, the events it decided on, whether it was `under_lock`, and the threshold. With many events, the remedies are the same. With few, the work is in `decide()` itself.
 
-| workload | events read | 1 caller, slowest | up to 80 callers, slowest |
+**At most one per kind per command type per minute.** A slow read or decide is rarely a one-off: every submission of the command type reads the same growing history. So each command type warns at most once a minute about reads and once about decides. The next warning reports how many came in between (`more_since_last_warning`). The bookkeeping lives in the batcher, per process.
+
+**The defaults.** `command_throughput.rs` now also prints, per scenario: the average read before the lock and the events it read, the slowest read, the slowest first decide, and how often and how slowly commands decided again under the lock. Reads, two rounds each, in-process with 800 commands per scenario and with a +1 ms round trip with 400:
+
+| workload | events read | slowest read, 1 caller | slowest read, up to 80 callers |
 |---|---|---|---|
-| spread (empty history) | 0 | 2-11 ms | 22-86 ms |
-| hot-snap (snapshot item and its tail) | 13-138 | 12-19 ms | 124-183 ms |
+| spread (empty history) | 0 | 2-12 ms | 22-91 ms |
+| hot-snap (snapshot item and its tail) | 13-153 | 11-19 ms | 124-183 ms |
 | hot-none (`nothing()`) | 0 | under 0.1 ms | under 0.1 ms |
 | hot (one account's whole history, up to 800 events) | 160-400 on average | 13-22 ms | 205-515 ms |
 
-Uncontended, every read stayed under 25 ms. Under load most of the read is waiting, for a pool connection or for Postgres: a read of no events at all took 39-56 ms on average at 80 callers with +1 ms. 250 ms is above every read of the cheap workloads at any load, and below the slowest whole-history reads at 80 callers in-process (403-515 ms). With +1 ms those peaked at 205-209 ms, under it: there the whole history was at most 400 events. A lower default would warn about load on commands that read nothing, which no change to the query fixes. `SkiljBuilder::slow_command_read_warning(d)` sets it, and `no_slow_command_read_warning()` turns it off. `CommandBatcher::with_slow_read_warning(Option<Duration>)` is the same for a batcher built by hand.
+Uncontended, every read stayed under 25 ms. Under load most of the read is waiting, for a pool connection or for Postgres: a read of no events at all took 39-56 ms on average at 80 callers with +1 ms. **250 ms** is above every read of the cheap workloads at any load, and below the slowest whole-history reads at 80 callers in-process (403-515 ms). With +1 ms those peaked at 205-209 ms, under it: there the whole history was at most 400 events. A lower default would warn about load on commands that read nothing, which no change to the query fixes.
 
-**Tests.** `a_slow_read_warns_once_per_interval_and_counts_the_rest` (unit, in `command_batcher.rs`) covers the once-a-minute rule and the count per command type. `a_slow_read_before_the_lock_warns_once_per_command_type_and_interval` (`skilj-core/tests/command_batcher.rs`) submits through a batcher with the warning off, which logs nothing, and through one with a zero threshold, where two submissions log one warning with the command type and the events read.
+Decides, in-process, two rounds: the slowest first decide was 1.1-2.0 ms on the whole history and at most 0.15 ms elsewhere. The slowest decide under the lock was 0.3-5.4 ms on the whole history and at most 0.04 ms elsewhere. `decide()` is pure computation, so load affects it far less than the read. **10 ms** is about twice the slowest seen. At that cost under the lock, a bounded context whose commands all decide again tops out near 100 commands a second.
+
+`SkiljBuilder::slow_command_read_warning(d)` and `slow_command_decide_warning(d)` set them. `no_slow_command_read_warning()` and `no_slow_command_decide_warning()` turn them off. `CommandBatcher::with_slow_read_warning` and `with_slow_decide_warning` take an `Option<Duration>` for a batcher built by hand.
+
+**Tests.**
+- `a_slow_command_warns_once_per_kind_and_interval_and_counts_the_rest` (unit, in `slow_command.rs`): the once-a-minute rule, per command type and per kind.
+- `a_slow_read_or_decide_before_the_lock_warns_once_per_command_type_and_interval` (`skilj-core/tests/command_batcher.rs`): a batcher with both warnings off logs nothing. One with zero thresholds logs one read warning and one decide warning for two submissions.
+- `a_slow_decide_again_under_the_lock_warns` (`skilj-core/tests/submit_command.rs`): a batch whose second command conflicts with its first, committed with a zero decide threshold, logs one warning with `under_lock` set.

@@ -943,9 +943,10 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
 }
 
 #[test]
-fn a_slow_read_before_the_lock_warns_once_per_command_type_and_interval() {
-    // docs/architecture.md §203. A zero threshold makes every read slow;
-    // the second within the minute is counted, not logged.
+fn a_slow_read_or_decide_before_the_lock_warns_once_per_command_type_and_interval() {
+    // docs/architecture.md §203. Zero thresholds make every read and every
+    // decide slow; the second of each within the minute is counted, not
+    // logged.
     use tracing_subscriber::layer::SubscriberExt;
     let warnings = Warnings::default();
     let _guard =
@@ -990,25 +991,30 @@ fn a_slow_read_before_the_lock_warns_once_per_command_type_and_interval() {
             }
         };
 
-        let quiet = CommandBatcher::new().with_slow_read_warning(None);
+        let quiet = CommandBatcher::new()
+            .with_slow_read_warning(None)
+            .with_slow_decide_warning(None);
         submit_with(quiet, "quiet").await;
         assert!(warnings.0.lock().unwrap().is_empty());
 
-        let batcher = CommandBatcher::new().with_slow_read_warning(Some(std::time::Duration::ZERO));
+        let batcher = CommandBatcher::new()
+            .with_slow_read_warning(Some(std::time::Duration::ZERO))
+            .with_slow_decide_warning(Some(std::time::Duration::ZERO));
         submit_with(batcher.clone(), "first").await;
         submit_with(batcher.clone(), "second").await;
         let logged = warnings.0.lock().unwrap().clone();
-        assert_eq!(logged.len(), 1, "{logged:?}");
-        assert!(
-            logged[0].contains("command_type=ShipOrder"),
-            "{}",
-            logged[0]
-        );
-        assert!(logged[0].contains("events_read=0"), "{}", logged[0]);
-        assert!(
-            logged[0].contains("more_slow_reads_since_last_warning=0"),
-            "{}",
-            logged[0]
-        );
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        let read = logged
+            .iter()
+            .find(|w| w.contains("read_ms"))
+            .expect("a read warning");
+        assert!(read.contains("command_type=ShipOrder"), "{read}");
+        assert!(read.contains("events_read=0"), "{read}");
+        assert!(read.contains("more_since_last_warning=0"), "{read}");
+        let decide = logged
+            .iter()
+            .find(|w| w.contains("decide_ms"))
+            .expect("a decide warning");
+        assert!(decide.contains("under_lock=false"), "{decide}");
     });
 }

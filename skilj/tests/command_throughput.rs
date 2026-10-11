@@ -27,7 +27,9 @@
 //! timing`) through a tracing layer, so each row also says how large the
 //! batches were and where the time inside the lock went. The
 //! `command optimistic read` event adds the read before the lock: its
-//! average, the events it read, and the slowest (docs/architecture.md
+//! average, the events it read, and the slowest read and decide; `command
+//! decide under lock` adds how often a conflict made a command decide
+//! again under the lock, and the slowest of those (docs/architecture.md
 //! §203). See
 //! docs/performance.md and docs/architecture.md §178 for the numbers.
 
@@ -70,6 +72,9 @@ struct BatchStats {
     read_us: u64,
     read_max_us: u64,
     read_decide_us: u64,
+    decide_max_us: u64,
+    redecides: u64,
+    redecide_max_us: u64,
 }
 
 /// A tracing layer summing the batcher's `debug` events into a
@@ -124,8 +129,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BatchStatsLayer {
                 stats.reads += 1;
                 stats.events_read += n("events_read");
                 stats.read_us += n("read_us");
-                stats.read_max_us = stats.read_max_us.max(n("read_us") + n("decide_us"));
+                stats.read_max_us = stats.read_max_us.max(n("read_us"));
                 stats.read_decide_us += n("decide_us");
+                stats.decide_max_us = stats.decide_max_us.max(n("decide_us"));
+            }
+            "command decide under lock" => {
+                stats.redecides += 1;
+                stats.redecide_max_us = stats.redecide_max_us.max(n("decide_us"));
             }
             "command batch phase timing" => {
                 stats.batches += 1;
@@ -201,7 +211,8 @@ async fn scenario(
         "{:<8} {:>3} workers {:>6.0} cmd/s  p50 {:>6.1} ms  p99 {:>6.1} ms | batch {:>5.1}  \
          lock wait {:>6.1} ms | per cmd in lock: decide {:>5.0} us (delta query {:>5.0} us, {:>3.0}%)  \
          seq {:>4.0} us  persist {:>5.0} us  commit {:>5.0} us | before lock: read {:>5.0} us \
-         ({:>5.0} events)  decide {:>5.0} us  slowest {:>6.1} ms",
+         ({:>5.0} events)  decide {:>5.0} us  slowest read {:>6.1} ms  slowest decide {:>6.2} ms | \
+         decided again under lock {:>4} times, slowest {:>6.2} ms",
         match workload {
             Workload::Spread => "spread",
             Workload::Hot => "hot",
@@ -224,6 +235,9 @@ async fn scenario(
         s.events_read as f64 / s.reads.max(1) as f64,
         s.read_decide_us as f64 / s.reads.max(1) as f64,
         s.read_max_us as f64 / 1000.0,
+        s.decide_max_us as f64 / 1000.0,
+        s.redecides,
+        s.redecide_max_us as f64 / 1000.0,
     );
 }
 

@@ -8932,6 +8932,7 @@ async fn decide_command_in_tx(
     covered_through: Option<i64>,
     batch_idempotency_keys: Option<&BatchIdempotencyKeys>,
     batch_delta: Option<&[Event]>,
+    slow: Option<&crate::slow_command::SlowCommandWarnings>,
 ) -> crate::error::Result<DecideOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
@@ -9153,6 +9154,7 @@ async fn decide_command_in_tx(
         // `bounded_context_events` already was); calling the
         // ordinary path here would silently drop everything the
         // snapshot had already folded.
+        let redecide_started = std::time::Instant::now();
         final_decision = match &snapshot {
             Some(ctx) => match dispatcher.dispatch_from_snapshot(
                 &bounded_context_name,
@@ -9177,6 +9179,24 @@ async fn decide_command_in_tx(
                 Some(Ok(d)) => d,
             },
         };
+        // docs/architecture.md §203: this one holds up every other
+        // command in the bounded context.
+        let redecide_time = redecide_started.elapsed();
+        tracing::debug!(
+            bounded_context = %bounded_context_name,
+            command_type = %command_type.name,
+            events_decided_on = redispatch_matching_events.len(),
+            decide_us = redecide_time.as_micros(),
+            "command decide under lock"
+        );
+        if let Some(slow) = slow {
+            slow.note_decide(
+                command_type,
+                redecide_time,
+                redispatch_matching_events.len(),
+                true,
+            );
+        }
         final_matching_events = Some(redispatch_matching_events);
     }
 
@@ -9497,6 +9517,7 @@ async fn submit_one_command_in_tx(
         extra_committed_events,
         event_types_by_name,
         covered_through,
+        None,
         None,
         None,
     )
@@ -9852,6 +9873,7 @@ pub async fn commit_command_batch(
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
     encryption_master_key: Option<&EncryptionMasterKey>,
     batch: Vec<BatchedCommand>,
+    slow: Option<&crate::slow_command::SlowCommandWarnings>,
 ) -> crate::error::Result<Vec<BatchedCommandResult>> {
     let CommandBatchLeaderTx {
         mut tx,
@@ -9895,6 +9917,7 @@ pub async fn commit_command_batch(
         &batch,
         locked_highest,
         &sync_projections,
+        slow,
     )
     .await
     {
@@ -9928,6 +9951,7 @@ pub async fn commit_command_batch(
                 locked_highest,
                 &sync_projections,
                 batch,
+                slow,
             )
             .await?
         }
@@ -10041,6 +10065,7 @@ async fn write_command_batch_as_set(
     batch: &[BatchedCommand],
     locked_highest: i64,
     sync_projections: &[String],
+    slow: Option<&crate::slow_command::SlowCommandWarnings>,
 ) -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> {
     let mut timing = BatchPhaseTiming {
         as_set: true,
@@ -10077,6 +10102,7 @@ async fn write_command_batch_as_set(
             item.covered_through,
             Some(&claimed),
             Some(batch_delta.as_deref().unwrap_or(&[])),
+            slow,
         )
         .await;
         let AcceptedDecision {
@@ -10715,6 +10741,7 @@ async fn commit_command_batch_per_command(
     locked_highest: i64,
     sync_projections: &[String],
     batch: Vec<BatchedCommand>,
+    slow: Option<&crate::slow_command::SlowCommandWarnings>,
 ) -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> {
     // Per-phase wall-clock accumulators (Codeberg issue #32,
     // round four investigation) - the batch-size histogram above already
@@ -10762,6 +10789,7 @@ async fn commit_command_batch_per_command(
             item.covered_through,
             None,
             None,
+            slow,
         )
         .await;
         decide_total += decide_started.elapsed();
@@ -10906,6 +10934,7 @@ pub async fn submit_command_batch(
         projection_dispatcher,
         encryption_master_key,
         batch,
+        None,
     )
     .await
 }

@@ -10,17 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A warning when a command's read before the lock is slow
-  (docs/architecture.md §203): the history `decide()` needs plus
-  `decide()` itself, over `SkiljBuilder::slow_command_read_warning(d)`
-  (default 250 ms, from the throughput bench), at most once a minute per
-  command type. It reports the events read, so a long history can be told
-  apart from a busy pool, and names the remedies. Turn it off with
-  `no_slow_command_read_warning()`. Also
-  `CommandBatcher::with_slow_read_warning`,
-  `ResolvedCommandSubmission::read_time`/`decide_time`, and a `debug`
-  event `command optimistic read`. The throughput bench prints the read
-  before the lock per scenario.
+- Warnings when a command is slow (docs/architecture.md §203): its read
+  before the lock over `SkiljBuilder::slow_command_read_warning(d)`
+  (default 250 ms), and one `decide()`, before the lock or again under it
+  after a conflict, over `slow_command_decide_warning(d)` (default 10 ms).
+  Both defaults come from the throughput bench. At most one of each a
+  minute per command type. They report the events read or decided on, so
+  a long history can be told apart from a busy pool or an expensive
+  `decide()`, and name the remedies. Turn them off with
+  `no_slow_command_read_warning()` and `no_slow_command_decide_warning()`.
+  New: `skilj_core::slow_command::SlowCommandWarnings`,
+  `CommandBatcher::with_slow_read_warning`/`with_slow_decide_warning`,
+  `ResolvedCommandSubmission::read_time`/`decide_time`, and `debug` events
+  `command optimistic read` and `command decide under lock`. The
+  throughput bench prints the read and the decides per scenario.
 - Snapshots as consistency query items (docs/architecture.md §202):
   `QueryItemMapping::snapshot::<S>(field)` hands the command snapshot
   `S`'s state for the tag value `field` derives, with every later event
@@ -175,6 +178,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `db::commit_command_batch` takes an
+  `Option<&slow_command::SlowCommandWarnings>` last, to check each
+  `decide()` again under the lock (docs/architecture.md §203); pass `None`
+  for no warnings.
 - A snapshot folds an event into every value of its tag key the event
   carries, not the first only (docs/architecture.md §202): a transfer
   tagged with two accounts updates both accounts' states, through

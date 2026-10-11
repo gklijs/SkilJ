@@ -22,6 +22,7 @@ pub mod event_store;
 pub mod plugin;
 pub mod projections;
 pub mod shared;
+pub mod slow_command;
 pub mod template_cache;
 
 pub use error::Error;

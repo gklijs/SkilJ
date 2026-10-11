@@ -869,7 +869,10 @@ impl Skilj {
             // `config.idempotency_key_retention` in specs/skilj.allium.
             idempotency_key_retention: Some(DEFAULT_IDEMPOTENCY_KEY_RETENTION),
             deadline_retention: Some(DEFAULT_DEADLINE_RETENTION),
-            slow_command_read_warning: Some(skilj_core::command_batcher::DEFAULT_SLOW_READ_WARNING),
+            slow_command_read_warning: Some(skilj_core::slow_command::DEFAULT_SLOW_READ_WARNING),
+            slow_command_decide_warning: Some(
+                skilj_core::slow_command::DEFAULT_SLOW_DECIDE_WARNING,
+            ),
             application_version: None,
         }
     }
@@ -1888,6 +1891,7 @@ pub struct SkiljBuilder {
     idempotency_key_retention: Option<std::time::Duration>,
     deadline_retention: Option<std::time::Duration>,
     slow_command_read_warning: Option<std::time::Duration>,
+    slow_command_decide_warning: Option<std::time::Duration>,
     application_version: Option<u64>,
 }
 
@@ -2332,10 +2336,10 @@ impl SkiljBuilder {
         self
     }
 
-    /// Warn when a command's read before the lock - the history its
-    /// `decide()` needs, then `decide()` itself - takes longer than
-    /// `threshold` (docs/architecture.md §203). Defaults to
-    /// [`skilj_core::command_batcher::DEFAULT_SLOW_READ_WARNING`] (250 ms),
+    /// Warn when a command's read before the lock - the snapshot rows and
+    /// the history its `decide()` needs - takes longer than `threshold`
+    /// (docs/architecture.md §203). Defaults to
+    /// [`skilj_core::slow_command::DEFAULT_SLOW_READ_WARNING`] (250 ms),
     /// chosen from the throughput bench. At most one warning per command
     /// type per minute; each says how many events were read, so a long
     /// history can be told apart from a busy pool.
@@ -2347,6 +2351,24 @@ impl SkiljBuilder {
     /// Never warn about slow command reads.
     pub fn no_slow_command_read_warning(mut self) -> Self {
         self.slow_command_read_warning = None;
+        self
+    }
+
+    /// Warn when one `decide()` takes longer than `threshold`: the first,
+    /// before the lock, or one again under the lock after a conflict,
+    /// which every other command in the bounded context waits for
+    /// (docs/architecture.md §203). Defaults to
+    /// [`skilj_core::slow_command::DEFAULT_SLOW_DECIDE_WARNING`], chosen
+    /// from the throughput bench. At most one warning per command type per
+    /// minute.
+    pub fn slow_command_decide_warning(mut self, threshold: std::time::Duration) -> Self {
+        self.slow_command_decide_warning = Some(threshold);
+        self
+    }
+
+    /// Never warn about slow decides.
+    pub fn no_slow_command_decide_warning(mut self) -> Self {
+        self.slow_command_decide_warning = None;
         self
     }
 
@@ -2574,7 +2596,8 @@ impl SkiljBuilder {
         let command_batcher = skilj_core::command_batcher::CommandBatcher::new()
             .with_idle_in_transaction_timeout(self.command_batch_idle_in_transaction_timeout)
             .with_max_batch_size(self.command_batch_max_size)
-            .with_slow_read_warning(self.slow_command_read_warning);
+            .with_slow_read_warning(self.slow_command_read_warning)
+            .with_slow_decide_warning(self.slow_command_decide_warning);
         let command_batcher = match self.command_batch_max_concurrent_leaders {
             Some(n) => command_batcher.with_max_concurrent_leaders(n),
             None => command_batcher,
