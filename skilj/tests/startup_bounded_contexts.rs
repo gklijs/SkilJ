@@ -447,7 +447,8 @@ async fn schema_shape(pool: &Pool, bounded_context: &str) -> Vec<String> {
 /// startup with the same columns, indexes, constraints and triggers as
 /// one provisioned today.
 /// Every table or column added since needs its startup patch; this is
-/// what notices one that's missing.
+/// what notices one that's missing. The bounded context is marked current
+/// in this process first, as a background tick can (§204).
 #[test]
 fn startup_upgrades_a_v0_0_1_bounded_context_to_the_current_schema() {
     runtime().block_on(async {
@@ -457,6 +458,13 @@ fn startup_upgrades_a_v0_0_1_bounded_context_to_the_current_schema() {
         let _serial = SERIAL.lock().await;
         let current = seed_bounded_context(&pool).await;
         let old = seed_bounded_context(&pool).await;
+        // What a background tick of another instance in this process can
+        // do before the swap below: mark the fresh schema current. Startup
+        // must patch the v0.0.1 one regardless (docs/architecture.md §204).
+        let old_bc = db::get_bounded_context(&pool, &old).await.unwrap().unwrap();
+        db::ensure_bounded_context_current(&pool, &old_bc)
+            .await
+            .unwrap();
 
         let schema = format!("\"bc_{old}\"");
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

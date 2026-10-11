@@ -11799,3 +11799,13 @@ Decides, in-process, two rounds: the slowest first decide was 1.1-2.0 ms on the 
 - `a_slow_command_warns_once_per_kind_and_interval_and_counts_the_rest` (unit, in `slow_command.rs`): the once-a-minute rule, per command type and per kind.
 - `a_slow_read_or_decide_before_the_lock_warns_once_per_command_type_and_interval` (`skilj-core/tests/command_batcher.rs`): a batcher with both warnings off logs nothing. One with zero thresholds logs one read warning and one decide warning for two submissions.
 - `a_slow_decide_again_under_the_lock_warns` (`skilj-core/tests/submit_command.rs`): a batch whose second command conflicts with its first, committed with a zero decide threshold, logs one warning with `under_lock` set.
+
+## 204. Startup always brings a bounded context up to date
+
+The user reported `startup_upgrades_a_v0_0_1_bounded_context_to_the_current_schema` failing: after `build()`, the v0.0.1 schema lacked `commands.consistency_query` and `event_tags` with its trigger (§198). It passed here, alone and with its whole binary.
+
+**Cause.** `ensure_bounded_context_current` (§200) runs the two patches once per process per (name, creation time), and `build()` called it too. The test seeds a bounded context with a current schema, then swaps in the v0.0.1 one. Earlier tests in the binary leave `Skilj` instances running, and their background ticks call `ensure_bounded_context_current` for every bounded context there is. A tick that came between the seed and the swap marked the fresh schema current, and `build()` then skipped the patches. Sleeping 3 s between the two made it fail every time. The binary otherwise finishes in about 1.6 s, rarely long enough for a tick, so it showed up only on a slower run.
+
+**Fix.** The shortcut is there for the command path and the background ticks, which call it on every command and every tick. Startup is documented to bring every bounded context up to date and runs once, so it doesn't need it. `build()` now calls `make_bounded_context_current`, which always runs the patches and then marks the bounded context. When nothing is missing, each patch is a catalog lookup (§158). Outside tests, a schema that goes back under the same name and creation time takes a manual restore, but startup is where an operator would expect that to be repaired.
+
+**Test.** The upgrade test now marks the bounded context current itself before the swap, as a tick can, so the scenario runs every time instead of depending on timing. Without the fix it fails with the same missing columns, index and trigger.

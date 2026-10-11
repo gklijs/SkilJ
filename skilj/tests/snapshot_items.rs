@@ -194,13 +194,28 @@ struct Ledger {
     cache: EventCache,
 }
 
+/// The binary's one test database, made once: `database_url` drops and
+/// recreates it, so tests calling it each raced on `CREATE DATABASE`, and
+/// the losers skipped.
+static TEST_DB: tokio::sync::OnceCell<Option<(String, Pool)>> = tokio::sync::OnceCell::const_new();
+
+async fn test_db() -> Option<(String, Pool)> {
+    TEST_DB
+        .get_or_init(|| async {
+            let database_url = skilj_test_support::database_url("skilj_snapshot_items").await?;
+            let pool = db::connect(&database_url).await.unwrap();
+            db::migrate(&pool).await.unwrap();
+            Some((database_url, pool))
+        })
+        .await
+        .clone()
+}
+
 /// A fresh bounded context with the ledger's types, built by a `Skilj`
 /// whose reconciliation role has admin access to it. `None` without a
 /// test database.
 async fn ledger() -> Option<Ledger> {
-    let database_url = skilj_test_support::database_url("skilj_snapshot_items").await?;
-    let pool = db::connect(&database_url).await.unwrap();
-    db::migrate(&pool).await.unwrap();
+    let (database_url, pool) = test_db().await?;
     let subject = format!("subject_{}", generate_token_id());
     let role = Role {
         id: generate_token_id(),

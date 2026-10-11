@@ -2252,12 +2252,25 @@ pub async fn ensure_bounded_context_current(
     {
         return Ok(());
     }
+    make_bounded_context_current(pool, bounded_context).await
+}
+
+/// [`ensure_bounded_context_current`] without its once-per-process
+/// shortcut: the patches always run, each a catalog lookup when nothing is
+/// missing (docs/architecture.md §158). `build()` calls this, so startup
+/// brings every bounded context up to date even when something earlier in
+/// the process - another instance's background tick - already marked it
+/// current and its schema has changed since.
+pub async fn make_bounded_context_current(
+    pool: &Pool,
+    bounded_context: &BoundedContext,
+) -> crate::error::Result<()> {
     ensure_consistency_query_column(pool, &bounded_context.name).await?;
     ensure_event_tags_index(pool, &bounded_context.name).await?;
     current_bounded_contexts()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key);
+        .insert((bounded_context.name.clone(), bounded_context.created_at));
     Ok(())
 }
 

@@ -2760,8 +2760,9 @@ impl SkiljBuilder {
                         // docs/architecture.md §198: the per-tag index a
                         // consistency query's typed items read, and the
                         // column a command's query is recorded in, each in
-                        // its own transaction (§200).
-                        skilj_core::db::ensure_bounded_context_current(pool, &bc).await?;
+                        // its own transaction (§200). Always run here, not
+                        // skipped for one this process already saw (§204).
+                        skilj_core::db::make_bounded_context_current(pool, &bc).await?;
                         // Last: it reads `events` as the patches above
                         // leave it - a bounded context from before
                         // `metadata_correlation_id`/`metadata_causation_id`

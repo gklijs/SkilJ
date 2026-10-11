@@ -334,6 +334,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `build()` brings every bounded context's schema up to date even when
+  something earlier in the same process marked it current, such as another
+  instance's background tick (docs/architecture.md §204). It used
+  `ensure_bounded_context_current`, whose once-per-process shortcut could
+  skip the §198 patches; it now calls the new
+  `db::make_bounded_context_current`, which always runs them.
+
 - A projection rebuild's promotion, or a new sync projection's
   registration, no longer waits for another instance's catch-up chunk
   while holding the bounded context's sequence lock, which stalled every
