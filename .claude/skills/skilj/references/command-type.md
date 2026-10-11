@@ -220,6 +220,15 @@ fn decide_with(payload: &Self::Payload, decision: &Decision<'_, Self::Event>) ->
 - The older `snapshot()` + `decide_from_snapshot` pair still works for a
   single-tag command, but new code should use snapshot items.
 
+### Knowing when to narrow: the slow-read warning
+
+skilj logs a `warn` when a command's read before the lock (its history,
+then `decide()`) takes longer than
+`SkiljBuilder::slow_command_read_warning(d)`, default 250 ms, at most
+once a minute per command type. Many `events_read` in it means narrow the
+read with one of the three tools above; few means the time went to
+waiting for the pool or Postgres, which no query change fixes.
+
 ## The `Event` associated type
 
 ```rust

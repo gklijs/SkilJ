@@ -10930,6 +10930,11 @@ pub struct ResolvedCommandSubmission {
     /// The states of the query's snapshot items, as of the read
     /// (docs/architecture.md §202) - empty for a query without any.
     pub snapshot_states: Vec<crate::plugin::SnapshotState>,
+    /// How long reading the history took, snapshot rows included
+    /// (docs/architecture.md §203).
+    pub read_time: std::time::Duration,
+    /// How long `decide()` took on what was read.
+    pub decide_time: std::time::Duration,
 }
 
 /// `CommandType::consistency_query`, as `dispatcher` holds it for
@@ -10991,6 +10996,7 @@ pub async fn resolve_command_submission(
         _ => None,
     };
 
+    let read_started = std::time::Instant::now();
     let mut snapshot_states = Vec::new();
     let (bounded_context_events, covered_through) =
         if crate::event_store::query_reads_nothing(&consistency_query) {
@@ -11032,7 +11038,9 @@ pub async fn resolve_command_submission(
         &decided_on(&consistency_query, &consistency_tags),
         &bounded_context_events,
     );
+    let read_time = read_started.elapsed();
 
+    let decide_started = std::time::Instant::now();
     let decision = match &snapshot_context {
         Some(ctx) => dispatcher
             .dispatch_from_snapshot(
@@ -11053,6 +11061,15 @@ pub async fn resolve_command_submission(
             )
             .ok_or(crate::error::Error::NoDeciderRegistered)??,
     };
+    let decide_time = decide_started.elapsed();
+    tracing::debug!(
+        bounded_context = %bounded_context_name,
+        command_type = %command_type.name,
+        events_read = bounded_context_events.len(),
+        read_us = read_time.as_micros(),
+        decide_us = decide_time.as_micros(),
+        "command optimistic read"
+    );
 
     Ok(ResolvedCommandSubmission {
         bounded_context_events,
@@ -11063,6 +11080,8 @@ pub async fn resolve_command_submission(
         decision,
         snapshot_context,
         snapshot_states,
+        read_time,
+        decide_time,
     })
 }
 

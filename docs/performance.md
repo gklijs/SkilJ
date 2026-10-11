@@ -224,6 +224,7 @@ All on `SkiljBuilder`:
 | `command_batch_idle_in_transaction_timeout(d)` | 30s | Postgres kills a leader whose transaction sits idle *between statements* longer than this, releasing the lock. A backstop for genuinely stuck leaders, not a throughput knob. The lock wait itself is not covered. |
 | `pool_options(...)` | sqlx default (10 connections, 30s acquire timeout) | See "Sizing the connection pool" below. `build()` refuses fewer than 2 connections. |
 | `statement_cache_capacity(n)` | the database URL's `statement-cache-capacity`, else 100 | Prepared statements each connection keeps. See "Sizing the statement cache" below. |
+| `slow_command_read_warning(d)` | 250 ms | Warns, at most once a minute per command type, when a command's read before the lock (its history plus `decide()`) takes longer. The warning says how many events were read: many means narrow the read with a consistency query, a snapshot item or `nothing()`; few means the time went to waiting for the pool or Postgres. `no_slow_command_read_warning()` turns it off. docs/architecture.md §203. |
 
 ## Sizing the connection pool
 

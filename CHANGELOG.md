@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A warning when a command's read before the lock is slow
+  (docs/architecture.md §203): the history `decide()` needs plus
+  `decide()` itself, over `SkiljBuilder::slow_command_read_warning(d)`
+  (default 250 ms, from the throughput bench), at most once a minute per
+  command type. It reports the events read, so a long history can be told
+  apart from a busy pool, and names the remedies. Turn it off with
+  `no_slow_command_read_warning()`. Also
+  `CommandBatcher::with_slow_read_warning`,
+  `ResolvedCommandSubmission::read_time`/`decide_time`, and a `debug`
+  event `command optimistic read`. The throughput bench prints the read
+  before the lock per scenario.
 - Snapshots as consistency query items (docs/architecture.md §202):
   `QueryItemMapping::snapshot::<S>(field)` hands the command snapshot
   `S`'s state for the tag value `field` derives, with every later event

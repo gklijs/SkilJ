@@ -11763,3 +11763,24 @@ From 8 callers up, time to decide in the lock fell from 594-760 µs a command to
 - `a_row_from_before_every_value_folding_is_never_trusted`: a row stamped without the flag, with a tampered balance, is ignored, then refolded by catch-up.
 
 `skilj/tests/consistency_query_build.rs` covers the three refusals and a valid snapshot item. `a_version_bump_refolds_every_page_when_events_carry_two_values` now expects every transfer in both accounts (1202 rather than 601).
+
+## 203. A warning when a command's read is slow
+
+After §201 and §202 the user asked for the warning on large reads, the third idea from the release check, to depend on time rather than on an event count, with the time configurable and a default taken from the benchmarks. Time is what a caller pays, and it covers what a count can't: one event type with large payloads, a `decide()` that does real work, a read the event cache can't serve.
+
+**What is timed.** `resolve_command_submission`, the optimistic half of a command, now measures its read (the snapshot rows and the history, from the cache or Postgres, plus selecting what `decide()` is handed) and `decide()` on it. Both go into `ResolvedCommandSubmission` as `read_time` and `decide_time`, and into a `debug` event, `command optimistic read`, with `events_read`, `read_us` and `decide_us`. `CommandBatcher::decide_and_submit`, the path GraphQL and REST submit through, warns when the two together exceed the threshold. The warning carries the bounded context, the command type, both times, the events read and the threshold. It names the remedies: a `consistency_query()`, a snapshot item (§202), or `QueryItemMapping::nothing()` (§201). The time is wall time, so it includes waiting for a pool connection. With few events read, a slow read points at load, not at history, and the message says so. Commands submitted by routes and deadlines (`decide_and_submit_command`) and dry runs aren't timed against the threshold. They run the same command types the surfaces do, so a type with a long history shows up there.
+
+**At most one per command type per minute.** A slow read is rarely a one-off: every submission of the command type reads the same growing history. So a command type warns at most once a minute, and the next warning reports how many slow reads came in between (`more_slow_reads_since_last_warning`). The count lives in the batcher, per process.
+
+**The default, 250 ms.** `command_throughput.rs` now also prints, per scenario, the average read before the lock, the average number of events it read, `decide()`'s share, and the slowest read. Two rounds each, in-process with 800 commands per scenario and with a +1 ms round trip with 400:
+
+| workload | events read | 1 caller, slowest | up to 80 callers, slowest |
+|---|---|---|---|
+| spread (empty history) | 0 | 2-11 ms | 22-86 ms |
+| hot-snap (snapshot item and its tail) | 13-138 | 12-19 ms | 124-183 ms |
+| hot-none (`nothing()`) | 0 | under 0.1 ms | under 0.1 ms |
+| hot (one account's whole history, up to 800 events) | 160-400 on average | 13-22 ms | 205-515 ms |
+
+Uncontended, every read stayed under 25 ms. Under load most of the read is waiting, for a pool connection or for Postgres: a read of no events at all took 39-56 ms on average at 80 callers with +1 ms. 250 ms is above every read of the cheap workloads at any load, and below the slowest whole-history reads at 80 callers in-process (403-515 ms). With +1 ms those peaked at 205-209 ms, under it: there the whole history was at most 400 events. A lower default would warn about load on commands that read nothing, which no change to the query fixes. `SkiljBuilder::slow_command_read_warning(d)` sets it, and `no_slow_command_read_warning()` turns it off. `CommandBatcher::with_slow_read_warning(Option<Duration>)` is the same for a batcher built by hand.
+
+**Tests.** `a_slow_read_warns_once_per_interval_and_counts_the_rest` (unit, in `command_batcher.rs`) covers the once-a-minute rule and the count per command type. `a_slow_read_before_the_lock_warns_once_per_command_type_and_interval` (`skilj-core/tests/command_batcher.rs`) submits through a batcher with the warning off, which logs nothing, and through one with a zero threshold, where two submissions log one warning with the command type and the events read.

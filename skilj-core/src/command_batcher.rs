@@ -101,6 +101,60 @@ type Queue = Arc<Mutex<Vec<PendingCommand>>>;
 /// never an ordinary slow batch.
 const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a command's read before the lock - its history, then
+/// `decide()` on it - may take before [`CommandBatcher`] warns
+/// (docs/architecture.md §203). In the throughput bench, reads of an
+/// empty history, of a snapshot plus its tail and of nothing stayed under
+/// 185 ms even at 80 concurrent callers, while folding one account's whole
+/// history took 200-515 ms there; uncontended, every read took under 25 ms.
+pub const DEFAULT_SLOW_READ_WARNING: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// At most one slow-read warning per command type this often; the next
+/// one says how many more there were in between.
+const SLOW_READ_WARNING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When a command type last warned about a slow read, and how many slow
+/// reads it has had since without warning.
+#[derive(Debug, Clone, Copy)]
+struct SlowReads {
+    warned_at: std::time::Instant,
+    since: u64,
+}
+
+/// Records one slow read for `key` at `now`, and says whether to warn:
+/// `Some(n)` with the `n` slow reads since the last warning, or `None`
+/// within [`SLOW_READ_WARNING_INTERVAL`] of it.
+fn slow_read_due(
+    slow_reads: &mut HashMap<(String, String), SlowReads>,
+    key: (String, String),
+    now: std::time::Instant,
+) -> Option<u64> {
+    match slow_reads.get_mut(&key) {
+        Some(seen) if now.duration_since(seen.warned_at) < SLOW_READ_WARNING_INTERVAL => {
+            seen.since += 1;
+            None
+        }
+        Some(seen) => {
+            let more = seen.since;
+            *seen = SlowReads {
+                warned_at: now,
+                since: 0,
+            };
+            Some(more)
+        }
+        None => {
+            slow_reads.insert(
+                key,
+                SlowReads {
+                    warned_at: now,
+                    since: 0,
+                },
+            );
+            Some(0)
+        }
+    }
+}
+
 /// See this module's own doc comment for the full design. `Clone` is
 /// cheap - `Arc`-wrapped internals, the identical "hand out a cheap
 /// clone, not an `Arc<Skilj>`" reasoning `EventCache`/`EventBroadcaster`
@@ -117,6 +171,9 @@ pub struct CommandBatcher {
     leader_permits: Arc<std::sync::OnceLock<Arc<Semaphore>>>,
     max_batch_size: usize,
     max_concurrent_leaders: Option<usize>,
+    slow_read_warning: Option<std::time::Duration>,
+    /// Per `(bounded context, command type)`.
+    slow_reads: Arc<Mutex<HashMap<(String, String), SlowReads>>>,
 }
 
 impl Default for CommandBatcher {
@@ -133,7 +190,59 @@ impl CommandBatcher {
             leader_permits: Arc::new(std::sync::OnceLock::new()),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_concurrent_leaders: None,
+            slow_read_warning: Some(DEFAULT_SLOW_READ_WARNING),
+            slow_reads: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// How long a command's read before the lock may take before a
+    /// warning is logged (default [`DEFAULT_SLOW_READ_WARNING`]); `None`
+    /// never warns. See docs/architecture.md §203.
+    pub fn with_slow_read_warning(mut self, threshold: Option<std::time::Duration>) -> Self {
+        self.slow_read_warning = threshold;
+        self
+    }
+
+    /// Warns, at most once per [`SLOW_READ_WARNING_INTERVAL`] per command
+    /// type, when the read before the lock took longer than the
+    /// configured threshold.
+    fn note_read(
+        &self,
+        command_type: &CommandType,
+        resolved: &crate::db::ResolvedCommandSubmission,
+    ) {
+        let Some(threshold) = self.slow_read_warning else {
+            return;
+        };
+        let took = resolved.read_time + resolved.decide_time;
+        if took <= threshold {
+            return;
+        }
+        let key = (
+            command_type.bounded_context.name.clone(),
+            command_type.name.clone(),
+        );
+        let Some(more) = slow_read_due(
+            &mut self.slow_reads.lock().unwrap_or_else(|e| e.into_inner()),
+            key,
+            std::time::Instant::now(),
+        ) else {
+            return;
+        };
+        tracing::warn!(
+            bounded_context = %command_type.bounded_context.name,
+            command_type = %command_type.name,
+            read_ms = resolved.read_time.as_millis() as u64,
+            decide_ms = resolved.decide_time.as_millis() as u64,
+            events_read = resolved.bounded_context_events.len(),
+            threshold_ms = threshold.as_millis() as u64,
+            more_slow_reads_since_last_warning = more,
+            "a command's read before the lock was slow (docs/architecture.md §203). \
+             With many events read, narrow what decide() reads: a consistency_query(), \
+             a snapshot item, or QueryItemMapping::nothing(). With few, the time went to \
+             waiting for a pool connection or for Postgres. \
+             SkiljBuilder::slow_command_read_warning sets the threshold"
+        );
     }
 
     /// The most commands one lock acquisition processes (default
@@ -376,6 +485,7 @@ impl CommandBatcher {
             payload,
         )
         .await?;
+        self.note_read(command_type, &resolved);
 
         self.submit(
             pool,
@@ -602,5 +712,39 @@ impl Drop for LeaderGuard {
                 "the command batch leader stopped before processing this command; retry",
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{slow_read_due, SLOW_READ_WARNING_INTERVAL};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_slow_read_warns_once_per_interval_and_counts_the_rest() {
+        let mut seen = HashMap::new();
+        let key = || ("bank".to_string(), "Withdraw".to_string());
+        let start = Instant::now();
+        assert_eq!(slow_read_due(&mut seen, key(), start), Some(0));
+        assert_eq!(
+            slow_read_due(&mut seen, key(), start + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            slow_read_due(&mut seen, key(), start + Duration::from_secs(2)),
+            None
+        );
+        let other = ("bank".to_string(), "Deposit".to_string());
+        assert_eq!(
+            slow_read_due(&mut seen, other, start + Duration::from_secs(3)),
+            Some(0)
+        );
+        let later = start + SLOW_READ_WARNING_INTERVAL;
+        assert_eq!(slow_read_due(&mut seen, key(), later), Some(2));
+        assert_eq!(
+            slow_read_due(&mut seen, key(), later + Duration::from_secs(1)),
+            None
+        );
     }
 }

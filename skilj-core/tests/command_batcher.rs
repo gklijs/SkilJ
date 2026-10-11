@@ -888,3 +888,127 @@ fn a_leader_cancelled_mid_batch_still_commits_and_answers_its_followers() {
         assert_eq!(orders, vec!["A", "B"]);
     });
 }
+
+struct NoSnapshots;
+
+impl skilj_core::plugin::SnapshotDispatcher for NoSnapshots {
+    fn snapshot_names(&self, _: &str) -> Vec<&'static str> {
+        Vec::new()
+    }
+    fn tag_key(&self, _: &str, _: &str) -> Option<&'static str> {
+        None
+    }
+    fn owner_tag_key(&self, _: &str, _: &str) -> Option<Option<&'static str>> {
+        None
+    }
+    fn version(&self, _: &str, _: &str) -> Option<u64> {
+        None
+    }
+    fn fold(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &Event,
+    ) -> Option<skilj_core::error::Result<String>> {
+        None
+    }
+    fn default_state(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+}
+
+/// The `warn` events a test thread logs, by their fields.
+#[derive(Clone, Default)]
+struct Warnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+#[test]
+fn a_slow_read_before_the_lock_warns_once_per_command_type_and_interval() {
+    // docs/architecture.md §203. A zero threshold makes every read slow;
+    // the second within the minute is counted, not logged.
+    use tracing_subscriber::layer::SubscriberExt;
+    let warnings = Warnings::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        seed_order_shipped_event_type(&pool, &bc).await;
+        let ct = seed_ship_order_command_type(&pool, &bc).await;
+        let command_dispatcher: Arc<dyn CommandDispatcher> = Arc::new(ShipOrderDispatcher);
+        let projection_dispatcher: Arc<dyn ProjectionDispatcher> =
+            Arc::new(NoopProjectionDispatcher);
+        let broadcaster = EventBroadcaster::new(64);
+        let event_cache = EventCache::new(1000);
+        let submit_with = |batcher: CommandBatcher, order: &'static str| {
+            let (pool, ct) = (pool.clone(), ct.clone());
+            let (command_dispatcher, projection_dispatcher) =
+                (command_dispatcher.clone(), projection_dispatcher.clone());
+            let (broadcaster, event_cache) = (&broadcaster, &event_cache);
+            async move {
+                batcher
+                    .decide_and_submit(
+                        &pool,
+                        &command_dispatcher,
+                        &projection_dispatcher,
+                        &NoSnapshots,
+                        broadcaster,
+                        event_cache,
+                        &ct,
+                        &format!(r#"{{"order_id":"{order}"}}"#),
+                        "test-client",
+                        None,
+                        None,
+                        None,
+                        Utc::now().trunc_subsecs(6),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+
+        let quiet = CommandBatcher::new().with_slow_read_warning(None);
+        submit_with(quiet, "quiet").await;
+        assert!(warnings.0.lock().unwrap().is_empty());
+
+        let batcher = CommandBatcher::new().with_slow_read_warning(Some(std::time::Duration::ZERO));
+        submit_with(batcher.clone(), "first").await;
+        submit_with(batcher.clone(), "second").await;
+        let logged = warnings.0.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(
+            logged[0].contains("command_type=ShipOrder"),
+            "{}",
+            logged[0]
+        );
+        assert!(logged[0].contains("events_read=0"), "{}", logged[0]);
+        assert!(
+            logged[0].contains("more_slow_reads_since_last_warning=0"),
+            "{}",
+            logged[0]
+        );
+    });
+}
