@@ -980,9 +980,9 @@ async fn insert_tagged_event(
 /// event carries two values of the snapshot's key - a transfer between
 /// two accounts - so the history has twice as many tag rows as events.
 /// Counting rows ended the paging after the first page, and the rows were
-/// marked current while missing the rest. An event folds into the first
-/// value of the key it carries, as the per-chunk fold always did, so each
-/// account holds the events that list it first.
+/// marked current while missing the rest. An event folds into every
+/// value of the key it carries (docs/architecture.md §202), so each
+/// account holds every transfer, whichever it lists first.
 #[test]
 fn a_version_bump_refolds_every_page_when_events_carry_two_values() {
     runtime().block_on(async {
@@ -1045,7 +1045,7 @@ fn a_version_bump_refolds_every_page_when_events_carry_two_values() {
             .unwrap()
             .unwrap();
             let state: BalanceState = serde_json::from_str(&resolved.state_json).unwrap();
-            assert_eq!(state.balance, 601, "every event listing it first");
+            assert_eq!(state.balance, 1202, "every event carrying it");
             assert!(resolved.as_of_sequence >= last - 1);
         }
     });

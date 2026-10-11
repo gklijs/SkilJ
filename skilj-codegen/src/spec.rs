@@ -67,6 +67,11 @@ pub struct CommandTypeSpec {
     /// override: every event carrying any of `tags`.
     #[serde(default)]
     pub query: Vec<QueryItemSpec>,
+    /// `decide()` needs no history: `consistency_query()` is
+    /// `QueryItemMapping::nothing()` (docs/architecture.md §201). Refused
+    /// together with `query`.
+    #[serde(default)]
+    pub reads_nothing: bool,
 }
 
 /// One consistency query item. `tags` names keys of the command type's
@@ -235,11 +240,17 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
         spec.event_types.iter().map(|e| e.name.as_str()).collect();
     for command in &spec.command_types {
         let what = format!("command_type {:?}", command.name);
+        if command.reads_nothing && !command.query.is_empty() {
+            problems.push(format!(
+                "{what}: reads_nothing reads no events, so it can't have query items too"
+            ));
+        }
         for (index, item) in command.query.iter().enumerate() {
             let item_what = format!("{what}: query item {}", index + 1);
             if item.event_types.is_empty() && item.tags.is_empty() {
                 problems.push(format!(
-                    "{item_what} names neither event types nor tags, so it would match every event"
+                    "{item_what} names neither event types nor tags, so it matches nothing; \
+                     for a command that needs no history, set reads_nothing = true instead"
                 ));
             }
             if item.latest == Some(0) {

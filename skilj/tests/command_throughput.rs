@@ -18,7 +18,9 @@
 //!   account's whole history, which grows as the run goes;
 //! - **hot-snap**: every command on one account, through `DepositFast`,
 //!   which decides from a `Balance` snapshot plus the events since it
-//!   (docs/architecture.md §19, §188).
+//!   (docs/architecture.md §19, §188);
+//! - **hot-none**: every command on one account, through `DepositBlind`,
+//!   whose query reads nothing (docs/architecture.md §201).
 //!
 //! Besides throughput and latency, it collects the command batcher's own
 //! `debug` events (`command batch leader lock wait`, `command batch phase
@@ -133,6 +135,7 @@ enum Workload {
     Spread,
     Hot,
     HotSnapshot,
+    HotNothing,
 }
 
 /// `COMMANDS` deposits from `workers` concurrent callers. Prints one row.
@@ -154,10 +157,13 @@ async fn scenario(
             for n in 0..per_worker {
                 let account = match workload {
                     Workload::Spread => format!("{run}-{worker}-{n}"),
-                    Workload::Hot | Workload::HotSnapshot => format!("{run}-hot"),
+                    Workload::Hot | Workload::HotSnapshot | Workload::HotNothing => {
+                        format!("{run}-hot")
+                    }
                 };
                 let credential = match workload {
                     Workload::HotSnapshot => &setup.fast_credential,
+                    Workload::HotNothing => &setup.blind_credential,
                     _ => &setup.credential,
                 };
                 latencies
@@ -184,6 +190,7 @@ async fn scenario(
             Workload::Spread => "spread",
             Workload::Hot => "hot",
             Workload::HotSnapshot => "hot-snap",
+            Workload::HotNothing => "hot-none",
         },
         workers,
         latencies.len() as f64 / elapsed.as_secs_f64(),
@@ -246,7 +253,12 @@ fn command_throughput() {
 
         for round in 1..=2 {
             println!("--- round {round} ---");
-            for workload in [Workload::Spread, Workload::Hot, Workload::HotSnapshot] {
+            for workload in [
+                Workload::Spread,
+                Workload::Hot,
+                Workload::HotSnapshot,
+                Workload::HotNothing,
+            ] {
                 for workers in [1, 8, 32, 80] {
                     scenario(&setup, &stats, workload, workers, commands).await;
                 }

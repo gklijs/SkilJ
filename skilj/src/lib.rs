@@ -392,6 +392,9 @@ pub struct Skilj {
 struct Dispatcher {
     command_types: Arc<HashMap<(String, String), RegisteredCommandType>>,
     template_cache: skilj_core::template_cache::TemplateCache,
+    /// What a command type's snapshot items fold with
+    /// (docs/architecture.md §202).
+    snapshots: SnapshotDispatcherImpl,
 }
 
 impl CommandDispatcher for Dispatcher {
@@ -408,7 +411,28 @@ impl CommandDispatcher for Dispatcher {
         let registered = self
             .command_types
             .get(&(bounded_context, command_type.to_string()))?;
-        Some((registered.decide)(payload, matching_events))
+        Some((registered.decide)(payload, matching_events, &[]))
+    }
+
+    fn dispatch_with(
+        &self,
+        bounded_context: &str,
+        command_type: &str,
+        payload: &str,
+        matching_events: &[Event],
+        snapshots: &[skilj_core::plugin::SnapshotState],
+    ) -> Option<skilj_core::error::Result<CommandDecision>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        let registered = self
+            .command_types
+            .get(&(bounded_context, command_type.to_string()))?;
+        Some((registered.decide)(payload, matching_events, snapshots))
+    }
+
+    fn snapshots(&self) -> Option<&dyn skilj_core::plugin::SnapshotDispatcher> {
+        Some(&self.snapshots)
     }
 
     fn required_role(
@@ -652,7 +676,24 @@ impl skilj_core::plugin::SnapshotDispatcher for SnapshotDispatcherImpl {
         let registered = self
             .snapshots
             .get(&(bounded_context, snapshot_name.to_string()))?;
-        Some((registered.fold)(state_json, event))
+        Some((registered.fold)(None, state_json, event))
+    }
+
+    fn fold_value(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+        tag_value: &str,
+        state_json: &str,
+        event: &Event,
+    ) -> Option<skilj_core::error::Result<String>> {
+        let bounded_context = self
+            .template_cache
+            .effective_bounded_context(bounded_context);
+        let registered = self
+            .snapshots
+            .get(&(bounded_context, snapshot_name.to_string()))?;
+        Some((registered.fold)(Some(tag_value), state_json, event))
     }
 
     fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String> {
@@ -845,6 +886,10 @@ impl Skilj {
         Arc::new(Dispatcher {
             command_types: self.command_types.clone(),
             template_cache: self.template_cache.clone(),
+            snapshots: SnapshotDispatcherImpl {
+                snapshots: self.snapshots.clone(),
+                template_cache: self.template_cache.clone(),
+            },
         })
     }
 
@@ -1278,8 +1323,15 @@ fn registered_event_type<T: EventType + 'static>() -> RegisteredEventType {
 /// decode step failing surfaces as `EventStoreError::PayloadDecodeFailed`,
 /// a library-level error rather than a `CommandDecision::Rejected` - see
 /// that variant's own doc comment for why.
-type DeciderFn =
-    Box<dyn Fn(&str, &[Event]) -> skilj_core::error::Result<CommandDecision> + Send + Sync>;
+type DeciderFn = Box<
+    dyn Fn(
+            &str,
+            &[Event],
+            &[skilj_core::plugin::SnapshotState],
+        ) -> skilj_core::error::Result<CommandDecision>
+        + Send
+        + Sync,
+>;
 
 /// `DeciderFn`'s own twin for `CommandType::decide_from_snapshot` -
 /// [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2". `(payload_json,
@@ -1324,13 +1376,18 @@ struct RegisteredCommandType {
 /// What `build()` refuses in a command type's `consistency_query()`
 /// (docs/architecture.md §198): an event type its bounded context doesn't
 /// register in this builder, a tag mapping that isn't one of its own
-/// `tag_mappings()`, an item with neither types nor tags (it would match
-/// every event), an item keeping the last 0 matches, and a query together
-/// with `snapshot()`, which folds by
+/// `tag_mappings()`, an item with neither types nor tags next to other
+/// items or with `latest` (alone, it is `QueryItemMapping::nothing()`: no
+/// history, §201), an item keeping the last 0 matches, a snapshot item
+/// (§202) naming a snapshot this builder doesn't register in the bounded
+/// context, with other than one tag mapping, of the snapshot's `TAG_KEY`
+/// and among the command type's, or with event types or `latest`, and a
+/// query together with `snapshot()`, which folds by
 /// tag and knows nothing of the query.
 fn validate_consistency_queries(
     command_types: &HashMap<(String, String), RegisteredCommandType>,
     event_types: &HashMap<(String, String), RegisteredEventType>,
+    snapshots: &HashMap<(String, String), RegisteredSnapshot>,
 ) -> Result<(), skilj_core::Error> {
     let mut names: Vec<&(String, String)> = command_types.keys().collect();
     names.sort();
@@ -1353,12 +1410,58 @@ fn validate_consistency_queries(
             );
         }
         for item in &registered.consistency_query {
+            if let Some(snapshot) = &item.snapshot {
+                let Some(registered_snapshot) =
+                    snapshots.get(&(bounded_context.clone(), snapshot.clone()))
+                else {
+                    return refuse(format!(
+                        "consistency_query() names snapshot {snapshot}, which isn't registered \
+                         in this bounded context"
+                    ));
+                };
+                let [mapping] = item.tag_mappings.as_slice() else {
+                    return refuse(format!(
+                        "a consistency_query() item for snapshot {snapshot} needs exactly one \
+                         tag mapping, the value whose state it reads"
+                    ));
+                };
+                if mapping.key != registered_snapshot.tag_key {
+                    return refuse(format!(
+                        "a consistency_query() item for snapshot {snapshot} maps tag {}, but \
+                         the snapshot is keyed by {}",
+                        mapping.key, registered_snapshot.tag_key
+                    ));
+                }
+                if !item.event_types.is_empty() || item.latest.is_some() {
+                    return refuse(format!(
+                        "a consistency_query() item for snapshot {snapshot} folds every event \
+                         carrying its tag, so it takes neither event types nor latest"
+                    ));
+                }
+                if !registered.tag_mappings.contains(mapping) {
+                    return refuse(format!(
+                        "consistency_query() tag {} (field {}) isn't one of its tag_mappings()",
+                        mapping.key, mapping.field
+                    ));
+                }
+                continue;
+            }
             if item.event_types.is_empty() && item.tag_mappings.is_empty() {
-                return refuse(
-                    "a consistency_query() item names neither event types nor tags, so it \
-                     would match every event"
-                        .to_string(),
-                );
+                if registered.consistency_query.len() > 1 {
+                    return refuse(
+                        "a consistency_query() item names neither event types nor tags, so it \
+                         matches nothing; QueryItemMapping::nothing() stands alone"
+                            .to_string(),
+                    );
+                }
+                if item.latest.is_some() {
+                    return refuse(
+                        "QueryItemMapping::nothing() reads no events, so it can't keep the \
+                         latest of them"
+                            .to_string(),
+                    );
+                }
+                continue;
             }
             if item.latest == Some(0) {
                 return refuse(
@@ -1404,7 +1507,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
         required_role: T::required_role(),
         snapshot_name: T::snapshot(),
         consistency_query: T::consistency_query(),
-        decide: Box::new(|payload_json, raw_events| {
+        decide: Box::new(|payload_json, raw_events, snapshots| {
             let payload: T::Payload = serde_json::from_str(payload_json)
                 .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
             let mut matching = Vec::with_capacity(raw_events.len());
@@ -1416,7 +1519,10 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
                     );
                 }
             }
-            Ok(T::decide(&payload, &matching))
+            Ok(T::decide_with(
+                &payload,
+                &skilj_core::plugin::Decision::new(&matching, snapshots),
+            ))
         }),
         decide_from_snapshot: Box::new(|payload_json, snapshot_state_json, raw_events| {
             let payload: T::Payload = serde_json::from_str(payload_json)
@@ -1559,7 +1665,10 @@ fn registered_projection<T: Projection + 'static>() -> RegisteredProjection {
 /// `TAG_KEY` - a `BoundedContextEvent::try_from_event` failure here is a
 /// real, surfaced `Err`, not a silent no-op (see
 /// `SnapshotDispatcher::fold`'s own doc comment).
-type SnapshotFoldFn = Box<dyn Fn(&str, &Event) -> skilj_core::error::Result<String> + Send + Sync>;
+/// `(tag_value, state_json, event)`: `Snapshot::fold_for` for a value,
+/// `Snapshot::fold` for `None`.
+type SnapshotFoldFn =
+    Box<dyn Fn(Option<&str>, &str, &Event) -> skilj_core::error::Result<String> + Send + Sync>;
 
 /// See `RegisteredProjection` above - same shape and reasoning, for
 /// `Snapshot`. `name` (`T::NAME`) is carried as its own field, unlike
@@ -1588,7 +1697,7 @@ fn registered_snapshot<T: Snapshot + 'static>() -> RegisteredSnapshot {
         version: T::VERSION,
         partition_count: T::PARTITION_COUNT,
         default_state_json,
-        fold: Box::new(|state_json, event| {
+        fold: Box::new(|tag_value, state_json, event| {
             let mut state: T::State = serde_json::from_str(state_json)
                 .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
             let converted = T::Event::try_from_event(event).ok_or_else(|| {
@@ -1601,7 +1710,10 @@ fn registered_snapshot<T: Snapshot + 'static>() -> RegisteredSnapshot {
             })?;
             let converted =
                 converted.map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
-            T::fold(&mut state, &converted);
+            match tag_value {
+                Some(value) => T::fold_for(&mut state, value, &converted),
+                None => T::fold(&mut state, &converted),
+            }
             Ok(serde_json::to_string(&state).expect("JSON serialization of State is infallible"))
         }),
     }
@@ -2295,7 +2407,7 @@ impl SkiljBuilder {
             }
         }
         // docs/architecture.md §198.
-        validate_consistency_queries(&self.command_types, &self.event_types)?;
+        validate_consistency_queries(&self.command_types, &self.event_types, &self.snapshots)?;
         // docs/architecture.md §194.
         let graphql_naming = match &self.graphql_federation {
             Some(options) => options.naming().map_err(skilj_core::Error::configuration)?,
@@ -2698,6 +2810,10 @@ impl SkiljBuilder {
                 dispatcher: Arc::new(Dispatcher {
                     command_types: command_types.clone(),
                     template_cache: template_cache.clone(),
+                    snapshots: SnapshotDispatcherImpl {
+                        snapshots: snapshots.clone(),
+                        template_cache: template_cache.clone(),
+                    },
                 }),
                 projection_dispatcher: Arc::new(ProjectionDispatcherImpl {
                     projections: projections.clone(),

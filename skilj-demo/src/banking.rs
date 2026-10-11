@@ -31,11 +31,14 @@
 //!
 //! **[§19](../../docs/architecture.md#optional-snapshotting-matching-events)'s own real adopter**: `AccountBalanceSnapshot`/`WithdrawMoneyFast`
 //! near the bottom of this file are deliberately *not* part of the
-//! codegen'd shape above - `skilj-codegen` doesn't generate `snapshot()`/
-//! `decide_from_snapshot()` (out of scope for this pass, see
+//! codegen'd shape above - `skilj-codegen` doesn't generate snapshots or
+//! `decide_with()` (out of scope for this pass, see
 //! [docs/architecture.md §19](../../docs/architecture.md#optional-snapshotting-matching-events)'s own "Files to touch"), so proving
 //! snapshotting end-to-end needed one small, genuinely hand-written
 //! `CommandType` instead of retrofitting the generated `WithdrawMoney`.
+//! It reads the snapshot through a snapshot item in its consistency query
+//! ([docs/architecture.md §202](../../docs/architecture.md#snapshot-items)), which hands `decide_with()` the
+//! balance already brought up to date.
 //! Same real business logic as `decide_withdraw_money` above, on
 //! purpose - see that pair's own doc comment for why sharing
 //! `apply_money_event` keeps them from drifting apart.
@@ -185,7 +188,7 @@ impl skilj::Snapshot for AccountBalanceSnapshot {
 /// `WithdrawMoney`'s own real behaviour (see `decide_withdraw_money`
 /// above), reachable through the snapshot-accelerated path instead -
 /// two separate `CommandType`s, not the same one wearing two hats,
-/// since `snapshot()`/`decide_from_snapshot()` aren't part of
+/// since snapshot items and `decide_with()` aren't part of
 /// `banking.skilj.toml`'s own generated shape (this file's own module
 /// doc comment). A real consuming app with a genuinely large per-account
 /// history would give its *actual* `WithdrawMoney` this treatment
@@ -215,39 +218,29 @@ impl skilj::CommandType for WithdrawMoneyFast {
     fn rest_trigger_allowed() -> bool {
         true
     }
-    fn snapshot() -> Option<&'static str> {
-        Some("AccountBalanceSnapshot")
+    /// The account's balance, and nothing else: the snapshot's stored
+    /// row with the account's events since folded on top.
+    fn consistency_query() -> Vec<skilj_core::shared::QueryItemMapping> {
+        vec![skilj_core::shared::QueryItemMapping::snapshot::<
+            AccountBalanceSnapshot,
+        >("account_id")]
     }
 
-    /// Never actually reached once `snapshot()` is `Some` - the
-    /// framework always prefers `decide_from_snapshot` for an opted-in
-    /// command type (`CommandType::snapshot()`'s own doc comment) - but
-    /// still required, since `decide()` has no default. Delegates to
-    /// the identical `withdraw_decision` both paths share, so they can
-    /// never disagree.
-    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
-        withdraw_decision(payload, balance_of(matching_events))
-    }
-
-    fn decide_from_snapshot(
+    fn decide_with(
         payload: &Self::Payload,
-        snapshot_state_json: &str,
-        events_since_snapshot: &[Self::Event],
+        decision: &skilj_core::plugin::Decision<'_, Self::Event>,
     ) -> CommandDecision {
-        let snapshot: AccountBalanceSnapshotState =
-            serde_json::from_str(snapshot_state_json).unwrap_or_default();
-        let balance = events_since_snapshot
-            .iter()
-            .fold(snapshot.balance, apply_money_event);
+        let balance = decision
+            .snapshot::<AccountBalanceSnapshot>(&payload.account_id)
+            .map_or(0, |state| state.balance);
         withdraw_decision(payload, balance)
     }
 }
 
-/// The one real rule both `WithdrawMoneyFast::decide`/`decide_from_snapshot`
-/// share - identical to `decide_withdraw_money`'s own body above, just
-/// taking an already-computed `balance` instead of `matching_events`
-/// directly, since the two callers arrive at that balance two different
-/// ways (a full replay vs. a folded snapshot plus a short tail).
+/// The one real rule `WithdrawMoneyFast::decide_with` applies - identical
+/// to `decide_withdraw_money`'s own body above, just taking an
+/// already-computed `balance` instead of `matching_events` directly,
+/// since the snapshot hands it the balance rather than the history.
 fn withdraw_decision(payload: &WithdrawMoneyFastPayload, balance: i64) -> CommandDecision {
     if payload.amount <= 0 {
         return CommandDecision::Rejected {

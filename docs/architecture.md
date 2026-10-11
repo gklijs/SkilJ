@@ -11679,3 +11679,87 @@ Before the release, the commit with §197 and §198 was reviewed in three parts:
 **Two failing events in one chunk.** A chunk that fails is folded again up to the event blamed, and that run commits. The event blamed isn't always the earliest failing one. A new snapshot row's history is refolded before the other rows are folded, so its failure is found first even when another row fails at an earlier event. The shorter run then failed too and committed nothing. Both catch-ups, projections and snapshots, now shorten the run again until it commits. Test: `the_earliest_of_two_failing_events_bounds_the_committed_progress`. Before the fix, neither account kept any of its events from that chunk.
 
 `skilj-temporal`'s manifest named the workspace README while the crate ships its own; `cargo package` warned and packaged its own. It names its own now.
+
+<a id="no-history"></a>
+## 201. A command that needs no history
+
+A follow-up to §198, from the question "what else could cut the events a decide reads?". Some commands decide from their payload alone: skilj-demo's `DepositMoney` checks only that the amount is positive, and the same goes for logging a contact or adding a note. §199's load run found that `DepositMoney` still read its account's whole history before every decision, because it declares no query, and that this history is what limits a hot account. There was no way to say "nothing" in the query. An empty query is the default, which reads by tag. `build()` refused an item naming neither types nor tags. Dropping `tag_mappings()` did give an empty `matching_events`, but also dropped the command's tags, which owner scoping reads (`event_store::command_owner_scope_satisfied`).
+
+**The declaration.** `QueryItemMapping::nothing()`, an item naming neither event types nor tag mappings, as a command type's whole query: `vec![QueryItemMapping::nothing()]`. §200 already made such an item match nothing, both from the event cache and from Postgres, so the meaning was in place and only the declaration was refused. `build()` (`validate_consistency_queries`) now accepts it alone and without `latest`. It refuses it next to other items, where it would be dead, and with `latest`, a count of events it never reads. The spec's `ConsistencyQueryIsWellFormed` says the same and calls it the nothing item. It no longer gives the old reason for refusing an item naming neither ("it would match every event"), which `QueryItem.matches` hasn't meant since §200. An item rather than a separate trait method, because the query is already where a command type says what it reads, and DCB has an empty query for an append without a condition. It also leaves `consistency_query()`'s signature alone, which skilj-helpdesk was adopting at the time. GraphQL's `consistencyQuery` shows it as one item with no event types, no tag mappings and no `latest`. The schema is unchanged, so the conformance transcript and the federation fixtures are too.
+
+**What it skips.** `event_store::query_reads_nothing` is true for a declared query whose every item names neither. That also covers a query whose every item's tags derived nothing (§200). For such a command:
+- `resolve_command_submission` reads nothing before the lock: no cache lookup, and none of the `latest_sequence`, bounded context and query round trips a cache miss costs.
+- `decide_command_in_tx` re-checks nothing under the lock. No event can match, so none conflicts, and `decide()` runs exactly once.
+- `batch_recheck_delta` leaves its tags out of the batch's single tag query. Its read position, -1 since it read nothing, would otherwise have started that query at the beginning of history for the whole batch.
+
+The command keeps its `consistency_tags`. It records its query in `commands.consistency_query` as the one empty item, and its consistency boundary is null.
+
+**Measured.** `command_throughput.rs` gains **hot-none**: every command on one account, through `DepositBlind`, an uncapped deposit with the nothing query, next to the bench's capped `Deposit` (**hot**, which folds the account's history) and `DepositFast` (**hot-snap**, a snapshot plus the events since). In-process, 800 commands per scenario, two rounds, release build, embedded Postgres on a shared machine (round 2's **spread** at one caller ran at a quarter of round 1's, so the noise is large):
+
+| callers | spread | hot | hot-snap | hot-none |
+|---|---|---|---|---|
+| 1 | 87-343 | 50-96 | 267-282 | 411-515 |
+| 8 | 544-1,382 | 110-125 | 392-417 | 2,569-2,727 |
+| 32 | 888-2,277 | 128-137 | 389-423 | 4,002-5,055 |
+| 80 | 841-1,912 | 139-159 | 326-385 | 3,816-4,672 |
+
+With a millisecond added to every round trip (`SKILJ_BENCH_LATENCY_MS=1`, 400 commands per scenario, two rounds; round 2 had stalls of a second or more at p99 in **spread** and **hot**):
+
+| callers | spread | hot | hot-snap | hot-none |
+|---|---|---|---|---|
+| 1 | 23-31 | 19-21 | 39-47 | 57-59 |
+| 8 | 52-124 | 164-182 | 283-288 | 434-459 |
+| 32 | 137-236 | 171-244 | 358-381 | 1,089-1,170 |
+| 80 | 259-338 | 93-269 | 263-329 | 1,496-1,520 |
+
+At +1 ms, every **hot-none** batch held as many commands as there were callers, and p99 stayed within a few milliseconds of p50.
+
+**hot-none** is faster than **spread**, whose commands each read an empty history but still pay for the read and, under concurrency, for the re-check. Its time in the lock is 11-35 µs a command to decide, against 1.3-1.9 ms for **hot**, and its batches are larger, since the lock is held for less time.
+
+**Tests.** `a_query_of_nothing_reads_no_history_and_never_conflicts` (`skilj-core/tests/consistency_query.rs`) covers a `LogContact` command tagged by company. With the company's sign-up and a ticket committed, its read is empty and `decide()` gets no events. A ticket of the company committed between its read and the lock doesn't make it decide again. The command keeps its company tag and records the query. In a batch next to a `CreateTicket`, the two `LogContact`s are accepted on their first decision, while the ticket is decided again on the company's expiry and refused. `skilj/tests/consistency_query_build.rs` has the two refusals and checks that a lone `nothing()` gets past the query checks. skilj-codegen: `reads_nothing = true` on a `[[command_type]]` generates the override, and is refused together with `[[command_type.query]]` items. An item with neither key is still refused, and now points to `reads_nothing`.
+
+**skilj-demo.** `DepositMoney` declares `reads_nothing = true`, and the checked-in generated copy (§191) was re-recorded. `WithdrawMoney` and `WithdrawMoneyFast` still read the balance they check.
+
+<a id="snapshot-items"></a>
+## 202. Snapshots as query items
+
+A follow-up to §201. The user asked whether snapshots and consistency queries could be combined, and then for a design that would also work for commands with several tags. Two things kept them apart. `build()` refused `snapshot()` together with `consistency_query()`. And a snapshot was used only when the command derived exactly one tag, the snapshot's own (`resolve_snapshot_context`). So a transfer, tagged with two accounts and a transfer id, couldn't use the account balance it needs, and neither could a ticket that needs a requester's open-ticket count plus its company's status. The user's observation was the key: every snapshot row stores the position it is folded through, so a command can always fetch the events since and say which other events it needs.
+
+**The model.** A snapshot is one kind of query item: `QueryItemMapping::snapshot::<S>(field)`, the state of `S` for the tag value the payload's `field` derives under `S::TAG_KEY`. A query holds any number of them, over one snapshot or several, next to ordinary items. For the conflict check a snapshot item is an ordinary item: tags only, any type, every match. Every event carrying its value conflicts with the command, and the item's matches count toward the consistency boundary as before. What changes is how `decide()` is handed them: as the snapshot's state rather than as events. `QueryItemMapping` and `QueryItem` gain `snapshot: Option<String>`, serialized only when set, so the query recorded on a command stays as it was for other items. `derive_query` derives one item per value, so a list-valued field names several accounts, each with its own state. A missing value derives an item matching nothing.
+
+**`decide_with`.** `CommandType::decide_with(payload, &Decision)` is what the framework now calls. `Decision::events()` is what `matching_events` was, the events of the items other than snapshot items. `Decision::snapshot::<S>(value)` is the typed state, or `None` when the query derived no such item. The default `decide_with` calls `decide()`, and `decide()` gained a default too (a rejection, `decide_not_implemented`), so a command type implements whichever it needs. Every existing implementation compiles unchanged. `Decision` is a struct rather than more parameters, so what a decision is handed can grow without changing the signature again. `CommandDispatcher` gains `dispatch_with`, defaulting to `dispatch`, and `snapshots()`, the `SnapshotDispatcher` the command path folds with, defaulting to `None`.
+
+**The framework folds, not the decider.** §19's `decide_from_snapshot` handed the decider the stored state and the events since, and left the folding to it, with the obligation to reach what `decide()` would have. Here the command path folds with the snapshot's own fold (`SnapshotDispatcher::fold_value`), the same function catch-up uses. The state a decision sees is by construction the fold of every event carrying the value, and that obligation is gone.
+
+**Reading it.**
+1. `read_query_with_snapshots` reads the stored rows of every (snapshot, value) pair the items derive in one statement (`get_current_snapshot_rows`). A missing row, or one at another version, is the default state at -1.
+2. One statement then reads every item, each from its own position (`list_events_matching_items_with_bc`): a snapshot item from its row's `as_of_sequence`, the other items from the start. A position shared by several items is bound once, so a query whose items all read from the same position sends the statement it always did. The event cache serves the read when its window holds everything after the lowest position. That happens when every item is a snapshot item, since ordinary items read from the start.
+3. The events past each state's position are folded into it.
+
+The states travel with the command, in `ResolvedCommandSubmission::snapshot_states` and `BatchedCommand::snapshot_states`, and as a new argument of `submit_command` and `CommandBatcher::submit`. Under the lock, the events past the read that match a snapshot item are folded into its state, the ordinary items' events are selected again, and the command is decided again, as §178 does for every conflict. The consistency boundary includes the highest position any state holds its value through.
+
+**An event folds into every value it carries.** Since §197, an event carrying several values of a snapshot's key, such as a transfer tagged with both accounts, was folded into the first value's row only (§200 pinned this down). With the user's choice, it is now folded into each value's row, through a new `Snapshot::fold_for(state, tag_value, event)`. It defaults to `fold`, and is overridden when the fold depends on the side: a debit for `from`, a credit for `to`. `fold` gained an empty default, so a snapshot implements whichever it needs. `SnapshotDispatcher::fold_value` defaults to `fold`. Catch-up plans one fold per value an event carries (`snapshot_tag_values`), in the per-chunk fold and in the history refold alike. The old-API path, `decide_from_snapshot`, reads the same rows. Its decider folds the tail itself with `fold`, which is right unless the snapshot overrides `fold_for`.
+
+**Rows folded under the old rule.** The stored `snapshot_version` of a row this version writes carries a flag bit (`SNAPSHOT_EVERY_VALUE_FOLD`, bit 40). A row without the flag, folded before the upgrade, never matches, so it is treated as at an older `Snapshot::VERSION`. A command treats it as absent and folds the value's whole history. Catch-up resets and refolds it the next time an event touches the value, as after a `VERSION` bump (§152). This also covers a rolling deploy. An older instance resets a flagged row it touches, since the version doesn't match its own, and writes it back without the flag. Every newer instance then distrusts the row until it refolds it. A row is never trusted under the wrong rule, at the cost of refolding back and forth while both versions run. The read functions report the version without the flag, and 0 for a row without it (`reported_snapshot_version`). A one-time data migration was considered instead. It would have needed a marker table, and it would not have caught rows an older instance writes after it.
+
+**Validation.** `build()` refuses a snapshot item whose snapshot isn't registered in the bounded context, one with other than exactly one tag mapping, one whose mapping isn't under the snapshot's `TAG_KEY`, and one with event types or `latest`. Its mapping must also be one of the command type's `tag_mappings()`, like any item's. The spec's `ConsistencyQueryIsWellFormed` states the shape. That the snapshot is deployed is a deployment fact, not state the spec can range over. `snapshot()` together with a query stays refused: the old form is kept for existing command types, not combined with the new.
+
+**Surfaces.** GraphQL `QueryItemMapping.snapshot: String`, null for other items. skilj-codegen sets `snapshot: None` in the items it emits; it doesn't generate snapshots, so it doesn't generate snapshot items either. skilj-demo's `WithdrawMoneyFast` and the bench's `DepositFast` moved from `snapshot()` + `decide_from_snapshot` to a snapshot item and `decide_with`. Their tests and figures run through the new path.
+
+**Measured.** `command_throughput.rs`'s **hot-snap**, every deposit on one account through `DepositFast`, now runs through a snapshot item. In-process, 800 commands per scenario, two rounds, against the same run on the old path from §201 (whose **spread** and **hot** rows came out within noise of this run's):
+
+| callers | hot-snap, `decide_from_snapshot` | hot-snap, snapshot item |
+|---|---|---|
+| 1 | 267-282 | 323-330 |
+| 8 | 392-417 | 531-606 |
+| 32 | 389-423 | 506-534 |
+| 80 | 326-385 | 453-469 |
+
+From 8 callers up, time to decide in the lock fell from 594-760 µs a command to 416-577 µs. Where the difference comes from wasn't profiled. Both paths read the stored row and then the tail, so it isn't fewer round trips before the lock. The new path folds the tail through JSON per event, which, if anything, costs more per event. What the figures do show is that moving the fold from the decider to the framework costs nothing measurable.
+
+**Tests.** `skilj/tests/snapshot_items.rs` covers a typed ledger built through the facade. `Transfer` decides on two `Balance` snapshot items and a transfer-id item, and `Balance::fold_for` debits and credits.
+- `a_transfer_decides_on_both_balances_and_its_id`: decisions from cold states, then from stored rows plus a deposit since. A transfer is folded into both accounts, and a used id is refused.
+- `an_event_committed_after_the_read_is_folded_in_before_deciding_again`: a transfer resolved against a balance of 50, with another 30 leaving the account before its lock, is decided again and refused.
+- `a_row_from_before_every_value_folding_is_never_trusted`: a row stamped without the flag, with a tampered balance, is ignored, then refolded by catch-up.
+
+`skilj/tests/consistency_query_build.rs` covers the three refusals and a valid snapshot item. `a_version_bump_refolds_every_page_when_events_carry_two_values` now expects every transfer in both accounts (1202 rather than 601).

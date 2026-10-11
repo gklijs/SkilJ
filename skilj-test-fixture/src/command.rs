@@ -2,7 +2,7 @@
 //! given/when/then harness. See the crate root doc comment for what this
 //! deliberately does and doesn't stand in for.
 
-use skilj_core::plugin::CommandType;
+use skilj_core::plugin::{CommandType, Decision, Snapshot, SnapshotState};
 use skilj_core::shared::{CommandDecision, EventSpec};
 
 use crate::pretty;
@@ -17,11 +17,30 @@ use crate::pretty;
 /// scope for a plugin author's own decide() test.
 pub struct GivenEvents<T: CommandType> {
     events: Vec<T::Event>,
+    snapshots: Vec<SnapshotState>,
 }
 
 impl<T: CommandType> GivenEvents<T> {
     pub fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            snapshots: Vec::new(),
+        }
+    }
+
+    /// Snapshot `S`'s state for `tag_value`, as a snapshot item in `T`'s
+    /// consistency query would hand it to `decide_with()`
+    /// (docs/architecture.md §202): already brought up to date, so the
+    /// test states it directly rather than as events to fold.
+    pub fn snapshot<S: Snapshot>(mut self, tag_value: &str, state: S::State) -> Self {
+        self.snapshots.push(SnapshotState {
+            snapshot: S::NAME.to_string(),
+            tag_value: tag_value.to_string(),
+            state_json: serde_json::to_string(&state)
+                .expect("JSON serialization of a snapshot State is infallible"),
+            folded_through: -1,
+        });
+        self
     }
 
     pub fn event(mut self, event: T::Event) -> Self {
@@ -34,12 +53,14 @@ impl<T: CommandType> GivenEvents<T> {
         self
     }
 
-    /// Calls `T::decide(&payload, &self.events)` directly - no database,
-    /// no HTTP, no access-control check (those are `skilj`'s own
-    /// surfaces' job, not `decide()`'s).
+    /// Calls `T::decide_with()` directly, with the given events and
+    /// snapshot states - what the framework calls, and `decide()` for a
+    /// command type that implements only that. No database, no HTTP, no
+    /// access-control check (those are `skilj`'s own surfaces' job, not
+    /// `decide()`'s).
     pub fn when(self, payload: T::Payload) -> CommandOutcome {
         CommandOutcome {
-            decision: T::decide(&payload, &self.events),
+            decision: T::decide_with(&payload, &Decision::new(&self.events, &self.snapshots)),
         }
     }
 }

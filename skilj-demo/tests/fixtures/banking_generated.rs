@@ -50,6 +50,9 @@ impl ::skilj::CommandType for DepositMoney {
             "account_id".to_string() }
         ]
     }
+    fn consistency_query() -> Vec<::skilj_core::shared::QueryItemMapping> {
+        Vec::from([::skilj_core::shared::QueryItemMapping::nothing()])
+    }
     fn rest_trigger_allowed() -> bool {
         true
     }

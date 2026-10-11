@@ -298,6 +298,7 @@ type BankQueryItemMapping @inaccessible {
 	eventTypes: [String!]!
 	tagMappings: [BankTagMapping!]!
 	latest: Int
+	snapshot: String
 }
 
 type BankRole {

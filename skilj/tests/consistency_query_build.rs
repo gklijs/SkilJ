@@ -1,5 +1,5 @@
 //! What `build()` refuses in a command type's `consistency_query()`
-//! (docs/architecture.md §198). Checked before `build()` connects, so no
+//! (docs/architecture.md §198, §201). Checked before `build()` connects, so no
 //! database is needed: the URL below is never dialled.
 
 use schemars::JsonSchema;
@@ -63,8 +63,23 @@ impl<const QUERY: u8> CommandType for CreateTicket<QUERY> {
                 .tagged(vec![company()])
                 .latest()],
             1 => vec![QueryItemMapping::types(&["TicketCreated"]).tagged(vec![ticket()])],
-            2 => vec![QueryItemMapping::tags(Vec::new())],
+            2 => vec![
+                QueryItemMapping::tags(Vec::new()),
+                QueryItemMapping::types(&["TicketCreated"]).tagged(vec![company()]),
+            ],
             4 => vec![QueryItemMapping::types(&["TicketCreated"]).last(0)],
+            5 => vec![QueryItemMapping::nothing().latest()],
+            6 => vec![QueryItemMapping::nothing()],
+            7 => vec![QueryItemMapping::snapshot::<CompanySnapshot>("company_id")],
+            8 => vec![QueryItemMapping {
+                snapshot: Some("MissingSnapshot".into()),
+                ..QueryItemMapping::snapshot::<CompanySnapshot>("company_id")
+            }],
+            9 => vec![QueryItemMapping {
+                tag_mappings: vec![ticket()],
+                ..QueryItemMapping::snapshot::<CompanySnapshot>("ticket_id")
+            }],
+            10 => vec![QueryItemMapping::snapshot::<CompanySnapshot>("company_id").latest()],
             _ => vec![QueryItemMapping::types(&["TicketCreated"]).tagged(vec![company()])],
         }
     }
@@ -119,9 +134,24 @@ fn a_tag_the_command_type_does_not_map_is_refused() {
 }
 
 #[test]
-fn an_item_matching_everything_is_refused() {
+fn an_item_matching_nothing_next_to_others_is_refused() {
     let err = refusal::<2>();
     assert!(err.contains("names neither event types nor tags"), "{err}");
+}
+
+#[test]
+fn nothing_keeping_the_latest_is_refused() {
+    let err = refusal::<5>();
+    assert!(err.contains("can't keep the latest"), "{err}");
+}
+
+/// A lone `nothing()` passes the query checks: `build()` gets as far as
+/// dialling the database (docs/architecture.md §201).
+#[test]
+fn nothing_alone_is_a_valid_query() {
+    let err = refusal::<6>();
+    assert!(!err.contains("consistency_query()"), "{err}");
+    assert!(!err.contains("nothing()"), "{err}");
 }
 
 #[test]
@@ -137,4 +167,36 @@ fn a_query_with_a_snapshot_is_refused() {
 fn keeping_the_last_zero_matches_is_refused() {
     let err = refusal::<4>();
     assert!(err.contains("keeps the last 0 matching events"), "{err}");
+}
+
+/// docs/architecture.md §202: a snapshot item over a registered snapshot,
+/// keyed by its `TAG_KEY`, passes the query checks.
+#[test]
+fn a_snapshot_item_is_a_valid_query() {
+    let err = refusal::<7>();
+    assert!(!err.contains("consistency_query()"), "{err}");
+}
+
+#[test]
+fn a_snapshot_item_naming_an_unregistered_snapshot_is_refused() {
+    let err = refusal::<8>();
+    assert!(
+        err.contains("names snapshot MissingSnapshot, which isn't registered"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_snapshot_item_on_another_tag_key_is_refused() {
+    let err = refusal::<9>();
+    assert!(err.contains("the snapshot is keyed by company"), "{err}");
+}
+
+#[test]
+fn a_snapshot_item_keeping_the_latest_is_refused() {
+    let err = refusal::<10>();
+    assert!(
+        err.contains("takes neither event types nor latest"),
+        "{err}"
+    );
 }

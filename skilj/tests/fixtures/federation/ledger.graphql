@@ -298,6 +298,7 @@ type LedgerQueryItemMapping @inaccessible {
 	eventTypes: [String!]!
 	tagMappings: [LedgerTagMapping!]!
 	latest: Int
+	snapshot: String
 }
 
 type LedgerRole {

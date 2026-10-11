@@ -10,6 +10,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Snapshots as consistency query items (docs/architecture.md §202):
+  `QueryItemMapping::snapshot::<S>(field)` hands the command snapshot
+  `S`'s state for the tag value `field` derives, with every later event
+  carrying that value folded in by the framework. A query holds any
+  number of them next to ordinary items, so a command with several tags
+  (a transfer between two accounts) can decide on a snapshot per tag
+  value, plus whatever else it reads. Every event carrying such a value
+  conflicts with the command and is folded in before it decides again.
+  New: `CommandType::decide_with(payload, &Decision)`, which the framework
+  now calls (its default calls `decide()`, which gained a default of its
+  own); `Decision::events()`, `Decision::snapshot::<S>(value)`;
+  `Snapshot::fold_for(state, tag_value, event)` (default calls `fold()`,
+  which gained an empty default); `CommandDispatcher::dispatch_with` and
+  `CommandDispatcher::snapshots` (defaulted);
+  `SnapshotDispatcher::fold_value` (defaulted); `plugin::SnapshotState`;
+  GraphQL `QueryItemMapping.snapshot`. `build()` refuses a snapshot item
+  over an unregistered snapshot, on another tag key, with other than one
+  tag mapping, or with event types or `latest`. skilj-demo's
+  `WithdrawMoneyFast` uses one. `snapshot()` with `decide_from_snapshot()`
+  still works, and is superseded. skilj-test-fixture's `GivenEvents` calls
+  `decide_with()` and takes `.snapshot::<S>(tag_value, state)`.
+
+- `QueryItemMapping::nothing()`: a command type whose `decide()` needs no
+  history declares `consistency_query()` as `vec![QueryItemMapping::nothing()]`
+  (docs/architecture.md §201). Its commands read no events before the lock
+  or under it, and nothing committed meanwhile conflicts with them, while
+  `tag_mappings()` still tag them for owner scoping. `build()` refuses
+  `nothing()` next to other items or with `latest`. skilj-codegen:
+  `reads_nothing = true` on a `[[command_type]]`. skilj-demo's
+  `DepositMoney` uses it. On one hot account, in-process, such a command
+  ran at 2,500-5,000 commands/s from 8 callers up, against 110-160 for a
+  deposit folding the account's history and 330-420 for one deciding
+  from a snapshot; with a millisecond added to every round trip,
+  430-1,520 against 160-270 and 280-380. `command_throughput.rs` has the
+  workload as `hot-none`.
+
 - A command type can declare a consistency query, DCB's query items:
   `CommandType::consistency_query()` returns `QueryItemMapping`s, each
   naming event types and tags (all of which an event must carry), and
@@ -127,6 +163,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal. `skilj_bridge::ack` takes the epoch (breaking).
 
 ### Changed
+
+- A snapshot folds an event into every value of its tag key the event
+  carries, not the first only (docs/architecture.md §202): a transfer
+  tagged with two accounts updates both accounts' states, through
+  `Snapshot::fold_for`. Stored rows from earlier versions are no longer
+  trusted: a command folds the value's history instead, and catch-up
+  refolds the row the next time an event touches the value, as after a
+  `VERSION` bump. `snapshots.snapshot_version` now carries a flag bit for
+  this; `db::get_snapshot_state` and `inspectSnapshot` report the version
+  without it, and 0 for a row folded before.
+- **Breaking:** `db::submit_command` and `CommandBatcher::submit` take the
+  snapshot items' states (`&[SnapshotState]`, after the snapshot context),
+  `BatchedCommand` and `ResolvedCommandSubmission` have a
+  `snapshot_states` field, and `QueryItemMapping`/`QueryItem` a `snapshot`
+  field (docs/architecture.md §202).
 
 - Snapshot catch-up folds 100 events per transaction, reading and writing
   each row once per chunk instead of once per event, and refolds the rows a

@@ -30,10 +30,11 @@ Consequences:
 /v1/commands/trigger` on the in-process router (no network) into one bounded
 context, from 1, 8, 32 or 80 concurrent callers, and reads the command
 batcher's own `debug` events to report batch size, lock wait and where the
-time inside the lock goes. Three workloads: **spread** (every command on its
+time inside the lock goes. Four workloads: **spread** (every command on its
 own account, so `decide()` sees an empty history), **hot** (every command on
-one account, whose history grows as the run goes) and **hot-snap** (hot, but
-deciding from a snapshot, docs/architecture.md §19).
+one account, whose history grows as the run goes), **hot-snap** (hot, but
+deciding from a snapshot, docs/architecture.md §19) and **hot-none** (hot, but
+an uncapped deposit whose query reads nothing, docs/architecture.md §201).
 
 Measured on a 22-core development machine against the embedded Postgres 18,
 shared with other work - the load average moved between 6 and 15 during the
@@ -72,7 +73,14 @@ What the profile says:
 - **hot-snap**, the hot workload deciding from a `Balance` snapshot
   (§19), reads only the events since the snapshot, usually from the event
   cache (§188): 216-221 commands/s with one caller, 260-340 from 8 callers
-  up, against 48-134 for plain hot.
+  up, against 48-134 for plain hot. Through a snapshot item in the query
+  (§202), the same workload ran at 323-330 with one caller and 453-606
+  from 8 up, against 267-423 on the old path in the same session.
+- **hot-none**, a deposit with no cap whose `decide()` needs no history
+  (`QueryItemMapping::nothing()`, §201), reads nothing and never conflicts:
+  411-515 commands/s with one caller and 2,500-5,000 from 8 up, on the same
+  hot account, faster than spread. A command that checks only its payload
+  should say so.
 - **Hot** is bounded by the account's history, which every command carries
   into the lock and folds: `decide` takes ~1 ms even with nothing new to
   re-check, and the consistency boundary is computed over the same history

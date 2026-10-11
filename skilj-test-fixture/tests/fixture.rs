@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use skilj_core::event_store::Event;
-use skilj_core::plugin::{BoundedContextEvent, CommandType, Projection};
-use skilj_core::shared::{CommandDecision, EventSpec};
+use skilj_core::plugin::{BoundedContextEvent, CommandType, Decision, Projection, Snapshot};
+use skilj_core::shared::{CommandDecision, EventSpec, QueryItemMapping};
 
 use skilj_test_fixture::command::GivenEvents as GivenCommandEvents;
 use skilj_test_fixture::projection::GivenEvents as GivenProjectionEvents;
@@ -107,6 +107,71 @@ impl Projection for CounterTotal {
             CounterEvent::Decremented(p) => state.total -= p.amount,
         }
     }
+}
+
+/// The counter's total as a snapshot, for `AdjustCounterFast`.
+struct CounterSnapshot;
+
+impl Snapshot for CounterSnapshot {
+    type State = CounterTotalState;
+    type Event = CounterEvent;
+    const NAME: &'static str = "CounterSnapshot";
+    const TAG_KEY: &'static str = "counter";
+    const VERSION: u64 = 1;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct AdjustNamedCounterPayload {
+    counter: String,
+    delta: i64,
+}
+
+/// Decides on the counter's total from a snapshot item
+/// (docs/architecture.md §202) rather than from events.
+struct AdjustCounterFast;
+
+impl CommandType for AdjustCounterFast {
+    type Payload = AdjustNamedCounterPayload;
+    type Event = CounterEvent;
+    const NAME: &'static str = "AdjustCounterFast";
+
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::snapshot::<CounterSnapshot>("counter")]
+    }
+
+    fn decide_with(
+        payload: &Self::Payload,
+        decision: &Decision<'_, Self::Event>,
+    ) -> CommandDecision {
+        let total = decision
+            .snapshot::<CounterSnapshot>(&payload.counter)
+            .map_or(0, |state| state.total);
+        if total + payload.delta < 0 {
+            return CommandDecision::Rejected {
+                reason: "counter would go negative".into(),
+                kind: "would_go_negative".into(),
+            };
+        }
+        CommandDecision::Accepted { events: vec![] }
+    }
+}
+
+#[test]
+fn a_given_snapshot_state_reaches_decide_with() {
+    GivenCommandEvents::<AdjustCounterFast>::new()
+        .snapshot::<CounterSnapshot>("c1", CounterTotalState { total: 3 })
+        .when(AdjustNamedCounterPayload {
+            counter: "c1".into(),
+            delta: -5,
+        })
+        .then_rejected("would_go_negative");
+    GivenCommandEvents::<AdjustCounterFast>::new()
+        .snapshot::<CounterSnapshot>("c1", CounterTotalState { total: 7 })
+        .when(AdjustNamedCounterPayload {
+            counter: "c1".into(),
+            delta: -5,
+        })
+        .then_accepted(vec![]);
 }
 
 #[test]

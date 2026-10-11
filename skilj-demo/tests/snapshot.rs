@@ -5,7 +5,7 @@
 //! `skilj-core/tests/snapshot_context.rs` already covers the DB/dispatcher
 //! plumbing in isolation; this file's whole point is the real thing,
 //! end to end, through real HTTP - and specifically, proving
-//! `decide_from_snapshot` is genuinely *read from* the stored snapshot
+//! its snapshot item (§202) genuinely *reads* the stored snapshot
 //! row, not silently bypassed in favour of a correct-either-way full
 //! replay. A plain "does the right thing" test can't tell those two
 //! apart, since both would reach the identical correct answer against
@@ -48,9 +48,9 @@ fn withdraw_money_fast_is_correct_both_cold_and_after_a_real_catch_up_tick() {
             "deposit should be accepted: {response:?}"
         );
 
-        // No snapshot row exists yet for this account - decide_from_snapshot's
-        // own cold-start path (Snapshot::State::default() plus every real
-        // event as events_since_snapshot) must still reach the correct
+        // No snapshot row exists yet for this account - the snapshot
+        // item's cold start (Snapshot::State::default() with every real
+        // event of the account folded in) must still reach the correct
         // answer, the same as an ordinary full replay would.
         let response = trigger(
             &router,
@@ -117,7 +117,7 @@ fn withdraw_money_fast_is_correct_both_cold_and_after_a_real_catch_up_tick() {
 
 /// The decisive proof: a tampered stored snapshot changes
 /// `WithdrawMoneyFast`'s own decision - possible only if
-/// `decide_from_snapshot` genuinely reads the stored row, not a
+/// the snapshot item genuinely reads the stored row, not a
 /// coincidence a full-replay fallback could also produce.
 #[test]
 fn a_tampered_stored_snapshot_changes_the_decision_proving_it_is_actually_read() {
@@ -180,7 +180,7 @@ fn a_tampered_stored_snapshot_changes_the_decision_proving_it_is_actually_read()
         .unwrap();
 
         // The same 500 withdrawal must now succeed - only explicable if
-        // decide_from_snapshot read the tampered row's own balance
+        // the snapshot item read the tampered row's own balance
         // (1,000,000), not the real history (still genuinely 100).
         let response = trigger(
             &router,
@@ -191,7 +191,7 @@ fn a_tampered_stored_snapshot_changes_the_decision_proving_it_is_actually_read()
         assert!(
             accepted(&response),
             "a withdrawal that only clears the tampered balance must be accepted here - if this \
-             fails, decide_from_snapshot is not actually reading the stored snapshot row: \
+             fails, the snapshot item is not actually reading the stored snapshot row: \
              {response:?}"
         );
     });

@@ -232,7 +232,31 @@ pub trait CommandType {
         None
     }
 
-    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision;
+    /// Decides from the events the command's query selects. Implement
+    /// this, or [`decide_with`](CommandType::decide_with) when the
+    /// decision also needs a snapshot's state; the framework only calls
+    /// `decide_with`, whose default calls this. The default here refuses
+    /// every command, for a type that implements neither.
+    fn decide(_payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Rejected {
+            reason: "this CommandType implements neither decide() nor decide_with()".to_string(),
+            kind: "decide_not_implemented".to_string(),
+        }
+    }
+
+    /// What the framework calls to decide a command
+    /// (docs/architecture.md §202): `decision.events()` is what
+    /// `matching_events` is to `decide()`, and `decision.snapshot::<S>(value)`
+    /// is snapshot `S`'s state for a tag value one of the query's
+    /// [`QueryItemMapping::snapshot`] items derived, already brought up to
+    /// date - nothing to fold. The default calls `decide()` with the
+    /// events, so a type that needs no snapshot implements `decide()` alone.
+    fn decide_with(
+        payload: &Self::Payload,
+        decision: &Decision<'_, Self::Event>,
+    ) -> CommandDecision {
+        Self::decide(payload, decision.events())
+    }
 
     /// Which events `decide()` receives, and which later events conflict
     /// with it (docs/architecture.md §198, the DCB query model). Each item
@@ -248,14 +272,24 @@ pub trait CommandType {
     /// conflicts less: an event carrying the command's tag but matching
     /// no item no longer makes it decide again.
     ///
+    /// `vec![QueryItemMapping::nothing()]` is a command whose `decide()`
+    /// needs no history (docs/architecture.md §201): it reads no events,
+    /// and nothing committed after it is read conflicts with it.
+    ///
     /// `build()` refuses a query naming an event type its bounded context
     /// doesn't register in the same builder, a tag mapping that isn't one
-    /// of `tag_mappings()`, an item with neither types nor tags, and a
-    /// query together with `snapshot()`.
+    /// of `tag_mappings()`, an item with neither types nor tags other than
+    /// a lone `nothing()`, and a query together with `snapshot()`.
     fn consistency_query() -> Vec<QueryItemMapping> {
         Vec::new()
     }
 
+    /// Superseded by snapshot items in `consistency_query()`
+    /// (`QueryItemMapping::snapshot`, docs/architecture.md §202), which
+    /// work with any number of tags and hand `decide_with()` the state
+    /// already brought up to date; kept working for existing command
+    /// types.
+    ///
     /// Opt-in accelerator for `decide()` against a large tag-scoped
     /// history ([docs/architecture.md §19](../../../docs/architecture.md#optional-snapshotting-matching-events)'s "Problem 2") - names the
     /// `Snapshot::NAME` this command type's own decide() can fold
@@ -597,13 +631,14 @@ pub trait Projection {
 /// catch-up task, own inspection endpoint - no shared code path a
 /// read-model change could destabilise.
 ///
-/// Scoped to exactly one tag key, deliberately: `matching_events` is a
-/// *union* across a command's own derived tags (`courses.rs`'s real
-/// `EnrollStudentInCourse` unions `student` and `course` in one
-/// `decide()` call), and only a single tag key has a stable, reusable
-/// identity to snapshot against - a multi-tag command gets no benefit
-/// here, out of scope for now (composing several single-tag snapshots
-/// is feasible in principle, real unbuilt design work).
+/// Scoped to one tag key, holding a state per value of it. A command
+/// type of any shape uses it through snapshot items in its consistency
+/// query (`QueryItemMapping::snapshot`, docs/architecture.md §202): any
+/// number of them, over one snapshot or several, next to ordinary items,
+/// each handing `decide_with()` the state for one value. An event
+/// carrying several values of the key - a transfer between two accounts -
+/// is folded into each value's state, through `fold_for`, which is told
+/// the value.
 ///
 /// One `Snapshot` definition is shared by every `CommandType` that tags
 /// on its `TAG_KEY` and opts in - `banking.rs`'s `DepositMoney`/
@@ -669,11 +704,71 @@ pub trait Snapshot {
     const PARTITION_COUNT: u32 = 1;
 
     /// Folds one event into `state`, in place - the identical shape
-    /// `Projection::project` already has, minus the `key` parameter
-    /// (`Snapshot` only ever folds one entity's own events into its own
-    /// state, never several at once the way a multi-instance projection
-    /// can).
-    fn fold(state: &mut Self::State, event: &Self::Event);
+    /// `Projection::project` already has, minus the `key` parameter.
+    /// Implement this, or [`fold_for`](Snapshot::fold_for) when the fold
+    /// depends on which tag value it's folding for; the framework only
+    /// calls `fold_for`, whose default calls this. The default here
+    /// changes nothing.
+    fn fold(_state: &mut Self::State, _event: &Self::Event) {}
+
+    /// Folds `event` into the state for `tag_value`, one of the values of
+    /// `TAG_KEY` the event carries (docs/architecture.md §202). An event
+    /// carrying several - a transfer tagged with both accounts - is
+    /// folded into each value's state, once per value, so a fold that
+    /// treats them differently (a debit for one, a credit for the other)
+    /// tells them apart by `tag_value`. The default calls `fold()`.
+    fn fold_for(state: &mut Self::State, tag_value: &str, event: &Self::Event) {
+        let _ = tag_value;
+        Self::fold(state, event)
+    }
+}
+
+/// One snapshot's state for one tag value, as a decision is handed it
+/// (docs/architecture.md §202): the stored row with every later event
+/// carrying the value folded in, JSON-encoded. Read typed through
+/// [`Decision::snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotState {
+    /// `Snapshot::NAME`.
+    pub snapshot: String,
+    pub tag_value: String,
+    pub state_json: String,
+    /// The position `state_json` holds every event carrying the value
+    /// through: the stored row's `as_of_sequence`, or the last event
+    /// folded on top of it; -1 for none.
+    pub folded_through: i64,
+}
+
+/// What `CommandType::decide_with` decides from (docs/architecture.md
+/// §202): the events the command's query selects, and the state of every
+/// snapshot item it derives. Built by the framework; room to grow without
+/// changing `decide_with`'s signature.
+pub struct Decision<'a, E> {
+    events: &'a [E],
+    snapshots: &'a [SnapshotState],
+}
+
+impl<'a, E> Decision<'a, E> {
+    pub fn new(events: &'a [E], snapshots: &'a [SnapshotState]) -> Self {
+        Self { events, snapshots }
+    }
+
+    /// The events the query's items other than snapshot items select, in
+    /// sequence order, each once - `decide()`'s `matching_events`.
+    pub fn events(&self) -> &'a [E] {
+        self.events
+    }
+
+    /// Snapshot `S`'s state for `tag_value`, as of the command's read,
+    /// with every event carrying the value folded in. `None` when no item
+    /// of the query derived that value for `S`: a decision should treat
+    /// that as a misconfiguration rather than an empty state.
+    pub fn snapshot<S: Snapshot>(&self, tag_value: &str) -> Option<S::State> {
+        self.snapshots
+            .iter()
+            .find(|s| s.snapshot == S::NAME && s.tag_value == tag_value)
+            .and_then(|s| serde_json::from_str(&s.state_json).ok())
+    }
 }
 
 /// Type-erased dispatch to a bounded context's own typed `decide()` -
@@ -702,6 +797,32 @@ pub trait CommandDispatcher: Send + Sync {
         payload: &str,
         matching_events: &[Event],
     ) -> Option<crate::error::Result<CommandDecision>>;
+
+    /// `dispatch`, with the states of the query's snapshot items
+    /// (docs/architecture.md §202) - what the command path calls. The
+    /// default ignores `snapshots` and calls `dispatch`, right for a
+    /// dispatcher whose command types declare no snapshot items.
+    fn dispatch_with(
+        &self,
+        bounded_context: &str,
+        command_type: &str,
+        payload: &str,
+        matching_events: &[Event],
+        snapshots: &[SnapshotState],
+    ) -> Option<crate::error::Result<CommandDecision>> {
+        let _ = snapshots;
+        self.dispatch(bounded_context, command_type, payload, matching_events)
+    }
+
+    /// The snapshots this dispatcher's command types name in
+    /// [`QueryItemMapping::snapshot`] items (docs/architecture.md §202):
+    /// what the command path reads their versions, defaults and folds
+    /// from, before the lock and under it. `None`, the default, for a
+    /// dispatcher whose command types declare none; a command whose query
+    /// has one is then refused as a configuration error.
+    fn snapshots(&self) -> Option<&dyn SnapshotDispatcher> {
+        None
+    }
 
     /// The registered command type's own `CommandType::required_role()` -
     /// see that method's own doc comment. Outer `None` mirrors
@@ -908,6 +1029,22 @@ pub trait SnapshotDispatcher: Send + Sync {
         state_json: &str,
         event: &Event,
     ) -> Option<crate::error::Result<String>>;
+
+    /// `fold`, for one of the values of the snapshot's tag key `event`
+    /// carries: `Snapshot::fold_for` (docs/architecture.md §202). What
+    /// catch-up and the command path call. The default ignores
+    /// `tag_value` and calls `fold`.
+    fn fold_value(
+        &self,
+        bounded_context: &str,
+        snapshot_name: &str,
+        tag_value: &str,
+        state_json: &str,
+        event: &Event,
+    ) -> Option<crate::error::Result<String>> {
+        let _ = tag_value;
+        self.fold(bounded_context, snapshot_name, state_json, event)
+    }
 
     /// `T::State::default()`, JSON-serialised - the starting point for a
     /// tag value with no stored snapshot yet, or one whose stored

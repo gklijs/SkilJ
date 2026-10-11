@@ -60,7 +60,7 @@ impl CommandDispatcher for HelpdeskDispatcher {
         payload: &str,
         matching_events: &[Event],
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
-        if command_type == "RecentTickets" {
+        if command_type == "RecentTickets" || command_type == "LogContact" {
             self.seen
                 .lock()
                 .unwrap()
@@ -116,6 +116,9 @@ impl CommandDispatcher for HelpdeskDispatcher {
         _bounded_context: &str,
         command_type: &str,
     ) -> Option<Vec<QueryItemMapping>> {
+        if command_type == "LogContact" {
+            return Some(vec![QueryItemMapping::nothing()]);
+        }
         if command_type == "RecentTickets" {
             return Some(vec![QueryItemMapping::types(&["TicketCreated"])
                 .tagged(vec![company()])
@@ -249,6 +252,7 @@ struct Helpdesk {
     created: EventType,
     create_ticket: CommandType,
     recent_tickets: CommandType,
+    log_contact: CommandType,
 }
 
 async fn seed(pool: &Pool) -> Helpdesk {
@@ -306,6 +310,12 @@ async fn seed(pool: &Pool) -> Helpdesk {
     db::upsert_command_type(pool, &recent_tickets)
         .await
         .unwrap();
+    let log_contact = CommandType {
+        name: "LogContact".to_string(),
+        tag_mappings: vec![company()],
+        ..create_ticket.clone()
+    };
+    db::upsert_command_type(pool, &log_contact).await.unwrap();
     Helpdesk {
         bc,
         signed_up,
@@ -313,6 +323,7 @@ async fn seed(pool: &Pool) -> Helpdesk {
         created,
         create_ticket,
         recent_tickets,
+        log_contact,
     }
 }
 
@@ -508,6 +519,7 @@ async fn submit(
         None,
         test_now(),
         None,
+        &[],
         None,
         Some(resolved.covered_through),
     )
@@ -641,6 +653,7 @@ fn a_batch_rechecks_each_command_against_its_own_query() {
                 initial_decision: resolved.decision,
                 now: test_now(),
                 snapshot: None,
+                snapshot_states: Vec::new(),
                 idempotency_key: None,
                 event_types_by_name: std::collections::HashMap::new(),
                 resolved: std::collections::HashMap::new(),
@@ -728,6 +741,7 @@ fn an_item_keeps_its_last_n_matches() {
             None,
             test_now(),
             None,
+            &[],
             None,
             Some(resolved.covered_through),
         )
@@ -782,6 +796,7 @@ fn a_batch_rechecks_a_query_its_tag_query_does_not_cover() {
             initial_decision: resolved.decision,
             now: test_now(),
             snapshot: None,
+            snapshot_states: Vec::new(),
             idempotency_key: None,
             event_types_by_name: std::collections::HashMap::new(),
             resolved: std::collections::HashMap::new(),
@@ -831,5 +846,142 @@ fn an_item_whose_tag_derives_nothing_matches_nothing() {
             events.iter().filter(|e| query_matches(&derived, e)).count(),
             1
         );
+    });
+}
+
+/// A `BatchedCommand` of `command_type` for what `resolved` read.
+fn batched(
+    command_type: &CommandType,
+    payload: String,
+    resolved: db::ResolvedCommandSubmission,
+) -> db::BatchedCommand {
+    db::BatchedCommand {
+        command_type: command_type.clone(),
+        payload,
+        client_id: "client".to_string(),
+        correlation_id: None,
+        causation_id: None,
+        bounded_context_events: resolved.bounded_context_events,
+        covered_through: Some(resolved.covered_through),
+        consistency_tags: resolved.consistency_tags,
+        matching_events: resolved.matching_events,
+        initial_decision: resolved.decision,
+        now: test_now(),
+        snapshot: None,
+        snapshot_states: Vec::new(),
+        idempotency_key: None,
+        event_types_by_name: std::collections::HashMap::new(),
+        resolved: std::collections::HashMap::new(),
+    }
+}
+
+/// docs/architecture.md §201: `LogContact`'s query is
+/// `QueryItemMapping::nothing()`. Its `decide()` gets no events though the
+/// company has a history, and an event carrying the company's tag
+/// committed between read and lock is no conflict - alone, and in a batch
+/// next to a `CreateTicket` whose own re-check still runs. The command is
+/// still tagged by company, and records the query it was decided with.
+#[test]
+fn a_query_of_nothing_reads_no_history_and_never_conflicts() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let h = seed(&pool).await;
+        record(&pool, &h.bc, &h.signed_up, "acme", None).await;
+        record(&pool, &h.bc, &h.created, "acme", Some("t1")).await;
+        let dispatcher = HelpdeskDispatcher::new();
+        let cache = EventCache::new(1000);
+        let contact = serde_json::json!({ "company_id": "acme" }).to_string();
+        let resolve_contact = || {
+            db::resolve_command_submission(
+                &pool,
+                &dispatcher,
+                &NoSnapshots,
+                &cache,
+                &h.log_contact,
+                &contact,
+            )
+        };
+
+        let resolved = resolve_contact().await.unwrap();
+        assert!(resolved.bounded_context_events.is_empty());
+        assert!(resolved.matching_events.is_empty());
+        record(&pool, &h.bc, &h.created, "acme", Some("t2")).await;
+        let outcome = db::submit_command(
+            &pool,
+            &dispatcher,
+            &NoProjections,
+            &EventBroadcaster::new(16),
+            &cache,
+            &h.log_contact,
+            &contact,
+            "client",
+            None,
+            None,
+            &resolved.bounded_context_events,
+            &resolved.consistency_tags,
+            &resolved.matching_events,
+            resolved.decision,
+            None,
+            test_now(),
+            None,
+            &[],
+            None,
+            Some(resolved.covered_through),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kind(&outcome), "accepted");
+        assert_eq!(dispatcher.calls(), vec![Vec::<i64>::new()], "no redispatch");
+
+        let commands = db::list_commands_for_bounded_context(&pool, &h.bc.name)
+            .await
+            .unwrap();
+        let command = commands.last().unwrap();
+        assert_eq!(
+            command.consistency_tags,
+            vec![Tag {
+                key: "company".to_string(),
+                value: Some("acme".to_string()),
+            }]
+        );
+        assert_eq!(command.consistency_query.len(), 1);
+        assert!(command.consistency_query[0].event_types.is_empty());
+        assert!(command.consistency_query[0].tags.is_empty());
+
+        let batch = vec![
+            batched(
+                &h.log_contact,
+                contact.clone(),
+                resolve_contact().await.unwrap(),
+            ),
+            batched(
+                &h.create_ticket,
+                payload("t3"),
+                resolve(&pool, &h, &dispatcher, &cache, "t3").await,
+            ),
+            batched(
+                &h.log_contact,
+                contact.clone(),
+                resolve_contact().await.unwrap(),
+            ),
+        ];
+        let expired = record(&pool, &h.bc, &h.expired, "acme", None).await;
+        let results =
+            db::submit_command_batch(&pool, &dispatcher, &NoProjections, None, &h.bc.name, batch)
+                .await
+                .unwrap();
+        let kinds: Vec<String> = results
+            .iter()
+            .map(|r| kind(r.as_ref().unwrap()).to_string())
+            .collect();
+        assert_eq!(kinds, ["accepted", "company_expired", "accepted"]);
+        let calls = dispatcher.calls();
+        // One call per resolve, then one redispatch: the ticket's, with the
+        // expiry in place of the sign-up.
+        assert_eq!(calls.len(), 5, "{calls:?}");
+        assert_eq!(calls[4], vec![expired]);
+        assert!(calls[..4].iter().filter(|c| c.is_empty()).count() == 3);
     });
 }

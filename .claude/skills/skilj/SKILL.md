@@ -43,10 +43,10 @@ projection consuming that event type folds it in afterward.
 
 There is a fourth plugin type, `Snapshot` - an optional accelerator for
 `decide()` against a large per-entity history, its own trait with its
-own registration and inspection endpoint - but it's a distinct,
-narrower concept, not part of this decision tree, and out of scope for
-this skill; see `docs/architecture.md`'s `Snapshot` section if that's
-what you're looking for.
+own registration and inspection endpoint. It isn't part of this decision
+tree: a command uses one through a snapshot item in its consistency
+query (see `references/command-type.md`, "snapshot items"), and
+`docs/architecture.md` §202 has the design.
 
 ## The three traits, at a glance
 

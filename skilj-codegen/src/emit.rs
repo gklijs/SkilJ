@@ -89,11 +89,21 @@ fn tag_mappings_fn(tags: &BTreeMap<String, String>) -> Option<TokenStream> {
 /// `None` when `query` is empty - the trait's own default (no query)
 /// covers that, as `tag_mappings_fn` does for no tags. Each item's tags
 /// are looked up in the command type's own `tags`; `spec::validate` has
-/// already refused one that isn't there.
+/// already refused one that isn't there. `reads_nothing` is the lone
+/// `QueryItemMapping::nothing()` (docs/architecture.md §201); `spec::validate`
+/// has refused it together with items.
 fn consistency_query_fn(
     query: &[QueryItemSpec],
+    reads_nothing: bool,
     tags: &BTreeMap<String, String>,
 ) -> Option<TokenStream> {
+    if reads_nothing {
+        return Some(quote! {
+            fn consistency_query() -> Vec<::skilj_core::shared::QueryItemMapping> {
+                Vec::from([::skilj_core::shared::QueryItemMapping::nothing()])
+            }
+        });
+    }
     if query.is_empty() {
         return None;
     }
@@ -112,6 +122,7 @@ fn consistency_query_fn(
                 event_types: Vec::from([#(#event_types.to_string()),*]),
                 tag_mappings: Vec::from([#(#tag_mappings),*]),
                 latest: #latest,
+                snapshot: None,
             }
         }
     });
@@ -157,7 +168,7 @@ fn emit_command_type(command: &CommandTypeSpec, event_enum_ident: &syn::Ident) -
     let marker_ident = format_ident!("{}", command.name);
     let name_lit = &command.name;
     let tag_fn = tag_mappings_fn(&command.tags);
-    let query_fn = consistency_query_fn(&command.query, &command.tags);
+    let query_fn = consistency_query_fn(&command.query, command.reads_nothing, &command.tags);
     let rest_fn = command.rest_trigger_allowed.then(|| {
         quote! {
             fn rest_trigger_allowed() -> bool { true }

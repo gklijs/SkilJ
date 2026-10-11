@@ -4894,6 +4894,32 @@ fn event_owner(owner_tag_key: Option<&str>, event: &Event) -> Option<String> {
     })
 }
 
+/// Set in every `snapshots.snapshot_version` this version writes: its
+/// rows fold an event into every value of the tag key the event carries
+/// (docs/architecture.md §202), where earlier versions folded it into the
+/// first only. A row without it - written before the upgrade, or by an
+/// older instance during a rolling deploy - never matches, so it is
+/// treated as at an older `Snapshot::VERSION`: absent to a command, and
+/// reset and refolded by catch-up when an event next touches its value.
+const SNAPSHOT_EVERY_VALUE_FOLD: i64 = 1 << 40;
+
+/// The `snapshots.snapshot_version` a row folded by this version at
+/// `Snapshot::VERSION` `version` carries.
+fn stored_snapshot_version(version: u64) -> i64 {
+    (version as i64) | SNAPSHOT_EVERY_VALUE_FOLD
+}
+
+/// The `Snapshot::VERSION` a stored `snapshot_version` was folded at, as
+/// the read functions report it: 0 for a row from before
+/// [`SNAPSHOT_EVERY_VALUE_FOLD`], which no current `VERSION` trusts.
+fn reported_snapshot_version(stored: i64) -> u64 {
+    if stored & SNAPSHOT_EVERY_VALUE_FOLD == 0 {
+        0
+    } else {
+        (stored & !SNAPSHOT_EVERY_VALUE_FOLD) as u64
+    }
+}
+
 /// `(snapshot_version, as_of_sequence, state, updated_at)` -
 /// `get_snapshot_state`'s own return shape, named to satisfy
 /// `clippy::type_complexity` rather than because anything else reuses
@@ -4909,7 +4935,9 @@ type SnapshotStateRow = (u64, i64, String, DateTime<Utc>);
 /// "nothing yet" and "a stored `snapshot_version` that no longer
 /// matches the currently-registered `Snapshot::VERSION`" identically -
 /// a cold start, not an error - see `CommandType::decide_from_snapshot`'s
-/// own doc comment.
+/// own doc comment. The version is reported without the every-value
+/// flag the stored column carries, and as 0 for a row folded before
+/// docs/architecture.md §202.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_snapshot_state(
     pool: &Pool,
@@ -4930,7 +4958,12 @@ pub async fn get_snapshot_state(
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|(version, as_of_sequence, state, updated_at)| {
-        (version as u64, as_of_sequence, state, updated_at)
+        (
+            reported_snapshot_version(version),
+            as_of_sequence,
+            state,
+            updated_at,
+        )
     }))
 }
 
@@ -4965,9 +4998,54 @@ pub async fn get_snapshot_state_and_owner(
     .await?;
     Ok(
         row.map(|(version, as_of_sequence, state, updated_at, owner)| {
-            ((version as u64, as_of_sequence, state, updated_at), owner)
+            (
+                (
+                    reported_snapshot_version(version),
+                    as_of_sequence,
+                    state,
+                    updated_at,
+                ),
+                owner,
+            )
         }),
     )
+}
+
+/// For each `(snapshot_name, tag_key, tag_value, Snapshot::VERSION)`, in
+/// order, the stored row's `(as_of_sequence, state)` when it is current -
+/// folded at that `VERSION` under the every-value rule
+/// ([`stored_snapshot_version`]) - and `None` when there is none or it
+/// isn't. One statement for all of them (docs/architecture.md §202).
+async fn get_current_snapshot_rows(
+    pool: &Pool,
+    bounded_context: &str,
+    wanted: &[(&str, &str, &str, u64)],
+) -> crate::error::Result<Vec<Option<(i64, String)>>> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = schema_ident(bounded_context);
+    let names: Vec<&str> = wanted.iter().map(|w| w.0).collect();
+    let keys: Vec<&str> = wanted.iter().map(|w| w.1).collect();
+    let values: Vec<&str> = wanted.iter().map(|w| w.2).collect();
+    let versions: Vec<i64> = wanted
+        .iter()
+        .map(|w| stored_snapshot_version(w.3))
+        .collect();
+    let rows: Vec<(i32, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT w.ord::int, s.as_of_sequence, s.state::text          FROM unnest($1::text[], $2::text[], $3::text[], $4::bigint[])              WITH ORDINALITY AS w(snapshot_name, tag_key, tag_value, snapshot_version, ord)          JOIN {schema}.snapshots s ON s.snapshot_name = w.snapshot_name              AND s.tag_key = w.tag_key AND s.tag_value = w.tag_value              AND s.snapshot_version = w.snapshot_version"
+    )))
+    .bind(&names)
+    .bind(&keys)
+    .bind(&values)
+    .bind(&versions)
+    .fetch_all(pool)
+    .await?;
+    let mut found = vec![None; wanted.len()];
+    for (ord, as_of_sequence, state) in rows {
+        found[ord as usize - 1] = Some((as_of_sequence, state));
+    }
+    Ok(found)
 }
 
 /// What `submit_command`'s own snapshot-accelerated `decide_from_snapshot`
@@ -5018,14 +5096,16 @@ pub async fn resolve_snapshot_context(
     let version = snapshot_dispatcher
         .version(bounded_context, snapshot_name)
         .unwrap_or(0);
-    let stored =
-        get_snapshot_state(pool, bounded_context, snapshot_name, tag_key, tag_value).await?;
+    let stored = get_current_snapshot_rows(
+        pool,
+        bounded_context,
+        &[(snapshot_name, tag_key, tag_value.as_str(), version)],
+    )
+    .await?
+    .pop()
+    .flatten();
     let (as_of_sequence, state_json) = match stored {
-        Some((stored_version, as_of_sequence, state_json, _updated_at))
-            if stored_version == version =>
-        {
-            (as_of_sequence, state_json)
-        }
+        Some((as_of_sequence, state_json)) => (as_of_sequence, state_json),
         _ => (
             -1,
             snapshot_dispatcher
@@ -6546,6 +6626,28 @@ async fn list_events_matching_query_with_bc(
     after_sequence: Option<i64>,
     known_event_types: Option<&std::collections::HashMap<String, EventType>>,
 ) -> crate::error::Result<Vec<Event>> {
+    list_events_matching_items_with_bc(
+        conn,
+        bc,
+        query,
+        &vec![after_sequence; query.len()],
+        known_event_types,
+    )
+    .await
+}
+
+/// [`list_events_matching_query_with_bc`] with a position of its own per
+/// item: `afters[i]` for `query[i]`. A snapshot item reads its tag value's
+/// events after the stored row's `as_of_sequence`, the other items their
+/// whole history, in the one statement (docs/architecture.md §202). The
+/// result is every event some item matched past that item's position.
+async fn list_events_matching_items_with_bc(
+    conn: &mut sqlx::PgConnection,
+    bc: &BoundedContext,
+    query: &[QueryItem],
+    afters: &[Option<i64>],
+    known_event_types: Option<&std::collections::HashMap<String, EventType>>,
+) -> crate::error::Result<Vec<Event>> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
@@ -6561,10 +6663,22 @@ async fn list_events_matching_query_with_bc(
         binds.push(bind);
         format!("${}", binds.len())
     };
-    let after =
-        after_sequence.map(|after| format!("{}::bigint", param(&mut binds, Bind::Sequence(after))));
+    // One parameter per distinct position, so a query with one position
+    // for every item sends the statement it always did.
+    let mut positions: Vec<(i64, String)> = Vec::new();
     let mut selects = Vec::with_capacity(query.len());
-    for item in query {
+    for (item, item_after) in query.iter().zip(afters) {
+        let after = item_after.map(|after| {
+            match positions.iter().find(|(position, _)| *position == after) {
+                Some((_, placeholder)) => placeholder.clone(),
+                None => {
+                    let placeholder =
+                        format!("{}::bigint", param(&mut binds, Bind::Sequence(after)));
+                    positions.push((after, placeholder.clone()));
+                    placeholder
+                }
+            }
+        });
         let after_clause = |column: &str| match &after {
             Some(after) => format!(" AND {column} > {after}"),
             None => String::new(),
@@ -6658,6 +6772,167 @@ async fn list_events_matching_query_with_bc(
     }
     let rows: Vec<EventRowAnyType> = statement.fetch_all(&mut *conn).await?;
     events_from_rows(conn, bc, rows, known_event_types).await
+}
+
+/// The snapshot state `item` reads, when it is a snapshot item whose tag
+/// derived a value: the entry of `states` for its snapshot and value.
+fn snapshot_state_of<'s>(
+    item: &QueryItem,
+    states: &'s [crate::plugin::SnapshotState],
+) -> Option<&'s crate::plugin::SnapshotState> {
+    let (Some(name), [tag]) = (&item.snapshot, item.tags.as_slice()) else {
+        return None;
+    };
+    let value = tag.value.as_deref()?;
+    states
+        .iter()
+        .find(|state| state.snapshot == *name && state.tag_value == value)
+}
+
+/// Folds every event of `events` (in sequence order) past a state's
+/// `folded_through` into each of `states` it belongs to - an event
+/// matching a snapshot item of `query` for that snapshot and value - with
+/// the snapshot's own fold for that value (docs/architecture.md §202).
+fn fold_into_snapshot_states(
+    snapshots: &dyn crate::plugin::SnapshotDispatcher,
+    bounded_context: &str,
+    query: &[QueryItem],
+    states: &mut [crate::plugin::SnapshotState],
+    events: &[Event],
+) -> crate::error::Result<()> {
+    for event in events {
+        for state in states.iter_mut() {
+            if event.sequence <= state.folded_through {
+                continue;
+            }
+            let belongs = query.iter().any(|item| {
+                item.snapshot.as_deref() == Some(state.snapshot.as_str())
+                    && item.tags.first().and_then(|t| t.value.as_deref())
+                        == Some(state.tag_value.as_str())
+                    && item.matches(event)
+            });
+            if !belongs {
+                continue;
+            }
+            let folded = snapshots
+                .fold_value(
+                    bounded_context,
+                    &state.snapshot,
+                    &state.tag_value,
+                    &state.state_json,
+                    event,
+                )
+                .ok_or_else(|| unregistered_snapshot(&state.snapshot))??;
+            state.state_json = folded;
+            state.folded_through = event.sequence;
+        }
+    }
+    Ok(())
+}
+
+fn unregistered_snapshot(name: &str) -> crate::error::Error {
+    crate::error::Error::configuration(format!(
+        "a consistency_query() item names snapshot {name}, which this instance doesn't register"
+    ))
+}
+
+/// A command's read before the lock when its query has snapshot items
+/// (docs/architecture.md §202). The stored rows of every snapshot and tag
+/// value the items derive come first, in one statement; a row that is
+/// missing, or at another `Snapshot::VERSION`, is the default state at -1.
+/// Then one read of every item: a snapshot item past its row's
+/// `as_of_sequence`, the others their whole history - from the event
+/// cache when its window holds everything after the lowest of those
+/// positions, else from Postgres. The events past each state's position
+/// are folded into it. Returns the events read, the position the read is
+/// complete through, and the states.
+async fn read_query_with_snapshots(
+    pool: &Pool,
+    cache: &crate::event_cache::EventCache,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    bounded_context: &str,
+    query: &[QueryItem],
+) -> crate::error::Result<(Vec<Event>, i64, Vec<crate::plugin::SnapshotState>)> {
+    let Some(snapshots) = dispatcher.snapshots() else {
+        let name = query
+            .iter()
+            .find_map(|item| item.snapshot.as_deref())
+            .unwrap_or_default();
+        return Err(unregistered_snapshot(name));
+    };
+    let mut wanted: Vec<(&str, &str, &str, u64)> = Vec::new();
+    for item in query {
+        let (Some(name), [tag]) = (&item.snapshot, item.tags.as_slice()) else {
+            continue;
+        };
+        let Some(value) = tag.value.as_deref() else {
+            continue;
+        };
+        if wanted.iter().any(|w| w.0 == name && w.2 == value) {
+            continue;
+        }
+        let version = snapshots
+            .version(bounded_context, name)
+            .ok_or_else(|| unregistered_snapshot(name))?;
+        wanted.push((name, tag.key.as_str(), value, version));
+    }
+    let rows = get_current_snapshot_rows(pool, bounded_context, &wanted).await?;
+    let mut states = Vec::with_capacity(wanted.len());
+    for ((name, _, value, _), row) in wanted.iter().zip(rows) {
+        let (folded_through, state_json) = match row {
+            Some(row) => row,
+            None => (
+                -1,
+                snapshots
+                    .default_state(bounded_context, name)
+                    .ok_or_else(|| unregistered_snapshot(name))?,
+            ),
+        };
+        states.push(crate::plugin::SnapshotState {
+            snapshot: name.to_string(),
+            tag_value: value.to_string(),
+            state_json,
+            folded_through,
+        });
+    }
+
+    let afters: Vec<Option<i64>> = query
+        .iter()
+        .map(|item| snapshot_state_of(item, &states).map(|state| state.folded_through))
+        .collect();
+    let lowest = afters.iter().map(|a| a.unwrap_or(-1)).min().unwrap_or(-1);
+    let past_its_item = |event: &Event| {
+        query
+            .iter()
+            .zip(&afters)
+            .any(|(item, after)| item.matches(event) && event.sequence > after.unwrap_or(-1))
+    };
+    let (events, covered_through) = match cache
+        .try_events_matching_query(pool, bounded_context, query, lowest)
+        .await?
+    {
+        Some((events, covered_through)) => (
+            events.into_iter().filter(|e| past_its_item(e)).collect(),
+            covered_through,
+        ),
+        None => {
+            let (covered_through, bc) = futures_util::try_join!(
+                latest_sequence(pool, bounded_context),
+                require_bounded_context(pool, bounded_context),
+            )?;
+            let events = list_events_matching_items_with_bc(
+                &mut *pool.acquire().await?,
+                &bc,
+                query,
+                &afters,
+                None,
+            )
+            .await?;
+            (events, covered_through.unwrap_or(-1))
+        }
+    };
+    fold_into_snapshot_states(snapshots, bounded_context, query, &mut states, &events)?;
+    Ok((events, covered_through, states))
 }
 
 /// `list_events_matching_query_with_bc` for a command's read before the
@@ -8265,6 +8540,7 @@ pub async fn submit_command(
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
     snapshot: Option<SnapshotContext<'_>>,
+    snapshot_states: &[crate::plugin::SnapshotState],
     idempotency_key: Option<&str>,
     covered_through: Option<i64>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
@@ -8312,6 +8588,7 @@ pub async fn submit_command(
         encryption_master_key,
         now,
         snapshot,
+        snapshot_states,
         idempotency_key,
         locked_highest,
         &sync_projections,
@@ -8487,7 +8764,9 @@ fn recheck_from(
 /// at, up to `locked_highest`. Each command then keeps its own part in
 /// memory - the events past its own position matching its own tags -
 /// which is exactly what its own query would have returned, through the
-/// same tag index. `None` when no command needs a re-check.
+/// same tag index. `None` when no command needs a re-check. A command
+/// whose query reads nothing needs none (docs/architecture.md §201), and
+/// its tags would only widen the query.
 ///
 /// The tag list is padded, repeating its last tag, to a power of two: the
 /// query's text has one `OR` term per tag, and a batch's union varies in
@@ -8495,6 +8774,7 @@ fn recheck_from(
 /// every batch.
 async fn batch_recheck_delta(
     conn: &mut sqlx::PgConnection,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
     batch: &[BatchedCommand],
     locked_highest: i64,
 ) -> crate::error::Result<Option<Vec<Event>>> {
@@ -8506,7 +8786,14 @@ async fn batch_recheck_delta(
             item.snapshot.as_ref().map(|s| s.as_of_sequence),
             item.covered_through,
         );
-        if covered >= locked_highest || item.consistency_tags.is_empty() {
+        if covered >= locked_highest
+            || item.consistency_tags.is_empty()
+            || crate::event_store::query_reads_nothing(&command_consistency_query(
+                dispatcher,
+                &item.command_type,
+                &item.payload,
+            ))
+        {
             continue;
         }
         from = Some(from.map_or(covered, |f| f.min(covered)));
@@ -8551,6 +8838,18 @@ async fn batch_recheck_delta(
         "command decide delta query"
     );
     Ok(Some(events))
+}
+
+/// The highest position any of `states` holds its value's events
+/// through: a snapshot item's part of a command's consistency boundary
+/// (docs/architecture.md §202). `None` when there are no states, or none
+/// holds an event.
+fn states_boundary(states: &[crate::plugin::SnapshotState]) -> Option<i64> {
+    states
+        .iter()
+        .map(|state| state.folded_through)
+        .filter(|position| *position >= 0)
+        .max()
 }
 
 /// Idempotency keys claimed by commands earlier in the same batch, by
@@ -8625,6 +8924,7 @@ async fn decide_command_in_tx(
     matching_events: &[Event],
     initial_decision: crate::shared::CommandDecision,
     snapshot: Option<SnapshotContext<'_>>,
+    snapshot_states: &[crate::plugin::SnapshotState],
     idempotency_key: Option<&str>,
     locked_highest: i64,
     extra_committed_events: &[Event],
@@ -8686,7 +8986,8 @@ async fn decide_command_in_tx(
     // below needs an extended one. The boundary is a plain maximum, raised
     // by the delta's.
     let mut consistency_boundary =
-        crate::event_store::query_boundary(&query, bounded_context_events);
+        crate::event_store::query_boundary(&query, bounded_context_events)
+            .max(states_boundary(snapshot_states));
     // Codeberg issue #7: `None` is the caller's own pre-lock set,
     // replaced below only if a DCB conflict forced a redispatch -
     // whichever one actually produced `final_decision` is the one a
@@ -8742,6 +9043,9 @@ async fn decide_command_in_tx(
             })
             .cloned()
             .collect()
+    } else if crate::event_store::query_reads_nothing(&consistency_query) {
+        // docs/architecture.md §201: no event can match, so none conflicts.
+        Vec::new()
     } else if locked_highest > covered && !consistency_query.is_empty() {
         // Every event matching any item counts, however many matches the
         // item keeps: a newer one displaces the oldest the command
@@ -8819,9 +9123,27 @@ async fn decide_command_in_tx(
         extended.sort_by_key(|e| e.sequence);
         // The query selects again over the extended history: a newer
         // match displaces an item's oldest kept one when it keeps a count.
-        let redispatch_matching_events =
-            crate::event_store::select_matching_events(&query, &extended);
-        consistency_boundary = redispatch_matching_events.iter().map(|e| e.sequence).max();
+        // A snapshot item's new events are folded into its state instead
+        // (docs/architecture.md §202).
+        let redispatch_matching_events = crate::event_store::select_matching_events(
+            &decided_on(&consistency_query, consistency_tags),
+            &extended,
+        );
+        let mut redispatch_states = snapshot_states.to_vec();
+        if !redispatch_states.is_empty() {
+            let snapshots = dispatcher
+                .snapshots()
+                .ok_or_else(|| unregistered_snapshot(&redispatch_states[0].snapshot))?;
+            fold_into_snapshot_states(
+                snapshots,
+                &bounded_context_name,
+                &consistency_query,
+                &mut redispatch_states,
+                &extended,
+            )?;
+        }
+        consistency_boundary = crate::event_store::query_boundary(&query, &extended)
+            .max(states_boundary(&redispatch_states));
         // docs/architecture.md §19: a snapshot-accelerated initial
         // decision redispatches through `dispatch_from_snapshot`
         // again too, not the ordinary `dispatch` - the snapshot's
@@ -8843,11 +9165,12 @@ async fn decide_command_in_tx(
                 Some(Err(e)) => return Err(e),
                 Some(Ok(d)) => d,
             },
-            None => match dispatcher.dispatch(
+            None => match dispatcher.dispatch_with(
                 &bounded_context_name,
                 &command_type.name,
                 payload,
                 &redispatch_matching_events,
+                &redispatch_states,
             ) {
                 None => return Err(crate::error::Error::NoDeciderRegistered),
                 Some(Err(e)) => return Err(e),
@@ -9147,6 +9470,7 @@ async fn submit_one_command_in_tx(
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
     snapshot: Option<SnapshotContext<'_>>,
+    snapshot_states: &[crate::plugin::SnapshotState],
     idempotency_key: Option<&str>,
     locked_highest: i64,
     sync_projections: &[String],
@@ -9167,6 +9491,7 @@ async fn submit_one_command_in_tx(
         matching_events,
         initial_decision,
         snapshot,
+        snapshot_states,
         idempotency_key,
         locked_highest,
         extra_committed_events,
@@ -9257,6 +9582,9 @@ pub struct BatchedCommand {
     pub initial_decision: crate::shared::CommandDecision,
     pub now: DateTime<Utc>,
     pub snapshot: Option<OwnedSnapshotContext>,
+    /// See `ResolvedCommandSubmission::snapshot_states`
+    /// (docs/architecture.md §202).
+    pub snapshot_states: Vec<crate::plugin::SnapshotState>,
     pub idempotency_key: Option<String>,
     /// Pre-lock-warmed by this command's own original caller, via
     /// `warm_up_event_types_and_encryption_keys`, before it ever joined a
@@ -9725,7 +10053,7 @@ async fn write_command_batch_as_set(
     let mut highest_assigned = locked_highest;
 
     let decide_started = std::time::Instant::now();
-    let batch_delta = batch_recheck_delta(tx, batch, locked_highest).await?;
+    let batch_delta = batch_recheck_delta(tx, dispatcher, batch, locked_highest).await?;
     for (index, item) in batch.iter().enumerate() {
         let decided = decide_command_in_tx(
             tx,
@@ -9741,6 +10069,7 @@ async fn write_command_batch_as_set(
                 state_json: &s.state_json,
                 as_of_sequence: s.as_of_sequence,
             }),
+            &item.snapshot_states,
             item.idempotency_key.as_deref(),
             locked_highest,
             &extra_committed_events,
@@ -10425,6 +10754,7 @@ async fn commit_command_batch_per_command(
                 state_json: &s.state_json,
                 as_of_sequence: s.as_of_sequence,
             }),
+            &item.snapshot_states,
             item.idempotency_key.as_deref(),
             locked_highest,
             &extra_committed_events,
@@ -10597,6 +10927,9 @@ pub struct ResolvedCommandSubmission {
     pub matching_events: Vec<Event>,
     pub decision: crate::shared::CommandDecision,
     pub snapshot_context: Option<ResolvedSnapshot>,
+    /// The states of the query's snapshot items, as of the read
+    /// (docs/architecture.md §202) - empty for a query without any.
+    pub snapshot_states: Vec<crate::plugin::SnapshotState>,
 }
 
 /// `CommandType::consistency_query`, as `dispatcher` holds it for
@@ -10658,27 +10991,45 @@ pub async fn resolve_command_submission(
         _ => None,
     };
 
-    let (bounded_context_events, covered_through) = if consistency_query.is_empty() {
-        list_events_for_bounded_context_matching_tags_cached(
-            pool,
-            event_cache,
-            &bounded_context_name,
-            &consistency_tags,
-            snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
-        )
-        .await?
-    } else {
-        list_events_matching_query_cached(
-            pool,
-            event_cache,
-            &bounded_context_name,
-            &consistency_query,
-            None,
-        )
-        .await?
-    };
+    let mut snapshot_states = Vec::new();
+    let (bounded_context_events, covered_through) =
+        if crate::event_store::query_reads_nothing(&consistency_query) {
+            // docs/architecture.md §201: no history to read, and the re-check
+            // under the lock skips it too, so the position it would start from
+            // doesn't matter.
+            (Vec::new(), -1)
+        } else if crate::event_store::query_has_snapshots(&consistency_query) {
+            let (events, covered_through, states) = read_query_with_snapshots(
+                pool,
+                event_cache,
+                dispatcher,
+                &bounded_context_name,
+                &consistency_query,
+            )
+            .await?;
+            snapshot_states = states;
+            (events, covered_through)
+        } else if consistency_query.is_empty() {
+            list_events_for_bounded_context_matching_tags_cached(
+                pool,
+                event_cache,
+                &bounded_context_name,
+                &consistency_tags,
+                snapshot_context.as_ref().map(|ctx| ctx.as_of_sequence),
+            )
+            .await?
+        } else {
+            list_events_matching_query_cached(
+                pool,
+                event_cache,
+                &bounded_context_name,
+                &consistency_query,
+                None,
+            )
+            .await?
+        };
     let matching_events = crate::event_store::select_matching_events(
-        &crate::event_store::effective_query(&consistency_query, &consistency_tags),
+        &decided_on(&consistency_query, &consistency_tags),
         &bounded_context_events,
     );
 
@@ -10693,11 +11044,12 @@ pub async fn resolve_command_submission(
             )
             .ok_or(crate::error::Error::NoDeciderRegistered)??,
         None => dispatcher
-            .dispatch(
+            .dispatch_with(
                 &bounded_context_name,
                 &command_type.name,
                 payload,
                 &matching_events,
+                &snapshot_states,
             )
             .ok_or(crate::error::Error::NoDeciderRegistered)??,
     };
@@ -10710,7 +11062,20 @@ pub async fn resolve_command_submission(
         matching_events,
         decision,
         snapshot_context,
+        snapshot_states,
     })
+}
+
+/// The items whose events `decide()` is handed: the command's query
+/// without its snapshot items, whose events are folded into their states
+/// instead (docs/architecture.md §202), or the default, one item per
+/// consistency tag, for a command type that declares no query.
+fn decided_on(consistency_query: &[QueryItem], consistency_tags: &[Tag]) -> Vec<QueryItem> {
+    if consistency_query.is_empty() {
+        crate::event_store::effective_query(consistency_query, consistency_tags)
+    } else {
+        crate::event_store::event_items(consistency_query)
+    }
 }
 
 /// What [`dry_run_command`] found: `decide()`'s answer, and the matching
@@ -10908,6 +11273,7 @@ pub async fn decide_and_submit_command(
                 state_json: &ctx.state_json,
                 as_of_sequence: ctx.as_of_sequence,
             }),
+        &resolved.snapshot_states,
         idempotency_key,
         Some(resolved.covered_through),
     )
@@ -14484,6 +14850,24 @@ async fn list_projection_partition_progress(
         .collect())
 }
 
+/// The values of `tag_key` `event` carries, each once, in the order it
+/// carries them: the snapshot rows it folds into (docs/architecture.md
+/// §202). A tag with no value has no row.
+fn snapshot_tag_values<'e>(event: &'e Event, tag_key: &str) -> Vec<&'e str> {
+    let mut values: Vec<&str> = Vec::new();
+    for tag in &event.tags {
+        if tag.key != tag_key {
+            continue;
+        }
+        if let Some(value) = tag.value.as_deref() {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+    }
+    values
+}
+
 /// One snapshot row's state while a chunk is folded: read and locked
 /// before the chunk's events are folded into it, written back once after
 /// (docs/architecture.md §197).
@@ -14539,35 +14923,30 @@ async fn fold_snapshot_chunk_in_tx(
     let Some(tag_key) = dispatcher.tag_key(bounded_context, name) else {
         return Ok(());
     };
-    let version = dispatcher.version(bounded_context, name).unwrap_or(0);
+    let version = stored_snapshot_version(dispatcher.version(bounded_context, name).unwrap_or(0));
     let default_state_json = dispatcher
         .default_state(bounded_context, name)
         .unwrap_or_default();
     let owner_tag_key = dispatcher.owner_tag_key(bounded_context, name).flatten();
 
     // The events this snapshot folds, with the tag value each one folds
-    // into.
+    // into: every value of the key it carries (docs/architecture.md
+    // §202), each once.
     let mut planned: Vec<(usize, &str)> = Vec::new();
     let mut values: Vec<&str> = Vec::new();
     for (index, event) in events.iter().enumerate() {
         if event.sequence <= after {
             continue;
         }
-        let Some(value) = event
-            .tags
-            .iter()
-            .find(|t| t.key == tag_key)
-            .and_then(|t| t.value.as_deref())
-        else {
-            continue;
-        };
-        if let Some((partition_index, partition_count)) = partition {
-            if partition_for_key(value, partition_count) != partition_index {
-                continue;
+        for value in snapshot_tag_values(event, tag_key) {
+            if let Some((partition_index, partition_count)) = partition {
+                if partition_for_key(value, partition_count) != partition_index {
+                    continue;
+                }
             }
+            planned.push((index, value));
+            values.push(value);
         }
-        planned.push((index, value));
-        values.push(value);
     }
     if planned.is_empty() {
         return Ok(());
@@ -14590,7 +14969,7 @@ async fn fold_snapshot_chunk_in_tx(
     .bind(name)
     .bind(tag_key)
     .bind(&values)
-    .bind(version as i64)
+    .bind(version)
     .bind(&default_state_json)
     .fetch_all(&mut *conn)
     .await?;
@@ -14647,7 +15026,9 @@ async fn fold_snapshot_chunk_in_tx(
             if row.as_of_sequence >= event.sequence {
                 continue;
             }
-            if let Some(result) = dispatcher.fold(bounded_context, name, &row.state, event) {
+            if let Some(result) =
+                dispatcher.fold_value(bounded_context, name, value, &row.state, event)
+            {
                 row.state = result.inspect_err(|_| *reached = *index)?;
             }
             row.as_of_sequence = event.sequence;
@@ -14677,7 +15058,7 @@ async fn fold_snapshot_chunk_in_tx(
     )))
     .bind(name)
     .bind(tag_key)
-    .bind(version as i64)
+    .bind(version)
     .bind(&written_values)
     .bind(&states)
     .bind(&owners)
@@ -14811,23 +15192,20 @@ async fn refold_snapshot_histories(
         let full = page.len() as i64 == PAGE;
         let page = events_from_rows(&mut *conn, bc, page, None).await?;
         for event in &page {
-            let Some(value) = event
-                .tags
-                .iter()
-                .find(|t| t.key == tag_key)
-                .and_then(|t| t.value.as_deref())
-            else {
-                continue;
-            };
-            let Some(planned) = refold.get(value) else {
-                continue;
-            };
-            let Some(&(_, index)) = planned.iter().find(|(seq, _)| *seq >= event.sequence) else {
-                continue;
-            };
-            let row = rows.get_mut(value).expect("every refolded row was read");
-            if let Some(result) = dispatcher.fold(&bc.name, name, &row.state, event) {
-                row.state = result.inspect_err(|_| *reached = index)?;
+            for value in snapshot_tag_values(event, tag_key) {
+                let Some(planned) = refold.get(value) else {
+                    continue;
+                };
+                let Some(&(_, index)) = planned.iter().find(|(seq, _)| *seq >= event.sequence)
+                else {
+                    continue;
+                };
+                let row = rows.get_mut(value).expect("every refolded row was read");
+                if let Some(result) =
+                    dispatcher.fold_value(&bc.name, name, value, &row.state, event)
+                {
+                    row.state = result.inspect_err(|_| *reached = index)?;
+                }
             }
         }
         match page.last() {

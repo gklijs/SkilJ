@@ -486,6 +486,10 @@ fn command_type_consistency_query_field(n: &Naming) -> Field {
 
 /// `value QueryItemMapping`: one item of a command type's consistency
 /// query. `latest` is null for every match, else how many of the newest.
+/// An item naming neither event types nor tag mappings is
+/// `QueryItemMapping::nothing()`, alone in its query: the command needs no
+/// history (docs/architecture.md §201). `snapshot` names the snapshot a
+/// snapshot item reads the state of (§202), null for other items.
 pub fn query_item_mapping_object(n: &Naming) -> Object {
     Object::new(n.ty("QueryItemMapping"))
         .field(Field::new(
@@ -512,6 +516,14 @@ pub fn query_item_mapping_object(n: &Naming) -> Object {
             TypeRef::named(TypeRef::INT),
             |item: &QueryItemMapping| match item.latest {
                 Some(count) => Value::from(count),
+                None => Value::Null,
+            },
+        ))
+        .field(scalar_field(
+            "snapshot",
+            TypeRef::named(TypeRef::STRING),
+            |item: &QueryItemMapping| match &item.snapshot {
+                Some(name) => Value::from(name.clone()),
                 None => Value::Null,
             },
         ))

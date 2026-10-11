@@ -147,9 +147,78 @@ fn consistency_query() -> Vec<QueryItemMapping> {
   unnoticed.
 - `build()` refuses an item's event type that isn't registered in the
   same bounded context, an item tag that isn't one of `tag_mappings()`,
-  an item with neither types nor tags, `last(0)`, and a query together with
-  `snapshot()`. Reach for a query before a `Snapshot`: it reads a few
-  index entries instead of a growing history, and needs no catch-up.
+  an item with neither types nor tags (other than a lone `nothing()`,
+  below), `last(0)`, and a query together with `snapshot()`. Reach for a
+  query before a `Snapshot`: it reads a few index entries instead of a
+  growing history, and needs no catch-up. When the decision is a fold
+  over a long history, put the `Snapshot` in the query (below).
+
+### When `decide()` needs no history: `QueryItemMapping::nothing()`
+
+Some commands decide from the payload alone - a deposit with no cap,
+logging a contact, adding a note. Declare that, and the command reads no
+events and nothing ever conflicts with it (docs/architecture.md §201):
+
+```rust
+fn tag_mappings() -> Vec<TagMapping> { vec![account()] } // still tagged
+fn consistency_query() -> Vec<QueryItemMapping> {
+    vec![QueryItemMapping::nothing()]
+}
+```
+
+Its `tag_mappings()` still tag the command, so owner scoping works as
+before - which is what dropping the tag mappings to get an empty
+`matching_events` would lose. `nothing()` must be the only item and
+can't take `.latest()`/`.last(n)`. In a `.skilj.toml`, it's
+`reads_nothing = true` on the `[[command_type]]`. Only use it when
+`decide()` truly checks nothing outside the payload: any rule over
+earlier events (a balance, a uniqueness check, a status) needs those
+events in the query.
+
+### When `decide()` needs a fold over a long history: snapshot items
+
+A balance, a count of open tickets - a value folded over every event of
+an account or requester - grows with history. Put a `Snapshot` in the
+query instead of the events, and implement `decide_with` to read its
+state (docs/architecture.md §202):
+
+```rust
+fn tag_mappings() -> Vec<TagMapping> {
+    vec![account("from"), account("to"), transfer()]
+}
+fn consistency_query() -> Vec<QueryItemMapping> {
+    vec![
+        // Balance's state for the account in payload.from, and for payload.to
+        QueryItemMapping::snapshot::<Balance>("from"),
+        QueryItemMapping::snapshot::<Balance>("to"),
+        // plain items still work next to them
+        QueryItemMapping::types(&["Transferred"]).tagged(vec![transfer()]).latest(),
+    ]
+}
+fn decide_with(payload: &Self::Payload, decision: &Decision<'_, Self::Event>) -> CommandDecision {
+    let Some(from) = decision.snapshot::<Balance>(&payload.from) else { /* misconfigured */ };
+    if !decision.events().is_empty() { /* transfer id used */ }
+    // ...
+}
+```
+
+- `decision.snapshot::<S>(value)` is the stored state with every later
+  event carrying that value already folded in, by the framework, with
+  `S`'s own fold - don't fold anything yourself. `decision.events()` is
+  what the other items selected.
+- Every event carrying a snapshot item's value conflicts with the
+  command, and is folded in before it decides again.
+- A snapshot folds an event into every value of its key the event
+  carries. When the fold depends on which one (a transfer debits `from`
+  and credits `to`), implement `Snapshot::fold_for(state, value, event)`
+  instead of `fold`.
+- The item's field must map under the snapshot's `TAG_KEY` and be one of
+  `tag_mappings()`; it takes no event types and no `latest`. `build()`
+  checks that, and that the snapshot is registered.
+- `decide_with` is optional: its default calls `decide()`, so a command
+  without snapshot items keeps implementing `decide()` only.
+- The older `snapshot()` + `decide_from_snapshot` pair still works for a
+  single-tag command, but new code should use snapshot items.
 
 ## The `Event` associated type
 

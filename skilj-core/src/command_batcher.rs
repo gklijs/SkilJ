@@ -230,6 +230,7 @@ impl CommandBatcher {
         encryption_master_key: Option<&EncryptionMasterKey>,
         now: DateTime<Utc>,
         snapshot: Option<SnapshotContext<'_>>,
+        snapshot_states: &[crate::plugin::SnapshotState],
         idempotency_key: Option<&str>,
         covered_through: Option<i64>,
     ) -> Result<SubmitCommandOutcome> {
@@ -267,6 +268,7 @@ impl CommandBatcher {
                 state_json: s.state_json.to_string(),
                 as_of_sequence: s.as_of_sequence,
             }),
+            snapshot_states: snapshot_states.to_vec(),
             idempotency_key: idempotency_key.map(str::to_string),
             event_types_by_name,
             resolved,
@@ -399,6 +401,7 @@ impl CommandBatcher {
                     state_json: &ctx.state_json,
                     as_of_sequence: ctx.as_of_sequence,
                 }),
+            &resolved.snapshot_states,
             idempotency_key,
             Some(resolved.covered_through),
         )

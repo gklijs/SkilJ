@@ -95,7 +95,9 @@ step like this.
   the company's tag. Note that per command: which event types it needs
   under each tag, and whether only the latest counts. It becomes a
   consistency query (DCB query items) in the `skilj` skill, and it also
-  narrows what conflicts with the command.
+  narrows what conflicts with the command. A command that decides from
+  its payload alone (no rule over earlier events) needs no history at
+  all - note that too; it becomes `QueryItemMapping::nothing()`.
 - **Not every field is a tag.** Tagging is deliberately opt-in and
   narrow - only fields another command's own decision genuinely needs to
   match on. A field nothing else ever needs to see by isn't a tag

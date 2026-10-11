@@ -297,10 +297,18 @@ value QueryItemMapping {
                                  -- tags an item scopes by are always a subset of the
                                  -- command's consistency_tags, which is what owner scoping
                                  -- reads. Empty means the item is unscoped by tag, and is
-                                 -- then only ever valid with at least one event type
+                                 -- then only valid with at least one event type - or
+                                 -- with none, as the nothing item: alone in its query,
+                                 -- no latest, a decision that needs no history
     latest: Integer?             -- null: every event matching this item; n: only the n matching
                                  -- events with the highest sequences (fewer when fewer match).
                                  -- At least 1 when set (see invariant ConsistencyQueryIsWellFormed)
+    snapshot: String?            -- null for an ordinary item. Set, the item is a snapshot item:
+                                 -- it names a summary (see the ProcessCommand note on summaries)
+                                 -- keyed by its one tag mapping's key, and its matches reach
+                                 -- decide() folded into that summary's state for the tag value
+                                 -- the mapping derives, not as events. No event_types and no
+                                 -- latest (invariant ConsistencyQueryIsWellFormed)
 }
 
 -- A QueryItemMapping resolved against one command's payload: its
@@ -311,6 +319,7 @@ value QueryItem {
     event_types: Set<String>
     tags: Set<Tag>
     latest: Integer?
+    snapshot: String?            -- as on the QueryItemMapping it was derived from
 
     -- The DCB item match: the event is of one of the item's types (or the
     -- item names none) AND carries every one of the item's tags. ALL, not
@@ -2156,7 +2165,10 @@ default SystemCreator skilj = { }
 -- non-scalars) leaves an item whose tags no event can carry, since an
 -- item requires every one, and that item resolves with no event_types
 -- and no tags, matching nothing - not with the tag dropped, which would
--- match more than declared. Since every item's tag_mappings are
+-- match more than declared. A snapshot item resolves to one QueryItem
+-- per value its tag mapping derives, each with that one tag - a mapping
+-- over a list names several accounts, each its own summary state - and
+-- to the item matching nothing when it derives no tag with a value. Since every item's tag_mappings are
 -- among the type's own (see invariant ConsistencyQueryIsWellFormed), every tag any item
 -- derives is in consistency_tags too. It yields the empty list for a type
 -- declaring no consistency_query.
@@ -2179,7 +2191,12 @@ default SystemCreator skilj = { }
 --     type gives the latest of each.
 -- The result is in sequence order and holds each event once, however
 -- many items it matches. Its highest sequence is the command's
--- consistency_boundary, as before. An item's latest narrows only what
+-- consistency_boundary, as before. A snapshot item is an item like any
+-- other here: every event carrying its tag is among its matches, counts
+-- toward the boundary and conflicts with the command. Only how decide()
+-- is handed them differs - folded into the summary's state for that tag
+-- value, see the ProcessCommand note on summaries - so a decision over a
+-- long-lived account reads the account's summary, not its history. An item's latest narrows only what
 -- decide() is handed, never what the command conflicts with:
 -- DynamicConsistencyBoundaryHonoured reads Command.in_consistency_query,
 -- which is any item regardless of its latest, so an event committed
@@ -2201,10 +2218,10 @@ default SystemCreator skilj = { }
 -- compiled command type, the same place decide() comes from, and serving
 -- typed items through a per-tag index - is the same register as the
 -- Postgres and indexing notes elsewhere here, and changes nothing above.
--- One limit of the implementation is worth stating where it bites: a
--- snapshot summary (see the ProcessCommand note on it) is never used for
--- a command type with a non-empty consistency_query; that combination is
--- refused when the application is built.
+-- A summary (see the ProcessCommand note on it) joins a query as a
+-- snapshot item; the older form, a summary named beside decide() rather
+-- than in the query, is refused together with a non-empty
+-- consistency_query when the application is built.
 --
 -- Reading events - the Events collections read by FetchEvents and
 -- ProcessCommand below - is served by an in-memory cache of the most
@@ -4059,16 +4076,23 @@ rule ProcessCommand {
     -- identical, way is to combine a periodically-updated, versioned
     -- summary of everything up to some earlier point with only the events
     -- committed since - the same final matching_events either way, just
-    -- cheaper once that summary covers a long prefix. This summary, when
-    -- one exists, is scoped to a single one of consistency_tags' own keys
-    -- (never their union - a command deriving more than one tag simply has
-    -- no such summary to draw on, and computes matching_events the first
-    -- way instead) and is never used at all by a command type declaring
-    -- a non-empty consistency_query, whose items an implementation would
-    -- otherwise have to reconcile with a single-key summary (the
-    -- combination is refused when the application is built, so it never
-    -- arises at run time - see the consistency query note above the
-    -- rules). It is versioned: a summary computed under a
+    -- cheaper once that summary covers a long prefix. A summary is keyed
+    -- by one tag key and holds a state per value of it: every event
+    -- carrying a value of that key is folded into the state of each value
+    -- it carries, the fold told which value it is folding for - a
+    -- transfer tagged with two accounts debits one state and credits the
+    -- other. A command type uses summaries through snapshot items in its
+    -- consistency_query (see value QueryItemMapping): for each, decide()
+    -- is handed the summary's state for the item's tag value, with every
+    -- event carrying that value folded in up to the command's read and,
+    -- on a conflict, again up to the lock - the same information the
+    -- item's matches are, never an approximation of it - next to the
+    -- events of the query's other items. Any number of snapshot items may
+    -- stand in one query, over one summary or several. An older form
+    -- names one summary beside decide() instead, used only when the
+    -- command derives exactly that summary's one tag, and never with a
+    -- non-empty consistency_query (refused when the application is
+    -- built). It is versioned: a summary computed under a
     -- superseded definition is never trusted as current, treated instead
     -- as if none exists yet. See surface SnapshotInspection for the one
     -- place this summary is itself observable - nowhere else does its
@@ -6899,7 +6923,7 @@ invariant ConsistencyQueryIsWellFormed {
     -- validity is not a registration check: the deploying process refuses
     -- to start with a command type whose query breaks any of these, the
     -- same way it refuses a query combined with a snapshot summary (see
-    -- the consistency query note above the rules). Four conditions, each
+    -- the consistency query note above the rules). Each condition is there
     -- for its own reason:
     --
     -- Every event type an item names is an EventType of the command
@@ -6919,12 +6943,29 @@ invariant ConsistencyQueryIsWellFormed {
     -- too, with nothing restated for them.
     --
     -- Every item names at least one event type or at least one tag
-    -- mapping. An item with neither matches every event in the bounded
-    -- context, which is no consistency boundary at all - it would turn
-    -- every concurrent command in the context into a conflict, or with
-    -- latest set hand decide() whatever happened to be committed last. A
+    -- mapping, except the nothing item. Read as an unconstrained DCB item,
+    -- one naming neither would match every event in the bounded context,
+    -- which is no consistency boundary at all; that reading is not
+    -- available, since QueryItem.matches matches nothing for it. A
     -- tag-less item naming event types stays allowed, with or without
-    -- latest (see the note on type-wide reads above the rules).
+    -- latest (see the note on type-wide reads above the rules). The
+    -- nothing item names neither, stands alone in its query and has no
+    -- latest: the query selects no event and no event conflicts with the
+    -- command - a decision made from the payload alone, such as an
+    -- uncapped deposit, while consistency_tags still scope the command
+    -- for owner scoping. It is distinct from the empty query, the
+    -- default, which reads by tag. Next to other items it would be a dead
+    -- item, and with latest a count of events it never reads, so both are
+    -- refused.
+    --
+    -- A snapshot item names a summary the command type's bounded context
+    -- deploys, has exactly one tag mapping, keyed by that summary's own
+    -- tag key - the value whose state it reads - and names no event types
+    -- and no latest: a summary folds every event carrying its value, so a
+    -- narrower item would hand decide() a state built from events the
+    -- item says it doesn't depend on. The summary being deployed is a
+    -- deployment fact, not state here, so only the shape is stated
+    -- below.
     --
     -- And an item's latest, when set, is at least 1: latest = 0 would be
     -- an item that reads nothing yet still conflicts on every match,
@@ -6933,8 +6974,12 @@ invariant ConsistencyQueryIsWellFormed {
         for q in ct.consistency_query:
             q.event_types.all(n => ct.bounded_context.event_types.any(et => et.name = n))
                 and q.tag_mappings.all(m => m in ct.tag_mappings)
-                and (q.event_types.count > 0 or q.tag_mappings.count > 0)
+                and (q.event_types.count > 0 or q.tag_mappings.count > 0
+                    or (ct.consistency_query.count = 1 and q.latest = null))
                 and (q.latest = null or q.latest >= 1)
+                and (q.snapshot = null
+                    or (q.tag_mappings.count = 1 and q.event_types.count = 0
+                        and q.latest = null))
 }
 
 invariant SystemTriggeredClientIdIsSystem {

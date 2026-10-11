@@ -2,7 +2,9 @@
 //! bounded context with one capped `Deposit` command over `Deposited`
 //! events tagged by account, a REST token for it, and a helper that
 //! submits one deposit through the in-process router. `DepositFast` is
-//! the same command deciding from a `Balance` snapshot (§19).
+//! the same command deciding from a `Balance` snapshot item (§19, §202);
+//! `DepositBlind` is an uncapped deposit whose query reads nothing
+//! (§201).
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -15,9 +17,10 @@ use skilj_core::access_control::{self, AccessLevel, Role, RoleAccessMapping, Rol
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::db::{self, Pool};
 use skilj_core::event_store::{BoundedContext, BoundedContextStatus, Event};
-use skilj_core::plugin::BoundedContextEvent;
+use skilj_core::plugin::{BoundedContextEvent, Decision};
 use skilj_core::shared::{
-    generate_token_id, generate_token_secret, CommandDecision, EventSpec, TagMapping,
+    generate_token_id, generate_token_secret, CommandDecision, EventSpec, QueryItemMapping,
+    TagMapping,
 };
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
@@ -132,19 +135,39 @@ impl CommandType for DepositFast {
     fn tag_mappings() -> Vec<TagMapping> {
         Deposit::tag_mappings()
     }
-    fn snapshot() -> Option<&'static str> {
-        Some(Balance::NAME)
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::snapshot::<Balance>("account_id")]
     }
-    fn decide(payload: &Self::Payload, matching_events: &[Self::Event]) -> CommandDecision {
-        deposit_decision(payload, balance_of(matching_events))
-    }
-    fn decide_from_snapshot(
+    fn decide_with(
         payload: &Self::Payload,
-        snapshot_state_json: &str,
-        events_since_snapshot: &[Self::Event],
+        decision: &Decision<'_, Self::Event>,
     ) -> CommandDecision {
-        let state: BalanceState = serde_json::from_str(snapshot_state_json).unwrap_or_default();
-        deposit_decision(payload, state.balance + balance_of(events_since_snapshot))
+        let balance = decision
+            .snapshot::<Balance>(&payload.account_id)
+            .map_or(0, |state| state.balance);
+        deposit_decision(payload, balance)
+    }
+}
+
+/// A deposit with no cap, so `decide()` needs no history: its query is
+/// `QueryItemMapping::nothing()` (docs/architecture.md §201).
+pub struct DepositBlind;
+
+impl CommandType for DepositBlind {
+    type Payload = DepositedPayload;
+    type Event = AccountEvent;
+    const NAME: &'static str = "DepositBlind";
+    fn rest_trigger_allowed() -> bool {
+        true
+    }
+    fn tag_mappings() -> Vec<TagMapping> {
+        Deposit::tag_mappings()
+    }
+    fn consistency_query() -> Vec<QueryItemMapping> {
+        vec![QueryItemMapping::nothing()]
+    }
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        deposit_decision(payload, 0)
     }
 }
 
@@ -166,6 +189,9 @@ pub struct Setup {
     /// `DepositFast`'s token.
     #[allow(dead_code)] // command_throughput.rs only
     pub fast_credential: String,
+    /// `DepositBlind`'s token.
+    #[allow(dead_code)] // command_throughput.rs only
+    pub blind_credential: String,
 }
 
 #[allow(dead_code)] // coresident_pgbench.rs only
@@ -247,6 +273,7 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
             .event_type::<Deposited>()
             .command_type::<Deposit>()
             .command_type::<DepositFast>()
+            .command_type::<DepositBlind>()
             .snapshot::<Balance>()
             .reconciliation_role(subject.clone())
             .build()
@@ -263,7 +290,7 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
     }
 
     let mut credentials = Vec::new();
-    for name in ["Deposit", "DepositFast"] {
+    for name in ["Deposit", "DepositFast", "DepositBlind"] {
         let command_type = db::get_command_type(pool, &bc_name, name)
             .await
             .unwrap()
@@ -285,6 +312,7 @@ pub async fn setup_instances(database_url: String, pool: &Pool, instances: usize
         router: skilj.rest_router(),
         skilj,
         others,
+        blind_credential: credentials.pop().unwrap(),
         fast_credential: credentials.pop().unwrap(),
         credential: credentials.pop().unwrap(),
     }

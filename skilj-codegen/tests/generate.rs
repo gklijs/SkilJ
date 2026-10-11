@@ -323,3 +323,31 @@ latest = 0
         );
     }
 }
+
+/// docs/architecture.md §201: `reads_nothing = true` is a lone
+/// `QueryItemMapping::nothing()`, and refused together with query items.
+#[test]
+fn reads_nothing_becomes_a_query_of_nothing() {
+    let toml = BANKING_TOML.replace(
+        "rest_trigger_allowed = true",
+        "rest_trigger_allowed = true\nreads_nothing = true",
+    );
+    let output = skilj_codegen::generate(&toml).unwrap();
+    assert!(output.contains("Vec::from([::skilj_core::shared::QueryItemMapping::nothing()])"));
+}
+
+#[test]
+fn reads_nothing_with_query_items_is_a_named_problem() {
+    let toml = HELPDESK_TOML.replace(
+        "tags = { company = \"company_id\", ticket = \"ticket_id\" }\n\n[[command_type.query]]",
+        "tags = { company = \"company_id\", ticket = \"ticket_id\" }\nreads_nothing = true\n\n[[command_type.query]]",
+    );
+    assert_ne!(toml, HELPDESK_TOML);
+    let problems = invalid(&toml);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("reads_nothing reads no events, so it can't have query items too")),
+        "{problems:?}"
+    );
+}

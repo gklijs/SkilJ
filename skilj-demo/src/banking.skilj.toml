@@ -27,6 +27,9 @@ tags = { account = "account_id" }
 [[command_type]]
 name = "DepositMoney"
 rest_trigger_allowed = true
+# decide_deposit_money checks only the amount: it reads no history, and
+# nothing conflicts with it (docs/architecture.md §201).
+reads_nothing = true
 fields = [
     { name = "account_id", type = "string" },
     { name = "amount", type = "i64" },

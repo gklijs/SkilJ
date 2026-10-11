@@ -425,6 +425,7 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
             None,
             test_now(),
             None,
+            &[],
             None,
             None,
         )
@@ -512,6 +513,7 @@ fn submit_command_does_not_redispatch_for_an_unrelated_concurrent_event() {
             None,
             test_now(),
             None,
+            &[],
             None,
             None,
         )
@@ -578,6 +580,7 @@ fn submit_command_persists_a_real_command_id_that_round_trips() {
             None,
             test_now(),
             None,
+            &[],
             None,
             None,
         )
@@ -653,6 +656,7 @@ fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original
             None,
             test_now(),
             None,
+            &[],
             Some(key),
             None,
         )
@@ -686,6 +690,7 @@ fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original
             None,
             test_now(),
             None,
+            &[],
             Some(key),
             None,
         )
@@ -763,6 +768,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             None,
             test_now(),
             None,
+            &[],
             Some(key),
             None,
         )
@@ -799,6 +805,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             None,
             test_now(),
             None,
+            &[],
             Some(key),
             None,
         )
@@ -856,6 +863,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             None,
             test_now(),
             None,
+            &[],
             Some(key),
             None,
         )
@@ -989,6 +997,7 @@ fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
             None,
             test_now(),
             None,
+            &[],
             Some("legacy-key"),
             None,
         )
@@ -1047,6 +1056,7 @@ fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
             None,
             test_now(),
             None,
+            &[],
             Some("a-different-key-this-client-owns"),
             None,
         )
@@ -1194,6 +1204,7 @@ fn submit_command_without_an_idempotency_key_still_double_processes_a_repeated_s
                 None,
                 test_now(),
                 None,
+                &[],
                 None,
                 None,
             )
@@ -1277,6 +1288,7 @@ fn ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_th
             None,
             test_now(),
             None,
+            &[],
             Some(key),
             None,
         )
@@ -1305,6 +1317,7 @@ fn ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_th
             None,
             test_now(),
             None,
+            &[],
             Some(key),
             None,
         )
@@ -1356,6 +1369,7 @@ fn submit_command_leaves_no_sequence_gap_when_process_command_fails() {
             None,
             test_now(),
             None,
+            &[],
             None,
             None,
         )
@@ -1419,6 +1433,7 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
             None,
             test_now(),
             None,
+            &[],
             None,
             None,
         )
@@ -1491,6 +1506,7 @@ fn submit_command_batches_sequence_allocation_for_a_multi_event_command() {
             None,
             test_now(),
             None,
+            &[],
             None,
             None,
         )
@@ -1537,6 +1553,7 @@ fn batched(
         initial_decision,
         now: test_now(),
         snapshot: None,
+        snapshot_states: Vec::new(),
         idempotency_key: None,
         event_types_by_name: std::collections::HashMap::new(),
         resolved: std::collections::HashMap::new(),
@@ -2016,6 +2033,7 @@ fn a_known_read_position_still_catches_a_conflict_committed_after_it() {
             None,
             test_now(),
             None,
+            &[],
             None,
             Some(1),
         )
@@ -2076,6 +2094,7 @@ fn an_event_the_read_already_holds_above_its_position_is_not_counted_twice() {
             None,
             test_now(),
             None,
+            &[],
             None,
             // Read before the event committed, the read itself after.
             Some(-1),

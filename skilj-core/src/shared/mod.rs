@@ -115,21 +115,70 @@ pub struct TagMapping {
 /// // The requester's last three tickets.
 /// let recent = QueryItemMapping::types(&["TicketCreated"]).last(3);
 /// assert_eq!(recent.latest, Some(3));
+/// // A command whose decide() needs no history: alone in its query.
+/// let none = QueryItemMapping::nothing();
+/// assert!(none.event_types.is_empty() && none.tag_mappings.is_empty());
 /// ```
+///
+/// An item with `snapshot` set hands `decide_with()` that snapshot's
+/// state for the tag value its tag mapping derives, brought up to date,
+/// instead of events - see [`QueryItemMapping::snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct QueryItemMapping {
     pub event_types: Vec<String>,
     pub tag_mappings: Vec<TagMapping>,
     pub latest: Option<u32>,
+    /// A `Snapshot::NAME`: this item is that snapshot's state for the tag
+    /// value its one tag mapping derives (docs/architecture.md §202).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 }
 
 impl QueryItemMapping {
+    /// An item matching no event (docs/architecture.md §201). As a
+    /// command type's whole query, `vec![QueryItemMapping::nothing()]`,
+    /// it says `decide()` needs no history: the command reads no events
+    /// and no event conflicts with it, while its `tag_mappings()` still
+    /// tag it for owner scoping. `build()` refuses it next to other items
+    /// or with `latest`.
+    pub fn nothing() -> Self {
+        Self {
+            event_types: Vec::new(),
+            tag_mappings: Vec::new(),
+            latest: None,
+            snapshot: None,
+        }
+    }
+
+    /// Snapshot `S`'s state for the tag value the payload's `field`
+    /// derives under `S::TAG_KEY` (docs/architecture.md §202). The
+    /// command reads the stored row and the events carrying that value
+    /// since its `as_of_sequence`, and the framework folds those on top
+    /// with `S`'s own fold, so `decide_with()` gets the state as of the
+    /// read through `Decision::snapshot` - not the events. Any later event
+    /// carrying the value conflicts, and is folded in before deciding
+    /// again. A list-valued `field` gives one state per value. The tag
+    /// mapping must be one of the command type's `tag_mappings()`, and `S`
+    /// registered in the same bounded context; `build()` checks both.
+    pub fn snapshot<S: crate::plugin::Snapshot>(field: &str) -> Self {
+        Self {
+            event_types: Vec::new(),
+            tag_mappings: vec![TagMapping {
+                key: S::TAG_KEY.to_string(),
+                field: field.to_string(),
+            }],
+            latest: None,
+            snapshot: Some(S::NAME.to_string()),
+        }
+    }
+
     /// An item matching these event types, every match, no tags yet.
     pub fn types(event_types: &[&str]) -> Self {
         Self {
             event_types: event_types.iter().map(|t| t.to_string()).collect(),
             tag_mappings: Vec::new(),
             latest: None,
+            snapshot: None,
         }
     }
 
@@ -139,6 +188,7 @@ impl QueryItemMapping {
             event_types: Vec::new(),
             tag_mappings,
             latest: None,
+            snapshot: None,
         }
     }
 
@@ -169,6 +219,11 @@ pub struct QueryItem {
     pub tags: Vec<Tag>,
     /// See [`QueryItemMapping::latest`].
     pub latest: Option<u32>,
+    /// See [`QueryItemMapping::snapshot`]: the item matches as a tag item
+    /// does, and its events are folded into that snapshot's state for its
+    /// one tag rather than handed to `decide_with()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 }
 
 /// `subject_field` is never encrypted - it's the plaintext identifier the

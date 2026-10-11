@@ -4401,28 +4401,76 @@ impl QueryItem {
 /// derived naming neither types nor tags, which matches nothing from the
 /// cache and from Postgres alike, rather than an item that silently drops
 /// the tag and matches more (docs/architecture.md §200).
+///
+/// A snapshot item (docs/architecture.md §202) derives one item per tag
+/// value its one tag mapping derives - a list-valued field names several
+/// accounts, each with a state of its own - and an item matching nothing
+/// when it derives none, or only a tag with no value: there is no state
+/// to hand over for a missing field.
 pub fn derive_query(mappings: &[QueryItemMapping], payload: &str) -> Vec<QueryItem> {
-    mappings
-        .iter()
-        .map(|mapping| {
-            let underived = mapping
-                .tag_mappings
-                .iter()
-                .any(|m| derive_tags(std::slice::from_ref(m), payload).is_empty());
-            if underived {
-                return QueryItem {
+    let mut items = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        if mapping.snapshot.is_some() {
+            let tags: Vec<Tag> = derive_tags(&mapping.tag_mappings, payload)
+                .into_iter()
+                .filter(|tag| tag.value.is_some())
+                .collect();
+            if tags.is_empty() {
+                items.push(QueryItem {
                     event_types: Vec::new(),
                     tags: Vec::new(),
-                    latest: mapping.latest,
-                };
+                    latest: None,
+                    snapshot: mapping.snapshot.clone(),
+                });
             }
-            QueryItem {
-                event_types: mapping.event_types.iter().map(|t| t.to_string()).collect(),
-                tags: derive_tags(&mapping.tag_mappings, payload),
+            items.extend(tags.into_iter().map(|tag| QueryItem {
+                event_types: Vec::new(),
+                tags: vec![tag],
+                latest: None,
+                snapshot: mapping.snapshot.clone(),
+            }));
+            continue;
+        }
+        let underived = mapping
+            .tag_mappings
+            .iter()
+            .any(|m| derive_tags(std::slice::from_ref(m), payload).is_empty());
+        if underived {
+            items.push(QueryItem {
+                event_types: Vec::new(),
+                tags: Vec::new(),
                 latest: mapping.latest,
-            }
-        })
+                snapshot: None,
+            });
+            continue;
+        }
+        items.push(QueryItem {
+            event_types: mapping.event_types.iter().map(|t| t.to_string()).collect(),
+            tags: derive_tags(&mapping.tag_mappings, payload),
+            latest: mapping.latest,
+            snapshot: None,
+        });
+    }
+    items
+}
+
+/// The items of `query` that hand `decide()` events: every item but a
+/// snapshot's (docs/architecture.md §202), whose events are folded into
+/// its state instead.
+pub fn event_items(query: &[QueryItem]) -> Vec<QueryItem> {
+    query
+        .iter()
+        .filter(|item| item.snapshot.is_none())
+        .cloned()
         .collect()
+}
+
+/// Whether `query` holds a snapshot item that can match an event - one
+/// whose tag derived a value (docs/architecture.md §202).
+pub fn query_has_snapshots(query: &[QueryItem]) -> bool {
+    query
+        .iter()
+        .any(|item| item.snapshot.is_some() && !item.tags.is_empty())
 }
 
 /// The query a command is decided with: its own `consistency_query`, or,
@@ -4442,8 +4490,21 @@ pub fn effective_query(
             event_types: Vec::new(),
             tags: vec![tag.clone()],
             latest: None,
+            snapshot: None,
         })
         .collect()
+}
+
+/// Whether `query` is declared and no item of it can match an event: a
+/// command type's `QueryItemMapping::nothing()`, or a query whose every
+/// item's tags derived nothing (see [`derive_query`]). Such a command
+/// reads no events before the lock and none under it, since nothing can
+/// conflict with it (docs/architecture.md §201).
+pub fn query_reads_nothing(query: &[QueryItem]) -> bool {
+    !query.is_empty()
+        && query
+            .iter()
+            .all(|item| item.event_types.is_empty() && item.tags.is_empty())
 }
 
 /// Whether `event` matches any item of `query` - what a re-check under
