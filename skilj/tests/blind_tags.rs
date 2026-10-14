@@ -282,6 +282,13 @@ async fn bounded_context(pool: &Pool) -> (String, String) {
     (name, subject)
 }
 
+/// `Skilj::builder` with a small pool: the tests run in parallel, several
+/// instances each, against one server.
+fn small_builder(database_url: impl Into<String>) -> SkiljBuilder {
+    skilj::Skilj::builder(database_url)
+        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+}
+
 /// The customer types, registered in `bc` - without a `BlindTag`, which
 /// each test adds.
 fn customer_types(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
@@ -290,7 +297,7 @@ fn customer_types(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
 
 /// [`customer_types`] for an instance that doesn't reconcile.
 fn customer_instance(database_url: &str, bc: &str) -> SkiljBuilder {
-    Skilj::builder(database_url)
+    small_builder(database_url)
         .bounded_context(bc)
         .event_type::<EmailClaimed>()
         .event_type::<EmailReleased>()
@@ -602,7 +609,7 @@ fn an_instance_without_the_blind_tag_refuses_rather_than_store_the_value() {
         // Declaring the types would need the `BlindTag` too: `build()`
         // refuses a blind mapping without one. So this instance declares
         // nothing, like one serving other bounded contexts.
-        let (other, _) = Skilj::builder(database_url).build().await.unwrap();
+        let (other, _) = small_builder(database_url).build().await.unwrap();
         let payload = serde_json::json!({ "customer_id": id("c"), "email": "carol@example.com" });
         let err = crm
             .submit_through(&other, "RegisterCustomer", payload)
@@ -681,7 +688,7 @@ fn startup_refuses_a_changed_normalizer_and_a_key_already_in_the_clear() {
             let (_, subject) = bounded_context(&pool).await;
             subject
         };
-        let Err(changed) = Skilj::builder(database_url.clone())
+        let Err(changed) = small_builder(database_url.clone())
             .bounded_context(crm.bc.clone())
             .blind_tag::<RenormalizedEmail>()
             .blind_index_key(blind_key())
@@ -702,7 +709,7 @@ fn startup_refuses_a_changed_normalizer_and_a_key_already_in_the_clear() {
             }
         }
         let (bc, subject) = bounded_context(&pool).await;
-        let (plain, _) = Skilj::builder(database_url.clone())
+        let (plain, _) = small_builder(database_url.clone())
             .bounded_context(bc.clone())
             .event_type::<PlainEmail>()
             .reconciliation_role(subject.clone())
@@ -710,7 +717,7 @@ fn startup_refuses_a_changed_normalizer_and_a_key_already_in_the_clear() {
             .await
             .unwrap();
         plain.shutdown(std::time::Duration::from_secs(10)).await;
-        let Err(in_use) = Skilj::builder(database_url)
+        let Err(in_use) = small_builder(database_url)
             .bounded_context(bc)
             .blind_tag::<ErasedEmail>()
             .blind_index_key(blind_key())
@@ -744,7 +751,7 @@ fn startup_refuses_a_different_blind_index_key_and_records_a_missing_fingerprint
 
         // Not a reconciling instance: the check runs either way.
         let restart = |key: BlindIndexKey| {
-            Skilj::builder(database_url.clone())
+            small_builder(database_url.clone())
                 .bounded_context(crm.bc.clone())
                 .event_type::<EmailClaimed>()
                 .event_type::<EmailReleased>()
@@ -1186,7 +1193,7 @@ fn a_tenant_records_its_own_key_fingerprint_and_is_checked_at_startup() {
         .await
         .unwrap();
         let (database_url, _) = test_db().await.unwrap();
-        let Err(changed) = Skilj::builder(database_url.clone())
+        let Err(changed) = small_builder(database_url.clone())
             .bounded_context(template)
             .blind_tag::<ErasedEmail>()
             .blind_index_key(blind_key())

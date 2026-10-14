@@ -3919,6 +3919,9 @@ own "second console for when the wire protocol isn't the point" niche.
 for when there are a lot of events needed to determine the
 consistency" - see "Snapshot, built for real" below for that pass.
 
+*Superseded by [§210](#tag-reads-without-gin): tag reads now go through
+`event_tags`, and the GIN index described here is dropped.*
+
 `db::list_events_for_bounded_context_matching_tags` (`skilj-core/src/db/mod.rs`)
 does exactly what's designed above - a `tags @> $N::jsonb` containment
 clause per wanted tag, `OR`'d, optionally `AND sequence > $N` - backed
@@ -11924,3 +11927,58 @@ The user asked what happens when the blind-index key is compromised, and then fo
 
 `blind`'s unit tests cover wrapping, the chain fingerprint and a generation past the configured keys.
 
+<a id="tag-reads-without-gin"></a>
+## 210. Tag reads go through `event_tags`; the GIN index on `events.tags` is dropped
+
+Asked on Discord what the GIN index on `events.tags` (§19) is still for. The honest answer was less than it looked: §198 moved the reads of a consistency query item with event types, and the snapshot refolds, to `event_tags`, a B-tree table of `(tag_key, tag_value, event_type_name, sequence)` kept by a trigger. The GIN index still served:
+- the OR-of-tags read of a command without a consistency query (`list_events_for_bounded_context_matching_tags_with_bc`): its history, its re-check under the lock, the batch re-check, the cache-miss read, `for_each_tagged_event_chunk`;
+- a query item with tags and no types;
+- blind-tag erasure (§205), finding a subject's events;
+- blind-index key rotation (§209), finding the events of a key.
+
+Every event paid for it on insert, inside the transaction that holds the bounded context's sequence lock, and in about 50 bytes of storage (Codeberg #92's measurement).
+
+**The benchmark.** `skilj/tests/tag_read_bench.rs` (ignored; `cargo test --release -p skilj --test tag_read_bench -- --ignored --nocapture`) writes 1,000,000 events with an `account` and a `customer` tag each, of three types: one long-lived account with 100,000 events, every other with ten. Each row is the median of repeated reads through the public functions with an empty event cache; embedded Postgres 18.
+
+| read | GIN (before) | `event_tags` (after) |
+|---|---:|---:|
+| tags: short account | 0.80 ms | 0.65 ms |
+| tags: short account + 2 customers | 1.61 ms | 0.83 ms |
+| tags: hot account, whole history (100,000 events) | 388 ms | 430 ms |
+| tags: hot account, after head - 100 | 0.85 ms | 0.65 ms |
+| tags: short account, after head - 100 | 0.54 ms | 0.42 ms |
+| items: short account, no types | 1.09 ms | 0.74 ms |
+| items: hot account, no types, latest | 0.75 ms | 0.65 ms |
+| items: hot account, all types, latest | **7.98 ms** | 0.67 ms |
+| items: hot account, no types, after head - 100 | 0.79 ms | 0.64 ms |
+| erasure: one account's blind tag (events only) | 118 ms | 5.8 ms |
+| rotation: every customer tag | 18.5 s | 14.5 s |
+| writing the 1,000,000 events (one `INSERT ... SELECT`) | 21.8 s | 16.5 s |
+
+**What changed.**
+- **One probe per event type** (`event_tags_select`). The index orders a tag's events by sequence within each type, not across types. A read with no types of its own probes every type the bounded context registers - a superset of any event's type, since `events.event_type_name` references `event_types` - each with one index range. So `sequence > after` is a seek per type, not a scan of the tag.
+- **Latest through a lateral join.** With `latest` (or a chunk's limit), each type's range is read from the wanted end, at most that many entries, and the per-type results cut again. That fixes §198's own slow case: "the latest of these types for a long-lived tag" read and sorted every entry of the tag, 8 ms for 100,000; now one backward seek per type.
+- **`sequence = ANY(ARRAY(...))`, not `sequence IN (...)`.** With `IN`, Postgres picked a join from row estimates, and the generic plan it settles on after a few executions of a prepared statement - planned for a tag with a handful of events - took 715 ms instead of 225 ms for the long-lived tag. An array leaves one plan: primary-key lookups in sequence order. That costs the one regression above: reading 100,000 events of one tag, 388 to 430 ms, where GIN's bitmap read the heap in physical order. A command reading a 100,000-event history is what snapshots (§19, §202) are for.
+- **Erasure** finds the subject's events through `event_tags` and deletes the blind tag's index rows by their full key. It used to delete by tag key and sequence, which scanned every index row of the key.
+- **Rotation** keeps its `tags @>` filter, now a sequential scan: it rewrites every event the key is on, and a join over a million distinct sequences was slower (29 s).
+
+**Dropping the index.** Provisioning no longer creates `events_by_tags`. `drop_events_by_tags_index`, in `make_bounded_context_current`, drops it from older bounded contexts: checked in the catalog first, so an up-to-date one takes no lock (§158), and `DROP INDEX CONCURRENTLY`, so writes continue. The v0.0.1 upgrade test (§159) compares the upgraded schema with a fresh one, so it fails if the drop is missing - checked by disabling it. An older skilj version rolled back to after the drop (§101) still works, its tag reads as sequential scans.
+
+**Command throughput.** `command_throughput` (docs/performance.md), same machine, back to back, round two of each:
+
+| workload | callers | before | after |
+|---|---:|---:|---:|
+| spread | 1 | 89 cmd/s, p50 11.1 ms | **404 cmd/s, p50 2.4 ms** |
+| spread | 8 | 539 | **1,883** |
+| spread | 32 | 844 | **2,940** |
+| spread | 80 | 791, p50 99 ms | **3,100, p50 26 ms** |
+| hot | 1 | 48 | 118 |
+| hot | 80 | 153, p50 417 ms | 159, p50 494 ms |
+| hot-snap | 1 / 80 | 302 / 483 | 317 / 469 |
+| hot-none | 8 / 80 | 2,322 / 4,205 | 3,027 / 5,019 |
+
+Spread commands read their account's history before the lock: a new account, so nothing. With GIN that read took 8.7 ms with one caller and 43 ms with 80; now 0.46 ms and 7.5 ms. The likely cause is GIN's fast-update pending list: new entries go to an unsorted list every search scans until a vacuum merges it, and on a table written to constantly the list is never empty, so even a tag with no events paid for it. `hot-none`, which reads nothing, shows the insert side: GIN maintenance ran inside the transaction holding the sequence lock. `hot` with 80 callers is the one row that didn't gain: throughput up 4%, p50 and p99 about 15% worse, within what hot rows move between rounds (performance.md's table spans 80-130 cmd/s for it).
+
+**Also found.** `blind_tags.rs` started thirteen parallel tests, several `Skilj` instances each, at the default pool size, and intermittently ran out of connections (`PoolTimedOut`) against the embedded server. Its instances now use four connections, like the other test files.
+
+**Not changed: erasure scans the commands.** Commands keep the tags and query they were decided with, for the record; nothing reads them to decide. With a blind tag both hold the hash, so erasure strips it and rotation rewraps it, finding the commands by `consistency_tags @> ...` with no index on `commands`. Measured with the benchmark's million stored commands, one per event: an erasure takes **319 ms**, the scan of the commands table; with a GIN index on `consistency_tags` (`jsonb_path_ops`), **3.4 ms** (median of five accounts each). Rotation, which rewrites nearly every command carrying the key, gains nothing from an index; with the commands it took 27 s. An index on `commands` would sit on the write path under the sequence lock, which is what this section removed from `events`, so it isn't added: a third of a second per erased subject is fine for an admin action. Bulk erasure is the case it isn't (a thousand subjects, five minutes); then a side table of only the blind tags' command rows, filled by a trigger like `event_tags`, would cost nothing to bounded contexts without blind tags.

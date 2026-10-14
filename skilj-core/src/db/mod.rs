@@ -860,29 +860,17 @@ async fn provision_bounded_context_schema(
     .await?;
     // Codeberg issue #18 - backs `event_store::query_events`/`count_events`'
     // own new correlation_id filter. Same "cold-start/large-history
-    // nicety, not a correctness requirement" register as `events_by_tags`
-    // below: both functions already operate on an in-memory slice.
+    // nicety, not a correctness requirement" register as §19's tag index
+    // was: both functions already operate on an in-memory slice.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE INDEX events_by_correlation_id ON {schema}.events (metadata_correlation_id) \
          WHERE metadata_correlation_id IS NOT NULL"
     )))
     .execute(&mut **tx)
     .await?;
-    // docs/architecture.md §19's "Problem 1" fix -
-    // `list_events_for_bounded_context_matching_tags`' own GIN index.
-    // `tags` is already `JSONB`, so this needs no column-type change:
-    // GIN indexes each array element's key/value pairs, which is what
-    // makes a `tags @> '[{"key":"...","value":"..."}]'::jsonb`
-    // containment query fast rather than a sequential scan. Only
-    // bounded contexts provisioned after this change get it - a
-    // pre-existing one would need `CREATE INDEX ... USING GIN (tags)`
-    // run by hand, see that function's own doc comment for why no
-    // backfill migration exists for this yet.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE INDEX events_by_tags ON {schema}.events USING GIN (tags)"
-    )))
-    .execute(&mut **tx)
-    .await?;
+    // No index on `tags`: tag reads go through `event_tags` (§198, §210).
+    // §19's GIN index on it, `events_by_tags`, is dropped from bounded
+    // contexts provisioned before (`drop_events_by_tags_index`).
     // docs/architecture.md §19's "Problem 2" fix - `Snapshot`'s own
     // storage, deliberately not shared with `projection_state` above
     // (see `crate::plugin::Snapshot`'s own doc comment for why). One
@@ -2137,11 +2125,11 @@ pub async fn ensure_registrations_generation<'e>(
 
 /// `event_tags`: one row per tag of every event, `(tag_key, tag_value,
 /// event_type_name, sequence)`, indexed in that order - what a consistency
-/// query item naming event types reads (docs/architecture.md §198). The
-/// GIN index on `events.tags` answers "which events carry this tag", but a
-/// query for the latest event of a few types carrying a company's tag
-/// would still walk every event with that tag; through this index it is a
-/// probe per type, however many other events the tag has.
+/// tag read goes through (docs/architecture.md §198, §210). A GIN index on
+/// `events.tags` answered "which events carry this tag", but a query for
+/// the latest event of a few types carrying a company's tag still walked
+/// every event with that tag; through this index it is a probe per type,
+/// however many other events the tag has.
 ///
 /// Filled by a statement-level trigger on `events`, not by skilj's insert
 /// paths, so no writer can leave it incomplete - including an instance of
@@ -2192,6 +2180,33 @@ pub async fn ensure_event_tags_index<'e>(
     )))
     .execute(executor)
     .await?;
+    Ok(())
+}
+
+/// Drops `events_by_tags`, the GIN index on `events.tags` (docs/architecture.md
+/// §19), from a bounded context provisioned before tag reads moved to
+/// `event_tags` (§210): nothing reads through it, and every event paid for
+/// it on insert. Checked in the catalog first, so a startup that finds it
+/// gone takes no lock (§158); dropped `CONCURRENTLY`, so writes to the
+/// events table go on meanwhile - which can't run in a transaction, hence
+/// a statement of its own on the pool.
+pub async fn drop_events_by_tags_index(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let index = format!("{schema}.events_by_tags");
+    let (present,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
+        .bind(&index)
+        .fetch_one(pool)
+        .await?;
+    if present {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP INDEX CONCURRENTLY IF EXISTS {index}"
+        )))
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2474,6 +2489,9 @@ pub async fn rotate_blind_tag(
         )
     };
     sqlx::query(sqlx::AssertSqlSafe(format!(
+        // A filter, not an index probe: a rotation rewrites every event the
+        // key is on, so reading the table through is what it costs anyway
+        // (docs/architecture.md §210).
         "UPDATE {schema}.events e SET tags = {} WHERE e.tags @> $2",
         rewrap("e.tags")
     )))
@@ -2658,6 +2676,7 @@ pub async fn make_bounded_context_current(
     ensure_consistency_query_column(pool, &bounded_context.name).await?;
     ensure_event_tags_index(pool, &bounded_context.name).await?;
     ensure_blind_tags_table(pool, &bounded_context.name).await?;
+    drop_events_by_tags_index(pool, &bounded_context.name).await?;
     current_bounded_contexts()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -4672,27 +4691,69 @@ pub async fn forget_subject_in_blind_tags(
     let mut events_changed = 0;
     for (tag_key, subject_tag) in &erased {
         let subject = serde_json::json!([{ "key": subject_tag, "value": subject_value }]);
-        let blind = serde_json::json!([{ "key": tag_key }]);
-        let sequences: Vec<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "UPDATE {schema}.events e SET tags = (\
-                SELECT coalesce(jsonb_agg(t), '[]'::jsonb) \
-                FROM jsonb_array_elements(e.tags) t WHERE t->>'key' <> $3) \
-             WHERE e.tags @> $1 AND e.tags @> $2 RETURNING e.sequence"
-        )))
-        .bind(Json(&subject))
-        .bind(Json(&blind))
-        .bind(tag_key)
-        .fetch_all(&mut *tx)
-        .await?;
-        let sequences: Vec<i64> = sequences.into_iter().map(|(s,)| s).collect();
+        // The subject's events carrying the blind tag, found through
+        // `event_tags` (docs/architecture.md §210), with the tag's index
+        // rows to delete exactly.
+        let carrying: Vec<(i64, String, Option<String>)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT e.sequence, e.event_type_name, t->>'value' \
+                 FROM {schema}.events e, jsonb_array_elements(e.tags) t \
+                 WHERE e.sequence = ANY(ARRAY(SELECT s.sequence FROM {schema}.event_tags s \
+                    WHERE s.tag_key = $1 AND s.tag_value = $2)) \
+                 AND t->>'key' = $3"
+            )))
+            .bind(subject_tag)
+            .bind(subject_value)
+            .bind(tag_key)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut sequences: Vec<i64> = carrying.iter().map(|(sequence, _, _)| *sequence).collect();
+        sequences.sort_unstable();
+        sequences.dedup();
         events_changed += sequences.len() as u64;
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {schema}.event_tags WHERE tag_key = $1 AND sequence = ANY($2)"
+            "UPDATE {schema}.events e SET tags = (\
+                SELECT coalesce(jsonb_agg(t), '[]'::jsonb) \
+                FROM jsonb_array_elements(e.tags) t WHERE t->>'key' <> $2) \
+             WHERE e.sequence = ANY($1)"
         )))
-        .bind(tag_key)
         .bind(&sequences)
+        .bind(tag_key)
         .execute(&mut *tx)
         .await?;
+        let (valued, unvalued): (Vec<_>, Vec<_>) = carrying
+            .into_iter()
+            .partition(|(_, _, value)| value.is_some());
+        let (valued_sequences, (valued_types, values)): (Vec<i64>, (Vec<String>, Vec<String>)) =
+            valued
+                .into_iter()
+                .map(|(sequence, event_type, value)| {
+                    (sequence, (event_type, value.unwrap_or_default()))
+                })
+                .unzip();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {schema}.event_tags et \
+             USING unnest($2::text[], $3::text[], $4::bigint[]) AS x(value, event_type, sequence) \
+             WHERE et.tag_key = $1 AND et.tag_value = x.value \
+             AND et.event_type_name = x.event_type AND et.sequence = x.sequence"
+        )))
+        .bind(tag_key)
+        .bind(&values)
+        .bind(&valued_types)
+        .bind(&valued_sequences)
+        .execute(&mut *tx)
+        .await?;
+        if !unvalued.is_empty() {
+            let unvalued: Vec<i64> = unvalued.iter().map(|(sequence, _, _)| *sequence).collect();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {schema}.event_tags \
+                 WHERE tag_key = $1 AND tag_value IS NULL AND sequence = ANY($2)"
+            )))
+            .bind(tag_key)
+            .bind(&unvalued)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {schema}.commands c SET \
                 consistency_tags = (\
@@ -6995,9 +7056,8 @@ pub async fn list_events_for_bounded_context_from_limited(
 /// own union semantics) - fine while a bounded context is small, but a
 /// full unfiltered scan on every command submission once it isn't. This
 /// pushes the same union-of-tags matching down into the query itself,
-/// via `events_by_tags` (a GIN index on the already-`JSONB` `tags`
-/// column, added in `provision_bounded_context_schema`) - one `tags @>
-/// $N::jsonb` containment clause per wanted tag, `OR`'d together,
+/// through `event_tags` (docs/architecture.md §210; §19's GIN index on
+/// `events.tags` before it) - one sub-select per wanted tag, their union,
 /// optionally further bounded by `sequence > after_sequence` (folds in
 /// both `queryEvents`' own pagination and `submit_command`'s
 /// DCB-conflict redispatch check, which needs the identical "tag-scoped
@@ -7053,45 +7113,59 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
         return Ok(Vec::new());
     }
 
-    let bounded_context = bc.name.as_str();
-    let schema = schema_ident(bounded_context);
-    // One `[Tag]`-shaped single-element JSONB array literal per wanted
-    // tag - containment (`@>`) needs the right-hand side to be an array
-    // too, since `tags` itself is stored as an array of tag objects, not
-    // one bare object.
-    let tag_literals: Vec<String> = tags
-        .iter()
-        .map(|t| {
-            serde_json::to_string(std::slice::from_ref(t)).expect("Tag serialisation is infallible")
-        })
-        .collect();
-    let tag_clause = (1..=tag_literals.len())
-        .map(|i| format!("tags @> ${i}::jsonb"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let sequence_param = tag_literals.len() + 1;
-    let where_clause = match after_sequence {
-        Some(_) => format!("({tag_clause}) AND sequence > ${sequence_param}"),
-        None => tag_clause,
-    };
-    let limit_clause = match limit {
-        Some(_) => format!(
-            " LIMIT ${}",
-            sequence_param + usize::from(after_sequence.is_some())
-        ),
+    let schema = schema_ident(&bc.name);
+    // One `event_tags` sub-select per wanted tag, their union the events'
+    // sequences (docs/architecture.md §210). Parameters: each tag's key and
+    // value, then the position and the limit.
+    let mut binds: Vec<Option<String>> = Vec::new();
+    let types = all_event_types(&schema);
+    let after_param = 2 * tags.len() + 1;
+    let limit_param = after_param + usize::from(after_sequence.is_some());
+    let filter = match after_sequence {
+        Some(_) => format!(" AND t.sequence > ${after_param}::bigint"),
         None => String::new(),
     };
-
+    let selects: Vec<String> = tags
+        .iter()
+        .map(|tag| {
+            binds.push(Some(tag.key.clone()));
+            let key = format!("${}", binds.len());
+            let value = match &tag.value {
+                Some(value) => {
+                    binds.push(Some(value.clone()));
+                    format!("= ${}", binds.len())
+                }
+                None => {
+                    // Keeps the parameter numbering fixed.
+                    binds.push(None);
+                    format!("IS NULL AND ${}::text IS NULL", binds.len())
+                }
+            };
+            event_tags_select(
+                &schema,
+                &key,
+                &value,
+                &types,
+                &filter,
+                limit.map(|_| (TagOrder::Oldest, format!("${limit_param}::bigint"))),
+            )
+        })
+        .collect();
+    let limit_clause = match limit {
+        Some(_) => format!(" LIMIT ${limit_param}::bigint"),
+        None => String::new(),
+    };
     let sql = format!(
         "SELECT event_type_name, sequence, payload, metadata_type, metadata_version, \
          metadata_client_id, metadata_created_at, metadata_correlation_id, \
          metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
-         WHERE {where_clause} ORDER BY sequence{limit_clause}"
+         WHERE sequence = ANY(ARRAY({})) ORDER BY sequence{limit_clause}",
+        selects.join(" UNION ")
     );
     let mut query = sqlx::query_as::<_, EventRowAnyType>(sqlx::AssertSqlSafe(sql));
-    for literal in tag_literals {
-        query = query.bind(literal);
+    for bind in binds {
+        query = query.bind(bind);
     }
     if let Some(after_sequence) = after_sequence {
         query = query.bind(after_sequence);
@@ -7104,18 +7178,86 @@ async fn list_events_for_bounded_context_matching_tags_with_bc(
     events_from_rows(conn, bc, rows, known_event_types).await
 }
 
+/// The statements built from [`event_tags_select`] read the events as
+/// `sequence = ANY(ARRAY(<sub-selects>))`, not `sequence IN (...)`
+/// (docs/architecture.md §210). With `IN`, Postgres chose a join from row
+/// estimates, and the generic plan it settles on after a few executions
+/// of a statement - planned for a tag with a few events - took 2.5 times
+/// as long on a long-lived tag. An array leaves it one plan: primary-key
+/// lookups, in sequence order.
+///
+/// Which end of a tag's matches [`event_tags_select`] keeps, when it keeps
+/// only some.
+#[derive(Clone, Copy)]
+enum TagOrder {
+    /// The first matches - a chunk of a read in sequence order.
+    Oldest,
+    /// The last matches - an item with `latest`.
+    Newest,
+}
+
+/// Every event type `schema`'s bounded context registers, as a SQL array:
+/// what a tag read with no types of its own probes `event_tags` for. A
+/// superset of the type of any event, which `events.event_type_name`
+/// references (docs/architecture.md §210). Evaluated once per statement.
+fn all_event_types(schema: &str) -> String {
+    format!("ARRAY(SELECT name FROM {schema}.event_types)")
+}
+
+/// A sub-select of the sequences in `event_tags` carrying the tag `key`
+/// (`value_condition` on its value) with one of `types`, and `filter` -
+/// `AND` conditions on `t`, its position and any further tags - in no
+/// particular order (docs/architecture.md §210).
+///
+/// The index is `(tag_key, tag_value, event_type_name, sequence)`, so a
+/// tag's events are in sequence order within each type, not across them.
+/// Without `limit` that doesn't matter: one index range per type. With
+/// it - an item's `latest`, or a chunk - each type's range is read from
+/// the wanted end, `limit` entries at most, through a lateral join, and
+/// the per-type results are cut to `limit` again. Ordering the whole
+/// tag instead would read every entry of a long-lived tag to keep one.
+fn event_tags_select(
+    schema: &str,
+    key: &str,
+    value_condition: &str,
+    types: &str,
+    filter: &str,
+    limit: Option<(TagOrder, String)>,
+) -> String {
+    match limit {
+        None => format!(
+            "(SELECT t.sequence FROM {schema}.event_tags t \
+             WHERE t.tag_key = {key} AND t.tag_value {value_condition} \
+             AND t.event_type_name = ANY({types}){filter})"
+        ),
+        Some((order, limit)) => {
+            let direction = match order {
+                TagOrder::Oldest => "",
+                TagOrder::Newest => " DESC",
+            };
+            format!(
+                "(SELECT l.sequence FROM unnest({types}) AS ty(name) \
+                 CROSS JOIN LATERAL (SELECT t.sequence FROM {schema}.event_tags t \
+                    WHERE t.tag_key = {key} AND t.tag_value {value_condition} \
+                    AND t.event_type_name = ty.name{filter} \
+                    ORDER BY t.sequence{direction} LIMIT {limit}) l \
+                 ORDER BY l.sequence{direction} LIMIT {limit})"
+            )
+        }
+    }
+}
+
 /// The events of `bc` matching `query`, after `after_sequence` when given,
 /// in sequence order - an item with `latest` contributes only that many
 /// of its matches, the newest (docs/architecture.md §198). One statement, so one snapshot: the
 /// union of one sub-select per item.
 ///
-/// An item naming event types and tags is read through `event_tags`: an
-/// index probe on its first tag and its types, each other tag checked on
-/// the event it finds. That is what keeps "the latest lifecycle event of
-/// this company" one probe per type however many other events carry the
-/// company's tag. An item with tags and no types goes through the GIN
-/// index on `events.tags`, as tag reads always have; one with types and no
-/// tags through `events_by_type`.
+/// An item with tags is read through `event_tags`: an index probe on its
+/// first tag and each of its types - every registered type when it names
+/// none - each other tag checked on the event it finds. That is what keeps
+/// "the latest lifecycle event of this company" one probe per type however
+/// many other events carry the company's tag (docs/architecture.md §210).
+/// One with types and no tags goes through `events_by_type`.
 ///
 /// The statement's text depends only on the shape of `query` - how many
 /// items, which kinds, how many tags, and whether a tag's value is null -
@@ -7192,7 +7334,7 @@ async fn list_events_matching_items_with_bc(
             None => String::new(),
         };
         let select = match (item.event_types.is_empty(), item.tags.split_first()) {
-            (false, Some((first, rest))) => {
+            (no_types, Some((first, rest))) => {
                 let key = param(&mut binds, Bind::Text(Some(first.key.clone())));
                 let value = match &first.value {
                     Some(value) => {
@@ -7200,7 +7342,17 @@ async fn list_events_matching_items_with_bc(
                     }
                     None => "IS NULL".to_string(),
                 };
-                let types = param(&mut binds, Bind::Texts(item.event_types.clone()));
+                // Without types, every type the bounded context registers:
+                // a superset of any event's, which `events.event_type_name`
+                // references (docs/architecture.md §210).
+                let types = if no_types {
+                    all_event_types(&schema)
+                } else {
+                    format!(
+                        "{}::text[]",
+                        param(&mut binds, Bind::Texts(item.event_types.clone()))
+                    )
+                };
                 let rest = if rest.is_empty() {
                     String::new()
                 } else {
@@ -7215,25 +7367,19 @@ async fn list_events_matching_items_with_bc(
                          WHERE r.sequence = t.sequence AND r.tags @> {tags}::jsonb)"
                     )
                 };
-                format!(
-                    "(SELECT t.sequence FROM {schema}.event_tags t \
-                     WHERE t.tag_key = {key} AND t.tag_value {value} \
-                     AND t.event_type_name = ANY({types}::text[]){}{rest}{})",
-                    after_clause("t.sequence"),
-                    latest(&mut binds, "t.sequence"),
-                )
-            }
-            (true, Some(_)) => {
-                let tags = param(
-                    &mut binds,
-                    Bind::Json(
-                        serde_json::to_string(&item.tags).expect("Tag serialisation is infallible"),
-                    ),
-                );
-                format!(
-                    "(SELECT sequence FROM {schema}.events WHERE tags @> {tags}::jsonb{}{})",
-                    after_clause("sequence"),
-                    latest(&mut binds, "sequence"),
+                let latest = item.latest.map(|count| {
+                    (
+                        TagOrder::Newest,
+                        param(&mut binds, Bind::Sequence(i64::from(count))),
+                    )
+                });
+                event_tags_select(
+                    &schema,
+                    &key,
+                    &value,
+                    &types,
+                    &format!("{}{rest}", after_clause("t.sequence")),
+                    latest,
                 )
             }
             (false, None) => {
@@ -7259,7 +7405,7 @@ async fn list_events_matching_items_with_bc(
          metadata_client_id, metadata_created_at, metadata_correlation_id, \
          metadata_causation_id, tags, origin_kind, origin_source_content, \
          origin_source_context, origin_command_id FROM {schema}.events \
-         WHERE sequence IN ({}) ORDER BY sequence",
+         WHERE sequence = ANY(ARRAY({})) ORDER BY sequence",
         selects.join(" UNION ")
     );
     let mut statement = sqlx::query_as::<_, EventRowAnyType>(sqlx::AssertSqlSafe(sql));
@@ -15790,7 +15936,7 @@ async fn fold_snapshots_chunk(
 /// (docs/architecture.md §152, §197). One paged read covers every value
 /// at once, instead of one read per value, through `event_tags` (§198):
 /// its btree hands back each value's sequences in order, where the GIN
-/// index on `events.tags` rebuilt and sorted every value's whole bitmap
+/// index on `events.tags` (since dropped, §210) rebuilt and sorted every value's whole bitmap
 /// for each page - about four times slower for 100 values of 500 events.
 /// The page is of distinct sequences: `event_tags` has a row per tag, so
 /// an event carrying two of the values has two, and a limit on rows

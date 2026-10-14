@@ -64,6 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Tag reads go through the `event_tags` table, and the GIN index on
+  `events.tags` (`events_by_tags`) is no longer created; startup drops it
+  from existing bounded contexts with `DROP INDEX CONCURRENTLY`
+  (docs/architecture.md §210). Commands that read their history by tag
+  (no consistency query of their own) ran 3.5-4.5x faster in
+  `command_throughput`'s spread workload; the latest event of several types
+  for a long-lived tag is one index probe per type instead of a sort of the
+  tag's history; blind-tag erasure no longer scans the tag index. Reading a
+  long-lived tag's whole history is about 10% slower. A rolled-back older
+  version still works, its tag reads as sequential scans.
+- New ignored benchmark `skilj/tests/tag_read_bench.rs`.
 - `TagMapping` has a `blind` field: a struct literal needs `blind: false`,
   or use `TagMapping::new`. Stored registrations are unchanged (the field
   is left out of the JSON when false).

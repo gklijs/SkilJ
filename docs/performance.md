@@ -81,6 +81,11 @@ What the profile says:
   411-515 commands/s with one caller and 2,500-5,000 from 8 up, on the same
   hot account, faster than spread. A command that checks only its payload
   should say so.
+- Tag reads go through `event_tags` since docs/architecture.md §210, and
+  the GIN index on `events.tags` is gone. Back to back, spread went from 89
+  to 404 commands/s with one caller and from 791 to 3,100 with 80: its read
+  of a new account's (empty) history took 8.7-43 ms through GIN's pending
+  list, and 0.5-7.5 ms now. The table above predates it.
 - **Hot** is bounded by the account's history, which every command carries
   into the lock and folds: `decide` takes ~1 ms even with nothing new to
   re-check, and the consistency boundary is computed over the same history
@@ -325,7 +330,10 @@ Settings outside skilj that change how it performs (docs/architecture.md
   events, the plans for the tag reads (one tag, several tags, a tag after a
   position, and a tag matching 10% of the events) and for the paged
   per-type read were the same at the default 4 and at 1.1: GIN bitmap
-  scans and the primary-key or `events_by_type` index throughout. Lowering
+  scans and the primary-key or `events_by_type` index throughout. That was
+  before tag reads moved to `event_tags` (architecture §210), whose
+  statements read the events by primary key from an array, leaving the
+  planner no join to choose; not re-checked since. Lowering
   it on SSD or NVMe storage is the usual advice for other queries, and
   does skilj no harm.
 
