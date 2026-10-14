@@ -2212,6 +2212,7 @@ pub async fn ensure_blind_tags_table<'e>(
                 tag_key TEXT PRIMARY KEY,
                 normalizer_version BIGINT NOT NULL,
                 key_fingerprint TEXT,
+                key_generation BIGINT NOT NULL DEFAULT 0,
                 erasure JSONB NOT NULL,
                 registered_at TIMESTAMPTZ NOT NULL
             );
@@ -2243,12 +2244,19 @@ pub async fn register_blind_tag(
         .bind(format!("skilj_blind_tags:{schema}"))
         .execute(&mut *tx)
         .await?;
-    let stored: Option<(i64, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT normalizer_version, key_fingerprint FROM {schema}.blind_tags WHERE tag_key = $1"
+    let stored: Option<(i64, Option<String>, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT normalizer_version, key_fingerprint, key_generation FROM {schema}.blind_tags \
+         WHERE tag_key = $1"
     )))
     .bind(&declaration.tag_key)
     .fetch_optional(&mut *tx)
     .await?;
+    // A fingerprint compares only at the generation it was taken at
+    // (docs/architecture.md §209); startup checks the stored one.
+    let stored = stored.map(|(version, fingerprint, generation)| {
+        let comparable = generation == i64::from(declaration.key_generation);
+        (version, fingerprint.filter(|_| comparable))
+    });
     match stored {
         Some((version, _)) if version != i64::from(declaration.normalizer_version) => {
             return Err(crate::event_store::Error::BlindNormalizerChanged {
@@ -2273,11 +2281,13 @@ pub async fn register_blind_tag(
         Some(_) => {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {schema}.blind_tags SET erasure = $2, \
-                 key_fingerprint = coalesce(key_fingerprint, $3) WHERE tag_key = $1"
+                 key_fingerprint = coalesce(key_fingerprint, $3) \
+                 WHERE tag_key = $1 AND (key_fingerprint IS NOT NULL OR key_generation = $4)"
             )))
             .bind(&declaration.tag_key)
             .bind(Json(&declaration.erasure))
             .bind(&declaration.key_fingerprint)
+            .bind(i64::from(declaration.key_generation))
             .execute(&mut *tx)
             .await?;
         }
@@ -2301,12 +2311,13 @@ pub async fn register_blind_tag(
             }
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {schema}.blind_tags \
-                 (tag_key, normalizer_version, key_fingerprint, erasure, registered_at) \
-                 VALUES ($1, $2, $3, $4, $5)"
+                 (tag_key, normalizer_version, key_fingerprint, key_generation, erasure, \
+                  registered_at) VALUES ($1, $2, $3, $4, $5, $6)"
             )))
             .bind(&declaration.tag_key)
             .bind(i64::from(declaration.normalizer_version))
             .bind(&declaration.key_fingerprint)
+            .bind(i64::from(declaration.key_generation))
             .bind(Json(&declaration.erasure))
             .bind(now)
             .execute(&mut *tx)
@@ -2317,30 +2328,207 @@ pub async fn register_blind_tag(
     Ok(())
 }
 
+/// `blind_tags`' columns, as `list_blind_tags` reads them.
+type BlindTagRow = (
+    String,
+    i64,
+    Option<String>,
+    i64,
+    Json<crate::blind::Erasure>,
+);
+
 /// Every blind tag stored for `bounded_context`.
 pub async fn list_blind_tags(
     pool: &Pool,
     bounded_context: &str,
 ) -> crate::error::Result<Vec<crate::blind::BlindTagDeclaration>> {
     let schema = schema_ident(bounded_context);
-    let rows: Vec<(String, i64, Option<String>, Json<crate::blind::Erasure>)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT tag_key, normalizer_version, key_fingerprint, erasure \
+    let rows: Vec<BlindTagRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT tag_key, normalizer_version, key_fingerprint, key_generation, erasure \
              FROM {schema}.blind_tags ORDER BY tag_key"
-        )))
-        .fetch_all(pool)
-        .await?;
+    )))
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
-        .map(
-            |(tag_key, version, key_fingerprint, erasure)| crate::blind::BlindTagDeclaration {
+        .map(|(tag_key, version, key_fingerprint, generation, erasure)| {
+            crate::blind::BlindTagDeclaration {
                 tag_key,
                 normalizer_version: u32::try_from(version).unwrap_or(u32::MAX),
                 erasure: erasure.0,
                 key_fingerprint,
-            },
-        )
+                key_generation: u32::try_from(generation).unwrap_or(u32::MAX),
+            }
+        })
         .collect())
+}
+
+/// Brings this process's view of `bounded_context`'s blind-tag
+/// generations up to date, under the bounded context's sequence lock
+/// (docs/architecture.md §209) - which a rotation holds while it
+/// rewrites, so what's read here can't change until the caller commits.
+/// Whether any differed from what this process hashed with: a command
+/// whose tags were derived before the lock then has to be derived again.
+/// No query at all for a bounded context this process declares no blind
+/// tag for.
+pub(crate) async fn refresh_blind_generations(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+    blind: &crate::blind::BlindIndex,
+) -> crate::error::Result<bool> {
+    if !blind.declares_any(bounded_context) {
+        return Ok(false);
+    }
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT tag_key, key_generation FROM {schema}.blind_tags"
+    )))
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut changed = false;
+    for (tag_key, generation) in rows {
+        let generation = u32::try_from(generation).unwrap_or(u32::MAX);
+        changed |= blind.observe_generation(bounded_context, &tag_key, generation);
+    }
+    Ok(changed)
+}
+
+/// Rewraps every stored tag of `bounded_context`'s blind tag `tag_key`
+/// from generation `from` to `from + 1` (docs/architecture.md §209): in
+/// `events.tags`, `event_tags`, the commands' `consistency_tags` and query
+/// items, and snapshot rows keyed by it - each value through `wrap`, which
+/// needs only the stored tag - and stores the new generation with
+/// `fingerprint`, the key chain's up to it. One transaction under the
+/// bounded context's sequence lock, so no write lands half-way and a
+/// crash leaves the old generation whole; every write to the bounded
+/// context waits meanwhile. `false`, changing nothing, when the stored
+/// generation isn't `from` - another instance rotated it.
+pub async fn rotate_blind_tag(
+    pool: &Pool,
+    bounded_context: &str,
+    tag_key: &str,
+    from: u32,
+    wrap: &(dyn Fn(&str) -> crate::error::Result<String> + Sync),
+    fingerprint: &str,
+) -> crate::error::Result<bool> {
+    ensure_registrations_generation(pool, bounded_context).await?;
+    let schema = schema_ident(bounded_context);
+    let mut tx = pool.begin().await?;
+    lock_bounded_context_sequence(&mut tx, bounded_context).await?;
+    let stored: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT key_generation FROM {schema}.blind_tags WHERE tag_key = $1 FOR UPDATE"
+    )))
+    .bind(tag_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if stored != Some((i64::from(from),)) {
+        return Ok(false);
+    }
+
+    let keyed = serde_json::json!([{ "key": tag_key }]);
+    let in_query = serde_json::json!([{ "tags": [{ "key": tag_key }] }]);
+    let old: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT tag_value FROM {schema}.event_tags \
+            WHERE tag_key = $1 AND tag_value IS NOT NULL \
+         UNION SELECT t->>'value' FROM {schema}.commands c, \
+            jsonb_array_elements(c.consistency_tags) t \
+            WHERE c.consistency_tags @> $2 AND t->>'key' = $1 AND t->>'value' IS NOT NULL \
+         UNION SELECT t->>'value' FROM {schema}.commands c, \
+            jsonb_array_elements(c.consistency_query) item, \
+            jsonb_array_elements(coalesce(item->'tags', '[]'::jsonb)) t \
+            WHERE c.consistency_query @> $3 AND t->>'key' = $1 AND t->>'value' IS NOT NULL \
+         UNION SELECT tag_value FROM {schema}.snapshots WHERE tag_key = $1"
+    )))
+    .bind(tag_key)
+    .bind(Json(&keyed))
+    .bind(Json(&in_query))
+    .fetch_all(&mut *tx)
+    .await?;
+    let old: Vec<String> = old.into_iter().map(|(v,)| v).collect();
+    let new = old
+        .iter()
+        .map(|v| wrap(v))
+        .collect::<crate::error::Result<Vec<String>>>()?;
+
+    sqlx::query(
+        "CREATE TEMP TABLE skilj_blind_rotation (old TEXT PRIMARY KEY, new TEXT NOT NULL) \
+         ON COMMIT DROP",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO skilj_blind_rotation (old, new) SELECT * FROM unnest($1::text[], $2::text[])",
+    )
+    .bind(&old)
+    .bind(&new)
+    .execute(&mut *tx)
+    .await?;
+    // A tag array with each of the key's values replaced, in order.
+    let rewrap = |column: &str| {
+        format!(
+            "(SELECT coalesce(jsonb_agg(CASE WHEN t->>'key' = $1 AND t->>'value' IS NOT NULL \
+                THEN jsonb_set(t, '{{value}}', to_jsonb((\
+                    SELECT r.new FROM skilj_blind_rotation r WHERE r.old = t->>'value'))) \
+                ELSE t END ORDER BY x.ord), '[]'::jsonb) \
+              FROM jsonb_array_elements({column}) WITH ORDINALITY AS x(t, ord))"
+        )
+    };
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.events e SET tags = {} WHERE e.tags @> $2",
+        rewrap("e.tags")
+    )))
+    .bind(tag_key)
+    .bind(Json(&keyed))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.event_tags et SET tag_value = r.new FROM skilj_blind_rotation r \
+         WHERE et.tag_key = $1 AND et.tag_value = r.old"
+    )))
+    .bind(tag_key)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.commands c SET \
+            consistency_tags = {}, \
+            consistency_query = (SELECT coalesce(jsonb_agg(CASE WHEN q.item ? 'tags' \
+                THEN jsonb_set(q.item, '{{tags}}', {}) ELSE q.item END ORDER BY q.ord), \
+                '[]'::jsonb) \
+              FROM jsonb_array_elements(c.consistency_query) WITH ORDINALITY AS q(item, ord)) \
+         WHERE c.consistency_tags @> $2 OR c.consistency_query @> $3",
+        rewrap("c.consistency_tags"),
+        rewrap("q.item->'tags'"),
+    )))
+    .bind(tag_key)
+    .bind(Json(&keyed))
+    .bind(Json(&in_query))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.snapshots s SET tag_value = r.new FROM skilj_blind_rotation r \
+         WHERE s.tag_key = $1 AND s.tag_value = r.old"
+    )))
+    .bind(tag_key)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.blind_tags SET key_generation = $2, key_fingerprint = $3 \
+         WHERE tag_key = $1"
+    )))
+    .bind(tag_key)
+    .bind(i64::from(from) + 1)
+    .bind(fingerprint)
+    .execute(&mut *tx)
+    .await?;
+    // Every instance's event cache holds the old tags (docs/architecture.md
+    // §205's erasure does the same).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.registrations_generation SET generation = generation + 1"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Records `key_fingerprint` for `bounded_context`'s blind tag `tag_key`
@@ -4471,6 +4659,16 @@ pub async fn forget_subject_in_blind_tags(
     }
     ensure_registrations_generation(pool, bounded_context).await?;
     let mut tx = pool.begin().await?;
+    // A rotation of these tags (docs/architecture.md §209) holds their
+    // rows while it rewrites the same events: wait for it here, before
+    // touching any, rather than meet it half-way.
+    let keys: Vec<&str> = erased.iter().map(|(tag_key, _)| tag_key.as_str()).collect();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {schema}.blind_tags WHERE tag_key = ANY($1) FOR SHARE"
+    )))
+    .bind(&keys)
+    .execute(&mut *tx)
+    .await?;
     let mut events_changed = 0;
     for (tag_key, subject_tag) in &erased {
         let subject = serde_json::json!([{ "key": subject_tag, "value": subject_value }]);
@@ -8544,6 +8742,9 @@ pub async fn create_and_insert_external_event(
 
     let mut tx = pool.begin().await?;
     let next_seq = next_sequence(&mut *tx, &bounded_context_name).await?;
+    // docs/architecture.md §209: tags are derived below, under the lock a
+    // rotation holds - of the generation stored now.
+    refresh_blind_generations(&mut tx, &bounded_context_name, blind).await?;
 
     // On a hit: implicit rollback - nothing else was written, the same
     // "a hit is a cached prior answer, not a new decision, tx is simply
@@ -8673,6 +8874,9 @@ pub async fn create_and_insert_direct_event(
 
     let mut tx = pool.begin().await?;
     let next_seq = next_sequence(&mut *tx, &bounded_context_name).await?;
+    // docs/architecture.md §209: tags are derived below, under the lock a
+    // rotation holds - of the generation stored now.
+    refresh_blind_generations(&mut tx, &bounded_context_name, blind).await?;
     let event = crate::event_store::create_direct_event(
         adapter,
         payload,
@@ -9286,6 +9490,32 @@ async fn decide_command_in_tx(
                     triggered_event_sequences,
                 },
             ));
+        }
+    }
+
+    // docs/architecture.md §209: the command's tags, and the history read
+    // with them, were derived before the lock. If a key rotation of this
+    // bounded context committed since, they are of the old generation and
+    // match nothing stored: derive them again now that nothing can rotate,
+    // and send the command round once more if they changed. Compared per
+    // command, not per refresh - an earlier command, in this batch or on
+    // another task, may have refreshed the generations already. A query's
+    // blind keys are among the command's own tags (`build()` checks it), so
+    // these cover it too.
+    let blind = dispatcher.blind_index();
+    if blind.declares_any(&bounded_context_name) {
+        refresh_blind_generations(&mut *conn, &bounded_context_name, &blind).await?;
+        let current = crate::event_store::derive_tags(
+            &command_type.tag_mappings,
+            payload,
+            &blind,
+            &bounded_context_name,
+        )?;
+        if current != consistency_tags {
+            return Err(crate::blind::Error::Rotated {
+                bounded_context: bounded_context_name,
+            }
+            .into());
         }
     }
 
@@ -11605,6 +11835,59 @@ pub async fn dry_run_command(
 /// rather than arriving as a burst of concurrent external requests.
 #[allow(clippy::too_many_arguments)]
 pub async fn decide_and_submit_command(
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+    idempotency_key: Option<&str>,
+) -> crate::error::Result<SubmitCommandOutcome> {
+    let mut rotated_once = false;
+    loop {
+        let outcome = decide_and_submit_command_once(
+            pool,
+            dispatcher,
+            projection_dispatcher,
+            snapshot_dispatcher,
+            broadcaster,
+            event_cache,
+            command_type,
+            payload,
+            client_id,
+            correlation_id,
+            causation_id,
+            encryption_master_key,
+            now,
+            idempotency_key,
+        )
+        .await;
+        match outcome {
+            Err(err) if blind_tags_rotated(&err) && !rotated_once => rotated_once = true,
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Whether `err` is a command sent round again because its blind tags were
+/// derived before a key rotation (docs/architecture.md §209) - retried once
+/// by the submission functions, rehashed.
+pub fn blind_tags_rotated(err: &crate::error::Error) -> bool {
+    matches!(
+        err,
+        crate::error::Error::Blind(crate::blind::Error::Rotated { .. })
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide_and_submit_command_once(
     pool: &Pool,
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,

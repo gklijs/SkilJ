@@ -43,20 +43,29 @@ async fn parse_tags(
             plaintext,
         });
     }
+    let blind = state.dispatcher.blind_index();
     let blind_keys = if tags.iter().any(|t| t.plaintext) {
-        skilj_core::db::list_blind_tags(&state.pool, bounded_context)
+        let stored = skilj_core::db::list_blind_tags(&state.pool, bounded_context)
             .await
-            .map_err(to_graphql_error)?
-            .into_iter()
-            .map(|b| b.tag_key)
-            .collect()
+            .map_err(to_graphql_error)?;
+        // Hashed at the generation stored now, should a key rotation
+        // (docs/architecture.md §209) have landed since this process last
+        // looked.
+        for declaration in &stored {
+            blind.observe_generation(
+                bounded_context,
+                &declaration.tag_key,
+                declaration.key_generation,
+            );
+        }
+        stored.into_iter().map(|b| b.tag_key).collect()
     } else {
         Vec::new()
     };
     skilj_core::event_store::resolve_query_tags(
         tags,
         &blind_keys,
-        &state.dispatcher.blind_index(),
+        &blind,
         bounded_context,
         access_mapping,
     )

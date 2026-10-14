@@ -849,6 +849,7 @@ impl Skilj {
             snapshots: HashMap::new(),
             blind_tags: HashMap::new(),
             blind_index_key: None,
+            previous_blind_index_keys: Vec::new(),
             cross_context_routes: HashMap::new(),
             schedule_deadlines: HashMap::new(),
             cancel_deadlines: HashMap::new(),
@@ -1486,21 +1487,36 @@ fn validate_blind_tags(
     Ok(())
 }
 
+/// A blind tag stored at an older key generation than this process's
+/// current key (docs/architecture.md §209): its bounded context, the one
+/// declaring it (its template, for a tenant), the tag key and the stored
+/// generation.
+struct PendingBlindRotation {
+    bounded_context: String,
+    declaring: String,
+    tag_key: String,
+    generation: u32,
+}
+
 /// Refuses to start when a declared `BlindTag`'s normalizer version
-/// differs from the stored one (docs/architecture.md §205), or its key
-/// fingerprint does (§208), whether or not this process reconciles: it
-/// would hash values so they no longer match what's stored. Covers the
-/// tenants created from a declaring bounded context too, which hash with
-/// their template's normalizer under keys of their own, and records a
-/// fingerprint a tenant's creator couldn't.
+/// differs from the stored one (docs/architecture.md §205), its key
+/// fingerprint does (§208), or it was rotated to a key this process
+/// doesn't have (§209), whether or not this process reconciles: it would
+/// hash values so they no longer match what's stored. Covers the tenants
+/// created from a declaring bounded context too, which hash with their
+/// template's normalizer under keys of their own, and records a
+/// fingerprint a tenant's creator couldn't. Loads each constraint's
+/// stored generation into `blind_index`, and returns the ones behind its
+/// current key.
 async fn check_stored_blind_tags(
     pool: &Pool,
     blind_tags: &HashMap<(String, String), RegisteredBlindTag>,
     blind_index: &skilj_core::blind::BlindIndex,
     template_cache: &skilj_core::template_cache::TemplateCache,
-) -> Result<(), skilj_core::Error> {
+) -> Result<Vec<PendingBlindRotation>, skilj_core::Error> {
+    let mut pending = Vec::new();
     if blind_tags.is_empty() {
-        return Ok(());
+        return Ok(pending);
     }
     let declaring: HashSet<&String> = blind_tags.keys().map(|(bc, _)| bc).collect();
     // Recorded only once every check passed: a refused process records
@@ -1538,7 +1554,18 @@ async fn check_stored_blind_tags(
                 }
                 .into());
             }
-            let Some(fingerprint) = blind_index.fingerprint(&bc, &stored.tag_key) else {
+            let generation = stored.key_generation;
+            if generation > blind_index.current_generation() {
+                return Err(skilj_core::blind::Error::KeyNotConfigured {
+                    bounded_context: bc,
+                    tag_key: stored.tag_key,
+                    generation,
+                }
+                .into());
+            }
+            blind_index.observe_generation(&bc, &stored.tag_key, generation);
+            let Some(fingerprint) = blind_index.fingerprint(&bc, &stored.tag_key, generation)
+            else {
                 continue;
             };
             match stored.key_fingerprint {
@@ -1550,12 +1577,83 @@ async fn check_stored_blind_tags(
                     .into());
                 }
                 Some(_) => {}
-                None => missing.push((bc.clone(), stored.tag_key, fingerprint)),
+                None => missing.push((bc.clone(), stored.tag_key.clone(), fingerprint)),
+            }
+            if generation < blind_index.current_generation() {
+                pending.push(PendingBlindRotation {
+                    bounded_context: bc.clone(),
+                    declaring: effective.clone(),
+                    tag_key: stored.tag_key,
+                    generation,
+                });
             }
         }
     }
     for (bc, tag_key, fingerprint) in missing {
         skilj_core::db::record_blind_tag_fingerprint(pool, &bc, &tag_key, &fingerprint).await?;
+    }
+    Ok(pending)
+}
+
+/// Rewraps the stored tags of every constraint behind this process's
+/// current blind-index key (docs/architecture.md §209), one generation at
+/// a time, for each bounded context the reconciliation Role administers -
+/// itself, or for a tenant its template. Another instance rotating the
+/// same constraint meanwhile is noticed and skipped.
+async fn rotate_blind_tags(
+    pool: &Pool,
+    role: &Role,
+    pending: Vec<PendingBlindRotation>,
+    blind_index: &skilj_core::blind::BlindIndex,
+    report: &mut ReconciliationReport,
+) -> Result<(), skilj_core::Error> {
+    for rotation in pending {
+        let PendingBlindRotation {
+            bounded_context: bc,
+            declaring,
+            tag_key,
+            generation,
+        } = rotation;
+        let administers = resolve_bounded_context_and_admin_mapping(pool, &role.id, &bc)
+            .await?
+            .is_some()
+            || resolve_bounded_context_and_admin_mapping(pool, &role.id, &declaring)
+                .await?
+                .is_some();
+        if !administers {
+            report
+                .skipped_no_access
+                .push(format!("{bc}/{tag_key} (blind-index key rotation)"));
+            continue;
+        }
+        for from in generation..blind_index.current_generation() {
+            let to = from + 1;
+            let fingerprint = blind_index
+                .fingerprint(&bc, &tag_key, to)
+                .expect("checked at startup: this process declares the constraint and has the key");
+            let wrap = |tag: &str| -> skilj_core::error::Result<String> {
+                Ok(blind_index.wrap(&bc, &tag_key, to, tag)?)
+            };
+            let started = std::time::Instant::now();
+            if !skilj_core::db::rotate_blind_tag(pool, &bc, &tag_key, from, &wrap, &fingerprint)
+                .await?
+            {
+                tracing::info!(
+                    bounded_context = %bc,
+                    tag_key = %tag_key,
+                    "blind tag rotated by another instance meanwhile"
+                );
+                break;
+            }
+            blind_index.observe_generation(&bc, &tag_key, to);
+            tracing::info!(
+                bounded_context = %bc,
+                tag_key = %tag_key,
+                generation = to,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "blind tag rotated to the current blind-index key"
+            );
+        }
     }
     Ok(())
 }
@@ -1590,7 +1688,15 @@ async fn reconcile_blind_tags(
                 tag_key: tag_key.clone(),
                 normalizer_version: registered.normalizer_version,
                 erasure: registered.erasure.clone(),
-                key_fingerprint: blind_index.fingerprint(bounded_context_name, tag_key),
+                // A new constraint starts at the current key; an existing
+                // one keeps its stored generation (docs/architecture.md
+                // §209).
+                key_fingerprint: blind_index.fingerprint(
+                    bounded_context_name,
+                    tag_key,
+                    blind_index.current_generation(),
+                ),
+                key_generation: blind_index.current_generation(),
             },
             chrono::Utc::now(),
         )
@@ -2090,6 +2196,7 @@ pub struct SkiljBuilder {
     /// §205).
     blind_tags: HashMap<(String, String), RegisteredBlindTag>,
     blind_index_key: Option<skilj_core::blind::BlindIndexKey>,
+    previous_blind_index_keys: Vec<skilj_core::blind::BlindIndexKey>,
     /// Keyed by `CrossContextRoute::NAME` alone, not `(bounded_context,
     /// name)` the way `event_types`/`command_types`/`projections`/
     /// `snapshots` are - a route by definition spans two bounded
@@ -2235,6 +2342,28 @@ impl SkiljBuilder {
     /// stored no longer match. Required once a `BlindTag` is declared.
     pub fn blind_index_key(mut self, key: BlindIndexKey) -> Self {
         self.blind_index_key = Some(key);
+        self
+    }
+
+    /// The blind-index keys [`blind_index_key`](Self::blind_index_key)
+    /// replaced, oldest first - how a key is rotated (docs/architecture.md
+    /// §209). Stored tags are of the oldest key wrapped under each later
+    /// one up to their constraint's stored generation, so this process can
+    /// hash at any generation up to the current key's. A process with a
+    /// reconciliation role rewraps every stored tag of each constraint
+    /// behind the current key at startup; one without hashes at the stored
+    /// generation until one has.
+    ///
+    /// To rotate a leaked key: configure a new key here and the old one as
+    /// previous on every instance, then start one with the reconciliation
+    /// role. Keep the previous keys configured afterwards: every new value
+    /// is still hashed under them first and wrapped under the new one,
+    /// which is what keeps it unguessable to whoever has only the old.
+    pub fn previous_blind_index_keys(
+        mut self,
+        keys: impl IntoIterator<Item = BlindIndexKey>,
+    ) -> Self {
+        self.previous_blind_index_keys = keys.into_iter().collect();
         self
     }
 
@@ -2721,6 +2850,12 @@ impl SkiljBuilder {
         }
         // docs/architecture.md §198.
         validate_consistency_queries(&self.command_types, &self.event_types, &self.snapshots)?;
+        // docs/architecture.md §209.
+        if !self.previous_blind_index_keys.is_empty() && self.blind_index_key.is_none() {
+            return Err(skilj_core::Error::configuration(
+                "previous_blind_index_keys is configured without a blind_index_key to rotate to",
+            ));
+        }
         // docs/architecture.md §205.
         validate_blind_tags(
             &self.blind_tags,
@@ -2845,6 +2980,7 @@ impl SkiljBuilder {
                     .iter()
                     .map(|((bc, tag_key), b)| (bc.clone(), tag_key.clone(), b.normalize)),
             )
+            .with_previous_keys(self.previous_blind_index_keys.iter().cloned())
             .with_templates(template_cache.clone()),
             None => skilj_core::blind::BlindIndex::default(),
         };
@@ -3090,7 +3226,8 @@ impl SkiljBuilder {
         // reconciliation reads each declared bounded context's
         // registration tables, which a bounded context from an older
         // version only has every column of once they've run.
-        check_stored_blind_tags(&pool, &self.blind_tags, &blind_index, &template_cache).await?;
+        let pending_rotations =
+            check_stored_blind_tags(&pool, &self.blind_tags, &blind_index, &template_cache).await?;
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
             let role = skilj_core::access_control::resolve_role_by_external_subject(
@@ -3101,6 +3238,7 @@ impl SkiljBuilder {
 
             // Before the types, which map the blind keys (docs/architecture.md §205).
             reconcile_blind_tags(&pool, &role, &self.blind_tags, &blind_index, &mut report).await?;
+            rotate_blind_tags(&pool, &role, pending_rotations, &blind_index, &mut report).await?;
             let version = RegistrationVersion::new(self.application_version);
             reconcile_event_types(
                 &pool,
@@ -3125,6 +3263,18 @@ impl SkiljBuilder {
                 &version,
             )
             .await?;
+        } else {
+            // docs/architecture.md §209: hashing at the stored generation
+            // meanwhile, which `check_stored_blind_tags` loaded.
+            for rotation in &pending_rotations {
+                tracing::warn!(
+                    bounded_context = %rotation.bounded_context,
+                    tag_key = %rotation.tag_key,
+                    generation = rotation.generation,
+                    "blind tag behind the current blind-index key; an instance with a \
+                     reconciliation role rotates it at startup"
+                );
+            }
         }
 
         // The initial GraphQL schema (Codeberg issue #2; `@guarantee

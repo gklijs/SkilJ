@@ -1390,16 +1390,21 @@ entity RoleAccessMapping {
 -- and configured, not stored - a black box, like the encryption scheme -
 -- so only the version and a fingerprint of the derived key (§208) are
 -- compared: an instance declaring another version, or configured with
--- another key, is refused at startup, since its hashes would no longer
--- match the stored ones. A key already mapped plainly by a registered type can't become
+-- another key, or without a key of the stored generation, is refused at
+-- startup, since its hashes would no longer match the stored ones. A key already mapped plainly by a registered type can't become
 -- blind - its values are stored in the clear - and a key's blindness never
 -- changes afterwards.
 entity BlindTag {
     bounded_context: BoundedContext
     tag_key: String
     normalizer_version: Integer
-    key_fingerprint: String?               -- a one-way value of the constraint's derived key,
-                                            -- revealing nothing about it. Null only for a
+    key_generation: Integer                -- how many later root keys its tags are wrapped
+                                            -- under (§209): HMAC(k_g, tag of g - 1). Rotating
+                                            -- rewrites every stored tag to the next
+                                            -- generation from the tag alone
+    key_fingerprint: String?               -- a one-way value of the constraint's derived keys
+                                            -- up to key_generation, revealing nothing about
+                                            -- them. Null only for a
                                             -- tenant created by an instance that doesn't
                                             -- declare the template's BlindTag; the first
                                             -- instance that does records it

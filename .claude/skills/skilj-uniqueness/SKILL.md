@@ -10,7 +10,8 @@ description: >
   two customers with the same ...", "already registered/taken", "unique
   username", "blind index", "BlindTag", "TagMapping::blind",
   "blind_index_key", "blind_tag_not_declared", "blind_tag_mismatch",
-  "blind_index_key_changed", a sensitive field that also needs to be
+  "blind_index_key_changed", "rotate the blind index key", "blind index
+  key leaked/compromised", a sensitive field that also needs to be
   looked up by value, or checking a value before submitting - "is this
   email available", "is this username free", "check if taken before
   registering", "look a customer up by email". Do NOT use for: uniqueness
@@ -155,17 +156,31 @@ The `decide_*` functions stay hand-written. Complete example:
 `blind_index_key` is a root secret every constraint's HMAC key is derived
 from. Treat it like the encryption master key, and keep it separate:
 
-- **Identical on every instance, stable forever.** Stored hashes only
+- **Identical on every instance, never changed casually.** Stored hashes only
   match new ones under the same key. skilj stores a fingerprint of each
   constraint's derived key and refuses to start with another key
   (`blind_index_key_changed`, `docs/architecture.md` §208), so a mistyped
   or regenerated key fails loudly instead of letting every value be
   claimed again.
-- **Not rotatable in place.** The hashes can't be recomputed: the values
-  are encrypted per subject, and forgotten subjects' are gone. Rotating
-  means a new tag key and `BlindTag`, re-claiming the live values under
-  it (the command that changes them can claim both), and the old key kept
-  until that is done. Say so when the user asks about key rotation.
+- **Rotatable, from the stored tags alone.** If the key leaks, whoever
+  also gets a copy of the tags can test guesses against them. Rotate it
+  (`docs/architecture.md` §209):
+  1. Generate a new key. On every instance, configure it as
+     `blind_index_key` and the leaked one in `previous_blind_index_keys`
+     (oldest first), and roll that out. They keep working meanwhile.
+  2. Start an instance with the reconciliation role. It rewraps every
+     stored tag under the new key: events, the tag index, commands and
+     snapshot rows. Writes to each bounded context wait while it runs.
+  3. Keep both keys configured afterwards. New values are hashed under
+     the old key and wrapped under the new one; the new key is what keeps
+     them unguessable.
+
+  No plaintext is needed, so a forgotten subject's `Keep` hash is
+  rotated too. Copies of the database taken before the rotation stay
+  exposed, and a hash a client saved from an event's tags stops matching.
+  Don't suggest a new tag key or `BlindTag` as a rotation: every
+  constraint key is derived from the same root key, so it's exactly as
+  exposed.
 - **Losing it** loses the guarantee for every value claimed so far. Back
   it up with the master key, in the same secret store.
 - **Loading it** is the application's: `BlindIndexKey::from_bytes` takes
@@ -255,7 +270,9 @@ before the first deploy.
 | `blind_tag_mismatch` | a key is blind on one type and plain on another, or blind with no stored `BlindTag` | use `TagMapping::blind::<B>` everywhere the key is mapped |
 | `blind_tag_key_in_use` | making blind a key already mapped in the clear | use a new tag key |
 | `blind_normalizer_changed` | `NORMALIZER_VERSION` differs from the stored one | revert the normalizer change |
-| `blind_index_key_changed` | this process's `blind_index_key` isn't the one the stored tags were hashed with | configure the original key; see "The key" |
+| `blind_index_key_changed` | this process's `blind_index_key` (or a previous one) isn't the one the stored tags were hashed with | configure the original keys; see "The key" |
+| `blind_index_key_not_configured` | the tags were rotated to a key this process isn't configured with, or it lacks the previous keys | configure the new key and `previous_blind_index_keys`; another instance retries meanwhile |
+| `blind_tags_rotated` | a key rotation committed while the command was decided, twice in a row | retry; submission already retried once |
 | `invalid_blind_tag_mapping` | blind owner key, or blind mapping on a scheduled type | tag the owner plainly; drop the blind mapping there |
 | `sensitive_field_tag_overlap` | a *plain* tag on a sensitive field | `TagMapping::blind` |
 | `blind_tag_lookup_not_granted` | `plaintext: true` on a blind key from a grant that can't read sensitive fields | use a grant with `can_read_sensitive` |
@@ -266,5 +283,5 @@ declared key mapped plainly, a missing `subject_tag` mapping.
 
 Design and rationale: `docs/architecture.md` §205 (blind tags), §206
 (`.skilj.toml` and the API by use case), §207 (plaintext lookup), §208
-(the key fingerprint). Worked tests: `skilj/tests/blind_tags.rs`, and
+(the key fingerprint), §209 (rotating the key). Worked tests: `skilj/tests/blind_tags.rs`, and
 `skilj-demo/tests/customers.rs` for the generated version.

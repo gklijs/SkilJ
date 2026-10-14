@@ -285,6 +285,11 @@ async fn bounded_context(pool: &Pool) -> (String, String) {
 /// The customer types, registered in `bc` - without a `BlindTag`, which
 /// each test adds.
 fn customer_types(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
+    customer_instance(database_url, bc).reconciliation_role(subject)
+}
+
+/// [`customer_types`] for an instance that doesn't reconcile.
+fn customer_instance(database_url: &str, bc: &str) -> SkiljBuilder {
     Skilj::builder(database_url)
         .bounded_context(bc)
         .event_type::<EmailClaimed>()
@@ -292,7 +297,6 @@ fn customer_types(database_url: &str, bc: &str, subject: &str) -> SkiljBuilder {
         .command_type::<RegisterCustomer>()
         .command_type::<ChangeEmail>()
         .encryption_master_key(master_key())
-        .reconciliation_role(subject)
 }
 
 struct Crm {
@@ -300,6 +304,8 @@ struct Crm {
     pool: Pool,
     bc: String,
     cache: EventCache,
+    /// The reconciliation role's subject, with admin access to `bc`.
+    subject: String,
 }
 
 /// A fresh bounded context with the customer types, the address erased
@@ -324,10 +330,22 @@ async fn crm_with<B: BlindTag + 'static>(
         pool,
         bc,
         cache: EventCache::new(1000),
+        subject,
     })
 }
 
 impl Crm {
+    /// The same bounded context, served by `skilj`.
+    fn served_by(&self, skilj: Skilj) -> Crm {
+        Crm {
+            skilj,
+            pool: self.pool.clone(),
+            bc: self.bc.clone(),
+            cache: EventCache::new(1000),
+            subject: self.subject.clone(),
+        }
+    }
+
     async fn submit_through(
         &self,
         skilj: &Skilj,
@@ -767,6 +785,207 @@ fn startup_refuses_a_different_blind_index_key_and_records_a_missing_fingerprint
     });
 }
 
+// --- rotating the key (docs/architecture.md §209) ---
+
+fn new_blind_key() -> BlindIndexKey {
+    BlindIndexKey::from_bytes([13; 32])
+}
+
+/// `blind_tags`' row for `email`: its generation and key fingerprint.
+async fn stored_generation(crm: &Crm) -> (u32, Option<String>) {
+    let stored = db::list_blind_tags(&crm.pool, &crm.bc).await.unwrap();
+    (stored[0].key_generation, stored[0].key_fingerprint.clone())
+}
+
+/// A reconciling instance configured with a new key and the old one as
+/// previous rewraps every stored tag - events, their index, commands and
+/// snapshot rows - without any address in the clear, so a forgotten
+/// customer's kept address stays taken too. Nothing of the old tags is
+/// left, every address taken before still is, and an instance with only
+/// one of the two keys refuses to start.
+#[test]
+fn rotating_the_key_rewraps_every_stored_tag_and_keeps_every_value_taken() {
+    runtime().block_on(async {
+        let Some(crm) = crm::<KeptEmail>().await else {
+            return;
+        };
+        let (forgotten, changed) = (id("c"), id("c"));
+        assert_eq!(
+            crm.register(&forgotten, "alice@example.com").await,
+            "accepted"
+        );
+        assert_eq!(crm.register(&changed, "bob@example.com").await, "accepted");
+        assert_eq!(
+            crm.change(&changed, "bob@example.com", "robert@example.com")
+                .await,
+            "accepted"
+        );
+        crm.forget(&forgotten).await;
+        let old_hashes = crm.stored_hashes().await;
+        assert_eq!(old_hashes.len(), 3);
+        let (generation, old_fingerprint) = stored_generation(&crm).await;
+        assert_eq!(generation, 0);
+        // A snapshot keyed by the tag holds a hash too.
+        let schema = format!("\"bc_{}\"", crm.bc);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {schema}.snapshots (snapshot_name, tag_key, tag_value, \
+             snapshot_version, as_of_sequence, state, updated_at) \
+             VALUES ('Claims', 'email', $1, 1, 0, '{{}}', now())"
+        )))
+        .bind(&old_hashes[0])
+        .execute(&crm.pool)
+        .await
+        .unwrap();
+
+        let (database_url, _) = test_db().await.unwrap();
+        let (rotated, report) = customer_types(&database_url, &crm.bc, &crm.subject)
+            .blind_tag::<KeptEmail>()
+            .blind_index_key(new_blind_key())
+            .previous_blind_index_keys([blind_key()])
+            .build()
+            .await
+            .unwrap();
+        assert!(report.skipped_no_access.is_empty(), "{report:?}");
+        let rotated = crm.served_by(rotated);
+        let (generation, fingerprint) = stored_generation(&rotated).await;
+        assert_eq!(generation, 1);
+        assert_ne!(fingerprint, old_fingerprint);
+
+        let new_hashes = rotated.stored_hashes().await;
+        assert_eq!(new_hashes.len(), 3);
+        for old in &old_hashes {
+            assert!(!new_hashes.contains(old));
+            assert!(!rotated.stores(old).await, "{old} left behind");
+        }
+        let (snapshot_tag,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT tag_value FROM {schema}.snapshots WHERE snapshot_name = 'Claims'"
+        )))
+        .fetch_one(&rotated.pool)
+        .await
+        .unwrap();
+        assert!(new_hashes.contains(&snapshot_tag));
+
+        // Every address keeps its state: the forgotten one stays taken, the
+        // changed-from one is free, and new ones hash under the new key.
+        assert_eq!(
+            rotated.register(&id("c"), "Alice@Example.com").await,
+            "email_taken"
+        );
+        assert_eq!(
+            rotated.register(&id("c"), "robert@example.com").await,
+            "email_taken"
+        );
+        assert_eq!(
+            rotated.register(&id("c"), "bob@example.com").await,
+            "accepted"
+        );
+        assert_eq!(
+            rotated.register(&id("c"), "carol@example.com").await,
+            "accepted"
+        );
+        assert_eq!(
+            rotated.register(&id("c"), " carol@example.com").await,
+            "email_taken"
+        );
+        rotated
+            .skilj
+            .shutdown(std::time::Duration::from_secs(10))
+            .await;
+
+        for (keys, what) in [
+            (vec![blind_key()], "only the old key"),
+            (vec![new_blind_key()], "only the new key"),
+        ] {
+            let mut builder = customer_instance(&database_url, &crm.bc).blind_tag::<KeptEmail>();
+            for key in keys {
+                builder = builder.blind_index_key(key);
+            }
+            let Err(refused) = builder.build().await else {
+                panic!("an instance with {what} started");
+            };
+            assert_eq!(refused.code(), "blind_index_key_not_configured", "{what}");
+        }
+        let (again, _) = customer_instance(&database_url, &crm.bc)
+            .blind_tag::<KeptEmail>()
+            .blind_index_key(new_blind_key())
+            .previous_blind_index_keys([blind_key()])
+            .build()
+            .await
+            .unwrap();
+        again.shutdown(std::time::Duration::from_secs(10)).await;
+        crm.skilj.shutdown(std::time::Duration::from_secs(10)).await;
+    });
+}
+
+/// Instances already running when another rotates: one configured with
+/// both keys notices under the write lock that its tags are of the old
+/// generation and decides again, rehashed - so an address taken before
+/// the rotation stays taken - and one with only the old key refuses with
+/// a code another instance can take over.
+#[test]
+fn a_running_instance_rehashes_after_another_rotates_the_key() {
+    runtime().block_on(async {
+        let Some(crm) = crm::<ErasedEmail>().await else {
+            return;
+        };
+        assert_eq!(
+            crm.register(&id("c"), "alice@example.com").await,
+            "accepted"
+        );
+        let (database_url, _) = test_db().await.unwrap();
+        let both_keys = || {
+            customer_instance(&database_url, &crm.bc)
+                .blind_tag::<ErasedEmail>()
+                .blind_index_key(new_blind_key())
+                .previous_blind_index_keys([blind_key()])
+        };
+        // Started before the rotation: hashes at generation 0.
+        let (waiting, _) = both_keys().build().await.unwrap();
+        let waiting = crm.served_by(waiting);
+        assert_eq!(stored_generation(&crm).await.0, 0);
+        assert_eq!(
+            waiting.register(&id("c"), "alice@example.com").await,
+            "email_taken"
+        );
+
+        let (rotating, _) = both_keys()
+            .reconciliation_role(crm.subject.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(stored_generation(&crm).await.0, 1);
+
+        assert_eq!(
+            waiting.register(&id("c"), "ALICE@example.com").await,
+            "email_taken"
+        );
+        assert_eq!(
+            waiting.register(&id("c"), "dave@example.com").await,
+            "accepted"
+        );
+        let rotating = crm.served_by(rotating);
+        assert_eq!(
+            rotating.register(&id("c"), " dave@example.com").await,
+            "email_taken"
+        );
+
+        let refused = crm
+            .submit_through(
+                &crm.skilj,
+                "RegisterCustomer",
+                json!({ "customer_id": id("c"), "email": "erin@example.com" }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "blind_index_key_not_configured");
+        assert!(skilj_retry::another_instance_can_do_it(refused.code()));
+
+        for crm in [crm, waiting, rotating] {
+            crm.skilj.shutdown(std::time::Duration::from_secs(10)).await;
+        }
+    });
+}
+
 // --- looking a blind tag up by its plaintext (docs/architecture.md §207) ---
 
 const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
@@ -933,7 +1152,7 @@ fn a_tenant_records_its_own_key_fingerprint_and_is_checked_at_startup() {
             blind_key(),
             [(tenant.clone(), "email".to_string(), normalize::email as _)],
         )
-        .fingerprint(&tenant, "email");
+        .fingerprint(&tenant, "email", 0);
         assert!(own.is_some());
         assert_eq!(fingerprint(tenant.clone()).await, own);
         assert_ne!(fingerprint(crm.bc.clone()).await, own);

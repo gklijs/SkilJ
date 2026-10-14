@@ -80,7 +80,7 @@ what a rejected registration's error actually means.
 ## Secrets the builder needs before the first deploy
 
 Two keys, both `[u8; 32]`, both identical on every instance and never
-changed afterwards - generate them once and keep them in the secret store:
+changed casually - generate them once and keep them in the secret store:
 
 - `.encryption_master_key(...)` when any type has `sensitive_fields()` -
   without it, writing a sensitive payload is refused with
@@ -89,8 +89,8 @@ changed afterwards - generate them once and keep them in the secret store:
   rule on personal data) - `build()` refuses a `BlindTag` without it,
   and an instance missing the `BlindTag` refuses those commands with
   `blind_tag_not_declared`. Startup refuses a key other than the one
-  already used (`blind_index_key_changed`). The `skilj-uniqueness` skill
-  covers it.
+  already used (`blind_index_key_changed`); a leaked one is rotated with
+  `previous_blind_index_keys`. The `skilj-uniqueness` skill covers it.
 
 ## `.identity_provider(...)` is a separate axis, easy to conflate with the above
 

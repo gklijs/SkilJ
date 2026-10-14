@@ -81,8 +81,14 @@ async fn apply_template_registrations(
         .await
         .map_err(to_graphql_error)?
     {
-        declaration.key_fingerprint =
-            blind_index.tenant_fingerprint(&template.name, &tenant.name, &declaration.tag_key);
+        // At the template's key generation (§209): the tenant starts where
+        // its template is.
+        declaration.key_fingerprint = blind_index.tenant_fingerprint(
+            &template.name,
+            &tenant.name,
+            &declaration.tag_key,
+            declaration.key_generation,
+        );
         skilj_core::db::register_blind_tag(pool, &tenant.name, &declaration, now)
             .await
             .map_err(to_graphql_error)?;

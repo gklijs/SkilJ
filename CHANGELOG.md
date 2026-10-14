@@ -43,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constraint's derived key, as it stores the normalizer version, so a
   rotated, lost or mistyped key can't silently make every value claimable
   again. Tenants made from a template record their own.
+- Rotating the blind-index key (docs/architecture.md §209):
+  `SkiljBuilder::previous_blind_index_keys([old, ...])` next to a new
+  `blind_index_key`. A reconciling instance rewraps every stored blind tag
+  under the new key at startup, from the stored tag alone - no plaintext,
+  so forgotten subjects' kept tags are covered too - in events, the tag
+  index, commands and snapshot rows. Running instances notice under the
+  write lock; a command decided with old-generation tags is decided once
+  more. New codes `blind_index_key_not_configured` and
+  `blind_tags_rotated`, both retried by another instance.
 - `TagMapping::new(key, field)`, `SensitiveField::new(field, subject_key,
   subject_field)` and `BlindErasure::with_subject(subject)`.
 - `.skilj.toml` (`skilj-codegen`): `sensitive = [{ field, subject_key,

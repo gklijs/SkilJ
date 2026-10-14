@@ -387,6 +387,55 @@ impl CommandBatcher {
         now: DateTime<Utc>,
         idempotency_key: Option<&str>,
     ) -> Result<SubmitCommandOutcome> {
+        // docs/architecture.md §209: once more, rehashed, when a key
+        // rotation committed between deriving the tags and the lock.
+        let mut rotated_once = false;
+        loop {
+            let outcome = self
+                .decide_and_submit_once(
+                    pool,
+                    dispatcher,
+                    projection_dispatcher,
+                    snapshot_dispatcher,
+                    broadcaster,
+                    event_cache,
+                    command_type,
+                    payload,
+                    client_id,
+                    correlation_id,
+                    causation_id,
+                    encryption_master_key,
+                    now,
+                    idempotency_key,
+                )
+                .await;
+            match outcome {
+                Err(err) if crate::db::blind_tags_rotated(&err) && !rotated_once => {
+                    rotated_once = true
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_and_submit_once(
+        &self,
+        pool: &Pool,
+        dispatcher: &Arc<dyn CommandDispatcher>,
+        projection_dispatcher: &Arc<dyn ProjectionDispatcher>,
+        snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+        broadcaster: &EventBroadcaster,
+        event_cache: &EventCache,
+        command_type: &CommandType,
+        payload: &str,
+        client_id: &str,
+        correlation_id: Option<&str>,
+        causation_id: Option<&str>,
+        encryption_master_key: Option<&EncryptionMasterKey>,
+        now: DateTime<Utc>,
+        idempotency_key: Option<&str>,
+    ) -> Result<SubmitCommandOutcome> {
         let resolved = crate::db::resolve_command_submission(
             pool,
             dispatcher.as_ref(),

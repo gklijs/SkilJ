@@ -89,8 +89,14 @@ another instance.
 **`blind_index_key_changed`** (at startup) - a `BlindTag`'s stored key
 fingerprint isn't this process's: its `blind_index_key` differs from the
 one the bounded context's blind tags were hashed with. Configure the
-original key; a new key can't be rotated in (see the `skilj-uniqueness`
-skill).
+original key. To replace a key, rotate it: the new one as
+`blind_index_key`, the old one in `previous_blind_index_keys` (see the
+`skilj-uniqueness` skill).
+
+**`blind_index_key_not_configured`** - the bounded context's blind tags
+were rotated to a key this process isn't configured with, or it lacks the
+previous keys. Configure both on every instance; meanwhile another
+instance takes the work over.
 
 **`PayloadDoesNotMatchSchema`** - the JSON payload handed to a command
 submission (or a direct/external event creation) doesn't validate

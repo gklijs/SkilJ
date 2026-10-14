@@ -22,7 +22,7 @@
 //! across them.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ring::{hkdf, hmac};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,27 @@ pub enum Error {
          sensitive fields"
     )]
     LookupNotGranted { tag_key: String },
+
+    /// The constraint is stored at a key generation this process has no
+    /// root key for (docs/architecture.md §209): it was rotated to a key
+    /// this process isn't configured with. An instance that is can do it
+    /// (`skilj_retry::ANOTHER_INSTANCE_CODES`).
+    #[error(
+        "blind tag `{tag_key}` of bounded context `{bounded_context}` is at key generation \
+         {generation}, and this process has no blind_index_key for it"
+    )]
+    KeyNotConfigured {
+        bounded_context: String,
+        tag_key: String,
+        generation: u32,
+    },
+
+    /// A command's blind tags were hashed before a key rotation of its
+    /// bounded context committed (docs/architecture.md §209). Submission
+    /// retries it once, rehashed; it surfaces only if a second rotation
+    /// lands in between.
+    #[error("the blind tags of bounded context `{bounded_context}` were rotated meanwhile; retry")]
+    Rotated { bounded_context: String },
 }
 
 impl crate::error::SkiljRejection for Error {
@@ -65,6 +86,8 @@ impl crate::error::SkiljRejection for Error {
         match self {
             Error::NotDeclared { .. } => "blind_tag_not_declared",
             Error::LookupNotGranted { .. } => "blind_tag_lookup_not_granted",
+            Error::KeyNotConfigured { .. } => "blind_index_key_not_configured",
+            Error::Rotated { .. } => "blind_tags_rotated",
         }
     }
 
@@ -77,7 +100,9 @@ impl crate::error::SkiljRejection for Error {
 /// `SkiljBuilder::blind_index_key`. Never persisted; like the encryption
 /// master key, the application keeps it stable across restarts and
 /// identical across instances. Losing or changing it changes every blind
-/// tag, so values already stored no longer match new ones.
+/// tag, so values already stored no longer match new ones; replacing a
+/// leaked one is a rotation (docs/architecture.md §209), which keeps it
+/// configured as a previous key.
 #[derive(Clone)]
 pub struct BlindIndexKey([u8; KEY_LEN]);
 
@@ -99,9 +124,19 @@ impl BlindIndexKey {
     /// ahead of the info, so it reveals nothing about the constraint key
     /// and can't equal the tag of any value. Equal for two root keys
     /// exactly when they hash every value of the constraint alike.
-    fn fingerprint(&self, bounded_context: &str, tag_key: &str) -> String {
+    ///
+    /// `previous` is the fingerprint of the key chain before this key
+    /// (docs/architecture.md §209), empty for the first.
+    fn fingerprint(&self, bounded_context: &str, tag_key: &str, previous: &str) -> String {
         let key = self.derive(FINGERPRINT_LABEL, bounded_context, tag_key);
-        hex(hmac::sign(&key, b"").as_ref())
+        hex(hmac::sign(&key, previous.as_bytes()).as_ref())
+    }
+
+    /// `tag`, a tag of the previous generation, wrapped under this key's
+    /// constraint key (docs/architecture.md §209).
+    fn wrap(&self, bounded_context: &str, tag_key: &str, tag: &str) -> String {
+        let key = self.constraint_key(bounded_context, tag_key);
+        hex(hmac::sign(&key, tag.as_bytes()).as_ref())
     }
 
     /// HKDF-SHA256 over the root key, with `label` (empty for the
@@ -172,6 +207,10 @@ pub struct BlindTagDeclaration {
     /// doesn't declare its template's `BlindTag` - and recorded by the
     /// first instance that can.
     pub key_fingerprint: Option<String>,
+    /// How many times the constraint's tags have been wrapped under a
+    /// later root key (docs/architecture.md §209); `key_fingerprint` is
+    /// the chain's up to it.
+    pub key_generation: u32,
 }
 
 /// A normalizer: what a payload value becomes before it's hashed.
@@ -198,9 +237,35 @@ pub mod normalize {
 }
 
 struct Inner {
-    root: BlindIndexKey,
+    /// Every root key, oldest first; the last is the current one
+    /// (docs/architecture.md §209). One key unless a rotation is underway
+    /// or done.
+    keys: Vec<BlindIndexKey>,
     normalizers: HashMap<(String, String), Normalizer>,
     templates: Option<crate::template_cache::TemplateCache>,
+    /// The stored `key_generation` of each constraint this process has
+    /// seen, by `(bounded context, tag key)` - startup loads it, and the
+    /// check under each write's bounded-context lock corrects it after a
+    /// rotation (§209). Shared by every clone.
+    generations: Arc<RwLock<HashMap<(String, String), u32>>>,
+}
+
+impl Inner {
+    /// The constraint key of generation `generation`.
+    fn key(
+        &self,
+        generation: u32,
+        bounded_context: &str,
+        tag_key: &str,
+    ) -> Result<&BlindIndexKey, Error> {
+        self.keys
+            .get(generation as usize)
+            .ok_or_else(|| Error::KeyNotConfigured {
+                bounded_context: bounded_context.to_string(),
+                tag_key: tag_key.to_string(),
+                generation,
+            })
+    }
 }
 
 /// Every constraint this process can hash, by `(bounded context, tag
@@ -212,6 +277,15 @@ struct Inner {
 /// its template's declaration through the [`TemplateCache`]: the template's
 /// normalizer, but a key derived from the tenant's own name, so two
 /// tenants' hashes of the same value differ.
+///
+/// **Generations** (docs/architecture.md §209). A constraint's tags are
+/// hashed under the first root key and then wrapped once under each later
+/// one, up to the constraint's stored `key_generation`: generation 0 is
+/// `HMAC(k0, normalize(value))`, generation `g` is `HMAC(k_g, tag of g -
+/// 1)`. A rotation can therefore rewrite every stored tag from the tag
+/// alone, without the value - which is encrypted, or forgotten - and a
+/// leaked earlier key no longer lets anyone test a value against the
+/// stored tags.
 ///
 /// [`TemplateCache`]: crate::template_cache::TemplateCache
 #[derive(Clone, Default)]
@@ -236,10 +310,26 @@ impl BlindIndex {
             .map(|(bounded_context, tag_key, normalize)| ((bounded_context, tag_key), normalize))
             .collect();
         Self(Some(Arc::new(Inner {
-            root,
+            keys: vec![root],
             normalizers,
             templates: None,
+            generations: Arc::default(),
         })))
+    }
+
+    /// The root keys `new`'s replaced, oldest first, for a rotation
+    /// (docs/architecture.md §209): `new`'s key becomes the newest.
+    pub fn with_previous_keys(self, previous: impl IntoIterator<Item = BlindIndexKey>) -> Self {
+        Self(self.0.map(|inner| {
+            let mut keys: Vec<BlindIndexKey> = previous.into_iter().collect();
+            keys.extend(inner.keys.iter().cloned());
+            Arc::new(Inner {
+                keys,
+                normalizers: inner.normalizers.clone(),
+                templates: inner.templates.clone(),
+                generations: inner.generations.clone(),
+            })
+        }))
     }
 
     /// Resolves a bounded context that declares nothing itself through
@@ -247,9 +337,10 @@ impl BlindIndex {
     pub fn with_templates(self, templates: crate::template_cache::TemplateCache) -> Self {
         Self(self.0.map(|inner| {
             Arc::new(Inner {
-                root: inner.root.clone(),
+                keys: inner.keys.clone(),
                 normalizers: inner.normalizers.clone(),
                 templates: Some(templates),
+                generations: inner.generations.clone(),
             })
         }))
     }
@@ -280,8 +371,72 @@ impl BlindIndex {
         self.normalizer(bounded_context, tag_key).is_some()
     }
 
+    /// Whether this process declares any constraint of `bounded_context`,
+    /// itself or through its template.
+    pub fn declares_any(&self, bounded_context: &str) -> bool {
+        let Some(inner) = self.0.as_deref() else {
+            return false;
+        };
+        let template = inner
+            .templates
+            .as_ref()
+            .map(|templates| templates.effective_bounded_context(bounded_context));
+        inner
+            .normalizers
+            .keys()
+            .any(|(bc, _)| bc == bounded_context || template.as_deref() == Some(bc.as_str()))
+    }
+
+    /// The newest generation this process can hash: one less than its
+    /// number of root keys. What a new constraint is stored with.
+    pub fn current_generation(&self) -> u32 {
+        self.0
+            .as_deref()
+            .map_or(0, |inner| inner.keys.len().saturating_sub(1) as u32)
+    }
+
+    /// The constraint's generation as this process last saw it stored;
+    /// [`current_generation`](Self::current_generation) for one it hasn't
+    /// seen, which the check under the write lock corrects.
+    pub fn generation(&self, bounded_context: &str, tag_key: &str) -> u32 {
+        let Some(inner) = self.0.as_deref() else {
+            return 0;
+        };
+        inner
+            .generations
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(bounded_context.to_string(), tag_key.to_string()))
+            .copied()
+            .unwrap_or_else(|| self.current_generation())
+    }
+
+    /// Records the constraint's stored generation; whether it differed
+    /// from what this process hashed with.
+    pub fn observe_generation(
+        &self,
+        bounded_context: &str,
+        tag_key: &str,
+        generation: u32,
+    ) -> bool {
+        let Some(inner) = self.0.as_deref() else {
+            return false;
+        };
+        let changed = self.generation(bounded_context, tag_key) != generation;
+        inner
+            .generations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (bounded_context.to_string(), tag_key.to_string()),
+                generation,
+            );
+        changed
+    }
+
     /// The tag value `value` becomes under the constraint: the hex
-    /// HMAC-SHA256 of its normalized form, keyed for `bounded_context`.
+    /// HMAC-SHA256 of its normalized form, keyed for `bounded_context`,
+    /// wrapped up to the constraint's generation.
     pub fn blind(
         &self,
         bounded_context: &str,
@@ -294,30 +449,86 @@ impl BlindIndex {
                     bounded_context: bounded_context.to_string(),
                     tag_key: tag_key.to_string(),
                 })?;
-        let key = inner.root.constraint_key(bounded_context, tag_key);
-        let tag = hmac::sign(&key, normalize(value).as_bytes());
-        Ok(hex(tag.as_ref()))
+        let generation = self.generation(bounded_context, tag_key);
+        let first = inner.key(0, bounded_context, tag_key)?;
+        let key = first.constraint_key(bounded_context, tag_key);
+        let mut tag = hex(hmac::sign(&key, normalize(value).as_bytes()).as_ref());
+        for g in 1..=generation {
+            tag = inner
+                .key(g, bounded_context, tag_key)?
+                .wrap(bounded_context, tag_key, &tag);
+        }
+        Ok(tag)
     }
 
-    /// The constraint's key fingerprint (docs/architecture.md §208), or
-    /// `None` when this process doesn't declare it.
-    pub fn fingerprint(&self, bounded_context: &str, tag_key: &str) -> Option<String> {
+    /// A tag of generation `generation - 1` as generation `generation`
+    /// stores it - what a rotation rewrites each stored tag with
+    /// (docs/architecture.md §209).
+    pub fn wrap(
+        &self,
+        bounded_context: &str,
+        tag_key: &str,
+        generation: u32,
+        tag: &str,
+    ) -> Result<String, Error> {
+        let inner = self.0.as_deref().ok_or_else(|| Error::NotDeclared {
+            bounded_context: bounded_context.to_string(),
+            tag_key: tag_key.to_string(),
+        })?;
+        Ok(inner
+            .key(generation, bounded_context, tag_key)?
+            .wrap(bounded_context, tag_key, tag))
+    }
+
+    /// The constraint's key fingerprint at `generation` (docs/architecture.md
+    /// §208, §209), or `None` when this process doesn't declare it or
+    /// lacks a key of that generation.
+    pub fn fingerprint(
+        &self,
+        bounded_context: &str,
+        tag_key: &str,
+        generation: u32,
+    ) -> Option<String> {
         let (inner, _) = self.normalizer(bounded_context, tag_key)?;
-        Some(inner.root.fingerprint(bounded_context, tag_key))
+        chain_fingerprint(inner, bounded_context, tag_key, generation)
     }
 
-    /// The key fingerprint `tenant` gets for its template's constraint,
-    /// or `None` when this process doesn't declare it - for creating a
-    /// tenant, which the template cache may not know yet.
+    /// The key fingerprint `tenant` gets for its template's constraint at
+    /// `generation`, or `None` when this process can't compute it - for
+    /// creating a tenant, which the template cache may not know yet.
     pub fn tenant_fingerprint(
         &self,
         template: &str,
         tenant: &str,
         tag_key: &str,
+        generation: u32,
     ) -> Option<String> {
         let (inner, _) = self.normalizer(template, tag_key)?;
-        Some(inner.root.fingerprint(tenant, tag_key))
+        chain_fingerprint(inner, tenant, tag_key, generation)
     }
+}
+
+/// The fingerprint of the key chain up to `generation`: the first key's,
+/// then each later key's fingerprint over the previous one. Equal for two
+/// chains exactly when every key up to `generation` is.
+fn chain_fingerprint(
+    inner: &Inner,
+    bounded_context: &str,
+    tag_key: &str,
+    generation: u32,
+) -> Option<String> {
+    let mut fingerprint = inner
+        .keys
+        .first()?
+        .fingerprint(bounded_context, tag_key, "");
+    for g in 1..=generation {
+        fingerprint =
+            inner
+                .keys
+                .get(g as usize)?
+                .fingerprint(bounded_context, tag_key, &fingerprint);
+    }
+    Some(fingerprint)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -391,28 +602,28 @@ mod tests {
     #[test]
     fn a_fingerprint_tells_root_keys_apart_and_is_no_tag() {
         let one = index(1);
-        let fingerprint = one.fingerprint("crm", "email").unwrap();
+        let fingerprint = one.fingerprint("crm", "email", 0).unwrap();
         assert_eq!(fingerprint.len(), 64);
         assert_eq!(
             Some(fingerprint.clone()),
-            index(1).fingerprint("crm", "email")
+            index(1).fingerprint("crm", "email", 0)
         );
         assert_ne!(
             Some(fingerprint.clone()),
-            index(2).fingerprint("crm", "email")
+            index(2).fingerprint("crm", "email", 0)
         );
         assert_ne!(
             Some(fingerprint.clone()),
-            one.fingerprint("crm", "backup_email")
+            one.fingerprint("crm", "backup_email", 0)
         );
         assert_ne!(
             Some(fingerprint.clone()),
-            one.fingerprint("billing", "email")
+            one.fingerprint("billing", "email", 0)
         );
         assert_ne!(fingerprint, one.blind("crm", "email", "").unwrap());
-        assert_eq!(one.fingerprint("crm", "phone"), None);
+        assert_eq!(one.fingerprint("crm", "phone", 0), None);
         assert_eq!(
-            one.tenant_fingerprint("crm", "acme", "email"),
+            one.tenant_fingerprint("crm", "acme", "email", 0),
             BlindIndex::new(
                 BlindIndexKey::from_bytes([1; KEY_LEN]),
                 [(
@@ -421,10 +632,63 @@ mod tests {
                     normalize::email as Normalizer
                 )],
             )
-            .fingerprint("acme", "email")
+            .fingerprint("acme", "email", 0)
         );
-        assert_eq!(one.tenant_fingerprint("acme", "acme", "email"), None);
-        assert_eq!(BlindIndex::default().fingerprint("crm", "email"), None);
+        assert_eq!(one.tenant_fingerprint("acme", "acme", "email", 0), None);
+        assert_eq!(BlindIndex::default().fingerprint("crm", "email", 0), None);
+    }
+
+    #[test]
+    fn a_rotated_tag_wraps_the_previous_generation() {
+        let old = index(1);
+        let rotated = index(2).with_previous_keys([BlindIndexKey::from_bytes([1; KEY_LEN])]);
+        assert_eq!(rotated.current_generation(), 1);
+
+        // Before the rotation is stored, generation 0: the old key's hash.
+        let before = old.blind("crm", "email", "Alice@Example.com").unwrap();
+        rotated.observe_generation("crm", "email", 0);
+        assert_eq!(
+            rotated.blind("crm", "email", "alice@example.com").unwrap(),
+            before
+        );
+
+        // After: the old tag wrapped, which is what a rotation rewrites to,
+        // and neither key alone gives it.
+        let wrapped = rotated.wrap("crm", "email", 1, &before).unwrap();
+        assert!(rotated.observe_generation("crm", "email", 1));
+        assert!(!rotated.observe_generation("crm", "email", 1));
+        let after = rotated.blind("crm", "email", " alice@example.com").unwrap();
+        assert_eq!(after, wrapped);
+        assert_ne!(after, before);
+        assert_ne!(
+            after,
+            index(2).blind("crm", "email", "alice@example.com").unwrap()
+        );
+
+        // The chain's fingerprint at generation 0 is the old key's.
+        assert_eq!(
+            rotated.fingerprint("crm", "email", 0),
+            old.fingerprint("crm", "email", 0)
+        );
+        assert_ne!(
+            rotated.fingerprint("crm", "email", 1),
+            rotated.fingerprint("crm", "email", 0)
+        );
+        assert_ne!(
+            rotated.fingerprint("crm", "email", 1),
+            index(2).fingerprint("crm", "email", 0)
+        );
+        assert_eq!(rotated.fingerprint("crm", "email", 2), None);
+    }
+
+    #[test]
+    fn a_generation_past_the_configured_keys_is_refused() {
+        let index = index(1);
+        index.observe_generation("crm", "email", 1);
+        let err = index.blind("crm", "email", "a").unwrap_err();
+        assert!(matches!(err, Error::KeyNotConfigured { generation: 1, .. }));
+        assert!(index.declares_any("crm"));
+        assert!(!index.declares_any("sales"));
     }
 
     #[test]
