@@ -13,10 +13,20 @@
 //! this - it stays fully hand-written, deliberately (see `banking.rs`'s
 //! own doc comment for why).
 
+//!
+//! `tests/customers.skilj.toml` is generated here too, for
+//! `tests/customers.rs` alone: its blind tag (docs/architecture.md §205)
+//! needs a `blind_index_key`, which the demo's own bounded contexts and
+//! server don't configure, so it stays out of the library.
+
 use std::path::PathBuf;
 
 fn main() {
-    let toml_path = "src/banking.skilj.toml";
+    generate("src/banking.skilj.toml", "banking_generated.rs");
+    generate("tests/customers.skilj.toml", "customers_generated.rs");
+}
+
+fn generate(toml_path: &str, output: &str) {
     println!("cargo:rerun-if-changed={toml_path}");
 
     let toml_source = std::fs::read_to_string(toml_path)
@@ -25,6 +35,6 @@ fn main() {
         .unwrap_or_else(|e| panic!("skilj-codegen failed on {toml_path}: {e}"));
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR"));
-    std::fs::write(out_dir.join("banking_generated.rs"), generated)
-        .expect("failed to write banking_generated.rs to OUT_DIR");
+    std::fs::write(out_dir.join(output), generated)
+        .unwrap_or_else(|e| panic!("failed to write {output} to OUT_DIR: {e}"));
 }

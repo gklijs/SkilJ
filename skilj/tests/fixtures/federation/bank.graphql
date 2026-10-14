@@ -350,16 +350,19 @@ type BankSubmitCommandPayload {
 input BankTagInput @inaccessible {
 	key: String! @inaccessible
 	value: String @inaccessible
+	plaintext: Boolean @inaccessible
 }
 
 type BankTagMapping {
 	key: String!
 	field: String!
+	blind: Boolean!
 }
 
 input BankTagMappingInput @inaccessible {
 	key: String! @inaccessible
 	field: String! @inaccessible
+	blind: Boolean @inaccessible
 }
 
 type BankWouldBeEvent @inaccessible {

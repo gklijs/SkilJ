@@ -89,10 +89,12 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext) -> EventType {
             TagMapping {
                 key: "order".to_string(),
                 field: "order_id".to_string(),
+                blind: false,
             },
             TagMapping {
                 key: "customer".to_string(),
                 field: "customer_id".to_string(),
+                blind: false,
             },
         ],
         owner_tag_key: None,

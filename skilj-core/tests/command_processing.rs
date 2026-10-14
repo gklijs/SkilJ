@@ -288,6 +288,7 @@ fn authorise_command_trigger_rejects_a_command_whose_owner_does_not_match_the_to
             vec![skilj_core::shared::TagMapping {
                 key: "company".into(),
                 field: "company_id".into(),
+                blind: false,
             }],
         )
     };
@@ -320,6 +321,7 @@ fn authorise_command_trigger_succeeds_when_the_owner_matches_the_tokens_scope() 
             vec![skilj_core::shared::TagMapping {
                 key: "company".into(),
                 field: "company_id".into(),
+                blind: false,
             }],
         )
     };
@@ -336,13 +338,7 @@ fn authorise_command_trigger_succeeds_when_the_owner_matches_the_tokens_scope() 
     )
     .unwrap();
 
-    assert_eq!(
-        authorised.consistency_tags,
-        vec![skilj_core::shared::Tag {
-            key: "company".into(),
-            value: Some("acme".into()),
-        }]
-    );
+    assert_eq!(authorised.payload, r#"{"company_id":"acme"}"#);
 }
 
 #[test]
@@ -354,6 +350,7 @@ fn authorise_command_trigger_rejects_a_payload_naming_no_owner_at_all_when_scope
             vec![skilj_core::shared::TagMapping {
                 key: "company".into(),
                 field: "company_id".into(),
+                blind: false,
             }],
         )
     };
@@ -531,6 +528,7 @@ fn authorise_command_submission_rejects_a_command_whose_owner_does_not_match_the
             vec![skilj_core::shared::TagMapping {
                 key: "company".into(),
                 field: "company_id".into(),
+                blind: false,
             }],
         )
     };
@@ -555,10 +553,7 @@ fn authorise_command_submission_rejects_a_command_whose_owner_does_not_match_the
     assert_eq!(err.code(), access_control::Error::GrantScopeMismatch.code());
 }
 
-/// The success half - a matching owner still submits normally, and the
-/// returned `consistency_tags` (the Rust-only field carrying what would
-/// otherwise be recomputed by every caller - see `CommandAuthorised`'s
-/// own doc comment) reflects the derived tag.
+/// The success half - a matching owner still submits normally.
 #[test]
 fn authorise_command_submission_succeeds_when_the_owner_matches_the_grants_scope() {
     let ct = CommandType {
@@ -568,6 +563,7 @@ fn authorise_command_submission_succeeds_when_the_owner_matches_the_grants_scope
             vec![skilj_core::shared::TagMapping {
                 key: "company".into(),
                 field: "company_id".into(),
+                blind: false,
             }],
         )
     };
@@ -589,13 +585,7 @@ fn authorise_command_submission_succeeds_when_the_owner_matches_the_grants_scope
     )
     .unwrap();
 
-    assert_eq!(
-        authorised.consistency_tags,
-        vec![skilj_core::shared::Tag {
-            key: "company".into(),
-            value: Some("acme".into()),
-        }]
-    );
+    assert_eq!(authorised.payload, r#"{"company_id":"acme"}"#);
 }
 
 /// An unscoped grant (`scope: None`, every grant's behaviour before this
@@ -611,6 +601,7 @@ fn authorise_command_submission_is_unrestricted_for_a_grant_naming_no_scope() {
             vec![skilj_core::shared::TagMapping {
                 key: "company".into(),
                 field: "company_id".into(),
+                blind: false,
             }],
         )
     };
@@ -663,6 +654,7 @@ fn process_command_accepts_and_creates_the_command_and_its_triggered_events() {
         },
         timestamp(1000),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -723,6 +715,7 @@ fn process_command_calls_next_sequence_once_per_triggered_event_in_order() {
         },
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -753,6 +746,7 @@ fn process_command_surfaces_a_rejected_decision_verbatim() {
         || 0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -787,6 +781,7 @@ fn process_command_rejects_an_event_spec_naming_an_unregistered_event_type() {
         || 0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -896,6 +891,7 @@ fn command_consistency_tags_are_empty_when_the_command_type_declares_no_tag_mapp
         || 0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -909,6 +905,7 @@ fn command_consistency_tags_are_derived_for_real_from_a_real_tag_mapping() {
         vec![skilj_core::shared::TagMapping {
             key: "account".into(),
             field: "account_id".into(),
+            blind: false,
         }],
     );
 
@@ -925,6 +922,7 @@ fn command_consistency_tags_are_derived_for_real_from_a_real_tag_mapping() {
         || 0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -942,6 +940,7 @@ fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
         vec![skilj_core::shared::TagMapping {
             key: "account".into(),
             field: "account_id".into(),
+            blind: false,
         }],
     );
 
@@ -958,6 +957,7 @@ fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
         || 1,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -988,7 +988,7 @@ fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
 
     let (boundary, matching) = event_store::consistency_boundary_and_matching_events(
         std::slice::from_ref(&prior_event),
-        &event_store::derive_tags(&ct.tag_mappings, r#"{"account_id":"A"}"#),
+        &event_store::derive_plain_tags(&ct.tag_mappings, r#"{"account_id":"A"}"#),
     );
 
     assert_eq!(boundary, Some(1));
@@ -998,7 +998,7 @@ fn a_full_dcb_scenario_uses_real_derive_tags_output_not_hand_built_fixtures() {
     // A different account's tag doesn't match at all.
     let (boundary_other, matching_other) = event_store::consistency_boundary_and_matching_events(
         std::slice::from_ref(&prior_event),
-        &event_store::derive_tags(&ct.tag_mappings, r#"{"account_id":"B"}"#),
+        &event_store::derive_plain_tags(&ct.tag_mappings, r#"{"account_id":"B"}"#),
     );
     assert_eq!(boundary_other, None);
     assert!(matching_other.is_empty());

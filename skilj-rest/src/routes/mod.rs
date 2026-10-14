@@ -784,6 +784,7 @@ async fn post_events_external(
         dedupe,
         Utc::now(),
         state.encryption_master_key.as_ref(),
+        &state.dispatcher.blind_index(),
     )
     .await?;
 
@@ -829,6 +830,7 @@ async fn post_events_direct(
         body.causation_id,
         Utc::now(),
         state.encryption_master_key.as_ref(),
+        &state.dispatcher.blind_index(),
     )
     .await?;
 

@@ -252,6 +252,10 @@ pub fn parse_tag_mappings(value: &ValueAccessor) -> async_graphql::Result<Vec<Ta
         mappings.push(TagMapping {
             key: obj.try_get("key")?.string()?.to_string(),
             field: obj.try_get("field")?.string()?.to_string(),
+            blind: match obj.get("blind") {
+                Some(blind) if !blind.is_null() => blind.boolean()?,
+                _ => false,
+            },
         });
     }
     Ok(mappings)

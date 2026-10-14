@@ -14,6 +14,12 @@ an `Order`) and every command for that aggregate replays its entire history. `sk
 less. A command that touches two things at once (say, enrolling a student in a course) can check
 both their histories in one atomic decision, without either one having to "own" the other.
 
+Personal data fits the same model. A payload field can be encrypted per person, so forgetting
+the person makes it unreadable, and a tag can be **blind**: a keyed hash of the value instead of
+the value. That's how "an email address is registered once" stays an ordinary consistency check,
+without the address ever being stored in the clear - see
+[`docs/architecture.md` §205](docs/architecture.md#blind-tags).
+
 ## A quick look
 
 This is trimmed from [`templates/skilj-template/src/wallet.rs`](templates/skilj-template/src/wallet.rs)
@@ -31,7 +37,7 @@ impl EventType for Withdrawn {
     type Payload = WithdrawnPayload;
     const NAME: &'static str = "Withdrawn";
     fn tag_mappings() -> Vec<TagMapping> {
-        vec![TagMapping { key: "wallet".into(), field: "wallet_id".into() }]
+        vec![TagMapping::new("wallet", "wallet_id")]
     }
 }
 

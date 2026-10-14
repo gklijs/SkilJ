@@ -268,6 +268,7 @@ fn loads_registered_types_projections_and_events_for_a_bounded_context() {
             None,
             test_now(),
             Some(&master_key),
+            &skilj_core::blind::BlindIndex::default(),
         )
         .await
         .unwrap();

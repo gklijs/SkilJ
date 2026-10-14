@@ -88,6 +88,7 @@ impl CommandType for PlaceOrder {
         vec![TagMapping {
             key: "order".into(),
             field: "order_id".into(),
+            blind: false,
         }]
     }
     fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {

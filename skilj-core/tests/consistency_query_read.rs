@@ -36,6 +36,7 @@ fn company() -> TagMapping {
     TagMapping {
         key: "company".to_string(),
         field: "company_id".to_string(),
+        blind: false,
     }
 }
 
@@ -43,6 +44,7 @@ fn ticket() -> TagMapping {
     TagMapping {
         key: "ticket".to_string(),
         field: "ticket_id".to_string(),
+        blind: false,
     }
 }
 
@@ -213,7 +215,7 @@ async fn seed(pool: &Pool, tickets: usize) -> (CommandType, CommandType) {
         let event = Event {
             bounded_context: bc.clone(),
             event_type: et.clone(),
-            tags: skilj_core::event_store::derive_tags(&et.tag_mappings, &payload),
+            tags: skilj_core::event_store::derive_plain_tags(&et.tag_mappings, &payload),
             payload,
             metadata: Metadata {
                 r#type: et.name.clone(),

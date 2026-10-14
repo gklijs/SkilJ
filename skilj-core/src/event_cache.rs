@@ -361,8 +361,24 @@ impl EventCache {
     /// just a cold one) and returns whether it now covers `sequence`.
     async fn freshen(&self, pool: &Pool, bounded_context: &str) -> crate::error::Result<()> {
         let state = crate::db::events_table_identity(pool, bounded_context).await?;
-        self.freshen_events(pool, bounded_context, state.table, state.latest)
-            .await?;
+        // A blind tag erasure rewrites the tags of events this window may
+        // hold, and bumps the registrations stamp in the same transaction
+        // (docs/architecture.md §205): a window stamped otherwise is
+        // refilled rather than extended. A re-registration refills it too -
+        // rare, and only costs the one read `warm` makes.
+        let stale = {
+            let contexts = self.contexts.read().await;
+            contexts
+                .get(bounded_context)
+                .and_then(|w| w.registrations.as_ref())
+                .is_some_and(|r| r.stamp != state.registrations)
+        };
+        if stale {
+            self.refill(pool, bounded_context, state.table).await?;
+        } else {
+            self.freshen_events(pool, bounded_context, state.table, state.latest)
+                .await?;
+        }
         self.refresh_registrations(pool, bounded_context, state.registrations)
             .await
     }

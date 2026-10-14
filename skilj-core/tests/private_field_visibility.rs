@@ -311,6 +311,7 @@ fn register_event_type_rejects_a_private_field_that_is_also_a_tag_mapping() {
         vec![TagMapping {
             key: "note".into(),
             field: "note".into(),
+            blind: false,
         }],
         None,
         Vec::new(),

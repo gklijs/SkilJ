@@ -102,3 +102,28 @@ step like this.
   narrow - only fields another command's own decision genuinely needs to
   match on. A field nothing else ever needs to see by isn't a tag
   candidate, it's just payload data.
+
+## Uniqueness on personal data
+
+"No two customers with the same email address" is a tag question like
+any other: the command claiming an address must see the earlier claims
+of *that address*, so the address is a tag, on the claim/release events
+and on the command. When the value is personal data, that tag is
+**blind**: skilj stores a keyed hash of the normalized value instead of
+the value (a plain tag on an encrypted field is refused, because tags
+are stored and served in the clear). Two things to settle in the
+conversation, both of which end up in the summary:
+
+- **What counts as the same value?** Case, surrounding spaces, spacing
+  inside an IBAN. That becomes the tag's normalizer, and it is hard to
+  change later.
+- **What happens when the person is forgotten?** Either the value is
+  free again and no trace remains (the usual answer under a right to
+  erasure), or it stays taken (a trial used once, a banned address).
+
+Model the claim as events - `EmailClaimed`/`EmailReleased`, or a
+registration and an email change carrying the old address - since an
+append-only log has no "delete the claim". The rule is then "the latest
+claim-or-release of this value is a claim". Uniqueness only holds within
+one bounded context; if it must span several, that rule is its own
+bounded context. The `skilj-uniqueness` skill turns this into code.

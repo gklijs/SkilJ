@@ -10,10 +10,7 @@ impl ::skilj::EventType for MoneyDeposited {
     type Payload = MoneyDepositedPayload;
     const NAME: &'static str = "MoneyDeposited";
     fn tag_mappings() -> Vec<::skilj_core::shared::TagMapping> {
-        vec![
-            ::skilj_core::shared::TagMapping { key : "account".to_string(), field :
-            "account_id".to_string() }
-        ]
+        Vec::from([::skilj_core::shared::TagMapping::new("account", "account_id")])
     }
 }
 #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::schemars::JsonSchema)]
@@ -27,10 +24,7 @@ impl ::skilj::EventType for MoneyWithdrawn {
     type Payload = MoneyWithdrawnPayload;
     const NAME: &'static str = "MoneyWithdrawn";
     fn tag_mappings() -> Vec<::skilj_core::shared::TagMapping> {
-        vec![
-            ::skilj_core::shared::TagMapping { key : "account".to_string(), field :
-            "account_id".to_string() }
-        ]
+        Vec::from([::skilj_core::shared::TagMapping::new("account", "account_id")])
     }
 }
 #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, ::schemars::JsonSchema)]
@@ -45,10 +39,7 @@ impl ::skilj::CommandType for DepositMoney {
     type Event = BankingEvent;
     const NAME: &'static str = "DepositMoney";
     fn tag_mappings() -> Vec<::skilj_core::shared::TagMapping> {
-        vec![
-            ::skilj_core::shared::TagMapping { key : "account".to_string(), field :
-            "account_id".to_string() }
-        ]
+        Vec::from([::skilj_core::shared::TagMapping::new("account", "account_id")])
     }
     fn consistency_query() -> Vec<::skilj_core::shared::QueryItemMapping> {
         Vec::from([::skilj_core::shared::QueryItemMapping::nothing()])
@@ -75,10 +66,7 @@ impl ::skilj::CommandType for WithdrawMoney {
     type Event = BankingEvent;
     const NAME: &'static str = "WithdrawMoney";
     fn tag_mappings() -> Vec<::skilj_core::shared::TagMapping> {
-        vec![
-            ::skilj_core::shared::TagMapping { key : "account".to_string(), field :
-            "account_id".to_string() }
-        ]
+        Vec::from([::skilj_core::shared::TagMapping::new("account", "account_id")])
     }
     fn rest_trigger_allowed() -> bool {
         true

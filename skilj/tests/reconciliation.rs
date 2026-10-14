@@ -645,6 +645,7 @@ fn account_tag_mappings() -> Vec<skilj_core::shared::TagMapping> {
     vec![skilj_core::shared::TagMapping {
         key: "company".to_string(),
         field: "company".to_string(),
+        blind: false,
     }]
 }
 

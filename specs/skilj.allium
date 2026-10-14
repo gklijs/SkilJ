@@ -273,6 +273,18 @@ value TagMapping {
                                  -- deeper, and never a nested-object-typed field itself, since
                                  -- there is no tag whose value is a whole address (see the
                                  -- payload schema shape note above entity CommandType).
+    blind: Boolean               -- a blind mapping's tag value is a keyed hash of the field's
+                                 -- normalized value, never the value (docs/architecture.md §205):
+                                 -- a black box here, like protect_sensitive_fields. Its key must
+                                 -- be declared by a BlindTag of the bounded context, and every
+                                 -- mapping of one key there is blind or none is (BlindKeysAreDeclared).
+                                 -- Two payloads carry the same blind tag exactly when their
+                                 -- normalized values are equal, which is what lets a consistency
+                                 -- query enforce that a value is unique without the value being
+                                 -- stored. Because the value isn't stored, a blind mapping may name
+                                 -- a sensitive or private field (see the overlap note above rule
+                                 -- RegisterEventType), and is never an owner_tag_key: a scope is a
+                                 -- plain value, compared with a plain tag.
 }
 
 -- One item of a command type's DCB consistency query (dcb.events), as
@@ -656,6 +668,7 @@ entity BoundedContext {
     subscriptions: Subscription with bounded_context = this
     access_mappings: RoleAccessMapping with bounded_context = this
     encryption_keys: EncryptionKey with bounded_context = this
+    blind_tags: BlindTag with bounded_context = this
 
     transitions status {
         active -> archived
@@ -1370,6 +1383,35 @@ entity RoleAccessMapping {
     }
 }
 
+-- One blind-index constraint of a bounded context (docs/architecture.md
+-- §205): the tag key whose values TagMapping.blind mappings hash, with the
+-- normalizer version every instance must agree on and what ForgetSubject
+-- does with the hashes. The normalizer and the hashing key are compiled
+-- and configured, not stored - a black box, like the encryption scheme -
+-- so only the version and a fingerprint of the derived key (§208) are
+-- compared: an instance declaring another version, or configured with
+-- another key, is refused at startup, since its hashes would no longer
+-- match the stored ones. A key already mapped plainly by a registered type can't become
+-- blind - its values are stored in the clear - and a key's blindness never
+-- changes afterwards.
+entity BlindTag {
+    bounded_context: BoundedContext
+    tag_key: String
+    normalizer_version: Integer
+    key_fingerprint: String?               -- a one-way value of the constraint's derived key,
+                                            -- revealing nothing about it. Null only for a
+                                            -- tenant created by an instance that doesn't
+                                            -- declare the template's BlindTag; the first
+                                            -- instance that does records it
+    erasure_subject_key: String?           -- null: the hashes are kept after ForgetSubject, so
+                                            -- the value stays taken. Set: ForgetSubject of an
+                                            -- EncryptionKey with this subject_key removes them
+    erasure_subject_tag: String? when erasure_subject_key != null
+                                            -- the plain tag key whose value is the subject's
+                                            -- value - how its events and commands are found
+                                            -- without decrypting anything
+}
+
 entity EncryptionKey {
     bounded_context: BoundedContext
     subject_key: String                    -- e.g. "user" - see SensitiveField.subject_key
@@ -1381,8 +1423,10 @@ entity EncryptionKey {
     -- Crypto-shredding: destroying this key is what "forgets" a subject
     -- (see ForgetSubject). Historical events encrypted under it keep
     -- their ciphertext exactly as stored - event sourcing is
-    -- append-only, so forgetting never edits or removes an event - the
-    -- ciphertext simply becomes permanently unreadable. A later event
+    -- append-only, so forgetting never removes an event or edits its
+    -- payload - the ciphertext simply becomes permanently unreadable.
+    -- The one edit is to derived index data: a BlindTag erased with its
+    -- subject loses its hashes from the subject's tags. A later event
     -- for the same subject provisions a new active key; it does not
     -- revive this one.
     transitions status {
@@ -4472,6 +4516,17 @@ rule FetchCommands {
 -- filters. after_sequence is the caller's own cursor, absent meaning from
 -- the beginning, exactly as in FetchEvents.
 --
+-- A blind tag's value is a keyed hash (TagMapping.blind), which a caller
+-- can't compute. The wire contract therefore lets a tag carry its value as
+-- plaintext, for the surface to hash as stored before the tags reach either
+-- rule (docs/architecture.md §207) - a black box here, like the hashing
+-- itself, so tags is unchanged by the time it arrives. Doing so tells the
+-- caller whether a value is in use, which is the value's own sensitivity,
+-- so it is refused unless access_mapping.can_read_sensitive - a caller who
+-- may read the encrypted field learns nothing new. That is what lets a
+-- client ask whether an address is taken before submitting the command
+-- that would be rejected for it.
+--
 -- Like FetchEvents, QueryProjection and FetchCommands, none of the three
 -- requires the bounded context to be active: archiving stops new events,
 -- and reading the ones appended before that is the point.
@@ -5460,6 +5515,13 @@ rule ApplyTemplateRegistrations {
 -- given reader's leaf came back from - one that leaves ciphertext
 -- standing, one that replaces the leaf with null. So a payload field is
 -- at most one of the three: tagged, sensitive or private.
+--
+-- A blind TagMapping (docs/architecture.md §205) is exempt from all three:
+-- its tag is a keyed hash of the normalized value, not the value, so it
+-- smuggles nothing into Event.tags / Command.consistency_tags that a
+-- reader could read back, and ForgetSubject can remove it (BlindTag's
+-- erasure). That is the point of it: a value that is encrypted and still
+-- unique.
 --
 -- Each constraint is on PrivateField.field alone, exactly as the original
 -- is on SensitiveField.field alone. PrivateField.addressee_field is a
@@ -6543,6 +6605,15 @@ rule ForgetSubject {
     ensures:
         key.status = destroyed
         key.destroyed_at = now
+        -- docs/architecture.md §205: a blind tag erased with its subject
+        -- leaves the subject's events and commands, so the value is free
+        -- and no hash of it is left. without_key is a black box: the set
+        -- less every tag with that key.
+        for blind in key.bounded_context.blind_tags where erasure_subject_key = key.subject_key:
+            for event in key.bounded_context.events where Tag(key: blind.erasure_subject_tag, value: key.subject_value) in tags:
+                event.tags = without_key(event.tags, blind.tag_key)
+            for command in key.bounded_context.commands where Tag(key: blind.erasure_subject_tag, value: key.subject_value) in consistency_tags:
+                command.consistency_tags = without_key(command.consistency_tags, blind.tag_key)
 }
 
 -- The four rules below are the whole of the private-field mechanism's own

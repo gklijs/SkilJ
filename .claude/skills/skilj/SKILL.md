@@ -13,7 +13,8 @@ description: >
   context, IdP/access-control/RoleAccessMapping setup, the GraphQL/REST
   wire contract itself, skilj-tui usage, or the cross-instance/inspector
   internals - those are skilj's own implementation, not the plugin API
-  this skill covers.
+  this skill covers. A uniqueness rule (an email address registered once)
+  is the `skilj-uniqueness` skill.
 ---
 
 # skilj
@@ -40,6 +41,13 @@ exists" requires.
 A command's own `decide()` never writes anything directly - it returns
 which events to append (or a rejection); skilj appends them, and any
 projection consuming that event type folds it in afterward.
+
+**A value that must be unique** (an email address, a username) is a
+command whose consistency query reads earlier claims of the value - and,
+when the value is personal data, a blind tag (`BlindTag`,
+`TagMapping::blind`) so it is only ever stored as a keyed hash. Use the
+`skilj-uniqueness` skill for that; don't tag a sensitive field plainly or
+hash it by hand.
 
 There is a fourth plugin type, `Snapshot` - an optional accelerator for
 `decide()` against a large per-entity history, its own trait with its

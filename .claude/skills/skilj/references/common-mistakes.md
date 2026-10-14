@@ -25,7 +25,21 @@ exactly what's allowed.
 **`SensitiveFieldTagOverlap`** - the same `field` appears in both
 `tag_mappings()` and `sensitive_fields()` on the same type. Tag the
 *subject* field instead if you need both an indexed tag and an
-encrypted field pointing at the same conceptual subject.
+encrypted field pointing at the same conceptual subject. If the point
+was to match on the sensitive value itself (a uniqueness check on an
+email address), make the mapping blind - `TagMapping::blind::<B>` with a
+`BlindTag` declaring the key; see the `skilj-uniqueness` skill.
+
+**`InvalidBlindTagMapping`** - a blind mapping's key is the type's
+`owner_tag_key`, or the type is scheduled (`system_triggered_allowed`).
+An owner is compared with a grant's plain scope, so tag it plainly.
+
+**`BlindTagMismatch`** / **`BlindTagKeyInUse`** /
+**`BlindNormalizerChanged`** - a tag key's blindness or normalizer
+disagrees with what the bounded context stores: blind here and plain on
+another type, made blind while a registered type maps it plainly, or a
+`BlindTag::NORMALIZER_VERSION` other than the stored one. The
+`skilj-uniqueness` skill's error table has the fixes.
 
 **`SchemaIncompatible`** - re-registering an existing type with a schema
 change that would break an existing reader: a field removed, an existing
@@ -64,6 +78,19 @@ weren't both overridden. See `event-type.md`'s scheduling section - both
 are required together, no default for either.
 
 ## At submission/creation time (not registration)
+
+**`blind_tag_not_declared`** - the type maps a tag key blind, but the
+process handling the request declares no `BlindTag` for it (or has no
+`blind_index_key`), so it can't hash the value and refuses rather than
+store it in the clear. Every instance serving the bounded context needs
+the `BlindTag` and the same key; a deadline or route retries this on
+another instance.
+
+**`blind_index_key_changed`** (at startup) - a `BlindTag`'s stored key
+fingerprint isn't this process's: its `blind_index_key` differs from the
+one the bounded context's blind tags were hashed with. Configure the
+original key; a new key can't be rotated in (see the `skilj-uniqueness`
+skill).
 
 **`PayloadDoesNotMatchSchema`** - the JSON payload handed to a command
 submission (or a direct/external event creation) doesn't validate

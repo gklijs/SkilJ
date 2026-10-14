@@ -1013,6 +1013,7 @@ async fn provision_bounded_context_schema(
     add_registration_version_columns(&mut **tx, bounded_context).await?;
     ensure_registrations_generation(&mut **tx, bounded_context).await?;
     ensure_event_tags_index(&mut **tx, bounded_context).await?;
+    ensure_blind_tags_table(&mut **tx, bounded_context).await?;
     Ok(())
 }
 
@@ -2194,6 +2195,207 @@ pub async fn ensure_event_tags_index<'e>(
     Ok(())
 }
 
+/// `blind_tags`: the bounded context's blind-index constraints, one row per
+/// tag key (docs/architecture.md §205) - what every instance agrees on
+/// about each: its normalizer version, its key fingerprint (§208) and what
+/// `forgetSubject` does with it. Created at provisioning, and for a bounded context from before it
+/// by [`ensure_bounded_context_current`]; a call that finds it there
+/// creates and locks nothing (docs/architecture.md §158).
+pub async fn ensure_blind_tags_table<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DO $patch$ BEGIN IF to_regclass({table}) IS NULL THEN
+            CREATE TABLE IF NOT EXISTS {schema}.blind_tags (
+                tag_key TEXT PRIMARY KEY,
+                normalizer_version BIGINT NOT NULL,
+                key_fingerprint TEXT,
+                erasure JSONB NOT NULL,
+                registered_at TIMESTAMPTZ NOT NULL
+            );
+        END IF; END $patch$",
+        table = sql_literal(&format!("{schema}.blind_tags")),
+    )))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Records `declaration` as one of `bounded_context`'s blind tags
+/// (docs/architecture.md §205), or checks it against the stored one: the
+/// normalizer version must match, and the key fingerprint too when both
+/// sides have one (§208; a missing stored one is recorded); the erasure
+/// policy is updated, since it only decides what a later `forgetSubject`
+/// does. A new key is refused
+/// when a registered type already maps it in the clear. Under an advisory
+/// lock, so two instances starting together agree.
+pub async fn register_blind_tag(
+    pool: &Pool,
+    bounded_context: &str,
+    declaration: &crate::blind::BlindTagDeclaration,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(format!("skilj_blind_tags:{schema}"))
+        .execute(&mut *tx)
+        .await?;
+    let stored: Option<(i64, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT normalizer_version, key_fingerprint FROM {schema}.blind_tags WHERE tag_key = $1"
+    )))
+    .bind(&declaration.tag_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match stored {
+        Some((version, _)) if version != i64::from(declaration.normalizer_version) => {
+            return Err(crate::event_store::Error::BlindNormalizerChanged {
+                tag_key: declaration.tag_key.clone(),
+                stored: version,
+                declared: declaration.normalizer_version,
+            }
+            .into());
+        }
+        Some((_, Some(stored)))
+            if declaration
+                .key_fingerprint
+                .as_ref()
+                .is_some_and(|declared| *declared != stored) =>
+        {
+            return Err(crate::event_store::Error::BlindIndexKeyChanged {
+                bounded_context: bounded_context.to_string(),
+                tag_key: declaration.tag_key.clone(),
+            }
+            .into());
+        }
+        Some(_) => {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {schema}.blind_tags SET erasure = $2, \
+                 key_fingerprint = coalesce(key_fingerprint, $3) WHERE tag_key = $1"
+            )))
+            .bind(&declaration.tag_key)
+            .bind(Json(&declaration.erasure))
+            .bind(&declaration.key_fingerprint)
+            .execute(&mut *tx)
+            .await?;
+        }
+        None => {
+            let (in_use,): (bool,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT EXISTS (SELECT 1 FROM {schema}.event_types t, \
+                    jsonb_array_elements(t.tag_mappings) m \
+                    WHERE m->>'key' = $1 AND NOT coalesce((m->>'blind')::boolean, false)) \
+                 OR EXISTS (SELECT 1 FROM {schema}.command_types t, \
+                    jsonb_array_elements(t.tag_mappings) m \
+                    WHERE m->>'key' = $1 AND NOT coalesce((m->>'blind')::boolean, false))"
+            )))
+            .bind(&declaration.tag_key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if in_use {
+                return Err(crate::event_store::Error::BlindTagKeyInUse(
+                    declaration.tag_key.clone(),
+                )
+                .into());
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {schema}.blind_tags \
+                 (tag_key, normalizer_version, key_fingerprint, erasure, registered_at) \
+                 VALUES ($1, $2, $3, $4, $5)"
+            )))
+            .bind(&declaration.tag_key)
+            .bind(i64::from(declaration.normalizer_version))
+            .bind(&declaration.key_fingerprint)
+            .bind(Json(&declaration.erasure))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Every blind tag stored for `bounded_context`.
+pub async fn list_blind_tags(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<crate::blind::BlindTagDeclaration>> {
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<(String, i64, Option<String>, Json<crate::blind::Erasure>)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT tag_key, normalizer_version, key_fingerprint, erasure \
+             FROM {schema}.blind_tags ORDER BY tag_key"
+        )))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(tag_key, version, key_fingerprint, erasure)| crate::blind::BlindTagDeclaration {
+                tag_key,
+                normalizer_version: u32::try_from(version).unwrap_or(u32::MAX),
+                erasure: erasure.0,
+                key_fingerprint,
+            },
+        )
+        .collect())
+}
+
+/// Records `key_fingerprint` for `bounded_context`'s blind tag `tag_key`
+/// when none is stored yet (docs/architecture.md §208): a tenant created
+/// by an instance that couldn't compute it. A no-op when one is stored.
+pub async fn record_blind_tag_fingerprint(
+    pool: &Pool,
+    bounded_context: &str,
+    tag_key: &str,
+    key_fingerprint: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.blind_tags SET key_fingerprint = $2 \
+         WHERE tag_key = $1 AND key_fingerprint IS NULL"
+    )))
+    .bind(tag_key)
+    .bind(key_fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Refuses `tag_mappings` unless each is blind exactly when the bounded
+/// context stores a blind tag for its key (docs/architecture.md §205):
+/// a key is one constraint for every type that maps it, so a type can't
+/// store in the clear what another hashes, nor hash a key no `BlindTag`
+/// declares. Checked by the type upserts, whichever surface registers.
+async fn check_blind_tag_mappings(
+    pool: &Pool,
+    bounded_context: &str,
+    tag_mappings: &[TagMapping],
+) -> crate::error::Result<()> {
+    if tag_mappings.is_empty() {
+        return Ok(());
+    }
+    // A bounded context an older instance added has no table yet.
+    ensure_blind_tags_table(pool, bounded_context).await?;
+    let schema = schema_ident(bounded_context);
+    let keys: Vec<&str> = tag_mappings.iter().map(|m| m.key.as_str()).collect();
+    let blind_keys: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT tag_key FROM {schema}.blind_tags WHERE tag_key = ANY($1)"
+    )))
+    .bind(&keys)
+    .fetch_all(pool)
+    .await?;
+    let consistent = tag_mappings
+        .iter()
+        .all(|m| m.blind == blind_keys.iter().any(|(k,)| *k == m.key));
+    if !consistent {
+        return Err(crate::event_store::Error::BlindTagMismatch.into());
+    }
+    Ok(())
+}
+
 /// `commands.consistency_query`, the query a command was decided with
 /// (docs/architecture.md §198), for a bounded context from before it. Its
 /// own statement, never in the transaction of
@@ -2267,6 +2469,7 @@ pub async fn make_bounded_context_current(
 ) -> crate::error::Result<()> {
     ensure_consistency_query_column(pool, &bounded_context.name).await?;
     ensure_event_tags_index(pool, &bounded_context.name).await?;
+    ensure_blind_tags_table(pool, &bounded_context.name).await?;
     current_bounded_contexts()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3356,6 +3559,7 @@ const EVENT_TYPE_COLUMNS: &str =
 /// rewind a position the scheduler had just advanced, re-firing the
 /// occurrence - every instance re-registers every type at startup.
 pub async fn upsert_event_type(pool: &Pool, et: &EventType) -> crate::error::Result<()> {
+    check_blind_tag_mappings(pool, &et.bounded_context.name, &et.tag_mappings).await?;
     let schema = schema_ident(&et.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.event_types ({EVENT_TYPE_COLUMNS}) \
@@ -3756,6 +3960,7 @@ const COMMAND_TYPE_COLUMNS: &str = "name, schema, schema_version, tag_mappings, 
 /// See `upsert_event_type` above - same shape and reasoning.
 #[tracing::instrument(skip_all)]
 pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error::Result<()> {
+    check_blind_tag_mappings(pool, &ct.bounded_context.name, &ct.tag_mappings).await?;
     let schema = schema_ident(&ct.bounded_context.name);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.command_types ({COMMAND_TYPE_COLUMNS}) \
@@ -4230,6 +4435,91 @@ pub async fn destroy_encryption_key(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// `forgetSubject`'s blind-tag half (docs/architecture.md §205): for every
+/// blind tag of `bounded_context` declared `Erasure::WithSubject` with this
+/// `subject_key`, removes the tag from every event and command whose
+/// `subject_tag` tag is `subject_value` - from `events.tags`, `event_tags`,
+/// `commands.consistency_tags` and the items of `commands.consistency_query`
+/// - so the value is free again and no hash of it is left. Called before
+/// the key is destroyed, so a failure leaves `forgetSubject` retryable.
+///
+/// One transaction, which also bumps the registrations generation: every
+/// instance's event cache refills a window whose registrations stamp
+/// changed, so none keeps serving the erased tags. Returns how many events
+/// lost a tag.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn forget_subject_in_blind_tags(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+) -> crate::error::Result<u64> {
+    ensure_blind_tags_table(pool, bounded_context).await?;
+    let schema = schema_ident(bounded_context);
+    let erased: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT tag_key, erasure->>'subject_tag' FROM {schema}.blind_tags \
+         WHERE erasure->>'kind' = 'with_subject' AND erasure->>'subject_key' = $1 \
+         ORDER BY tag_key"
+    )))
+    .bind(subject_key)
+    .fetch_all(pool)
+    .await?;
+    if erased.is_empty() {
+        return Ok(0);
+    }
+    ensure_registrations_generation(pool, bounded_context).await?;
+    let mut tx = pool.begin().await?;
+    let mut events_changed = 0;
+    for (tag_key, subject_tag) in &erased {
+        let subject = serde_json::json!([{ "key": subject_tag, "value": subject_value }]);
+        let blind = serde_json::json!([{ "key": tag_key }]);
+        let sequences: Vec<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.events e SET tags = (\
+                SELECT coalesce(jsonb_agg(t), '[]'::jsonb) \
+                FROM jsonb_array_elements(e.tags) t WHERE t->>'key' <> $3) \
+             WHERE e.tags @> $1 AND e.tags @> $2 RETURNING e.sequence"
+        )))
+        .bind(Json(&subject))
+        .bind(Json(&blind))
+        .bind(tag_key)
+        .fetch_all(&mut *tx)
+        .await?;
+        let sequences: Vec<i64> = sequences.into_iter().map(|(s,)| s).collect();
+        events_changed += sequences.len() as u64;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {schema}.event_tags WHERE tag_key = $1 AND sequence = ANY($2)"
+        )))
+        .bind(tag_key)
+        .bind(&sequences)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.commands c SET \
+                consistency_tags = (\
+                    SELECT coalesce(jsonb_agg(t), '[]'::jsonb) \
+                    FROM jsonb_array_elements(c.consistency_tags) t WHERE t->>'key' <> $2), \
+                consistency_query = (\
+                    SELECT coalesce(jsonb_agg(jsonb_set(item, '{{tags}}', (\
+                        SELECT coalesce(jsonb_agg(t), '[]'::jsonb) \
+                        FROM jsonb_array_elements(coalesce(item->'tags', '[]'::jsonb)) t \
+                        WHERE t->>'key' <> $2))), '[]'::jsonb) \
+                    FROM jsonb_array_elements(c.consistency_query) item) \
+             WHERE c.consistency_tags @> $1"
+        )))
+        .bind(Json(&subject))
+        .bind(tag_key)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.registrations_generation SET generation = generation + 1"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(events_changed)
 }
 
 // --- Command ---
@@ -8226,6 +8516,7 @@ pub async fn create_and_insert_external_event(
     dedupe: Option<ExternalEventDedupe<'_>>,
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
+    blind: &crate::blind::BlindIndex,
 ) -> crate::error::Result<CreateExternalEventOutcome> {
     // Every `requires` first, as the spec orders them: before any key is
     // provisioned, the sequence lock taken, or a redelivery recognised
@@ -8235,6 +8526,7 @@ pub async fn create_and_insert_external_event(
         &payload,
         correlation_id.as_deref(),
         causation_id.as_deref(),
+        blind,
     )?;
     let bounded_context_name = adapter.event_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
@@ -8296,6 +8588,7 @@ pub async fn create_and_insert_external_event(
                 );
             (key.clone(), data_key.clone())
         },
+        blind,
     )?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
     // Fetched only now - after `next_sequence` above already took this
@@ -8355,6 +8648,7 @@ pub async fn create_and_insert_direct_event(
     causation_id: Option<String>,
     now: DateTime<Utc>,
     encryption_master_key: Option<&EncryptionMasterKey>,
+    blind: &crate::blind::BlindIndex,
 ) -> crate::error::Result<Event> {
     // See `create_and_insert_external_event`'s identical check.
     crate::event_store::check_create_direct_event(
@@ -8362,6 +8656,7 @@ pub async fn create_and_insert_direct_event(
         &payload,
         correlation_id.as_deref(),
         causation_id.as_deref(),
+        blind,
     )?;
     let bounded_context_name = adapter.event_type.bounded_context.name.clone();
 
@@ -8394,6 +8689,7 @@ pub async fn create_and_insert_direct_event(
                 );
             (key.clone(), data_key.clone())
         },
+        blind,
     )?;
     let encryption_key_ids = encryption_key_ids(&event.encryption_keys, &resolved);
     // Fetched only now - after `next_sequence` above already took this
@@ -8805,7 +9101,7 @@ async fn batch_recheck_delta(
                 dispatcher,
                 &item.command_type,
                 &item.payload,
-            ))
+            )?)
         {
             continue;
         }
@@ -8886,6 +9182,9 @@ struct AcceptedDecision {
     /// on the command (docs/architecture.md §198).
     consistency_query: Vec<QueryItem>,
     event_types_by_name: std::collections::HashMap<String, EventType>,
+    /// What the command's events' blind tags are hashed with - the
+    /// dispatcher's, carried to where they're derived.
+    blind: crate::blind::BlindIndex,
 }
 
 /// [`decide_command_in_tx`]'s own return type - either a terminal outcome
@@ -8994,7 +9293,7 @@ async fn decide_command_in_tx(
     // docs/architecture.md §198: what the command reads and conflicts on.
     // Without a query of its own, one item per consistency tag - every
     // event carrying any of them, as before.
-    let consistency_query = command_consistency_query(dispatcher, command_type, payload);
+    let consistency_query = command_consistency_query(dispatcher, command_type, payload)?;
     let query = crate::event_store::effective_query(&consistency_query, consistency_tags);
     // docs/architecture.md §196: no copy of the history unless a conflict
     // below needs an extended one. The boundary is a plain maximum, raised
@@ -9258,6 +9557,7 @@ async fn decide_command_in_tx(
         consistency_boundary,
         consistency_query,
         event_types_by_name,
+        blind: dispatcher.blind_index(),
     }))
 }
 
@@ -9382,6 +9682,7 @@ async fn finish_accepted_command_in_tx(
         consistency_boundary,
         consistency_query,
         event_types_by_name,
+        blind,
     } = decided;
     let mut sequences = sequences.into_iter();
 
@@ -9424,6 +9725,7 @@ async fn finish_accepted_command_in_tx(
                 );
             (key.clone(), data_key.clone())
         },
+        &blind,
     )?;
 
     // Command and every one of its triggered events, in the one
@@ -10123,6 +10425,7 @@ async fn write_command_batch_as_set(
             consistency_boundary,
             consistency_query,
             event_types_by_name,
+            blind,
         } = match decided {
             Ok(DecideOutcome::Terminal(outcome)) => {
                 results.push(Some(Ok(outcome)));
@@ -10183,6 +10486,7 @@ async fn write_command_batch_as_set(
                     );
                 (key.clone(), data_key.clone())
             },
+            &blind,
         );
         let result = match processed {
             Ok(result) => result,
@@ -10988,11 +11292,17 @@ fn command_consistency_query(
     dispatcher: &dyn crate::plugin::CommandDispatcher,
     command_type: &CommandType,
     payload: &str,
-) -> Vec<QueryItem> {
-    dispatcher
-        .consistency_query(&command_type.bounded_context.name, &command_type.name)
-        .map(|mappings| crate::event_store::derive_query(&mappings, payload))
-        .unwrap_or_default()
+) -> crate::error::Result<Vec<QueryItem>> {
+    let bounded_context = &command_type.bounded_context.name;
+    match dispatcher.consistency_query(bounded_context, &command_type.name) {
+        Some(mappings) => crate::event_store::derive_query(
+            &mappings,
+            payload,
+            &dispatcher.blind_index(),
+            bounded_context,
+        ),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// The optimistic, unlocked half of `ProcessCommand`'s own "optimistic
@@ -11018,8 +11328,13 @@ pub async fn resolve_command_submission(
     // command to be written with. Once per process per bounded context.
     ensure_bounded_context_current(pool, &command_type.bounded_context).await?;
     let bounded_context_name = command_type.bounded_context.name.clone();
-    let consistency_tags = crate::event_store::derive_tags(&command_type.tag_mappings, payload);
-    let consistency_query = command_consistency_query(dispatcher, command_type, payload);
+    let consistency_tags = crate::event_store::derive_tags(
+        &command_type.tag_mappings,
+        payload,
+        &dispatcher.blind_index(),
+        &bounded_context_name,
+    )?;
+    let consistency_query = command_consistency_query(dispatcher, command_type, payload)?;
 
     // `build()` refuses a snapshot together with a query; a dispatcher
     // built by hand that has both gets the query.
@@ -11224,7 +11539,12 @@ pub async fn dry_run_command(
                 let event_type = event_types[&spec.event_type].clone();
                 let payload = spec.payload.to_string();
                 events.push(WouldBeEvent {
-                    tags: crate::event_store::derive_tags(&event_type.tag_mappings, &payload),
+                    tags: crate::event_store::derive_tags(
+                        &event_type.tag_mappings,
+                        &payload,
+                        &dispatcher.blind_index(),
+                        &command_type.bounded_context.name,
+                    )?,
                     event_type,
                     payload,
                     client_id: client_id.to_string(),
@@ -12279,7 +12599,7 @@ pub fn parked_delivery_visible_to(
     let payload =
         serde_json::to_string(payload).expect("serde_json::Value serialization is infallible");
     crate::event_store::tag_owner_scope_satisfied(
-        &crate::event_store::derive_tags(&rules.tag_mappings, &payload),
+        &crate::event_store::derive_plain_tags(&rules.tag_mappings, &payload),
         rules.owner_tag_key.as_deref(),
         access_mapping.scope.as_deref(),
     )

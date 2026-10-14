@@ -121,6 +121,7 @@ fn create_external_event_succeeds_and_stamps_source_fields_and_metadata() {
         7,
         timestamp(500),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -164,6 +165,7 @@ fn create_external_event_allows_an_absent_source_context() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -188,6 +190,7 @@ fn create_external_event_rejects_an_event_type_not_opted_into_external_creation(
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -216,6 +219,7 @@ fn create_external_event_event_type_is_always_the_adapters_event_type_by_constru
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     );
     assert_eq!(adapter.event_type, et);
 }
@@ -235,6 +239,7 @@ fn create_external_event_rejects_a_revoked_token() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -258,6 +263,7 @@ fn create_external_event_rejects_an_archived_bounded_context() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -286,6 +292,7 @@ fn create_external_event_rejects_a_payload_that_does_not_match_the_schema() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -301,6 +308,7 @@ fn create_external_event_derives_real_tags_from_a_real_tag_mapping() {
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "order".into(),
             field: "order_id".into(),
+            blind: false,
         }],
         ..event_type(true, false)
     };
@@ -316,6 +324,7 @@ fn create_external_event_derives_real_tags_from_a_real_tag_mapping() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -340,6 +349,7 @@ fn create_external_event_rejects_an_event_whose_owner_does_not_match_the_tokens_
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         ..event_type(true, false)
     };
@@ -358,6 +368,7 @@ fn create_external_event_rejects_an_event_whose_owner_does_not_match_the_tokens_
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -373,6 +384,7 @@ fn create_external_event_succeeds_when_the_owner_matches_the_tokens_scope() {
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         ..event_type(true, false)
     };
@@ -391,6 +403,7 @@ fn create_external_event_succeeds_when_the_owner_matches_the_tokens_scope() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -421,6 +434,7 @@ fn create_direct_event_succeeds_and_stamps_metadata() {
         3,
         timestamp(200),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -441,6 +455,7 @@ fn create_direct_event_derives_real_tags_from_a_real_tag_mapping() {
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "order".into(),
             field: "order_id".into(),
+            blind: false,
         }],
         ..event_type(false, true)
     };
@@ -454,6 +469,7 @@ fn create_direct_event_derives_real_tags_from_a_real_tag_mapping() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -479,6 +495,7 @@ fn create_direct_event_rejects_an_event_type_not_opted_into_direct_creation() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -503,6 +520,7 @@ fn create_direct_event_event_type_is_always_the_adapters_event_type_by_construct
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     );
     assert_eq!(adapter.event_type, et);
 }
@@ -520,6 +538,7 @@ fn create_direct_event_rejects_a_revoked_token() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -541,6 +560,7 @@ fn create_direct_event_rejects_an_archived_bounded_context() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -567,6 +587,7 @@ fn create_direct_event_rejects_a_payload_that_does_not_match_the_schema() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -587,6 +608,7 @@ fn create_direct_event_rejects_an_event_whose_owner_does_not_match_the_tokens_sc
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         ..event_type(false, true)
     };
@@ -603,6 +625,7 @@ fn create_direct_event_rejects_an_event_whose_owner_does_not_match_the_tokens_sc
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -619,6 +642,7 @@ fn create_direct_event_succeeds_when_the_owner_matches_the_tokens_scope() {
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         ..event_type(false, true)
     };
@@ -635,6 +659,7 @@ fn create_direct_event_succeeds_when_the_owner_matches_the_tokens_scope() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -654,6 +679,7 @@ fn create_direct_event_rejects_a_payload_naming_no_owner_at_all_when_scoped() {
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         ..event_type(false, true)
     };
@@ -670,6 +696,7 @@ fn create_direct_event_rejects_a_payload_naming_no_owner_at_all_when_scoped() {
         0,
         timestamp(0),
         |_, _| unreachable!("no sensitive fields in this test"),
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 

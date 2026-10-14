@@ -162,6 +162,7 @@ async fn seed_event_type(pool: &Pool, bc: &BoundedContext, name: &str, tag_key: 
         tag_mappings: vec![TagMapping {
             key: tag_key.to_string(),
             field: "account_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),

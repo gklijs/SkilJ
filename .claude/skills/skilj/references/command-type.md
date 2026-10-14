@@ -173,7 +173,8 @@ can't take `.latest()`/`.last(n)`. In a `.skilj.toml`, it's
 `reads_nothing = true` on the `[[command_type]]`. Only use it when
 `decide()` truly checks nothing outside the payload: any rule over
 earlier events (a balance, a uniqueness check, a status) needs those
-events in the query.
+events in the query. A uniqueness check on personal data has its own
+skill, `skilj-uniqueness`: the value is a blind tag.
 
 ### When `decide()` needs a fold over a long history: snapshot items
 

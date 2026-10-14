@@ -50,6 +50,7 @@ impl EventType for MoneyDeposited {
         vec![skilj_core::shared::TagMapping {
             key: "amount".into(),
             field: "amount".into(),
+            blind: false,
         }]
     }
     fn owner_tag_key() -> Option<&'static str> {

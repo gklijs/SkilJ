@@ -723,6 +723,108 @@ pub trait Snapshot {
     }
 }
 
+/// One blind-index constraint (docs/architecture.md §205): the tag key
+/// whose values are stored as a keyed hash of a payload field instead of
+/// the field, so a command can check that no earlier event carries the
+/// same value - an email address registered once - without the value
+/// ever being stored in the clear. A type tags it with
+/// [`TagMapping::blind::<Self>`](crate::shared::TagMapping::blind), which
+/// may name a sensitive field; a command's consistency query reads it
+/// like any other tag.
+///
+/// ```
+/// use skilj_core::blind::normalize;
+/// use skilj_core::plugin::{BlindErasure, BlindTag};
+///
+/// struct CustomerEmail;
+/// impl BlindTag for CustomerEmail {
+///     const BOUNDED_CONTEXT: &'static str = "crm";
+///     const TAG_KEY: &'static str = "email";
+///     const ERASURE: BlindErasure = BlindErasure::with_subject("customer");
+///     fn normalize(value: &str) -> String {
+///         normalize::email(value)
+///     }
+/// }
+/// ```
+///
+/// Every instance serving the bounded context must declare it, with the
+/// same `blind_index_key`: an instance that doesn't refuses to derive the
+/// tag (`blind_tag_not_declared`) rather than store the value.
+pub trait BlindTag {
+    /// See `CommandType::BOUNDED_CONTEXT`'s own doc comment.
+    const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT;
+
+    /// The tag key. One `BlindTag` per key per bounded context; the key's
+    /// constraint is its own HMAC key, derived from the
+    /// `blind_index_key` and `(BOUNDED_CONTEXT, TAG_KEY)`.
+    const TAG_KEY: &'static str;
+
+    /// Bumped by hand whenever [`normalize`](BlindTag::normalize)
+    /// changes what it returns for any input. Values hashed under the old
+    /// normalizer don't match new ones, so `build()` refuses a version
+    /// that differs from the stored one rather than silently letting a
+    /// taken value be taken again.
+    const NORMALIZER_VERSION: u32 = 1;
+
+    /// What `forgetSubject` does with the tag - see [`BlindErasure`].
+    const ERASURE: BlindErasure;
+
+    /// What a payload value becomes before it's hashed, so values that
+    /// mean the same thing collide: [`crate::blind::normalize::email`]
+    /// trims and lowercases. Must be deterministic. It can also add an
+    /// application secret of its own - a pepper the database never sees.
+    /// The default leaves the value as it is.
+    fn normalize(value: &str) -> String {
+        value.to_string()
+    }
+}
+
+/// What `forgetSubject` does with a [`BlindTag`]'s hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindErasure {
+    /// The hash stays: the value is still taken after the subject is
+    /// forgotten. For a rule that outlives the person - a trial used once,
+    /// an address that was banned.
+    Keep,
+    /// Forgetting `subject_key`'s subject removes the tag from every event
+    /// and command whose `subject_tag` tag carries the subject's value, so
+    /// the value can be taken again and no hash of it is left. Every type
+    /// tagging the blind key must also tag `subject_tag`; `build()`
+    /// checks.
+    WithSubject {
+        subject_key: &'static str,
+        subject_tag: &'static str,
+    },
+}
+
+impl BlindErasure {
+    /// [`BlindErasure::WithSubject`] where the encryption subject key and
+    /// the plain tag carrying the subject's value share one name - the
+    /// usual case, e.g. `SensitiveField::new("email", "customer",
+    /// "customer_id")` next to `TagMapping::new("customer", "customer_id")`.
+    pub const fn with_subject(subject: &'static str) -> Self {
+        BlindErasure::WithSubject {
+            subject_key: subject,
+            subject_tag: subject,
+        }
+    }
+}
+
+impl From<BlindErasure> for crate::blind::Erasure {
+    fn from(erasure: BlindErasure) -> Self {
+        match erasure {
+            BlindErasure::Keep => crate::blind::Erasure::Keep,
+            BlindErasure::WithSubject {
+                subject_key,
+                subject_tag,
+            } => crate::blind::Erasure::WithSubject {
+                subject_key: subject_key.to_string(),
+                subject_tag: subject_tag.to_string(),
+            },
+        }
+    }
+}
+
 /// One snapshot's state for one tag value, as a decision is handed it
 /// (docs/architecture.md §202): the stored row with every later event
 /// carrying the value folded in, JSON-encoded. Read typed through
@@ -876,6 +978,16 @@ pub trait CommandDispatcher: Send + Sync {
         snapshot_state_json: &str,
         events_since_snapshot: &[Event],
     ) -> Option<crate::error::Result<CommandDecision>>;
+
+    /// The blind tags this process declares, keyed for hashing
+    /// (docs/architecture.md §205) - what every tag derivation on the
+    /// command path, and event creation through the same surfaces, hashes
+    /// a blind mapping with. Empty, the default, for a dispatcher whose
+    /// bounded contexts declare none: a stored blind mapping is then
+    /// refused with `blind_tag_not_declared`, never derived in the clear.
+    fn blind_index(&self) -> crate::blind::BlindIndex {
+        crate::blind::BlindIndex::default()
+    }
 }
 
 /// Type-erased dispatch to a bounded context's own typed `project()` -

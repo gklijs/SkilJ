@@ -24,7 +24,9 @@ One-sentence description of what this bounded context is responsible for.
 
 - **Payload sketch**: field: rough type, field: rough type, ...
 - **Triggered by**: <CommandName> (see below) | scheduled | external
-- **Tag candidates**: <tag key>: <payload field>, ...
+- **Tag candidates**: <tag key>: <payload field>, ... - mark a tag on
+  personal data that a rule matches on (a unique email address) as
+  `(blind, normalized: <how>, on erasure: free | keep taken)`
 
 (repeat per event)
 

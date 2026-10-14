@@ -22,10 +22,7 @@ use skilj_core::shared::{CommandDecision, EventSpec, TagMapping};
 pub const BOUNDED_CONTEXT: &str = "wallet";
 
 fn wallet_tag() -> Vec<TagMapping> {
-    vec![TagMapping {
-        key: "wallet".into(),
-        field: "wallet_id".into(),
-    }]
+    vec![TagMapping::new("wallet", "wallet_id")]
 }
 
 // --- events ---

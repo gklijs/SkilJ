@@ -110,6 +110,7 @@ fn tag_mapping(key: &str, field: &str) -> TagMapping {
     TagMapping {
         key: key.into(),
         field: field.into(),
+        blind: false,
     }
 }
 

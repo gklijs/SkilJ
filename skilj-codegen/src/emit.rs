@@ -7,7 +7,8 @@
 //! statements in scope.
 
 use crate::spec::{
-    BoundedContextSpec, CommandTypeSpec, EventTypeSpec, FieldSpec, FieldType, QueryItemSpec,
+    BlindTagSpec, BoundedContextSpec, CommandTypeSpec, ErasureSpec, EventTypeSpec, FieldSpec,
+    FieldType, QueryItemSpec, SensitiveSpec,
 };
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -21,15 +22,23 @@ pub fn emit(spec: &BoundedContextSpec) -> TokenStream {
 
     let event_enum_ident = format_ident!("{}", event_enum_name(bc_name));
 
-    let event_items = spec.event_types.iter().map(emit_event_type);
+    // Blind tag key -> its marker type: every tag on the key is blind.
+    let blind: BlindKeys = spec
+        .blind_tags
+        .iter()
+        .map(|b| (b.key.clone(), b.name.clone()))
+        .collect();
+    let blind_items = spec.blind_tags.iter().map(emit_blind_tag);
+    let event_items = spec.event_types.iter().map(|e| emit_event_type(e, &blind));
     let command_items = spec
         .command_types
         .iter()
-        .map(|c| emit_command_type(c, &event_enum_ident));
+        .map(|c| emit_command_type(c, &event_enum_ident, &blind));
     let event_enum = emit_event_enum(spec, &event_enum_ident);
 
     quote! {
         #bc_const
+        #(#blind_items)*
         #(#event_items)*
         #(#command_items)*
         #event_enum
@@ -68,20 +77,38 @@ fn payload_struct(type_name: &str, fields: &[FieldSpec]) -> (syn::Ident, TokenSt
     (struct_ident, tokens)
 }
 
+/// Blind tag key -> the `BlindTag` marker type declaring it.
+type BlindKeys = BTreeMap<String, String>;
+
+/// One tag mapping: `TagMapping::blind::<Marker>` for a key a
+/// `[[blind_tag]]` declares, `TagMapping::new` otherwise.
+fn tag_mapping(key: &str, field: &str, blind: &BlindKeys) -> TokenStream {
+    match blind.get(key) {
+        Some(marker) => {
+            let marker = format_ident!("{}", marker);
+            quote! { ::skilj_core::shared::TagMapping::blind::<#marker>(#field) }
+        }
+        None => quote! { ::skilj_core::shared::TagMapping::new(#key, #field) },
+    }
+}
+
 /// `None` when `tags` is empty - the trait's own default
 /// (`Vec::new()`) already covers that case, so nothing needs
 /// overriding; emitting an override anyway would just be a longer way
 /// to say the same thing.
-fn tag_mappings_fn(tags: &BTreeMap<String, String>) -> Option<TokenStream> {
+fn tag_mappings_fn(tags: &BTreeMap<String, String>, blind: &BlindKeys) -> Option<TokenStream> {
     if tags.is_empty() {
         return None;
     }
-    let entries = tags.iter().map(|(key, field)| {
-        quote! { ::skilj_core::shared::TagMapping { key: #key.to_string(), field: #field.to_string() } }
-    });
+    let entries = tags
+        .iter()
+        .map(|(key, field)| tag_mapping(key, field, blind));
+    // `Vec::from([...])`, not `vec![...]`: prettyplease leaves a macro's
+    // tokens unformatted (`blind:: < Marker >`), and this is read in
+    // review (§191).
     Some(quote! {
         fn tag_mappings() -> Vec<::skilj_core::shared::TagMapping> {
-            vec![#(#entries),*]
+            Vec::from([#(#entries),*])
         }
     })
 }
@@ -96,6 +123,7 @@ fn consistency_query_fn(
     query: &[QueryItemSpec],
     reads_nothing: bool,
     tags: &BTreeMap<String, String>,
+    blind: &BlindKeys,
 ) -> Option<TokenStream> {
     if reads_nothing {
         return Some(quote! {
@@ -109,10 +137,10 @@ fn consistency_query_fn(
     }
     let items = query.iter().map(|item| {
         let event_types = &item.event_types;
-        let tag_mappings = item.tags.iter().map(|key| {
-            let field = &tags[key];
-            quote! { ::skilj_core::shared::TagMapping { key: #key.to_string(), field: #field.to_string() } }
-        });
+        let tag_mappings = item
+            .tags
+            .iter()
+            .map(|key| tag_mapping(key, &tags[key], blind));
         let latest = match item.latest {
             Some(count) => quote! { Some(#count) },
             None => quote! { None },
@@ -135,11 +163,76 @@ fn consistency_query_fn(
     })
 }
 
-fn emit_event_type(event: &EventTypeSpec) -> TokenStream {
+/// `None` when there are none - the trait's own default.
+fn sensitive_fields_fn(sensitive: &[SensitiveSpec]) -> Option<TokenStream> {
+    if sensitive.is_empty() {
+        return None;
+    }
+    let entries = sensitive.iter().map(|s| {
+        let (field, subject_key, subject_field) = (&s.field, &s.subject_key, &s.subject_field);
+        quote! { ::skilj_core::shared::SensitiveField::new(#field, #subject_key, #subject_field) }
+    });
+    Some(quote! {
+        fn sensitive_fields() -> Vec<::skilj_core::shared::SensitiveField> {
+            Vec::from([#(#entries),*])
+        }
+    })
+}
+
+/// A `[[blind_tag]]`: its marker type and `BlindTag` impl
+/// (docs/architecture.md §205). `spec::validate` has refused a
+/// `with_subject` erasure without a subject and a normalizer that is
+/// neither a ready-made one nor a path.
+fn emit_blind_tag(blind: &BlindTagSpec) -> TokenStream {
+    let marker_ident = format_ident!("{}", blind.name);
+    let key = &blind.key;
+    let version = proc_macro2::Literal::u32_unsuffixed(blind.normalizer_version);
+    let erasure = match (blind.erasure, &blind.subject, &blind.subject_tag) {
+        (ErasureSpec::WithSubject, Some(subject), Some(subject_tag)) if subject_tag != subject => {
+            quote! {
+                ::skilj::BlindErasure::WithSubject {
+                    subject_key: #subject,
+                    subject_tag: #subject_tag,
+                }
+            }
+        }
+        (ErasureSpec::WithSubject, Some(subject), _) => {
+            quote! { ::skilj::BlindErasure::with_subject(#subject) }
+        }
+        _ => quote! { ::skilj::BlindErasure::Keep },
+    };
+    let normalize_fn = blind.normalize.as_deref().map(|normalize| {
+        let function: syn::Path = if crate::spec::NORMALIZERS.contains(&normalize) {
+            let name = format_ident!("{}", normalize);
+            syn::parse_quote! { ::skilj::normalize::#name }
+        } else {
+            syn::parse_str(normalize).expect("spec::validate refused an unparseable path")
+        };
+        quote! {
+            fn normalize(value: &str) -> String {
+                #function(value)
+            }
+        }
+    });
+    quote! {
+        pub struct #marker_ident;
+
+        #[::skilj::auto_register(BOUNDED_CONTEXT)]
+        impl ::skilj::BlindTag for #marker_ident {
+            const TAG_KEY: &'static str = #key;
+            const NORMALIZER_VERSION: u32 = #version;
+            const ERASURE: ::skilj::BlindErasure = #erasure;
+            #normalize_fn
+        }
+    }
+}
+
+fn emit_event_type(event: &EventTypeSpec, blind: &BlindKeys) -> TokenStream {
     let (payload_ident, payload_tokens) = payload_struct(&event.name, &event.fields);
     let marker_ident = format_ident!("{}", event.name);
     let name_lit = &event.name;
-    let tag_fn = tag_mappings_fn(&event.tags);
+    let tag_fn = tag_mappings_fn(&event.tags, blind);
+    let sensitive_fn = sensitive_fields_fn(&event.sensitive);
 
     quote! {
         #payload_tokens
@@ -151,6 +244,7 @@ fn emit_event_type(event: &EventTypeSpec) -> TokenStream {
             type Payload = #payload_ident;
             const NAME: &'static str = #name_lit;
             #tag_fn
+            #sensitive_fn
         }
     }
 }
@@ -163,12 +257,18 @@ fn emit_event_type(event: &EventTypeSpec) -> TokenStream {
 /// immediate "cannot find function" compile error in the including
 /// crate - never a silent gap, and never something this crate itself
 /// needs to detect ahead of time.
-fn emit_command_type(command: &CommandTypeSpec, event_enum_ident: &syn::Ident) -> TokenStream {
+fn emit_command_type(
+    command: &CommandTypeSpec,
+    event_enum_ident: &syn::Ident,
+    blind: &BlindKeys,
+) -> TokenStream {
     let (payload_ident, payload_tokens) = payload_struct(&command.name, &command.fields);
     let marker_ident = format_ident!("{}", command.name);
     let name_lit = &command.name;
-    let tag_fn = tag_mappings_fn(&command.tags);
-    let query_fn = consistency_query_fn(&command.query, command.reads_nothing, &command.tags);
+    let tag_fn = tag_mappings_fn(&command.tags, blind);
+    let sensitive_fn = sensitive_fields_fn(&command.sensitive);
+    let query_fn =
+        consistency_query_fn(&command.query, command.reads_nothing, &command.tags, blind);
     let rest_fn = command.rest_trigger_allowed.then(|| {
         quote! {
             fn rest_trigger_allowed() -> bool { true }
@@ -187,6 +287,7 @@ fn emit_command_type(command: &CommandTypeSpec, event_enum_ident: &syn::Ident) -
             type Event = #event_enum_ident;
             const NAME: &'static str = #name_lit;
             #tag_fn
+            #sensitive_fn
             #query_fn
             #rest_fn
             fn decide(

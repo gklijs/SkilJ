@@ -83,6 +83,7 @@ impl CommandType for WithdrawMoney {
         vec![TagMapping {
             key: "amount".into(),
             field: "amount".into(),
+            blind: false,
         }]
     }
     /// Cross-tenant write fix (docs/architecture.md's own write-up of

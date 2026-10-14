@@ -56,8 +56,7 @@ fn generates_a_real_event_type_impl_with_tag_mappings() {
     assert!(output.contains("impl ::skilj::EventType for MoneyDeposited"));
     assert!(output.contains(r#"const NAME: &'static str = "MoneyDeposited""#));
     assert!(output.contains("fn tag_mappings"));
-    assert!(output.contains(r#""account".to_string()"#));
-    assert!(output.contains(r#""account_id".to_string()"#));
+    assert!(output.contains(r#"TagMapping::new("account", "account_id")"#));
 }
 
 #[test]
@@ -211,7 +210,10 @@ fn a_keyword_field_is_emitted_as_a_raw_identifier() {
     .unwrap();
     assert!(output.contains("pub r#type: String"), "{output}");
     // The tag mapping names the wire field, `type`, not `r#type`.
-    assert!(output.contains(r#"field : "type""#), "{output}");
+    assert!(
+        output.contains(r#"TagMapping::new("kind", "type")"#),
+        "{output}"
+    );
 }
 
 /// What makes the raw identifier above the right choice: serde and
@@ -278,7 +280,7 @@ fn a_command_type_query_becomes_a_consistency_query_override() {
     assert!(output.contains(r#"event_types: Vec::from(["CompanySignedUp".to_string()])"#));
     assert!(output.contains("latest: Some(1u32)"));
     assert!(output.contains("latest: None"));
-    assert!(output.contains(r#"field: "ticket_id".to_string()"#));
+    assert!(output.contains(r#"TagMapping::new("ticket", "ticket_id")"#));
 }
 
 #[test]
@@ -350,4 +352,170 @@ fn reads_nothing_with_query_items_is_a_named_problem() {
             .any(|p| p.contains("reads_nothing reads no events, so it can't have query items too")),
         "{problems:?}"
     );
+}
+
+// --- blind tags and sensitive fields (docs/architecture.md §205) ---
+
+/// A customer with an email that is blind-tagged and encrypted, `extra`
+/// appended to the `[[blind_tag]]`, `event_extra` to the event type.
+fn customers_toml(blind_extra: &str, event_extra: &str) -> String {
+    format!(
+        r#"
+        bounded_context = "customers"
+
+        [[blind_tag]]
+        name = "CustomerEmail"
+        key = "email"
+        {blind_extra}
+
+        [[event_type]]
+        name = "EmailClaimed"
+        fields = [
+            {{ name = "customer_id", type = "string" }},
+            {{ name = "email", type = "string" }},
+        ]
+        tags = {{ customer = "customer_id", email = "email" }}
+        sensitive = [{{ field = "email", subject_key = "customer", subject_field = "customer_id" }}]
+        {event_extra}
+        "#
+    )
+}
+
+#[test]
+fn a_blind_tag_generates_its_impl_and_blind_mappings() {
+    let output = skilj_codegen::generate(&customers_toml(
+        r#"normalize = "email"
+        erasure = "with_subject"
+        subject = "customer""#,
+        "",
+    ))
+    .unwrap();
+    assert!(
+        output.contains("impl ::skilj::BlindTag for CustomerEmail"),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#"const TAG_KEY: &'static str = "email";"#),
+        "{output}"
+    );
+    assert!(
+        output.contains("const NORMALIZER_VERSION: u32 = 1;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("::skilj::BlindErasure::with_subject("),
+        "{output}"
+    );
+    assert!(
+        output.contains("::skilj::normalize::email(value)"),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#"TagMapping::blind::<CustomerEmail>("email")"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#"TagMapping::new("customer", "customer_id")"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#"SensitiveField::new("email", "customer", "customer_id")"#),
+        "{output}"
+    );
+}
+
+#[test]
+fn a_blind_tag_can_keep_its_hashes_and_use_a_normalizer_of_its_own() {
+    let output = skilj_codegen::generate(&customers_toml(
+        r#"normalize = "crate::normalize_handle"
+        normalizer_version = 2
+        erasure = "keep""#,
+        "",
+    ))
+    .unwrap();
+    assert!(output.contains("::skilj::BlindErasure::Keep"), "{output}");
+    assert!(
+        output.contains("crate::normalize_handle(value)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("const NORMALIZER_VERSION: u32 = 2;"),
+        "{output}"
+    );
+}
+
+#[test]
+fn a_subject_tag_of_another_name_spells_out_the_erasure() {
+    let output = skilj_codegen::generate(
+        &customers_toml(
+            r#"erasure = "with_subject"
+            subject = "person"
+            subject_tag = "customer""#,
+            "",
+        )
+        .replace(r#"subject_key = "customer""#, r#"subject_key = "person""#),
+    )
+    .unwrap();
+    assert!(output.contains(r#"subject_key: "person""#), "{output}");
+    assert!(output.contains(r#"subject_tag: "customer""#), "{output}");
+    assert!(!output.contains("fn normalize"), "{output}");
+}
+
+#[test]
+fn an_unusable_blind_tag_or_sensitive_field_is_refused() {
+    let all = |toml: String| invalid(&toml).join("\n");
+
+    let problems = all(customers_toml(
+        r#"normalize = "lowercase"
+        erasure = "keep""#,
+        "",
+    ));
+    assert!(problems.contains("normalize \"lowercase\""), "{problems}");
+
+    let problems = all(customers_toml(r#"erasure = "with_subject""#, ""));
+    assert!(problems.contains("needs subject"), "{problems}");
+
+    let problems = all(customers_toml(
+        r#"erasure = "keep"
+        subject = "customer""#,
+        "",
+    ));
+    assert!(problems.contains("takes no subject"), "{problems}");
+
+    // The subject tag must be on every type with the blind key.
+    let problems = all(customers_toml(
+        r#"erasure = "with_subject"
+        subject = "customer""#,
+        "",
+    )
+    .replace(r#"customer = "customer_id", "#, ""));
+    assert!(
+        problems.contains("must also tag \"customer\""),
+        "{problems}"
+    );
+
+    // Without the [[blind_tag]], the email tag would store the encrypted
+    // field in the clear.
+    let problems =
+        all(customers_toml(r#"erasure = "keep""#, "")
+            .replace(r#"key = "email""#, r#"key = "mail""#));
+    assert!(
+        problems.contains("stores sensitive field \"email\" in the clear"),
+        "{problems}"
+    );
+
+    let problems = all(customers_toml(
+        r#"erasure = "keep""#,
+        r#"[[blind_tag]]
+        name = "OtherEmail"
+        key = "email"
+        erasure = "keep""#,
+    ));
+    assert!(problems.contains("has another [[blind_tag]]"), "{problems}");
+
+    let problems = all(customers_toml(r#"erasure = "keep""#, "").replace(
+        r#"subject_field = "customer_id""#,
+        r#"subject_field = "id""#,
+    ));
+    assert!(problems.contains("names field \"id\""), "{problems}");
 }

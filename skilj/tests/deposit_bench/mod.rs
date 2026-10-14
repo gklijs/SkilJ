@@ -40,6 +40,7 @@ impl EventType for Deposited {
         vec![TagMapping {
             key: "account".into(),
             field: "account_id".into(),
+            blind: false,
         }]
     }
 }
@@ -70,6 +71,7 @@ impl CommandType for Deposit {
         vec![TagMapping {
             key: "account".into(),
             field: "account_id".into(),
+            blind: false,
         }]
     }
     /// A real decision over the account's history: deposits are capped,

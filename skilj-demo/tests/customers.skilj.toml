@@ -1,0 +1,67 @@
+# A customer's email address, unique per bounded context and stored only
+# encrypted (docs/architecture.md §205). The address is a blind tag: a
+# keyed hash of the normalized address, so RegisterCustomer's consistency
+# query finds an earlier claim of it without the address being stored in
+# the clear. Forgetting the customer removes the hash, freeing the
+# address. build.rs generates tests/customers.rs's types from this; the
+# decide_* functions there are hand-written.
+
+bounded_context = "customers"
+
+[[blind_tag]]
+name = "CustomerEmail"
+key = "email"
+normalize = "email"
+erasure = "with_subject"
+subject = "customer"
+
+[[event_type]]
+name = "EmailClaimed"
+fields = [
+    { name = "customer_id", type = "string" },
+    { name = "email", type = "string" },
+]
+tags = { customer = "customer_id", email = "email" }
+sensitive = [{ field = "email", subject_key = "customer", subject_field = "customer_id" }]
+
+[[event_type]]
+name = "EmailReleased"
+fields = [
+    { name = "customer_id", type = "string" },
+    { name = "email", type = "string" },
+]
+tags = { customer = "customer_id", email = "email" }
+sensitive = [{ field = "email", subject_key = "customer", subject_field = "customer_id" }]
+
+[[command_type]]
+name = "RegisterCustomer"
+fields = [
+    { name = "customer_id", type = "string" },
+    { name = "email", type = "string" },
+]
+tags = { customer = "customer_id", email = "email" }
+sensitive = [{ field = "email", subject_key = "customer", subject_field = "customer_id" }]
+
+# The latest claim or release of the address decides whether it's taken.
+[[command_type.query]]
+event_types = ["EmailClaimed", "EmailReleased"]
+tags = ["email"]
+latest = 1
+
+[[command_type]]
+name = "ChangeEmail"
+fields = [
+    { name = "customer_id", type = "string" },
+    { name = "old_email", type = "string" },
+    { name = "email", type = "string" },
+]
+tags = { customer = "customer_id", email = "email" }
+sensitive = [
+    { field = "old_email", subject_key = "customer", subject_field = "customer_id" },
+    { field = "email", subject_key = "customer", subject_field = "customer_id" },
+]
+
+[[command_type.query]]
+event_types = ["EmailClaimed", "EmailReleased"]
+tags = ["email"]
+latest = 1

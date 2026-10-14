@@ -40,22 +40,13 @@ pub const BOUNDED_CONTEXT: &str = "courses";
 pub const MAX_ACTIVE_COURSES_PER_STUDENT: usize = 3;
 
 fn course_tag() -> Vec<TagMapping> {
-    vec![TagMapping {
-        key: "course".into(),
-        field: "course_id".into(),
-    }]
+    vec![TagMapping::new("course", "course_id")]
 }
 
 fn student_and_course_tags() -> Vec<TagMapping> {
     vec![
-        TagMapping {
-            key: "student".into(),
-            field: "student_id".into(),
-        },
-        TagMapping {
-            key: "course".into(),
-            field: "course_id".into(),
-        },
+        TagMapping::new("student", "student_id"),
+        TagMapping::new("course", "course_id"),
     ]
 }
 

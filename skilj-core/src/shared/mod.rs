@@ -89,10 +89,43 @@ pub struct Tag {
     pub value: Option<String>,
 }
 
+/// Derives a tag from a payload field. A `blind` mapping's tag value is a
+/// keyed hash of the field rather than the field itself
+/// (docs/architecture.md §205): it may name a sensitive field, and two
+/// payloads carry the same tag exactly when their normalized values are
+/// equal - a uniqueness check without storing the value. Its key must be
+/// declared by a [`crate::plugin::BlindTag`] in the same bounded context;
+/// build with [`TagMapping::blind`]. Stored with the type, so every
+/// instance knows the tag must be hashed, including one that doesn't
+/// declare it and so refuses rather than storing the value in the clear.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TagMapping {
     pub key: String,
     pub field: FieldPath,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blind: bool,
+}
+
+impl TagMapping {
+    /// A plain mapping: the tag value is the field's value.
+    pub fn new(key: impl Into<String>, field: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            field: field.into(),
+            blind: false,
+        }
+    }
+
+    /// A blind mapping under `B`'s constraint: the tag key is
+    /// `B::TAG_KEY`, its value the keyed hash of `field`'s normalized
+    /// value.
+    pub fn blind<B: crate::plugin::BlindTag>(field: impl Into<String>) -> Self {
+        Self {
+            key: B::TAG_KEY.to_string(),
+            field: field.into(),
+            blind: true,
+        }
+    }
 }
 
 /// One item of a command type's consistency query (docs/architecture.md
@@ -106,7 +139,7 @@ pub struct TagMapping {
 ///
 /// ```
 /// # use skilj_core::shared::{QueryItemMapping, TagMapping};
-/// let company = TagMapping { key: "company".into(), field: "company_id".into() };
+/// let company = TagMapping::new("company", "company_id");
 /// // The company's latest lifecycle event, whatever kind it is.
 /// let status = QueryItemMapping::types(&["CompanySignedUp", "CompanyExpired"])
 ///     .tagged(vec![company])
@@ -163,10 +196,7 @@ impl QueryItemMapping {
     pub fn snapshot<S: crate::plugin::Snapshot>(field: &str) -> Self {
         Self {
             event_types: Vec::new(),
-            tag_mappings: vec![TagMapping {
-                key: S::TAG_KEY.to_string(),
-                field: field.to_string(),
-            }],
+            tag_mappings: vec![TagMapping::new(S::TAG_KEY, field)],
             latest: None,
             snapshot: Some(S::NAME.to_string()),
         }
@@ -235,6 +265,23 @@ pub struct SensitiveField {
     pub field: FieldPath,
     pub subject_key: String,
     pub subject_field: FieldPath,
+}
+
+impl SensitiveField {
+    /// `field`, encrypted under the key of the subject named by
+    /// `subject_field`'s value in the `subject_key` namespace - e.g.
+    /// `SensitiveField::new("email", "customer", "customer_id")`.
+    pub fn new(
+        field: impl Into<String>,
+        subject_key: impl Into<String>,
+        subject_field: impl Into<String>,
+    ) -> Self {
+        Self {
+            field: field.into(),
+            subject_key: subject_key.into(),
+            subject_field: subject_field.into(),
+        }
+    }
 }
 
 /// See `value PrivateField` in the spec - the private-field mechanism's

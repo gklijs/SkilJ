@@ -207,6 +207,10 @@ far as a test exercises them, and some aren't checked at all
 - **Known races**: a targeted test each, often using a trigger to force
   the interleaving. There is one property test,
   `UniqueReadCursorPerToken` in `skilj-core/tests/event_fetch_surface.rs`.
+- **Blind tags** (§205): `skilj/tests/blind_tags.rs` checks that a blind
+  value appears in no stored tag, query or payload, that racing claims
+  accept one, and that erasure removes the hash from the database and
+  from the event cache.
 - **The template**: `scripts/check-template.sh` generates it and builds
   it, but doesn't run it.
 - **Federation composition**: `skilj/tests/graphql_federation.rs` checks
@@ -238,7 +242,8 @@ far as a test exercises them, and some aren't checked at all
   `#[ignore]`d. A throughput regression fails nothing.
 - **Mixed versions on one database.** Upgrading is tested. Two skilj
   versions running side by side during a rolling deploy are not; §164
-  records one known gap.
+  records one known gap, and §205 another: a version from before blind
+  tags would derive a blind tag's value in the clear.
 - **Spec against code.** No test is generated from `specs/skilj.allium`.
   Their alignment is checked by periodic drift audits.
 - **Interleavings in general.** Races someone thought of have tests.

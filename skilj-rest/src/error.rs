@@ -158,6 +158,8 @@ fn status_for(err: &CoreError) -> StatusCode {
             EventStoreError::SensitiveFieldTagOverlap => StatusCode::BAD_REQUEST,
             EventStoreError::SchemaIncompatible => StatusCode::CONFLICT,
             EventStoreError::TagMappingKeyDropped => StatusCode::CONFLICT,
+            EventStoreError::InvalidBlindTagMapping => StatusCode::BAD_REQUEST,
+            EventStoreError::BlindTagMismatch => StatusCode::CONFLICT,
             EventStoreError::UnregisteredEventType(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
@@ -171,6 +173,12 @@ fn status_for(err: &CoreError) -> StatusCode {
         // wrapped key are both operator-facing configuration/data-integrity
         // problems, never a caller-facing 4xx.
         CoreError::Encryption(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // This instance can't hash a blind tag another instance can - the
+        // same status `NoDeciderRegistered` gives "can't decide here".
+        CoreError::Blind(skilj_core::blind::Error::LookupNotGranted { .. }) => {
+            StatusCode::FORBIDDEN
+        }
+        CoreError::Blind(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // §7.3/§5.4: a rejection is a legitimate outcome of a successful
         // request, not an HTTP-level error - CommandTrigger's own handler
         // renders this as 200-with-typed-data instead of ever routing a

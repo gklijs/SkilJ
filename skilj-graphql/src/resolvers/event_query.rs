@@ -9,13 +9,19 @@ use crate::gql_types::InspectedEventData;
 use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
+use skilj_core::event_store::QueryTag;
 use skilj_core::shared::Tag;
 
 /// Parses a `[TagInput!]` argument (nullable - absent means "no tag
 /// restriction", matching `query_events`'/`count_events`'s own
-/// `Option<&[Tag]>`) into `Vec<Tag>`.
-fn parse_tags(
-    value: Option<async_graphql::dynamic::ValueAccessor>,
+/// `Option<&[Tag]>`) into `Vec<Tag>`, a `plaintext` value of a blind key
+/// hashed as stored (docs/architecture.md §207). The bounded context's
+/// blind keys are read only when some tag asks for it.
+async fn parse_tags(
+    value: Option<async_graphql::dynamic::ValueAccessor<'_>>,
+    state: &GraphqlState,
+    bounded_context: &str,
+    access_mapping: &skilj_core::access_control::RoleAccessMapping,
 ) -> async_graphql::Result<Option<Vec<Tag>>> {
     let Some(value) = value.filter(|v| !v.is_null()) else {
         return Ok(None);
@@ -28,9 +34,34 @@ fn parse_tags(
             Some(v) => Some(v.string()?.to_string()),
             None => None,
         };
-        tags.push(Tag { key, value });
+        let plaintext = match obj.get("plaintext").filter(|v| !v.is_null()) {
+            Some(v) => v.boolean()?,
+            None => false,
+        };
+        tags.push(QueryTag {
+            tag: Tag { key, value },
+            plaintext,
+        });
     }
-    Ok(Some(tags))
+    let blind_keys = if tags.iter().any(|t| t.plaintext) {
+        skilj_core::db::list_blind_tags(&state.pool, bounded_context)
+            .await
+            .map_err(to_graphql_error)?
+            .into_iter()
+            .map(|b| b.tag_key)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    skilj_core::event_store::resolve_query_tags(
+        tags,
+        &blind_keys,
+        &state.dispatcher.blind_index(),
+        bounded_context,
+        access_mapping,
+    )
+    .map(Some)
+    .map_err(to_graphql_error)
 }
 
 /// `queryEvents(boundedContext: String!, eventTypes: [String!]!, tags: [TagInput!], afterSequence: Int, correlationId: String): [QueriedEvent!]!`
@@ -55,7 +86,13 @@ pub fn query_events_field(n: &Naming) -> Field {
                             .ok_or_else(|| not_found("EventType", &name))?;
                     event_types.push(et);
                 }
-                let tags = parse_tags(ctx.args.get("tags"))?;
+                let tags = parse_tags(
+                    ctx.args.get("tags"),
+                    state,
+                    &bounded_context_name,
+                    &access_mapping,
+                )
+                .await?;
                 skilj_core::event_store::valid_query_tags(tags.as_deref())
                     .map_err(to_graphql_error)?;
                 let after_sequence = ctx
@@ -211,7 +248,13 @@ pub fn count_events_field(n: &Naming) -> Field {
                             .ok_or_else(|| not_found("EventType", &name))?;
                     event_types.push(et);
                 }
-                let tags = parse_tags(ctx.args.get("tags"))?;
+                let tags = parse_tags(
+                    ctx.args.get("tags"),
+                    state,
+                    &bounded_context_name,
+                    &access_mapping,
+                )
+                .await?;
                 skilj_core::event_store::valid_query_tags(tags.as_deref())
                     .map_err(to_graphql_error)?;
                 let correlation_id = ctx

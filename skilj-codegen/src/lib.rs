@@ -2,14 +2,16 @@
 //! format, Codeberg issue #5's "narrower cut" (see `docs/architecture.md`
 //! [§17](../../docs/architecture.md#event-command-codegen-real) for the full design, and [§16](../../docs/architecture.md#declarative-bounded-context-codegen-prototype) for the prototype that scoped it
 //! down to this). A `.skilj.toml` file describes one bounded context's
-//! event/command type *shapes* only, fields, DCB tags and
-//! `rest_trigger_allowed`, and this crate turns that into real Rust:
+//! event/command type *shapes* only, fields, DCB tags, sensitive fields
+//! and `rest_trigger_allowed`, and this crate turns that into real Rust:
 //! one payload struct and one `EventType`/`CommandType` impl per
 //! declared type, plus the shared per-bounded-context event enum and
-//! its `BoundedContextEvent` impl.
+//! its `BoundedContextEvent` impl. A `[[blind_tag]]` becomes a `BlindTag`
+//! impl, and every tag on its key a `TagMapping::blind`
+//! (docs/architecture.md §205, `skilj-demo/tests/customers.skilj.toml`).
 //!
 //! **Deliberately narrow, not a gap to widen casually.**
-//! `sensitive_fields`, the event creation-origin flags
+//! The event creation-origin flags
 //! (`external_creation_allowed`/`direct_creation_allowed`/
 //! `event_read_allowed`), scheduling, `#[requires_role]`, and every
 //! `Projection` concept are real, legitimate parts of the plugin API
@@ -51,7 +53,10 @@
 mod emit;
 mod spec;
 
-pub use spec::{BoundedContextSpec, CommandTypeSpec, EventTypeSpec, FieldSpec, FieldType};
+pub use spec::{
+    BlindTagSpec, BoundedContextSpec, CommandTypeSpec, ErasureSpec, EventTypeSpec, FieldSpec,
+    FieldType, SensitiveSpec,
+};
 
 #[derive(Debug)]
 pub enum Error {

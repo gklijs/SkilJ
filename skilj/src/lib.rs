@@ -27,7 +27,7 @@ use skilj_core::event_store::{Error as EventStoreError, Event, EventBroadcaster}
 use skilj_core::plugin::{BoundedContextEvent, CommandDispatcher};
 use skilj_core::projections::{ProjectionRebuildStatus, ProjectionRegistration};
 use skilj_core::shared::CommandDecision;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use tracing::Instrument;
@@ -158,10 +158,11 @@ async fn contain_panic(
 /// intended entry point.
 pub use inventory;
 pub use skilj_core::access_control::{IdpConfig, SigningAlgorithm};
+pub use skilj_core::blind::{normalize, BlindIndexKey};
 pub use skilj_core::encryption::EncryptionMasterKey;
 pub use skilj_core::plugin::{
-    requires_role, CancelDeadline, CommandType, CrossContextRoute, EventType, Projection,
-    ScheduleDeadline, Snapshot, DEFAULT_BOUNDED_CONTEXT,
+    requires_role, BlindErasure, BlindTag, CancelDeadline, CommandType, CrossContextRoute,
+    EventType, Projection, ScheduleDeadline, Snapshot, DEFAULT_BOUNDED_CONTEXT,
 };
 pub use skilj_graphql::federation::FederationOptions;
 pub use skilj_graphql::limits::GraphqlLimits;
@@ -380,6 +381,9 @@ pub struct Skilj {
     /// which surface (REST trigger, GraphQL `submitCommand`, parked-
     /// delivery redrive) produced it.
     command_batcher: skilj_core::command_batcher::CommandBatcher,
+    /// Every `BlindTag` this process declares, keyed from the
+    /// `blind_index_key` (docs/architecture.md §205).
+    blind_index: skilj_core::blind::BlindIndex,
     /// The background loops `.build()` started, for [`Skilj::shutdown`].
     background: Background,
 }
@@ -395,9 +399,15 @@ struct Dispatcher {
     /// What a command type's snapshot items fold with
     /// (docs/architecture.md §202).
     snapshots: SnapshotDispatcherImpl,
+    /// What blind tags are hashed with (docs/architecture.md §205).
+    blind_index: skilj_core::blind::BlindIndex,
 }
 
 impl CommandDispatcher for Dispatcher {
+    fn blind_index(&self) -> skilj_core::blind::BlindIndex {
+        self.blind_index.clone()
+    }
+
     fn dispatch(
         &self,
         bounded_context: &str,
@@ -837,6 +847,8 @@ impl Skilj {
             command_types: HashMap::new(),
             projections: HashMap::new(),
             snapshots: HashMap::new(),
+            blind_tags: HashMap::new(),
+            blind_index_key: None,
             cross_context_routes: HashMap::new(),
             schedule_deadlines: HashMap::new(),
             cancel_deadlines: HashMap::new(),
@@ -894,6 +906,7 @@ impl Skilj {
                 snapshots: self.snapshots.clone(),
                 template_cache: self.template_cache.clone(),
             },
+            blind_index: self.blind_index.clone(),
         })
     }
 
@@ -1377,6 +1390,215 @@ struct RegisteredCommandType {
     decide_from_snapshot: DecideFromSnapshotFn,
 }
 
+/// What `build()` refuses about blind tags (docs/architecture.md §205): a
+/// declared `BlindTag` without a `blind_index_key`; a type mapping a key
+/// blind that no `BlindTag` declares in its bounded context, or mapping a
+/// declared key plainly; for a `BlindErasure::WithSubject` tag, a type
+/// mapping it without also mapping its `subject_tag` plainly, a
+/// `subject_tag` that is itself blind, or a snapshot keyed by it, whose
+/// rows would keep the hash.
+fn validate_blind_tags(
+    blind_tags: &HashMap<(String, String), RegisteredBlindTag>,
+    has_key: bool,
+    event_types: &HashMap<(String, String), RegisteredEventType>,
+    command_types: &HashMap<(String, String), RegisteredCommandType>,
+    snapshots: &HashMap<(String, String), RegisteredSnapshot>,
+) -> Result<(), skilj_core::Error> {
+    if !blind_tags.is_empty() && !has_key {
+        return Err(skilj_core::Error::configuration(
+            "a BlindTag is declared, but no blind_index_key is configured \
+             (SkiljBuilder::blind_index_key)",
+        ));
+    }
+    let types = event_types
+        .iter()
+        .map(|((bc, name), t)| (bc, name, &t.tag_mappings))
+        .chain(
+            command_types
+                .iter()
+                .map(|((bc, name), t)| (bc, name, &t.tag_mappings)),
+        );
+    let mut types: Vec<_> = types.collect();
+    types.sort_by_key(|(bc, name, _)| (bc.as_str(), name.as_str()));
+    for (bc, name, tag_mappings) in types {
+        let refuse = |why: String| {
+            Err(skilj_core::Error::configuration(format!(
+                "type {name} in bounded context {bc}: {why}"
+            )))
+        };
+        for mapping in tag_mappings {
+            let declared = blind_tags.get(&(bc.clone(), mapping.key.clone()));
+            match (mapping.blind, declared) {
+                (true, None) => {
+                    return refuse(format!(
+                        "tag key {} is mapped blind, but no BlindTag declares it",
+                        mapping.key
+                    ))
+                }
+                (false, Some(_)) => {
+                    return refuse(format!(
+                        "tag key {} is a BlindTag; map it with TagMapping::blind",
+                        mapping.key
+                    ))
+                }
+                (true, Some(declared)) => {
+                    if let skilj_core::blind::Erasure::WithSubject { subject_tag, .. } =
+                        &declared.erasure
+                    {
+                        if !tag_mappings
+                            .iter()
+                            .any(|m| &m.key == subject_tag && !m.blind)
+                        {
+                            return refuse(format!(
+                                "tag key {} is erased with its subject, so the type must also \
+                                 map its subject_tag {subject_tag} plainly",
+                                mapping.key
+                            ));
+                        }
+                    }
+                }
+                (false, None) => {}
+            }
+        }
+    }
+    let mut declared: Vec<_> = blind_tags.iter().collect();
+    declared.sort_by_key(|(key, _)| *key);
+    for ((bc, tag_key), blind_tag) in declared {
+        let skilj_core::blind::Erasure::WithSubject { subject_tag, .. } = &blind_tag.erasure else {
+            continue;
+        };
+        if blind_tags.contains_key(&(bc.clone(), subject_tag.clone())) {
+            return Err(skilj_core::Error::configuration(format!(
+                "blind tag {tag_key} in bounded context {bc}: its subject_tag {subject_tag} is \
+                 itself blind"
+            )));
+        }
+        if let Some(((_, snapshot), _)) = snapshots
+            .iter()
+            .find(|((sbc, _), s)| sbc == bc && s.tag_key == tag_key)
+        {
+            return Err(skilj_core::Error::configuration(format!(
+                "snapshot {snapshot} in bounded context {bc} is keyed by blind tag {tag_key}, \
+                 which is erased with its subject: the snapshot's rows would keep the hash"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses to start when a declared `BlindTag`'s normalizer version
+/// differs from the stored one (docs/architecture.md §205), or its key
+/// fingerprint does (§208), whether or not this process reconciles: it
+/// would hash values so they no longer match what's stored. Covers the
+/// tenants created from a declaring bounded context too, which hash with
+/// their template's normalizer under keys of their own, and records a
+/// fingerprint a tenant's creator couldn't.
+async fn check_stored_blind_tags(
+    pool: &Pool,
+    blind_tags: &HashMap<(String, String), RegisteredBlindTag>,
+    blind_index: &skilj_core::blind::BlindIndex,
+    template_cache: &skilj_core::template_cache::TemplateCache,
+) -> Result<(), skilj_core::Error> {
+    if blind_tags.is_empty() {
+        return Ok(());
+    }
+    let declaring: HashSet<&String> = blind_tags.keys().map(|(bc, _)| bc).collect();
+    // Recorded only once every check passed: a refused process records
+    // nothing.
+    let mut missing = Vec::new();
+    for bounded_context in skilj_core::db::list_bounded_contexts(pool).await? {
+        let bc = bounded_context.name;
+        let effective = template_cache.effective_bounded_context(&bc);
+        if !declaring.contains(&effective) {
+            continue;
+        }
+        let stored_tags = match skilj_core::db::list_blind_tags(pool, &bc).await {
+            Ok(stored_tags) => stored_tags,
+            // Deleted since the listing (docs/architecture.md §157).
+            Err(skilj_core::Error::Database(err))
+                if err
+                    .as_database_error()
+                    .and_then(|e| e.code())
+                    .is_some_and(|code| code == "42P01" || code == "3F000") =>
+            {
+                continue
+            }
+            Err(err) => return Err(err),
+        };
+        for stored in stored_tags {
+            let Some(declared) = blind_tags.get(&(effective.clone(), stored.tag_key.clone()))
+            else {
+                continue;
+            };
+            if declared.normalizer_version != stored.normalizer_version {
+                return Err(skilj_core::event_store::Error::BlindNormalizerChanged {
+                    tag_key: stored.tag_key,
+                    stored: i64::from(stored.normalizer_version),
+                    declared: declared.normalizer_version,
+                }
+                .into());
+            }
+            let Some(fingerprint) = blind_index.fingerprint(&bc, &stored.tag_key) else {
+                continue;
+            };
+            match stored.key_fingerprint {
+                Some(stored_fingerprint) if stored_fingerprint != fingerprint => {
+                    return Err(skilj_core::event_store::Error::BlindIndexKeyChanged {
+                        bounded_context: bc,
+                        tag_key: stored.tag_key,
+                    }
+                    .into());
+                }
+                Some(_) => {}
+                None => missing.push((bc.clone(), stored.tag_key, fingerprint)),
+            }
+        }
+    }
+    for (bc, tag_key, fingerprint) in missing {
+        skilj_core::db::record_blind_tag_fingerprint(pool, &bc, &tag_key, &fingerprint).await?;
+    }
+    Ok(())
+}
+
+/// Records every declared `BlindTag` in its bounded context's
+/// `blind_tags` (docs/architecture.md §205), for each bounded context the
+/// reconciliation Role administers - the same gate the types after it
+/// pass through.
+async fn reconcile_blind_tags(
+    pool: &Pool,
+    role: &Role,
+    blind_tags: &HashMap<(String, String), RegisteredBlindTag>,
+    blind_index: &skilj_core::blind::BlindIndex,
+    report: &mut ReconciliationReport,
+) -> Result<(), skilj_core::Error> {
+    let mut declared: Vec<_> = blind_tags.iter().collect();
+    declared.sort_by_key(|(key, _)| *key);
+    for ((bounded_context_name, tag_key), registered) in declared {
+        if resolve_bounded_context_and_admin_mapping(pool, &role.id, bounded_context_name)
+            .await?
+            .is_none()
+        {
+            report
+                .skipped_no_access
+                .push(format!("{bounded_context_name}/{tag_key}"));
+            continue;
+        }
+        skilj_core::db::register_blind_tag(
+            pool,
+            bounded_context_name,
+            &skilj_core::blind::BlindTagDeclaration {
+                tag_key: tag_key.clone(),
+                normalizer_version: registered.normalizer_version,
+                erasure: registered.erasure.clone(),
+                key_fingerprint: blind_index.fingerprint(bounded_context_name, tag_key),
+            },
+            chrono::Utc::now(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// What `build()` refuses in a command type's `consistency_query()`
 /// (docs/architecture.md §198): an event type its bounded context doesn't
 /// register in this builder, a tag mapping that isn't one of its own
@@ -1842,6 +2064,19 @@ inventory::collect!(ProjectionRegistrar);
 pub struct SnapshotRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
 inventory::collect!(SnapshotRegistrar);
 
+/// See `EventTypeRegistrar` above - same shape and reasoning, for
+/// `#[auto_register]` over a `BlindTag` impl (docs/architecture.md §205).
+pub struct BlindTagRegistrar(pub fn(SkiljBuilder) -> SkiljBuilder);
+inventory::collect!(BlindTagRegistrar);
+
+/// A `.blind_tag::<B>()` call's own captured data (docs/architecture.md
+/// §205).
+struct RegisteredBlindTag {
+    normalizer_version: u32,
+    erasure: skilj_core::blind::Erasure,
+    normalize: skilj_core::blind::Normalizer,
+}
+
 pub struct SkiljBuilder {
     database_url: String,
     current_bounded_context: String,
@@ -1851,6 +2086,10 @@ pub struct SkiljBuilder {
     command_types: HashMap<(String, String), RegisteredCommandType>,
     projections: HashMap<(String, String), RegisteredProjection>,
     snapshots: HashMap<(String, String), RegisteredSnapshot>,
+    /// Keyed by `(bounded_context, BlindTag::TAG_KEY)` (docs/architecture.md
+    /// §205).
+    blind_tags: HashMap<(String, String), RegisteredBlindTag>,
+    blind_index_key: Option<skilj_core::blind::BlindIndexKey>,
     /// Keyed by `CrossContextRoute::NAME` alone, not `(bounded_context,
     /// name)` the way `event_types`/`command_types`/`projections`/
     /// `snapshots` are - a route by definition spans two bounded
@@ -1933,6 +2172,9 @@ impl SkiljBuilder {
         for registrar in inventory::iter::<SnapshotRegistrar> {
             self = (registrar.0)(self);
         }
+        for registrar in inventory::iter::<BlindTagRegistrar> {
+            self = (registrar.0)(self);
+        }
         self
     }
 
@@ -1964,6 +2206,35 @@ impl SkiljBuilder {
         let bc = self.current_bounded_context();
         self.snapshots
             .insert((bc, T::NAME.to_string()), registered_snapshot::<T>());
+        self
+    }
+
+    /// Declares a [`BlindTag`] (docs/architecture.md §205): its tag key's
+    /// values are stored as keyed hashes, so a type can tag a sensitive
+    /// field with [`TagMapping::blind`](skilj_core::shared::TagMapping::blind)
+    /// and a command can check the value is unique. Needs
+    /// [`blind_index_key`](Self::blind_index_key).
+    pub fn blind_tag<B: BlindTag + 'static>(mut self) -> Self {
+        let bc = self.current_bounded_context();
+        self.blind_tags.insert(
+            (bc, B::TAG_KEY.to_string()),
+            RegisteredBlindTag {
+                normalizer_version: B::NORMALIZER_VERSION,
+                erasure: B::ERASURE.into(),
+                normalize: B::normalize,
+            },
+        );
+        self
+    }
+
+    /// The root secret every [`BlindTag`]'s HMAC key is derived from, one
+    /// key per bounded context and tag key (docs/architecture.md §205).
+    /// Separate from the encryption master key, and like it never
+    /// persisted: every instance needs the same one, kept stable - a
+    /// different key hashes every value differently, so values already
+    /// stored no longer match. Required once a `BlindTag` is declared.
+    pub fn blind_index_key(mut self, key: BlindIndexKey) -> Self {
+        self.blind_index_key = Some(key);
         self
     }
 
@@ -2450,6 +2721,14 @@ impl SkiljBuilder {
         }
         // docs/architecture.md §198.
         validate_consistency_queries(&self.command_types, &self.event_types, &self.snapshots)?;
+        // docs/architecture.md §205.
+        validate_blind_tags(
+            &self.blind_tags,
+            self.blind_index_key.is_some(),
+            &self.event_types,
+            &self.command_types,
+            &self.snapshots,
+        )?;
         // docs/architecture.md §194.
         let graphql_naming = match &self.graphql_federation {
             Some(options) => options.naming().map_err(skilj_core::Error::configuration)?,
@@ -2559,6 +2838,16 @@ impl SkiljBuilder {
         warn_on_small_statement_cache(statement_cache_capacity, &bounded_contexts_for_warm_up);
         let template_cache = skilj_core::template_cache::TemplateCache::new();
         template_cache.refresh(&pool).await?;
+        let blind_index = match &self.blind_index_key {
+            Some(key) => skilj_core::blind::BlindIndex::new(
+                key.clone(),
+                self.blind_tags
+                    .iter()
+                    .map(|((bc, tag_key), b)| (bc.clone(), tag_key.clone(), b.normalize)),
+            )
+            .with_templates(template_cache.clone()),
+            None => skilj_core::blind::BlindIndex::default(),
+        };
 
         let identity_provider = self.identity_provider.map(|config| {
             Arc::new(IdentityProvider {
@@ -2801,6 +3090,7 @@ impl SkiljBuilder {
         // reconciliation reads each declared bounded context's
         // registration tables, which a bounded context from an older
         // version only has every column of once they've run.
+        check_stored_blind_tags(&pool, &self.blind_tags, &blind_index, &template_cache).await?;
         let mut report = ReconciliationReport::default();
         if let Some(external_subject) = &self.reconciliation_role {
             let role = skilj_core::access_control::resolve_role_by_external_subject(
@@ -2809,6 +3099,8 @@ impl SkiljBuilder {
             )?
             .clone();
 
+            // Before the types, which map the blind keys (docs/architecture.md §205).
+            reconcile_blind_tags(&pool, &role, &self.blind_tags, &blind_index, &mut report).await?;
             let version = RegistrationVersion::new(self.application_version);
             reconcile_event_types(
                 &pool,
@@ -2859,6 +3151,7 @@ impl SkiljBuilder {
                         snapshots: snapshots.clone(),
                         template_cache: template_cache.clone(),
                     },
+                    blind_index: blind_index.clone(),
                 }),
                 projection_dispatcher: Arc::new(ProjectionDispatcherImpl {
                     projections: projections.clone(),
@@ -2909,6 +3202,7 @@ impl SkiljBuilder {
             schema_registry,
             template_cache,
             command_batcher,
+            blind_index,
             background: background.clone(),
         };
 

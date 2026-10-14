@@ -2,7 +2,7 @@
 //! context's event/command *shapes* only (fields, DCB tags, consistency
 //! queries, `rest_trigger_allowed`). Deliberately narrow (Codeberg issue #5's
 //! own "narrower cut" - see this crate's own root doc comment and
-//! [docs/architecture.md §17](../../docs/architecture.md#event-command-codegen-real)): `decide()` bodies, `sensitive_fields`,
+//! [docs/architecture.md §17](../../docs/architecture.md#event-command-codegen-real)): `decide()` bodies,
 //! scheduling, `#[requires_role]`, and every `Projection` concept are
 //! all real, legitimate parts of the plugin API this format doesn't
 //! cover yet - named here as deliberately deferred, not silently
@@ -34,6 +34,61 @@ pub struct BoundedContextSpec {
     pub event_types: Vec<EventTypeSpec>,
     #[serde(default, rename = "command_type")]
     pub command_types: Vec<CommandTypeSpec>,
+    /// One `[[blind_tag]]` per blind tag key (docs/architecture.md §205).
+    /// Every type's tag, and every query item's, on one of these keys is
+    /// generated as `TagMapping::blind`.
+    #[serde(default, rename = "blind_tag")]
+    pub blind_tags: Vec<BlindTagSpec>,
+}
+
+/// A `BlindTag` impl (docs/architecture.md §205).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlindTagSpec {
+    /// The generated marker type's name, e.g. `CustomerEmail`.
+    pub name: String,
+    /// `BlindTag::TAG_KEY`.
+    pub key: String,
+    /// `BlindTag::normalize`: `"email"` or `"compact_uppercase"` (the
+    /// ready-made `skilj::normalize` functions), or the path of a
+    /// `fn(&str) -> String` of your own, e.g. `"crate::customers::handle"`.
+    /// Absent: the value as it is.
+    pub normalize: Option<String>,
+    /// `BlindTag::NORMALIZER_VERSION` - bump only together with a change
+    /// to what the normalizer returns.
+    #[serde(default = "first_version")]
+    pub normalizer_version: u32,
+    /// `BlindTag::ERASURE`.
+    pub erasure: ErasureSpec,
+    /// For `erasure = "with_subject"`: the `SensitiveField.subject_key`
+    /// whose `forgetSubject` removes the hashes, and - unless
+    /// `subject_tag` says otherwise - the plain tag key carrying the
+    /// subject's value.
+    pub subject: Option<String>,
+    pub subject_tag: Option<String>,
+}
+
+fn first_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErasureSpec {
+    Keep,
+    WithSubject,
+}
+
+/// The ready-made normalizers `BlindTagSpec::normalize` can name.
+pub(crate) const NORMALIZERS: &[&str] = &["email", "compact_uppercase"];
+
+/// A `SensitiveField` (`sensitive = [{ field, subject_key, subject_field }]`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SensitiveSpec {
+    pub field: String,
+    pub subject_key: String,
+    pub subject_field: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +105,9 @@ pub struct EventTypeSpec {
     /// is simply the cheapest deterministic order to emit.
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    /// `sensitive_fields()` - encrypted per subject.
+    #[serde(default)]
+    pub sensitive: Vec<SensitiveSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +118,9 @@ pub struct CommandTypeSpec {
     pub fields: Vec<FieldSpec>,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    /// See `EventTypeSpec::sensitive`.
+    #[serde(default)]
+    pub sensitive: Vec<SensitiveSpec>,
     #[serde(default)]
     pub rest_trigger_allowed: bool,
     /// `CommandType::consistency_query()` (docs/architecture.md §198), one
@@ -147,6 +208,72 @@ fn is_bounded_context_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Checks every `[[blind_tag]]`, claiming its marker type's name, and
+/// returns each blind key with the `subject_tag` it is erased by, if any.
+fn validate_blind_tags(
+    spec: &BoundedContextSpec,
+    problems: &mut Vec<String>,
+    claim: &mut dyn FnMut(String, String, &mut Vec<String>),
+) -> BTreeMap<String, Option<String>> {
+    let mut keys = BTreeMap::new();
+    for blind in &spec.blind_tags {
+        let what = format!("blind_tag {:?}", blind.name);
+        if !is_identifier(&blind.name) || is_keyword(&blind.name) {
+            problems.push(format!(
+                "{what}: the name must be a Rust identifier and not a keyword"
+            ));
+        } else {
+            claim(blind.name.clone(), what.clone(), problems);
+        }
+        if let Some(normalize) = &blind.normalize {
+            let path = normalize.contains("::") && syn::parse_str::<syn::Path>(normalize).is_ok();
+            if !NORMALIZERS.contains(&normalize.as_str()) && !path {
+                problems.push(format!(
+                    "{what}: normalize {normalize:?} is neither one of {NORMALIZERS:?} nor the \
+                     path of a function (e.g. \"crate::customers::normalize_handle\")"
+                ));
+            }
+        }
+        let subject_tag = match blind.erasure {
+            ErasureSpec::Keep => {
+                if blind.subject.is_some() || blind.subject_tag.is_some() {
+                    problems.push(format!(
+                        "{what}: erasure = \"keep\" takes no subject or subject_tag"
+                    ));
+                }
+                None
+            }
+            ErasureSpec::WithSubject => match &blind.subject {
+                Some(subject) => Some(blind.subject_tag.clone().unwrap_or_else(|| subject.clone())),
+                None => {
+                    problems.push(format!(
+                        "{what}: erasure = \"with_subject\" needs subject, the subject_key \
+                         whose forgetSubject removes the hashes"
+                    ));
+                    None
+                }
+            },
+        };
+        if keys.insert(blind.key.clone(), subject_tag).is_some() {
+            problems.push(format!(
+                "{what}: tag key {:?} has another [[blind_tag]]",
+                blind.key
+            ));
+        }
+    }
+    for blind in &spec.blind_tags {
+        if let Some(Some(subject_tag)) = keys.get(&blind.key) {
+            if keys.contains_key(subject_tag) {
+                problems.push(format!(
+                    "blind_tag {:?}: its subject_tag {subject_tag:?} is itself a blind tag",
+                    blind.name
+                ));
+            }
+        }
+    }
+    keys
+}
+
 /// Every problem with `spec` that would otherwise surface as a panic in
 /// `build.rs`, a compile error inside generated code, or a registration
 /// failure at startup - all of them, not just the first, so one build
@@ -187,16 +314,20 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
         );
     }
 
+    let blind_keys = validate_blind_tags(spec, &mut problems, &mut |name, what, problems| {
+        claim(name, what, problems)
+    });
+
     let types = spec
         .event_types
         .iter()
-        .map(|e| ("event_type", &e.name, &e.fields, &e.tags))
+        .map(|e| ("event_type", &e.name, &e.fields, &e.tags, &e.sensitive))
         .chain(
             spec.command_types
                 .iter()
-                .map(|c| ("command_type", &c.name, &c.fields, &c.tags)),
+                .map(|c| ("command_type", &c.name, &c.fields, &c.tags, &c.sensitive)),
         );
-    for (kind, name, fields, tags) in types {
+    for (kind, name, fields, tags, sensitive) in types {
         let what = format!("{kind} {name:?}");
         if !is_identifier(name) || is_keyword(name) {
             problems.push(format!(
@@ -233,6 +364,37 @@ pub(crate) fn validate(spec: &BoundedContextSpec) -> Vec<String> {
                 problems.push(format!(
                     "{what}: tag {tag_key:?} maps to field {field:?}, which this type doesn't declare"
                 ));
+            }
+        }
+        for sensitive in sensitive {
+            for field in [&sensitive.field, &sensitive.subject_field] {
+                if !field_names.contains(field.as_str()) {
+                    problems.push(format!(
+                        "{what}: sensitive field {:?} names field {field:?}, which this type \
+                         doesn't declare",
+                        sensitive.field
+                    ));
+                }
+            }
+            if let Some((tag_key, _)) = tags
+                .iter()
+                .find(|(key, field)| **field == sensitive.field && !blind_keys.contains_key(*key))
+            {
+                problems.push(format!(
+                    "{what}: tag {tag_key:?} stores sensitive field {:?} in the clear; make \
+                     {tag_key:?} a [[blind_tag]] to tag it as a keyed hash",
+                    sensitive.field
+                ));
+            }
+        }
+        for tag_key in tags.keys() {
+            if let Some(Some(subject_tag)) = blind_keys.get(tag_key) {
+                if !tags.contains_key(subject_tag) {
+                    problems.push(format!(
+                        "{what}: blind tag {tag_key:?} is erased with its subject, so the type \
+                         must also tag {subject_tag:?}"
+                    ));
+                }
             }
         }
     }

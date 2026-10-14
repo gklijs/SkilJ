@@ -41,7 +41,7 @@ impl EventType for MoneyDeposited {
     type Payload = MoneyDepositedPayload;
     const NAME: &'static str = "MoneyDeposited";
     fn tag_mappings() -> Vec<TagMapping> {
-        vec![TagMapping { key: "account".into(), field: "account_id".into() }]
+        vec![TagMapping::new("account", "account_id")]
     }
 }
 ```
@@ -89,7 +89,7 @@ error, not something to handle gracefully.
 
 ```rust
 fn tag_mappings() -> Vec<TagMapping> {
-    vec![TagMapping { key: "account".into(), field: "account_id".into() }]
+    vec![TagMapping::new("account", "account_id")]
 }
 ```
 
@@ -128,6 +128,13 @@ intent. Tagging the *subject* field instead (e.g. mapping `"account"` to
 `account_id` while also naming `account_id` as some other field's
 `subject_field`) is fine and normal - only overlap with the sensitive
 `field` itself is forbidden.
+
+The one exception is a **blind** mapping,
+`TagMapping::blind::<CustomerEmail>("email")`: its tag value is a keyed
+hash of the normalized field, never the value, so it may name a
+sensitive field. That's how a command checks an email address is unique
+without the address being stored in the clear - see the
+`skilj-uniqueness` skill and docs/architecture.md §205.
 
 ## `field`/`subject_field` shape rule (applies to `TagMapping` too)
 

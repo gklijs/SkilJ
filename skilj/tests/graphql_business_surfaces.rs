@@ -254,6 +254,7 @@ impl EventType for ThingHappened {
         vec![TagMapping {
             key: "thing".to_string(),
             field: "thing_id".to_string(),
+            blind: false,
         }]
     }
 }
@@ -309,6 +310,7 @@ impl CommandType for DoThingFast {
         vec![TagMapping {
             key: "thing".to_string(),
             field: "thing_id".to_string(),
+            blind: false,
         }]
     }
     fn snapshot() -> Option<&'static str> {
@@ -372,10 +374,12 @@ impl EventType for TicketOpened {
             TagMapping {
                 key: "ticket".to_string(),
                 field: "ticket_id".to_string(),
+                blind: false,
             },
             TagMapping {
                 key: "company".to_string(),
                 field: "company_id".to_string(),
+                blind: false,
             },
         ]
     }
@@ -462,10 +466,12 @@ fn case_tag_mappings() -> Vec<TagMapping> {
         TagMapping {
             key: "case".to_string(),
             field: "case_id".to_string(),
+            blind: false,
         },
         TagMapping {
             key: "company".to_string(),
             field: "company_id".to_string(),
+            blind: false,
         },
     ]
 }
@@ -586,6 +592,7 @@ fn account_tag() -> Vec<TagMapping> {
     vec![TagMapping {
         key: "account".into(),
         field: "account_id".into(),
+        blind: false,
     }]
 }
 

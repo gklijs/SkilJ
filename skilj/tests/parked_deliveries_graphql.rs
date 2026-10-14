@@ -1692,6 +1692,7 @@ impl skilj::CommandType for Admit {
         vec![skilj_core::shared::TagMapping {
             key: "company".to_string(),
             field: "company_id".to_string(),
+            blind: false,
         }]
     }
     fn owner_tag_key() -> Option<&'static str> {

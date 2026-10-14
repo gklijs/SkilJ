@@ -142,6 +142,7 @@ async fn seed_order_placed_event_type(pool: &Pool, bc: &BoundedContext) -> Event
         tag_mappings: vec![TagMapping {
             key: "order".to_string(),
             field: "order_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
@@ -212,6 +213,7 @@ async fn create_with(
         dedupe,
         test_now(),
         None,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .await
     .unwrap()
@@ -538,6 +540,7 @@ fn a_revoked_adapters_redelivery_is_refused_not_recognised() {
             Some(ExternalEventDedupe::Watermark(dedupe())),
             test_now(),
             None,
+            &skilj_core::blind::BlindIndex::default(),
         )
         .await
         .expect_err("a revoked adapter's submission must be refused");
@@ -597,6 +600,7 @@ fn a_refused_submission_provisions_no_encryption_key() {
                 None,
                 test_now(),
                 Some(master_key),
+                &skilj_core::blind::BlindIndex::default(),
             )
             .await
         };
@@ -649,6 +653,7 @@ fn a_refused_submission_provisions_no_encryption_key() {
             None,
             test_now(),
             Some(master_key),
+            &skilj_core::blind::BlindIndex::default(),
         )
         .await
         .expect_err("a revoked direct token's submission must be refused");

@@ -210,10 +210,7 @@ impl skilj::CommandType for WithdrawMoneyFast {
     type Event = BankingEvent;
     const NAME: &'static str = "WithdrawMoneyFast";
     fn tag_mappings() -> Vec<skilj_core::shared::TagMapping> {
-        vec![skilj_core::shared::TagMapping {
-            key: "account".to_string(),
-            field: "account_id".to_string(),
-        }]
+        vec![skilj_core::shared::TagMapping::new("account", "account_id")]
     }
     fn rest_trigger_allowed() -> bool {
         true

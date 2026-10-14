@@ -68,9 +68,25 @@ async fn apply_template_registrations(
     template: &BoundedContext,
     tenant: &BoundedContext,
     projection_dispatcher: &dyn ProjectionDispatcher,
+    blind_index: &skilj_core::blind::BlindIndex,
     now: chrono::DateTime<chrono::Utc>,
 ) -> async_graphql::Result<()> {
     let mapping = synthetic_admin_mapping(caller, tenant, now);
+
+    // docs/architecture.md §205: the tenant's blind tags before its types,
+    // which map them blind. The tenant's hashes are keyed by its own name,
+    // so is its key fingerprint (§208); an instance that doesn't declare
+    // the template's `BlindTag` leaves it for one that does to record.
+    for mut declaration in skilj_core::db::list_blind_tags(pool, &template.name)
+        .await
+        .map_err(to_graphql_error)?
+    {
+        declaration.key_fingerprint =
+            blind_index.tenant_fingerprint(&template.name, &tenant.name, &declaration.tag_key);
+        skilj_core::db::register_blind_tag(pool, &tenant.name, &declaration, now)
+            .await
+            .map_err(to_graphql_error)?;
+    }
 
     let template_event_types =
         skilj_core::db::list_event_types_for_bounded_context(pool, &template.name)
@@ -267,6 +283,7 @@ async fn finish_creating_tenant(
         template,
         tenant,
         state.projection_dispatcher.as_ref(),
+        &state.dispatcher.blind_index(),
         now,
     )
     .await?;
@@ -454,6 +471,7 @@ pub fn resync_bounded_context_from_template_field(n: &Naming) -> Field {
                     &template,
                     &tenant,
                     state.projection_dispatcher.as_ref(),
+                    &state.dispatcher.blind_index(),
                     now,
                 )
                 .await?;

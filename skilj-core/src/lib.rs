@@ -11,6 +11,7 @@
 //! `docs/architecture.md` §3.2 for the reasoning and the full module map.
 
 pub mod access_control;
+pub mod blind;
 pub mod bootstrap;
 pub mod command_batcher;
 pub mod cross_instance;

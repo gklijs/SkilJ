@@ -17,6 +17,7 @@ use crate::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
     ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
+use crate::blind::BlindIndex;
 use crate::encryption::DataKey;
 use crate::error::SkiljRejection;
 use crate::shared::{
@@ -570,6 +571,51 @@ pub enum Error {
     #[error("a re-registration may not drop a tag mapping key already in use")]
     TagMappingKeyDropped,
 
+    /// docs/architecture.md §205: a blind tag's value is a hash, so it
+    /// can't name an owner a grant's scope is compared against, and a
+    /// scheduled type's fixed payload has nothing worth hashing.
+    #[error("a blind tag mapping may not be the owner_tag_key, nor belong to a scheduled type")]
+    InvalidBlindTagMapping,
+
+    /// docs/architecture.md §205: whether a tag key is blind is fixed once
+    /// it's in use - flipping it would leave the history's tags unmatchable,
+    /// or put a value that was hashed in the clear.
+    #[error(
+        "a tag key is blind in one registration of this bounded context and plain in another, \
+         or has no BlindTag declared"
+    )]
+    BlindTagMismatch,
+
+    /// docs/architecture.md §205: values stored under the old normalizer
+    /// wouldn't match new ones, so a taken value could be taken again.
+    #[error(
+        "blind tag `{tag_key}` is stored with normalizer version {stored}, this process declares \
+         {declared}"
+    )]
+    BlindNormalizerChanged {
+        tag_key: String,
+        stored: i64,
+        declared: u32,
+    },
+
+    /// docs/architecture.md §208: the constraint's stored key fingerprint
+    /// isn't this process's, so its `blind_index_key` differs from the one
+    /// the stored tags were hashed with, and a taken value could be taken
+    /// again.
+    #[error(
+        "blind tag `{tag_key}` of bounded context `{bounded_context}` was hashed with a different \
+         blind_index_key than this process's"
+    )]
+    BlindIndexKeyChanged {
+        bounded_context: String,
+        tag_key: String,
+    },
+
+    /// docs/architecture.md §205: a registered type already maps the key in
+    /// the clear, so its values are stored; the key can't become blind.
+    #[error("tag key `{0}` is already mapped in the clear by a registered type")]
+    BlindTagKeyInUse(String),
+
     #[error("this EncryptionKey is not active")]
     EncryptionKeyNotActive,
 
@@ -742,6 +788,11 @@ impl SkiljRejection for Error {
             Error::InvalidPrivateField => "invalid_private_field",
             Error::PrivateFieldOverlap => "private_field_overlap",
             Error::TagMappingKeyDropped => "tag_mapping_key_dropped",
+            Error::InvalidBlindTagMapping => "invalid_blind_tag_mapping",
+            Error::BlindTagMismatch => "blind_tag_mismatch",
+            Error::BlindNormalizerChanged { .. } => "blind_normalizer_changed",
+            Error::BlindTagKeyInUse(_) => "blind_tag_key_in_use",
+            Error::BlindIndexKeyChanged { .. } => "blind_index_key_changed",
             Error::EventTypeNotInBoundedContext => "event_type_not_in_bounded_context",
             Error::CommandTypeNotInBoundedContext => "command_type_not_in_bounded_context",
             Error::TriggeredEventNotInBoundedContext => "triggered_event_not_in_bounded_context",
@@ -1131,6 +1182,34 @@ pub fn valid_owner_tag_key(tag_mappings: &[TagMapping], owner_tag_key: Option<&s
     }
 }
 
+/// docs/architecture.md §205: a blind mapping is never the
+/// `owner_tag_key` - a grant's scope is a plain value, compared against a
+/// plain tag - and never on a scheduled event type, whose payload is the
+/// same fixed value every occurrence. Every mapping of one key is blind
+/// or none is: one key is one constraint.
+pub fn valid_blind_tag_mappings(
+    tag_mappings: &[TagMapping],
+    owner_tag_key: Option<&str>,
+    system_triggered: bool,
+) -> bool {
+    tag_mappings.iter().filter(|m| m.blind).all(|m| {
+        !system_triggered
+            && owner_tag_key != Some(m.key.as_str())
+            && tag_mappings.iter().all(|n| n.key != m.key || n.blind)
+    })
+}
+
+/// Whether every key `existing` maps keeps its blindness in `new` - a
+/// re-registration can't make a hashed key plain, or a plain one hashed
+/// (docs/architecture.md §205).
+pub fn blind_unchanged(existing: &[TagMapping], new: &[TagMapping]) -> bool {
+    existing.iter().all(|m| {
+        new.iter()
+            .filter(|n| n.key == m.key)
+            .all(|n| n.blind == m.blind)
+    })
+}
+
 /// The one gate `Metadata.correlation_id`/`causation_id` (Codeberg issue
 /// #18) each pass through, independently (`rule ProcessCommand`/
 /// `CreateExternalEvent`/`CreateDirectEvent` all call this twice, once
@@ -1460,6 +1539,58 @@ pub fn valid_query_tags(tags: Option<&[Tag]>) -> crate::error::Result<()> {
         return Err(Error::TooManyTags.into());
     }
     Ok(())
+}
+
+/// One tag of a `queryEvents`/`countEvents` filter, and whether its value
+/// is the plaintext of a blind tag for the server to hash
+/// (docs/architecture.md §207).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryTag {
+    pub tag: Tag,
+    pub plaintext: bool,
+}
+
+/// The tags a query filters on, a plaintext value of a blind key hashed
+/// as stored, so a caller can ask whether a value is in use - an address
+/// already registered - and catch a command that would be rejected
+/// before submitting it (docs/architecture.md §207). `blind_keys` are the
+/// bounded context's stored blind tag keys. A plaintext value of a blind
+/// key needs `access_mapping.can_read_sensitive`: such a caller can read
+/// the encrypted fields themselves, so the answer tells it nothing new,
+/// where for any other caller it would reveal whether the value is in use.
+/// A plaintext value of a plain key is used as it is - a plain tag holds
+/// the plaintext - and a value without the flag is never hashed, so a hash
+/// read back from an event's tags finds that event.
+pub fn resolve_query_tags(
+    tags: Vec<QueryTag>,
+    blind_keys: &[String],
+    blind: &BlindIndex,
+    bounded_context: &str,
+    access_mapping: &RoleAccessMapping,
+) -> crate::error::Result<Vec<Tag>> {
+    tags.into_iter()
+        .map(|QueryTag { tag, plaintext }| {
+            let hashed = plaintext && blind_keys.contains(&tag.key);
+            match tag.value {
+                Some(value) if hashed => {
+                    if !access_mapping.can_read_sensitive {
+                        return Err(
+                            crate::blind::Error::LookupNotGranted { tag_key: tag.key }.into()
+                        );
+                    }
+                    let value = blind.blind(bounded_context, &tag.key, &value)?;
+                    Ok(Tag {
+                        key: tag.key,
+                        value: Some(value),
+                    })
+                }
+                value => Ok(Tag {
+                    key: tag.key,
+                    value,
+                }),
+            }
+        })
+        .collect()
 }
 
 /// Classic SQL-LIKE matching for `FilterOperator::IsLike` - `%` matches
@@ -1980,30 +2111,77 @@ fn push_unique_tag(tags: &mut Vec<Tag>, key: &str, value: Option<String>) {
 /// already collapses every one of those onto the single correct
 /// `Tag(key, value: null)` "absent" state with no extra branching.
 /// `tag_mappings` empty needs no payload parse at all.
-pub fn derive_tags(tag_mappings: &[TagMapping], payload: &str) -> Vec<Tag> {
-    if tag_mappings.is_empty() {
-        return Vec::new();
+///
+/// A blind mapping, or one whose key `blind` declares a constraint for in
+/// `bounded_context`, gets each value replaced by its keyed hash
+/// (docs/architecture.md §205) - never the value itself: a blind mapping
+/// this process can't hash is refused with `blind_tag_not_declared`. An
+/// absent value stays absent. Checking the declaration too, not only the
+/// mapping's own flag, covers a query item's mappings, which are built in
+/// code without one.
+pub fn derive_tags(
+    tag_mappings: &[TagMapping],
+    payload: &str,
+    blind: &BlindIndex,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<Tag>> {
+    derive_mapped_tags(tag_mappings, payload, blind, bounded_context)
+}
+
+/// [`derive_tags`] over the plain mappings only - a blind mapping derives
+/// nothing here, so this never needs a [`BlindIndex`] and can never fail.
+/// Enough for owner scoping, whose `owner_tag_key` is never blind
+/// (`valid_blind_tag_mappings`), and for a scheduled event type, which
+/// never has a blind mapping.
+pub fn derive_plain_tags(tag_mappings: &[TagMapping], payload: &str) -> Vec<Tag> {
+    derive_mapped_tags(
+        tag_mappings.iter().filter(|m| !m.blind),
+        payload,
+        &BlindIndex::default(),
+        "",
+    )
+    .expect("deriving plain tag mappings never hashes, so never fails")
+}
+
+fn derive_mapped_tags<'a>(
+    tag_mappings: impl IntoIterator<Item = &'a TagMapping>,
+    payload: &str,
+    blind: &BlindIndex,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<Tag>> {
+    let mut tag_mappings = tag_mappings.into_iter().peekable();
+    if tag_mappings.peek().is_none() {
+        return Ok(Vec::new());
     }
     let parsed: serde_json::Value =
         serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
     let mut tags = Vec::new();
     for mapping in tag_mappings {
+        let blinded = mapping.blind || blind.declares(bounded_context, &mapping.key);
+        let tag_value = |scalar: Option<String>| -> crate::error::Result<Option<String>> {
+            match scalar {
+                Some(value) if blinded => {
+                    Ok(Some(blind.blind(bounded_context, &mapping.key, &value)?))
+                }
+                other => Ok(other),
+            }
+        };
         let value = payload_field_value(&parsed, &mapping.field);
         match value.and_then(|v| v.as_array()) {
             Some(elements) if !elements.is_empty() => {
                 for element in elements {
                     if let Some(scalar) = json_scalar_to_string(element) {
-                        push_unique_tag(&mut tags, &mapping.key, Some(scalar));
+                        push_unique_tag(&mut tags, &mapping.key, tag_value(Some(scalar))?);
                     }
                 }
             }
             _ => {
                 let scalar = value.and_then(json_scalar_to_string);
-                push_unique_tag(&mut tags, &mapping.key, scalar);
+                push_unique_tag(&mut tags, &mapping.key, tag_value(scalar)?);
             }
         }
     }
-    tags
+    Ok(tags)
 }
 
 /// The two-grant test itself (see the note above rule
@@ -2494,9 +2672,11 @@ pub fn register_event_type(
     if !valid_private_fields(&schema, &private_fields) {
         return Err(Error::InvalidPrivateField.into());
     }
+    // A blind mapping may name a sensitive or private field: its tag is
+    // a keyed hash, not the value (docs/architecture.md §205).
     if tag_mappings
         .iter()
-        .any(|m| sensitive_fields.iter().any(|s| s.field == m.field))
+        .any(|m| !m.blind && sensitive_fields.iter().any(|s| s.field == m.field))
     {
         return Err(Error::SensitiveFieldTagOverlap.into());
     }
@@ -2506,7 +2686,7 @@ pub fn register_event_type(
     // own doc comment).
     if tag_mappings
         .iter()
-        .any(|m| private_fields.iter().any(|p| p.field == m.field))
+        .any(|m| !m.blind && private_fields.iter().any(|p| p.field == m.field))
         || sensitive_fields
             .iter()
             .any(|s| private_fields.iter().any(|p| p.field == s.field))
@@ -2522,6 +2702,13 @@ pub fn register_event_type(
         && (system_triggered_schedule.is_none() || missed_occurrence_policy.is_none())
     {
         return Err(Error::MissingScheduleOrPolicy.into());
+    }
+    if !valid_blind_tag_mappings(
+        &tag_mappings,
+        owner_tag_key.as_deref(),
+        system_triggered_allowed,
+    ) {
+        return Err(Error::InvalidBlindTagMapping.into());
     }
 
     // The one act that anchors schedule_position, whether for a brand
@@ -2561,6 +2748,9 @@ pub fn register_event_type(
         .all(|m| tag_mappings.iter().any(|n| n.key == m.key))
     {
         return Err(Error::TagMappingKeyDropped.into());
+    }
+    if !blind_unchanged(&existing.tag_mappings, &tag_mappings) {
+        return Err(Error::BlindTagMismatch.into());
     }
 
     let schema_changed = existing.schema != schema;
@@ -2657,21 +2847,26 @@ pub fn register_command_type(
     if !valid_private_fields(&schema, &private_fields) {
         return Err(Error::InvalidPrivateField.into());
     }
+    // A blind mapping may name a sensitive or private field: its tag is
+    // a keyed hash, not the value (docs/architecture.md §205).
     if tag_mappings
         .iter()
-        .any(|m| sensitive_fields.iter().any(|s| s.field == m.field))
+        .any(|m| !m.blind && sensitive_fields.iter().any(|s| s.field == m.field))
     {
         return Err(Error::SensitiveFieldTagOverlap.into());
     }
     // See the identical check in `register_event_type` - same reasoning.
     if tag_mappings
         .iter()
-        .any(|m| private_fields.iter().any(|p| p.field == m.field))
+        .any(|m| !m.blind && private_fields.iter().any(|p| p.field == m.field))
         || sensitive_fields
             .iter()
             .any(|s| private_fields.iter().any(|p| p.field == s.field))
     {
         return Err(Error::PrivateFieldOverlap.into());
+    }
+    if !valid_blind_tag_mappings(&tag_mappings, owner_tag_key.as_deref(), false) {
+        return Err(Error::InvalidBlindTagMapping.into());
     }
 
     let Some(existing) = existing else {
@@ -2697,6 +2892,9 @@ pub fn register_command_type(
         .all(|m| tag_mappings.iter().any(|n| n.key == m.key))
     {
         return Err(Error::TagMappingKeyDropped.into());
+    }
+    if !blind_unchanged(&existing.tag_mappings, &tag_mappings) {
+        return Err(Error::BlindTagMismatch.into());
     }
 
     let schema_changed = existing.schema != schema;
@@ -3793,6 +3991,7 @@ pub fn check_create_external_event(
     payload: &str,
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
+    blind: &BlindIndex,
 ) -> crate::error::Result<Vec<Tag>> {
     if adapter.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
@@ -3806,6 +4005,7 @@ pub fn check_create_external_event(
         payload,
         correlation_id,
         causation_id,
+        blind,
     )
 }
 
@@ -3816,6 +4016,7 @@ pub fn check_create_direct_event(
     payload: &str,
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
+    blind: &BlindIndex,
 ) -> crate::error::Result<Vec<Tag>> {
     if adapter.status != TokenStatus::Active {
         return Err(crate::access_control::Error::TokenNotActive.into());
@@ -3829,6 +4030,7 @@ pub fn check_create_direct_event(
         payload,
         correlation_id,
         causation_id,
+        blind,
     )
 }
 
@@ -3840,6 +4042,7 @@ fn check_event_creation(
     payload: &str,
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
+    blind: &BlindIndex,
 ) -> crate::error::Result<Vec<Tag>> {
     if event_type.bounded_context.status != BoundedContextStatus::Active {
         return Err(Error::BoundedContextArchived.into());
@@ -3863,7 +4066,12 @@ fn check_event_creation(
     // reasoning authorise_command_submission's own note gives. Vacuously
     // true for a token naming no scope or an event type declaring no
     // owner dimension.
-    let tags = derive_tags(&event_type.tag_mappings, payload);
+    let tags = derive_tags(
+        &event_type.tag_mappings,
+        payload,
+        blind,
+        &event_type.bounded_context.name,
+    )?;
     if !tag_owner_scope_satisfied(&tags, event_type.owner_tag_key.as_deref(), scope) {
         return Err(crate::access_control::Error::GrantScopeMismatch.into());
     }
@@ -3888,12 +4096,14 @@ pub fn create_external_event(
     next_sequence: i64,
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
+    blind: &BlindIndex,
 ) -> crate::error::Result<Event> {
     let tags = check_create_external_event(
         adapter,
         &payload,
         correlation_id.as_deref(),
         causation_id.as_deref(),
+        blind,
     )?;
     let event_type = &adapter.event_type;
 
@@ -3929,6 +4139,7 @@ pub fn create_external_event(
 /// checked (`direct_creation_allowed`), the absence of the two opaque
 /// `source_content`/`source_context` fields, and the resulting
 /// `EventOrigin` variant.
+#[allow(clippy::too_many_arguments)]
 pub fn create_direct_event(
     adapter: &DirectCreationToken,
     payload: String,
@@ -3937,12 +4148,14 @@ pub fn create_direct_event(
     next_sequence: i64,
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
+    blind: &BlindIndex,
 ) -> crate::error::Result<Event> {
     let tags = check_create_direct_event(
         adapter,
         &payload,
         correlation_id.as_deref(),
         causation_id.as_deref(),
+        blind,
     )?;
     let event_type = &adapter.event_type;
 
@@ -4108,7 +4321,8 @@ pub fn create_system_event(
             causation_id: None,
         },
         sequence: next_sequence,
-        tags: derive_tags(&event_type.tag_mappings, &payload),
+        // A scheduled type has no blind mapping (`valid_blind_tag_mappings`).
+        tags: derive_plain_tags(&event_type.tag_mappings, &payload),
         encryption_keys: protected.encryption_keys,
         origin: EventOrigin::SystemTriggered,
     };
@@ -4153,20 +4367,15 @@ pub fn skip_missed_occurrences(
 /// The `CommandAuthorised` fact `AuthoriseCommandSubmission`/
 /// `AuthoriseCommandTrigger` each produce, and `process_command` below
 /// consumes - the join point between REST/GraphQL authorisation and the
-/// one command-processing pipeline both funnel into. `consistency_tags`
-/// is a Rust-only addition beyond the spec's own `CommandAuthorised`
-/// fact: both authorising functions already have to compute
-/// `derive_tags(command_type, payload)` themselves to check
-/// `tag_owner_scope_satisfied` before returning, and every caller needs the
-/// identical value again immediately afterward (to fetch
-/// `matching_events`) - carrying it here is one computation instead of
-/// two, not a behaviour change.
+/// one command-processing pipeline both funnel into. It carries no tags:
+/// authorisation derives only the plain ones it needs for the owner check
+/// ([`derive_plain_tags`]), and the command's own are derived, blind ones
+/// hashed, when it is resolved (docs/architecture.md §205).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandAuthorised {
     pub command_type: CommandType,
     pub payload: String,
     pub client_id: String,
-    pub consistency_tags: Vec<Tag>,
     /// The caller's own opaque value, threaded through unvalidated here -
     /// same footing `idempotency_key` already has at this layer.
     /// `process_command` (Codeberg issue #18) is where
@@ -4208,9 +4417,9 @@ pub fn authorise_command_trigger(
     // EventFetch's tokens are (see create_event_read_token's own doc
     // comment). Single-record, so this rejects outright rather than
     // filtering - there is exactly one command being authorised here.
-    let consistency_tags = derive_tags(&command_type.tag_mappings, &payload);
+    let owner_tags = derive_plain_tags(&command_type.tag_mappings, &payload);
     if !tag_owner_scope_satisfied(
-        &consistency_tags,
+        &owner_tags,
         command_type.owner_tag_key.as_deref(),
         token.scope.as_deref(),
     ) {
@@ -4221,7 +4430,6 @@ pub fn authorise_command_trigger(
         command_type: command_type.clone(),
         payload,
         client_id: token.id.clone(),
-        consistency_tags,
         correlation_id,
         causation_id,
     })
@@ -4278,9 +4486,9 @@ pub fn authorise_command_submission(
     // command being authorised here, so there is nothing to filter, only
     // one thing to refuse. Vacuously true, same as always, for a grant
     // naming no scope or a command type declaring no owner dimension.
-    let consistency_tags = derive_tags(&command_type.tag_mappings, &payload);
+    let owner_tags = derive_plain_tags(&command_type.tag_mappings, &payload);
     if !tag_owner_scope_satisfied(
-        &consistency_tags,
+        &owner_tags,
         command_type.owner_tag_key.as_deref(),
         access_mapping.scope.as_deref(),
     ) {
@@ -4291,7 +4499,6 @@ pub fn authorise_command_submission(
         command_type: command_type.clone(),
         payload,
         client_id: access_mapping.role.id.clone(),
-        consistency_tags,
         correlation_id,
         causation_id,
     })
@@ -4407,14 +4614,20 @@ impl QueryItem {
 /// accounts, each with a state of its own - and an item matching nothing
 /// when it derives none, or only a tag with no value: there is no state
 /// to hand over for a missing field.
-pub fn derive_query(mappings: &[QueryItemMapping], payload: &str) -> Vec<QueryItem> {
+pub fn derive_query(
+    mappings: &[QueryItemMapping],
+    payload: &str,
+    blind: &BlindIndex,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<QueryItem>> {
     let mut items = Vec::with_capacity(mappings.len());
     for mapping in mappings {
         if mapping.snapshot.is_some() {
-            let tags: Vec<Tag> = derive_tags(&mapping.tag_mappings, payload)
-                .into_iter()
-                .filter(|tag| tag.value.is_some())
-                .collect();
+            let tags: Vec<Tag> =
+                derive_tags(&mapping.tag_mappings, payload, blind, bounded_context)?
+                    .into_iter()
+                    .filter(|tag| tag.value.is_some())
+                    .collect();
             if tags.is_empty() {
                 items.push(QueryItem {
                     event_types: Vec::new(),
@@ -4431,10 +4644,11 @@ pub fn derive_query(mappings: &[QueryItemMapping], payload: &str) -> Vec<QueryIt
             }));
             continue;
         }
-        let underived = mapping
-            .tag_mappings
-            .iter()
-            .any(|m| derive_tags(std::slice::from_ref(m), payload).is_empty());
+        let mut underived = false;
+        for m in &mapping.tag_mappings {
+            underived |=
+                derive_tags(std::slice::from_ref(m), payload, blind, bounded_context)?.is_empty();
+        }
         if underived {
             items.push(QueryItem {
                 event_types: Vec::new(),
@@ -4446,12 +4660,12 @@ pub fn derive_query(mappings: &[QueryItemMapping], payload: &str) -> Vec<QueryIt
         }
         items.push(QueryItem {
             event_types: mapping.event_types.iter().map(|t| t.to_string()).collect(),
-            tags: derive_tags(&mapping.tag_mappings, payload),
+            tags: derive_tags(&mapping.tag_mappings, payload, blind, bounded_context)?,
             latest: mapping.latest,
             snapshot: None,
         });
     }
-    items
+    Ok(items)
 }
 
 /// The items of `query` that hand `decide()` events: every item but a
@@ -4644,10 +4858,16 @@ pub fn process_command(
     next_sequence: impl FnMut() -> i64,
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
+    blind: &BlindIndex,
 ) -> crate::error::Result<ProcessCommandResult> {
     let boundary = consistency_boundary(
         bounded_context_events,
-        &derive_tags(&command_type.tag_mappings, payload),
+        &derive_tags(
+            &command_type.tag_mappings,
+            payload,
+            blind,
+            &command_type.bounded_context.name,
+        )?,
     );
     process_command_at_boundary(
         id,
@@ -4663,6 +4883,7 @@ pub fn process_command(
         next_sequence,
         now,
         resolve_key,
+        blind,
     )
 }
 
@@ -4685,6 +4906,7 @@ pub(crate) fn process_command_at_boundary(
     mut next_sequence: impl FnMut() -> i64,
     now: chrono::DateTime<chrono::Utc>,
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
+    blind: &BlindIndex,
 ) -> crate::error::Result<ProcessCommandResult> {
     // Codeberg issue #18 - see `valid_correlation_id`'s own doc comment.
     // Checked here rather than only at the authorisation layer above
@@ -4722,7 +4944,9 @@ pub(crate) fn process_command_at_boundary(
         .unwrap_or_else(crate::shared::generate_token_id);
     let causation_id = causation_id.filter(|id| !id.is_empty()).map(str::to_string);
 
-    let consistency_tags = derive_tags(&command_type.tag_mappings, payload);
+    let bounded_context = &command_type.bounded_context.name;
+    let consistency_tags =
+        derive_tags(&command_type.tag_mappings, payload, blind, bounded_context)?;
 
     let protected = protect_sensitive_fields(&command_type.sensitive_fields, payload, &resolve_key);
     let command = Command {
@@ -4767,7 +4991,12 @@ pub(crate) fn process_command_at_boundary(
                 causation_id: Some(command.id.clone()),
             },
             sequence: next_sequence(),
-            tags: derive_tags(&event_type.tag_mappings, &spec_payload),
+            tags: derive_tags(
+                &event_type.tag_mappings,
+                &spec_payload,
+                blind,
+                bounded_context,
+            )?,
             encryption_keys: event_protected.encryption_keys,
             origin: EventOrigin::CommandTriggered {
                 command: Box::new(command.clone()),

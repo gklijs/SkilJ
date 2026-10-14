@@ -186,6 +186,7 @@ async fn seed_order_shipped_event_type(pool: &Pool, bc: &BoundedContext) -> Even
         tag_mappings: vec![TagMapping {
             key: "order".to_string(),
             field: "order_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
@@ -212,6 +213,7 @@ async fn seed_ship_order_command_type(pool: &Pool, bc: &BoundedContext) -> Comma
         tag_mappings: vec![TagMapping {
             key: "order".to_string(),
             field: "order_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
@@ -239,7 +241,7 @@ async fn submit(
     payload: &str,
 ) -> skilj_core::error::Result<SubmitCommandOutcome> {
     let consistency_tags =
-        skilj_core::event_store::derive_tags(&command_type.tag_mappings, payload);
+        skilj_core::event_store::derive_plain_tags(&command_type.tag_mappings, payload);
     let bounded_context_events = db::list_events_for_bounded_context_matching_tags(
         pool,
         &command_type.bounded_context.name,

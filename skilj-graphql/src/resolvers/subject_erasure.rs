@@ -71,6 +71,16 @@ pub fn field(n: &Naming) -> Field {
                 )
                 .await
                 .map_err(to_graphql_error)?;
+                // docs/architecture.md §205: blind tags erased with their
+                // subject. Also before the key goes.
+                skilj_core::db::forget_subject_in_blind_tags(
+                    &state.pool,
+                    &bounded_context_name,
+                    &subject_key,
+                    &subject_value,
+                )
+                .await
+                .map_err(to_graphql_error)?;
                 skilj_core::db::destroy_encryption_key(
                     &state.pool,
                     &bounded_context_name,

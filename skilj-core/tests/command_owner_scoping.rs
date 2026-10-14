@@ -59,6 +59,7 @@ fn open_ticket() -> CommandType {
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         owner_tag_key: Some("company".into()),
         sensitive_fields: Vec::new(),
@@ -370,6 +371,7 @@ fn register_command_type_accepts_an_owner_tag_key_naming_a_real_tag_mapping_key(
         vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         Some("company".into()),
         Vec::new(),
@@ -405,6 +407,7 @@ fn register_command_type_allows_clearing_a_previously_set_owner_tag_key() {
         vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         None,
         Vec::new(),

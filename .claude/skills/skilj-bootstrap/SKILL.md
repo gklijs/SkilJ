@@ -77,6 +77,21 @@ This is where the `skilj` skill picks up - which trait to implement for
 a new `EventType`/`CommandType`/`Projection`, `#[auto_register]`, and
 what a rejected registration's error actually means.
 
+## Secrets the builder needs before the first deploy
+
+Two keys, both `[u8; 32]`, both identical on every instance and never
+changed afterwards - generate them once and keep them in the secret store:
+
+- `.encryption_master_key(...)` when any type has `sensitive_fields()` -
+  without it, writing a sensitive payload is refused with
+  `encryption_master_key_not_configured`.
+- `.blind_index_key(...)` when any `BlindTag` is declared (a uniqueness
+  rule on personal data) - `build()` refuses a `BlindTag` without it,
+  and an instance missing the `BlindTag` refuses those commands with
+  `blind_tag_not_declared`. Startup refuses a key other than the one
+  already used (`blind_index_key_changed`). The `skilj-uniqueness` skill
+  covers it.
+
 ## `.identity_provider(...)` is a separate axis, easy to conflate with the above
 
 Granting a Role `Admin` access via `RoleAccessMapping` is *authorization*

@@ -12,13 +12,17 @@ use std::time::Duration;
 
 /// The error codes (GraphQL `extensions.code`, the REST body's `code`)
 /// that mean "this skilj instance can't do it, another can": it doesn't
-/// declare the command type's `decide()`, or a sync projection the
-/// resulting event feeds - ordinary mid rolling deploy. A caller retrying
+/// declare the command type's `decide()`, a sync projection the
+/// resulting event feeds, or the blind tag a payload must be hashed under
+/// (docs/architecture.md §205) - ordinary mid rolling deploy. A caller retrying
 /// on one of these waits [`ANOTHER_INSTANCE_RETRY_DELAY`] instead of
 /// spending an attempt of its [`RetryPolicy`], and never parks for it
 /// (docs/architecture.md §161).
-pub const ANOTHER_INSTANCE_CODES: [&str; 2] =
-    ["no_decider_registered", "sync_projection_not_declared"];
+pub const ANOTHER_INSTANCE_CODES: [&str; 3] = [
+    "no_decider_registered",
+    "sync_projection_not_declared",
+    "blind_tag_not_declared",
+];
 
 /// Whether `code` is one of [`ANOTHER_INSTANCE_CODES`].
 pub fn another_instance_can_do_it(code: &str) -> bool {

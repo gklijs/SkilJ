@@ -314,6 +314,7 @@ fn valid_tag_mappings_rejects_a_bare_nested_object_field() {
     let mappings = vec![TagMapping {
         key: "k".into(),
         field: "address".into(),
+        blind: false,
     }];
     assert!(!event_store::valid_tag_mappings(SCHEMA, &mappings));
 }
@@ -323,6 +324,7 @@ fn valid_tag_mappings_accepts_a_bare_unit_enum_field() {
     let mappings = vec![TagMapping {
         key: "k".into(),
         field: "status".into(),
+        blind: false,
     }];
     assert!(event_store::valid_tag_mappings(SCHEMA, &mappings));
 }
@@ -332,6 +334,7 @@ fn valid_tag_mappings_accepts_a_dotted_path_into_a_nested_shape() {
     let mappings = vec![TagMapping {
         key: "k".into(),
         field: "address.country".into(),
+        blind: false,
     }];
     assert!(event_store::valid_tag_mappings(SCHEMA, &mappings));
 }

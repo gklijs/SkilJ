@@ -8,6 +8,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Blind tags: uniqueness on personal data (docs/architecture.md §205). A
+  `TagMapping::blind::<B>(field)` tags a payload field with
+  `HMAC-SHA256(key, normalize(value))` instead of the value, so a
+  command's consistency query can check that an email address is
+  registered once while the address is only ever stored encrypted. A
+  blind mapping may name a sensitive or private field. Each constraint is
+  declared by a new plugin trait, `BlindTag` (`TAG_KEY`, `normalize()`,
+  `NORMALIZER_VERSION`, `ERASURE`), registered with
+  `SkiljBuilder::blind_tag::<B>()` or `#[auto_register]`, and hashed with a
+  key derived per bounded context and tag key from the new
+  `SkiljBuilder::blind_index_key`, separate from the encryption master
+  key. `BlindErasure::WithSubject` makes `forgetSubject` remove the hashes
+  from the subject's events and commands, freeing the value;
+  `BlindErasure::Keep` keeps it taken. Ready-made normalizers in
+  `skilj::normalize`. New error codes `blind_tag_not_declared` (retried
+  by another instance, like `no_decider_registered`), `blind_tag_mismatch`,
+  `blind_tag_key_in_use`, `blind_normalizer_changed` and
+  `invalid_blind_tag_mapping`. GraphQL `TagMapping` gains `blind`, and
+  `TagMappingInput` an optional `blind`. Each bounded context gets a
+  `blind_tags` table, added at startup.
+- Looking a blind tag up by its plaintext (docs/architecture.md §207):
+  GraphQL `TagInput` takes `plaintext: true`, and `queryEvents`/
+  `countEvents` hash the value as stored, so a client can check whether
+  an address is taken before submitting the command that would be
+  rejected. Needs `can_read_sensitive`; refused otherwise with
+  `blind_tag_lookup_not_granted`. New: `event_store::QueryTag`,
+  `resolve_query_tags`.
+- Startup refuses a `blind_index_key` other than the one a bounded
+  context's blind tags were hashed with (`blind_index_key_changed`,
+  docs/architecture.md §208): `blind_tags` stores a fingerprint of each
+  constraint's derived key, as it stores the normalizer version, so a
+  rotated, lost or mistyped key can't silently make every value claimable
+  again. Tenants made from a template record their own.
+- `TagMapping::new(key, field)`, `SensitiveField::new(field, subject_key,
+  subject_field)` and `BlindErasure::with_subject(subject)`.
+- `.skilj.toml` (`skilj-codegen`): `sensitive = [{ field, subject_key,
+  subject_field }]` on a type, and `[[blind_tag]]` tables generating a
+  `BlindTag` impl, with every tag on its key generated as
+  `TagMapping::blind` (docs/architecture.md §206). Generated tag mappings
+  are written `Vec::from([...])`.
+- A `skilj-uniqueness` skill for uniqueness rules, steering personal data
+  to blind tags; the `skilj` and `skilj-event-modeling` skills point to it.
+
+### Changed
+
+- `TagMapping` has a `blind` field: a struct literal needs `blind: false`,
+  or use `TagMapping::new`. Stored registrations are unchanged (the field
+  is left out of the JSON when false).
+- `event_store::derive_tags` and `derive_query` take a
+  `blind::BlindIndex` and the bounded context, and return a `Result`;
+  `derive_plain_tags` is the infallible form for plain mappings.
+  `process_command`, `create_external_event`/`create_direct_event`, their
+  `check_*` forms and `db::create_and_insert_external_event`/`_direct_event`
+  take the index too; `CommandDispatcher::blind_index()` supplies it on
+  the command path. `CommandAuthorised` no longer carries
+  `consistency_tags`.
+- The event cache refills a bounded context's window when its
+  registrations stamp changes, rather than only reloading the types, so
+  an erasure that rewrites tags reaches every instance's cache.
+
 ## [0.0.10] - 2026-10-11
 
 ### Added

@@ -62,6 +62,7 @@ fn ticket_opened() -> EventType {
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "company".into(),
             field: "company_id".into(),
+            blind: false,
         }],
         owner_tag_key: Some("company".into()),
         sensitive_fields: Vec::new(),

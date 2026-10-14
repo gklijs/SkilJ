@@ -273,6 +273,7 @@ async fn seed_order_shipped_event_type(pool: &Pool, bc: &BoundedContext) -> Even
         tag_mappings: vec![TagMapping {
             key: "order".to_string(),
             field: "order_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
@@ -322,6 +323,7 @@ async fn seed_command_type(pool: &Pool, bc: &BoundedContext, name: &str) -> Comm
         tag_mappings: vec![TagMapping {
             key: "order".to_string(),
             field: "order_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),

@@ -120,6 +120,7 @@ fn process_command_emits_a_span_with_bounded_context_and_command_type_fields() {
             || 1,
             Utc.timestamp_opt(1000, 0).unwrap(),
             |_, _| unreachable!("no sensitive fields in this test"),
+            &skilj_core::blind::BlindIndex::default(),
         );
     });
 

@@ -19,6 +19,7 @@ fn company() -> TagMapping {
     TagMapping {
         key: "company".into(),
         field: "company_id".into(),
+        blind: false,
     }
 }
 
@@ -26,6 +27,7 @@ fn ticket() -> TagMapping {
     TagMapping {
         key: "ticket".into(),
         field: "ticket_id".into(),
+        blind: false,
     }
 }
 

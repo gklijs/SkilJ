@@ -206,6 +206,7 @@ async fn redrive_parked_delivery(
                 Some(dedupe),
                 Utc::now(),
                 state.encryption_master_key.as_ref(),
+                &state.dispatcher.blind_index(),
             )
             .await?;
             // Under the per-row cursor only an earlier redrive of this same

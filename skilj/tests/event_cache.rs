@@ -46,6 +46,7 @@ impl EventType for OrderShipped {
         vec![TagMapping {
             key: "order".into(),
             field: "order_id".into(),
+            blind: false,
         }]
     }
 }
@@ -88,6 +89,7 @@ impl CommandType for ShipOrder {
         vec![TagMapping {
             key: "order".into(),
             field: "order_id".into(),
+            blind: false,
         }]
     }
     /// "Can't ship the same order twice" - real DCB-guarded behaviour,

@@ -281,6 +281,7 @@ async fn seed_order_shipped_event_type(pool: &Pool, bc: &BoundedContext) -> Even
         tag_mappings: vec![TagMapping {
             key: "order".to_string(),
             field: "order_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
@@ -330,6 +331,7 @@ async fn seed_command_type(pool: &Pool, bc: &BoundedContext, name: &str) -> Comm
         tag_mappings: vec![TagMapping {
             key: "order".to_string(),
             field: "order_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: None,
         sensitive_fields: Vec::new(),
@@ -388,7 +390,8 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
         let event_cache = EventCache::new(1000);
 
         let payload = r#"{"order_id":"A"}"#;
-        let consistency_tags = skilj_core::event_store::derive_tags(&ct.tag_mappings, payload);
+        let consistency_tags =
+            skilj_core::event_store::derive_plain_tags(&ct.tag_mappings, payload);
 
         // The caller's own optimistic, unlocked read/dispatch - genuinely
         // stale: nothing has shipped order "A" yet as far as this read
@@ -481,7 +484,8 @@ fn submit_command_does_not_redispatch_for_an_unrelated_concurrent_event() {
         let event_cache = EventCache::new(1000);
 
         let payload = r#"{"order_id":"A"}"#;
-        let consistency_tags = skilj_core::event_store::derive_tags(&ct.tag_mappings, payload);
+        let consistency_tags =
+            skilj_core::event_store::derive_plain_tags(&ct.tag_mappings, payload);
         let bounded_context_events: Vec<Event> = Vec::new();
         let initial_decision = dispatcher
             .dispatch(&bc.name, &ct.name, payload, &[])
@@ -2008,7 +2012,7 @@ fn a_known_read_position_still_catches_a_conflict_committed_after_it() {
         insert_concurrent_event(&pool, &bc, &et, "X").await;
         insert_concurrent_event(&pool, &bc, &et, "Y").await;
         let payload = r#"{"order_id":"A"}"#;
-        let consistency_tags = skilj_core::event_store::derive_tags(&ct.tag_mappings, payload);
+        let consistency_tags = skilj_core::event_store::derive_plain_tags(&ct.tag_mappings, payload);
         let initial_decision = dispatcher
             .dispatch(&bc.name, &ct.name, payload, &[])
             .unwrap()
@@ -2070,7 +2074,7 @@ fn an_event_the_read_already_holds_above_its_position_is_not_counted_twice() {
             .await
             .unwrap();
         let payload = r#"{"order_id":"A"}"#;
-        let consistency_tags = skilj_core::event_store::derive_tags(&ct.tag_mappings, payload);
+        let consistency_tags = skilj_core::event_store::derive_plain_tags(&ct.tag_mappings, payload);
         let initial_decision = dispatcher
             .dispatch(&bc.name, &ct.name, payload, &held)
             .unwrap()

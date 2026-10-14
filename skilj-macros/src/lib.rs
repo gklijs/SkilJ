@@ -137,7 +137,7 @@ pub fn requires_role(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Only sanity-checked to be sitting on an `impl ... for ...` block whose
 /// trait path's last segment is literally `EventType`/`CommandType`/
-/// `Projection`/`Snapshot` - the same best-effort diagnostic
+/// `Projection`/`Snapshot`/`BlindTag` - the same best-effort diagnostic
 /// `requires_role` makes for `CommandType`, not a real type check.
 #[proc_macro_attribute]
 pub fn auto_register(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -208,12 +208,20 @@ pub fn auto_register(attr: TokenStream, item: TokenStream) -> TokenStream {
                 })
             }
         },
+        Some("BlindTag") => quote! {
+            ::skilj::inventory::submit! {
+                ::skilj::BlindTagRegistrar(|b| {
+                    b.bounded_context(<#self_ty as ::skilj_core::plugin::BlindTag>::BOUNDED_CONTEXT)
+                        .blind_tag::<#self_ty>()
+                })
+            }
+        },
         _ => {
             return syn::Error::new_spanned(
                 &item_impl,
                 "#[auto_register] only belongs on an `impl EventType for ...` / `impl \
-                 CommandType for ...` / `impl Projection for ...` / `impl Snapshot for ...` \
-                 block",
+                 CommandType for ...` / `impl Projection for ...` / `impl Snapshot for ...` / \
+                 `impl BlindTag for ...` block",
             )
             .to_compile_error()
             .into();

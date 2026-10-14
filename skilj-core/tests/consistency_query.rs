@@ -23,6 +23,7 @@ fn company() -> TagMapping {
     TagMapping {
         key: "company".to_string(),
         field: "company_id".to_string(),
+        blind: false,
     }
 }
 
@@ -30,6 +31,7 @@ fn ticket() -> TagMapping {
     TagMapping {
         key: "ticket".to_string(),
         field: "ticket_id".to_string(),
+        blind: false,
     }
 }
 
@@ -345,7 +347,7 @@ async fn record(
     let event = Event {
         bounded_context: bc.clone(),
         event_type: et.clone(),
-        tags: skilj_core::event_store::derive_tags(&et.tag_mappings, &payload),
+        tags: skilj_core::event_store::derive_plain_tags(&et.tag_mappings, &payload),
         payload,
         metadata: Metadata {
             r#type: et.name.clone(),
@@ -836,12 +838,25 @@ fn an_item_whose_tag_derives_nothing_matches_nothing() {
         let mapping = QueryItemMapping::types(&["TicketCreated"]).tagged(vec![TagMapping {
             key: "ticket".to_string(),
             field: "ticket_id".to_string(),
+            blind: false,
         }]);
-        let underived = derive_query(std::slice::from_ref(&mapping), r#"{"ticket_id":[{}]}"#);
+        let underived = derive_query(
+            std::slice::from_ref(&mapping),
+            r#"{"ticket_id":[{}]}"#,
+            &skilj_core::blind::BlindIndex::default(),
+            "helpdesk",
+        )
+        .unwrap();
         assert!(underived[0].event_types.is_empty() && underived[0].tags.is_empty());
         assert!(events.iter().all(|e| !query_matches(&underived, e)));
 
-        let derived = derive_query(std::slice::from_ref(&mapping), r#"{"ticket_id":["t1"]}"#);
+        let derived = derive_query(
+            std::slice::from_ref(&mapping),
+            r#"{"ticket_id":["t1"]}"#,
+            &skilj_core::blind::BlindIndex::default(),
+            "helpdesk",
+        )
+        .unwrap();
         assert_eq!(
             events.iter().filter(|e| query_matches(&derived, e)).count(),
             1

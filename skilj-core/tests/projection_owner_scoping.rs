@@ -186,6 +186,7 @@ async fn seed_ticket_opened(pool: &Pool, bc: &BoundedContext) -> EventType {
         tag_mappings: vec![TagMapping {
             key: "company".to_string(),
             field: "company_id".to_string(),
+            blind: false,
         }],
         owner_tag_key: Some("company".to_string()),
         sensitive_fields: Vec::new(),

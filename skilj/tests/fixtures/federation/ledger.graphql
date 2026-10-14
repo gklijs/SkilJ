@@ -350,16 +350,19 @@ type LedgerSubmitCommandPayload {
 input LedgerTagInput @inaccessible {
 	key: String! @inaccessible
 	value: String @inaccessible
+	plaintext: Boolean @inaccessible
 }
 
 type LedgerTagMapping {
 	key: String!
 	field: String!
+	blind: Boolean!
 }
 
 input LedgerTagMappingInput @inaccessible {
 	key: String! @inaccessible
 	field: String! @inaccessible
+	blind: Boolean @inaccessible
 }
 
 type LedgerWouldBeEvent @inaccessible {

@@ -91,6 +91,7 @@ fn process_command_generates_a_correlation_id_when_the_caller_supplies_none() {
         || 0,
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -115,6 +116,7 @@ fn process_command_preserves_a_caller_supplied_correlation_id_verbatim() {
         || 0,
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -162,6 +164,7 @@ fn every_command_triggered_event_inherits_the_commands_correlation_id_and_is_cau
         },
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -202,6 +205,7 @@ fn process_command_rejects_an_over_length_correlation_id() {
         || 0,
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -225,6 +229,7 @@ fn process_command_rejects_an_over_length_causation_id() {
         || 0,
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap_err();
 
@@ -295,6 +300,7 @@ fn create_external_event_generates_a_correlation_id_when_the_caller_supplies_non
         0,
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -315,6 +321,7 @@ fn create_external_event_preserves_a_caller_supplied_pair_verbatim() {
         0,
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -339,6 +346,7 @@ fn create_direct_event_generates_a_correlation_id_when_the_caller_supplies_none(
         0,
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 
@@ -361,6 +369,7 @@ fn event_causation_id_composes_bounded_context_and_sequence() {
         42,
         timestamp(0),
         no_sensitive_fields,
+        &skilj_core::blind::BlindIndex::default(),
     )
     .unwrap();
 

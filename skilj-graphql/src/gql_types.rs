@@ -313,11 +313,13 @@ pub fn projection_rebuild_status_enum(n: &Naming) -> Enum {
 /// `value TagMapping`. `TagMappingInput` (used by
 /// `registerEventType`/`registerCommandType`'s own arguments) mirrors it
 /// field-for-field, plain scalars only - no bridge needed between the two
-/// beyond `resolvers::type_registration`'s own parsing.
+/// beyond `resolvers::type_registration`'s own parsing. `blind`
+/// (docs/architecture.md §205) is optional on input, false when left out.
 pub fn tag_mapping_object(n: &Naming) -> Object {
     gql_object!(TagMapping => n.ty("TagMapping") {
         scalar "key": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.key.clone()),
         scalar "field": TypeRef::named_nn(TypeRef::STRING) => |t| Value::from(t.field.clone()),
+        scalar "blind": TypeRef::named_nn(TypeRef::BOOLEAN) => |t| Value::from(t.blind),
     })
 }
 
@@ -325,6 +327,7 @@ pub fn tag_mapping_input(n: &Naming) -> InputObject {
     InputObject::new(n.ty("TagMappingInput"))
         .field(InputValue::new("key", TypeRef::named_nn(TypeRef::STRING)))
         .field(InputValue::new("field", TypeRef::named_nn(TypeRef::STRING)))
+        .field(InputValue::new("blind", TypeRef::named(TypeRef::BOOLEAN)))
 }
 
 /// `value SensitiveField`. See `tag_mapping_object`'s own doc comment -
@@ -798,6 +801,12 @@ pub fn tag_input(n: &Naming) -> InputObject {
     InputObject::new(n.ty("TagInput"))
         .field(InputValue::new("key", TypeRef::named_nn(TypeRef::STRING)))
         .field(InputValue::new("value", TypeRef::named(TypeRef::STRING)))
+        // docs/architecture.md §207: `value` is a blind tag's plaintext,
+        // hashed by the server. False when left out.
+        .field(InputValue::new(
+            "plaintext",
+            TypeRef::named(TypeRef::BOOLEAN),
+        ))
 }
 
 /// `queryEvents`' own per-row shape - `event_store::query_events`'s

@@ -313,6 +313,7 @@ fn create_system_event_stamps_tags_from_the_payload_it_resolves() {
         tag_mappings: vec![skilj_core::shared::TagMapping {
             key: "kind".into(),
             field: "kind".into(),
+            blind: false,
         }],
         ..scheduled_event_type(MissedOccurrencePolicy::ReplayBacklog, timestamp(1000), None)
     };
