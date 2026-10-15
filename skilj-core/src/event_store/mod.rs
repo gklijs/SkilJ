@@ -1788,17 +1788,57 @@ fn color_similarity_within(payload: &str, filter_value: &str) -> bool {
 
 /// `FilterOperator::InSubnet` - `payload` is a stored IPv4/IPv6 address
 /// string, `filter_value` is a CIDR (e.g. `"192.168.1.0/24"`,
-/// `"2001:db8::/32"`). Delegates the actual containment check to
-/// `ipnet` rather than hand-rolled bitwise subnet math - IPv6 in
-/// particular is easy to get subtly wrong by hand.
+/// `"2001:db8::/32"`). Hand-rolled bitwise subnet containment (the `ipnet`
+/// crate this used to delegate to only ever provided exactly this one
+/// operation); the address and the CIDR must be the same family, and both
+/// are masked to the prefix length before comparison, so a CIDR naming
+/// *any* address in the range (not just its network address) still matches.
 fn ip_in_subnet(payload: &str, filter_value: &str) -> bool {
     let Ok(addr) = payload.trim().parse::<std::net::IpAddr>() else {
         return false;
     };
-    let Ok(subnet) = filter_value.trim().parse::<ipnet::IpNet>() else {
+    let Some((network, prefix)) = parse_cidr(filter_value.trim()) else {
         return false;
     };
-    subnet.contains(&addr)
+    match (addr, network) {
+        (std::net::IpAddr::V4(addr), std::net::IpAddr::V4(network)) => {
+            mask_v4(u32::from(addr), prefix) == mask_v4(u32::from(network), prefix)
+        }
+        (std::net::IpAddr::V6(addr), std::net::IpAddr::V6(network)) => {
+            mask_v6(u128::from(addr), prefix) == mask_v6(u128::from(network), prefix)
+        }
+        // A v4 address never matches a v6 CIDR (or the reverse) - the same
+        // family check `ipnet::IpNet::contains` made.
+        _ => false,
+    }
+}
+
+/// `"192.168.1.0/24"` -> `(192.168.1.0, 24)`. `None` for a missing `/`, an
+/// unparsable address, or a prefix longer than the address's own width
+/// (32 for IPv4, 128 for IPv6) - a bare address with no prefix is not a
+/// CIDR here, matching `IpNet`'s own parser.
+fn parse_cidr(raw: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (addr, prefix) = raw.split_once('/')?;
+    let addr: std::net::IpAddr = addr.trim().parse().ok()?;
+    let prefix: u8 = prefix.trim().parse().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    (prefix <= max).then_some((addr, prefix))
+}
+
+fn mask_v4(value: u32, prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        value & (u32::MAX << (32 - prefix))
+    }
+}
+
+fn mask_v6(value: u128, prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        value & (u128::MAX << (128 - prefix))
+    }
 }
 
 /// `FilterOperator::In` - `filter_value` is a comma-separated list of

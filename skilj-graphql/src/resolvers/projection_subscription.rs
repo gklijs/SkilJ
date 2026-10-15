@@ -10,7 +10,7 @@
 //! `state.event_broadcaster.subscribe()` next, *before* the initial state
 //! read (identical drift-audit-finding-#7 ordering, same reasoning - see
 //! that module's own comment at its `subscribe()` call site); then hand
-//! back an `asynk_strim::try_stream_fn` stream that pulls from the
+//! back a `crate::stream_gen::try_stream_fn` stream that pulls from the
 //! already-subscribed receiver for as long as the connection lives.
 //!
 //! Where this genuinely differs from `EventSubscription`, deliberately:
@@ -118,7 +118,7 @@ pub fn projection_updates_field(n: &Naming) -> SubscriptionField {
                     &ctx,
                     state.limits.max_subscriptions_per_connection,
                 )?;
-                Ok(asynk_strim::try_stream_fn(move |mut yielder| async move {
+                Ok(crate::stream_gen::try_stream_fn(move |yielder| async move {
                     let _slot = slot;
                     yielder
                         .yield_ok(FieldValue::owned_any(initial_value).with_type(type_name.clone()))

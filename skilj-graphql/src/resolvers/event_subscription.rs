@@ -15,8 +15,9 @@
 //! snapshot read just after it, not the reverse; build the initial
 //! `Subscription` value from that snapshot via
 //! `event_store::create_all_events_subscription`/`create_event_type_subscription`
-//! (the pure rule, unchanged); then hand back an `asynk_strim::try_stream_fn`
-//! stream that pulls from the already-subscribed receiver for as long as
+//! (the pure rule, unchanged); then hand back a
+//! `crate::stream_gen::try_stream_fn` stream that pulls from the
+//! already-subscribed receiver for as long as
 //! the connection lives, re-running `deliver_to_subscriptions` (also
 //! unchanged) per delivered event against a *freshly refetched*
 //! `access_mapping` - never the snapshot captured at subscribe time (see
@@ -220,7 +221,7 @@ pub fn all_events_field(n: &Naming) -> SubscriptionField {
                 &ctx,
                 state.limits.max_subscriptions_per_connection,
             )?;
-            Ok(asynk_strim::try_stream_fn(move |mut yielder| async move {
+            Ok(crate::stream_gen::try_stream_fn(move |yielder| async move {
                 let _slot = slot;
                 let mut current = Subscription::AllEventsSubscription(Box::new(initial));
                 let mut revocation_rx = state.revocation_broadcaster.subscribe();
@@ -394,7 +395,7 @@ pub fn events_by_type_field(n: &Naming) -> SubscriptionField {
                 &ctx,
                 state.limits.max_subscriptions_per_connection,
             )?;
-            Ok(asynk_strim::try_stream_fn(move |mut yielder| async move {
+            Ok(crate::stream_gen::try_stream_fn(move |yielder| async move {
                 let _slot = slot;
                 let mut current = Subscription::EventTypeSubscription(Box::new(initial));
                 let mut revocation_rx = state.revocation_broadcaster.subscribe();

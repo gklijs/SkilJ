@@ -34,7 +34,8 @@
 
 use crate::auth::BearerCredential;
 use crate::error::RestError;
-use axum::extract::{Request, State};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -50,11 +51,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 // `axum::extract::Query` doesn't support a repeated `filter=`/`filter=`
 // query param deserializing into `Vec<String>` (`serde_urlencoded`, which
 // it's built on, has no sequence support for query strings) - found via
-// this pass's own real end-to-end REST test, not assumed.
-// `axum_extra::extract::Query` (built on `serde_html_form`) does, and is
-// otherwise a drop-in-compatible replacement for the single-value fields
-// (`after`/`mode`) both query structs also carry.
-use axum_extra::extract::Query;
+// this pass's own real end-to-end REST test, not assumed. This used to be
+// solved with `axum_extra::extract::Query` (built on `serde_html_form`),
+// which does; the small extractor below replaces that dependency, parsing
+// only the shapes these routes actually carry.
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use skilj_core::access_control::{
@@ -501,6 +501,77 @@ struct ConsumeResponse {
     event_type_schema_version: i64,
 }
 
+/// Query-string extractor for these routes - like `axum::extract::Query`,
+/// but repeating a key (`?filter=a&filter=b`) collects into a `Vec`
+/// instead of erroring, which is the `filter` wire shape §7.3 uses.
+struct Query<T>(T);
+
+impl<S, T> FromRequestParts<S> for Query<T>
+where
+    S: Send + Sync,
+    T: FromQueryString,
+{
+    type Rejection = RestError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Query(T::from_query_string(parts.uri.query().unwrap_or(""))))
+    }
+}
+
+/// One of these routes' query strings, parsed from the raw request target.
+trait FromQueryString: Sized {
+    fn from_query_string(raw: &str) -> Self;
+}
+
+/// The query string's `key=value` pairs, in order, percent-decoded. An
+/// unknown key is ignored (as the previous serde-based extractor did); a
+/// repeated key is preserved for the caller to collect or keep the last
+/// of.
+fn query_pairs(raw: &str) -> Vec<(String, String)> {
+    raw.split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (decode_query_component(key), decode_query_component(value)),
+            None => (decode_query_component(pair), String::new()),
+        })
+        .collect()
+}
+
+/// One `application/x-www-form-urlencoded` component: `+` is a space and
+/// `%XX` is a byte (an invalid `%` sequence is left literal), matching
+/// what the previous extractor's own decoder did.
+fn decode_query_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |byte: u8| (byte as char).to_digit(16);
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi * 16 + lo) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EventsQuery {
@@ -516,6 +587,27 @@ struct EventsQuery {
     // the REST-side counterpart to `queryEvents`'s own `correlationId`
     // GraphQL argument.
     correlation_id: Option<String>,
+}
+
+impl FromQueryString for EventsQuery {
+    fn from_query_string(raw: &str) -> Self {
+        let mut query = EventsQuery {
+            filter: Vec::new(),
+            after: None,
+            epoch: None,
+            correlation_id: None,
+        };
+        for (key, value) in query_pairs(raw) {
+            match key.as_str() {
+                "filter" => query.filter.push(value),
+                "after" => query.after = Some(value),
+                "epoch" => query.epoch = Some(value),
+                "correlationId" => query.correlation_id = Some(value),
+                _ => {}
+            }
+        }
+        query
+    }
 }
 
 /// `GET /v1/events`' `nextCursor`: the position and the database epoch it
@@ -553,6 +645,23 @@ struct ConsumeQuery {
     mode: Option<String>,
     #[serde(default)]
     filter: Vec<String>,
+}
+
+impl FromQueryString for ConsumeQuery {
+    fn from_query_string(raw: &str) -> Self {
+        let mut query = ConsumeQuery {
+            mode: None,
+            filter: Vec::new(),
+        };
+        for (key, value) in query_pairs(raw) {
+            match key.as_str() {
+                "mode" => query.mode = Some(value),
+                "filter" => query.filter.push(value),
+                _ => {}
+            }
+        }
+        query
+    }
 }
 
 /// §7.3's `filter=field:op:value` wire shape, repeatable

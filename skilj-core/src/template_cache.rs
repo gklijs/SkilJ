@@ -40,14 +40,13 @@
 //! spurious `no_decider_registered`).
 
 use crate::db::Pool;
-use arc_swap::ArcSwap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// See this module's own doc comment.
 #[derive(Clone, Default)]
 pub struct TemplateCache {
-    current: Arc<ArcSwap<HashMap<String, Option<String>>>>,
+    current: Arc<RwLock<HashMap<String, Option<String>>>>,
 }
 
 impl TemplateCache {
@@ -56,13 +55,14 @@ impl TemplateCache {
     }
 
     /// Re-fetches every `(name, dispatch_template)` pair from Postgres
-    /// and swaps it in - the same "build the new snapshot, then one
-    /// atomic swap" shape `SchemaRegistry::rebuild` already uses, so a
+    /// and swaps it in - the same "build the new snapshot, then replace it
+    /// under one lock" shape `SchemaRegistry::rebuild` already uses, so a
     /// dispatch call in flight keeps reading a consistent map rather
     /// than observing a partial update.
     pub async fn refresh(&self, pool: &Pool) -> crate::error::Result<()> {
         let mappings = crate::db::list_dispatch_template_mappings(pool).await?;
-        self.current.store(Arc::new(mappings.into_iter().collect()));
+        let replacement: HashMap<String, Option<String>> = mappings.into_iter().collect();
+        *self.current.write().unwrap() = replacement;
         Ok(())
     }
 
@@ -72,7 +72,7 @@ impl TemplateCache {
     /// exactly like an untemplated context, never a dispatch failure of
     /// its own).
     pub fn effective_bounded_context(&self, bounded_context: &str) -> String {
-        match self.current.load().get(bounded_context) {
+        match self.current.read().unwrap().get(bounded_context) {
             Some(Some(template)) => template.clone(),
             _ => bounded_context.to_string(),
         }

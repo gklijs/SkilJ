@@ -22,7 +22,6 @@ use crate::naming::Naming;
 use crate::projection_types;
 use crate::resolvers;
 use crate::GraphqlState;
-use arc_swap::ArcSwap;
 use async_graphql::dynamic::{Field, Object, Schema, Subscription, Type};
 use skilj_core::access_control::Role;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -37,10 +36,14 @@ const MAX_SCOPED_SCHEMAS: usize = 1024;
 /// the generation it was built under.
 type ScopedSchemas = HashMap<BTreeSet<String>, (u64, Arc<Schema>)>;
 
-/// Holds the live schema behind an `ArcSwap`, so a request in flight
-/// keeps using whichever `Arc<Schema>` it already loaded even if
-/// [`rebuild`](SchemaRegistry::rebuild) swaps in a new one concurrently -
-/// no lock a request has to wait on, no torn reads.
+/// Holds the live schema behind an `RwLock<Arc<Schema>>`, so a request in
+/// flight keeps using whichever `Arc<Schema>` it already cloned out even
+/// if [`rebuild`](SchemaRegistry::rebuild) replaces the held one
+/// concurrently - the lock is held only for the clone, never across
+/// request handling, and a read never tears (it sees either the old schema
+/// or the new one). Replaced `arc-swap`'s lock-free `ArcSwap` with `std`
+/// here; nothing needed the lock-free load, only the cheap, consistent
+/// snapshot.
 ///
 /// The live schema holds every bounded context's projection types, named
 /// after the bounded context. Only a superadmin is served it: anyone else
@@ -50,7 +53,7 @@ type ScopedSchemas = HashMap<BTreeSet<String>, (u64, Arc<Schema>)>;
 /// (tenants) exist (docs/architecture.md §138). Those are built on
 /// demand and cached per set of bounded contexts until the next rebuild.
 pub struct SchemaRegistry {
-    current: ArcSwap<Schema>,
+    current: std::sync::RwLock<Arc<Schema>>,
     /// Bumped by every [`rebuild`](SchemaRegistry::rebuild); a scoped
     /// schema built under an older one is stale.
     generation: AtomicU64,
@@ -81,7 +84,7 @@ impl SchemaRegistry {
     pub async fn build(state: GraphqlState) -> skilj_core::error::Result<Self> {
         let schema = build(state, None).await?;
         Ok(Self {
-            current: ArcSwap::from_pointee(schema),
+            current: std::sync::RwLock::new(Arc::new(schema)),
             generation: AtomicU64::new(0),
             scoped: Default::default(),
             published: Default::default(),
@@ -93,7 +96,7 @@ impl SchemaRegistry {
     /// what a superadmin is served. Requests go through
     /// [`for_caller`](SchemaRegistry::for_caller).
     pub fn current(&self) -> Arc<Schema> {
-        self.current.load_full()
+        self.current.read().unwrap().clone()
     }
 
     /// The schema `caller` is served: the full one for a superadmin,
@@ -206,7 +209,7 @@ impl SchemaRegistry {
     /// dispatch loop).
     pub async fn rebuild(&self, state: GraphqlState) -> skilj_core::error::Result<()> {
         let schema = build(state, None).await?;
-        self.current.store(Arc::new(schema));
+        *self.current.write().unwrap() = Arc::new(schema);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.scoped.lock().unwrap().clear();
         *self.published.lock().unwrap() = None;

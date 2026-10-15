@@ -339,29 +339,46 @@ pub struct EventSpec {
 // caller-supplied-output treatment (it takes strings, not producing an
 // opaque one), so it was real from the start rather than deferred.
 
-/// Generates the opaque `id` half of an `AccessToken`/`Role` - a UUIDv4,
-/// hyphens stripped (32 lowercase hex characters), matching every other
-/// identifier this codebase already treats as an opaque `String` rather
-/// than a typed newtype. Not a secret itself - safe to log, appear in a
-/// URL path, etc. - only `generate_token_secret` below carries the
-/// confidentiality requirement `secret_matches` is built to compare
-/// without leaking.
+/// Generates the opaque `id` half of an `AccessToken`/`Role` - 16 random
+/// bytes from the OS CSPRNG, hex-encoded (32 lowercase hex characters),
+/// matching every other identifier this codebase already treats as an
+/// opaque `String` rather than a typed newtype. Not a secret itself -
+/// safe to log, appear in a URL path, etc. - only
+/// `generate_token_secret` below carries the confidentiality requirement
+/// `secret_matches` is built to compare without leaking.
 pub fn generate_token_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+    random_hex::<16>()
 }
 
 /// Generates the `secret` half of an `AccessToken`/`BootstrapSecret` -
-/// two concatenated UUIDv4s (244 bits of randomness, comfortably more
-/// than a single v4's 122), hyphens stripped. `uuid`'s `v4` feature reads
-/// from the OS CSPRNG (`getrandom`), so this is cryptographically
-/// unpredictable, not merely unique like `generate_token_id` only needs
-/// to be.
+/// 32 random bytes from the OS CSPRNG (256 bits), hex-encoded (64
+/// lowercase hex characters). `ring`'s `SystemRandom` reads from the OS
+/// CSPRNG, so this is cryptographically unpredictable, not merely unique
+/// like `generate_token_id` only needs to be.
 pub fn generate_token_secret() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
+    random_hex::<32>()
+}
+
+/// `N` random bytes from the OS CSPRNG, lower-case hex - the shared body
+/// of [`generate_token_id`]/[`generate_token_secret`] above. Uses `ring`
+/// (already this crate's cryptographically-secure randomness source, via
+/// `encryption`) rather than the `uuid` crate these two used to go
+/// through: neither value grew any structure from being spelled as a
+/// UUID, only the 32/64 hex characters did, so a plain byte-string is the
+/// honest shape.
+fn random_hex<const N: usize>() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0u8; N];
+    SystemRandom::new().fill(&mut bytes).expect(
+        "SystemRandom::fill only fails on catastrophic OS RNG failure - see ring's own docs",
+    );
+    let mut out = String::with_capacity(N * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Hashes the `secret` half of an `AccessToken` for storage - see the
@@ -370,23 +387,22 @@ pub fn generate_token_secret() -> String {
 /// the hashing scheme and the comparison are black boxes here, the same
 /// register as generate_token_secret and generate_token_id: the spec
 /// owns that the secret is never stored or compared in plaintext, not
-/// which primitive does it." `generate_token_secret` already gives 244
+/// which primitive does it." `generate_token_secret` already gives 256
 /// bits of CSPRNG randomness (see its own doc comment) - high-entropy,
 /// unlike a user-chosen password - so a plain cryptographic hash
 /// (SHA-256, via `ring`, already a dependency for `encryption`) is the
-/// appropriate primitive: brute-forcing a 244-bit secret back out of its
+/// appropriate primitive: brute-forcing a 256-bit secret back out of its
 /// hash is infeasible regardless of how fast the hash is, and a slow
 /// password KDF (bcrypt/argon2/scrypt) would only add latency to every
 /// request's auth check for no security benefit. Base64-encoded
-/// (`base64::engine::general_purpose::STANDARD`), the same encoding
-/// `encryption::encrypt` already uses for its own opaque byte output.
+/// (`crate::base64`), the same encoding `encryption::encrypt` already
+/// uses for its own opaque byte output.
 /// Deterministic (no per-secret salt) - safe here specifically because
 /// the input is never a low-entropy human-chosen value a rainbow table
 /// could target, unlike a password hash.
 pub fn hash_secret(secret: &str) -> String {
-    use base64::Engine;
     let digest = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+    crate::base64::encode(digest.as_ref())
 }
 
 /// See the `secret_matches` note above `rule CreateSuperadmin`: compares

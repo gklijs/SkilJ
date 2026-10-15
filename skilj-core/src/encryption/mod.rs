@@ -169,21 +169,17 @@ pub fn unwrap_data_key(
 /// ciphertext+tag and base64-encoded as a single opaque string - the
 /// value that replaces the leaf's plaintext in the stored payload.
 pub fn encrypt_leaf(data_key: &DataKey, plaintext: &str) -> String {
-    use base64::Engine;
     let nonce_bytes = random_bytes::<NONCE_LEN>();
     let sealed = seal(&data_key.0, nonce_bytes, plaintext.as_bytes().to_vec());
     let mut combined = Vec::with_capacity(NONCE_LEN + sealed.len());
     combined.extend_from_slice(&nonce_bytes);
     combined.extend_from_slice(&sealed);
-    base64::engine::general_purpose::STANDARD.encode(combined)
+    crate::base64::encode(&combined)
 }
 
 /// Inverts `encrypt_leaf`.
 pub fn decrypt_leaf(data_key: &DataKey, ciphertext_b64: &str) -> Result<String, Error> {
-    use base64::Engine;
-    let combined = base64::engine::general_purpose::STANDARD
-        .decode(ciphertext_b64)
-        .map_err(|_| Error::DecryptFailed)?;
+    let combined = crate::base64::decode(ciphertext_b64).ok_or(Error::DecryptFailed)?;
     if combined.len() < NONCE_LEN {
         return Err(Error::DecryptFailed);
     }

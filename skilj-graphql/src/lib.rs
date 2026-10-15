@@ -15,6 +15,7 @@ pub mod naming;
 pub mod projection_types;
 pub mod resolvers;
 pub mod schema;
+mod stream_gen;
 
 use opentelemetry::metrics::Histogram;
 use skilj_core::access_control::RevocationBroadcaster;
