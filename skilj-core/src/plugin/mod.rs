@@ -1342,6 +1342,23 @@ pub enum DeadlinePollStartFrom {
     /// Unix timestamp, seconds, UTC.
     AtTime(i64),
 }
+/// Missed-run policy for recurring deadlines (Issue #96).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissedRunPolicy {
+    Skip,
+    FireOnce,
+    FireAll,
+}
+
+/// Recurrence specification for per-entity deadlines (Issue #96).
+#[derive(Debug, Clone)]
+pub struct RecurrenceSpec {
+    pub schedule: String,
+    pub policy: MissedRunPolicy,
+    pub start_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub end_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+}
 
 /// `ScheduleDeadline::schedule`'s own `Some` output - everything a
 /// one-shot, per-entity timer needs: when it fires (`fire_at`), what it's
@@ -1352,6 +1369,7 @@ pub struct DeadlineSpec<P> {
     pub fire_at: chrono::DateTime<chrono::Utc>,
     pub tags: Vec<Tag>,
     pub payload: P,
+    pub recurrence: Option<RecurrenceSpec>,
 }
 
 /// Codeberg issue #20: a native one-shot, per-entity deadline/timer -

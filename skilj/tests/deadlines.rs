@@ -267,6 +267,7 @@ impl ScheduleDeadline for ScheduleOrderCancelDeadline {
             payload: CancelOrderPayload {
                 order_id: source_payload.order_id.clone(),
             },
+            recurrence: None,
         })
     }
 }
@@ -289,6 +290,7 @@ impl ScheduleDeadline for ScheduleReminderDeadline {
             payload: SendReminderPayload {
                 order_id: source_payload.order_id.clone(),
             },
+            recurrence: None,
         })
     }
 }
