@@ -162,7 +162,8 @@ pub use skilj_core::blind::{normalize, BlindIndexKey};
 pub use skilj_core::encryption::EncryptionMasterKey;
 pub use skilj_core::plugin::{
     requires_role, BlindErasure, BlindTag, CancelDeadline, CommandType, CrossContextRoute,
-    EventType, Projection, ScheduleDeadline, Snapshot, DEFAULT_BOUNDED_CONTEXT,
+    EventType, MissedRunPolicy, Projection, RecurrenceSpec, ScheduleDeadline, Snapshot,
+    DEFAULT_BOUNDED_CONTEXT,
 };
 pub use skilj_graphql::federation::FederationOptions;
 pub use skilj_graphql::limits::GraphqlLimits;
@@ -2110,6 +2111,7 @@ fn registered_schedule_deadline<S: ScheduleDeadline + 'static>() -> RegisteredSc
                     fire_at: spec.fire_at,
                     tags: spec.tags,
                     payload_json: serde_json::to_string(&spec.payload)?,
+                    recurrence: spec.recurrence,
                 })),
             }
         },

@@ -137,6 +137,7 @@ impl Schedules {
             fire_at,
             tags: vec![order_tag(source_payload_json)],
             payload_json: "{}".to_string(),
+            recurrence: None,
         })))
     }
 }

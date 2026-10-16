@@ -1342,7 +1342,17 @@ pub enum DeadlinePollStartFrom {
     /// Unix timestamp, seconds, UTC.
     AtTime(i64),
 }
-/// Missed-run policy for recurring deadlines (Issue #96).
+/// Missed-run policy for recurring deadlines (Codeberg issue #95).
+///
+/// Mirrors the global scheduler's own `MissedOccurrencePolicy`
+/// (`ReplayBacklog`/`FireOnce`/`Skip`) but is deliberately its own type:
+/// a global schedule and a per-entity deadline are different reactor
+/// families (`SkipMissedOccurrences` skips on the shared `event_types`
+/// position; this one advances a private `deadlines` chain), and a name
+/// saying what it's for beats leaning on a type whose own doc comment is
+/// written entirely in terms of `event_types`. Same ordering the global
+/// one uses: `Skip` never replays, `FireOnce` collapses a backlog to one
+/// firing, `FireAll` steps through every missed occurrence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissedRunPolicy {
     Skip,
@@ -1350,7 +1360,13 @@ pub enum MissedRunPolicy {
     FireAll,
 }
 
-/// Recurrence specification for per-entity deadlines (Issue #96).
+/// Recurrence specification for per-entity deadlines (Codeberg issue
+/// #95). `schedule` is the same 7-field Quartz-dialect cron expression
+/// (`cron` crate) the global scheduler evaluates, so one mental model
+/// covers both surfaces. `start_at`/`end_at` bound the occurrences
+/// themselves; `valid_until` is the kill-switch - a pending row past it
+/// never fires and begets nothing, even if an occurrence would still be
+/// due. All three are optional: absent means unbounded that way.
 #[derive(Debug, Clone)]
 pub struct RecurrenceSpec {
     pub schedule: String,
@@ -1360,10 +1376,85 @@ pub struct RecurrenceSpec {
     pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// The next firing of a recurring deadline chain, given only the
+/// previous firing - pure, no I/O, so both `db::fire_due_deadlines` and
+/// the unit tests below evaluate the identical math. `prev_fire_at` is
+/// the occurrence the chain just fired (or, at schedule time, the initial
+/// `fire_at`); `now` bounds the catch-up, the same register
+/// `event_store::create_system_event`'s own `nothing_later_is_due`
+/// already is. Returns `None` when the chain ends: the schedule doesn't
+/// parse, no occurrence is left, or the candidate fails the validity
+/// window (`start_at`/`end_at`/`valid_until`, or `now` past
+/// `valid_until`).
+pub fn next_recurrence_fire_at(
+    recurrence: &RecurrenceSpec,
+    prev_fire_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use crate::event_store::{latest_occurrence_at_or_before, next_occurrence_after};
+    if now
+        > recurrence
+            .valid_until
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    {
+        return None;
+    }
+    let candidate = match recurrence.policy {
+        MissedRunPolicy::Skip => {
+            // Missed occurrences are skipped outright: the first
+            // occurrence strictly after whichever is later, the previous
+            // firing or now.
+            next_occurrence_after(&recurrence.schedule, prev_fire_at.max(now))?
+        }
+        MissedRunPolicy::FireOnce => {
+            // A backlog collapses to a single firing of its latest
+            // occurrence - the `fire_once` register §150 already is for
+            // the global scheduler - and with no backlog this is just the
+            // next occurrence after the previous firing.
+            match latest_occurrence_at_or_before(&recurrence.schedule, now) {
+                Some(latest) if latest > prev_fire_at => latest,
+                _ => next_occurrence_after(&recurrence.schedule, prev_fire_at)?,
+            }
+        }
+        MissedRunPolicy::FireAll => {
+            // Step through every occurrence, missed or not.
+            next_occurrence_after(&recurrence.schedule, prev_fire_at)?
+        }
+    };
+    if candidate
+        < recurrence
+            .start_at
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+    {
+        return None;
+    }
+    if candidate
+        > recurrence
+            .end_at
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    {
+        return None;
+    }
+    if candidate
+        > recurrence
+            .valid_until
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
 /// `ScheduleDeadline::schedule`'s own `Some` output - everything a
 /// one-shot, per-entity timer needs: when it fires (`fire_at`), what it's
 /// scoped to for a later `CancelDeadline` lookup (`tags`), and what to
 /// submit when it does (`payload`, `Self::Target`'s own payload type).
+/// `recurrence` (Codeberg issue #95) turns the one-shot into the first
+/// firing of a chain: after it fires, `db::fire_due_deadlines` derives
+/// the next `fire_at` from the cron schedule and the missed-run policy,
+/// until the validity window ends or a `CancelDeadline` cancels the
+/// pending row. `None` - the default every existing schedule passes - is
+/// the unchanged one-shot.
 #[derive(Debug, Clone)]
 pub struct DeadlineSpec<P> {
     pub fire_at: chrono::DateTime<chrono::Utc>,
@@ -1541,12 +1632,15 @@ pub trait ScheduleDeadlineDispatcher: Send + Sync {
 /// `DeadlineSpec<P>` with `P` resolved to its already-serialised JSON,
 /// the same "erase the payload's own concrete type at the dispatcher
 /// boundary" treatment every other dispatcher trait in this module
-/// already gives its own typed payloads.
+/// already gives its own typed payloads. `recurrence` is carried through
+/// verbatim (Codeberg issue #95) - the dispatcher boundary erases the
+/// payload type only, never the schedule's own recurrence decision.
 #[derive(Debug, Clone)]
 pub struct ErasedDeadlineSpec {
     pub fire_at: chrono::DateTime<chrono::Utc>,
     pub tags: Vec<Tag>,
     pub payload_json: String,
+    pub recurrence: Option<RecurrenceSpec>,
 }
 
 /// Type-erased dispatch to a bounded context's own typed

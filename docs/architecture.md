@@ -221,6 +221,7 @@ listed separately here; see that section itself for its own structure.
 - [166. CI runs the tests against a real Postgres, not the embedded fallback](#ci-postgres-service)
 - [167. Every test binary gets its own database, not the one `DATABASE_URL` names](#per-binary-test-databases)
 - [168. Which of two colliding projections is served was a coin flip](#projection-type-name-collision-order)
+- [212. Per-entity recurrence for deadlines, with a missed-run policy](#deadline-recurrence)
 
 ---
 
@@ -12163,4 +12164,64 @@ new GraphQL types or fields. Those are checked-in fixtures -
 type and a `fetchSecret` field is its own pass with a deliberate re-record,
 kept separate so this one stays reviewable and doesn't move two fixture
 surfaces at once.
+
+<a id="deadline-recurrence"></a>
+## 212. Per-entity recurrence for deadlines, with a missed-run policy (Codeberg issue #95)
+
+Raised against the gap between the two schedulers §46 and §22 left: the
+global scheduler is cron-based and recurring but fires one system event
+for a whole `EventType`, while a native deadline (§46) is per-entity but
+strictly one-shot. "Remind this order every day until paid" had no native
+shape - hand-built on the recurring scheduler, or `skilj-temporal` (§34)
+for a single deferred command.
+
+**Modeling: extend `DeadlineSpec`, not a new trait.** A recurring
+deadline is still scheduled by one pure reaction to one committed event
+(the §46 trigger model stands), so `DeadlineSpec` gains `recurrence:
+Option<RecurrenceSpec>` and `None` is the unchanged one-shot - every
+existing schedule passes it, and the wire surfaces (GraphQL/REST), codegen,
+and the inspector never learn recurrence exists. `RecurrenceSpec` carries
+the same 7-field Quartz-dialect cron expression the global scheduler
+evaluates (one mental model for both surfaces), a `MissedRunPolicy`
+(`Skip`/`FireOnce`/`FireAll` - deliberately its own type rather than
+reusing `MissedOccurrencePolicy`, since a global schedule and a per-entity
+chain are different reactor families), and the validity window
+(`start_at`/`end_at` bounding the occurrences, `valid_until` the
+kill-switch: a pending row past it never fires and begets nothing).
+
+**One row per occurrence, not one mutating row.** Each firing inserts the
+next pending row, then marks itself `fired` - history is preserved until
+retention (§163) deletes it, and `CancelDeadline` matches pending rows by
+tags exactly as today, so a cancel naturally ends the chain (cancelled
+rows never fire, hence never beget). The next row's id is deterministic
+(`"{parent_id}#r{sequence}"`, the parent naming itself at sequence 0),
+inserted *before* the fired mark under `ON CONFLICT DO NOTHING`: a crash
+between the two re-fires idempotently under the same `skilj-deadline:` key
+and re-inserts the same next row as a no-op. `FireAll` needs no extra
+backpressure cap - only the immediate next occurrence is inserted per
+firing, so a backlog drains one fire tick at a time within the existing
+per-tick cap.
+
+**Pure policy math** (`plugin::next_recurrence_fire_at`, unit-tested
+without a database): `Skip` takes the first occurrence after
+`max(prev, now)`; `FireOnce` collapses a backlog to its latest occurrence
+(the §150 register) or the next occurrence with none; `FireAll` steps to
+the next occurrence after the previous firing. The window checks then end
+the chain (`None`): unparseable cron, `now` past `valid_until`, or the
+candidate outside `[start_at, end_at, valid_until]`. Schedule time refuses
+an initial `fire_at` outside its own window (caller bug, skipped with a
+warning); a bad cron degrades to a stored one-shot rather than refusing
+the row. Fire-time expiry marks the row `fired` without submitting.
+Accepted, Rejected (per-occurrence business, like a one-shot's),
+Deduplicated, and Parked outcomes all advance the chain - one poisoned
+occurrence doesn't stall the rest; retryable errors and
+`another_instance` defers leave the row pending and beget nothing, so a
+cancel in the meantime still wins (§131 ordering untouched).
+
+**Tests.** `skilj-core/tests/deadline_recurrence.rs` pins the policy math
+and the persistence (columns stored, out-of-window initials skipped, bad
+cron degrades); `skilj/tests/deadline_recurrence.rs` runs a real `Skilj`
+where one order's every-second chain fires several times then stops at
+`end_at` on its own, while a paid order's chain is cut short by its
+cancel.
 

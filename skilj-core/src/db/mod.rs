@@ -1879,6 +1879,20 @@ pub async fn ensure_snapshot_partition_progress_table<'e>(
 /// instance's claim can be reclaimed after it goes stale - see
 /// `fire_due_deadlines`'s own doc comment for the reclaim window.
 ///
+/// Codeberg issue #95 - the recurrence columns make one pending row the
+/// current head of a chain: `recurrence_schedule` (the 7-field
+/// Quartz-dialect cron expression) with `recurrence_policy`
+/// (`'skip'`/`'fire_once'`/`'fire_all'`), and the validity window
+/// (`recurrence_start_at`/`recurrence_end_at`/`recurrence_valid_until`,
+/// all nullable). `recurrence_parent_id` names the chain's first row and
+/// `recurrence_sequence` the row's position in it (0 for the first,
+/// `NULL` for a one-shot that never recurs), so the next row's
+/// deterministic id (`"{parent_id}#r{sequence}"`) is a safe
+/// `ON CONFLICT (id) DO NOTHING` no-op on redelivery, the identical
+/// property the first row's own `"{schedule_name}:{source_event_sequence}"`
+/// id already has. Every column is nullable - a row scheduled before this
+/// feature reads as the one-shot it is.
+///
 /// The DDL itself is shared between `provision_bounded_context_schema`
 /// (a brand-new context, run against its own open transaction) and
 /// `ensure_deadlines_table` below (an existing one, run against `&Pool`) -
@@ -1902,7 +1916,14 @@ fn deadlines_table_ddl(schema: &str) -> String {
             attempt_count INT NOT NULL DEFAULT 0,
             first_failed_at TIMESTAMPTZ,
             next_attempt_at TIMESTAMPTZ,
-            last_error TEXT
+            last_error TEXT,
+            recurrence_schedule TEXT,
+            recurrence_policy TEXT CHECK (recurrence_policy IN ('skip', 'fire_once', 'fire_all')),
+            recurrence_start_at TIMESTAMPTZ,
+            recurrence_end_at TIMESTAMPTZ,
+            recurrence_valid_until TIMESTAMPTZ,
+            recurrence_parent_id TEXT,
+            recurrence_sequence BIGINT
         )"
     )
 }
@@ -1954,6 +1975,35 @@ pub async fn ensure_deadlines_table(
             ADD COLUMN IF NOT EXISTS first_failed_at TIMESTAMPTZ, \
             ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ, \
             ADD COLUMN IF NOT EXISTS last_error TEXT"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    // Codeberg issue #95 - a recurring chain's own state, one pending row
+    // the head. Nullable throughout, so every row scheduled before this
+    // feature reads as the one-shot it is.
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "deadlines",
+        &[
+            "recurrence_schedule",
+            "recurrence_policy",
+            "recurrence_start_at",
+            "recurrence_end_at",
+            "recurrence_valid_until",
+            "recurrence_parent_id",
+            "recurrence_sequence",
+        ],
+        format!(
+            "ALTER TABLE {schema}.deadlines \
+            ADD COLUMN IF NOT EXISTS recurrence_schedule TEXT, \
+            ADD COLUMN IF NOT EXISTS recurrence_policy TEXT \
+                CHECK (recurrence_policy IN ('skip', 'fire_once', 'fire_all')), \
+            ADD COLUMN IF NOT EXISTS recurrence_start_at TIMESTAMPTZ, \
+            ADD COLUMN IF NOT EXISTS recurrence_end_at TIMESTAMPTZ, \
+            ADD COLUMN IF NOT EXISTS recurrence_valid_until TIMESTAMPTZ, \
+            ADD COLUMN IF NOT EXISTS recurrence_parent_id TEXT, \
+            ADD COLUMN IF NOT EXISTS recurrence_sequence BIGINT"
         ),
     )))
     .execute(pool)
@@ -3725,6 +3775,28 @@ fn missed_occurrence_policy_from_str(s: &str) -> MissedOccurrencePolicy {
         "fire_once" => MissedOccurrencePolicy::FireOnce,
         "replay_backlog" => MissedOccurrencePolicy::ReplayBacklog,
         _ => MissedOccurrencePolicy::Skip,
+    }
+}
+
+/// Codeberg issue #95 - a recurring chain's own policy, as stored.
+fn recurrence_policy_to_str(policy: crate::plugin::MissedRunPolicy) -> &'static str {
+    match policy {
+        crate::plugin::MissedRunPolicy::Skip => "skip",
+        crate::plugin::MissedRunPolicy::FireOnce => "fire_once",
+        crate::plugin::MissedRunPolicy::FireAll => "fire_all",
+    }
+}
+
+/// The inverse of `recurrence_policy_to_str` - `None` for a `NULL`
+/// column (a one-shot) or for a value no writer this codebase knows
+/// could have stored (defensive; the `CHECK` constraint already refuses
+/// those at the door).
+fn recurrence_policy_from_str(s: Option<&str>) -> Option<crate::plugin::MissedRunPolicy> {
+    match s {
+        Some("skip") => Some(crate::plugin::MissedRunPolicy::Skip),
+        Some("fire_once") => Some(crate::plugin::MissedRunPolicy::FireOnce),
+        Some("fire_all") => Some(crate::plugin::MissedRunPolicy::FireAll),
+        _ => None,
     }
 }
 
@@ -14454,28 +14526,87 @@ pub async fn catch_up_schedule_deadline(
                 // apply - a real, expected outcome, not an error.
             }
             Some(Ok(Some(spec))) => {
-                // Deterministic id - see `ensure_deadlines_table`'s own
-                // doc comment for why `ON CONFLICT (id) DO NOTHING` makes
-                // a redelivered tick a safe no-op.
-                let id = format!("{}:{}", schedule.name, event.sequence);
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "INSERT INTO {schema}.deadlines \
-                     (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
-                      target_command_type, payload, status, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9) \
-                     ON CONFLICT (id) DO NOTHING"
-                )))
-                .bind(&id)
-                .bind(schedule.name)
-                .bind(spec.fire_at)
-                .bind(Json(&spec.tags))
-                .bind(event.metadata.correlation_id.as_deref())
-                .bind(schedule.target_bounded_context)
-                .bind(schedule.target_command_type)
-                .bind(&spec.payload_json)
-                .bind(Utc::now())
-                .execute(pool)
-                .await?;
+                // Codeberg issue #95 - a recurring spec's own initial
+                // `fire_at` must lie inside its own validity window, or
+                // the chain would emit a row that is already expired.
+                // Skipped with a warning, cursor still advances - a caller
+                // bug in `schedule()`, not a condition to retry.
+                let out_of_window = match &spec.recurrence {
+                    Some(recurrence) => {
+                        spec.fire_at
+                            < recurrence
+                                .start_at
+                                .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
+                            || spec.fire_at
+                                > recurrence
+                                    .end_at
+                                    .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC)
+                            || spec.fire_at
+                                > recurrence
+                                    .valid_until
+                                    .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC)
+                    }
+                    None => false,
+                };
+                if out_of_window {
+                    tracing::warn!(
+                        sequence = event.sequence,
+                        fire_at = %spec.fire_at,
+                        "schedule deadline: initial fire_at outside its own recurrence window - skipping"
+                    );
+                } else {
+                    // Deterministic id - see `ensure_deadlines_table`'s
+                    // own doc comment for why `ON CONFLICT (id) DO
+                    // NOTHING` makes a redelivered tick a safe no-op.
+                    // The first row names itself its own chain parent at
+                    // sequence 0; `fire_due_deadlines` derives every later
+                    // row's id from those. A one-shot stores no recurrence
+                    // columns at all. A bad cron expression degrades to a
+                    // one-shot (a warning here, not a refusal) - the chain
+                    // simply ends after the first firing.
+                    let id = format!("{}:{}", schedule.name, event.sequence);
+                    let (recurrence_schedule, recurrence_policy, recurrence_start_at) =
+                        match &spec.recurrence {
+                            Some(recurrence) => (
+                                Some(recurrence.schedule.clone()),
+                                Some(recurrence_policy_to_str(recurrence.policy)),
+                                recurrence.start_at,
+                            ),
+                            None => (None, None, None),
+                        };
+                    let (recurrence_end_at, recurrence_valid_until) = match &spec.recurrence {
+                        Some(recurrence) => (recurrence.end_at, recurrence.valid_until),
+                        None => (None, None),
+                    };
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "INSERT INTO {schema}.deadlines \
+                         (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+                          target_command_type, payload, status, created_at, recurrence_schedule, \
+                          recurrence_policy, recurrence_start_at, recurrence_end_at, \
+                          recurrence_valid_until, recurrence_parent_id, recurrence_sequence) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, \
+                                 $14, $15, $16) \
+                         ON CONFLICT (id) DO NOTHING"
+                    )))
+                    .bind(&id)
+                    .bind(schedule.name)
+                    .bind(spec.fire_at)
+                    .bind(Json(&spec.tags))
+                    .bind(event.metadata.correlation_id.as_deref())
+                    .bind(schedule.target_bounded_context)
+                    .bind(schedule.target_command_type)
+                    .bind(&spec.payload_json)
+                    .bind(Utc::now())
+                    .bind(recurrence_schedule)
+                    .bind(recurrence_policy)
+                    .bind(recurrence_start_at)
+                    .bind(recurrence_end_at)
+                    .bind(recurrence_valid_until)
+                    .bind(spec.recurrence.as_ref().map(|_| id.clone()))
+                    .bind(spec.recurrence.as_ref().map(|_| 0_i64))
+                    .execute(pool)
+                    .await?;
+                }
             }
         }
         update_deadline_cursor(
@@ -14760,12 +14891,49 @@ struct DueDeadlineRow {
     id: String,
     schedule_name: String,
     fire_at: DateTime<Utc>,
+    tags: Json<Vec<Tag>>,
     correlation_id: Option<String>,
     target_bounded_context: String,
     target_command_type: String,
     payload: String,
     attempt_count: i32,
     first_failed_at: Option<DateTime<Utc>>,
+    recurrence_schedule: Option<String>,
+    recurrence_policy: Option<String>,
+    recurrence_start_at: Option<DateTime<Utc>>,
+    recurrence_end_at: Option<DateTime<Utc>>,
+    recurrence_valid_until: Option<DateTime<Utc>>,
+    recurrence_parent_id: Option<String>,
+    recurrence_sequence: Option<i64>,
+}
+
+/// Codeberg issue #95 - one due row's own recurrence state, reconstituted
+/// from its columns. `None` for a one-shot (`recurrence_schedule` is
+/// `NULL`) or for a row whose stored policy no known writer could have
+/// stored (defensive; the `CHECK` constraint already refuses those) - a
+/// chain that can't be understood is simply not advanced.
+struct Recurrence {
+    schedule: String,
+    policy: crate::plugin::MissedRunPolicy,
+    start_at: Option<DateTime<Utc>>,
+    end_at: Option<DateTime<Utc>>,
+    valid_until: Option<DateTime<Utc>>,
+    parent_id: Option<String>,
+    sequence: Option<i64>,
+}
+
+impl DueDeadlineRow {
+    fn recurrence(&self) -> Option<Recurrence> {
+        Some(Recurrence {
+            schedule: self.recurrence_schedule.clone()?,
+            policy: recurrence_policy_from_str(self.recurrence_policy.as_deref())?,
+            start_at: self.recurrence_start_at,
+            end_at: self.recurrence_end_at,
+            valid_until: self.recurrence_valid_until,
+            parent_id: self.recurrence_parent_id.clone(),
+            sequence: self.recurrence_sequence,
+        })
+    }
 }
 
 /// A `Deadline`-kind parked row's `source` is this prefix plus the
@@ -14821,6 +14989,23 @@ pub const DEADLINE_CLIENT_ID: &str = "deadline";
 /// target bounded context and marked `parked`, where an operator can
 /// retry or discard it like a parked route delivery. Either way the rest
 /// of the tick carries on (docs/architecture.md §115).
+///
+/// Codeberg issue #95 - a row carrying recurrence state is the head of a
+/// chain, and a firing advances it: the next row is inserted *before*
+/// this one is marked `fired` (deterministic id, `ON CONFLICT DO
+/// NOTHING`), so a crash between the two re-fires idempotently under the
+/// same `skilj-deadline:` key and re-inserts the same next row as a
+/// no-op - no gap, no duplicate. An `Accepted`, `Rejected` (per-fire
+/// business, like a one-shot's) or `Deduplicated` outcome advances the
+/// chain; a parked outcome advances it too, so one poisoned occurrence
+/// doesn't stall every later one. A retryable error or an
+/// `another_instance` defer leaves the row `pending` and begets nothing;
+/// an unregistered target, an archived target, an unparseable schedule,
+/// or a window the next occurrence falls outside of ends the chain - the
+/// row is simply marked `fired`. A pending row already past
+/// `valid_until` never submits at all: marked `fired`, nothing begotten.
+/// `Cancelled` rows never reach here, so a `CancelDeadline` matching the
+/// head ends the chain the same way - nothing further is ever inserted.
 #[allow(clippy::too_many_arguments)]
 pub async fn fire_due_deadlines(
     pool: &Pool,
@@ -14843,8 +15028,10 @@ pub async fn fire_due_deadlines(
     let mut cancel_backlogs: std::collections::HashMap<&str, Option<DateTime<Utc>>> =
         std::collections::HashMap::new();
     let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, schedule_name, fire_at, correlation_id, target_bounded_context, \
-         target_command_type, payload, attempt_count, first_failed_at \
+        "SELECT id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+         target_command_type, payload, attempt_count, first_failed_at, recurrence_schedule, \
+         recurrence_policy, recurrence_start_at, recurrence_end_at, recurrence_valid_until, \
+         recurrence_parent_id, recurrence_sequence \
          FROM {schema}.deadlines \
          WHERE (status = 'pending' OR (status = 'firing' AND firing_at <= $1)) AND fire_at <= $2 \
          AND (next_attempt_at IS NULL OR next_attempt_at <= $2) \
@@ -14876,6 +15063,22 @@ pub async fn fire_due_deadlines(
             if backlog.is_some_and(|first_unprocessed| first_unprocessed <= row.fire_at) {
                 continue 'rows;
             }
+        }
+        // Codeberg issue #95 - the chain's kill-switch: a pending row
+        // already past its own `valid_until` never submits and begets
+        // nothing, marked `fired` like any other chain end. The claim
+        // below is skipped deliberately - no side effect has happened, so
+        // a concurrent cancel racing this tick is just ordinary
+        // "cancelled before it fired", the same register the
+        // unregistered-target path already is.
+        let recurrence = row.recurrence();
+        if recurrence.as_ref().is_some_and(|recurrence| {
+            now > recurrence
+                .valid_until
+                .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC)
+        }) {
+            mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
+            continue;
         }
         let Some(target_command_type) =
             get_command_type(pool, &row.target_bounded_context, &row.target_command_type).await?
@@ -14973,6 +15176,15 @@ pub async fn fire_due_deadlines(
             }
             Err(e) => {
                 record_deadline_failure(pool, &schema, &row, &e, retry_policy, now).await?;
+                let parked: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT id FROM {schema}.deadlines WHERE id = $1 AND status = 'parked'"
+                )))
+                .bind(&row.id)
+                .fetch_optional(pool)
+                .await?;
+                if parked.is_some() {
+                    advance_deadline_chain(pool, &schema, &row, recurrence.as_ref(), now).await?;
+                }
                 continue;
             }
         };
@@ -14984,8 +15196,91 @@ pub async fn fire_due_deadlines(
                  unexpected otherwise, since the key space is reserved"
             );
         }
+        // Codeberg issue #95 - the next row lands before this one is
+        // marked `fired`, so a crash between the two re-fires idempotently
+        // and re-inserts the same next id as a no-op.
+        advance_deadline_chain(pool, &schema, &row, recurrence.as_ref(), now).await?;
         mark_deadline_resolved(pool, &schema, &row.id, "fired", now).await?;
     }
+    Ok(())
+}
+
+/// Codeberg issue #95 - advances one recurring chain past the firing of
+/// `row`: derives the next `fire_at` from the recurrence math and inserts
+/// the next pending row (deterministic id, `ON CONFLICT DO NOTHING`),
+/// carrying the chain's tags, payload, correlation, target and recurrence
+/// state forward. A `None` derivation ends the chain silently - warned
+/// once only for an unparseable schedule, since a windowed end is the
+/// ordinary, expected way a chain stops. The sequence counts up from the
+/// parent's 0, so ids (`"{parent_id}#r{sequence}"`) can never collide with
+/// the parent's own `"{schedule}:{sequence}"` shape or with each other.
+async fn advance_deadline_chain(
+    pool: &Pool,
+    schema: &str,
+    row: &DueDeadlineRow,
+    recurrence: Option<&Recurrence>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let Some(recurrence) = recurrence else {
+        return Ok(());
+    };
+    let Some(next_fire_at) = crate::plugin::next_recurrence_fire_at(
+        &crate::plugin::RecurrenceSpec {
+            schedule: recurrence.schedule.clone(),
+            policy: recurrence.policy,
+            start_at: recurrence.start_at,
+            end_at: recurrence.end_at,
+            valid_until: recurrence.valid_until,
+        },
+        row.fire_at,
+        now,
+    ) else {
+        if crate::event_store::next_occurrence_after(&recurrence.schedule, row.fire_at).is_none()
+            && crate::event_store::latest_occurrence_at_or_before(&recurrence.schedule, now)
+                .is_none()
+        {
+            tracing::warn!(
+                deadline_id = %row.id,
+                schedule = %recurrence.schedule,
+                "deadline's own recurrence schedule does not parse - ending the chain"
+            );
+        }
+        return Ok(());
+    };
+    let parent_id = recurrence.parent_id.as_deref().unwrap_or(&row.id);
+    let next_sequence = recurrence
+        .sequence
+        .map(|sequence| sequence + 1)
+        .unwrap_or(1);
+    let next_id = format!("{parent_id}#r{next_sequence}");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.deadlines \
+         (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+          target_command_type, payload, status, created_at, recurrence_schedule, \
+          recurrence_policy, recurrence_start_at, recurrence_end_at, \
+          recurrence_valid_until, recurrence_parent_id, recurrence_sequence) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, \
+                 $14, $15, $16) \
+         ON CONFLICT (id) DO NOTHING"
+    )))
+    .bind(&next_id)
+    .bind(&row.schedule_name)
+    .bind(next_fire_at)
+    .bind(&row.tags)
+    .bind(row.correlation_id.as_deref())
+    .bind(&row.target_bounded_context)
+    .bind(&row.target_command_type)
+    .bind(&row.payload)
+    .bind(now)
+    .bind(&recurrence.schedule)
+    .bind(recurrence_policy_to_str(recurrence.policy))
+    .bind(recurrence.start_at)
+    .bind(recurrence.end_at)
+    .bind(recurrence.valid_until)
+    .bind(parent_id)
+    .bind(next_sequence)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

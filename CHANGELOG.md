@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-entity recurrence for deadlines, with a missed-run policy
+  (docs/architecture.md §212, Codeberg issue #95):
+  `DeadlineSpec.recurrence: Option<RecurrenceSpec>` turns a one-shot
+  deadline into the first firing of a chain. `RecurrenceSpec` carries the
+  same 7-field cron expression the global scheduler evaluates, a
+  `MissedRunPolicy` (`Skip`/`FireOnce`/`FireAll`), and a validity window
+  (`start_at`/`end_at`/`valid_until`). Each firing inserts the next
+  pending row (deterministic id, `ON CONFLICT DO NOTHING`) before marking
+  itself `fired`, so a cancel ends the chain and a crash re-fires
+  idempotently. The `deadlines` table gains nullable recurrence columns,
+  patched into existing bounded contexts at startup. New:
+  `plugin::MissedRunPolicy`, `plugin::RecurrenceSpec`,
+  `plugin::next_recurrence_fire_at`, `ErasedDeadlineSpec.recurrence`
+  (breaking for code constructing it directly), and facade re-exports
+  `MissedRunPolicy`/`RecurrenceSpec`.
 - Blind tags: uniqueness on personal data (docs/architecture.md §205). A
   `TagMapping::blind::<B>(field)` tags a payload field with
   `HMAC-SHA256(key, normalize(value))` instead of the value, so a
