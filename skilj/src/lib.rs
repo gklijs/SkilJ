@@ -3086,6 +3086,12 @@ impl SkiljBuilder {
                         // comments.
                         skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
                         skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
+                        // Secrets (docs/architecture.md's own write-up of
+                        // this pass) - the new `secret_versions`/
+                        // `secret_grants` tables, same "patched into every
+                        // bounded context, every startup" treatment. See
+                        // `ensure_secret_tables`'s own doc comment.
+                        skilj_core::db::ensure_secret_tables(pool, &bc.name).await?;
                         // Cross-context event router (docs/architecture.md's
                         // own write-up of this pass) - same "patched into
                         // every bounded context, every startup" treatment.

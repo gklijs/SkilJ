@@ -2443,3 +2443,346 @@ fn get_or_create_encryption_key_survives_a_key_vanishing_mid_provision() {
             .is_some());
     });
 }
+
+// --- Secrets (docs/architecture.md §Secret) ---
+//
+// The leak list this pass is checked against, item by item:
+//   * rotation actually shreds the previous version's key (test 1);
+//   * an adapter with no grant is refused (test 2);
+//   * revoke shreds and ends the active version (test 3);
+//   * a normal query / the inspector sees metadata only, never the value
+//     (test 4), and at rest even the raw row is ciphertext (test 6);
+//   * the read audit is a summary on the row, not an event per fetch
+//     (test 5).
+// Command payloads / idempotency / parked deliveries: a secret never
+// enters one by construction - `SecretValue` is not `Serialize`, so it
+// cannot be embedded in a payload at all - and skilj's own idempotency
+// records store only event sequences, never a payload. See the
+// architecture write-up.
+
+fn secret_subject(name: &str, version: i64) -> String {
+    skilj_core::secrets::subject_value(name, version)
+}
+
+/// Put a first version, then put again: the new version is active, the old
+/// one is retired, and - the point - the old version's `EncryptionKey` is
+/// genuinely destroyed (`wrapped_key` nulled), so nobody holding the master
+/// key can recover the previous secret from a database dump.
+#[test]
+fn put_secret_value_rotates_and_shreds_the_previous_version_key() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([21u8; 32]);
+        let role = seed_role(&pool, false).await;
+        let name = "github-oauth-refresh";
+
+        let v1 = db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            "refresh-token-1",
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v1.version, 1);
+        assert_eq!(v1.status, skilj_core::secrets::SecretStatus::Active);
+        assert!(
+            db::get_active_encryption_key(
+                &pool,
+                &bc.name,
+                skilj_core::secrets::SUBJECT_KEY,
+                &secret_subject(name, 1),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "the first version must have provisioned a key"
+        );
+
+        let v2 = db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            "refresh-token-2",
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.status, skilj_core::secrets::SecretStatus::Active);
+
+        // The previous version's key is gone - real crypto-shredding.
+        assert_eq!(
+            db::get_active_encryption_key(
+                &pool,
+                &bc.name,
+                skilj_core::secrets::SUBJECT_KEY,
+                &secret_subject(name, 1),
+            )
+            .await
+            .unwrap(),
+            None,
+            "rotating must destroy the previous version's key"
+        );
+
+        db::grant_secret_access(&pool, &bc.name, name, &role.id, test_now())
+            .await
+            .unwrap();
+        let fetched = db::fetch_secret_value(&pool, &bc.name, name, &role.id, &master, test_now())
+            .await
+            .unwrap();
+        assert_eq!(fetched.expose(), "refresh-token-2");
+    });
+}
+
+/// An adapter with no grant on this secret is refused - and, because the
+/// grant is checked before the secret is even looked up, the refusal is the
+/// same whether or not the secret exists.
+#[test]
+fn fetch_secret_value_refuses_an_adapter_without_a_grant() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([22u8; 32]);
+        let granted = seed_role(&pool, false).await;
+        let stranger = seed_role(&pool, false).await;
+        let name = "payments-api-key";
+
+        db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            "sk_live_123",
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+        db::grant_secret_access(&pool, &bc.name, name, &granted.id, test_now())
+            .await
+            .unwrap();
+
+        match db::fetch_secret_value(&pool, &bc.name, name, &stranger.id, &master, test_now()).await
+        {
+            Err(e) => assert_eq!(e.code(), "secret_access_not_granted"),
+            Ok(_) => panic!("an ungranted adapter must be refused"),
+        }
+    });
+}
+
+/// Revoking ends the active version and shreds its key; a later fetch (even
+/// by a still-granted adapter) finds nothing to decrypt.
+#[test]
+fn revoke_secret_shreds_and_ends_the_active_version() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([23u8; 32]);
+        let role = seed_role(&pool, false).await;
+        let name = "expired-oauth-token";
+
+        db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            "to-be-revoked",
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+        db::grant_secret_access(&pool, &bc.name, name, &role.id, test_now())
+            .await
+            .unwrap();
+
+        let revoked = db::revoke_secret(&pool, &bc.name, name, test_now())
+            .await
+            .unwrap();
+        assert_eq!(revoked.status, skilj_core::secrets::SecretStatus::Revoked);
+
+        assert_eq!(
+            db::get_active_secret(&pool, &bc.name, name).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            db::get_active_encryption_key(
+                &pool,
+                &bc.name,
+                skilj_core::secrets::SUBJECT_KEY,
+                &secret_subject(name, 1),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        match db::fetch_secret_value(&pool, &bc.name, name, &role.id, &master, test_now()).await {
+            Err(e) => assert_eq!(e.code(), "secret_not_active"),
+            Ok(_) => panic!("a revoked secret must not be fetchable"),
+        }
+    });
+}
+
+/// A normal query returns `Secret` metadata only - the type physically has
+/// no value field, so the plaintext cannot appear in `list_active_secrets`
+/// or in a debug rendering of it.
+#[test]
+fn secret_metadata_never_carries_the_value() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([24u8; 32]);
+        let name = "stripe-secret";
+
+        db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            "super-secret-plaintext-value",
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        let listed = db::list_active_secrets(&pool, &bc.name).await.unwrap();
+        let one = listed.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(one.version, 1);
+        assert!(
+            !format!("{one:?}").contains("super-secret-plaintext-value"),
+            "a normal query's metadata must never contain the value"
+        );
+        let active = db::get_active_secret(&pool, &bc.name, name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!format!("{active:?}").contains("super-secret-plaintext-value"));
+    });
+}
+
+/// A fetch updates the version row's own `last_read_at`/`last_read_by`
+/// summary - the read audit, not an event per fetch.
+#[test]
+fn fetch_secret_value_records_a_last_read_summary() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([25u8; 32]);
+        let role = seed_role(&pool, false).await;
+        let name = "audit-me";
+
+        db::put_secret_value(&pool, &bc.name, name, "value", None, &master, test_now())
+            .await
+            .unwrap();
+        db::grant_secret_access(&pool, &bc.name, name, &role.id, test_now())
+            .await
+            .unwrap();
+        assert_eq!(
+            db::get_active_secret(&pool, &bc.name, name)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_read_by,
+            None
+        );
+
+        db::fetch_secret_value(&pool, &bc.name, name, &role.id, &master, test_now())
+            .await
+            .unwrap();
+
+        let after = db::get_active_secret(&pool, &bc.name, name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.last_read_by.as_deref(), Some(role.id.as_str()));
+        assert!(after.last_read_at.is_some());
+    });
+}
+
+/// A full database dump of a secret row yields ciphertext, not the value -
+/// the same "encrypted at rest" property the inspector relies on for a
+/// sensitive field. This is what makes the inspector safe without it
+/// decrypting anything.
+#[test]
+fn secret_value_is_ciphertext_at_rest() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([26u8; 32]);
+        let name = "at-rest";
+
+        db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            "plaintext-in-the-clear",
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        let schema = format!("\"bc_{}\"", bc.name);
+        let stored: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT ciphertext FROM {schema}.secret_versions WHERE name = $1 AND status = 'active'"
+        )))
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_ne!(stored, "plaintext-in-the-clear");
+        assert!(!stored.contains("plaintext-in-the-clear"));
+    });
+}
+
+/// Two concurrent rotations of one secret serialize on the per-secret
+/// advisory lock: both succeed, one is version 1 and the other version 2,
+/// and exactly one version is left active.
+#[test]
+fn concurrent_rotations_of_one_secret_serialize() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([27u8; 32]);
+        let name = "concurrent-rotation";
+
+        let (a, b) = tokio::join!(
+            db::put_secret_value(&pool, &bc.name, name, "a", None, &master, test_now()),
+            db::put_secret_value(&pool, &bc.name, name, "b", None, &master, test_now()),
+        );
+        let mut versions = [a.unwrap().version, b.unwrap().version];
+        versions.sort();
+        assert_eq!(versions, [1, 2]);
+
+        let active = db::list_active_secrets(&pool, &bc.name)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.name == name)
+            .count();
+        assert_eq!(active, 1);
+    });
+}

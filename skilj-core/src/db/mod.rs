@@ -43,6 +43,7 @@ use crate::event_store::{
     ReadCursor, WouldBeEvent,
 };
 use crate::projections::{Projection, ProjectionRebuild, ProjectionRebuildStatus};
+use crate::secrets::{self, Secret, SecretGrant, SecretGrantStatus, SecretStatus, SecretValue};
 use crate::shared::{Metadata, PrivateField, QueryItem, SensitiveField, Tag, TagMapping};
 use chrono::{DateTime, Utc};
 use opentelemetry::metrics::{Counter, Histogram, Meter};
@@ -672,6 +673,33 @@ async fn provision_bounded_context_schema(
             encryption_key_id BIGINT NOT NULL REFERENCES {schema}.encryption_keys (id),
             PRIMARY KEY (command_id, encryption_key_id)
         )"
+    )))
+    .execute(&mut **tx)
+    .await?;
+
+    // Secrets (docs/architecture.md §Secret) - both tables are created here
+    // for a brand-new context and by `ensure_secret_tables` on startup for
+    // one provisioned before this pass. `secret_versions` FK-references
+    // `encryption_keys` above, so it must come after it.
+    sqlx::query(sqlx::AssertSqlSafe(secret_versions_table_ddl(&schema)))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE UNIQUE INDEX secret_versions_unique_active \
+         ON {schema}.secret_versions (name) WHERE status = 'active'"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX secret_versions_by_name ON {schema}.secret_versions (name, version DESC)"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(secret_grants_table_ddl(&schema)))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX secret_grants_by_grantee ON {schema}.secret_grants (grantee_role_id, status)"
     )))
     .execute(&mut **tx)
     .await?;
@@ -4631,6 +4659,21 @@ pub async fn destroy_encryption_key(
     destroyed_at: DateTime<Utc>,
 ) -> crate::error::Result<()> {
     let schema = schema_ident(bounded_context);
+    destroy_encryption_key_on(pool, &schema, subject_key, subject_value, destroyed_at).await
+}
+
+/// [`destroy_encryption_key`] on any executor, with the schema already in
+/// hand - so a secret rotation (`put_secret_value`) or revocation
+/// (`revoke_secret`) can shred the superseded version's key in the *same*
+/// transaction that retires it, never a second pooled connection and never
+/// a window where the version is gone but its key is not.
+async fn destroy_encryption_key_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    schema: &str,
+    subject_key: &str,
+    subject_value: &str,
+    destroyed_at: DateTime<Utc>,
+) -> crate::error::Result<()> {
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.encryption_keys SET status = 'destroyed', destroyed_at = $1, \
          wrapped_key = NULL, wrap_nonce = NULL \
@@ -4639,9 +4682,535 @@ pub async fn destroy_encryption_key(
     .bind(destroyed_at)
     .bind(subject_key)
     .bind(subject_value)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+// --- Secret / SecretGrant (docs/architecture.md §Secret) ---
+//
+// A secret version is a row in `{schema}.secret_versions` holding only the
+// *ciphertext* (sealed under that version's own `DataKey`, which is itself
+// wrapped under the process-wide master key) plus metadata. The value is
+// never stored in the clear, so the identical guarantee the inspector
+// already relies on for a sensitive field holds here: a raw database dump
+// and the inspector both see ciphertext, nothing else. Rotation/revocation
+// destroy the version's `EncryptionKey` in the same transaction
+// (`destroy_encryption_key_on`), which is real crypto-shredding.
+//
+// The `secret_grants` table is the only thing that lets a caller past
+// `secrets::require_secret_access`; there is deliberately no admin
+// override, so an ungranted adapter (or an admin) is refused a fetch.
+
+fn secret_versions_table_ddl(schema: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.secret_versions (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            version BIGINT NOT NULL,
+            ciphertext TEXT NOT NULL,
+            encryption_key_id BIGINT NOT NULL REFERENCES {schema}.encryption_keys (id),
+            status TEXT NOT NULL CHECK (status IN ('active', 'rotated', 'revoked')),
+            expires_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL,
+            rotated_at TIMESTAMPTZ,
+            revoked_at TIMESTAMPTZ,
+            last_read_at TIMESTAMPTZ,
+            last_read_by TEXT,
+            UNIQUE (name, version)
+        )"
+    )
+}
+
+fn secret_grants_table_ddl(schema: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.secret_grants (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            grantee_role_id TEXT NOT NULL REFERENCES public.roles (id),
+            status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+            created_at TIMESTAMPTZ NOT NULL,
+            revoked_at TIMESTAMPTZ
+        )"
+    )
+}
+
+/// Creates `secret_versions`/`secret_grants` in one bounded context if they
+/// are not already there - the same "patched into every bounded context,
+/// every startup, no general per-context migration mechanism"
+/// (`ensure_private_field_grants_table`'s own doc comment) treatment.
+pub async fn ensure_secret_tables(pool: &Pool, bounded_context: &str) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(secret_versions_table_ddl(&schema)))
+        .execute(pool)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "secret_versions_unique_active",
+        format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS secret_versions_unique_active \
+             ON {schema}.secret_versions (name) WHERE status = 'active'"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "secret_versions_by_name",
+        format!(
+            "CREATE INDEX IF NOT EXISTS secret_versions_by_name \
+             ON {schema}.secret_versions (name, version DESC)"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(secret_grants_table_ddl(&schema)))
+        .execute(pool)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "secret_grants_by_grantee",
+        format!(
+            "CREATE INDEX IF NOT EXISTS secret_grants_by_grantee \
+             ON {schema}.secret_grants (grantee_role_id, status)"
+        ),
+    )))
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct SecretVersionRow {
+    id: i64,
+    name: String,
+    version: i64,
+    #[allow(dead_code)]
+    ciphertext: String,
+    #[allow(dead_code)]
+    encryption_key_id: i64,
+    status: String,
+    expires_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    rotated_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+    last_read_at: Option<DateTime<Utc>>,
+    last_read_by: Option<String>,
+}
+
+const SECRET_VERSION_COLUMNS: &str = "id, name, version, ciphertext, encryption_key_id, status, \
+     expires_at, created_at, rotated_at, revoked_at, last_read_at, last_read_by";
+
+impl SecretVersionRow {
+    /// The `Secret` domain value - note it carries no ciphertext field at
+    /// all, so the value cannot ride along on a normal query's result even
+    /// by accident.
+    fn to_domain(&self, bounded_context: BoundedContext) -> Secret {
+        Secret {
+            bounded_context,
+            name: self.name.clone(),
+            version: self.version,
+            status: secret_status_from_str(&self.status),
+            expires_at: self.expires_at,
+            created_at: self.created_at,
+            rotated_at: self.rotated_at,
+            revoked_at: self.revoked_at,
+            last_read_at: self.last_read_at,
+            last_read_by: self.last_read_by.clone(),
+        }
+    }
+}
+
+fn secret_status_from_str(s: &str) -> SecretStatus {
+    match s {
+        "rotated" => SecretStatus::Rotated,
+        "revoked" => SecretStatus::Revoked,
+        _ => SecretStatus::Active,
+    }
+}
+
+fn secret_grant_status_from_str(s: &str) -> SecretGrantStatus {
+    match s {
+        "revoked" => SecretGrantStatus::Revoked,
+        _ => SecretGrantStatus::Active,
+    }
+}
+
+/// Serializes every mutating operation on one secret (create/rotate/revoke)
+/// within a bounded context, across instances - a transaction-scoped
+/// advisory lock keyed by the context and name. Without it two concurrent
+/// first-creations could both decide version 1 and collide on
+/// `(name, version)`; with it they serialize, the second seeing the first's
+/// version and rotating it. Released automatically at commit/rollback.
+async fn acquire_secret_lock(
+    conn: &mut sqlx::PgConnection,
+    bounded_context: &str,
+    name: &str,
+) -> crate::error::Result<()> {
+    let key = format!("skilj-secret:{bounded_context}:{name}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(key)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// The active version row. `for_update` takes a row lock (`SELECT ... FOR
+/// UPDATE`) so two concurrent rotations of the same secret serialize: the
+/// second waits, re-reads under `READ COMMITTED`, finds the row no longer
+/// `active`, and provisions the next version instead of colliding on the
+/// `(name, version)` unique constraint.
+async fn get_active_secret_row_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    bounded_context: &str,
+    name: &str,
+    for_update: bool,
+) -> crate::error::Result<Option<SecretVersionRow>> {
+    let schema = schema_ident(bounded_context);
+    let lock = if for_update { " FOR UPDATE" } else { "" };
+    let row: Option<SecretVersionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SECRET_VERSION_COLUMNS} FROM {schema}.secret_versions \
+         WHERE name = $1 AND status = 'active'{lock}"
+    )))
+    .bind(name)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row)
+}
+
+/// The active version of one secret, metadata only - a normal query's own
+/// result shape. Never the value.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context, name = %name))]
+pub async fn get_active_secret(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+) -> crate::error::Result<Option<Secret>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(None);
+    };
+    Ok(get_active_secret_row_on(pool, bounded_context, name, false)
+        .await?
+        .map(|row| row.to_domain(bc)))
+}
+
+/// Every active secret's metadata in one bounded context - the shape a
+/// `secrets` list query returns, `Secret` (metadata) and never
+/// `SecretValue`. Ordered by name so the list is stable.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_active_secrets(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<Vec<Secret>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(Vec::new());
+    };
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<SecretVersionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SECRET_VERSION_COLUMNS} FROM {schema}.secret_versions \
+         WHERE status = 'active' ORDER BY name"
+    )))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|row| row.to_domain(bc.clone())).collect())
+}
+
+/// Creates a secret (or a new version of one, rotating the previous active
+/// version). The value is sealed under a fresh per-version `DataKey` in the
+/// `"secret"`/`"{name}#{version}"` namespace and only the ciphertext is
+/// stored. If a previous version was active, it is retired (`rotated`) and
+/// its key destroyed in the *same* transaction - so an old secret value is
+/// unrecoverable even against someone who later reads the whole database
+/// with the master key in hand.
+///
+/// A concurrent rotation of the same secret serializes on the active row's
+/// own lock (`get_active_secret_row_on`'s `for_update`): the second waits,
+/// finds the version already retired, and provisions the next one rather
+/// than colliding on `(name, version)`.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context, name = %name))]
+pub async fn put_secret_value(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+    plaintext: &str,
+    expires_at: Option<DateTime<Utc>>,
+    master_key: &EncryptionMasterKey,
+    now: DateTime<Utc>,
+) -> crate::error::Result<Secret> {
+    secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    let schema = schema_ident(bounded_context);
+    let mut tx = pool.begin().await?;
+    acquire_secret_lock(&mut tx, bounded_context, name).await?;
+
+    // Retire and shred the currently-active version, if there is one. Read
+    // with the transaction so the version counter below is computed under
+    // the same snapshot.
+    if let Some(old) = get_active_secret_row_on(&mut *tx, bounded_context, name, true).await? {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {schema}.secret_versions SET status = 'rotated', rotated_at = $1 \
+             WHERE id = $2"
+        )))
+        .bind(now)
+        .bind(old.id)
+        .execute(&mut *tx)
+        .await?;
+        let old_subject_value = secrets::subject_value(name, old.version);
+        destroy_encryption_key_on(
+            &mut *tx,
+            &schema,
+            secrets::SUBJECT_KEY,
+            &old_subject_value,
+            now,
+        )
+        .await?;
+    }
+
+    let next_version: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM {schema}.secret_versions WHERE name = $1"
+    )))
+    .bind(name)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let subject_value = secrets::subject_value(name, next_version);
+    let (_key, key_id, data_key) = get_or_create_encryption_key_on(
+        &mut tx,
+        bc.clone(),
+        secrets::SUBJECT_KEY,
+        &subject_value,
+        master_key,
+    )
+    .await?;
+    let ciphertext = encryption::encrypt_leaf(&data_key, plaintext);
+
+    let row: SecretVersionRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.secret_versions \
+         (name, version, ciphertext, encryption_key_id, status, expires_at, created_at) \
+         VALUES ($1, $2, $3, $4, 'active', $5, $6) \
+         RETURNING {SECRET_VERSION_COLUMNS}"
+    )))
+    .bind(name)
+    .bind(next_version)
+    .bind(&ciphertext)
+    .bind(key_id)
+    .bind(expires_at)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(row.to_domain(bc))
+}
+
+/// Explicitly revokes the active version of a secret and destroys its key -
+/// the "end of life" that rotation also performs, but terminal and
+/// deliberate: nothing can fetch this secret again. Returns the
+/// now-revoked version.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context, name = %name))]
+pub async fn revoke_secret(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<Secret> {
+    secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    let schema = schema_ident(bounded_context);
+    let mut tx = pool.begin().await?;
+    acquire_secret_lock(&mut tx, bounded_context, name).await?;
+
+    let Some(row) = get_active_secret_row_on(&mut *tx, bounded_context, name, true).await? else {
+        return Err(secrets::Error::NotActive {
+            name: name.to_string(),
+        }
+        .into());
+    };
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.secret_versions SET status = 'revoked', revoked_at = $1 WHERE id = $2"
+    )))
+    .bind(now)
+    .bind(row.id)
+    .execute(&mut *tx)
+    .await?;
+    let subject_value = secrets::subject_value(name, row.version);
+    destroy_encryption_key_on(&mut *tx, &schema, secrets::SUBJECT_KEY, &subject_value, now).await?;
+
+    tx.commit().await?;
+
+    let mut revoked = row.to_domain(bc);
+    revoked.status = SecretStatus::Revoked;
+    revoked.revoked_at = Some(now);
+    Ok(revoked)
+}
+
+/// Grants one Role read access to one secret. The grant is what
+/// `fetch_secret_value` checks; without it the fetch is refused.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context, name = %name))]
+pub async fn grant_secret_access(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+    grantee_role_id: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<SecretGrant> {
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    let grant = secrets::grant_secret_access(&bc, name, grantee_role_id, now)
+        .map_err(crate::error::Error::from)?;
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.secret_grants \
+         (id, name, grantee_role_id, status, created_at) VALUES ($1, $2, $3, 'active', $4)"
+    )))
+    .bind(&grant.id)
+    .bind(&grant.name)
+    .bind(&grant.grantee_role_id)
+    .bind(grant.created_at)
+    .execute(pool)
+    .await?;
+    Ok(grant)
+}
+
+/// Ends every active grant of `name` to `grantee_role_id`. Returns how many
+/// were revoked (0 is not an error - revoking a grant that was never made,
+/// or was already revoked, is idempotent).
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context, name = %name))]
+pub async fn revoke_secret_access(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+    grantee_role_id: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<u64> {
+    let schema = schema_ident(bounded_context);
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.secret_grants SET status = 'revoked', revoked_at = $1 \
+         WHERE name = $2 AND grantee_role_id = $3 AND status = 'active'"
+    )))
+    .bind(now)
+    .bind(name)
+    .bind(grantee_role_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+#[derive(sqlx::FromRow)]
+struct SecretGrantRow {
+    id: String,
+    name: String,
+    grantee_role_id: String,
+    status: String,
+    created_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+const SECRET_GRANT_COLUMNS: &str = "id, name, grantee_role_id, status, created_at, revoked_at";
+
+impl SecretGrantRow {
+    fn to_domain(&self, bounded_context: BoundedContext) -> SecretGrant {
+        SecretGrant {
+            id: self.id.clone(),
+            bounded_context,
+            name: self.name.clone(),
+            grantee_role_id: self.grantee_role_id.clone(),
+            status: secret_grant_status_from_str(&self.status),
+            created_at: self.created_at,
+            revoked_at: self.revoked_at,
+        }
+    }
+}
+
+/// The active grants naming `grantee_role_id` in one bounded context -
+/// everything `fetch_secret_value` consults for a caller.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_active_secret_grants_for_grantee(
+    pool: &Pool,
+    bounded_context: &str,
+    grantee_role_id: &str,
+) -> crate::error::Result<Vec<SecretGrant>> {
+    let Some(bc) = get_bounded_context(pool, bounded_context).await? else {
+        return Ok(Vec::new());
+    };
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<SecretGrantRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SECRET_GRANT_COLUMNS} FROM {schema}.secret_grants \
+         WHERE grantee_role_id = $1 AND status = 'active'"
+    )))
+    .bind(grantee_role_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|row| row.to_domain(bc.clone())).collect())
+}
+
+/// The one place a secret is ever decrypted: an explicit fetch by a caller
+/// already granted it.
+///
+/// Order matters for the leak list: the grant is checked **before** the
+/// secret is even looked up, so an ungranted caller (`secret_access_not_granted`)
+/// cannot tell a live secret from a missing one - the fetch is a single
+/// opaque "no". A granted caller then gets `secret_not_active` if there is
+/// no active version (rotated/revoked/never created), or the plaintext if
+/// there is. The read is then summarised onto the version's own row
+/// (`last_read_at`/`last_read_by`), one `UPDATE`, never an event per fetch.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context, name = %name))]
+pub async fn fetch_secret_value(
+    pool: &Pool,
+    bounded_context: &str,
+    name: &str,
+    caller_role_id: &str,
+    master_key: &EncryptionMasterKey,
+    now: DateTime<Utc>,
+) -> crate::error::Result<SecretValue> {
+    secrets::validate_secret_name(name).map_err(crate::error::Error::from)?;
+    // Confirms the bounded context exists before anything else; the row
+    // itself is not needed here.
+    let _ = require_bounded_context(pool, bounded_context).await?;
+
+    let grants =
+        list_active_secret_grants_for_grantee(pool, bounded_context, caller_role_id).await?;
+    secrets::require_secret_access(name, caller_role_id, &grants)
+        .map_err(crate::error::Error::from)?;
+
+    let Some(row) = get_active_secret_row_on(pool, bounded_context, name, false).await? else {
+        return Err(secrets::Error::NotActive {
+            name: name.to_string(),
+        }
+        .into());
+    };
+
+    let subject_value = secrets::subject_value(name, row.version);
+    let Some(data_key) = get_active_data_key(
+        pool,
+        bounded_context,
+        secrets::SUBJECT_KEY,
+        &subject_value,
+        master_key,
+    )
+    .await?
+    else {
+        // The active version's key is gone - a torn state that only a raced
+        // revoke/rotate or a manual key destroy could produce. Report it as
+        // no-active-secret rather than panic; nothing is fetchable.
+        return Err(secrets::Error::NotActive {
+            name: name.to_string(),
+        }
+        .into());
+    };
+    let plaintext = encryption::decrypt_leaf(&data_key, &row.ciphertext)?;
+
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.secret_versions SET last_read_at = $1, last_read_by = $2 WHERE id = $3"
+    )))
+    .bind(now)
+    .bind(caller_role_id)
+    .bind(row.id)
+    .execute(pool)
+    .await?;
+
+    Ok(SecretValue::new(plaintext))
 }
 
 /// `forgetSubject`'s blind-tag half (docs/architecture.md §205): for every

@@ -11983,3 +11983,123 @@ Spread commands read their account's history before the lock: a new account, so 
 **Also found.** `blind_tags.rs` started thirteen parallel tests, several `Skilj` instances each, at the default pool size, and intermittently ran out of connections (`PoolTimedOut`) against the embedded server. Its instances now use four connections, like the other test files.
 
 **Not changed: erasure scans the commands.** Commands keep the tags and query they were decided with, for the record; nothing reads them to decide. With a blind tag both hold the hash, so erasure strips it and rotation rewraps it, finding the commands by `consistency_tags @> ...` with no index on `commands`. Measured with the benchmark's million stored commands, one per event: an erasure takes **319 ms**, the scan of the commands table; with a GIN index on `consistency_tags` (`jsonb_path_ops`), **3.4 ms** (median of five accounts each). Rotation, which rewrites nearly every command carrying the key, gains nothing from an index; with the commands it took 27 s. An index on `commands` would sit on the write path under the sequence lock, which is what this section removed from `events`, so it isn't added: a third of a second per erased subject is fine for an admin action. Bulk erasure is the case it isn't (a thousand subjects, five minutes); then a side table of only the blind tags' command rows, filled by a trigger like `event_tags`, would cost nothing to bounded contexts without blind tags.
+
+## 211. Secrets: rotatable credentials an adapter fetches, never a normal read
+
+A fourth field-level protection, alongside `sensitive_fields` (crypto-shredded
+PII, §SubjectErasure) and `private_fields` (§31). A **secret** differs from
+personal data in *who reads it* and *how it ends*, not in how it is protected:
+an OAuth refresh token lives in the same envelope encryption, but it is keyed
+by the secret's own **version** rather than a person, it ends by **rotation**
+(which shreds the previous version) or explicit **revocation** rather than a
+GDPR erasure, and it is **never** returned by a normal query at all - only an
+explicit fetch, by the one adapter granted it.
+
+**What is reused, deliberately.** The whole envelope scheme of
+`crate::encryption` (a per-record `DataKey` wrapped under the process-wide
+`EncryptionMasterKey`) and the crypto-shredding of `db::destroy_encryption_key`
+(nulling the wrapped bytes in the same statement that flips the status). A
+secret version is provisioned into the existing `encryption_keys` table under
+the `"secret"` subject namespace, `subject_value = "{name}#{version}"` - the
+table, `get_or_create_encryption_key` and `destroy_encryption_key` are already
+generic over that namespace, so nothing about the key lifecycle changed. The
+one structural difference from `sensitive_fields` is what the key is *keyed
+by*: a per-version key, so rotating a secret only ever affects that secret's
+own previous value, never anyone else's.
+
+**The model.** `secret_versions` (per bounded context) holds one row per
+version: the **ciphertext** (never the value), the `EncryptionKey` it was
+sealed under, `status` (`active`/`rotated`/`revoked`), `expires_at`, the
+lifecycle timestamps, and the read-audit summary. A partial unique index
+(`name WHERE status = 'active'`) is the same "one active, append-only history"
+shape `encryption_keys_unique_active` already uses, so there is never more
+than one fetchable version of a name. `secret_grants` names the one Role per
+secret that may fetch it. Both tables are created for a new bounded context in
+`provision_bounded_context_schema` and patched into an existing one by
+`ensure_secret_tables` on every `build()` - the same treatment every other
+per-context table gets (§158, §166).
+
+**Rotation and revocation are real shredding, not a status flag.**
+`db::put_secret_value` retires the current active version (`rotated`) and
+destroys its key **in the same transaction** that inserts the new version, so
+there is no window where the old version is gone but its key is not, and a
+later full-database dump - even with the master key in hand - cannot recover
+the previous value. `db::revoke_secret` does the same terminally. Both call a
+new transaction-aware `destroy_encryption_key_on`; the public
+`destroy_encryption_key` now delegates to it, so there is exactly one
+shredding statement.
+
+**Only a granted adapter fetches one.** `fetch_secret_value` checks the
+caller's `secret_grants` **before** it looks the secret up, so an ungranted
+caller gets one opaque `secret_access_not_granted` and cannot tell a live
+secret from a missing one. There is deliberately **no admin override**:
+`AccessLevel::Admin` manages secrets and grants, but reading one is a separate
+entitlement, exactly as Claude's design proposed ("the one adapter granted
+access"). A fresh adapter with no grant is refused by construction.
+
+**A secret that cannot be printed.** `SecretValue` is the one type that must
+never reach anywhere unintended, so it implements **no `Debug`, no `Display`,
+and neither `Serialize` nor `Deserialize`**. That is compile-time prevention
+for the whole leak list: a `format!("{:?}")` does not compile, a struct
+embedding one cannot derive `Debug`, and - the important one - it cannot be
+folded into a serde payload at all, so it can never ride into a command
+payload, an idempotency record, a parked delivery, a rejection reason, or a
+tracing span. The single deliberate escape hatch, `SecretValue::expose`, has
+to be spelled out by hand, so a secret reaching a surface is always a visible,
+reviewable decision rather than an accident. (This is stronger than
+`DataKey`'s own treatment - no `Debug` at all - because a fetched secret is
+plaintext application data, not key material.)
+
+**Normal queries and the inspector never see it.** `Secret` carries
+**metadata only** (`name`, `version`, `status`, expiry, lifecycle and
+read-audit timestamps) - the type physically has no value field, so
+`get_active_secret`/`list_active_secrets` cannot leak one even by mistake.
+A secret never enters an `Event`/`Command` payload or a projection, so the
+GraphQL/REST/TUI read surfaces and `render_event`/`render_command` are
+untouched by it. The value is ciphertext at rest (like a sensitive field), so
+`skilj-inspector` - which reads tables raw and decrypts nothing - sees only
+ciphertext, without needing any redaction logic of its own.
+
+**Read audit is a summary, not an event per fetch.** A fetch updates the
+version row's own `last_read_at`/`last_read_by`, one `UPDATE`. A per-fetch
+event table would grow without bound for a credential an adapter refreshes on
+a timer; "who last read it, and when" is what an audit actually needs.
+
+**Expiry.** `expires_at` plus the pure `secrets::secret_needs_refresh(secret,
+now)` give a scheduler, or a reusing deadline (§46), the "refresh this before
+it expires" trigger.
+
+**How the leak list was checked** (`skilj-core/tests/persistence.rs`,
+`skilj-core/src/secrets/mod.rs`'s own unit tests):
+
+- *Command payloads, idempotency records, queued retries* - `SecretValue` is
+  not `Serialize`, so a secret cannot be embedded in a payload at compile
+  time; skilj's own idempotency records store only event sequences, never a
+  payload; and a secret is out-of-band of the command/event/parked-delivery
+  path entirely.
+- *Rejection reasons and tracing spans* - a `SecretValue` cannot be formatted
+  into either (no `Debug`/`Display`); the only way in is an explicit
+  `.expose()`, which is greppable.
+- *Rotation destroys the previous key* -
+  `put_secret_value_rotates_and_shreds_the_previous_version_key`.
+- *Normal queries, TUI and inspector stay hidden even for an admin* -
+  `secret_metadata_never_carries_the_value` and
+  `secret_value_is_ciphertext_at_rest`; there is no admin-exempt read path.
+- *An adapter without a grant is refused* -
+  `fetch_secret_value_refuses_an_adapter_without_a_grant`.
+- *Revocation shreds and ends the version* -
+  `revoke_secret_shreds_and_ends_the_active_version`.
+- *The read audit is a summary* -
+  `fetch_secret_value_records_a_last_read_summary`.
+
+**Deliberately deferred: the GraphQL/REST surface.** This pass implements the
+whole pattern at the library core (`db::put_secret_value`, `revoke_secret`,
+`grant_secret_access`, `revoke_secret_access`, `fetch_secret_value`,
+`get_active_secret`, `list_active_secrets`) plus its tests; it does not add
+new GraphQL types or fields. Those are checked-in fixtures -
+`skilj/tests/graphql_federation.rs`'s published federation description and
+`skilj/tests/conformance.rs`'s transcript (§179, §194) - so adding a `Secret`
+type and a `fetchSecret` field is its own pass with a deliberate re-record,
+kept separate so this one stays reviewable and doesn't move two fixture
+surfaces at once.
+

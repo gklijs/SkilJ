@@ -179,6 +179,14 @@ fn status_for(err: &CoreError) -> StatusCode {
             StatusCode::FORBIDDEN
         }
         CoreError::Blind(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // Secrets are a GraphQL-only surface today; mapped by what each
+        // rejection actually means rather than left to a wildcard, the way
+        // this whole match already treats every variant.
+        CoreError::Secrets(skilj_core::secrets::Error::AccessNotGranted { .. }) => {
+            StatusCode::FORBIDDEN
+        }
+        CoreError::Secrets(skilj_core::secrets::Error::NotActive { .. }) => StatusCode::FORBIDDEN,
+        CoreError::Secrets(_) => StatusCode::BAD_REQUEST,
         // §7.3/§5.4: a rejection is a legitimate outcome of a successful
         // request, not an HTTP-level error - CommandTrigger's own handler
         // renders this as 200-with-typed-data instead of ever routing a

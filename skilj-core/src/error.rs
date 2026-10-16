@@ -32,6 +32,9 @@ pub enum Error {
     #[error(transparent)]
     Blind(#[from] crate::blind::Error),
 
+    #[error(transparent)]
+    Secrets(#[from] crate::secrets::Error),
+
     #[error("command rejected: {reason}")]
     CommandRejected { reason: String, kind: String },
 
@@ -130,6 +133,7 @@ impl SkiljRejection for Error {
             Error::Bootstrap(e) => e.code(),
             Error::Encryption(e) => e.code(),
             Error::Blind(e) => e.code(),
+            Error::Secrets(e) => e.code(),
             Error::CommandRejected { kind, .. } => kind,
             Error::NoDeciderRegistered => "no_decider_registered",
             Error::Database(_) => "database_error",
@@ -146,6 +150,7 @@ impl SkiljRejection for Error {
             Error::Bootstrap(e) => e.message(),
             Error::Encryption(e) => e.message(),
             Error::Blind(e) => e.message(),
+            Error::Secrets(e) => e.message(),
             Error::CommandRejected { reason, .. } => reason.clone(),
             Error::NoDeciderRegistered => self.to_string(),
             // docs/architecture.md §93: never the raw `sqlx`/Postgres text,
