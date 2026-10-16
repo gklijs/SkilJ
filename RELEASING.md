@@ -112,10 +112,10 @@ instead (pure-Rust `protox`, no external compiler). See
 CONTRIBUTING.md's own note.
 
 `skilj-temporal`'s own dependencies - `temporalio-client`/
-`temporalio-common`/`temporalio-sdk-core` (dev-only) - are "Public
+`temporalio-common` - are "Public
 Preview" per Temporal's own docs as of when this crate was built: "the
 API can and will continue to evolve." Treat a routine `cargo update`
-touching any of the three as something to actually review, not the
+touching either as something to actually review, not the
 same "trust semver, move on" confidence the rest of this workspace's
 dependencies warrant - a patch-level bump there is more likely than
 usual to need a real code change here, not just a version bump.

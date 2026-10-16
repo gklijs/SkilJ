@@ -5847,8 +5847,9 @@ absent tag, `null`-valued tag, bounded-context-qualifies the id,
 `signal_request_id` stable across a simulated redelivery and distinct
 per event) plus 3 real end-to-end tests
 (`skilj-temporal/tests/temporal_bridge.rs`) against a *real*, ephemeral
-Temporal service (`temporalio_sdk_core::ephemeral_server::TestServerConfig`,
-dev-dependency only - never linked into the shipped crate) and a small
+Temporal service (a `temporal-test-server` the test downloads from
+`temporal.download` and launches itself,
+dev-only - never linked into the shipped crate) and a small
 local mock of skilj's own REST surface (the same "wire protocol only,
 no real skilj crate" treatment `skilj-tui`'s own
 `tests/subscription.rs` already gives its GraphQL half, since skilj's

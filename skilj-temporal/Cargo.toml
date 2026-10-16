@@ -29,6 +29,21 @@ path = "src/lib.rs"
 # Temporal service - never a production dependency of skilj-temporal
 # itself (which speaks only `temporalio-client`, the thin gRPC client -
 # see docs/architecture.md §34's own note on why `temporalio-sdk`, the
-# worker/Activity-authoring crate, is deliberately not depended on).
-temporalio-sdk-core = { version = "0.9.0", features = ["ephemeral-server"] }
+# worker/Activity-authoring crate, is deliberately not depended on). The
+# test downloads and launches that service itself rather than through
+# `temporalio-sdk-core`'s `ephemeral-server` feature: that feature's
+# `zip = "^8.4"` dependency can no longer be resolved, because crates.io
+# yanked every `zip` release before 9.0.3 (three HIGH archive-extraction
+# advisories, Oct 2026) and no fixed 8.x exists. See
+# `tests/temporal_bridge.rs`'s own `start_temporal`.
 axum = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The Unix test-server archive is a `.tar.gz`.
+flate2 = "1"
+tar = "0.4"
+
+[target.'cfg(windows)'.dev-dependencies]
+# The Windows test-server archive is a `.zip`; 9.x is the fixed line (the
+# yanked 8.x line is exactly what this crate no longer depends on).
+zip = { version = "9", default-features = false, features = ["deflate"] }

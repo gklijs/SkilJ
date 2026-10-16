@@ -1,7 +1,7 @@
 //! End-to-end proof of `skilj_temporal::poll_once` against two real
 //! systems, neither mocked at the protocol level it matters for: a real,
-//! ephemeral Temporal service (`temporalio_sdk_core`'s own
-//! `TestServerConfig`, dev-dependency only - see this crate's own
+//! ephemeral Temporal service (a `temporal-test-server` this file
+//! downloads and launches itself, dev-only - see this crate's own
 //! Cargo.toml) receives the actual `StartWorkflowExecution`/
 //! `SignalWorkflowExecution` calls this crate makes, and proves they
 //! really take effect there, not just that no error was returned. The
@@ -17,10 +17,9 @@
 //! Downloads a small (~25MB) test-server binary on first run, cached
 //! under `~/.cache/skilj-temporal-test-server` (never `/tmp` - see
 //! CONTRIBUTING.md's own note on that directory's tmpfs-fill history)
-//! for 15 days per `temporalio_sdk_core::ephemeral_server::default_cached_download`'s
-//! own TTL. Skips gracefully, the same register every other real-external-
-//! service test in this workspace already uses (`DATABASE_URL`-then-
-//! embedded-Postgres-then-skip), if that download can't reach the
+//! for 15 days. Skips gracefully, the same register every other real-
+//! external-service test in this workspace already uses (`DATABASE_URL`-
+//! then-embedded-Postgres-then-skip), if that download can't reach the
 //! network in a given environment.
 //! `SKILJ_TEMPORAL_TEST_SERVER=/path/to/temporal-test-server` runs that
 //! binary instead of downloading one; the Java SDK's GitHub releases
@@ -45,54 +44,252 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// A launched `temporal-test-server`, stopped when this is dropped.
+struct TemporalServer {
+    /// gRPC target host:port of the server frontend.
+    target: String,
+    /// Held only for its `kill_on_drop` - dropping this struct stops the
+    /// server, the same lifecycle `temporalio-sdk-core`'s own
+    /// `EphemeralServer` used to give us.
+    _child: tokio::process::Child,
+}
+
 /// Starts a real, ephemeral Temporal service - `None` (skip) if the
 /// one-time binary download can't reach the network here, the same
 /// tolerance this workspace's own embedded-Postgres tests already have
 /// for their own external dependency.
-async fn start_temporal() -> Option<temporalio_sdk_core::ephemeral_server::EphemeralServer> {
-    use temporalio_sdk_core::ephemeral_server::{
-        EphemeralExe, EphemeralExeVersion, TestServerConfig,
-    };
-
+///
+/// This used to be `temporalio-sdk-core`'s own `ephemeral-server`
+/// feature, but that dependency's `zip = "^8.4"` cannot be resolved any
+/// more: crates.io yanked every `zip` release before 9.0.3 after three
+/// HIGH archive-extraction advisories (Oct 2026), and no fixed 8.x
+/// exists. So the provisioning is done here, mirroring what that feature
+/// did - ask `temporal.download` which archive to fetch, cache the
+/// extracted executable, launch it on a free port, wait for its gRPC
+/// frontend - with the archive unpacked by `tar`/`flate2` (Unix) or the
+/// fixed `zip` 9 (Windows) instead of the vulnerable 8.x line.
+async fn start_temporal() -> Option<TemporalServer> {
     // `SKILJ_TEMPORAL_TEST_SERVER` names a `temporal-test-server` binary to
     // run instead of downloading one - for a network that blocks
     // temporal.download. It is also published with the Java SDK's GitHub
     // releases (`temporal-test-server_<version>_linux_amd64.tar.gz`).
     let exe = match std::env::var("SKILJ_TEMPORAL_TEST_SERVER") {
-        Ok(path) => EphemeralExe::ExistingPath(path),
-        Err(_) => EphemeralExe::CachedDownload {
-            version: EphemeralExeVersion::SDKDefault {
-                sdk_name: "sdk-rust".to_string(),
-                sdk_version: "0.1.0".to_string(),
-            },
-            dest_dir: Some(dirs_cache_dir()),
-            ttl: Some(std::time::Duration::from_secs(60 * 60 * 24 * 15)),
+        Ok(path) => {
+            let path = std::path::PathBuf::from(path);
+            if !path.exists() {
+                eprintln!(
+                    "skipping: SKILJ_TEMPORAL_TEST_SERVER={} does not exist",
+                    path.display()
+                );
+                return None;
+            }
+            path
+        }
+        Err(_) => match cached_test_server().await {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "skipping: downloading the ephemeral Temporal test server failed \
+                     (no network egress to temporal.download, most likely): {e}"
+                );
+                return None;
+            }
         },
     };
-    let config = TestServerConfig {
-        exe,
-        port: None,
-        extra_args: Vec::new(),
-    };
-    match config
-        .start_server_with_output(std::process::Stdio::null(), std::process::Stdio::null())
-        .await
-    {
-        Ok(server) => Some(server),
+
+    let port = match free_port() {
+        Ok(port) => port,
         Err(e) => {
-            eprintln!(
-                "skipping: starting the ephemeral Temporal test server failed \
-                 (no network egress to download it, most likely): {e:?}"
-            );
-            None
+            eprintln!("skipping: no free TCP port for the ephemeral Temporal test server: {e}");
+            return None;
+        }
+    };
+    let mut child = match tokio::process::Command::new(&exe)
+        .arg(port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("skipping: starting {} failed: {e}", exe.display());
+            return None;
+        }
+    };
+
+    let target = format!("127.0.0.1:{port}");
+    let options = ConnectionOptions::new(
+        format!("http://{target}")
+            .parse::<temporalio_client::Url>()
+            .unwrap(),
+    )
+    .build();
+    // Try to connect every 100ms for 5s, the same readiness check
+    // `EphemeralServer` used.
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if Connection::connect(options.clone()).await.is_ok() {
+            return Some(TemporalServer {
+                target,
+                _child: child,
+            });
         }
     }
+    let _ = child.kill().await;
+    eprintln!("skipping: the ephemeral Temporal test server at {target} did not become ready");
+    None
 }
 
 /// Never `/tmp` - see this file's own doc comment.
-fn dirs_cache_dir() -> String {
+fn cache_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").expect("HOME must be set");
-    format!("{home}/.cache/skilj-temporal-test-server")
+    std::path::PathBuf::from(home).join(".cache/skilj-temporal-test-server")
+}
+
+/// The extracted test-server executable for this platform.
+fn cache_path() -> std::path::PathBuf {
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    cache_dir().join(format!("temporal-test-server-sdk-rust-0.1.0{ext}"))
+}
+
+/// A TCP port the OS reports as free, the same `get_free_port` the SDK's
+/// own ephemeral server used.
+fn free_port() -> std::io::Result<u16> {
+    Ok(std::net::TcpListener::bind(("0.0.0.0", 0))?
+        .local_addr()?
+        .port())
+}
+
+/// What `temporal.download` answers with: the archive to fetch and the
+/// path of the executable inside it.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadInfo {
+    archive_url: String,
+    file_to_extract: String,
+}
+
+/// Downloads and extracts the platform's test server, reusing the cached
+/// copy (15 days, the SDK's own TTL) when it is still fresh. Guarded by a
+/// `OnceCell` so the parallel test threads share one download instead of
+/// racing each other into the same cache file.
+async fn cached_test_server() -> Result<std::path::PathBuf, String> {
+    static CELL: tokio::sync::OnceCell<Result<std::path::PathBuf, String>> =
+        tokio::sync::OnceCell::const_new();
+    CELL.get_or_init(download_test_server).await.clone()
+}
+
+/// The body of `cached_test_server`, run at most once per test process.
+async fn download_test_server() -> Result<std::path::PathBuf, String> {
+    let dest = cache_path();
+    if let Ok(mtime) = std::fs::metadata(&dest).and_then(|m| m.modified()) {
+        if mtime.elapsed().unwrap_or_default() < Duration::from_secs(60 * 60 * 24 * 15) {
+            return Ok(dest);
+        }
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "arm" | "aarch64" => "arm64",
+        other => return Err(format!("unsupported architecture: {other}")),
+    };
+    let platform = match std::env::consts::OS {
+        "windows" => "windows",
+        "macos" => "darwin",
+        _ => "linux",
+    };
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("could not build the download client: {e}"))?;
+    let info: DownloadInfo = client
+        .get(format!(
+            "https://temporal.download/temporal-test-server/default\
+             ?arch={arch}&platform={platform}&sdk-name=sdk-rust&sdk-version=0.1.0"
+        ))
+        .send()
+        .await
+        .map_err(|e| format!("could not reach temporal.download: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("temporal.download rejected the request: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("could not parse the temporal.download response: {e}"))?;
+
+    let bytes = client
+        .get(&info.archive_url)
+        .send()
+        .await
+        .map_err(|e| format!("could not download {}: {e}", info.archive_url))?
+        .error_for_status()
+        .map_err(|e| format!("downloading {} failed: {e}", info.archive_url))?
+        .bytes()
+        .await
+        .map_err(|e| format!("could not read {}: {e}", info.archive_url))?;
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    }
+    extract_server(&info.archive_url, &info.file_to_extract, &bytes, &dest)
+        .map_err(|e| format!("could not extract {}: {e}", info.file_to_extract))?;
+    Ok(dest)
+}
+
+#[cfg(unix)]
+fn extract_server(
+    archive_url: &str,
+    file_to_extract: &str,
+    bytes: &[u8],
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if !archive_url.ends_with(".tar.gz") {
+        return Err(format!("unsupported archive format: {archive_url}"));
+    }
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        if entry.path().map_err(|e| e.to_string())?.as_ref()
+            == std::path::Path::new(file_to_extract)
+        {
+            // Mode 0o755, the same one the SDK's own downloader used - the
+            // archive's own entry mode is not copied by `io::copy`.
+            let mut out = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o755)
+                .open(dest)
+                .map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+    Err(format!("{file_to_extract} not found in {archive_url}"))
+}
+
+#[cfg(windows)]
+fn extract_server(
+    archive_url: &str,
+    file_to_extract: &str,
+    bytes: &[u8],
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    if !archive_url.ends_with(".zip") {
+        return Err(format!("unsupported archive format: {archive_url}"));
+    }
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let mut entry = archive
+        .by_name(file_to_extract)
+        .map_err(|e| e.to_string())?;
+    let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 async fn connect_temporal(target: &str) -> Client {

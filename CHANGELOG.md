@@ -89,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The event cache refills a bounded context's window when its
   registrations stamp changes, rather than only reloading the types, so
   an erasure that rewrites tags reaches every instance's cache.
+- `skilj-temporal`'s Temporal integration test no longer depends on
+  `temporalio-sdk-core`'s `ephemeral-server` feature (dev-only,
+  docs/architecture.md §34): that feature's `zip = "^8.4"` is
+  unresolvable now that crates.io has yanked every `zip` release before
+  9.0.3 (three HIGH archive-extraction advisories, Oct 2026), and no
+  fixed 8.x exists. The test downloads and launches the
+  `temporal-test-server` itself, unpacking the `.tar.gz` with
+  `tar`/`flate2` and the Windows `.zip` with the fixed `zip` 9.
 
 ## [0.0.10] - 2026-10-11
 
