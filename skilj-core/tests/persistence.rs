@@ -2847,3 +2847,123 @@ fn destroy_encryption_key_refuses_a_secret_version_key() {
         assert_eq!(fetched.expose(), "token");
     });
 }
+
+/// The public provisioning door refuses the secrets namespace too, so an
+/// application cannot `get_or_create_encryption_key` its way onto a secret
+/// version's key.
+#[test]
+fn get_or_create_encryption_key_refuses_the_secrets_namespace() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([29u8; 32]);
+
+        match db::get_or_create_encryption_key(
+            &pool,
+            &bc.name,
+            skilj_core::secrets::SUBJECT_KEY,
+            &secret_subject("linkedin", 1),
+            &master,
+        )
+        .await
+        {
+            Err(e) => assert_eq!(
+                e.code(),
+                skilj_core::secrets::Error::ReservedSubjectKey.code()
+            ),
+            Ok(_) => panic!("the secrets namespace must be reserved for provisioning"),
+        }
+    });
+}
+
+/// The public unwrap door refuses it as well; the only way to a secret
+/// version's `DataKey` is `fetch_secret_value`.
+#[test]
+fn get_active_data_key_refuses_the_secrets_namespace() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([30u8; 32]);
+        let name = "unwrap-door";
+        db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            &skilj_core::secrets::SecretValue::new("v"),
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        match db::get_active_data_key(
+            &pool,
+            &bc.name,
+            skilj_core::secrets::SUBJECT_KEY,
+            &secret_subject(name, 1),
+            &master,
+        )
+        .await
+        {
+            Err(e) => assert_eq!(
+                e.code(),
+                skilj_core::secrets::Error::ReservedSubjectKey.code()
+            ),
+            Ok(_) => panic!("the secrets namespace must be reserved for unwrapping"),
+        }
+    });
+}
+
+/// The projection decrypt-on-read lookup matches on `subject_value` across
+/// every namespace and so excludes the reserved one: a subject value that
+/// collides with a secret version's hand out the other namespace's key,
+/// never the secret's.
+#[test]
+fn list_active_data_keys_for_subject_value_excludes_the_secrets_namespace() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([31u8; 32]);
+        let name = "shadowed";
+        let subject_value = secret_subject(name, 1);
+
+        db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            &skilj_core::secrets::SecretValue::new("secret-value"),
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+        // A non-reserved key sharing the exact subject value.
+        let (_key, _id, user_key) =
+            db::get_or_create_encryption_key(&pool, &bc.name, "user", &subject_value, &master)
+                .await
+                .unwrap();
+        let ciphertext = skilj_core::encryption::encrypt_leaf(&user_key, "user-value");
+
+        let keys = db::list_active_data_keys_for_subject_value(
+            &pool,
+            &bc.name,
+            &subject_value,
+            Some(&master),
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys.len(), 1, "the reserved key must be excluded");
+        assert_eq!(
+            skilj_core::encryption::decrypt_leaf(&keys[0], &ciphertext).unwrap(),
+            "user-value"
+        );
+    });
+}

@@ -126,7 +126,7 @@ async-graphql = { version = "7", features = ["tracing"] }
 async-graphql-axum = "7"
 proptest = "1"
 ring = "0.17"
-zeroize = { version = "1", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 syn = "3"
 quote = "1"
 proc-macro2 = "1"

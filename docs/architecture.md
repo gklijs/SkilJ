@@ -12009,17 +12009,25 @@ own previous value, never anyone else's.
 
 **The `"secret"` namespace is reserved.** Sharing the table means anything
 else that reaches `encryption_keys` by subject key could reach a secret's
-key, so `secrets::is_reserved_subject_key` is checked at each such door:
+key, so `secrets::is_reserved_subject_key` is checked at every such door:
 `register_event_type`/`register_command_type` reject a `SensitiveField`
 whose `subject_key` is `"secret"` (otherwise an application payload naming
-`"linkedin#3"` would provision or share that version's key), and
+`"linkedin#3"` would provision or share that version's key),
 `event_store::forget_subject` and the public `db::destroy_encryption_key`
 refuse it (otherwise an admin's `forgetSubject` would shred a version's key
 while its row still said `active` - nothing leaks, a fetch already reports
 `secret_not_active` for that torn state, but `list_active_secrets` would
-keep listing a secret nobody can read). All three reject with
-`subject_key_reserved`. Only `put_secret_value`/`revoke_secret`, through the
-private `destroy_encryption_key_on`, shred a secret's key.
+keep listing a secret nobody can read), and the public
+`db::get_or_create_encryption_key`/`db::get_active_data_key` refuse it (so
+an application can neither provision nor unwrap a secret version's key by
+naming its namespace). `db::list_active_data_keys_for_subject_value` - the
+projection decrypt-on-read path, which matches on `subject_value` alone
+across every namespace - excludes the reserved one rather than refusing
+outright. All of these reject with `subject_key_reserved`; the secrets
+module reaches the reserved namespace through the private
+`get_or_create_encryption_key_on`/`get_active_data_key_on`/`destroy_encryption_key_on`,
+so only `put_secret_value`/`revoke_secret` can provision or shred a secret's
+key and only `fetch_secret_value` can unwrap it.
 
 **The model.** `secret_versions` (per bounded context) holds one row per
 version: the **ciphertext** (never the value), the `EncryptionKey` it was
@@ -12084,13 +12092,19 @@ stores, so a plain loop of zeros can silently compile to nothing. A correct
 hand-rolled wipe needs `unsafe` `ptr::write_volatile` per byte plus a
 `compiler_fence` - small, but new `unsafe` code of our own that only a
 review would ever check. `zeroize` is exactly that code, widely used and
-reviewed, with no dependencies of its own (`default-features = false`
-leaves out even its derive macro), and it is **already compiled into every
-skilj build** through rustls and aws-lc-rs (via sqlx, reqwest and
+reviewed, with no dependencies of its own, and it is **already compiled into
+every skilj build** through rustls and aws-lc-rs (via sqlx, reqwest and
 jsonwebtoken). Naming it as a direct dependency therefore adds no code to
-the build and nothing to the attack surface, while rolling our own would
-add `unsafe` code. The same reasoning made `ring` a direct dependency
-(see the encryption write-up). `zeroize` was chosen.
+the build and nothing to the attack surface, while rolling our own would add
+`unsafe` code. The same reasoning made `ring` a direct dependency (see the
+encryption write-up). `zeroize` was chosen.
+
+Its one feature that matters here is `alloc`, which is what provides
+`impl Zeroize for String`; it is named explicitly
+(`default-features = false, features = ["alloc"]`) rather than relied on
+through feature unification from a TLS crate, so `self.0.zeroize()` keeps
+compiling if that path ever leaves the graph. Naming a feature that is
+already enabled adds nothing to the build.
 
 **Normal queries and the inspector never see it.** `Secret` carries
 **metadata only** (`name`, `version`, `status`, expiry, lifecycle and
@@ -12147,9 +12161,12 @@ and revocation end what a fetch can return.
   `register_command_type_rejects_a_sensitive_field_in_the_secrets_namespace`
   (`type_registration.rs`),
   `forget_subject_rejects_a_key_in_the_secrets_namespace`
-  (`subject_erasure.rs`) and
-  `destroy_encryption_key_refuses_a_secret_version_key`, which also checks
-  the secret is still fetchable afterwards.
+  (`subject_erasure.rs`),
+  `destroy_encryption_key_refuses_a_secret_version_key` (which also checks
+  the secret is still fetchable afterwards),
+  `get_or_create_encryption_key_refuses_the_secrets_namespace`,
+  `get_active_data_key_refuses_the_secrets_namespace` and
+  `list_active_data_keys_for_subject_value_excludes_the_secrets_namespace`.
 - *Refresh is due before expiry* -
   `refresh_is_due_within_the_lead_time_of_expiry`.
 

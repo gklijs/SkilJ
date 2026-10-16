@@ -4315,6 +4315,11 @@ const ENCRYPTION_KEY_COLUMNS: &str =
 /// already has. The caller needs `id` to link `event_encryption_keys`/
 /// `command_encryption_keys` join rows once the event/command itself is
 /// inserted.
+///
+/// Refuses the secrets namespace (`secrets::is_reserved_subject_key`): an
+/// application's declared `SensitiveField` cannot provision or share a
+/// secret version's key. A secret version's own key is provisioned by
+/// `put_secret_value` through the private `get_or_create_encryption_key_on`.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_or_create_encryption_key(
     pool: &Pool,
@@ -4323,6 +4328,9 @@ pub async fn get_or_create_encryption_key(
     subject_value: &str,
     master_key: &EncryptionMasterKey,
 ) -> crate::error::Result<(EncryptionKey, i64, DataKey)> {
+    if secrets::is_reserved_subject_key(subject_key) {
+        return Err(secrets::Error::ReservedSubjectKey.into());
+    }
     let bc = require_bounded_context(pool, bounded_context).await?;
     get_or_create_encryption_key_on(
         &mut *pool.acquire().await?,
@@ -4590,8 +4598,36 @@ pub async fn get_active_encryption_key(
 /// `ForgetSubject`" identically, matching `resolve_data_keys_for_reading`'s
 /// own doc comment for why that's correct crypto-shredding behaviour, not
 /// a gap.
+///
+/// Refuses the secrets namespace (`secrets::is_reserved_subject_key`): a
+/// secret version's key is only ever unwrapped by `fetch_secret_value`,
+/// which goes through the private `get_active_data_key_on`. An
+/// application's declared `SensitiveField` cannot read a secret's key.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_active_data_key(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+    master_key: &EncryptionMasterKey,
+) -> crate::error::Result<Option<DataKey>> {
+    if secrets::is_reserved_subject_key(subject_key) {
+        return Err(secrets::Error::ReservedSubjectKey.into());
+    }
+    get_active_data_key_on(
+        pool,
+        bounded_context,
+        subject_key,
+        subject_value,
+        master_key,
+    )
+    .await
+}
+
+/// [`get_active_data_key`] without the reserved-namespace guard - the shared
+/// body, used by `fetch_secret_value` (which is *how* the reserved
+/// namespace is meant to be reached) and by the public wrapper above.
+async fn get_active_data_key_on(
     pool: &Pool,
     bounded_context: &str,
     subject_key: &str,
@@ -4620,6 +4656,11 @@ pub async fn get_active_data_key(
 /// configuration error `resolve_encryption_keys`/`resolve_data_keys_for_reading`
 /// already raise for the same underlying reason - confirmed with the
 /// user before building real decrypt-on-read at all.
+///
+/// Excludes the secrets namespace (`secrets::SUBJECT_KEY`): a projection
+/// never holds a secret version's ciphertext, and a secret's key is only
+/// ever unwrapped by `fetch_secret_value`, so a subject value that
+/// happens to match a secret version must not hand its `DataKey` out here.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_active_data_keys_for_subject_value(
     pool: &Pool,
@@ -4630,9 +4671,10 @@ pub async fn list_active_data_keys_for_subject_value(
     let schema = schema_ident(bounded_context);
     let rows: Vec<EncryptionKeyRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ENCRYPTION_KEY_COLUMNS} FROM {schema}.encryption_keys \
-         WHERE subject_value = $1 AND status = 'active'"
+         WHERE subject_value = $1 AND status = 'active' AND subject_key <> $2"
     )))
     .bind(subject_value)
+    .bind(secrets::SUBJECT_KEY)
     .fetch_all(pool)
     .await?;
     if rows.is_empty() {
@@ -5204,7 +5246,7 @@ pub async fn fetch_secret_value(
     };
 
     let subject_value = secrets::subject_value(name, row.version);
-    let Some(data_key) = get_active_data_key(
+    let Some(data_key) = get_active_data_key_on(
         pool,
         bounded_context,
         secrets::SUBJECT_KEY,
