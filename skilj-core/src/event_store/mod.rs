@@ -2709,6 +2709,12 @@ pub fn register_event_type(
     if !valid_sensitive_fields(&schema, &sensitive_fields) {
         return Err(Error::InvalidSensitiveField.into());
     }
+    if sensitive_fields
+        .iter()
+        .any(|s| crate::secrets::is_reserved_subject_key(&s.subject_key))
+    {
+        return Err(crate::secrets::Error::ReservedSubjectKey.into());
+    }
     if !valid_private_fields(&schema, &private_fields) {
         return Err(Error::InvalidPrivateField.into());
     }
@@ -2884,6 +2890,12 @@ pub fn register_command_type(
     if !valid_sensitive_fields(&schema, &sensitive_fields) {
         return Err(Error::InvalidSensitiveField.into());
     }
+    if sensitive_fields
+        .iter()
+        .any(|s| crate::secrets::is_reserved_subject_key(&s.subject_key))
+    {
+        return Err(crate::secrets::Error::ReservedSubjectKey.into());
+    }
     if !valid_private_fields(&schema, &private_fields) {
         return Err(Error::InvalidPrivateField.into());
     }
@@ -2982,6 +2994,12 @@ pub fn forget_subject(
     }
     if key.status != EncryptionKeyStatus::Active {
         return Err(Error::EncryptionKeyNotActive.into());
+    }
+    // A secret version's key is shredded only by its own rotation or
+    // revocation, which retire the version row with it (docs/architecture.md
+    // §211) - never by an admin erasure that would leave the row `active`.
+    if crate::secrets::is_reserved_subject_key(&key.subject_key) {
+        return Err(crate::secrets::Error::ReservedSubjectKey.into());
     }
 
     Ok(EncryptionKey {

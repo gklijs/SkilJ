@@ -1497,3 +1497,72 @@ fn valid_payload_caches_compiled_schemas_by_content() {
         five
     ));
 }
+
+/// docs/architecture.md §211 - a `SensitiveField` may not use the subject
+/// key secrets reserve, so an application's payload can never provision or
+/// share a secret version's `EncryptionKey`.
+#[test]
+fn register_event_type_rejects_a_sensitive_field_in_the_secrets_namespace() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let reserved = SensitiveField {
+        subject_key: skilj_core::secrets::SUBJECT_KEY.into(),
+        ..sensitive_field("currency", "amount")
+    };
+
+    let err = event_store::register_event_type(
+        &mapping,
+        &bc,
+        "OrderPlaced".into(),
+        schema_v1(),
+        Vec::new(),
+        None,
+        vec![reserved],
+        Vec::new(),
+        false,
+        false,
+        false,
+        None,
+        None,
+        false,
+        None,
+        timestamp(0),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        skilj_core::secrets::Error::ReservedSubjectKey.code()
+    );
+}
+
+/// The same reservation on the command side - a command's payload is
+/// protected by the same `SensitiveField` mechanism.
+#[test]
+fn register_command_type_rejects_a_sensitive_field_in_the_secrets_namespace() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let bc = bounded_context(BoundedContextStatus::Active);
+    let reserved = SensitiveField {
+        subject_key: skilj_core::secrets::SUBJECT_KEY.into(),
+        ..sensitive_field("currency", "amount")
+    };
+
+    let err = event_store::register_command_type(
+        &mapping,
+        &bc,
+        "PlaceOrder".into(),
+        schema_v1(),
+        Vec::new(),
+        None,
+        vec![reserved],
+        Vec::new(),
+        false,
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        skilj_core::secrets::Error::ReservedSubjectKey.code()
+    );
+}

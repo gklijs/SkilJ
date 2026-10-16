@@ -12007,6 +12007,20 @@ one structural difference from `sensitive_fields` is what the key is *keyed
 by*: a per-version key, so rotating a secret only ever affects that secret's
 own previous value, never anyone else's.
 
+**The `"secret"` namespace is reserved.** Sharing the table means anything
+else that reaches `encryption_keys` by subject key could reach a secret's
+key, so `secrets::is_reserved_subject_key` is checked at each such door:
+`register_event_type`/`register_command_type` reject a `SensitiveField`
+whose `subject_key` is `"secret"` (otherwise an application payload naming
+`"linkedin#3"` would provision or share that version's key), and
+`event_store::forget_subject` and the public `db::destroy_encryption_key`
+refuse it (otherwise an admin's `forgetSubject` would shred a version's key
+while its row still said `active` - nothing leaks, a fetch already reports
+`secret_not_active` for that torn state, but `list_active_secrets` would
+keep listing a secret nobody can read). All three reject with
+`subject_key_reserved`. Only `put_secret_value`/`revoke_secret`, through the
+private `destroy_encryption_key_on`, shred a secret's key.
+
 **The model.** `secret_versions` (per bounded context) holds one row per
 version: the **ciphertext** (never the value), the `EncryptionKey` it was
 sealed under, `status` (`active`/`rotated`/`revoked`), `expires_at`, the
@@ -12017,7 +12031,10 @@ than one fetchable version of a name. `secret_grants` names the one Role per
 secret that may fetch it. Both tables are created for a new bounded context in
 `provision_bounded_context_schema` and patched into an existing one by
 `ensure_secret_tables` on every `build()` - the same treatment every other
-per-context table gets (§158, §166).
+per-context table gets (§158, §166). Reading a status back fails closed: any
+string other than the known ones maps to the terminal state (`revoked`), never
+to `active` - unreachable under the CHECK constraints, but the safe direction
+if a later status is ever added without updating the mapping.
 
 **Rotation and revocation are real shredding, not a status flag.**
 `db::put_secret_value` retires the current active version (`rotated`) and
@@ -12048,7 +12065,32 @@ tracing span. The single deliberate escape hatch, `SecretValue::expose`, has
 to be spelled out by hand, so a secret reaching a surface is always a visible,
 reviewable decision rather than an accident. (This is stronger than
 `DataKey`'s own treatment - no `Debug` at all - because a fetched secret is
-plaintext application data, not key material.)
+plaintext application data, not key material.) It covers both directions:
+`put_secret_value` takes a `&SecretValue` too, not a `&str`, so the value an
+adapter writes back (a refreshed OAuth token) gets the same protection on its
+way in as on its way out.
+
+**Wiped on drop, and not `Clone`.** `SecretValue` has one owner and one
+buffer, and `Drop` overwrites that buffer with zeros. On the fetch path that
+buffer is the very one AES-GCM decrypted into (`decrypt_leaf` hands its
+`Vec` to `String::from_utf8`, which reuses it), so no other plaintext copy
+is made inside skilj. What it does not cover, and is not meant to: copies a
+caller makes after `expose()`, and the database driver's own row buffers.
+It narrows how long a secret lingers in memory; it is not a guarantee.
+
+*Rolling our own, or `zeroize`?* The one non-obvious part of a wipe is that
+the compiler may delete writes to memory that is about to be freed as dead
+stores, so a plain loop of zeros can silently compile to nothing. A correct
+hand-rolled wipe needs `unsafe` `ptr::write_volatile` per byte plus a
+`compiler_fence` - small, but new `unsafe` code of our own that only a
+review would ever check. `zeroize` is exactly that code, widely used and
+reviewed, with no dependencies of its own (`default-features = false`
+leaves out even its derive macro), and it is **already compiled into every
+skilj build** through rustls and aws-lc-rs (via sqlx, reqwest and
+jsonwebtoken). Naming it as a direct dependency therefore adds no code to
+the build and nothing to the attack surface, while rolling our own would
+add `unsafe` code. The same reasoning made `ring` a direct dependency
+(see the encryption write-up). `zeroize` was chosen.
 
 **Normal queries and the inspector never see it.** `Secret` carries
 **metadata only** (`name`, `version`, `status`, expiry, lifecycle and
@@ -12066,8 +12108,17 @@ event table would grow without bound for a credential an adapter refreshes on
 a timer; "who last read it, and when" is what an audit actually needs.
 
 **Expiry.** `expires_at` plus the pure `secrets::secret_needs_refresh(secret,
-now)` give a scheduler, or a reusing deadline (§46), the "refresh this before
-it expires" trigger.
+now, lead_time)` give a scheduler, or a reusing deadline (§46), the "refresh
+this before it expires" trigger. It is due once `now` is within `lead_time`
+of `expires_at`, not at expiry itself: by then an OAuth token has already
+stopped working, so the caller picks a margin covering its polling interval
+plus the refresh round trip (`Duration::zero()` gives "only once expired").
+
+Expiry is **advisory**: `fetch_secret_value` still returns an active version
+after its `expires_at`. The credential's issuer is what enforces expiry, and
+an adapter refreshing an expired access token typically still needs the
+stored refresh token, or the expired value itself, to do it. Only rotation
+and revocation end what a fetch can return.
 
 **How the leak list was checked** (`skilj-core/tests/persistence.rs`,
 `skilj-core/src/secrets/mod.rs`'s own unit tests):
@@ -12091,6 +12142,16 @@ it expires" trigger.
   `revoke_secret_shreds_and_ends_the_active_version`.
 - *The read audit is a summary* -
   `fetch_secret_value_records_a_last_read_summary`.
+- *The namespace is reserved* -
+  `register_event_type_rejects_a_sensitive_field_in_the_secrets_namespace`,
+  `register_command_type_rejects_a_sensitive_field_in_the_secrets_namespace`
+  (`type_registration.rs`),
+  `forget_subject_rejects_a_key_in_the_secrets_namespace`
+  (`subject_erasure.rs`) and
+  `destroy_encryption_key_refuses_a_secret_version_key`, which also checks
+  the secret is still fetchable afterwards.
+- *Refresh is due before expiry* -
+  `refresh_is_due_within_the_lead_time_of_expiry`.
 
 **Deliberately deferred: the GraphQL/REST surface.** This pass implements the
 whole pattern at the library core (`db::put_secret_value`, `revoke_secret`,

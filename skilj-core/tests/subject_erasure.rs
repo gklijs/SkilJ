@@ -220,3 +220,23 @@ fn forget_subject_never_creates_a_second_active_key() {
 // GraphQL-scaffolding gap, same as every prior surface's deferred set
 // (see command_processing.rs's header comment) - no resolver/schema
 // wiring in skilj-graphql yet.
+
+/// docs/architecture.md §211 - the secrets namespace is reserved: an admin
+/// erasure must not shred a secret version's key behind `secret_versions`'
+/// back (which would leave the version `active` with its key gone).
+#[test]
+fn forget_subject_rejects_a_key_in_the_secrets_namespace() {
+    let mapping = access_mapping(RoleStatus::Active, AccessLevel::Admin);
+    let key = EncryptionKey {
+        subject_key: skilj_core::secrets::SUBJECT_KEY.into(),
+        subject_value: skilj_core::secrets::subject_value("linkedin", 3),
+        ..active_key()
+    };
+
+    let err = event_store::forget_subject(&mapping, &key, timestamp(0)).unwrap_err();
+
+    assert_eq!(
+        err.code(),
+        skilj_core::secrets::Error::ReservedSubjectKey.code()
+    );
+}

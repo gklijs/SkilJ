@@ -35,18 +35,30 @@
 //! out - so a secret reaching a payload, an error or a log is always a
 //! visible, reviewable choice, never an accident.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::error::SkiljRejection;
 use crate::event_store::BoundedContext;
 use crate::shared::generate_token_id;
 
 /// The `encryption_keys.subject_key` namespace every secret version's
-/// `DataKey` lives under. Distinct from any `SensitiveField.subject_key` an
-/// application declares, so a secret's key is never reachable by the
-/// per-subject decrypt a `sensitive_fields` read performs.
+/// `DataKey` lives under. **Reserved**: [`is_reserved_subject_key`] is
+/// checked wherever anything else could reach a key in this namespace -
+/// registering a `SensitiveField` (`event_store::register_event_type`/
+/// `register_command_type`), `event_store::forget_subject` and the public
+/// `db::destroy_encryption_key` - so an application's sensitive field can
+/// never provision or share a secret's key, and an admin's `forgetSubject`
+/// can never destroy one behind `secret_versions`' back (which would leave a
+/// version `active` whose key is gone). Only this module's own rotation and
+/// revocation shred a secret's key.
 pub const SUBJECT_KEY: &str = "secret";
+
+/// Whether `subject_key` is the namespace secrets own ([`SUBJECT_KEY`]).
+pub fn is_reserved_subject_key(subject_key: &str) -> bool {
+    subject_key == SUBJECT_KEY
+}
 
 /// The longest a secret name may be. Long enough for any real credential
 /// name (`"github-oauth-refresh-token"`), short enough that a name is never
@@ -152,13 +164,18 @@ impl SecretGrantStatus {
     }
 }
 
-/// The plaintext value of a secret, handed to exactly one caller at exactly
-/// one place: an explicit, granted fetch.
+/// The plaintext value of a secret, on its way in (`db::put_secret_value`)
+/// or out (an explicit, granted `db::fetch_secret_value`).
 ///
 /// Deliberately implements no `Debug`, no `Display`, and neither `Serialize`
 /// nor `Deserialize` (see this module's own doc comment). The only way out
 /// is [`SecretValue::expose`].
-#[derive(Clone)]
+///
+/// Not `Clone` either, so the plaintext has one owner and one buffer, and
+/// that buffer is overwritten with zeros on drop (`zeroize`, which volatile-
+/// writes so the compiler cannot elide it as a dead store). This narrows
+/// how long the value lingers in memory; it does not cover copies a caller
+/// makes after [`SecretValue::expose`], nor the driver's own row buffers.
 pub struct SecretValue(String);
 
 impl SecretValue {
@@ -173,9 +190,16 @@ impl SecretValue {
     }
 
     /// Consumes the value, returning the owned plaintext. The other half of
-    /// the escape hatch, for a caller that genuinely needs to move it.
-    pub fn into_inner(self) -> String {
-        self.0
+    /// the escape hatch, for a caller that genuinely needs to move it - the
+    /// returned `String` is the caller's to wipe.
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -193,6 +217,12 @@ pub enum Error {
 
     #[error("this caller is not granted read access to secret \"{name}\"")]
     AccessNotGranted { name: String },
+
+    #[error("a secret grant must name the Role it is granted to")]
+    InvalidGrantee,
+
+    #[error("the subject key \"{SUBJECT_KEY}\" is reserved for secrets")]
+    ReservedSubjectKey,
 }
 
 impl SkiljRejection for Error {
@@ -201,6 +231,8 @@ impl SkiljRejection for Error {
             Error::InvalidName => "secret_name_invalid",
             Error::NotActive { .. } => "secret_not_active",
             Error::AccessNotGranted { .. } => "secret_access_not_granted",
+            Error::InvalidGrantee => "secret_grantee_invalid",
+            Error::ReservedSubjectKey => "subject_key_reserved",
         }
     }
 
@@ -265,7 +297,7 @@ pub fn grant_secret_access(
 ) -> Result<SecretGrant, Error> {
     validate_secret_name(name)?;
     if grantee_role_id.is_empty() {
-        return Err(Error::InvalidName);
+        return Err(Error::InvalidGrantee);
     }
     Ok(SecretGrant {
         id: generate_token_id(),
@@ -318,9 +350,16 @@ pub fn require_secret_access(
 
 /// Whether an active version is due to be refreshed - the predicate a
 /// scheduler or a reusing deadline (§46) evaluates to raise "refresh this
-/// before it expires". A version with no `expires_at` never needs one.
-pub fn secret_needs_refresh(secret: &Secret, now: DateTime<Utc>) -> bool {
-    secret.is_active() && secret.expires_at.is_some_and(|expires| expires <= now)
+/// before it expires". Due once `now` is within `lead_time` of
+/// `expires_at`: refreshing only *at* expiry is too late, since by then an
+/// OAuth token has already stopped working, so the caller picks a margin
+/// that covers its own polling interval plus the refresh's round trip. A
+/// version with no `expires_at` never needs one.
+pub fn secret_needs_refresh(secret: &Secret, now: DateTime<Utc>, lead_time: Duration) -> bool {
+    secret.is_active()
+        && secret
+            .expires_at
+            .is_some_and(|expires| expires - lead_time <= now)
 }
 
 #[cfg(test)]
@@ -415,14 +454,47 @@ mod unit_tests {
     }
 
     #[test]
-    fn refresh_is_due_only_when_expired() {
+    fn refresh_is_due_within_the_lead_time_of_expiry() {
+        let now = Utc::now();
+        let lead = Duration::minutes(5);
+        let mut secret = active_secret();
+        assert!(!secret_needs_refresh(&secret, now, lead));
+        secret.expires_at = Some(now + Duration::minutes(6));
+        assert!(!secret_needs_refresh(&secret, now, lead));
+        // Still valid, but inside the margin: due now, not at expiry.
+        secret.expires_at = Some(now + Duration::minutes(4));
+        assert!(secret_needs_refresh(&secret, now, lead));
+        secret.expires_at = Some(now - Duration::seconds(1));
+        assert!(secret_needs_refresh(&secret, now, lead));
+        // A zero lead time is the old "only once expired" behaviour.
+        secret.expires_at = Some(now + Duration::seconds(1));
+        assert!(!secret_needs_refresh(&secret, now, Duration::zero()));
+    }
+
+    #[test]
+    fn a_rotated_version_never_needs_a_refresh() {
         let now = Utc::now();
         let mut secret = active_secret();
-        assert!(!secret_needs_refresh(&secret, now));
-        secret.expires_at = Some(now + chrono::Duration::seconds(1));
-        assert!(!secret_needs_refresh(&secret, now));
-        secret.expires_at = Some(now - chrono::Duration::seconds(1));
-        assert!(secret_needs_refresh(&secret, now));
+        secret.expires_at = Some(now - Duration::seconds(1));
+        let rotated = rotate_secret(&secret, now).unwrap();
+        assert!(!secret_needs_refresh(&rotated, now, Duration::zero()));
+    }
+
+    #[test]
+    fn an_empty_grantee_is_its_own_error() {
+        assert_eq!(
+            grant_secret_access(&bc(), "oauth", "", Utc::now())
+                .unwrap_err()
+                .code(),
+            "secret_grantee_invalid"
+        );
+    }
+
+    #[test]
+    fn only_the_secret_namespace_is_reserved() {
+        assert!(is_reserved_subject_key(SUBJECT_KEY));
+        assert!(!is_reserved_subject_key("customer"));
+        assert!(!is_reserved_subject_key("secrets"));
     }
 
     #[test]

@@ -4650,6 +4650,10 @@ pub async fn list_active_data_keys_for_subject_value(
 /// Scoped to `status = 'active'` in the `WHERE` clause purely
 /// defensively, since the pure rule already rejects an inactive key
 /// before this is ever called.
+///
+/// Refuses the secrets namespace (`secrets::is_reserved_subject_key`): a
+/// secret version's key is only ever shredded by `put_secret_value`/
+/// `revoke_secret`, which retire the version row in the same transaction.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn destroy_encryption_key(
     pool: &Pool,
@@ -4658,6 +4662,9 @@ pub async fn destroy_encryption_key(
     subject_value: &str,
     destroyed_at: DateTime<Utc>,
 ) -> crate::error::Result<()> {
+    if secrets::is_reserved_subject_key(subject_key) {
+        return Err(secrets::Error::ReservedSubjectKey.into());
+    }
     let schema = schema_ident(bounded_context);
     destroy_encryption_key_on(pool, &schema, subject_key, subject_value, destroyed_at).await
 }
@@ -4821,18 +4828,22 @@ impl SecretVersionRow {
     }
 }
 
+// Both status mappings fail closed: the CHECK constraints make any other
+// string unreachable today, but should one ever appear (a hand edit, a
+// later status added without updating this), it reads as the terminal,
+// non-fetchable state rather than as `active`.
 fn secret_status_from_str(s: &str) -> SecretStatus {
     match s {
+        "active" => SecretStatus::Active,
         "rotated" => SecretStatus::Rotated,
-        "revoked" => SecretStatus::Revoked,
-        _ => SecretStatus::Active,
+        _ => SecretStatus::Revoked,
     }
 }
 
 fn secret_grant_status_from_str(s: &str) -> SecretGrantStatus {
     match s {
-        "revoked" => SecretGrantStatus::Revoked,
-        _ => SecretGrantStatus::Active,
+        "active" => SecretGrantStatus::Active,
+        _ => SecretGrantStatus::Revoked,
     }
 }
 
@@ -4927,12 +4938,16 @@ pub async fn list_active_secrets(
 /// own lock (`get_active_secret_row_on`'s `for_update`): the second waits,
 /// finds the version already retired, and provisions the next one rather
 /// than colliding on `(name, version)`.
+///
+/// Takes the value as a [`SecretValue`], so the input side gets the same
+/// no-`Debug`/no-serde protection as a fetched value, and the caller's
+/// plaintext is wiped when it drops that value.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context, name = %name))]
 pub async fn put_secret_value(
     pool: &Pool,
     bounded_context: &str,
     name: &str,
-    plaintext: &str,
+    plaintext: &SecretValue,
     expires_at: Option<DateTime<Utc>>,
     master_key: &EncryptionMasterKey,
     now: DateTime<Utc>,
@@ -4982,7 +4997,7 @@ pub async fn put_secret_value(
         master_key,
     )
     .await?;
-    let ciphertext = encryption::encrypt_leaf(&data_key, plaintext);
+    let ciphertext = encryption::encrypt_leaf(&data_key, plaintext.expose());
 
     let row: SecretVersionRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.secret_versions \
@@ -5154,6 +5169,14 @@ pub async fn list_active_secret_grants_for_grantee(
 /// no active version (rotated/revoked/never created), or the plaintext if
 /// there is. The read is then summarised onto the version's own row
 /// (`last_read_at`/`last_read_by`), one `UPDATE`, never an event per fetch.
+///
+/// `expires_at` is **not** checked here: an active version is returned even
+/// once it has expired. That is deliberate - expiry is advisory, the
+/// credential's own issuer is what enforces it, and an adapter refreshing
+/// an expired OAuth access token typically still needs the stored refresh
+/// token (or the expired value itself) to do so. Only rotation and
+/// revocation end what a fetch can return; use
+/// `secrets::secret_needs_refresh` to act before expiry.
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context, name = %name))]
 pub async fn fetch_secret_value(
     pool: &Pool,

@@ -18,6 +18,11 @@ chrono.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
 ring.workspace = true
+# `secrets::SecretValue`'s wipe-on-drop. Already in the tree through
+# rustls/aws-lc-rs (sqlx, reqwest, jsonwebtoken), so naming it here adds no
+# code to the build - the same reasoning that made `ring` a direct
+# dependency (docs/architecture.md §211).
+zeroize.workspace = true
 skilj-macros.workspace = true
 cron = "0.17.0"
 tracing.workspace = true

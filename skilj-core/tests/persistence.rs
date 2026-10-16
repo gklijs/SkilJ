@@ -2483,7 +2483,7 @@ fn put_secret_value_rotates_and_shreds_the_previous_version_key() {
             &pool,
             &bc.name,
             name,
-            "refresh-token-1",
+            &skilj_core::secrets::SecretValue::new("refresh-token-1"),
             None,
             &master,
             test_now(),
@@ -2509,7 +2509,7 @@ fn put_secret_value_rotates_and_shreds_the_previous_version_key() {
             &pool,
             &bc.name,
             name,
-            "refresh-token-2",
+            &skilj_core::secrets::SecretValue::new("refresh-token-2"),
             None,
             &master,
             test_now(),
@@ -2562,7 +2562,7 @@ fn fetch_secret_value_refuses_an_adapter_without_a_grant() {
             &pool,
             &bc.name,
             name,
-            "sk_live_123",
+            &skilj_core::secrets::SecretValue::new("sk_live_123"),
             None,
             &master,
             test_now(),
@@ -2598,7 +2598,7 @@ fn revoke_secret_shreds_and_ends_the_active_version() {
             &pool,
             &bc.name,
             name,
-            "to-be-revoked",
+            &skilj_core::secrets::SecretValue::new("to-be-revoked"),
             None,
             &master,
             test_now(),
@@ -2653,7 +2653,7 @@ fn secret_metadata_never_carries_the_value() {
             &pool,
             &bc.name,
             name,
-            "super-secret-plaintext-value",
+            &skilj_core::secrets::SecretValue::new("super-secret-plaintext-value"),
             None,
             &master,
             test_now(),
@@ -2689,9 +2689,17 @@ fn fetch_secret_value_records_a_last_read_summary() {
         let role = seed_role(&pool, false).await;
         let name = "audit-me";
 
-        db::put_secret_value(&pool, &bc.name, name, "value", None, &master, test_now())
-            .await
-            .unwrap();
+        db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            &skilj_core::secrets::SecretValue::new("value"),
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
         db::grant_secret_access(&pool, &bc.name, name, &role.id, test_now())
             .await
             .unwrap();
@@ -2735,7 +2743,7 @@ fn secret_value_is_ciphertext_at_rest() {
             &pool,
             &bc.name,
             name,
-            "plaintext-in-the-clear",
+            &skilj_core::secrets::SecretValue::new("plaintext-in-the-clear"),
             None,
             &master,
             test_now(),
@@ -2768,10 +2776,12 @@ fn concurrent_rotations_of_one_secret_serialize() {
         let bc = seed_bounded_context(&pool).await;
         let master = EncryptionMasterKey::from_bytes([27u8; 32]);
         let name = "concurrent-rotation";
+        let value_a = skilj_core::secrets::SecretValue::new("a");
+        let value_b = skilj_core::secrets::SecretValue::new("b");
 
         let (a, b) = tokio::join!(
-            db::put_secret_value(&pool, &bc.name, name, "a", None, &master, test_now()),
-            db::put_secret_value(&pool, &bc.name, name, "b", None, &master, test_now()),
+            db::put_secret_value(&pool, &bc.name, name, &value_a, None, &master, test_now()),
+            db::put_secret_value(&pool, &bc.name, name, &value_b, None, &master, test_now()),
         );
         let mut versions = [a.unwrap().version, b.unwrap().version];
         versions.sort();
@@ -2784,5 +2794,56 @@ fn concurrent_rotations_of_one_secret_serialize() {
             .filter(|s| s.name == name)
             .count();
         assert_eq!(active, 1);
+    });
+}
+
+/// The public `destroy_encryption_key` refuses the secrets namespace, so the
+/// only way to shred a secret version's key is its own rotation/revocation,
+/// which retire the version row with it. After the refusal the secret is
+/// untouched and still fetchable.
+#[test]
+fn destroy_encryption_key_refuses_a_secret_version_key() {
+    runtime().block_on(async {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let bc = seed_bounded_context(&pool).await;
+        let master = EncryptionMasterKey::from_bytes([28u8; 32]);
+        let role = seed_role(&pool, false).await;
+        let name = "linkedin-oauth";
+
+        db::put_secret_value(
+            &pool,
+            &bc.name,
+            name,
+            &skilj_core::secrets::SecretValue::new("token"),
+            None,
+            &master,
+            test_now(),
+        )
+        .await
+        .unwrap();
+
+        let err = db::destroy_encryption_key(
+            &pool,
+            &bc.name,
+            skilj_core::secrets::SUBJECT_KEY,
+            &secret_subject(name, 1),
+            test_now(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            skilj_core::secrets::Error::ReservedSubjectKey.code()
+        );
+
+        db::grant_secret_access(&pool, &bc.name, name, &role.id, test_now())
+            .await
+            .unwrap();
+        let fetched = db::fetch_secret_value(&pool, &bc.name, name, &role.id, &master, test_now())
+            .await
+            .unwrap();
+        assert_eq!(fetched.expose(), "token");
     });
 }
