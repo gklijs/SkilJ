@@ -90,6 +90,7 @@ impl CommandDispatcher for Dispatcher {
         _: &str,
         _: &str,
         _: &[Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         None
     }
@@ -264,6 +265,7 @@ async fn time_reads(pool: &Pool, command_type: &CommandType) -> (Duration, usize
             &cache,
             command_type,
             payload,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();

@@ -422,7 +422,12 @@ impl CommandDispatcher for Dispatcher {
         let registered = self
             .command_types
             .get(&(bounded_context, command_type.to_string()))?;
-        Some((registered.decide)(payload, matching_events, &[]))
+        Some((registered.decide)(
+            payload,
+            matching_events,
+            &[],
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+        ))
     }
 
     fn dispatch_with(
@@ -432,6 +437,7 @@ impl CommandDispatcher for Dispatcher {
         payload: &str,
         matching_events: &[Event],
         snapshots: &[skilj_core::plugin::SnapshotState],
+        context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         let bounded_context = self
             .template_cache
@@ -439,7 +445,12 @@ impl CommandDispatcher for Dispatcher {
         let registered = self
             .command_types
             .get(&(bounded_context, command_type.to_string()))?;
-        Some((registered.decide)(payload, matching_events, snapshots))
+        Some((registered.decide)(
+            payload,
+            matching_events,
+            snapshots,
+            context,
+        ))
     }
 
     fn snapshots(&self) -> Option<&dyn skilj_core::plugin::SnapshotDispatcher> {
@@ -495,6 +506,7 @@ impl CommandDispatcher for Dispatcher {
         payload: &str,
         snapshot_state_json: &str,
         events_since_snapshot: &[Event],
+        context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         let bounded_context = self
             .template_cache
@@ -506,6 +518,7 @@ impl CommandDispatcher for Dispatcher {
             payload,
             snapshot_state_json,
             events_since_snapshot,
+            context,
         ))
     }
 }
@@ -1347,6 +1360,7 @@ type DeciderFn = Box<
             &str,
             &[Event],
             &[skilj_core::plugin::SnapshotState],
+            &skilj_core::plugin::DecisionContext,
         ) -> skilj_core::error::Result<CommandDecision>
         + Send
         + Sync,
@@ -1357,8 +1371,16 @@ type DeciderFn = Box<
 /// snapshot_state_json, events_since_snapshot)` - the same shape
 /// `decide_from_snapshot` itself has, just with `payload`/`events_since_snapshot`
 /// still type-erased, exactly like `DeciderFn` above.
-type DecideFromSnapshotFn =
-    Box<dyn Fn(&str, &str, &[Event]) -> skilj_core::error::Result<CommandDecision> + Send + Sync>;
+type DecideFromSnapshotFn = Box<
+    dyn Fn(
+            &str,
+            &str,
+            &[Event],
+            &skilj_core::plugin::DecisionContext,
+        ) -> skilj_core::error::Result<CommandDecision>
+        + Send
+        + Sync,
+>;
 
 struct RegisteredCommandType {
     schema: String,
@@ -1840,7 +1862,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
         required_role: T::required_role(),
         snapshot_name: T::snapshot(),
         consistency_query: T::consistency_query(),
-        decide: Box::new(|payload_json, raw_events, snapshots| {
+        decide: Box::new(|payload_json, raw_events, snapshots, context| {
             let payload: T::Payload = serde_json::from_str(payload_json)
                 .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
             let mut matching = Vec::with_capacity(raw_events.len());
@@ -1854,10 +1876,10 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
             }
             Ok(T::decide_with(
                 &payload,
-                &skilj_core::plugin::Decision::new(&matching, snapshots),
+                &skilj_core::plugin::Decision::new(&matching, snapshots, context),
             ))
         }),
-        decide_from_snapshot: Box::new(|payload_json, snapshot_state_json, raw_events| {
+        decide_from_snapshot: Box::new(|payload_json, snapshot_state_json, raw_events, context| {
             let payload: T::Payload = serde_json::from_str(payload_json)
                 .map_err(|e| EventStoreError::PayloadDecodeFailed(e.to_string()))?;
             let mut matching = Vec::with_capacity(raw_events.len());
@@ -1873,6 +1895,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
                 &payload,
                 snapshot_state_json,
                 &matching,
+                context,
             ))
         }),
     }
@@ -2109,6 +2132,7 @@ fn registered_schedule_deadline<S: ScheduleDeadline + 'static>() -> RegisteredSc
                 None => Ok(None),
                 Some(spec) => Ok(Some(skilj_core::plugin::ErasedDeadlineSpec {
                     fire_at: spec.fire_at,
+                    expires_at: spec.expires_at,
                     tags: spec.tags,
                     payload_json: serde_json::to_string(&spec.payload)?,
                     recurrence: spec.recurrence,

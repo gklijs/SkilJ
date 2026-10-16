@@ -221,6 +221,19 @@ fn decide_with(payload: &Self::Payload, decision: &Decision<'_, Self::Event>) ->
 - The older `snapshot()` + `decide_from_snapshot` pair still works for a
   single-tag command, but new code should use snapshot items.
 
+### Reasoning about time: `Decision::now()` and `Decision::deadline()`
+
+`decide()` never reads a clock - it stays the pure, synchronous function
+above. The framework hands it the decision's own instant, and `decide_with`
+reads it with `decision.now()` (docs/architecture.md §213). A command the
+library submits for a deadline also gets that deadline's context through
+`decision.deadline()`: `scheduled_at` (when the deadline was meant to
+fire), `deadline_at` (its optional `expires_at`) and `expired`. So a
+reminder can refuse an action it fired too late for, and a redrive or
+retry is told apart from a genuine firing by a later `now` with the same
+`scheduled_at`. `GivenEvents::now(instant)`/`.deadline(scheduled_at,
+expires_at)` inject them in a test.
+
 ### Knowing when to narrow: the slow read and decide warnings
 
 skilj logs a `warn` when a command's read before the lock takes longer

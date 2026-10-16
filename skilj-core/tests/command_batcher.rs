@@ -73,6 +73,7 @@ impl CommandDispatcher for ShipOrderDispatcher {
         _payload: &str,
         _snapshot_state_json: &str,
         _events_since_snapshot: &[Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         unreachable!("this fixture never opts into snapshot()")
     }

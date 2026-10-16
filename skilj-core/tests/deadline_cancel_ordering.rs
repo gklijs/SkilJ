@@ -135,6 +135,7 @@ impl Schedules {
     ) -> Option<Result<Option<ErasedDeadlineSpec>, serde_json::Error>> {
         Some(Ok(Some(ErasedDeadlineSpec {
             fire_at,
+            expires_at: None,
             tags: vec![order_tag(source_payload_json)],
             payload_json: "{}".to_string(),
             recurrence: None,
@@ -289,6 +290,7 @@ impl skilj_core::plugin::CommandDispatcher for NoCommands {
         _: &str,
         _: &str,
         _: &[Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<skilj_core::shared::CommandDecision>> {
         None
     }

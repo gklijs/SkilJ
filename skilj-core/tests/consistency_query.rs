@@ -143,6 +143,7 @@ impl CommandDispatcher for HelpdeskDispatcher {
         _: &str,
         _: &str,
         _: &[Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         unreachable!("no snapshot here")
     }
@@ -387,6 +388,7 @@ async fn create_ticket(
         None,
         test_now(),
         None,
+        None,
     )
     .await
     .unwrap()
@@ -489,6 +491,7 @@ async fn resolve(
         cache,
         &h.create_ticket,
         &payload(ticket),
+        &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
     )
     .await
     .unwrap()
@@ -524,6 +527,7 @@ async fn submit(
         &[],
         None,
         Some(resolved.covered_through),
+        &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
     )
     .await
     .unwrap()
@@ -701,6 +705,7 @@ fn an_item_keeps_its_last_n_matches() {
             &cache,
             &h.recent_tickets,
             &payload,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -714,6 +719,7 @@ fn an_item_keeps_its_last_n_matches() {
             &EventCache::new(0),
             &h.recent_tickets,
             &payload,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -746,6 +752,7 @@ fn an_item_keeps_its_last_n_matches() {
             &[],
             None,
             Some(resolved.covered_through),
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -782,6 +789,7 @@ fn a_batch_rechecks_a_query_its_tag_query_does_not_cover() {
             &cache,
             &stored,
             &payload("t1"),
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -908,6 +916,7 @@ fn a_query_of_nothing_reads_no_history_and_never_conflicts() {
         let dispatcher = HelpdeskDispatcher::new();
         let cache = EventCache::new(1000);
         let contact = serde_json::json!({ "company_id": "acme" }).to_string();
+        let context = skilj_core::plugin::DecisionContext::at(chrono::Utc::now());
         let resolve_contact = || {
             db::resolve_command_submission(
                 &pool,
@@ -916,6 +925,7 @@ fn a_query_of_nothing_reads_no_history_and_never_conflicts() {
                 &cache,
                 &h.log_contact,
                 &contact,
+                &context,
             )
         };
 
@@ -944,6 +954,7 @@ fn a_query_of_nothing_reads_no_history_and_never_conflicts() {
             &[],
             None,
             Some(resolved.covered_through),
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();

@@ -10,6 +10,7 @@ description = "A given/when/then test harness for a skilj plugin author's own Co
 [dependencies]
 skilj-core.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 serde.workspace = true

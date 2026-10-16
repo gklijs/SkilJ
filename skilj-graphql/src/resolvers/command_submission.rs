@@ -420,6 +420,7 @@ pub fn dry_run_command_field(n: &Naming) -> Field {
                     &authorised.payload,
                     &authorised.client_id,
                     state.encryption_master_key.as_ref(),
+                    chrono::Utc::now(),
                 )
                 .await
                 .map_err(to_graphql_error)?;

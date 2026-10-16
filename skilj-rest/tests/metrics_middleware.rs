@@ -52,6 +52,7 @@ impl CommandDispatcher for NoopCommandDispatcher {
         _payload: &str,
         _snapshot_state_json: &str,
         _events_since_snapshot: &[Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         None
     }

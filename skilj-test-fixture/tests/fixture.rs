@@ -156,6 +156,88 @@ impl CommandType for AdjustCounterFast {
     }
 }
 
+/// Reads the injected time and deadline context (Codeberg issue #97) and
+/// reports what it saw through its rejection kind/reason, so a test can
+/// assert on it.
+struct TimeAware;
+
+impl CommandType for TimeAware {
+    type Payload = AdjustCounterPayload;
+    type Event = CounterEvent;
+    const NAME: &'static str = "TimeAware";
+
+    fn decide_with(
+        _payload: &Self::Payload,
+        decision: &Decision<'_, Self::Event>,
+    ) -> CommandDecision {
+        match decision.deadline() {
+            Some(deadline) if deadline.expired => CommandDecision::Rejected {
+                reason: decision.now().to_rfc3339(),
+                kind: "expired".into(),
+            },
+            Some(_) => CommandDecision::Rejected {
+                reason: decision.now().to_rfc3339(),
+                kind: "on_time".into(),
+            },
+            None => CommandDecision::Rejected {
+                reason: decision.now().to_rfc3339(),
+                kind: "no_deadline".into(),
+            },
+        }
+    }
+}
+
+fn ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(secs, 0).unwrap()
+}
+
+/// The injected `now` (not the wall clock) reaches `decide()`, and an
+/// ordinary submission carries no deadline (Codeberg issue #97).
+#[test]
+fn an_injected_now_reaches_decide_with_no_deadline() {
+    let now = ts(1_700_000_000);
+    GivenCommandEvents::<TimeAware>::new()
+        .now(now)
+        .when(AdjustCounterPayload { delta: 1 })
+        .then(|decision| match decision {
+            CommandDecision::Rejected { reason, kind } => {
+                assert_eq!(kind, "no_deadline");
+                assert_eq!(reason, &now.to_rfc3339());
+            }
+            CommandDecision::Accepted { .. } => panic!("expected a rejection"),
+        });
+}
+
+/// A deadline-fired decision fired past its `expires_at` is `expired`.
+#[test]
+fn a_late_deadline_is_expired() {
+    GivenCommandEvents::<TimeAware>::new()
+        .now(ts(2500))
+        .deadline(ts(1000), Some(ts(2000)))
+        .when(AdjustCounterPayload { delta: 1 })
+        .then_rejected("expired");
+}
+
+/// A deadline-fired decision fired before its `expires_at` is not.
+#[test]
+fn an_on_time_deadline_is_not_expired() {
+    GivenCommandEvents::<TimeAware>::new()
+        .now(ts(1500))
+        .deadline(ts(1000), Some(ts(2000)))
+        .when(AdjustCounterPayload { delta: 1 })
+        .then_rejected("on_time");
+}
+
+/// A deadline with no expiry is never expired.
+#[test]
+fn a_deadline_without_an_expiry_is_not_expired() {
+    GivenCommandEvents::<TimeAware>::new()
+        .now(ts(2500))
+        .deadline(ts(1000), None)
+        .when(AdjustCounterPayload { delta: 1 })
+        .then_rejected("on_time");
+}
+
 #[test]
 fn a_given_snapshot_state_reaches_decide_with() {
     GivenCommandEvents::<AdjustCounterFast>::new()

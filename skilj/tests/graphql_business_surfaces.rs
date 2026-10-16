@@ -326,6 +326,7 @@ impl CommandType for DoThingFast {
         payload: &Self::Payload,
         snapshot_state_json: &str,
         events_since_snapshot: &[Self::Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> CommandDecision {
         let snapshot: ThingTotalState =
             serde_json::from_str(snapshot_state_json).unwrap_or_default();

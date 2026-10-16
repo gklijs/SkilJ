@@ -102,6 +102,7 @@ impl CommandDispatcher for FlakyCommandDispatcher {
         _payload: &str,
         _snapshot_state_json: &str,
         _events_since_snapshot: &[Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         unreachable!("this file's own fixture never opts into snapshot()")
     }
@@ -580,6 +581,7 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
                 None,
                 Utc::now(),
                 Some(&idempotency_key),
+                None,
             )
         };
         assert!(matches!(
@@ -946,6 +948,7 @@ fn a_command_into_an_archived_bounded_context_is_refused() {
             None,
             Utc::now(),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1051,6 +1054,7 @@ impl CommandDispatcher for OlderInstance {
         _payload: &str,
         _snapshot_state_json: &str,
         _events_since_snapshot: &[Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         None
     }

@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The firing time, and a deadline's expiry, are handed to `decide()`
+  (docs/architecture.md §213, Codeberg issue #97). `DecisionContext
+  { now, deadline: Option<DeadlineContext> }` is built by the framework
+  and read through the new `Decision::now()`/`Decision::deadline()`:
+  `now` is the submission's own instant (no clock in `decide()`, so a
+  decision stays deterministic and a test can inject any `now`), and
+  `deadline` (present only for a deadline firing) carries `scheduled_at`
+  (the row's `fire_at`), `deadline_at` (its `expires_at`) and `expired`.
+  `DeadlineSpec.expires_at: Option<DateTime<Utc>>` and a nullable
+  `deadlines.expires_at` column add the expiry; `None` is the unchanged
+  one-shot and is never expired. `skilj-test-fixture`'s `GivenEvents`
+  gains `.now()`/`.deadline()`. New: `plugin::DecisionContext`,
+  `plugin::DeadlineContext`,
+  `Decision::now`/`deadline`/`context`, `ErasedDeadlineSpec.expires_at`.
 - Per-entity recurrence for deadlines, with a missed-run policy
   (docs/architecture.md §212, Codeberg issue #95):
   `DeadlineSpec.recurrence: Option<RecurrenceSpec>` turns a one-shot
@@ -79,6 +93,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `CommandDispatcher::dispatch_with` and `dispatch_from_snapshot`,
+  `CommandType::decide_from_snapshot`, and the facade's
+  `DeciderFn`/`DecideFromSnapshotFn` take a `&DecisionContext`
+  (docs/architecture.md §213, Codeberg issue #97); `db::
+  resolve_command_submission`, `db::submit_command` and
+  `db::decide_and_submit_command` thread it through
+  (`decide_and_submit_command` gains an `Option<DeadlineContext>`), and
+  `db::dry_run_command` takes a `now`. `Decision::new` takes the context.
+  `DeadlineSpec`/`ErasedDeadlineSpec` gain `expires_at`. Breaking for code
+  implementing or calling these directly.
 - Tag reads go through the `event_tags` table, and the GIN index on
   `events.tags` (`events_by_tags`) is no longer created; startup drops it
   from existing bounded contexts with `DROP INDEX CONCURRENTLY`

@@ -443,6 +443,7 @@ impl CommandBatcher {
             event_cache,
             command_type,
             payload,
+            &crate::plugin::DecisionContext::at(now),
         )
         .await?;
         self.slow.note_resolved(command_type, &resolved);

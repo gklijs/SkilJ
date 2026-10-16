@@ -266,6 +266,7 @@ impl ScheduleDeadlineDispatcher for Schedules {
     ) -> Option<Result<Option<ErasedDeadlineSpec>, serde_json::Error>> {
         Some(Ok(Some(ErasedDeadlineSpec {
             fire_at: self.fire_at,
+            expires_at: None,
             tags: vec![Tag {
                 key: "order".to_string(),
                 value: Some("o-1".to_string()),

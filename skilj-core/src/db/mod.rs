@@ -1904,6 +1904,7 @@ fn deadlines_table_ddl(schema: &str) -> String {
             id TEXT PRIMARY KEY,
             schedule_name TEXT NOT NULL,
             fire_at TIMESTAMPTZ NOT NULL,
+            expires_at TIMESTAMPTZ,
             tags JSONB NOT NULL,
             correlation_id TEXT,
             target_bounded_context TEXT NOT NULL,
@@ -1955,6 +1956,17 @@ pub async fn ensure_deadlines_table(
         "deadlines",
         &["firing_at"],
         format!("ALTER TABLE {schema}.deadlines ADD COLUMN IF NOT EXISTS firing_at TIMESTAMPTZ"),
+    )))
+    .execute(pool)
+    .await?;
+    // Codeberg issue #97 - a deadline's optional expiry, carried to the
+    // fired command's `decide_with`. Nullable, no `DEFAULT`, so every row
+    // scheduled before this feature reads as "no expiry".
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "deadlines",
+        &["expires_at"],
+        format!("ALTER TABLE {schema}.deadlines ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ"),
     )))
     .execute(pool)
     .await?;
@@ -9866,6 +9878,7 @@ pub async fn submit_command(
     snapshot_states: &[crate::plugin::SnapshotState],
     idempotency_key: Option<&str>,
     covered_through: Option<i64>,
+    context: &crate::plugin::DecisionContext,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
 
@@ -9919,6 +9932,7 @@ pub async fn submit_command(
         event_types_by_name,
         resolved,
         covered_through,
+        context,
     )
     .await?;
 
@@ -10259,6 +10273,7 @@ async fn decide_command_in_tx(
     batch_idempotency_keys: Option<&BatchIdempotencyKeys>,
     batch_delta: Option<&[Event]>,
     slow: Option<&crate::slow_command::SlowCommandWarnings>,
+    context: &crate::plugin::DecisionContext,
 ) -> crate::error::Result<DecideOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
@@ -10514,6 +10529,7 @@ async fn decide_command_in_tx(
                 payload,
                 ctx.state_json,
                 &redispatch_matching_events,
+                context,
             ) {
                 None => return Err(crate::error::Error::NoDeciderRegistered),
                 Some(Err(e)) => return Err(e),
@@ -10525,6 +10541,7 @@ async fn decide_command_in_tx(
                 payload,
                 &redispatch_matching_events,
                 &redispatch_states,
+                context,
             ) {
                 None => return Err(crate::error::Error::NoDeciderRegistered),
                 Some(Err(e)) => return Err(e),
@@ -10853,6 +10870,7 @@ async fn submit_one_command_in_tx(
     event_types_by_name: std::collections::HashMap<String, EventType>,
     resolved: std::collections::HashMap<(String, String), (EncryptionKey, i64, DataKey)>,
     covered_through: Option<i64>,
+    context: &crate::plugin::DecisionContext,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
     let decided = match decide_command_in_tx(
@@ -10875,6 +10893,7 @@ async fn submit_one_command_in_tx(
         None,
         None,
         None,
+        context,
     )
     .await?
     {
@@ -11435,6 +11454,7 @@ async fn write_command_batch_as_set(
     let decide_started = std::time::Instant::now();
     let batch_delta = batch_recheck_delta(tx, dispatcher, batch, locked_highest).await?;
     for (index, item) in batch.iter().enumerate() {
+        let context = crate::plugin::DecisionContext::at(item.now);
         let decided = decide_command_in_tx(
             tx,
             dispatcher,
@@ -11458,6 +11478,7 @@ async fn write_command_batch_as_set(
             Some(&claimed),
             Some(batch_delta.as_deref().unwrap_or(&[])),
             slow,
+            &context,
         )
         .await;
         let AcceptedDecision {
@@ -12124,6 +12145,7 @@ async fn commit_command_batch_per_command(
         // trouble, which no savepoint would contain. A decider's own
         // error is a Rust `Err`, not a statement, and stays per-command.
         let decide_started = std::time::Instant::now();
+        let context = crate::plugin::DecisionContext::at(item.now);
         let decide_result = decide_command_in_tx(
             tx,
             dispatcher,
@@ -12147,6 +12169,7 @@ async fn commit_command_batch_per_command(
             None,
             None,
             slow,
+            &context,
         )
         .await;
         decide_total += decide_started.elapsed();
@@ -12362,6 +12385,7 @@ pub async fn resolve_command_submission(
     event_cache: &crate::event_cache::EventCache,
     command_type: &CommandType,
     payload: &str,
+    context: &crate::plugin::DecisionContext,
 ) -> crate::error::Result<ResolvedCommandSubmission> {
     // docs/architecture.md §200: a bounded context an older instance added
     // during a rolling deploy has no `consistency_query` column for the
@@ -12446,6 +12470,7 @@ pub async fn resolve_command_submission(
                 payload,
                 &ctx.state_json,
                 &matching_events,
+                context,
             )
             .ok_or(crate::error::Error::NoDeciderRegistered)??,
         None => dispatcher
@@ -12455,6 +12480,7 @@ pub async fn resolve_command_submission(
                 payload,
                 &matching_events,
                 &snapshot_states,
+                context,
             )
             .ok_or(crate::error::Error::NoDeciderRegistered)??,
     };
@@ -12546,7 +12572,9 @@ pub async fn dry_run_command(
     payload: &str,
     client_id: &str,
     encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
 ) -> crate::error::Result<CommandDryRun> {
+    let context = crate::plugin::DecisionContext::at(now);
     let resolved = resolve_command_submission(
         pool,
         dispatcher,
@@ -12554,6 +12582,7 @@ pub async fn dry_run_command(
         event_cache,
         command_type,
         payload,
+        &context,
     )
     .await?;
     let decision = match resolved.decision {
@@ -12659,6 +12688,7 @@ pub async fn decide_and_submit_command(
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
     idempotency_key: Option<&str>,
+    deadline: Option<crate::plugin::DeadlineContext>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let mut rotated_once = false;
     loop {
@@ -12677,6 +12707,7 @@ pub async fn decide_and_submit_command(
             encryption_master_key,
             now,
             idempotency_key,
+            deadline,
         )
         .await;
         match outcome {
@@ -12712,7 +12743,15 @@ async fn decide_and_submit_command_once(
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
     idempotency_key: Option<&str>,
+    deadline: Option<crate::plugin::DeadlineContext>,
 ) -> crate::error::Result<SubmitCommandOutcome> {
+    let context = match deadline {
+        Some(deadline) => crate::plugin::DecisionContext {
+            now,
+            deadline: Some(deadline),
+        },
+        None => crate::plugin::DecisionContext::at(now),
+    };
     let resolved = resolve_command_submission(
         pool,
         dispatcher,
@@ -12720,6 +12759,7 @@ async fn decide_and_submit_command_once(
         event_cache,
         command_type,
         payload,
+        &context,
     )
     .await?;
 
@@ -12750,6 +12790,7 @@ async fn decide_and_submit_command_once(
         &resolved.snapshot_states,
         idempotency_key,
         Some(resolved.covered_through),
+        &context,
     )
     .await
 }
@@ -14238,6 +14279,7 @@ async fn catch_up_cross_context_route_locked(
                     encryption_master_key,
                     Utc::now(),
                     Some(&idempotency_key),
+                    None,
                 )
                 .await;
                 // Codeberg issue #21 - see this function's own doc
@@ -14580,17 +14622,19 @@ pub async fn catch_up_schedule_deadline(
                     };
                     sqlx::query(sqlx::AssertSqlSafe(format!(
                         "INSERT INTO {schema}.deadlines \
-                         (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
-                          target_command_type, payload, status, created_at, recurrence_schedule, \
-                          recurrence_policy, recurrence_start_at, recurrence_end_at, \
-                          recurrence_valid_until, recurrence_parent_id, recurrence_sequence) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, \
-                                 $14, $15, $16) \
+                         (id, schedule_name, fire_at, expires_at, tags, correlation_id, \
+                          target_bounded_context, target_command_type, payload, status, created_at, \
+                          recurrence_schedule, recurrence_policy, recurrence_start_at, \
+                          recurrence_end_at, recurrence_valid_until, recurrence_parent_id, \
+                          recurrence_sequence) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, $12, $13, \
+                                 $14, $15, $16, $17) \
                          ON CONFLICT (id) DO NOTHING"
                     )))
                     .bind(&id)
                     .bind(schedule.name)
                     .bind(spec.fire_at)
+                    .bind(spec.expires_at)
                     .bind(Json(&spec.tags))
                     .bind(event.metadata.correlation_id.as_deref())
                     .bind(schedule.target_bounded_context)
@@ -14891,6 +14935,7 @@ struct DueDeadlineRow {
     id: String,
     schedule_name: String,
     fire_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
     tags: Json<Vec<Tag>>,
     correlation_id: Option<String>,
     target_bounded_context: String,
@@ -15028,7 +15073,8 @@ pub async fn fire_due_deadlines(
     let mut cancel_backlogs: std::collections::HashMap<&str, Option<DateTime<Utc>>> =
         std::collections::HashMap::new();
     let rows: Vec<DueDeadlineRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+        "SELECT id, schedule_name, fire_at, expires_at, tags, correlation_id, \
+         target_bounded_context, \
          target_command_type, payload, attempt_count, first_failed_at, recurrence_schedule, \
          recurrence_policy, recurrence_start_at, recurrence_end_at, recurrence_valid_until, \
          recurrence_parent_id, recurrence_sequence \
@@ -15151,6 +15197,12 @@ pub async fn fire_due_deadlines(
         // own submission descends from the `Source` event that triggered
         // it (`event_causation_id`); a fired deadline's real cause is a
         // clock, not a prior commit.
+        // Codeberg issue #97: the target's `decide_with` gets the deadline
+        // this command descends from - when it was scheduled to fire
+        // (`fire_at`), its optional `expires_at`, and whether this firing
+        // is past it - so it can refuse an action it fired too late for.
+        let deadline_context =
+            crate::plugin::DeadlineContext::new(row.fire_at, row.expires_at, now);
         let outcome = decide_and_submit_command(
             pool,
             command_dispatcher,
@@ -15166,6 +15218,7 @@ pub async fn fire_due_deadlines(
             encryption_master_key,
             now,
             Some(&idempotency_key),
+            Some(deadline_context),
         )
         .await;
         let outcome = match outcome {
@@ -15255,17 +15308,18 @@ async fn advance_deadline_chain(
     let next_id = format!("{parent_id}#r{next_sequence}");
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {schema}.deadlines \
-         (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+         (id, schedule_name, fire_at, expires_at, tags, correlation_id, target_bounded_context, \
           target_command_type, payload, status, created_at, recurrence_schedule, \
           recurrence_policy, recurrence_start_at, recurrence_end_at, \
           recurrence_valid_until, recurrence_parent_id, recurrence_sequence) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, \
-                 $14, $15, $16) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, $12, $13, $14, \
+                 $15, $16, $17) \
          ON CONFLICT (id) DO NOTHING"
     )))
     .bind(&next_id)
     .bind(&row.schedule_name)
     .bind(next_fire_at)
+    .bind(row.expires_at)
     .bind(&row.tags)
     .bind(row.correlation_id.as_deref())
     .bind(&row.target_bounded_context)

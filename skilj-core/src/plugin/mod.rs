@@ -335,10 +335,14 @@ pub trait CommandType {
     /// without also overriding this: a real misconfiguration (unlike
     /// the multi-tag case above), but one this trait can still fail
     /// safely on rather than silently producing a wrong decision.
+    ///
+    /// `context` (Codeberg issue #97) is the same [`DecisionContext`]
+    /// `decide_with` reads through [`Decision::context`].
     fn decide_from_snapshot(
         _payload: &Self::Payload,
         _snapshot_state_json: &str,
         _events_since_snapshot: &[Self::Event],
+        _context: &DecisionContext,
     ) -> CommandDecision {
         CommandDecision::Rejected {
             reason: "this CommandType declares snapshot() but never overrides \
@@ -841,18 +845,106 @@ pub struct SnapshotState {
     pub folded_through: i64,
 }
 
+/// The time a decision is made against, and, for a command a deadline
+/// fired, that deadline's own schedule and expiry (Codeberg issue #97).
+///
+/// `decide()` never reads a clock itself (`CommandType`'s own doc comment,
+/// §1.1): the framework stamps every submission with the `now` it uses for
+/// the command's own `created_at`, its idempotency row and the events it
+/// appends, and hands that same instant here. A decision therefore stays
+/// deterministic and replayable, and a test can drive it with any `now`.
+/// `decide_with()` reads it through [`Decision::context`] (`Decision::now`
+/// and `Decision::deadline` are the two shorthands); the legacy
+/// `decide_from_snapshot` is handed it directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionContext {
+    /// The instant the submission is stamped with - the same `now` the
+    /// command's own `created_at` and idempotency row carry.
+    pub now: chrono::DateTime<chrono::Utc>,
+    /// Present only when this submission is a deadline firing
+    /// (`db::fire_due_deadlines`); `None` for every ordinary submission.
+    pub deadline: Option<DeadlineContext>,
+}
+
+impl DecisionContext {
+    /// An ordinary submission's context: `now`, no deadline.
+    pub fn at(now: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            now,
+            deadline: None,
+        }
+    }
+
+    /// A deadline firing's context (Codeberg issue #97): `scheduled_at` is
+    /// the fired row's own `fire_at`, `deadline_at` its optional
+    /// `expires_at`.
+    pub fn for_deadline(
+        now: chrono::DateTime<chrono::Utc>,
+        scheduled_at: chrono::DateTime<chrono::Utc>,
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self {
+            now,
+            deadline: Some(DeadlineContext::new(scheduled_at, deadline_at, now)),
+        }
+    }
+}
+
+/// What a deadline-fired command's `decide()` may reason about (Codeberg
+/// issue #97): `scheduled_at` is the deadline's own `fire_at` (when the
+/// chain intended it to fire), `deadline_at` its optional `expires_at`,
+/// and `expired` whether this firing happened after `deadline_at`. A
+/// target command can refuse an action it fired too late for, and can tell
+/// a genuine firing from a redrive or a retry by comparing
+/// `DecisionContext::now` with `scheduled_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineContext {
+    /// The fired row's own `fire_at` - when the deadline was scheduled to
+    /// fire.
+    pub scheduled_at: chrono::DateTime<chrono::Utc>,
+    /// The fired row's own `expires_at`, if it had one.
+    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `deadline_at` is `Some` and `now` is past it. Always `false` when
+    /// there is no expiry at all.
+    pub expired: bool,
+}
+
+impl DeadlineContext {
+    pub fn new(
+        scheduled_at: chrono::DateTime<chrono::Utc>,
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            scheduled_at,
+            deadline_at,
+            expired: deadline_at.is_some_and(|at| now > at),
+        }
+    }
+}
+
 /// What `CommandType::decide_with` decides from (docs/architecture.md
-/// §202): the events the command's query selects, and the state of every
-/// snapshot item it derives. Built by the framework; room to grow without
-/// changing `decide_with`'s signature.
+/// §202): the events the command's query selects, the state of every
+/// snapshot item it derives, and the [`DecisionContext`] the decision is
+/// made against (Codeberg issue #97). Built by the framework; room to grow
+/// without changing `decide_with`'s signature.
 pub struct Decision<'a, E> {
     events: &'a [E],
     snapshots: &'a [SnapshotState],
+    context: &'a DecisionContext,
 }
 
 impl<'a, E> Decision<'a, E> {
-    pub fn new(events: &'a [E], snapshots: &'a [SnapshotState]) -> Self {
-        Self { events, snapshots }
+    pub fn new(
+        events: &'a [E],
+        snapshots: &'a [SnapshotState],
+        context: &'a DecisionContext,
+    ) -> Self {
+        Self {
+            events,
+            snapshots,
+            context,
+        }
     }
 
     /// The events the query's items other than snapshot items select, in
@@ -870,6 +962,25 @@ impl<'a, E> Decision<'a, E> {
             .iter()
             .find(|s| s.snapshot == S::NAME && s.tag_value == tag_value)
             .and_then(|s| serde_json::from_str(&s.state_json).ok())
+    }
+
+    /// The time this decision is made against, and, for a deadline firing,
+    /// the deadline's own context (Codeberg issue #97).
+    pub fn context(&self) -> &'a DecisionContext {
+        self.context
+    }
+
+    /// Shorthand for `self.context().now` - the instant the submission is
+    /// stamped with, so `decide()` can reason about time without reading a
+    /// clock.
+    pub fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.context.now
+    }
+
+    /// Shorthand for `self.context().deadline`: the deadline that fired
+    /// this command, when one did (Codeberg issue #97).
+    pub fn deadline(&self) -> Option<&'a DeadlineContext> {
+        self.context.deadline.as_ref()
     }
 }
 
@@ -901,9 +1012,11 @@ pub trait CommandDispatcher: Send + Sync {
     ) -> Option<crate::error::Result<CommandDecision>>;
 
     /// `dispatch`, with the states of the query's snapshot items
-    /// (docs/architecture.md §202) - what the command path calls. The
-    /// default ignores `snapshots` and calls `dispatch`, right for a
-    /// dispatcher whose command types declare no snapshot items.
+    /// (docs/architecture.md §202) and the [`DecisionContext`] the
+    /// decision is made against (Codeberg issue #97) - what the command
+    /// path calls. The default ignores `snapshots` and `context`, calling
+    /// `dispatch`, right for a dispatcher whose command types declare no
+    /// snapshot items and don't read time.
     fn dispatch_with(
         &self,
         bounded_context: &str,
@@ -911,8 +1024,9 @@ pub trait CommandDispatcher: Send + Sync {
         payload: &str,
         matching_events: &[Event],
         snapshots: &[SnapshotState],
+        context: &DecisionContext,
     ) -> Option<crate::error::Result<CommandDecision>> {
-        let _ = snapshots;
+        let _ = (snapshots, context);
         self.dispatch(bounded_context, command_type, payload, matching_events)
     }
 
@@ -977,6 +1091,7 @@ pub trait CommandDispatcher: Send + Sync {
         payload: &str,
         snapshot_state_json: &str,
         events_since_snapshot: &[Event],
+        context: &DecisionContext,
     ) -> Option<crate::error::Result<CommandDecision>>;
 
     /// The blind tags this process declares, keyed for hashing
@@ -1455,9 +1570,22 @@ pub fn next_recurrence_fire_at(
 /// until the validity window ends or a `CancelDeadline` cancels the
 /// pending row. `None` - the default every existing schedule passes - is
 /// the unchanged one-shot.
+///
+/// `expires_at` (Codeberg issue #97) is an optional latest instant this
+/// firing is still meaningful. It is carried to the fired command's
+/// `decide_with` through [`DecisionContext::deadline`] as
+/// `deadline_at`/`expired`, so a target that only makes sense soon after
+/// its `fire_at` - an auto-reply, a reminder - can refuse one the
+/// scheduler or a retry ran late. `None` (the default every existing
+/// schedule passes) is unchanged: a firing is never `expired`. A window
+/// probe: it does not stop the row firing, only tells the command it was
+/// late - a chain that wants to stop outright uses
+/// `RecurrenceSpec::valid_until`.
 #[derive(Debug, Clone)]
 pub struct DeadlineSpec<P> {
     pub fire_at: chrono::DateTime<chrono::Utc>,
+    /// See this struct's own doc comment (Codeberg issue #97).
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub tags: Vec<Tag>,
     pub payload: P,
     pub recurrence: Option<RecurrenceSpec>,
@@ -1638,6 +1766,9 @@ pub trait ScheduleDeadlineDispatcher: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ErasedDeadlineSpec {
     pub fire_at: chrono::DateTime<chrono::Utc>,
+    /// `DeadlineSpec::expires_at`, carried through verbatim (Codeberg
+    /// issue #97).
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub tags: Vec<Tag>,
     pub payload_json: String,
     pub recurrence: Option<RecurrenceSpec>,

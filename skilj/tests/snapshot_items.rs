@@ -295,6 +295,7 @@ impl Ledger {
             None,
             now(),
             None,
+            None,
         )
         .await
         .unwrap()
@@ -406,6 +407,7 @@ fn an_event_committed_after_the_read_is_folded_in_before_deciding_again() {
             &l.cache,
             &transfer_type,
             &payload,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -438,6 +440,7 @@ fn an_event_committed_after_the_read_is_folded_in_before_deciding_again() {
             &resolved.snapshot_states,
             None,
             Some(resolved.covered_through),
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();

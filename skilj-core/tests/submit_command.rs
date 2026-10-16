@@ -130,6 +130,7 @@ impl CommandDispatcher for TestCommandDispatcher {
         _payload: &str,
         _snapshot_state_json: &str,
         _events_since_snapshot: &[Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<CommandDecision>> {
         unreachable!("no fixture in this file opts into snapshot()")
     }
@@ -431,6 +432,7 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
             &[],
             None,
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -520,6 +522,7 @@ fn submit_command_does_not_redispatch_for_an_unrelated_concurrent_event() {
             &[],
             None,
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -587,6 +590,7 @@ fn submit_command_persists_a_real_command_id_that_round_trips() {
             &[],
             None,
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -663,7 +667,8 @@ fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original
             &[],
             Some(key),
             None,
-        )
+                    &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+)
         .await
         .unwrap();
         let SubmitCommandOutcome::Accepted {
@@ -697,7 +702,8 @@ fn submit_command_with_a_repeated_idempotency_key_short_circuits_to_the_original
             &[],
             Some(key),
             None,
-        )
+                    &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+)
         .await
         .unwrap();
 
@@ -775,6 +781,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             &[],
             Some(key),
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -812,6 +819,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             &[],
             Some(key),
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -870,6 +878,7 @@ fn submit_command_with_the_same_idempotency_key_from_two_different_clients_does_
             &[],
             Some(key),
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -1004,6 +1013,7 @@ fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
             &[],
             Some("legacy-key"),
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -1063,6 +1073,7 @@ fn migrate_idempotency_keys_client_id_scoping_retires_pre_migration_rows() {
             &[],
             Some("a-different-key-this-client-owns"),
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -1211,6 +1222,7 @@ fn submit_command_without_an_idempotency_key_still_double_processes_a_repeated_s
                 &[],
                 None,
                 None,
+                &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
             )
             .await
             .unwrap();
@@ -1295,6 +1307,7 @@ fn ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_th
             &[],
             Some(key),
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -1324,6 +1337,7 @@ fn ensure_idempotency_keys_table_patches_a_bounded_context_provisioned_before_th
             &[],
             Some(key),
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -1376,6 +1390,7 @@ fn submit_command_leaves_no_sequence_gap_when_process_command_fails() {
             &[],
             None,
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await;
         assert!(result.is_err());
@@ -1440,6 +1455,7 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
             &[],
             None,
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await;
         assert!(
@@ -1513,6 +1529,7 @@ fn submit_command_batches_sequence_allocation_for_a_multi_event_command() {
             &[],
             None,
             None,
+            &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -2040,7 +2057,8 @@ fn a_known_read_position_still_catches_a_conflict_committed_after_it() {
             &[],
             None,
             Some(1),
-        )
+                    &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+)
         .await
         .unwrap();
 
@@ -2102,7 +2120,8 @@ fn an_event_the_read_already_holds_above_its_position_is_not_counted_twice() {
             None,
             // Read before the event committed, the read itself after.
             Some(-1),
-        )
+                    &skilj_core::plugin::DecisionContext::at(chrono::Utc::now()),
+)
         .await
         .unwrap();
 

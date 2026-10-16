@@ -164,6 +164,7 @@ impl ScheduleDeadline for ScheduleRecurringReminder {
     fn schedule(source_payload: &OrderPlacedPayload) -> Option<DeadlineSpec<SendReminderPayload>> {
         Some(DeadlineSpec {
             fire_at: source_payload.deadline_at,
+            expires_at: None,
             tags: vec![order_tag(&source_payload.order_id)],
             payload: SendReminderPayload {
                 order_id: source_payload.order_id.clone(),

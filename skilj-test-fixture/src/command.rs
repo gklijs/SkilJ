@@ -2,7 +2,9 @@
 //! given/when/then harness. See the crate root doc comment for what this
 //! deliberately does and doesn't stand in for.
 
-use skilj_core::plugin::{CommandType, Decision, Snapshot, SnapshotState};
+use skilj_core::plugin::{
+    CommandType, DeadlineContext, Decision, DecisionContext, Snapshot, SnapshotState,
+};
 use skilj_core::shared::{CommandDecision, EventSpec};
 
 use crate::pretty;
@@ -18,6 +20,8 @@ use crate::pretty;
 pub struct GivenEvents<T: CommandType> {
     events: Vec<T::Event>,
     snapshots: Vec<SnapshotState>,
+    now: chrono::DateTime<chrono::Utc>,
+    deadline: Option<DeadlineContext>,
 }
 
 impl<T: CommandType> GivenEvents<T> {
@@ -25,6 +29,10 @@ impl<T: CommandType> GivenEvents<T> {
         Self {
             events: Vec::new(),
             snapshots: Vec::new(),
+            // A fixed, replayable default (Codeberg issue #97): a test that
+            // doesn't set one gets the same `now` every run.
+            now: chrono::DateTime::UNIX_EPOCH,
+            deadline: None,
         }
     }
 
@@ -53,14 +61,42 @@ impl<T: CommandType> GivenEvents<T> {
         self
     }
 
+    /// The `now` `decide()` is handed through `Decision::now()`, and the
+    /// instant a `.deadline()` expiry is judged against (Codeberg issue
+    /// #97). Defaults to the Unix epoch.
+    pub fn now(mut self, now: chrono::DateTime<chrono::Utc>) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// Marks this decision a deadline firing (Codeberg issue #97):
+    /// `scheduled_at` is the deadline's own `fire_at`, `deadline_at` its
+    /// optional `expires_at`. `expired` is computed from the current
+    /// `now`, so call `.now()` first to control it.
+    pub fn deadline(
+        mut self,
+        scheduled_at: chrono::DateTime<chrono::Utc>,
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        self.deadline = Some(DeadlineContext::new(scheduled_at, deadline_at, self.now));
+        self
+    }
+
     /// Calls `T::decide_with()` directly, with the given events and
     /// snapshot states - what the framework calls, and `decide()` for a
     /// command type that implements only that. No database, no HTTP, no
     /// access-control check (those are `skilj`'s own surfaces' job, not
     /// `decide()`'s).
     pub fn when(self, payload: T::Payload) -> CommandOutcome {
+        let context = DecisionContext {
+            now: self.now,
+            deadline: self.deadline,
+        };
         CommandOutcome {
-            decision: T::decide_with(&payload, &Decision::new(&self.events, &self.snapshots)),
+            decision: T::decide_with(
+                &payload,
+                &Decision::new(&self.events, &self.snapshots, &context),
+            ),
         }
     }
 }

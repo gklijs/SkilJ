@@ -4146,7 +4146,20 @@ rule ProcessCommand {
     -- as if none exists yet. See surface SnapshotInspection for the one
     -- place this summary is itself observable - nowhere else does its
     -- existence, absence or content change what a caller can see.
-    let decision = decide(command_type, payload, matching_events)
+    -- The decider is also handed the instant the decision is made - the
+    -- same `now` every record this rule writes is stamped with (see the
+    -- ensures below), passed as one more input rather than read from a
+    -- clock by decide() itself. That is what lets a decider reason about
+    -- time ("is this reminder still worth sending?") while staying the
+    -- pure, synchronous, no-I/O function the plugin contract above
+    -- requires: the same inputs always yield the same decision. Where this
+    -- rule was reached from a deadline the library fired on its own behalf
+    -- (see the archiving note above), the decider is handed that firing's
+    -- timing context too - when the deadline was scheduled, and whether it
+    -- ran past its own expiry. Deadlines themselves are outside this
+    -- spec's scope; the instant is not, and is always present. (Codeberg
+    -- issue #97.)
+    let decision = decide(command_type, payload, matching_events, now)
     requires: decision.accepted = true
 
     -- The command's own payload is protected on the way into storage,
@@ -4284,7 +4297,7 @@ rule DryRunCommand {
     let consistency_query = derive_query(command_type, payload)
     let matching_events =
         query_matching_events(command_type.bounded_context, consistency_tags, consistency_query)
-    let decision = decide(command_type, payload, matching_events)
+    let decision = decide(command_type, payload, matching_events, now)
 
     let shown = last_by_sequence(
         filter(matching_events, e => event_owner_scope_satisfied(e, access_mapping.scope)),
@@ -4350,7 +4363,7 @@ rule DryRunTriggerCommand {
     let consistency_query = derive_query(command_type, payload)
     let matching_events =
         query_matching_events(command_type.bounded_context, consistency_tags, consistency_query)
-    let decision = decide(command_type, payload, matching_events)
+    let decision = decide(command_type, payload, matching_events, now)
 
     ensures:
         TriggerDryRun(

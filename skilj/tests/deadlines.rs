@@ -263,6 +263,7 @@ impl ScheduleDeadline for ScheduleOrderCancelDeadline {
         }
         Some(DeadlineSpec {
             fire_at: source_payload.deadline_at,
+            expires_at: None,
             tags: vec![order_tag(&source_payload.order_id)],
             payload: CancelOrderPayload {
                 order_id: source_payload.order_id.clone(),
@@ -286,6 +287,7 @@ impl ScheduleDeadline for ScheduleReminderDeadline {
     fn schedule(source_payload: &OrderPlacedPayload) -> Option<DeadlineSpec<SendReminderPayload>> {
         Some(DeadlineSpec {
             fire_at: source_payload.deadline_at,
+            expires_at: None,
             tags: vec![order_tag(&source_payload.order_id)],
             payload: SendReminderPayload {
                 order_id: source_payload.order_id.clone(),
@@ -1255,6 +1257,7 @@ impl skilj_core::plugin::CommandDispatcher for OlderInstance {
         _payload: &str,
         _snapshot_state_json: &str,
         _events_since_snapshot: &[skilj_core::event_store::Event],
+        _context: &skilj_core::plugin::DecisionContext,
     ) -> Option<skilj_core::error::Result<skilj_core::shared::CommandDecision>> {
         None
     }

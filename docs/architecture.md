@@ -222,6 +222,7 @@ listed separately here; see that section itself for its own structure.
 - [167. Every test binary gets its own database, not the one `DATABASE_URL` names](#per-binary-test-databases)
 - [168. Which of two colliding projections is served was a coin flip](#projection-type-name-collision-order)
 - [212. Per-entity recurrence for deadlines, with a missed-run policy](#deadline-recurrence)
+- [213. The firing time, and a deadline's expiry, handed to `decide()`](#deadline-firing-time-and-expiry)
 
 ---
 
@@ -12224,4 +12225,57 @@ cron degrades); `skilj/tests/deadline_recurrence.rs` runs a real `Skilj`
 where one order's every-second chain fires several times then stops at
 `end_at` on its own, while a paid order's chain is cut short by its
 cancel.
+
+<a id="deadline-firing-time-and-expiry"></a>
+## 213. The firing time, and a deadline's expiry, handed to `decide()` (Codeberg issue #97)
+
+Raised against §46's deadline: a `decide()` that wants to reason about
+time - "is this reminder still worth sending?", "is this auto-reply too
+late?" - had no clock, deliberately (§1.1: `decide()` is pure, so the
+framework owns the clock and the decision stays deterministic and
+replayable), and a deadline-fired command had no way to tell a firing
+that had run past its own expiry. A one-shot is scheduled at `fire_at`,
+but by the time the worker runs it `fire_at` may be well past - a
+restart, a busy tick - and nothing told the command.
+
+**One new argument, not a clock.** `DecisionContext { now:
+DateTime<Utc>, deadline: Option<DeadlineContext> }` is built by the
+framework and handed to every decision. `now` is the same instant the
+submission already stamps the command's `created_at`, its idempotency row
+and its events with, so `decide()` reads time through `Decision::now()`
+without reading a clock - the §202 "room to grow" `Decision` struct
+absorbs it, and `decide_with`'s own signature is unchanged.
+`DeadlineContext { scheduled_at, deadline_at, expired }` is present only
+when the submission is a deadline firing: `scheduled_at` the fired row's
+own `fire_at`, `deadline_at` its optional `expires_at`, and `expired`
+whether `now` is past `deadline_at`. Reached through
+`Decision::deadline()`. A redrive or retry keeps the same `scheduled_at`
+with a later `now`, so a command can tell them apart.
+
+**`expires_at` on `DeadlineSpec`.** `DeadlineSpec::expires_at:
+Option<DateTime<Utc>>` and a nullable `deadlines.expires_at` column carry
+it (`ErasedDeadlineSpec::expires_at` at the dispatcher boundary). `None`
+is the unchanged one-shot and is never `expired`; a recurring chain
+carries the same absolute `expires_at` to every row it begets. It is a
+window probe, not a kill-switch: a row past `expires_at` still fires, and
+the command decides what to do about being late - a chain that wants to
+stop outright uses `RecurrenceSpec::valid_until` (§212).
+
+**Plumbing.** `CommandDispatcher::dispatch_with` and
+`dispatch_from_snapshot`, `CommandType::decide_from_snapshot` and the
+facade's `DeciderFn`/`DecideFromSnapshotFn` all gain the context;
+`resolve_command_submission`, `submit_command`, `decide_command_in_tx`,
+the batch paths and `dry_run_command` thread it through. The batch and
+cross-context paths, and the GraphQL/REST dry-run paths, build an
+ordinary context from their own `now`; `fire_due_deadlines` builds a
+deadline one from the fired row. `skilj-test-fixture`'s `GivenEvents`
+gains `.now()` and `.deadline()`, so a plugin author drives an arbitrary
+instant with no database.
+
+**Tests.** `skilj-core/tests/deadline_expiry.rs` pins the persistence
+(`expires_at` stored), a late firing (the context `expired`, the right
+`scheduled_at`/`deadline_at`, and `now` the tick's own), an on-time
+firing, the no-expiry default, and an ordinary submission's `now` with no
+deadline. `skilj-test-fixture/tests/fixture.rs` pins the pure
+`Decision::now`/`Decision::deadline` plumbing.
 

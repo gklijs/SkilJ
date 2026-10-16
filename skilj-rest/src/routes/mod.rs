@@ -1370,6 +1370,7 @@ async fn post_commands_dry_run(
         &authorised.payload,
         &authorised.client_id,
         state.encryption_master_key.as_ref(),
+        chrono::Utc::now(),
     )
     .await?;
     Ok(Json(match dry_run.decision {
