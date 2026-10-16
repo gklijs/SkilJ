@@ -355,11 +355,15 @@ pub fn require_secret_access(
 /// OAuth token has already stopped working, so the caller picks a margin
 /// that covers its own polling interval plus the refresh's round trip. A
 /// version with no `expires_at` never needs one.
+///
+/// Compared as a signed difference rather than `expires_at - lead_time`, so
+/// an out-of-range `lead_time` (e.g. `Duration::MAX`) reads as "due" instead
+/// of panicking on overflow - the safe direction for a refresh check.
 pub fn secret_needs_refresh(secret: &Secret, now: DateTime<Utc>, lead_time: Duration) -> bool {
     secret.is_active()
         && secret
             .expires_at
-            .is_some_and(|expires| expires - lead_time <= now)
+            .is_some_and(|expires| expires.signed_duration_since(now) <= lead_time)
 }
 
 #[cfg(test)]
@@ -469,6 +473,10 @@ mod unit_tests {
         // A zero lead time is the old "only once expired" behaviour.
         secret.expires_at = Some(now + Duration::seconds(1));
         assert!(!secret_needs_refresh(&secret, now, Duration::zero()));
+        // An out-of-range lead time is due, not a panic (compared as a
+        // signed difference, not `expires_at - lead_time`).
+        secret.expires_at = Some(now + Duration::days(365));
+        assert!(secret_needs_refresh(&secret, now, Duration::MAX));
     }
 
     #[test]

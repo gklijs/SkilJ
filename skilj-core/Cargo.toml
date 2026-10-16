@@ -21,7 +21,10 @@ ring.workspace = true
 # `secrets::SecretValue`'s wipe-on-drop. Already in the tree through
 # rustls/aws-lc-rs (sqlx, reqwest, jsonwebtoken), so naming it here adds no
 # code to the build - the same reasoning that made `ring` a direct
-# dependency (docs/architecture.md §211).
+# dependency (docs/architecture.md §211). The `alloc` feature is what
+# provides `impl Zeroize for String`; it is named explicitly (rather than
+# relied on through feature unification from a TLS crate) so this keeps
+# compiling if that path ever leaves the graph.
 zeroize.workspace = true
 skilj-macros.workspace = true
 cron = "0.17.0"
