@@ -10,6 +10,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A supported single-user local mode (docs/architecture.md §216, Codeberg
+  issue #100). The `skilj` crate's `local` feature exposes
+  `skilj::local::LocalPostgres`, which installs, starts and owns an
+  embedded Postgres in a persistent data directory (platform default, or
+  `SKILJ_LOCAL_DATA_DIR`), creates the database and returns its URL;
+  `shutdown()` stops it and `cleanup: true` deletes the data. The demo
+  server starts it with `--local` or `SKILJ_LOCAL_MODE=1`, with
+  `SKILJ_LOCAL_PORT`/`SKILJ_LOCAL_DATABASE`/`SKILJ_LOCAL_CLEANUP` and
+  local mode taking precedence over `DATABASE_URL`. Same schema,
+  migrations and API as production.
+- Generic command approval (docs/architecture.md §214, Codeberg issue
+  #98). `CommandType::requires_approval()`, `approval_role()` and
+  `approval_deadline_seconds()` make a submission a pending
+  `CommandProposal` instead of running `decide()`; approval runs the
+  ordinary submission pipeline at approval time. New
+  `skilj_core::approvals` types, `command_approval_policies`/
+  `command_proposals` tables (patched into existing contexts at startup),
+  `db::propose_command`/`approve_command_proposal`/
+  `reject_command_proposal`/`list_command_proposals`, GraphQL
+  `commandProposals`/`approveCommand`/`rejectCommand` plus
+  `SubmitCommandPayload.pendingApproval`/`proposalId`,
+  `CommandType.requiresApproval`/`approvalPolicy`, new
+  `registerCommandType` arguments, and REST `CommandTrigger`'s
+  `pendingApproval`/`proposalId`. Approval decisions are GraphQL-only
+  because they are attributed to a `Role`; REST submissions still create
+  proposals. New error codes `command_proposal_not_found`,
+  `command_proposal_not_pending`, `command_proposal_expired`,
+  `insufficient_approval_role` and `invalid_approval_policy`.
+- Documented external-worker guarantees around private fields
+  (docs/architecture.md §215, Codeberg issue #99): `EventReadToken`
+  REST reads redact every private field unconditionally and serve
+  sensitive fields as ciphertext, the GraphQL read paths render through
+  the same entitlement checks, and database credentials, projection/
+  snapshot state and owner scope remain deliberate boundaries. New
+  regression test `an_external_read_token_never_sees_a_private_field`.
 - The firing time, and a deadline's expiry, are handed to `decide()`
   (docs/architecture.md §213, Codeberg issue #97). `DecisionContext
   { now, deadline: Option<DeadlineContext> }` is built by the framework

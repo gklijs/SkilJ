@@ -783,6 +783,13 @@ struct CommandTriggerResponse {
     // Command itself isn't re-fetched to answer this).
     #[serde(skip_serializing_if = "Option::is_none")]
     correlation_id: Option<String>,
+    // Codeberg issue #98: `true` when the command type requires approval.
+    // Nothing was decided or stored as a command; `proposal_id` names the
+    // pending `CommandProposal` an admin approves over GraphQL.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pending_approval: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proposal_id: Option<String>,
 }
 
 /// Codeberg issue #21 - which credential kind (and therefore which
@@ -1266,6 +1273,54 @@ async fn post_commands_trigger(
     span.record("bounded_context", bounded_context_name.as_str());
     span.record("command_type", authorised.command_type.name.as_str());
 
+    // Codeberg issue #98: an approval-required command becomes a pending
+    // proposal; `decide()` runs only when an approver accepts it. A key
+    // that already produced an accepted command (an earlier proposal was
+    // approved) falls through to the ordinary dedup path below.
+    if let Some(policy) = db::get_command_approval_policy(
+        &state.pool,
+        &bounded_context_name,
+        &authorised.command_type.name,
+    )
+    .await?
+    {
+        let key_already_used = match idempotency_key {
+            Some(key) => {
+                db::idempotency_key_already_used(
+                    &state.pool,
+                    &bounded_context_name,
+                    &authorised.command_type.name,
+                    &authorised.client_id,
+                    key,
+                )
+                .await?
+            }
+            None => false,
+        };
+        if !key_already_used {
+            let proposal = db::propose_command(
+                &state.pool,
+                &authorised.command_type,
+                &authorised,
+                &policy,
+                idempotency_key,
+                state.encryption_master_key.as_ref(),
+                Utc::now(),
+            )
+            .await?;
+            return Ok(Json(CommandTriggerResponse {
+                accepted: false,
+                triggered_event_sequences: None,
+                rejection_reason: None,
+                rejection_kind: None,
+                deduplicated: false,
+                correlation_id: None,
+                pending_approval: true,
+                proposal_id: Some(proposal.id),
+            }));
+        }
+    }
+
     // The full "optimistic decide, then locked submit" sequence -
     // docs/architecture.md §19's own "Problem 1"/"Problem 2" fixes
     // (tag-indexed fetch, snapshot-context resolution), now shared with
@@ -1313,6 +1368,8 @@ async fn post_commands_trigger(
             rejection_kind: Some(kind),
             deduplicated: false,
             correlation_id: None,
+            pending_approval: false,
+            proposal_id: None,
         },
         db::SubmitCommandOutcome::Accepted { command, events } => CommandTriggerResponse {
             accepted: true,
@@ -1321,6 +1378,8 @@ async fn post_commands_trigger(
             rejection_kind: None,
             deduplicated: false,
             correlation_id: command.metadata.correlation_id,
+            pending_approval: false,
+            proposal_id: None,
         },
         // Codeberg issue #12: a cached prior answer, not a fresh
         // decision.
@@ -1333,6 +1392,8 @@ async fn post_commands_trigger(
             rejection_kind: None,
             deduplicated: true,
             correlation_id: None,
+            pending_approval: false,
+            proposal_id: None,
         },
     }))
 }

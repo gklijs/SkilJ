@@ -212,6 +212,38 @@ pub trait CommandType {
         false
     }
 
+    /// Opt-in approval flow (Codeberg issue #98, docs/architecture.md
+    /// §214): when `true`, a submission - REST or GraphQL - creates a
+    /// pending `CommandProposal` instead of running `decide()`. An
+    /// approver with an active admin-level `RoleAccessMapping` on the
+    /// bounded context then approves it over GraphQL, which runs the
+    /// ordinary submission pipeline against the state at that time.
+    ///
+    /// A command may still be rejected by `decide()` at approval time;
+    /// the proposal is then recorded as rejected, with the decision's own
+    /// reason. `false` by default, so every existing command type keeps
+    /// its immediate-submission behaviour.
+    fn requires_approval() -> bool {
+        false
+    }
+
+    /// Narrows who may approve a `requires_approval()` command type, on
+    /// top of the admin grant every approver needs: `Some(name)` requires
+    /// the approver's `Role.name` to equal `name`, `None` (the default)
+    /// lets any active admin-level mapping approve. Ignored for a type
+    /// that does not require approval.
+    fn approval_role() -> Option<&'static str> {
+        None
+    }
+
+    /// An optional approval deadline, in seconds from proposal creation.
+    /// `None` (the default) means a proposal stays approvable until it is
+    /// approved or rejected. An expired proposal is recorded as expired
+    /// and cannot be approved.
+    fn approval_deadline_seconds() -> Option<i64> {
+        None
+    }
+
     /// An extra caller-facing gate, on top of the ordinary write-level
     /// `RoleAccessMapping` check: `None` (the default) means no extra
     /// restriction. Set this by writing `#[requires_role("name")]`

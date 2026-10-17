@@ -187,6 +187,16 @@ fn status_for(err: &CoreError) -> StatusCode {
         }
         CoreError::Secrets(skilj_core::secrets::Error::NotActive { .. }) => StatusCode::FORBIDDEN,
         CoreError::Secrets(_) => StatusCode::BAD_REQUEST,
+        // Command approvals (Codeberg issue #98) are GraphQL-only for
+        // decisions, so these are unreachable over REST today; mapped by
+        // meaning rather than left to the wildcard, like the module above.
+        CoreError::Approvals(skilj_core::approvals::Error::ProposalNotFound { .. }) => {
+            StatusCode::NOT_FOUND
+        }
+        CoreError::Approvals(skilj_core::approvals::Error::InsufficientApprovalRole { .. }) => {
+            StatusCode::FORBIDDEN
+        }
+        CoreError::Approvals(_) => StatusCode::CONFLICT,
         // §7.3/§5.4: a rejection is a legitimate outcome of a successful
         // request, not an HTTP-level error - CommandTrigger's own handler
         // renders this as 200-with-typed-data instead of ever routing a

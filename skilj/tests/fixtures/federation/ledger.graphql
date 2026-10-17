@@ -24,6 +24,43 @@ enum LedgerBoundedContextStatus @inaccessible {
 	ARCHIVED
 }
 
+type LedgerCommandApprovalPolicy @inaccessible {
+	approverRole: String
+	deadlineSeconds: Int
+}
+
+type LedgerCommandProposal @inaccessible {
+	id: String!
+	boundedContext: String!
+	commandTypeName: String!
+	payload: String!
+	status: LedgerCommandProposalStatus!
+	proposedBy: String!
+	createdAt: String!
+	expiresAt: String
+	decidedAt: String
+	decidedByRoleId: String
+	rejectionReason: String
+	rejectionKind: String
+	commandId: String
+}
+
+type LedgerCommandProposalDecisionPayload @inaccessible {
+	accepted: Boolean!
+	rejectionReason: String
+	rejectionKind: String
+	proposal: LedgerCommandProposal!
+	triggeredEventSequences: [Int]
+}
+
+enum LedgerCommandProposalStatus @inaccessible {
+	PENDING
+	APPROVING
+	APPROVED
+	REJECTED
+	EXPIRED
+}
+
 type LedgerCommandToken @inaccessible {
 	id: ID!
 	secret: String!
@@ -44,6 +81,8 @@ type LedgerCommandType @inaccessible {
 	restTriggerAllowed: Boolean!
 	privateFields: [LedgerPrivateField!]!
 	consistencyQuery: [LedgerQueryItemMapping!]!
+	requiresApproval: Boolean!
+	approvalPolicy: LedgerCommandApprovalPolicy
 }
 
 type LedgerContextCreator @inaccessible {
@@ -342,6 +381,8 @@ type LedgerSubmitCommandPayload {
 	rejectionKind: String
 	deduplicated: Boolean!
 	correlationId: String
+	pendingApproval: Boolean!
+	proposalId: String
 	matchingEventsTruncated: Boolean
 	triggeredEventSequences: [Int]
 	matchingEvents: [LedgerMatchingEvent]
@@ -387,7 +428,7 @@ type Mutation {
 	ledgerArchiveBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerDeleteBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: LedgerMissedOccurrencePolicy): LedgerEventType! @inaccessible
-	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!): LedgerCommandType! @inaccessible
+	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int): LedgerCommandType! @inaccessible
 	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): LedgerProjectionRegistrationResult! @inaccessible
 	ledgerRebuildProjection(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
 	ledgerDiscardProjectionRebuild(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
@@ -399,6 +440,8 @@ type Mutation {
 	ledgerCreateCommandToken(boundedContext: String!, commandTypeName: String!, scope: String): LedgerCommandToken! @inaccessible
 	ledgerRevokeToken(tokenId: ID!): LedgerAccessToken! @inaccessible
 	ledgerSubmitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): LedgerSubmitCommandPayload!
+	ledgerApproveCommand(boundedContext: String!, proposalId: ID!): LedgerCommandProposalDecisionPayload! @inaccessible
+	ledgerRejectCommand(boundedContext: String!, proposalId: ID!, reason: String): LedgerCommandProposalDecisionPayload! @inaccessible
 	ledgerForgetSubject(boundedContext: String!, subjectKey: String!, subjectValue: String!): LedgerEncryptionKey! @inaccessible
 	ledgerGrantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int): LedgerPrivateFieldGrant!
 	ledgerGrantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID): LedgerPrivateFieldGrant!
@@ -417,6 +460,7 @@ type Query {
 	ledgerEpoch: String!
 	ledgerInspectSnapshot(boundedContext: String!, snapshotName: String!, tagValue: String!): LedgerInspectedSnapshot @inaccessible
 	ledgerFetchCommands(boundedContext: String!, commandTypes: [String!]!, afterCommandId: String, after: String, before: String, triggeredEvent: Int, correlationId: String): [LedgerQueriedCommand!]! @inaccessible
+	ledgerCommandProposals(boundedContext: String!, commandTypeName: String, status: LedgerCommandProposalStatus): [LedgerCommandProposal!]! @inaccessible
 	ledgerDryRunCommand(boundedContext: String!, commandTypeName: String!, payload: String!): LedgerDryRunCommandPayload! @inaccessible
 	ledgerListPrivateFieldGrants(boundedContext: String!, grantorRoleId: ID): [LedgerPrivateFieldGrant!]!
 	ledgerParkedDeliveries(boundedContext: String!, after: String): [LedgerParkedDelivery!]! @inaccessible

@@ -35,6 +35,7 @@ use crate::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
     ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
+use crate::approvals::{CommandApprovalPolicy, CommandProposal, CommandProposalStatus};
 use crate::bootstrap::ContextCreator;
 use crate::encryption::{self, DataKey, EncryptionMasterKey};
 use crate::event_store::{
@@ -1024,6 +1025,30 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
+    // Codeberg issue #98 - the approval policy and proposal tables. Both
+    // are brand new, so the same DDL `ensure_command_approval_tables`
+    // patches an existing context with works here too.
+    sqlx::query(sqlx::AssertSqlSafe(command_approval_policies_table_ddl(
+        &schema,
+    )))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(command_proposals_table_ddl(&schema)))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX command_proposals_by_status \
+         ON {schema}.command_proposals (status, created_at)"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE UNIQUE INDEX command_proposals_pending_idempotency \
+         ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key) \
+         WHERE status = 'pending' AND idempotency_key IS NOT NULL"
+    )))
+    .execute(&mut **tx)
+    .await?;
 
     // docs/architecture.md §104 - after every table it touches exists.
     add_registration_version_columns(&mut **tx, bounded_context).await?;
@@ -1085,6 +1110,112 @@ pub async fn ensure_private_field_grants_table(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// --- Command approvals (Codeberg issue #98) ---
+
+/// `entity CommandApprovalPolicy` - kept in its own table rather than as
+/// columns on `command_types`, so adding it changed no `CommandType`
+/// literal anywhere. A row's presence is what makes the type require
+/// approval; `approver_role`/`deadline_seconds` are optional refinements.
+fn command_approval_policies_table_ddl(schema: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.command_approval_policies (
+            command_type_name TEXT PRIMARY KEY REFERENCES {schema}.command_types (name),
+            approver_role TEXT,
+            deadline_seconds BIGINT CHECK (deadline_seconds IS NULL OR deadline_seconds > 0)
+        )"
+    )
+}
+
+/// `entity CommandProposal`. `payload` is encrypted at rest exactly as
+/// `commands.payload` is; `metadata_*` mirror the `commands` table's own
+/// columns so approval can run the ordinary submission pipeline with the
+/// original submitter's `client_id`, correlation and causation ids.
+/// `status = 'approving'` is the claim an approver takes before running
+/// that pipeline; `command_external_id` is `commands.external_id` once
+/// approval produced one.
+fn command_proposals_table_ddl(schema: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.command_proposals (
+            id TEXT PRIMARY KEY,
+            command_type_name TEXT NOT NULL REFERENCES {schema}.command_types (name),
+            payload TEXT NOT NULL,
+            metadata_version BIGINT NOT NULL,
+            metadata_client_id TEXT NOT NULL,
+            metadata_created_at TIMESTAMPTZ NOT NULL,
+            metadata_correlation_id TEXT,
+            metadata_causation_id TEXT,
+            status TEXT NOT NULL CHECK (status IN \
+                ('pending', 'approving', 'approved', 'rejected', 'expired')),
+            idempotency_key TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+            expires_at TIMESTAMPTZ,
+            decided_at TIMESTAMPTZ,
+            decided_by_role_id TEXT REFERENCES public.roles (id),
+            rejection_reason TEXT,
+            rejection_kind TEXT,
+            command_external_id TEXT REFERENCES {schema}.commands (external_id)
+        )"
+    )
+}
+
+pub async fn ensure_command_approval_tables(
+    pool: &Pool,
+    bounded_context: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    // `command_proposals` references `commands.external_id`, and
+    // `command_approval_policies` references `command_types` - both already
+    // exist for any context this startup patch runs against. Patched by
+    // catalog lookup, not `CREATE ... IF NOT EXISTS`, so an up-to-date
+    // context takes no lock at all (docs/architecture.md §158).
+    sqlx::query(sqlx::AssertSqlSafe(create_table_patch(
+        &schema,
+        "command_approval_policies",
+        command_approval_policies_table_ddl(&schema),
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_table_patch(
+        &schema,
+        "command_proposals",
+        command_proposals_table_ddl(&schema),
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "command_proposals_by_status",
+        format!(
+            "CREATE INDEX command_proposals_by_status \
+             ON {schema}.command_proposals (status, created_at)"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "command_proposals_pending_idempotency",
+        format!(
+            "CREATE UNIQUE INDEX command_proposals_pending_idempotency \
+             ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key) \
+             WHERE status = 'pending' AND idempotency_key IS NOT NULL"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `ddl` (a bare `CREATE TABLE`) run only when `table` does not exist in
+/// `schema`: `CREATE TABLE IF NOT EXISTS` takes a lock before finding it
+/// already there, the same startup-cost problem as `create_index_patch`.
+fn create_table_patch(schema: &str, table: &str, ddl: String) -> String {
+    format!(
+        "DO $patch$ BEGIN IF to_regclass({}) IS NULL THEN {ddl}; END IF; END $patch$",
+        sql_literal(&format!("{schema}.{table}"))
+    )
 }
 
 // --- PrivateFieldGrant ---
@@ -4303,6 +4434,601 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     .await?;
     notify_registration_changed(pool).await;
     Ok(())
+}
+
+// --- Command approvals (Codeberg issue #98) ---
+
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn get_command_approval_policy(
+    pool: &Pool,
+    bounded_context: &str,
+    command_type_name: &str,
+) -> crate::error::Result<Option<CommandApprovalPolicy>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT approver_role, deadline_seconds FROM {schema}.command_approval_policies \
+             WHERE command_type_name = $1"
+    )))
+    .bind(command_type_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(approver_role, deadline_seconds)| {
+        CommandApprovalPolicy::new(approver_role, deadline_seconds)
+    }))
+}
+
+/// Writes `policy` for `command_type_name`. `None` removes the row, so the
+/// type no longer requires approval - an explicit admin decision
+/// (`registerCommandType` with `requiresApproval: false`), not something
+/// startup reconciliation does: a deploy that stops declaring
+/// `requires_approval()` leaves the stored policy in place, the same
+/// "startup never removes a protection" stance as §102.
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn set_command_approval_policy(
+    pool: &Pool,
+    bounded_context: &str,
+    command_type_name: &str,
+    policy: Option<&CommandApprovalPolicy>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    match policy {
+        Some(policy) => {
+            if policy.deadline_seconds.is_some_and(|seconds| seconds <= 0) {
+                return Err(crate::approvals::Error::InvalidApprovalPolicy.into());
+            }
+            if crate::db::get_command_type(pool, bounded_context, command_type_name)
+                .await?
+                .is_none()
+            {
+                return Err(crate::error::Error::row_not_found());
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {schema}.command_approval_policies \
+                 (command_type_name, approver_role, deadline_seconds) VALUES ($1, $2, $3) \
+                 ON CONFLICT (command_type_name) DO UPDATE SET \
+                    approver_role = EXCLUDED.approver_role, \
+                    deadline_seconds = EXCLUDED.deadline_seconds"
+            )))
+            .bind(command_type_name)
+            .bind(policy.approver_role.as_deref())
+            .bind(policy.deadline_seconds)
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {schema}.command_approval_policies WHERE command_type_name = $1"
+            )))
+            .bind(command_type_name)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Inserts a proposal for an already-authorised submission. The payload is
+/// encrypted at rest with the command type's own sensitive fields, exactly
+/// as a real command's is. With an idempotency key, a repeated pending
+/// submission for the same `(command type, client, key)` returns the
+/// original proposal rather than creating a second one.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(bounded_context = %command_type.bounded_context.name))]
+pub async fn propose_command(
+    pool: &Pool,
+    command_type: &CommandType,
+    authorised: &crate::event_store::CommandAuthorised,
+    policy: &CommandApprovalPolicy,
+    idempotency_key: Option<&str>,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<CommandProposal> {
+    let bounded_context_name = &command_type.bounded_context.name;
+    let schema = schema_ident(bounded_context_name);
+
+    let mut resolved = std::collections::HashMap::new();
+    resolve_encryption_keys(
+        pool,
+        bounded_context_name,
+        &command_type.sensitive_fields,
+        &authorised.payload,
+        encryption_master_key,
+        &mut resolved,
+    )
+    .await?;
+    let protected = crate::event_store::protect_sensitive_fields(
+        &command_type.sensitive_fields,
+        &authorised.payload,
+        |subject_key, subject_value| {
+            let (_, _, data_key) = resolved
+                .get(&(subject_key.to_string(), subject_value.to_string()))
+                .expect("every subject protect_sensitive_fields asks for was resolved just above");
+            (
+                resolved
+                    .get(&(subject_key.to_string(), subject_value.to_string()))
+                    .expect("resolved just above")
+                    .0
+                    .clone(),
+                data_key.clone(),
+            )
+        },
+    );
+
+    let id = crate::shared::generate_token_id();
+    let expires_at = policy
+        .deadline_seconds
+        .map(|seconds| now + chrono::Duration::seconds(seconds));
+    let inserted: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {schema}.command_proposals \
+         (id, command_type_name, payload, metadata_version, metadata_client_id, \
+          metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \
+          idempotency_key, created_at, expires_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$6,$10) \
+         ON CONFLICT (command_type_name, metadata_client_id, idempotency_key) \
+             WHERE status = 'pending' AND idempotency_key IS NOT NULL \
+         DO NOTHING \
+         RETURNING id"
+    )))
+    .bind(&id)
+    .bind(&command_type.name)
+    .bind(&protected.payload)
+    .bind(1_i64)
+    .bind(&authorised.client_id)
+    .bind(now)
+    .bind(&authorised.correlation_id)
+    .bind(&authorised.causation_id)
+    .bind(idempotency_key)
+    .bind(expires_at)
+    .fetch_optional(pool)
+    .await?;
+
+    let proposal_id = match inserted {
+        Some((id,)) => id,
+        None => {
+            let key = idempotency_key
+                .ok_or_else(|| crate::error::Error::Database(sqlx::Error::RowNotFound))?;
+            let (id,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT id FROM {schema}.command_proposals \
+                 WHERE command_type_name = $1 AND metadata_client_id = $2 \
+                   AND idempotency_key = $3 AND status = 'pending'"
+            )))
+            .bind(&command_type.name)
+            .bind(&authorised.client_id)
+            .bind(key)
+            .fetch_one(pool)
+            .await?;
+            id
+        }
+    };
+    get_command_proposal(pool, bounded_context_name, &proposal_id)
+        .await?
+        .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: proposal_id }.into())
+}
+
+/// Marks pending proposals whose deadline has passed as expired, then
+/// returns the ones matching `status`/`command_type_name`. The lazy update
+/// keeps listing and approving consistent without a background sweeper.
+pub async fn expire_command_proposals(
+    pool: &Pool,
+    bounded_context: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.command_proposals SET status = 'expired' \
+         WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= $1"
+    )))
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_command_proposals(
+    pool: &Pool,
+    bounded_context: &str,
+    status: Option<CommandProposalStatus>,
+    command_type_name: Option<&str>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<Vec<CommandProposal>> {
+    expire_command_proposals(pool, bounded_context, now).await?;
+    let schema = schema_ident(bounded_context);
+    let rows: Vec<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, command_type_name, payload, metadata_version, metadata_client_id, \
+                metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \
+                idempotency_key, created_at, expires_at, decided_at, decided_by_role_id, \
+                rejection_reason, rejection_kind, command_external_id \
+         FROM {schema}.command_proposals \
+         WHERE ($1::text IS NULL OR status = $1) \
+           AND ($2::text IS NULL OR command_type_name = $2) \
+         ORDER BY created_at, id"
+    )))
+    .bind(status.map(CommandProposalStatus::as_str))
+    .bind(command_type_name)
+    .fetch_all(pool)
+    .await?;
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.into_domain(bc.clone()))
+        .collect())
+}
+
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn get_command_proposal(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+) -> crate::error::Result<Option<CommandProposal>> {
+    let schema = schema_ident(bounded_context);
+    let row: Option<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, command_type_name, payload, metadata_version, metadata_client_id, \
+                metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \
+                idempotency_key, created_at, expires_at, decided_at, decided_by_role_id, \
+                rejection_reason, rejection_kind, command_external_id \
+         FROM {schema}.command_proposals WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    Ok(Some(row.into_domain(bc)))
+}
+
+#[derive(sqlx::FromRow)]
+struct ProposalRow {
+    id: String,
+    command_type_name: String,
+    payload: String,
+    metadata_version: i64,
+    metadata_client_id: String,
+    metadata_created_at: DateTime<Utc>,
+    metadata_correlation_id: Option<String>,
+    metadata_causation_id: Option<String>,
+    status: String,
+    idempotency_key: Option<String>,
+    created_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    decided_at: Option<DateTime<Utc>>,
+    decided_by_role_id: Option<String>,
+    rejection_reason: Option<String>,
+    rejection_kind: Option<String>,
+    command_external_id: Option<String>,
+}
+
+impl ProposalRow {
+    fn into_domain(self, bounded_context: BoundedContext) -> CommandProposal {
+        CommandProposal {
+            id: self.id,
+            bounded_context,
+            command_type_name: self.command_type_name,
+            payload: self.payload,
+            metadata: Metadata {
+                r#type: "Command".to_string(),
+                version: self.metadata_version,
+                client_id: self.metadata_client_id,
+                created_at: self.metadata_created_at,
+                correlation_id: self.metadata_correlation_id,
+                causation_id: self.metadata_causation_id,
+            },
+            status: CommandProposalStatus::from_db(&self.status)
+                .expect("command_proposals.status has a CHECK constraint"),
+            idempotency_key: self.idempotency_key,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            decided_at: self.decided_at,
+            decided_by_role_id: self.decided_by_role_id,
+            rejection_reason: self.rejection_reason,
+            rejection_kind: self.rejection_kind,
+            command_id: self.command_external_id,
+        }
+    }
+}
+
+/// Claims a pending proposal for `approver`, refusing an expired one. The
+/// conditional `UPDATE` is the lock: exactly one concurrent approver can
+/// move a row from `pending` to `approving`.
+pub async fn claim_command_proposal(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+    approver: &RoleAccessMapping,
+    now: DateTime<Utc>,
+) -> crate::error::Result<CommandProposal> {
+    expire_command_proposals(pool, bounded_context, now).await?;
+    let proposal = get_command_proposal(pool, bounded_context, id)
+        .await?
+        .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() })?;
+    if approver.bounded_context.name != bounded_context {
+        return Err(crate::access_control::Error::GrantNotActive.into());
+    }
+    let policy = get_command_approval_policy(pool, bounded_context, &proposal.command_type_name)
+        .await?
+        .ok_or(crate::approvals::Error::ProposalNotPending {
+            status: "not under an approval policy",
+        })?;
+    crate::approvals::check_approver(&policy, approver)?;
+    match proposal.status {
+        CommandProposalStatus::Pending if proposal.is_expired_at(now) => {
+            return Err(crate::approvals::Error::ProposalExpired.into())
+        }
+        CommandProposalStatus::Pending => {}
+        CommandProposalStatus::Expired => {
+            return Err(crate::approvals::Error::ProposalExpired.into())
+        }
+        status => {
+            return Err(crate::approvals::Error::ProposalNotPending {
+                status: status.as_str(),
+            }
+            .into())
+        }
+    }
+
+    let schema = schema_ident(bounded_context);
+    let claimed: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.command_proposals \
+         SET status = 'approving', decided_at = $2, decided_by_role_id = $3 \
+         WHERE id = $1 AND status = 'pending' AND (expires_at IS NULL OR expires_at > $2) \
+         RETURNING id"
+    )))
+    .bind(id)
+    .bind(now)
+    .bind(&approver.role.id)
+    .fetch_optional(pool)
+    .await?;
+    if claimed.is_none() {
+        return Err(crate::approvals::Error::ProposalNotPending { status: "claimed" }.into());
+    }
+    get_command_proposal(pool, bounded_context, id)
+        .await?
+        .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() }.into())
+}
+
+/// The payload approval hands `decide()`: the stored ciphertext revealed.
+pub async fn reveal_command_proposal_payload(
+    pool: &Pool,
+    command_type: &CommandType,
+    proposal: &CommandProposal,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+) -> crate::error::Result<String> {
+    let subjects = crate::event_store::sensitive_field_subjects(
+        &command_type.sensitive_fields,
+        &proposal.payload,
+    );
+    if subjects.is_empty() {
+        return Ok(proposal.payload.clone());
+    }
+    let master_key = encryption_master_key.ok_or(encryption::Error::MasterKeyNotConfigured)?;
+    let mut keys: std::collections::HashMap<(String, String), Option<DataKey>> =
+        std::collections::HashMap::new();
+    for (subject_key, subject_value) in subjects {
+        let key = get_active_data_key(
+            pool,
+            &proposal.bounded_context.name,
+            &subject_key,
+            &subject_value,
+            master_key,
+        )
+        .await?;
+        keys.insert((subject_key, subject_value), key);
+    }
+    crate::event_store::reveal_sensitive_fields(
+        &command_type.sensitive_fields,
+        &proposal.payload,
+        |subject_key, subject_value| {
+            keys.get(&(subject_key.to_string(), subject_value.to_string()))
+                .cloned()
+                .flatten()
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_command_proposal(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+    status: CommandProposalStatus,
+    rejection_reason: Option<&str>,
+    rejection_kind: Option<&str>,
+    command_external_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.command_proposals SET status = $2, decided_at = $3, \
+            rejection_reason = $4, rejection_kind = $5, command_external_id = $6 \
+         WHERE id = $1 AND status = 'approving'"
+    )))
+    .bind(id)
+    .bind(status.as_str())
+    .bind(now)
+    .bind(rejection_reason)
+    .bind(rejection_kind)
+    .bind(command_external_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn release_command_proposal(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+) -> crate::error::Result<()> {
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.command_proposals \
+         SET status = 'pending', decided_at = NULL, decided_by_role_id = NULL \
+         WHERE id = $1 AND status = 'approving'"
+    )))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn reject_command_proposal(
+    pool: &Pool,
+    bounded_context: &str,
+    id: &str,
+    approver: &RoleAccessMapping,
+    reason: Option<&str>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<CommandProposal> {
+    claim_command_proposal(pool, bounded_context, id, approver, now).await?;
+    let schema = schema_ident(bounded_context);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.command_proposals SET status = 'rejected', rejection_reason = $2, \
+            decided_at = $3 WHERE id = $1 AND status = 'approving'"
+    )))
+    .bind(id)
+    .bind(reason)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    get_command_proposal(pool, bounded_context, id)
+        .await?
+        .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() }.into())
+}
+
+/// What approving a proposal did: the proposal after its final update,
+/// and the ordinary submission outcome (`Accepted`, `Rejected` by
+/// `decide()`, or `Deduplicated` on a retry after a crash).
+pub struct CommandApprovalOutcome {
+    pub proposal: CommandProposal,
+    pub outcome: SubmitCommandOutcome,
+}
+
+/// Runs the ordinary submission pipeline for a claimed proposal, with the
+/// original submitter's own `client_id` and correlation/causation ids.
+/// On an `Err` the claim is released back to `pending`, so a transient
+/// failure is retryable; on a business rejection the proposal is recorded
+/// rejected with `decide()`'s own reason.
+#[allow(clippy::too_many_arguments)]
+pub async fn approve_command_proposal(
+    pool: &Pool,
+    dispatcher: &dyn crate::plugin::CommandDispatcher,
+    projection_dispatcher: &dyn crate::plugin::ProjectionDispatcher,
+    snapshot_dispatcher: &dyn crate::plugin::SnapshotDispatcher,
+    broadcaster: &crate::event_store::EventBroadcaster,
+    event_cache: &crate::event_cache::EventCache,
+    bounded_context: &str,
+    id: &str,
+    approver: &RoleAccessMapping,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<CommandApprovalOutcome> {
+    let proposal = claim_command_proposal(pool, bounded_context, id, approver, now).await?;
+    let command_type =
+        match get_command_type(pool, bounded_context, &proposal.command_type_name).await? {
+            Some(command_type) => command_type,
+            None => {
+                release_command_proposal(pool, bounded_context, id).await?;
+                return Err(crate::error::Error::row_not_found());
+            }
+        };
+    let payload = match reveal_command_proposal_payload(
+        pool,
+        &command_type,
+        &proposal,
+        encryption_master_key,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(e) => {
+            release_command_proposal(pool, bounded_context, id).await?;
+            return Err(e);
+        }
+    };
+
+    let idempotency_key = proposal.idempotency_key.clone().unwrap_or_else(|| {
+        format!(
+            "{}{}",
+            crate::event_store::RESERVED_APPROVAL_IDEMPOTENCY_KEY_PREFIX,
+            proposal.id
+        )
+    });
+    let outcome = decide_and_submit_command(
+        pool,
+        dispatcher,
+        projection_dispatcher,
+        snapshot_dispatcher,
+        broadcaster,
+        event_cache,
+        &command_type,
+        &payload,
+        &proposal.metadata.client_id,
+        proposal.metadata.correlation_id.as_deref(),
+        proposal.metadata.causation_id.as_deref(),
+        encryption_master_key,
+        now,
+        Some(&idempotency_key),
+        None,
+    )
+    .await;
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            release_command_proposal(pool, bounded_context, id).await?;
+            return Err(e);
+        }
+    };
+
+    match &outcome {
+        SubmitCommandOutcome::Accepted { command, .. } => {
+            finish_command_proposal(
+                pool,
+                bounded_context,
+                id,
+                CommandProposalStatus::Approved,
+                None,
+                None,
+                Some(command.id.as_str()),
+                now,
+            )
+            .await?;
+        }
+        SubmitCommandOutcome::Rejected { reason, kind, .. } => {
+            finish_command_proposal(
+                pool,
+                bounded_context,
+                id,
+                CommandProposalStatus::Rejected,
+                Some(reason),
+                Some(kind),
+                None,
+                now,
+            )
+            .await?;
+        }
+        SubmitCommandOutcome::Deduplicated { .. } => {
+            finish_command_proposal(
+                pool,
+                bounded_context,
+                id,
+                CommandProposalStatus::Approved,
+                None,
+                None,
+                None,
+                now,
+            )
+            .await?;
+        }
+    }
+
+    Ok(CommandApprovalOutcome {
+        proposal: get_command_proposal(pool, bounded_context, id)
+            .await?
+            .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() })?,
+        outcome,
+    })
 }
 
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
@@ -15487,6 +16213,26 @@ async fn mark_deadline_resolved(
 /// it already makes the DCB-conflict recheck a few lines below it
 /// race-free.
 ///
+/// Whether this `(command type, client, key)` already produced an
+/// accepted command. Approval-required submissions check this *before*
+/// creating a proposal: once an approver accepted a proposal submitted
+/// with a caller key, a duplicate submission must short-circuit to the
+/// ordinary dedup path rather than proposing the same command again.
+pub async fn idempotency_key_already_used(
+    pool: &Pool,
+    bounded_context: &str,
+    command_type_name: &str,
+    client_id: &str,
+    idempotency_key: &str,
+) -> crate::error::Result<bool> {
+    let schema = schema_ident(bounded_context);
+    Ok(
+        lookup_idempotency_key(pool, &schema, command_type_name, client_id, idempotency_key)
+            .await?
+            .is_some(),
+    )
+}
+
 /// A real `client_id`-only match, never a `client_id = ''` legacy row -
 /// see `migrate_idempotency_keys_client_id_scoping`'s own doc comment
 /// for why a pre-migration row is deliberately left permanently

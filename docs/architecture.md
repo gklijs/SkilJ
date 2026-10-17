@@ -12279,3 +12279,178 @@ firing, the no-expiry default, and an ordinary submission's `now` with no
 deadline. `skilj-test-fixture/tests/fixture.rs` pins the pure
 `Decision::now`/`Decision::deadline` plumbing.
 
+
+## 214. Generic command approval (Codeberg issue #98)
+
+Some commands are too consequential for the credential that can submit
+them: an agent may be allowed to ask for a refund, but not to approve
+one. A command type opts in with `CommandType::requires_approval() ->
+true`; its submissions then become proposals instead of commands.
+
+**Policy, separately stored.** A type that opts in may also narrow who
+may approve (`approval_role() -> Option<&'static str>`, matched against
+`Role.name`) and set a deadline (`approval_deadline_seconds() ->
+Option<i64>`). The policy lives in `{schema}.command_approval_policies`,
+not on `command_types`, so every existing `CommandType` literal and every
+stored registration kept its shape. A row's presence means approval is
+required; `approver_role` and `deadline_seconds` refine it. Startup
+reconciliation writes the policy whenever the compiled type declares one
+and never removes a stored one when a later deploy stops declaring it -
+the same "startup never removes a protection" stance as §102.
+`registerCommandType` accepts `requiresApproval`, `approvalRole` and
+`approvalDeadlineSeconds`; omitting `requiresApproval` leaves the stored
+policy alone, explicit `false` removes it. `CommandType.requiresApproval`
+and `CommandType.approvalPolicy` expose the result.
+
+**What a submission does.** REST `POST /v1/commands/trigger` and GraphQL
+`submitCommand` still authorise the caller exactly as before (token,
+grant, `required_role`, idempotency-key validation). They then look up
+the policy. If there is one, `decide()` is *not* run: the payload is
+encrypted with the type's sensitive fields, exactly as a command's would
+be, and inserted into `{schema}.command_proposals` with the submitter's
+`client_id`, correlation/causation ids and optional caller idempotency
+key. REST answers `accepted: false, pendingApproval: true,
+proposalId`; GraphQL's `SubmitCommandPayload` gains the same
+`pendingApproval`/`proposalId` pair. A repeated pending submission with
+the same idempotency key returns the original proposal (a partial unique
+index on the pending row does the deduplication).
+
+**Approval, not a second command type.** GraphQL adds
+`commandProposals(boundedContext, commandTypeName, status)`,
+`approveCommand(boundedContext, proposalId)` and
+`rejectCommand(boundedContext, proposalId, reason)`. All three require an
+active admin-level `RoleAccessMapping`; a type's `approval_role` narrows
+that to one role name. Approval re-runs the *ordinary* submission
+pipeline - `resolve_command_submission`, `decide()`, the bounded
+context's lock, sequence allocation, events, projections and broadcasts
+- at approval time, under the proposing client's own id, so a decision
+is made against current state, not a snapshot taken at proposal time.
+The proposal row records `decided_at`, `decided_by_role_id`, the resulting
+`command_external_id`, or, if `decide()` rejects, `rejection_reason` and
+`rejection_kind`. A proposal whose `expires_at` has passed becomes
+`expired` and cannot be approved.
+
+The claim is a conditional `UPDATE` from `pending` to `approving`, so
+two concurrent approvers cannot both accept one proposal. A transient
+failure releases the claim back to `pending`; a retry after a crash is
+idempotent because approval runs under
+`skilj-approval:<proposal id>` (or the caller's own key, if it supplied
+one) - the reserved-prefix check refuses that namespace from callers.
+
+**Why approvals are GraphQL-only.** A decision has to be attributed to a
+`Role` (`decided_by_role_id`), and REST's bearer credentials are
+capability tokens with no `Role` behind them. REST can therefore create
+proposals but not approve them; `commandProposals`/`approveCommand`/
+`rejectCommand` are not in the federation's published root fields.
+
+**Tests.** `skilj/tests/graphql_business_surfaces.rs` submits, lists,
+approves, re-approves (refused), rejects, and expires a proposal, and
+checks that the approved command and its event exist while the rejected
+one does not. `skilj/tests/command_trigger.rs` pins the REST submission's
+`pendingApproval`/`proposalId` answer and the stored proposal.
+
+## 215. External workers and private fields (Codeberg issue #99)
+
+The question this section answers: what can be promised to a service
+outside this process that reads events with an `EventReadToken`?
+
+**External read tokens never see a private field.** `FetchEvents` and
+`ConsumeEvents` run every event through `redact_private_fields`
+unconditionally - there is no grant, role or mapping on this path to
+condition it on, so every declared `PrivateField` is replaced with
+`null` before the payload is re-serialised. `EventReadToken` carries an
+owner scope, not a visibility capability. This is fail-closed: a new
+private field is redacted the moment its event type declares it, with no
+token migration.
+
+**Sensitive fields arrive as ciphertext, not plaintext.** `EventReadToken`
+has no `can_read_sensitive` bit and no data-key access, so a sensitive
+field is served exactly as stored - ciphertext - rather than decrypted.
+That is safe to hand to an external worker only if ciphertext is
+acceptable; it is not a grant of the plaintext. If a worker genuinely
+needs plaintext, the supported path is a service that authenticates a
+`Role` with a `PrivateFieldGrant`/`can_read_sensitive` grant through
+GraphQL or an in-process read, not a token change. Extending
+`EventReadToken` with a sensitive-field capability would require a new
+grant model and is deliberately not done here: the safe default is worth
+more than the convenience.
+
+**The GraphQL read paths are equivalent.** `queryEvents`, `countEvents`,
+`inspectEvent` (including its `origin.triggeringCommand`),
+`fetchCommands`, a rejection's `matchingEvents`, `dryRunCommand`'s
+would-be events and `eventSubscription` all render through
+`render_event`/`render_command`: private fields are redacted unless the
+caller is entitled (own/team/addressed/grant), sensitive fields decrypt
+only for a granted subject and active key. There is no GraphQL resolver
+that returns a raw `Event.payload` or `Command.payload`.
+
+**What is not safe to expose.** Three deliberate boundaries remain, and
+all three are "someone else already holds the keys":
+
+- **Database credentials bypass every check.** The DB user can read
+  `events.payload`, command proposals and snapshots directly, in
+  ciphertext for sensitive fields and plaintext for private fields. The
+  guarantee is about the SkilJ surfaces, not about a Postgres password.
+- **Projection state and snapshots are folded from raw events.** A
+  projection's `project()` and a snapshot's `fold()` see private fields
+  (they are server-side plugin code, §1.1), so their state can contain
+  them; `ProjectionQuery` and `InspectSnapshot` are Admin-level surfaces.
+  Do not project a private field into a state that is then exposed more
+  widely.
+- **`EventReadToken` scope is owner-tag scope, not a field capability.**
+  It limits *which* events a token reads, not which fields it sees. A
+  token minted without a scope reads every event of its type.
+
+**Recommendation.** For an external worker that only needs to react to
+events, give it an `EventReadToken` for one event type and expect private
+fields to be `null` and sensitive fields to be ciphertext; route anything
+that needs plaintext through a Role-authenticated service. Never give a
+worker the database URL, and never widen a token's scope solely to make a
+field appear. The fail-closed redaction is the guarantee worth keeping.
+
+**Test.** `skilj/tests/graphql_business_surfaces.rs`'s
+`an_external_read_token_never_sees_a_private_field` writes an
+`own`-private-event through GraphQL, reads it back through the real REST
+route with an `EventReadToken`, and asserts both that the field is `null`
+and that the plaintext appears nowhere in the response.
+
+## 216. Local mode: a supported embedded Postgres (Codeberg issue #100)
+
+The embedded Postgres already used by the test harness is now a supported
+runtime mode, not only a test fixture: the `skilj` crate's `local`
+feature exposes `skilj::local`, and `skilj-demo` starts it with `--local`
+or `SKILJ_LOCAL_MODE=1`.
+
+`LocalConfig` has a persistent `data_dir` (platform data directory by
+default, `SKILJ_LOCAL_DATA_DIR` to override), an optional port
+(`SKILJ_LOCAL_PORT`, random when absent), a database name
+(`SKILJ_LOCAL_DATABASE`, default `skilj`) and `cleanup`
+(`SKILJ_LOCAL_CLEANUP`; `false` keeps the data, `true` deletes it on
+shutdown). `LocalPostgres::start()` installs Postgres on first use,
+initializes the data directory, starts the server, creates the database
+if it is missing and returns the URL; `shutdown()` stops it (and removes
+the directory only when `cleanup` is set). The server listens on
+`127.0.0.1` with the fixed `postgres`/`skilj-local` credential - a
+local-only convenience, not a secret, and not a network service.
+
+It is the same Postgres schema, migrations and API as production; the
+only difference is who owns the server process. The demo does not infer
+local mode from a missing `DATABASE_URL`: a production process that
+forgot its environment variable fails loudly rather than silently
+starting a private database. If both are set, local mode wins and logs a
+warning.
+
+The data directory is initialized once and reused. `postgresql_embedded`
+keeps its password file outside it (`<data_dir>.pgpass`) because `initdb`
+refuses a non-empty directory; that file and the fixed password are what
+let a restart connect to the existing cluster. A crash can leave a stale
+`postmaster.pid`; the next `start()` goes through `pg_ctl`, which handles
+it, but concurrent processes pointed at one directory remain unsupported
+- local mode is single-user.
+
+**Tests.** `skilj/tests/local_mode.rs` refuses an unsafe database name
+without starting anything, and starts, migrates, stops, restarts from the
+same directory, checks the migrations are still applied, and checks
+`cleanup: true` removes the directory. Running that suite needs the same
+first-run embedded-Postgres download as the other DB-backed suites'
+`DATABASE_URL` fallback.

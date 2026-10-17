@@ -136,6 +136,30 @@ impl CommandType for CloseAccount {
     }
 }
 
+/// Codeberg issue #98 over REST: a `CommandToken` may submit it, but the
+/// submission becomes a pending proposal instead of a decided command.
+struct TransferMoney;
+
+impl CommandType for TransferMoney {
+    type Payload = WithdrawPayload;
+    type Event = BankingEvent;
+    const NAME: &'static str = "TransferMoney";
+    fn rest_trigger_allowed() -> bool {
+        true
+    }
+    fn requires_approval() -> bool {
+        true
+    }
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "MoneyDeposited".to_string(),
+                payload: serde_json::json!({ "amount": payload.amount }),
+            }],
+        }
+    }
+}
+
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
 
 struct TestDb {
@@ -271,6 +295,7 @@ async fn setup_with_pool(
         .event_type::<MoneyDeposited>()
         .command_type::<WithdrawMoney>()
         .command_type::<CloseAccount>()
+        .command_type::<TransferMoney>()
         .reconciliation_role(external_subject)
         .build()
         .await
@@ -294,6 +319,60 @@ async fn setup_with_pool(
 
     let credential = format!("{}.{}", token.id, token.secret);
     (skilj, credential, pool, bc_name, mapping, command_type)
+}
+
+#[test]
+fn an_approval_required_trigger_creates_a_pending_proposal() {
+    runtime().block_on(async {
+        if test_db().await.is_none() {
+            return;
+        }
+        let (skilj, _credential, pool, bc_name, mapping, _) = setup().await;
+        let command_type = db::get_command_type(&pool, &bc_name, "TransferMoney")
+            .await
+            .unwrap()
+            .unwrap();
+        let token = access_control::create_command_token(
+            &mapping,
+            &command_type,
+            generate_token_id(),
+            generate_token_secret(),
+            None,
+            test_now(),
+        )
+        .unwrap();
+        db::insert_command_token(&pool, &token).await.unwrap();
+        let credential = format!("{}.{}", token.id, token.secret);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/commands/trigger")
+            .header("authorization", format!("Bearer {credential}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "payload": { "amount": 7 } }).to_string(),
+            ))
+            .unwrap();
+        let response = skilj.rest_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["accepted"], serde_json::json!(false), "{body}");
+        assert_eq!(body["pendingApproval"], serde_json::json!(true), "{body}");
+        let proposal_id = body["proposalId"].as_str().expect("a proposal id");
+        let proposals = db::list_command_proposals(
+            &pool,
+            &bc_name,
+            Some(skilj_core::approvals::CommandProposalStatus::Pending),
+            Some("TransferMoney"),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].id, proposal_id);
+        assert_eq!(proposals[0].payload, r#"{"amount":7}"#);
+    });
 }
 
 /// Every write to a bounded context holds its `sequence` lock, and every

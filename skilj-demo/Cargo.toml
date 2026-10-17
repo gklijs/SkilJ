@@ -8,7 +8,7 @@ description = "Worked example built on `skilj`: two bounded contexts (banking, c
 publish = false
 
 [dependencies]
-skilj.workspace = true
+skilj = { workspace = true, features = ["local"] }
 skilj-core.workspace = true
 tokio.workspace = true
 axum.workspace = true

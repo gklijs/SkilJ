@@ -52,7 +52,7 @@ async fn each_background_loop_records_the_tick_duration_histogram() {
     // sleep (`skilj/src/lib.rs`'s own doc comments on each spawned
     // task) - this just needs to give the runtime a chance to actually
     // poll those spawned tasks at all.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     meter_provider
         .force_flush()

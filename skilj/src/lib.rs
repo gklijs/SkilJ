@@ -157,6 +157,10 @@ async fn contain_panic(
 /// directly by hand-written code; `SkiljBuilder::auto_register()` is the
 /// intended entry point.
 pub use inventory;
+/// Codeberg issue #100: the supported single-user local mode, behind the
+/// `local` feature. See `local`'s own module docs.
+#[cfg(feature = "local")]
+pub mod local;
 pub use skilj_core::access_control::{IdpConfig, SigningAlgorithm};
 pub use skilj_core::blind::{normalize, BlindIndexKey};
 pub use skilj_core::encryption::EncryptionMasterKey;
@@ -1389,6 +1393,12 @@ struct RegisteredCommandType {
     sensitive_fields: Vec<skilj_core::shared::SensitiveField>,
     private_fields: Vec<skilj_core::shared::PrivateField>,
     rest_trigger_allowed: bool,
+    /// Codeberg issue #98: `Some` when `requires_approval()` is true.
+    /// Written into `command_approval_policies` at reconciliation; `None`
+    /// leaves any stored policy alone (a deploy never removes a
+    /// protection, the same stance §102 takes for sensitive/private
+    /// fields).
+    approval_policy: Option<skilj_core::approvals::CommandApprovalPolicy>,
     /// `CommandType::required_role()`'s value, carried straight through
     /// unchanged - not persisted anywhere (see that method's own doc
     /// comment), read back only by `Dispatcher::required_role` for
@@ -1859,6 +1869,12 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
         sensitive_fields: T::sensitive_fields(),
         private_fields: T::private_fields(),
         rest_trigger_allowed: T::rest_trigger_allowed(),
+        approval_policy: T::requires_approval().then(|| {
+            skilj_core::approvals::CommandApprovalPolicy::new(
+                T::approval_role().map(str::to_string),
+                T::approval_deadline_seconds(),
+            )
+        }),
         required_role: T::required_role(),
         snapshot_name: T::snapshot(),
         consistency_query: T::consistency_query(),
@@ -3112,6 +3128,10 @@ impl SkiljBuilder {
                         // comments.
                         skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
                         skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
+                        // Codeberg issue #98: the approval policy and
+                        // proposal tables, same "patched into every bounded
+                        // context, every startup" treatment.
+                        skilj_core::db::ensure_command_approval_tables(pool, &bc.name).await?;
                         // Secrets (docs/architecture.md's own write-up of
                         // this pass) - the new `secret_versions`/
                         // `secret_grants` tables, same "patched into every
@@ -4945,6 +4965,15 @@ async fn reconcile_command_types(
             report.kept_protections.push(key.clone());
         }
         skilj_core::db::upsert_command_type(pool, registration.command_type()).await?;
+        if let Some(policy) = &registered.approval_policy {
+            skilj_core::db::set_command_approval_policy(
+                pool,
+                bounded_context_name,
+                name,
+                Some(policy),
+            )
+            .await?;
+        }
         version
             .stamp(
                 pool,
