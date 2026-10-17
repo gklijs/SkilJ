@@ -202,6 +202,27 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                     parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
                 let private_fields = parse_private_fields(&ctx.args.try_get("privateFields")?)?;
                 let rest_trigger_allowed = ctx.args.try_get("restTriggerAllowed")?.boolean()?;
+                // Codeberg issue #98. Omitted leaves any stored policy
+                // alone (the same compatibility stance startup
+                // reconciliation takes); explicit `false` removes it.
+                let requires_approval = ctx
+                    .args
+                    .get("requiresApproval")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.boolean())
+                    .transpose()?;
+                let approval_role = ctx
+                    .args
+                    .get("approvalRole")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.string().map(str::to_string))
+                    .transpose()?;
+                let approval_deadline_seconds = ctx
+                    .args
+                    .get("approvalDeadlineSeconds")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.i64())
+                    .transpose()?;
 
                 let bounded_context =
                     skilj_core::db::get_bounded_context(&state.pool, &bounded_context_name)
@@ -216,7 +237,7 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                 let registration = skilj_core::event_store::register_command_type(
                     &access_mapping,
                     &bounded_context,
-                    name,
+                    name.clone(),
                     schema,
                     tag_mappings,
                     owner_tag_key,
@@ -229,6 +250,32 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                 skilj_core::db::upsert_command_type(&state.pool, registration.command_type())
                     .await
                     .map_err(to_graphql_error)?;
+                match requires_approval {
+                    Some(true) => {
+                        skilj_core::db::set_command_approval_policy(
+                            &state.pool,
+                            &bounded_context_name,
+                            &name,
+                            Some(&skilj_core::approvals::CommandApprovalPolicy::new(
+                                approval_role,
+                                approval_deadline_seconds,
+                            )),
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
+                    }
+                    Some(false) => {
+                        skilj_core::db::set_command_approval_policy(
+                            &state.pool,
+                            &bounded_context_name,
+                            &name,
+                            None,
+                        )
+                        .await
+                        .map_err(to_graphql_error)?;
+                    }
+                    None => {}
+                }
 
                 Ok(Some(FieldValue::owned_any(
                     registration.command_type().clone(),
@@ -264,6 +311,18 @@ pub fn register_command_type_field(n: &Naming) -> Field {
     .argument(InputValue::new(
         "restTriggerAllowed",
         TypeRef::named_nn(TypeRef::BOOLEAN),
+    ))
+    .argument(InputValue::new(
+        "requiresApproval",
+        TypeRef::named(TypeRef::BOOLEAN),
+    ))
+    .argument(InputValue::new(
+        "approvalRole",
+        TypeRef::named(TypeRef::STRING),
+    ))
+    .argument(InputValue::new(
+        "approvalDeadlineSeconds",
+        TypeRef::named(TypeRef::INT),
     ))
 }
 

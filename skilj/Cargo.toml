@@ -7,6 +7,11 @@ repository.workspace = true
 readme = "../README.md"
 description = "SkilJ: a Rust library for building event-sourced, DDD-style applications backed by Postgres, exposing a GraphQL surface and a REST surface. A thin facade over skilj-core/skilj-graphql/skilj-rest - see docs/architecture.md §3.1."
 
+[features]
+default = []
+# Codeberg issue #100: the single-user local mode's embedded Postgres.
+local = ["dep:postgresql_embedded"]
+
 [dependencies]
 skilj-core.workspace = true
 skilj-graphql.workspace = true
@@ -34,6 +39,9 @@ opentelemetry.workspace = true
 # (used in skilj/tests/ for WebSocket stream handling), promoted to a
 # real dependency now that src/lib.rs uses it too.
 futures-util.workspace = true
+thiserror.workspace = true
+# Codeberg issue #100: only with the `local` feature.
+postgresql_embedded = { version = "0.21.0", optional = true }
 
 [dev-dependencies]
 skilj-test-support = { path = "../skilj-test-support" }

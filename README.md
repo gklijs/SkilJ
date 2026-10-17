@@ -93,7 +93,9 @@ skilj = "0.0"
 ```
 
 [`skilj-demo`](skilj-demo) in this repository is a larger worked example (two bounded contexts:
-banking and courses) if you want to see more before committing.
+banking and courses) if you want to see more before committing. It also has a supported
+single-user local mode: `cargo run -p skilj-demo --bin server -- --local` starts an embedded
+Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/architecture.md §216).
 
 ## Crates in this workspace
 

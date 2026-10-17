@@ -138,6 +138,32 @@ impl CommandType for CloseAccount {
     }
 }
 
+// --- Codeberg issue #98: a command type whose submissions are proposals.
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct TransferMoneyPayload {
+    amount: i64,
+}
+
+struct TransferMoney;
+
+impl CommandType for TransferMoney {
+    type Payload = TransferMoneyPayload;
+    type Event = BankingEvent;
+    const NAME: &'static str = "TransferMoney";
+    fn requires_approval() -> bool {
+        true
+    }
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "MoneyDeposited".to_string(),
+                payload: serde_json::json!({ "amount": payload.amount }),
+            }],
+        }
+    }
+}
+
 // --- a small, separate fixture for the private-field mechanism
 // (docs/architecture.md's own write-up of this pass) - `note` is an
 // `own`-kind private field, visible by default only to whoever submitted
@@ -154,6 +180,9 @@ impl EventType for TicketNoteAdded {
     type Payload = TicketNoteAddedPayload;
     const NAME: &'static str = "TicketNoteAdded";
     fn direct_creation_allowed() -> bool {
+        true
+    }
+    fn event_read_allowed() -> bool {
         true
     }
     fn private_fields() -> Vec<skilj_core::shared::PrivateField> {
@@ -847,7 +876,7 @@ async fn setup_with(
     // 10-connection pools of ~10 tests exhaust the shared embedded Postgres's
     // 100 connections and the last `build()` fails with `PoolTimedOut`.
     let builder = Skilj::builder(database_url.clone())
-        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(4))
+        .pool_options(skilj_core::db::PgPoolOptions::new().max_connections(2))
         .identity_provider(IdpConfig::new(
             jwks_url.parse().unwrap(),
             TEST_ISSUER,
@@ -858,6 +887,7 @@ async fn setup_with(
         .event_type::<MoneyDeposited>()
         .command_type::<WithdrawMoney>()
         .command_type::<CloseAccount>()
+        .command_type::<TransferMoney>()
         .event_type::<TicketNoteAdded>()
         .command_type::<AddTicketNote>()
         .projection::<LatestTicketNote>()
@@ -1165,6 +1195,385 @@ const SUBMIT_COMMAND_WITH_IDEMPOTENCY_KEY_MUTATION: &str = "\
 /// with the same `idempotencyKey` returns the identical
 /// `triggeredEventSequences` and `deduplicated: true` - and only one
 /// event actually exists, not just that the response looks right.
+#[test]
+fn an_external_read_token_never_sees_a_private_field() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, role) = setup().await;
+        let graphql = skilj.graphql_router().await.unwrap();
+        let submitted = graphql_request(
+            &graphql,
+            Some(&jwt),
+            SUBMIT_COMMAND_MUTATION,
+            json!({
+                "bc": bc_name,
+                "name": "AddTicketNote",
+                "payload": json!({ "note": "do not leak" }).to_string()
+            }),
+        )
+        .await;
+        assert_eq!(submitted["errors"], serde_json::Value::Null, "{submitted}");
+        assert_eq!(submitted["data"]["submitCommand"]["accepted"], json!(true));
+
+        let mapping = skilj_core::db::get_active_role_access_mapping(&pool, &role.id, &bc_name)
+            .await
+            .unwrap()
+            .expect("the setup admin mapping is active");
+        let event_type = skilj_core::db::get_event_type(&pool, &bc_name, "TicketNoteAdded")
+            .await
+            .unwrap()
+            .unwrap();
+        let token = skilj_core::access_control::create_event_read_token(
+            &mapping,
+            &event_type,
+            generate_token_id(),
+            skilj_core::shared::generate_token_secret(),
+            None,
+            None,
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
+        skilj_core::db::insert_event_read_token(&pool, &token)
+            .await
+            .unwrap();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/events")
+            .header(
+                "authorization",
+                format!("Bearer {}.{}", token.id, token.secret),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = skilj.rest_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{body}");
+        assert_eq!(
+            events[0]["payload"]["note"],
+            serde_json::Value::Null,
+            "{body}"
+        );
+        // The read token has no way to grant private visibility, and the
+        // REST track redacts unconditionally rather than trusting the
+        // stored payload to be ciphertext.
+        assert!(!body.to_string().contains("do not leak"));
+    });
+}
+
+#[test]
+fn command_approval_lifecycle_end_to_end() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, role) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let payload = json!({ "amount": 42 }).to_string();
+
+        let submitted = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!, $payload: String!, $key: String) { \
+                submitCommand(boundedContext: $bc, commandTypeName: $name, payload: $payload, idempotencyKey: $key) { \
+                    accepted pendingApproval proposalId deduplicated rejectionReason \
+                } \
+            }",
+            json!({
+                "bc": bc_name,
+                "name": "TransferMoney",
+                "payload": payload,
+                "key": "transfer-1"
+            }),
+        )
+        .await;
+        assert_eq!(submitted["errors"], serde_json::Value::Null, "{submitted}");
+        let result = &submitted["data"]["submitCommand"];
+        assert_eq!(result["accepted"], json!(false));
+        assert_eq!(result["pendingApproval"], json!(true));
+        let proposal_id = result["proposalId"]
+            .as_str()
+            .expect("a pending submission returns its proposal id")
+            .to_string();
+
+        // A repeated pending submission with the same key is the same
+        // proposal, not a second one.
+        let repeated = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL,
+            json!({
+                "bc": bc_name,
+                "name": "TransferMoney",
+                "payload": payload,
+                "key": "transfer-1"
+            }),
+        )
+        .await;
+        assert_eq!(repeated["errors"], serde_json::Value::Null, "{repeated}");
+        assert_eq!(
+            repeated["data"]["submitCommand"]["proposalId"],
+            json!(proposal_id)
+        );
+
+        // Nothing was decided or stored as a command yet.
+        let commands = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { fetchCommands(boundedContext: $bc, commandTypes: [\"TransferMoney\"]) { id payload } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(commands["errors"], serde_json::Value::Null, "{commands}");
+        assert_eq!(
+            commands["data"]["fetchCommands"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let pending = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { commandProposals(boundedContext: $bc, status: PENDING) { \
+                id status commandTypeName payload proposedBy commandId \
+            } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(pending["errors"], serde_json::Value::Null, "{pending}");
+        let list = pending["data"]["commandProposals"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "{pending}");
+        assert_eq!(list[0]["id"], json!(proposal_id));
+        assert_eq!(list[0]["status"], json!("PENDING"));
+        assert_eq!(list[0]["commandTypeName"], json!("TransferMoney"));
+        assert_eq!(list[0]["proposedBy"], json!(role.id));
+        assert_eq!(list[0]["payload"], json!(payload));
+        assert_eq!(list[0]["commandId"], serde_json::Value::Null);
+
+        let approved = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $id: ID!) { approveCommand(boundedContext: $bc, proposalId: $id) { \
+                accepted triggeredEventSequences proposal { id status commandId decidedByRoleId } \
+            } }",
+            json!({ "bc": bc_name, "id": proposal_id }),
+        )
+        .await;
+        assert_eq!(approved["errors"], serde_json::Value::Null, "{approved}");
+        let approved = &approved["data"]["approveCommand"];
+        assert_eq!(approved["accepted"], json!(true));
+        assert_eq!(
+            approved["triggeredEventSequences"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(approved["proposal"]["status"], json!("APPROVED"));
+        assert!(approved["proposal"]["commandId"].is_string());
+        assert_eq!(approved["proposal"]["decidedByRoleId"], json!(role.id));
+
+        let commands = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { fetchCommands(boundedContext: $bc, commandTypes: [\"TransferMoney\"]) { id payload } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(commands["errors"], serde_json::Value::Null, "{commands}");
+        let commands = commands["data"]["fetchCommands"].as_array().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["payload"], json!(payload));
+
+        let again = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $id: ID!) { approveCommand(boundedContext: $bc, proposalId: $id) { accepted } }",
+            json!({ "bc": bc_name, "id": proposal_id }),
+        )
+        .await;
+        assert_eq!(
+            again["errors"][0]["extensions"]["code"],
+            json!("command_proposal_not_pending"),
+            "{again}"
+        );
+
+        // The key that proposal was submitted under now names an accepted
+        // command: the duplicate goes through the ordinary dedup path, not
+        // a second proposal.
+        let duplicate = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL,
+            json!({
+                "bc": bc_name,
+                "name": "TransferMoney",
+                "payload": payload,
+                "key": "transfer-1"
+            }),
+        )
+        .await;
+        assert_eq!(duplicate["errors"], serde_json::Value::Null, "{duplicate}");
+        assert_eq!(
+            duplicate["data"]["submitCommand"]["pendingApproval"],
+            json!(false)
+        );
+        assert_eq!(
+            duplicate["data"]["submitCommand"]["deduplicated"],
+            json!(true)
+        );
+        assert_eq!(
+            duplicate["data"]["submitCommand"]["accepted"],
+            json!(true)
+        );
+
+        // A proposal an approver rejects never becomes a command.
+        let second = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $name: String!, $payload: String!) { \
+                submitCommand(boundedContext: $bc, commandTypeName: $name, payload: $payload) { \
+                    proposalId \
+                } \
+            }",
+            json!({ "bc": bc_name, "name": "TransferMoney", "payload": payload }),
+        )
+        .await;
+        let second_id = second["data"]["submitCommand"]["proposalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let rejected = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $id: ID!) { rejectCommand(boundedContext: $bc, proposalId: $id, reason: \"not today\") { \
+                accepted rejectionReason proposal { status rejectionReason } \
+            } }",
+            json!({ "bc": bc_name, "id": second_id }),
+        )
+        .await;
+        assert_eq!(rejected["errors"], serde_json::Value::Null, "{rejected}");
+        let rejected = &rejected["data"]["rejectCommand"];
+        assert_eq!(rejected["accepted"], json!(false));
+        assert_eq!(rejected["proposal"]["status"], json!("REJECTED"));
+        assert_eq!(rejected["proposal"]["rejectionReason"], json!("not today"));
+
+        let commands = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { fetchCommands(boundedContext: $bc, commandTypes: [\"TransferMoney\"]) { id } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            commands["data"]["fetchCommands"].as_array().unwrap().len(),
+            1,
+            "a rejected proposal must not create a command"
+        );
+
+        // The approval policy is visible on the command type too.
+        let command_type = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { commandTypes(boundedContext: $bc) { \
+                name requiresApproval approvalPolicy { approverRole deadlineSeconds } \
+            } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            command_type["errors"], serde_json::Value::Null,
+            "{command_type}"
+        );
+        let transfer = command_type["data"]["commandTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ct| ct["name"] == json!("TransferMoney"))
+            .expect("TransferMoney is registered");
+        assert_eq!(transfer["requiresApproval"], json!(true));
+        assert_eq!(transfer["approvalPolicy"]["approverRole"], serde_json::Value::Null);
+        assert_eq!(transfer["approvalPolicy"]["deadlineSeconds"], serde_json::Value::Null);
+
+        let _ = pool;
+    });
+}
+
+#[test]
+fn command_approval_rejects_an_expired_proposal() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _) = setup().await;
+        let policy = skilj_core::approvals::CommandApprovalPolicy::new(None, Some(1));
+        skilj_core::db::set_command_approval_policy(
+            &pool,
+            &bc_name,
+            "TransferMoney",
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let submitted = graphql_request(
+            &router,
+            Some(&jwt),
+            SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL,
+            json!({
+                "bc": bc_name,
+                "name": "TransferMoney",
+                "payload": json!({ "amount": 1 }).to_string()
+            }),
+        )
+        .await;
+        let id = submitted["data"]["submitCommand"]["proposalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let approved = graphql_request(
+            &router,
+            Some(&jwt),
+            "mutation($bc: String!, $id: ID!) { approveCommand(boundedContext: $bc, proposalId: $id) { accepted } }",
+            json!({ "bc": bc_name, "id": id }),
+        )
+        .await;
+        assert_eq!(
+            approved["errors"][0]["extensions"]["code"],
+            json!("command_proposal_expired"),
+            "{approved}"
+        );
+
+        let listed = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { commandProposals(boundedContext: $bc) { id status } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(listed["errors"], serde_json::Value::Null, "{listed}");
+        assert_eq!(
+            listed["data"]["commandProposals"][0]["status"],
+            json!("EXPIRED")
+        );
+    });
+}
+
+const SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL: &str = "\
+    mutation($bc: String!, $name: String!, $payload: String!, $key: String) { \
+        submitCommand(boundedContext: $bc, commandTypeName: $name, payload: $payload, idempotencyKey: $key) { \
+            accepted pendingApproval proposalId deduplicated \
+        } \
+    }";
+
 #[test]
 fn submit_command_deduplicates_a_repeated_idempotency_key_over_graphql() {
     runtime().block_on(async {

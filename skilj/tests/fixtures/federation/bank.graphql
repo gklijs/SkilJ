@@ -24,6 +24,43 @@ enum BankBoundedContextStatus @inaccessible {
 	ARCHIVED
 }
 
+type BankCommandApprovalPolicy @inaccessible {
+	approverRole: String
+	deadlineSeconds: Int
+}
+
+type BankCommandProposal @inaccessible {
+	id: String!
+	boundedContext: String!
+	commandTypeName: String!
+	payload: String!
+	status: BankCommandProposalStatus!
+	proposedBy: String!
+	createdAt: String!
+	expiresAt: String
+	decidedAt: String
+	decidedByRoleId: String
+	rejectionReason: String
+	rejectionKind: String
+	commandId: String
+}
+
+type BankCommandProposalDecisionPayload @inaccessible {
+	accepted: Boolean!
+	rejectionReason: String
+	rejectionKind: String
+	proposal: BankCommandProposal!
+	triggeredEventSequences: [Int]
+}
+
+enum BankCommandProposalStatus @inaccessible {
+	PENDING
+	APPROVING
+	APPROVED
+	REJECTED
+	EXPIRED
+}
+
 type BankCommandToken @inaccessible {
 	id: ID!
 	secret: String!
@@ -44,6 +81,8 @@ type BankCommandType @inaccessible {
 	restTriggerAllowed: Boolean!
 	privateFields: [BankPrivateField!]!
 	consistencyQuery: [BankQueryItemMapping!]!
+	requiresApproval: Boolean!
+	approvalPolicy: BankCommandApprovalPolicy
 }
 
 type BankContextCreator @inaccessible {
@@ -342,6 +381,8 @@ type BankSubmitCommandPayload {
 	rejectionKind: String
 	deduplicated: Boolean!
 	correlationId: String
+	pendingApproval: Boolean!
+	proposalId: String
 	matchingEventsTruncated: Boolean
 	triggeredEventSequences: [Int]
 	matchingEvents: [BankMatchingEvent]
@@ -387,7 +428,7 @@ type Mutation {
 	bankArchiveBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankDeleteBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: BankMissedOccurrencePolicy): BankEventType! @inaccessible
-	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!): BankCommandType! @inaccessible
+	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int): BankCommandType! @inaccessible
 	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): BankProjectionRegistrationResult! @inaccessible
 	bankRebuildProjection(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
 	bankDiscardProjectionRebuild(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
@@ -399,6 +440,8 @@ type Mutation {
 	bankCreateCommandToken(boundedContext: String!, commandTypeName: String!, scope: String): BankCommandToken! @inaccessible
 	bankRevokeToken(tokenId: ID!): BankAccessToken! @inaccessible
 	bankSubmitCommand(boundedContext: String!, commandTypeName: String!, payload: String!, idempotencyKey: String, correlationId: String, causationId: String): BankSubmitCommandPayload!
+	bankApproveCommand(boundedContext: String!, proposalId: ID!): BankCommandProposalDecisionPayload! @inaccessible
+	bankRejectCommand(boundedContext: String!, proposalId: ID!, reason: String): BankCommandProposalDecisionPayload! @inaccessible
 	bankForgetSubject(boundedContext: String!, subjectKey: String!, subjectValue: String!): BankEncryptionKey! @inaccessible
 	bankGrantPrivateFieldAccessForEvent(boundedContext: String!, granteeRoleId: ID!, eventSequence: Int): BankPrivateFieldGrant!
 	bankGrantPrivateFieldAccessForCommand(boundedContext: String!, granteeRoleId: ID!, commandId: ID): BankPrivateFieldGrant!
@@ -417,6 +460,7 @@ type Query {
 	bankEpoch: String!
 	bankInspectSnapshot(boundedContext: String!, snapshotName: String!, tagValue: String!): BankInspectedSnapshot @inaccessible
 	bankFetchCommands(boundedContext: String!, commandTypes: [String!]!, afterCommandId: String, after: String, before: String, triggeredEvent: Int, correlationId: String): [BankQueriedCommand!]! @inaccessible
+	bankCommandProposals(boundedContext: String!, commandTypeName: String, status: BankCommandProposalStatus): [BankCommandProposal!]! @inaccessible
 	bankDryRunCommand(boundedContext: String!, commandTypeName: String!, payload: String!): BankDryRunCommandPayload! @inaccessible
 	bankListPrivateFieldGrants(boundedContext: String!, grantorRoleId: ID): [BankPrivateFieldGrant!]!
 	bankParkedDeliveries(boundedContext: String!, after: String): [BankParkedDelivery!]! @inaccessible

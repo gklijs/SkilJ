@@ -1422,6 +1422,11 @@ pub const RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-deadline:";
 /// redrives - `idempotency_keys` is `client_id`-scoped).
 pub const RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-parked-delivery:";
 
+/// `db::approve_command_proposal`'s own per-proposal keys. A proposal that
+/// carried a caller key reuses it; one submitted without a key gets this
+/// one so a retry after a crash can never accept the same proposal twice.
+pub const RESERVED_APPROVAL_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-approval:";
+
 /// The longest caller-supplied idempotency key accepted, in characters -
 /// see [`reject_reserved_idempotency_key`] (docs/architecture.md §134).
 pub const MAX_IDEMPOTENCY_KEY_CHARS: usize = 255;
@@ -1456,7 +1461,8 @@ pub fn reject_reserved_idempotency_key(idempotency_key: Option<&str>) -> crate::
         Some(key)
             if key.starts_with(RESERVED_IDEMPOTENCY_KEY_PREFIX)
                 || key.starts_with(RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX)
-                || key.starts_with(RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX) =>
+                || key.starts_with(RESERVED_PARKED_DELIVERY_IDEMPOTENCY_KEY_PREFIX)
+                || key.starts_with(RESERVED_APPROVAL_IDEMPOTENCY_KEY_PREFIX) =>
         {
             Err(Error::ReservedIdempotencyKeyPrefix.into())
         }
@@ -2089,6 +2095,50 @@ pub fn protect_sensitive_fields(
             .expect("re-serialising a parsed JSON Value is infallible"),
         encryption_keys: used_keys,
     }
+}
+
+/// `protect_sensitive_fields`' inverse, for the one internal caller that
+/// needs the plaintext back without being a reader: approving a command
+/// proposal (Codeberg issue #98). A proposal's payload is stored
+/// encrypted, exactly like a real command's, so approving it must decrypt
+/// it before `decide()` sees it.
+///
+/// Every declared field whose subject is present must resolve a key.
+/// `resolve_key` returning `None` (a destroyed key - `ForgetSubject`) is
+/// `Error::EncryptionKeyNotActive`: the proposal can no longer be
+/// approved, which is the intended crypto-shredding outcome rather than a
+/// decryption panic. A field absent from the payload is skipped, matching
+/// `protect_sensitive_fields`'s own skip.
+pub fn reveal_sensitive_fields(
+    sensitive_fields: &[SensitiveField],
+    payload: &str,
+    resolve_key: impl Fn(&str, &str) -> Option<DataKey>,
+) -> crate::error::Result<String> {
+    if sensitive_fields.is_empty() {
+        return Ok(payload.to_string());
+    }
+    let mut parsed: serde_json::Value = serde_json::from_str(payload)
+        .expect("reveal_sensitive_fields: payload is always valid JSON by the time this is called");
+    for sf in sensitive_fields {
+        let Some(subject_value) =
+            payload_field_value(&parsed, &sf.subject_field).and_then(json_scalar_to_string)
+        else {
+            continue;
+        };
+        let Some(ciphertext) = payload_field_value(&parsed, &sf.field)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let key =
+            resolve_key(&sf.subject_key, &subject_value).ok_or(Error::EncryptionKeyNotActive)?;
+        let plaintext = crate::encryption::decrypt_leaf(&key, &ciphertext)?;
+        if let Some(slot) = payload_field_value_mut(&mut parsed, &sf.field) {
+            *slot = serde_json::Value::String(plaintext);
+        }
+    }
+    Ok(serde_json::to_string(&parsed).expect("re-serialising a parsed JSON Value is infallible"))
 }
 
 /// Every distinct `(subject_key, subject_value)` pair `payload` will need

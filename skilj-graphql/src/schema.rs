@@ -250,6 +250,9 @@ fn root_types(
         .field(resolvers::event_query::epoch_field(n))
         .field(admin(resolvers::snapshot_query::inspect_snapshot_field(n)))
         .field(admin(resolvers::command_query::fetch_commands_field(n)))
+        .field(admin(resolvers::command_approval::command_proposals_field(
+            n,
+        )))
         .field(admin(resolvers::command_submission::dry_run_command_field(
             n,
         )))
@@ -315,6 +318,8 @@ fn root_types(
         ))
         .field(admin(resolvers::token_revocation::revoke_token_field(n)))
         .field(resolvers::command_submission::submit_command_field(n))
+        .field(admin(resolvers::command_approval::approve_command_field(n)))
+        .field(admin(resolvers::command_approval::reject_command_field(n)))
         .field(admin(resolvers::subject_erasure::field(n)))
         .field(
             resolvers::private_field_grant_management::grant_private_field_access_for_event_field(
@@ -363,6 +368,10 @@ fn static_types(n: &Naming) -> Vec<Type> {
         gql_types::private_field_object(n).into(),
         gql_types::private_field_input(n).into(),
         gql_types::private_field_grant_object(n).into(),
+        gql_types::command_proposal_status_enum(n).into(),
+        gql_types::command_proposal_object(n).into(),
+        gql_types::command_proposal_decision_object(n).into(),
+        gql_types::command_approval_policy_object(n).into(),
         gql_types::event_type_object(n).into(),
         gql_types::command_type_object(n).into(),
         gql_types::query_item_mapping_object(n).into(),

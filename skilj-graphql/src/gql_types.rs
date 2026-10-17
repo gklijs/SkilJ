@@ -33,6 +33,7 @@ use skilj_core::access_control::{
     AccessLevel, CommandToken, DirectCreationToken, EventReadStartPosition, EventReadToken,
     ExternalEventToken, PrivateFieldGrant, Role, RoleAccessMapping, RoleStatus, TokenStatus,
 };
+use skilj_core::approvals::{CommandApprovalPolicy, CommandProposal, CommandProposalStatus};
 use skilj_core::bootstrap::ContextCreator;
 use skilj_core::event_store::{
     BoundedContext, BoundedContextStatus, CommandType, EncryptionKey, EncryptionKeyStatus,
@@ -447,6 +448,17 @@ pub fn event_type_object(n: &Naming) -> Object {
     })
 }
 
+/// `CommandType.approvalPolicy` (Codeberg issue #98): present when the
+/// type requires approval. `requiresApproval`/`approvalPolicy` are
+/// resolved from `command_approval_policies`, since the loaded
+/// `CommandType` row itself deliberately carries no approval fields.
+pub fn command_approval_policy_object(n: &Naming) -> Object {
+    gql_object!(CommandApprovalPolicy => n.ty("CommandApprovalPolicy") {
+        scalar "approverRole": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.approver_role.clone()),
+        scalar "deadlineSeconds": TypeRef::named(TypeRef::INT) => |p| p.deadline_seconds.map(Value::from).unwrap_or(Value::Null),
+    })
+}
+
 /// `entity CommandType`, same treatment as `event_type_object` above.
 pub fn command_type_object(n: &Naming) -> Object {
     gql_object!(CommandType => n.ty("CommandType") {
@@ -460,6 +472,50 @@ pub fn command_type_object(n: &Naming) -> Object {
         list "privateFields": TypeRef::named_nn_list_nn(n.ty("PrivateField")) => |ct| ct.private_fields.clone(),
     })
     .field(command_type_consistency_query_field(n))
+    .field(command_type_requires_approval_field())
+    .field(command_type_approval_policy_field(n))
+}
+
+fn command_type_requires_approval_field() -> Field {
+    Field::new(
+        "requiresApproval",
+        TypeRef::named_nn(TypeRef::BOOLEAN),
+        |ctx: ResolverContext| {
+            FieldFuture::new(async move {
+                let command_type = ctx.parent_value.try_downcast_ref::<CommandType>()?;
+                let state = ctx.data::<crate::GraphqlState>()?;
+                let policy = skilj_core::db::get_command_approval_policy(
+                    &state.pool,
+                    &command_type.bounded_context.name,
+                    &command_type.name,
+                )
+                .await
+                .map_err(crate::error::to_graphql_error)?;
+                Ok(Some(FieldValue::value(Value::from(policy.is_some()))))
+            })
+        },
+    )
+}
+
+fn command_type_approval_policy_field(n: &Naming) -> Field {
+    Field::new(
+        "approvalPolicy",
+        TypeRef::named(n.ty("CommandApprovalPolicy")),
+        |ctx: ResolverContext| {
+            FieldFuture::new(async move {
+                let command_type = ctx.parent_value.try_downcast_ref::<CommandType>()?;
+                let state = ctx.data::<crate::GraphqlState>()?;
+                let policy = skilj_core::db::get_command_approval_policy(
+                    &state.pool,
+                    &command_type.bounded_context.name,
+                    &command_type.name,
+                )
+                .await
+                .map_err(crate::error::to_graphql_error)?;
+                Ok(policy.map(FieldValue::owned_any))
+            })
+        },
+    )
 }
 
 /// `CommandType.consistencyQuery` (docs/architecture.md §198): the query
@@ -986,6 +1042,11 @@ pub struct SubmitCommandResult {
     // deduplicated outcome (the cached prior answer doesn't carry it -
     // see the resolver's own construction of this struct).
     pub correlation_id: Option<String>,
+    // Codeberg issue #98: `true` when the command became a proposal
+    // instead of being decided. `proposal_id` names it; `accepted` is
+    // false in that case (nothing was accepted yet).
+    pub pending_approval: bool,
+    pub proposal_id: Option<String>,
 }
 
 pub fn submit_command_payload_object(n: &Naming) -> Object {
@@ -1002,6 +1063,8 @@ pub fn submit_command_payload_object(n: &Naming) -> Object {
         scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
         scalar "deduplicated": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.deduplicated),
         scalar "correlationId": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.correlation_id.clone()),
+        scalar "pendingApproval": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.pending_approval),
+        scalar "proposalId": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.proposal_id.clone()),
         scalar "matchingEventsTruncated": TypeRef::named(TypeRef::BOOLEAN) => |r| {
             r.matching_events_truncated.map(Value::from).unwrap_or(Value::Null)
         },
@@ -1026,6 +1089,99 @@ pub fn submit_command_payload_object(n: &Naming) -> Object {
                 let parent = ctx.parent_value.try_downcast_ref::<SubmitCommandResult>()?;
                 Ok(parent.matching_events.as_ref().map(|events| {
                     FieldValue::list(events.iter().cloned().map(FieldValue::owned_any))
+                }))
+            })
+        },
+    ))
+}
+
+/// One pending (or decided) command proposal, with its payload already
+/// rendered for the reader - the same decrypt-granted/redact-private pass
+/// `fetchCommands` applies to a real `Command`.
+#[derive(Clone)]
+pub struct CommandProposalData {
+    pub proposal: CommandProposal,
+    pub payload: String,
+}
+
+pub fn command_proposal_status_name(status: CommandProposalStatus) -> &'static str {
+    match status {
+        CommandProposalStatus::Pending => "PENDING",
+        CommandProposalStatus::Approving => "APPROVING",
+        CommandProposalStatus::Approved => "APPROVED",
+        CommandProposalStatus::Rejected => "REJECTED",
+        CommandProposalStatus::Expired => "EXPIRED",
+    }
+}
+
+pub fn command_proposal_status_enum(n: &Naming) -> Enum {
+    Enum::new(n.ty("CommandProposalStatus"))
+        .item("PENDING")
+        .item("APPROVING")
+        .item("APPROVED")
+        .item("REJECTED")
+        .item("EXPIRED")
+}
+
+/// `approveCommand`/`rejectCommand`'s answer: the proposal after the
+/// decision, plus whatever the ordinary submission pipeline answered.
+/// `accepted` is true only when approval actually produced a command
+/// (or a deduplicated one); a `decide()` rejection comes back as
+/// `accepted: false` with the rejection reason/kind.
+pub struct CommandProposalDecisionResult {
+    pub proposal: CommandProposalData,
+    pub accepted: bool,
+    pub rejection_reason: Option<String>,
+    pub rejection_kind: Option<String>,
+    pub triggered_event_sequences: Option<Vec<i64>>,
+}
+
+pub fn command_proposal_object(n: &Naming) -> Object {
+    gql_object!(CommandProposalData => n.ty("CommandProposal") {
+        scalar "id": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.proposal.id.clone()),
+        scalar "boundedContext": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.proposal.bounded_context.name.clone()),
+        scalar "commandTypeName": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.proposal.command_type_name.clone()),
+        scalar "payload": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.payload.clone()),
+        scalar "status": TypeRef::named_nn(n.ty("CommandProposalStatus")) => |p| Value::from(command_proposal_status_name(p.proposal.status)),
+        scalar "proposedBy": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.proposal.metadata.client_id.clone()),
+        scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(p.proposal.created_at.to_rfc3339()),
+        scalar "expiresAt": TypeRef::named(TypeRef::STRING) => |p| optional_timestamp(p.proposal.expires_at),
+        scalar "decidedAt": TypeRef::named(TypeRef::STRING) => |p| optional_timestamp(p.proposal.decided_at),
+        scalar "decidedByRoleId": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.proposal.decided_by_role_id.clone()),
+        scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.proposal.rejection_reason.clone()),
+        scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.proposal.rejection_kind.clone()),
+        scalar "commandId": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.proposal.command_id.clone()),
+    })
+}
+
+pub fn command_proposal_decision_object(n: &Naming) -> Object {
+    gql_object!(CommandProposalDecisionResult => n.ty("CommandProposalDecisionPayload") {
+        scalar "accepted": TypeRef::named_nn(TypeRef::BOOLEAN) => |r| Value::from(r.accepted),
+        scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_reason.clone()),
+        scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |r| optional_string(r.rejection_kind.clone()),
+    })
+    .field(Field::new(
+        "proposal",
+        TypeRef::named_nn(n.ty("CommandProposal")),
+        |ctx: ResolverContext| {
+            FieldFuture::new(async move {
+                let parent = ctx
+                    .parent_value
+                    .try_downcast_ref::<CommandProposalDecisionResult>()?;
+                Ok(Some(FieldValue::owned_any(parent.proposal.clone())))
+            })
+        },
+    ))
+    .field(Field::new(
+        "triggeredEventSequences",
+        TypeRef::named_list(TypeRef::INT),
+        |ctx: ResolverContext| {
+            FieldFuture::new(async move {
+                let parent = ctx
+                    .parent_value
+                    .try_downcast_ref::<CommandProposalDecisionResult>()?;
+                Ok(parent.triggered_event_sequences.as_ref().map(|sequences| {
+                    FieldValue::list(sequences.iter().map(|s| FieldValue::value(Value::from(*s))))
                 }))
             })
         },

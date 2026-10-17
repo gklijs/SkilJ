@@ -149,6 +149,57 @@ pub fn submit_command_field(n: &Naming) -> Field {
                     Some(_) => {}
                 }
 
+                // Codeberg issue #98: an approval-required command becomes
+                // a pending proposal. Nothing is decided yet; the approver
+                // runs the ordinary pipeline at approval time. A key that
+                // already produced an accepted command (a proposal
+                // approved earlier) falls through to the batcher, which
+                // returns the cached deduplicated outcome.
+                let approval_policy = skilj_core::db::get_command_approval_policy(
+                    &state.pool,
+                    &bounded_context_name,
+                    &command_type_name,
+                )
+                .await
+                .map_err(to_graphql_error)?;
+                let key_already_used = match (&approval_policy, idempotency_key.as_deref()) {
+                    (Some(_), Some(key)) => skilj_core::db::idempotency_key_already_used(
+                        &state.pool,
+                        &bounded_context_name,
+                        &command_type_name,
+                        &authorised.client_id,
+                        key,
+                    )
+                    .await
+                    .map_err(to_graphql_error)?,
+                    _ => false,
+                };
+                if let Some(policy) = approval_policy.filter(|_| !key_already_used) {
+                    let proposal = skilj_core::db::propose_command(
+                        &state.pool,
+                        &authorised.command_type,
+                        &authorised,
+                        &policy,
+                        idempotency_key.as_deref(),
+                        state.encryption_master_key.as_ref(),
+                        Utc::now(),
+                    )
+                    .await
+                    .map_err(to_graphql_error)?;
+                    return Ok(Some(FieldValue::owned_any(SubmitCommandResult {
+                        accepted: false,
+                        triggered_event_sequences: None,
+                        rejection_reason: None,
+                        rejection_kind: None,
+                        matching_events: None,
+                        matching_events_truncated: None,
+                        deduplicated: false,
+                        correlation_id: None,
+                        pending_approval: true,
+                        proposal_id: Some(proposal.id),
+                    })));
+                }
+
                 // The full "optimistic decide, then locked submit"
                 // sequence (docs/architecture.md §19's own "Problem 1"/
                 // "Problem 2" fixes), shared with skilj-rest's identical
@@ -232,6 +283,8 @@ pub fn submit_command_field(n: &Naming) -> Field {
                             matching_events_truncated,
                             deduplicated: false,
                             correlation_id: None,
+                            pending_approval: false,
+                            proposal_id: None,
                         }
                     }
                     skilj_core::db::SubmitCommandOutcome::Accepted { command, events } => {
@@ -246,6 +299,8 @@ pub fn submit_command_field(n: &Naming) -> Field {
                             matching_events_truncated: None,
                             deduplicated: false,
                             correlation_id: command.metadata.correlation_id,
+                            pending_approval: false,
+                            proposal_id: None,
                         }
                     }
                     // Codeberg issue #12: a cached prior answer, not a
@@ -264,6 +319,8 @@ pub fn submit_command_field(n: &Naming) -> Field {
                         matching_events_truncated: None,
                         deduplicated: true,
                         correlation_id: None,
+                        pending_approval: false,
+                        proposal_id: None,
                     },
                 })))
             })

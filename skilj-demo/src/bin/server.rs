@@ -6,7 +6,10 @@
 //! `curl` at the printed examples, or a GraphQL client at `/graphql`.
 //!
 //! Needs `DATABASE_URL` pointing at a real Postgres (`PORT` optionally
-//! overrides the default `8080`). `SKILJ_FEDERATION_PREFIX` makes
+//! overrides the default `8080`), or `--local`/`SKILJ_LOCAL_MODE=1` to
+//! start a supported embedded single-user Postgres instead (Codeberg
+//! issue #100; data persists under `SKILJ_LOCAL_DATA_DIR` or the platform
+//! data directory). `SKILJ_FEDERATION_PREFIX` makes
 //! `/graphql` a federation subgraph under that prefix, publishing both
 //! bounded contexts (docs/architecture.md §194). Every run is safe to repeat against the
 //! same database: bounded contexts are only created if they don't exist
@@ -220,6 +223,23 @@ impl TelemetryProviders {
     }
 }
 
+/// `--local`/`SKILJ_LOCAL_MODE` (Codeberg issue #100) - an explicit flag,
+/// never inferred from a missing `DATABASE_URL`, so a production process
+/// that simply forgot its environment variable fails loudly instead of
+/// quietly starting a private database.
+fn local_mode_requested() -> bool {
+    let flag = std::env::args().any(|arg| arg == "--local");
+    let env = std::env::var("SKILJ_LOCAL_MODE")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    flag || env
+}
+
 /// Waits for `SIGINT` (`Ctrl+C`) or, on Unix, `SIGTERM` - `axum::serve`'s
 /// own `with_graceful_shutdown` future (see `main`), so an operator
 /// killing the process (or `docker stop`, systemd, etc., which send
@@ -375,8 +395,35 @@ fn init_telemetry() -> Option<TelemetryProviders> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let telemetry = init_telemetry();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set, e.g. postgres://user:pass@localhost:5432/skilj_demo");
+    // Codeberg issue #100: `--local` (or `SKILJ_LOCAL_MODE=1`) starts an
+    // embedded Postgres owned by this process, with no `DATABASE_URL`
+    // needed. See `skilj::local`'s own docs for the persistent data
+    // directory and its `SKILJ_LOCAL_*` settings.
+    let local_postgres = if local_mode_requested() {
+        if std::env::var_os("DATABASE_URL").is_some() {
+            tracing::warn!(
+                "both local mode and DATABASE_URL are set - local mode wins; unset DATABASE_URL \
+                 to silence this"
+            );
+        }
+        let config = skilj::local::LocalConfig::from_env()?;
+        let postgres = skilj::local::LocalPostgres::start(config).await?;
+        println!(
+            "local mode: embedded Postgres at {} (data in {})",
+            postgres.database_url(),
+            postgres.data_dir().display()
+        );
+        Some(postgres)
+    } else {
+        None
+    };
+    let database_url = match &local_postgres {
+        Some(postgres) => postgres.database_url().to_string(),
+        None => std::env::var("DATABASE_URL").expect(
+            "DATABASE_URL must be set (or pass --local / set SKILJ_LOCAL_MODE=1), e.g. \
+             postgres://user:pass@localhost:5432/skilj_demo",
+        ),
+    };
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -523,6 +570,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = skilj.shutdown(std::time::Duration::from_secs(10)).await;
     if !report.aborted.is_empty() {
         println!("shutdown: aborted after the timeout: {:?}", report.aborted);
+    }
+
+    if let Some(postgres) = local_postgres {
+        postgres.shutdown().await?;
     }
 
     if let Some(telemetry) = telemetry {
