@@ -473,7 +473,7 @@ fn an_order_placed_event_is_produced_to_kafka_with_its_own_tag_as_the_key() {
         let mapping = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token,
-            topic: topic.clone(),
+            destination: topic.clone(),
             key_tag_key: Some("order".to_string()),
             partition: None,
         };
@@ -987,7 +987,7 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
         let mapping = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token,
-            topic: topic.clone(),
+            destination: topic.clone(),
             key_tag_key: Some("order".to_string()),
             partition: None,
         };
@@ -1110,7 +1110,7 @@ fn two_partitioned_mappings_together_produce_every_key_exactly_once() {
             let mapping = OutboundMapping {
                 event_type: "OrderPlaced".to_string(),
                 credential: token,
-                topic: topic.clone(),
+                destination: topic.clone(),
                 key_tag_key: Some("order".to_string()),
                 partition: Some((partition_index, 2)),
             };
@@ -1217,7 +1217,7 @@ fn a_failed_owned_event_is_never_acknowledged_past_by_a_partition_skip() {
         let mapping = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token,
-            topic,
+            destination: topic,
             key_tag_key: Some("order".to_string()),
             partition,
         };
@@ -1606,7 +1606,7 @@ fn the_run_loops_stop_when_asked() {
         let mappings = vec![OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: "read-token".to_string(),
-            topic: topic.clone(),
+            destination: topic.clone(),
             key_tag_key: None,
             partition: None,
         }];
@@ -1813,7 +1813,7 @@ fn producer_settings_throughput() {
                 let mapping = OutboundMapping {
                     event_type: "OrderPlaced".to_string(),
                     credential: token,
-                    topic,
+                    destination: topic,
                     key_tag_key: Some("order".to_string()),
                     partition: None,
                 };

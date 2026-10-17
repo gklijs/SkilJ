@@ -134,6 +134,23 @@ impl SkiljError {
     }
 }
 
+/// Classification shared by every bridge's own error type, so `skilj_bridge`
+/// can decide "another instance can do it" / "permanent failure" without
+/// knowing the broker-specific variants. Each bridge crate implements this
+/// for its own `BridgeError` enum.
+pub trait BridgeError: std::error::Error + Send + Sync + 'static {
+    /// Whether skilj refused this with one of
+    /// [`skilj_retry::ANOTHER_INSTANCE_CODES`]:
+    /// the instance that took the request can't process it, so another one
+    /// can - retried after [`skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY`]
+    /// without spending an attempt, and never parked (docs/architecture.md §161).
+    fn another_instance_can_do_it(&self) -> bool;
+
+    /// Whether no retry can change the outcome (e.g. a payload that isn't
+    /// JSON) - such failures are parked at once.
+    fn is_permanent(&self) -> bool;
+}
+
 /// Whether a skilj error response `body` carries one of
 /// [`skilj_retry::ANOTHER_INSTANCE_CODES`]: the instance that took the
 /// request can't process it, another one can - retried after
@@ -243,6 +260,31 @@ impl InboundAction {
             InboundAction::Trigger { .. } => "command_trigger",
         }
     }
+}
+
+/// One skilj `EventType`'s own mapping to a broker destination - the
+/// outbound half, shared by `skilj-kafka` (topic), `skilj-amqp` (address)
+/// and `skilj-nats` (subject). Each broker crate re-exports this type so
+/// their public APIs are unchanged.
+#[derive(Debug, Clone)]
+pub struct OutboundMapping {
+    /// The `EventType::NAME` this mapping applies to.
+    pub event_type: String,
+    /// An `EventReadToken` credential (`"{id}.{secret}"`) scoped to this
+    /// event type.
+    pub credential: String,
+    /// The broker destination: a Kafka topic, an AMQP address, or a NATS
+    /// subject.
+    pub destination: String,
+    /// Which of this event type's own tag keys supplies the partitioning
+    /// / correlation input - `None` sends no key at all. See
+    /// [`correlation_key`].
+    pub key_tag_key: Option<String>,
+    /// `Some((partition_index, partition_count))` splits this mapping's
+    /// own outbound work across `partition_count` independent bridge
+    /// instances (docs/architecture.md §54). `None` (the default) means
+    /// unpartitioned: this mapping alone handles every event.
+    pub partition: Option<(u32, u32)>,
 }
 
 /// The most characters skilj accepts in an `Idempotency-Key`
@@ -567,6 +609,119 @@ pub async fn outbound_cycle<S: OutboundSink>(
     Ok(served)
 }
 
+/// One fetch-deliver-ack cycle for a single outbound mapping - each
+/// bridge's broker-specific `produce_once` is just this with its own
+/// [`OutboundSink`]. See [`outbound_cycle`] for what a cycle does.
+pub async fn produce_once<S: OutboundSink>(
+    http: &reqwest::Client,
+    skilj_base_url: &str,
+    target: &OutboundTarget<'_>,
+    sink: &mut S,
+    retry_policy: &skilj_retry::RetryPolicy,
+    retry_state: &mut Option<OutboundRetryState>,
+) -> Result<usize, S::Error> {
+    outbound_cycle(
+        http,
+        skilj_base_url,
+        target,
+        sink,
+        retry_policy,
+        retry_state,
+    )
+    .await
+}
+
+/// Runs [`produce_once`] forever, one mapping at a time in the order
+/// given, sleeping `poll_interval` between cycles that served nothing -
+/// the identical shape every bridge's `run_outbound` already has. `stop`
+/// is raced only against the idle sleep between cycles and checked after
+/// each cycle.
+///
+/// `make_sink` builds the broker-specific [`OutboundSink`] for a mapping
+/// (e.g. a Kafka producer, an AMQP sender, a JetStream context).
+pub async fn run_outbound_until<S, F>(
+    skilj_base_url: &str,
+    mappings: &[OutboundMapping],
+    poll_interval: std::time::Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
+    stop: impl std::future::Future<Output = ()>,
+    mut make_sink: F,
+) where
+    S: OutboundSink,
+    F: FnMut(&OutboundMapping) -> S,
+{
+    let mut stop = std::pin::pin!(stop);
+    let http = http_client();
+    let mut retry_states: Vec<Option<OutboundRetryState>> = vec![None; mappings.len()];
+    loop {
+        let mut served_any = false;
+        for (mapping, retry_state) in mappings.iter().zip(retry_states.iter_mut()) {
+            let mut sink = make_sink(mapping);
+            let target = OutboundTarget {
+                credential: &mapping.credential,
+                event_type: &mapping.event_type,
+                partition: mapping.partition,
+                key_tag_key: mapping.key_tag_key.as_deref(),
+            };
+            match produce_once(
+                &http,
+                skilj_base_url,
+                &target,
+                &mut sink,
+                retry_policy,
+                retry_state,
+            )
+            .await
+            {
+                Ok(served) => served_any |= served > 0,
+                Err(e) => {
+                    tracing::error!(
+                        event_type = %mapping.event_type,
+                        destination = %mapping.destination,
+                        "poll cycle failed, retrying after poll_interval: {e}"
+                    );
+                }
+            }
+        }
+        let idle = if served_any {
+            std::time::Duration::ZERO
+        } else {
+            poll_interval
+        };
+        tokio::select! {
+            biased;
+            () = &mut stop => return,
+            () = tokio::time::sleep(idle) => {}
+        }
+    }
+}
+
+/// [`run_outbound_until`] that never returns - `stop` is
+/// `std::future::pending()`. Each bridge's public `run_outbound` is just
+/// this wrapper.
+pub async fn run_outbound<S, F>(
+    skilj_base_url: &str,
+    mappings: &[OutboundMapping],
+    poll_interval: std::time::Duration,
+    retry_policy: &skilj_retry::RetryPolicy,
+    make_sink: F,
+) -> !
+where
+    S: OutboundSink,
+    F: FnMut(&OutboundMapping) -> S,
+{
+    run_outbound_until(
+        skilj_base_url,
+        mappings,
+        poll_interval,
+        retry_policy,
+        std::future::pending(),
+        make_sink,
+    )
+    .await;
+    unreachable!("run_outbound_until only returns once `stop` resolves, and `pending()` never does")
+}
+
 /// Acknowledges `run`, if there is one. `Ok(true)` when the cycle may
 /// carry on, `Ok(false)` when the acknowledgement failed and is now in
 /// backoff. An exhausted retry policy gives up the way a failed delivery
@@ -771,5 +926,94 @@ mod tests {
                 .count();
             assert_eq!(owners, 1, "{key}");
         }
+    }
+
+    /// A tag helper shared by the bridge crates' own tests.
+    fn tag(key: &str, value: &str) -> Tag {
+        Tag {
+            key: key.to_string(),
+            value: Some(value.to_string()),
+        }
+    }
+
+    /// docs/architecture.md §161: `correlation_key` returns `None` when no
+    /// key tag key is configured.
+    #[test]
+    fn correlation_key_is_none_when_no_key_tag_key_is_configured() {
+        let tags = vec![tag("order", "o-1")];
+        assert_eq!(correlation_key(None, &tags), None);
+    }
+
+    /// docs/architecture.md §161: `correlation_key` finds the matching tag.
+    #[test]
+    fn correlation_key_finds_the_matching_tag() {
+        let tags = vec![tag("company", "acme"), tag("order", "o-1")];
+        assert_eq!(
+            correlation_key(Some("order"), &tags),
+            Some("o-1".to_string())
+        );
+    }
+
+    /// docs/architecture.md §161: `correlation_key` returns `None` when the
+    /// tag key is entirely absent.
+    #[test]
+    fn correlation_key_is_none_when_the_tag_key_is_entirely_absent() {
+        let tags = vec![tag("company", "acme")];
+        assert_eq!(correlation_key(Some("order"), &tags), None);
+    }
+
+    /// docs/architecture.md §161: `correlation_key` returns `None` when the
+    /// tag is present but its value is null.
+    #[test]
+    fn correlation_key_is_none_when_the_tag_is_present_but_its_value_is_null() {
+        let tags = vec![Tag {
+            key: "order".to_string(),
+            value: None,
+        }];
+        assert_eq!(correlation_key(Some("order"), &tags), None);
+    }
+
+    /// A minimal error type implementing [`BridgeError`] for testing the
+    /// trait contract itself.
+    #[derive(Debug, thiserror::Error)]
+    enum TestBridgeError {
+        #[error("skijl status: {status}: {body}")]
+        SkiljStatus { status: u16, body: String },
+        #[error("broker failure: {0}")]
+        Broker(String),
+    }
+
+    impl BridgeError for TestBridgeError {
+        fn another_instance_can_do_it(&self) -> bool {
+            matches!(self, TestBridgeError::SkiljStatus { body, .. } if another_instance_refusal(body))
+        }
+
+        fn is_permanent(&self) -> bool {
+            matches!(self, TestBridgeError::Broker(_))
+        }
+    }
+
+    /// docs/architecture.md §161: only skilj's "another instance can"
+    /// codes are retried without spending an attempt, through the shared
+    /// [`BridgeError`] trait.
+    #[test]
+    fn bridge_error_another_instance_can_do_it() {
+        let status = |status: u16, body: &str| TestBridgeError::SkiljStatus {
+            status,
+            body: body.to_string(),
+        };
+        assert!(status(
+            503,
+            r#"{"code":"sync_projection_not_declared","message":"x"}"#
+        )
+        .another_instance_can_do_it());
+        assert!(
+            status(500, r#"{"code":"no_decider_registered","message":"x"}"#)
+                .another_instance_can_do_it()
+        );
+        assert!(
+            !status(503, r#"{"code":"database_error","message":"x"}"#).another_instance_can_do_it()
+        );
+        assert!(!TestBridgeError::Broker("boom".into()).another_instance_can_do_it());
     }
 }

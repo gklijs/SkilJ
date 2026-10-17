@@ -160,9 +160,14 @@ use std::time::Duration;
 
 // docs/architecture.md §165: the skilj side every bridge shares.
 use skilj_bridge::parked_payload;
+// `skilj_bridge::BridgeError` is the trait each crate's `BridgeError` enum
+// implements - imported anonymously so its methods are in scope for calls
+// like `e.another_instance_can_do_it()`, without colliding with the local
+// `BridgeError` enum name.
+use skilj_bridge::BridgeError as _;
 pub use skilj_bridge::{
     correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
-    InboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
+    InboundMapping, OutboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
 };
 
 /// Header names for the two Codeberg-issue-#18 ids this bridge carries
@@ -177,53 +182,6 @@ const CORRELATION_ID_HEADER: &str = "Skilj-Correlation-Id";
 const CAUSATION_ID_HEADER: &str = "Skilj-Causation-Id";
 
 // --- outbound: skilj event -> Kafka ---
-
-/// One skilj `EventType`'s own mapping to a Kafka topic - the outbound
-/// half, direct analogue of `skilj_temporal::EventTypeMapping`.
-pub struct OutboundMapping {
-    /// The `EventType::NAME` this mapping applies to.
-    pub event_type: String,
-    /// An `EventReadToken` credential (`"{id}.{secret}"`) scoped to this
-    /// event type - `EventReadToken` is always scoped to exactly one
-    /// `EventType` (`docs/rest-event-reading.md`), so one token per
-    /// mapped event type, not one for the whole bounded context.
-    pub credential: String,
-    pub topic: String,
-    /// Which of this event type's own tag keys supplies the Kafka
-    /// message key - `None` sends no key at all, and Kafka itself then
-    /// distributes the message across partitions on its own (round-robin
-    /// by default). See [`correlation_key`].
-    pub key_tag_key: Option<String>,
-    /// `Some((partition_index, partition_count))` splits this
-    /// `EventType`'s own outbound work across `partition_count`
-    /// independent bridge instances (Codeberg issue #25's investigation,
-    /// docs/architecture.md §54) - each with its own dedicated
-    /// `credential` (a distinct `EventReadToken`, so each gets its own
-    /// independently-checkout-protected `read_cursors` row, §53 - no new
-    /// coordination is needed beyond that). `None` (the default) means
-    /// unpartitioned: this mapping alone handles every event, exactly as
-    /// before this feature existed.
-    ///
-    /// Reuses [`correlation_key`]'s own output as the partitioning
-    /// input: the same tag that drives Kafka's own native partition
-    /// assignment also decides which bridge instance is responsible for
-    /// an event, via the identical FNV-1a hash
-    /// (`skilj_core::db::partition_for_key`) skilj-core's own §51/§52
-    /// partitioning already established, vendored here rather than
-    /// pulled in as a dependency (this crate is deliberately
-    /// skilj-core-free - see the module doc comment). An event with no
-    /// derivable key (no `key_tag_key` configured, or the tag absent)
-    /// hashes on the empty string, which is a real, stable answer - just
-    /// one that sends every keyless event to whichever single partition
-    /// happens to own that hash, not spread across instances. A
-    /// partitioned mapping that doesn't own a given event still
-    /// acknowledges it (advancing this instance's own cursor past it)
-    /// without producing it to Kafka - the identical "position always
-    /// advances even when nothing happens for this particular item"
-    /// treatment `catch_up_cross_context_route` already gives an
-    /// unregistered target command type.
-    pub partition: Option<(u32, u32)>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -254,6 +212,19 @@ pub enum BridgeError {
     MalformedPayload(#[from] serde_json::Error),
 }
 
+impl skilj_bridge::BridgeError for BridgeError {
+    fn another_instance_can_do_it(&self) -> bool {
+        match self {
+            BridgeError::SkiljStatus { body, .. } => skilj_bridge::another_instance_refusal(body),
+            _ => false,
+        }
+    }
+
+    fn is_permanent(&self) -> bool {
+        matches!(self, BridgeError::MalformedPayload(_))
+    }
+}
+
 impl From<skilj_bridge::SkiljError> for BridgeError {
     fn from(error: skilj_bridge::SkiljError) -> Self {
         match error {
@@ -264,20 +235,6 @@ impl From<skilj_bridge::SkiljError> for BridgeError {
             skilj_bridge::SkiljError::EventTypeMismatch { declared, actual } => {
                 BridgeError::EventTypeMismatch { declared, actual }
             }
-        }
-    }
-}
-
-impl BridgeError {
-    /// Whether skilj refused this with one of
-    /// [`skilj_retry::ANOTHER_INSTANCE_CODES`]: the instance that took the
-    /// request can't process it, another one can - retried after
-    /// [`skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY`] without spending an
-    /// attempt, and never parked (docs/architecture.md §161).
-    fn another_instance_can_do_it(&self) -> bool {
-        match self {
-            BridgeError::SkiljStatus { body, .. } => skilj_bridge::another_instance_refusal(body),
-            _ => false,
         }
     }
 }
@@ -299,7 +256,7 @@ impl skilj_bridge::OutboundSink for KafkaSink<'_> {
     async fn deliver(&mut self, event: &ConsumedEvent) -> Result<(), BridgeError> {
         let key = correlation_key(self.mapping.key_tag_key.as_deref(), &event.tags);
         let payload = event.payload.to_string();
-        let mut record = FutureRecord::to(&self.mapping.topic).payload(&payload);
+        let mut record = FutureRecord::to(&self.mapping.destination).payload(&payload);
         if let Some(k) = key.as_deref() {
             record = record.key(k);
         }
@@ -358,7 +315,7 @@ pub async fn produce_once(
         key_tag_key: mapping.key_tag_key.as_deref(),
     };
     let mut sink = KafkaSink { producer, mapping };
-    skilj_bridge::outbound_cycle(
+    skilj_bridge::produce_once(
         http,
         skilj_base_url,
         &target,
@@ -434,6 +391,7 @@ pub async fn run_outbound_until(
                 Err(e) => {
                     tracing::error!(
                         event_type = %mapping.event_type,
+                        destination = %mapping.destination,
                         "poll cycle failed, retrying after poll_interval: {e}"
                     );
                 }
@@ -991,71 +949,4 @@ pub async fn run_inbound_until(
             commit(consumer, &msg);
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// docs/architecture.md §161: only skilj's "another instance can"
-    /// codes are retried without spending an attempt.
-    #[test]
-    fn another_instance_refusals_are_recognised_by_their_code() {
-        let status = |status: u16, body: &str| BridgeError::SkiljStatus {
-            status: reqwest::StatusCode::from_u16(status).unwrap(),
-            body: body.to_string(),
-        };
-        assert!(status(
-            503,
-            r#"{"code":"sync_projection_not_declared","message":"x"}"#
-        )
-        .another_instance_can_do_it());
-        assert!(
-            status(500, r#"{"code":"no_decider_registered","message":"x"}"#)
-                .another_instance_can_do_it()
-        );
-        assert!(
-            !status(503, r#"{"code":"database_error","message":"x"}"#).another_instance_can_do_it()
-        );
-        assert!(!status(502, "Bad Gateway").another_instance_can_do_it());
-    }
-
-    fn tag(key: &str, value: &str) -> Tag {
-        Tag {
-            key: key.to_string(),
-            value: Some(value.to_string()),
-        }
-    }
-
-    #[test]
-    fn correlation_key_is_none_when_no_key_tag_key_is_configured() {
-        let tags = vec![tag("order", "o-1")];
-        assert_eq!(correlation_key(None, &tags), None);
-    }
-
-    #[test]
-    fn correlation_key_finds_the_matching_tag() {
-        let tags = vec![tag("company", "acme"), tag("order", "o-1")];
-        assert_eq!(
-            correlation_key(Some("order"), &tags),
-            Some("o-1".to_string())
-        );
-    }
-
-    #[test]
-    fn correlation_key_is_none_when_the_tag_key_is_entirely_absent() {
-        let tags = vec![tag("company", "acme")];
-        assert_eq!(correlation_key(Some("order"), &tags), None);
-    }
-
-    #[test]
-    fn correlation_key_is_none_when_the_tag_is_present_but_its_value_is_null() {
-        let tags = vec![Tag {
-            key: "order".to_string(),
-            value: None,
-        }];
-        assert_eq!(correlation_key(Some("order"), &tags), None);
-    }
-
-    // --- Codeberg issue #25's investigation (docs/architecture.md §54) ---
 }

@@ -41,7 +41,7 @@
 //! NATS has no Kafka-style "key routes to a partition" concept -
 //! JetStream streams aren't partitioned, so there's no routing decision
 //! a key could influence. What a DCB tag maps onto instead is a plain
-//! header (`Skilj-Correlation-Key`, see [`OutboundMapping::correlation_tag_key`]) -
+//! header (`Skilj-Correlation-Key`, see [`OutboundMapping::key_tag_key`]) -
 //! informational for whatever downstream consumer wants to filter or
 //! group by it, not something this crate or NATS itself acts on.
 //!
@@ -116,52 +116,27 @@ use futures_util::TryStreamExt;
 
 // docs/architecture.md §165: the skilj side every bridge shares.
 use skilj_bridge::parked_payload;
+// `skilj_bridge::BridgeError` is the trait each crate's `BridgeError` enum
+// implements - imported anonymously so its methods are in scope for calls
+// like `e.another_instance_can_do_it()`, without colliding with the local
+// `BridgeError` enum name.
+use skilj_bridge::BridgeError as _;
 pub use skilj_bridge::{
     correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
-    InboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
+    InboundMapping, OutboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
 };
 
 /// Header names for the two Codeberg-issue-#18 ids this bridge carries,
 /// both directions. **Deliberately not `Skilj-Correlation-Key`** -
 /// that's a pre-existing, unrelated header (a DCB-tag-derived value for
 /// a downstream consumer's own filtering/grouping, see
-/// [`OutboundMapping::correlation_tag_key`]/[`correlation_key`]), not a
+/// [`OutboundMapping::key_tag_key`]/[`correlation_key`]), not a
 /// business-transaction id - the two must not be conflated, hence `-Id`
 /// rather than `-Key` here.
 const CORRELATION_ID_HEADER: &str = "Skilj-Correlation-Id";
 const CAUSATION_ID_HEADER: &str = "Skilj-Causation-Id";
 
 // --- outbound: skilj event -> NATS JetStream ---
-
-/// One skilj `EventType`'s own mapping to a NATS subject - the outbound
-/// half, direct analogue of `skilj_kafka::OutboundMapping`/
-/// `skilj_amqp::OutboundMapping`.
-pub struct OutboundMapping {
-    /// The `EventType::NAME` this mapping applies to.
-    pub event_type: String,
-    /// An `EventReadToken` credential (`"{id}.{secret}"`) scoped to this
-    /// event type.
-    pub credential: String,
-    pub subject: String,
-    /// Which of this event type's own tag keys becomes the message's
-    /// own `Skilj-Correlation-Key` header - `None` sends no such header
-    /// at all. See this module's own "Correlation" doc section for why
-    /// this is a header, not a NATS-native routing concept the way a
-    /// Kafka key or an AMQP `group-id` is.
-    pub correlation_tag_key: Option<String>,
-    /// `Some((partition_index, partition_count))` splits this
-    /// `EventType`'s own outbound work across `partition_count`
-    /// independent bridge instances (Codeberg issue #25's investigation,
-    /// docs/architecture.md §54) - the identical mechanism
-    /// `skilj_kafka::OutboundMapping::partition` establishes; see that
-    /// field's own doc comment for the full design. Reuses
-    /// `correlation_key`'s own output as the partitioning input here
-    /// too: NATS has no native partition concept to align with (unlike
-    /// Kafka's message key or AMQP's `group-id`), so this is purely
-    /// skilj-side bookkeeping, with no broker-side echo. `None` (the
-    /// default) means unpartitioned.
-    pub partition: Option<(u32, u32)>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -212,17 +187,16 @@ impl From<skilj_bridge::SkiljError> for BridgeError {
     }
 }
 
-impl BridgeError {
-    /// Whether skilj refused this with one of
-    /// [`skilj_retry::ANOTHER_INSTANCE_CODES`]: the instance that took the
-    /// request can't process it, another one can - retried after
-    /// [`skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY`] without spending an
-    /// attempt, and never parked (docs/architecture.md §161).
+impl skilj_bridge::BridgeError for BridgeError {
     fn another_instance_can_do_it(&self) -> bool {
         match self {
             BridgeError::SkiljStatus { body, .. } => skilj_bridge::another_instance_refusal(body),
             _ => false,
         }
+    }
+
+    fn is_permanent(&self) -> bool {
+        matches!(self, BridgeError::MalformedPayload(_))
     }
 }
 
@@ -251,8 +225,7 @@ impl skilj_bridge::OutboundSink for JetstreamSink<'_> {
         let mut publish = PublishMessage::build()
             .payload(payload.into())
             .message_id(message_id);
-        if let Some(key) = correlation_key(self.mapping.correlation_tag_key.as_deref(), &event.tags)
-        {
+        if let Some(key) = correlation_key(self.mapping.key_tag_key.as_deref(), &event.tags) {
             publish = publish.header("Skilj-Correlation-Key", key.as_str());
         }
         // Codeberg issue #18 - always present on correlation_id (the spec's
@@ -266,7 +239,7 @@ impl skilj_bridge::OutboundSink for JetstreamSink<'_> {
             publish = publish.header(CAUSATION_ID_HEADER, id.as_str());
         }
         self.jetstream
-            .send_publish(self.mapping.subject.clone(), publish)
+            .send_publish(self.mapping.destination.clone(), publish)
             .await?
             .await?;
         Ok(())
@@ -294,14 +267,14 @@ pub async fn produce_once(
         credential: &mapping.credential,
         event_type: &mapping.event_type,
         partition: mapping.partition,
-        key_tag_key: mapping.correlation_tag_key.as_deref(),
+        key_tag_key: mapping.key_tag_key.as_deref(),
     };
     let mut sink = JetstreamSink {
         jetstream,
         bounded_context,
         mapping,
     };
-    skilj_bridge::outbound_cycle(
+    skilj_bridge::produce_once(
         http,
         skilj_base_url,
         &target,
@@ -375,6 +348,7 @@ pub async fn run_outbound_until(
                 Err(e) => {
                     tracing::error!(
                         event_type = %mapping.event_type,
+                        destination = %mapping.destination,
                         "poll cycle failed, retrying after poll_interval: {e}"
                     );
                 }
@@ -792,62 +766,4 @@ async fn wait_keeping_claim(
         }
         tokio::time::sleep(heartbeat.min(deadline - now)).await;
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// docs/architecture.md §161: only skilj's "another instance can"
-    /// codes are retried without spending an attempt.
-    #[test]
-    fn another_instance_refusals_are_recognised_by_their_code() {
-        let status = |status: u16, body: &str| BridgeError::SkiljStatus {
-            status: reqwest::StatusCode::from_u16(status).unwrap(),
-            body: body.to_string(),
-        };
-        assert!(status(
-            503,
-            r#"{"code":"sync_projection_not_declared","message":"x"}"#
-        )
-        .another_instance_can_do_it());
-        assert!(
-            status(500, r#"{"code":"no_decider_registered","message":"x"}"#)
-                .another_instance_can_do_it()
-        );
-        assert!(
-            !status(503, r#"{"code":"database_error","message":"x"}"#).another_instance_can_do_it()
-        );
-        assert!(!status(502, "Bad Gateway").another_instance_can_do_it());
-    }
-
-    fn tag(key: &str, value: &str) -> Tag {
-        Tag {
-            key: key.to_string(),
-            value: Some(value.to_string()),
-        }
-    }
-
-    #[test]
-    fn correlation_key_is_none_when_no_correlation_tag_key_is_configured() {
-        let tags = vec![tag("order", "o-1")];
-        assert_eq!(correlation_key(None, &tags), None);
-    }
-
-    #[test]
-    fn correlation_key_finds_the_matching_tag() {
-        let tags = vec![tag("company", "acme"), tag("order", "o-1")];
-        assert_eq!(
-            correlation_key(Some("order"), &tags),
-            Some("o-1".to_string())
-        );
-    }
-
-    #[test]
-    fn correlation_key_is_none_when_the_tag_key_is_entirely_absent() {
-        let tags = vec![tag("company", "acme")];
-        assert_eq!(correlation_key(Some("order"), &tags), None);
-    }
-
-    // --- Codeberg issue #25's investigation (docs/architecture.md §54) ---
 }

@@ -384,7 +384,7 @@ fn an_order_placed_event_is_sent_with_its_own_tag_as_the_group_id() {
         let mapping = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token,
-            address: address.clone(),
+            destination: address.clone(),
             key_tag_key: Some("order".to_string()),
             partition: None,
         };
@@ -855,7 +855,7 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
         let mapping = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token,
-            address: address.clone(),
+            destination: address.clone(),
             key_tag_key: Some("order".to_string()),
             partition: None,
         };
@@ -970,7 +970,7 @@ fn two_partitioned_mappings_together_send_every_key_exactly_once() {
         let mapping_0 = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token_0,
-            address: address.clone(),
+            destination: address.clone(),
             key_tag_key: Some("order".to_string()),
             partition: Some((0, 2)),
         };
@@ -989,7 +989,7 @@ fn two_partitioned_mappings_together_send_every_key_exactly_once() {
         let mapping_1 = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token_1,
-            address: address.clone(),
+            destination: address.clone(),
             key_tag_key: Some("order".to_string()),
             partition: Some((1, 2)),
         };
@@ -1179,7 +1179,7 @@ fn the_run_loops_stop_when_asked() {
         let mappings = vec![OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: "read-token".to_string(),
-            address: address.clone(),
+            destination: address.clone(),
             key_tag_key: None,
             partition: None,
         }];

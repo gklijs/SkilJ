@@ -20,6 +20,7 @@ sha2.workspace = true
 chrono.workspace = true
 skilj-retry.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 axum.workspace = true

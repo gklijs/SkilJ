@@ -109,9 +109,14 @@ use std::collections::HashMap;
 
 // docs/architecture.md §165: the skilj side every bridge shares.
 use skilj_bridge::parked_payload;
+// `skilj_bridge::BridgeError` is the trait each crate's `BridgeError` enum
+// implements - imported anonymously so its methods are in scope for calls
+// like `e.another_instance_can_do_it()`, without colliding with the local
+// `BridgeError` enum name.
+use skilj_bridge::BridgeError as _;
 pub use skilj_bridge::{
     correlation_key, http_client, ConsumedEvent, ConsumedEventMetadata, InboundAction,
-    InboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
+    InboundMapping, OutboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
 };
 
 /// The `application-properties` key this bridge uses for causation_id
@@ -124,34 +129,6 @@ pub use skilj_bridge::{
 const CAUSATION_ID_PROPERTY: &str = "Skilj-Causation-Id";
 
 // --- outbound: skilj event -> AMQP ---
-
-/// One skilj `EventType`'s own mapping to an AMQP address (a queue or
-/// topic name, broker-specific in shape but always just a string to
-/// AMQP itself) - the outbound half, direct analogue of
-/// `skilj_kafka::OutboundMapping`/`skilj_temporal::EventTypeMapping`.
-pub struct OutboundMapping {
-    /// The `EventType::NAME` this mapping applies to.
-    pub event_type: String,
-    /// An `EventReadToken` credential (`"{id}.{secret}"`) scoped to this
-    /// event type.
-    pub credential: String,
-    pub address: String,
-    /// Which of this event type's own tag keys becomes the message's
-    /// own `group-id` - `None` sends no `group-id` at all (a message
-    /// with no group is still perfectly valid AMQP). See
-    /// [`correlation_key`].
-    pub key_tag_key: Option<String>,
-    /// `Some((partition_index, partition_count))` splits this
-    /// `EventType`'s own outbound work across `partition_count`
-    /// independent bridge instances (Codeberg issue #25's investigation,
-    /// docs/architecture.md §54) - the identical mechanism
-    /// `skilj_kafka::OutboundMapping::partition` establishes; see that
-    /// field's own doc comment for the full design (each partition uses
-    /// its own dedicated `credential`, no new coordination needed beyond
-    /// §53's own per-token checkout). `None` (the default) means
-    /// unpartitioned.
-    pub partition: Option<(u32, u32)>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -205,17 +182,16 @@ impl From<skilj_bridge::SkiljError> for BridgeError {
     }
 }
 
-impl BridgeError {
-    /// Whether skilj refused this with one of
-    /// [`skilj_retry::ANOTHER_INSTANCE_CODES`]: the instance that took the
-    /// request can't process it, another one can - retried after
-    /// [`skilj_retry::ANOTHER_INSTANCE_RETRY_DELAY`] without spending an
-    /// attempt, and never parked (docs/architecture.md §161).
+impl skilj_bridge::BridgeError for BridgeError {
     fn another_instance_can_do_it(&self) -> bool {
         match self {
             BridgeError::SkiljStatus { body, .. } => skilj_bridge::another_instance_refusal(body),
             _ => false,
         }
+    }
+
+    fn is_permanent(&self) -> bool {
+        matches!(self, BridgeError::MalformedPayload(_))
     }
 }
 
@@ -307,7 +283,7 @@ pub async fn produce_once(
         key_tag_key: mapping.key_tag_key.as_deref(),
     };
     let mut sink = AmqpSink { sender, mapping };
-    skilj_bridge::outbound_cycle(
+    skilj_bridge::produce_once(
         http,
         skilj_base_url,
         &target,
@@ -378,6 +354,7 @@ pub async fn run_outbound_until(
                 Err(e) => {
                     tracing::error!(
                         event_type = %mapping.event_type,
+                        destination = %mapping.destination,
                         "poll cycle failed, retrying after poll_interval: {e}"
                     );
                 }
@@ -815,59 +792,6 @@ pub async fn run_inbound_until(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// docs/architecture.md §161: only skilj's "another instance can"
-    /// codes are retried without spending an attempt.
-    #[test]
-    fn another_instance_refusals_are_recognised_by_their_code() {
-        let status = |status: u16, body: &str| BridgeError::SkiljStatus {
-            status: reqwest::StatusCode::from_u16(status).unwrap(),
-            body: body.to_string(),
-        };
-        assert!(status(
-            503,
-            r#"{"code":"sync_projection_not_declared","message":"x"}"#
-        )
-        .another_instance_can_do_it());
-        assert!(
-            status(500, r#"{"code":"no_decider_registered","message":"x"}"#)
-                .another_instance_can_do_it()
-        );
-        assert!(
-            !status(503, r#"{"code":"database_error","message":"x"}"#).another_instance_can_do_it()
-        );
-        assert!(!status(502, "Bad Gateway").another_instance_can_do_it());
-    }
-
-    fn tag(key: &str, value: &str) -> Tag {
-        Tag {
-            key: key.to_string(),
-            value: Some(value.to_string()),
-        }
-    }
-
-    #[test]
-    fn correlation_key_is_none_when_no_key_tag_key_is_configured() {
-        let tags = vec![tag("order", "o-1")];
-        assert_eq!(correlation_key(None, &tags), None);
-    }
-
-    #[test]
-    fn correlation_key_finds_the_matching_tag() {
-        let tags = vec![tag("company", "acme"), tag("order", "o-1")];
-        assert_eq!(
-            correlation_key(Some("order"), &tags),
-            Some("o-1".to_string())
-        );
-    }
-
-    #[test]
-    fn correlation_key_is_none_when_the_tag_key_is_entirely_absent() {
-        let tags = vec![tag("company", "acme")];
-        assert_eq!(correlation_key(Some("order"), &tags), None);
-    }
-
-    // --- Codeberg issue #25's investigation (docs/architecture.md §54) ---
 
     #[test]
     fn message_id_to_string_is_stable_for_each_variant() {

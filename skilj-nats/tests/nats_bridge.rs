@@ -405,8 +405,8 @@ fn an_order_placed_event_is_published_with_its_own_tag_as_correlation_header() {
         let mapping = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token,
-            subject: format!("{stream_name}.orders"),
-            correlation_tag_key: Some("order".to_string()),
+            destination: format!("{stream_name}.orders"),
+            key_tag_key: Some("order".to_string()),
             partition: None,
         };
         let http = skilj_nats::http_client();
@@ -767,8 +767,8 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
         let mapping = OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: token,
-            subject: format!("{stream_name}.skip"),
-            correlation_tag_key: Some("order".to_string()),
+            destination: format!("{stream_name}.skip"),
+            key_tag_key: Some("order".to_string()),
             partition: None,
         };
         let http = skilj_nats::http_client();
@@ -879,8 +879,8 @@ fn two_partitioned_mappings_together_publish_every_key_exactly_once() {
             let mapping = OutboundMapping {
                 event_type: "OrderPlaced".to_string(),
                 credential: token,
-                subject: format!("{stream_name}.orders"),
-                correlation_tag_key: Some("order".to_string()),
+                destination: format!("{stream_name}.orders"),
+                key_tag_key: Some("order".to_string()),
                 partition: Some((partition_index, 2)),
             };
             let mut retry_state = None;
@@ -1050,8 +1050,8 @@ fn the_run_loops_stop_when_asked() {
         let mappings = vec![OutboundMapping {
             event_type: "OrderPlaced".to_string(),
             credential: "read-token".to_string(),
-            subject: format!("{stream_name}.out"),
-            correlation_tag_key: None,
+            destination: format!("{stream_name}.out"),
+            key_tag_key: None,
             partition: None,
         }];
         let (stop_outbound, stopped) = tokio::sync::oneshot::channel::<()>();

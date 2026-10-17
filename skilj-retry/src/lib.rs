@@ -111,6 +111,11 @@ impl RetryPolicy {
     /// returned as itself once reached - never round-tripped through
     /// `f64`, which for `Duration::MAX` (an "uncapped" policy) doesn't fit
     /// back into a `Duration`.
+    ///
+    /// The computation runs through `f64` (`as_secs_f64()`), so sub-microsecond
+    /// precision is lost for very large `initial_backoff` values - acceptable
+    /// since backoffs here are human-scale (milliseconds to hours), not
+    /// astronomical.
     pub fn next_backoff(&self, attempt: u32) -> Duration {
         let multiplier = if self.multiplier.is_finite() && self.multiplier >= 0.0 {
             self.multiplier
