@@ -1874,6 +1874,7 @@ fn registered_command_type<T: CommandType + 'static>() -> RegisteredCommandType 
                 T::approval_role().map(str::to_string),
                 T::approval_deadline_seconds(),
             )
+            .allowing_self_approval(T::approval_allows_self_approval())
         }),
         required_role: T::required_role(),
         snapshot_name: T::snapshot(),

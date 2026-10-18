@@ -51,7 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   submitting it with no approver. An `approving` claim older than
   `APPROVAL_CLAIM_STALE_AFTER` (left by a crash) can be taken over, and is
   first settled against what already committed. Proposals stay decidable
-  after their type's policy is removed.
+  after their type's policy is removed. Self-approval is off by default:
+  the Role that proposed may not approve (`self_approval_not_allowed`),
+  though it may still reject (withdraw); a type opts in with
+  `CommandType::approval_allows_self_approval()` or
+  `registerCommandType(approvalAllowsSelfApproval: true)`, exposed as
+  `CommandApprovalPolicy.allowsSelfApproval`.
 - Documented external-worker guarantees around private fields
   (docs/architecture.md §215, Codeberg issue #99): `EventReadToken`
   REST reads redact every private field unconditionally and serve

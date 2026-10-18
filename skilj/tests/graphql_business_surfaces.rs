@@ -154,6 +154,12 @@ impl CommandType for TransferMoney {
     fn requires_approval() -> bool {
         true
     }
+    // These tests approve with the same Role that proposed, so this type
+    // opts in; the default (off) is covered by
+    // `self_approval_is_refused_by_default`, which overrides the policy.
+    fn approval_allows_self_approval() -> bool {
+        true
+    }
     fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
         CommandDecision::Accepted {
             events: vec![EventSpec {
@@ -1482,7 +1488,7 @@ fn command_approval_lifecycle_end_to_end() {
             &router,
             Some(&jwt),
             "query($bc: String!) { commandTypes(boundedContext: $bc) { \
-                name requiresApproval approvalPolicy { approverRole deadlineSeconds } \
+                name requiresApproval approvalPolicy { approverRole deadlineSeconds allowsSelfApproval } \
             } }",
             json!({ "bc": bc_name }),
         )
@@ -1500,6 +1506,7 @@ fn command_approval_lifecycle_end_to_end() {
         assert_eq!(transfer["requiresApproval"], json!(true));
         assert_eq!(transfer["approvalPolicy"]["approverRole"], serde_json::Value::Null);
         assert_eq!(transfer["approvalPolicy"]["deadlineSeconds"], serde_json::Value::Null);
+        assert_eq!(transfer["approvalPolicy"]["allowsSelfApproval"], json!(true));
 
         let _ = pool;
     });
@@ -1512,7 +1519,9 @@ fn command_approval_rejects_an_expired_proposal() {
             return;
         }
         let (skilj, pool, bc_name, jwt, _) = setup().await;
-        let policy = skilj_core::approvals::CommandApprovalPolicy::new(None, Some(1));
+        // Self-approval on: this test is about expiry, approved by its proposer.
+        let policy = skilj_core::approvals::CommandApprovalPolicy::new(None, Some(1))
+            .allowing_self_approval(true);
         skilj_core::db::set_command_approval_policy(
             &pool,
             &bc_name,
@@ -3610,14 +3619,141 @@ fn proposals_stay_decidable_after_their_policy_is_removed() {
             rejected["data"]["rejectCommand"]["proposal"]["status"],
             json!("REJECTED")
         );
-        let approved = graphql_request(
+        // Without a policy the safe default applies: no self-approval.
+        let own = graphql_request(
             &router,
             Some(&jwt),
             APPROVE_MUTATION,
             json!({ "bc": bc_name, "id": to_approve }),
         )
         .await;
+        assert_eq!(
+            own["errors"][0]["extensions"]["code"],
+            json!("self_approval_not_allowed"),
+            "{own}"
+        );
+        let other = second_admin(&pool, &bc_name).await;
+        let approved = graphql_request(
+            &router,
+            Some(&other),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": to_approve }),
+        )
+        .await;
         assert_eq!(approved["errors"], serde_json::Value::Null, "{approved}");
         assert_eq!(approved["data"]["approveCommand"]["accepted"], json!(true));
+    });
+}
+
+/// A second admin on `bc_name`, returning its bearer token - an approver
+/// other than the Role `setup()` proposes with.
+async fn second_admin(pool: &Pool, bc_name: &str) -> String {
+    let subject = unique_name("approver");
+    let role = Role {
+        id: generate_token_id(),
+        external_subject: subject.clone(),
+        name: "Approver".to_string(),
+        superadmin: false,
+        status: RoleStatus::Active,
+        created_at: test_now(),
+        revoked_at: None,
+    };
+    skilj_core::db::insert_role(pool, &role).await.unwrap();
+    let bounded_context = skilj_core::db::get_bounded_context(pool, bc_name)
+        .await
+        .unwrap()
+        .unwrap();
+    skilj_core::db::insert_role_access_mapping(
+        pool,
+        &RoleAccessMapping {
+            role,
+            bounded_context,
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    sign_jwt(&subject)
+}
+
+/// Self-approval is off unless a type opts in: the Role that proposed may
+/// not approve its own proposal (the proposal stays pending), but may still
+/// withdraw it by rejecting, and a different admin may approve.
+#[test]
+fn self_approval_is_refused_by_default() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _) = setup().await;
+        // The fixture type opts in; put it back to the default.
+        let default_policy = skilj_core::approvals::CommandApprovalPolicy::new(None, None);
+        assert!(!default_policy.allow_self_approval);
+        skilj_core::db::set_command_approval_policy(
+            &pool,
+            &bc_name,
+            "TransferMoney",
+            Some(&default_policy),
+        )
+        .await
+        .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+
+        let id = propose_transfer(&router, &jwt, &bc_name).await;
+        let own = graphql_request(
+            &router,
+            Some(&jwt),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": id }),
+        )
+        .await;
+        assert_eq!(
+            own["errors"][0]["extensions"]["code"],
+            json!("self_approval_not_allowed"),
+            "{own}"
+        );
+        let listed = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { commandProposals(boundedContext: $bc) { id status } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            listed["data"]["commandProposals"][0]["status"],
+            json!("PENDING"),
+            "a refused self-approval must not claim the proposal: {listed}"
+        );
+        assert_eq!(transfer_command_count(&router, &jwt, &bc_name).await, 0);
+
+        let other = second_admin(&pool, &bc_name).await;
+        let approved = graphql_request(
+            &router,
+            Some(&other),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": id }),
+        )
+        .await;
+        assert_eq!(approved["errors"], serde_json::Value::Null, "{approved}");
+        assert_eq!(approved["data"]["approveCommand"]["accepted"], json!(true));
+
+        let withdrawn = propose_transfer(&router, &jwt, &bc_name).await;
+        let rejected = graphql_request(
+            &router,
+            Some(&jwt),
+            REJECT_MUTATION,
+            json!({ "bc": bc_name, "id": withdrawn }),
+        )
+        .await;
+        assert_eq!(rejected["errors"], serde_json::Value::Null, "{rejected}");
+        assert_eq!(
+            rejected["data"]["rejectCommand"]["proposal"]["status"],
+            json!("REJECTED")
+        );
     });
 }

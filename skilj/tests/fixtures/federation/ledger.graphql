@@ -27,6 +27,7 @@ enum LedgerBoundedContextStatus @inaccessible {
 type LedgerCommandApprovalPolicy @inaccessible {
 	approverRole: String
 	deadlineSeconds: Int
+	allowsSelfApproval: Boolean!
 }
 
 type LedgerCommandProposal @inaccessible {
@@ -428,7 +429,7 @@ type Mutation {
 	ledgerArchiveBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerDeleteBoundedContext(name: String!): LedgerBoundedContext! @inaccessible
 	ledgerRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: LedgerMissedOccurrencePolicy): LedgerEventType! @inaccessible
-	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int): LedgerCommandType! @inaccessible
+	ledgerRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [LedgerTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [LedgerSensitiveFieldInput!]!, privateFields: [LedgerPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): LedgerCommandType! @inaccessible
 	ledgerRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): LedgerProjectionRegistrationResult! @inaccessible
 	ledgerRebuildProjection(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible
 	ledgerDiscardProjectionRebuild(boundedContext: String!, name: String!): LedgerProjectionRebuild! @inaccessible

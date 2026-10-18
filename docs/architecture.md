@@ -12364,11 +12364,28 @@ same pending proposal by that key. A deadline's `DeadlineContext` is not
 carried onto the proposal: the command runs when it is approved, and
 deciding late is the approver's call.
 
+**No self-approval, unless a type opts in.** The point of an approval is
+a second pair of eyes, but an admin who submits through GraphQL is also an
+admin who could approve - their own proposal included. So by default the
+Role that proposed may not approve (`self_approval_not_allowed`, checked
+before the claim, so the proposal stays `pending` for someone else). A
+type opts in with `CommandType::approval_allows_self_approval() -> true`,
+or `registerCommandType(approvalAllowsSelfApproval: true)` (omitted means
+`false`); it is stored as `command_approval_policies.allow_self_approval`
+(added to existing contexts at startup, `false` for existing rows) and
+exposed as `CommandApprovalPolicy.allowsSelfApproval`. That suits a
+single-user setup, where the only human is also the proposer. "Self" is
+the proposal's `client_id`, which for a GraphQL submission is the Role's
+id; a REST token or an internal path (`deadline`, `cross-context-route`)
+has a client id no Role carries, so for those any admin may approve.
+Rejecting one's own proposal - withdrawing it - is always allowed.
+
 **A removed policy does not strand pending proposals.** Removing a type's
 policy (`requiresApproval: false`) stops new submissions from becoming
 proposals, but proposals already waiting stay decidable by any active
 admin of the bounded context, rather than being left `pending` with
-nobody able to approve or reject them.
+nobody able to approve or reject them - under the default rules, so not
+approvable by their own proposer.
 
 **Not re-checked at approval: the proposer.** The approved command runs
 under the proposer's `client_id`, but the proposer's credential is only
@@ -12387,8 +12404,11 @@ approves, re-approves (refused), rejects, and expires a proposal, and
 checks that the approved command and its event exist while the rejected
 one does not; `a_stale_approval_claim_is_taken_over`,
 `a_stale_claim_whose_command_committed_settles_as_approved` and
-`proposals_stay_decidable_after_their_policy_is_removed` cover the three
-paragraphs above. `skilj/tests/command_trigger.rs` pins the REST
+`proposals_stay_decidable_after_their_policy_is_removed` cover the stale
+claim and removed-policy paragraphs above, and
+`self_approval_is_refused_by_default` the self-approval one (refused,
+proposal still pending, approved by a second admin, withdrawn by its
+proposer). `skilj/tests/command_trigger.rs` pins the REST
 submission's `pendingApproval`/`proposalId` answer and the stored
 proposal. `skilj/tests/deadlines.rs`'s
 `a_deadline_targeting_an_approval_required_command_proposes_it` fires a

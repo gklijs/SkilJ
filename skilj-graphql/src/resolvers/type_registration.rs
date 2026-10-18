@@ -223,6 +223,15 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                     .filter(|v| !v.is_null())
                     .map(|v| v.i64())
                     .transpose()?;
+                // Omitted means `false`: self-approval stays off unless
+                // asked for.
+                let approval_allows_self_approval = ctx
+                    .args
+                    .get("approvalAllowsSelfApproval")
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.boolean())
+                    .transpose()?
+                    .unwrap_or(false);
 
                 let bounded_context =
                     skilj_core::db::get_bounded_context(&state.pool, &bounded_context_name)
@@ -256,10 +265,13 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                             &state.pool,
                             &bounded_context_name,
                             &name,
-                            Some(&skilj_core::approvals::CommandApprovalPolicy::new(
-                                approval_role,
-                                approval_deadline_seconds,
-                            )),
+                            Some(
+                                &skilj_core::approvals::CommandApprovalPolicy::new(
+                                    approval_role,
+                                    approval_deadline_seconds,
+                                )
+                                .allowing_self_approval(approval_allows_self_approval),
+                            ),
                         )
                         .await
                         .map_err(to_graphql_error)?;
@@ -323,6 +335,10 @@ pub fn register_command_type_field(n: &Naming) -> Field {
     .argument(InputValue::new(
         "approvalDeadlineSeconds",
         TypeRef::named(TypeRef::INT),
+    ))
+    .argument(InputValue::new(
+        "approvalAllowsSelfApproval",
+        TypeRef::named(TypeRef::BOOLEAN),
     ))
 }
 

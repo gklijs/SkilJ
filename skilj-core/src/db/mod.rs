@@ -1117,13 +1117,15 @@ pub async fn ensure_private_field_grants_table(
 /// `entity CommandApprovalPolicy` - kept in its own table rather than as
 /// columns on `command_types`, so adding it changed no `CommandType`
 /// literal anywhere. A row's presence is what makes the type require
-/// approval; `approver_role`/`deadline_seconds` are optional refinements.
+/// approval; `approver_role`/`deadline_seconds`/`allow_self_approval` are
+/// refinements.
 fn command_approval_policies_table_ddl(schema: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {schema}.command_approval_policies (
             command_type_name TEXT PRIMARY KEY REFERENCES {schema}.command_types (name),
             approver_role TEXT,
-            deadline_seconds BIGINT CHECK (deadline_seconds IS NULL OR deadline_seconds > 0)
+            deadline_seconds BIGINT CHECK (deadline_seconds IS NULL OR deadline_seconds > 0),
+            allow_self_approval BOOLEAN NOT NULL DEFAULT false
         )"
     )
 }
@@ -1174,6 +1176,19 @@ pub async fn ensure_command_approval_tables(
         &schema,
         "command_approval_policies",
         command_approval_policies_table_ddl(&schema),
+    )))
+    .execute(pool)
+    .await?;
+    // Added after the table first shipped; `false` keeps an existing policy
+    // at the safe default (no self-approval).
+    sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
+        &schema,
+        "command_approval_policies",
+        &["allow_self_approval"],
+        format!(
+            "ALTER TABLE {schema}.command_approval_policies \
+             ADD COLUMN IF NOT EXISTS allow_self_approval BOOLEAN NOT NULL DEFAULT false"
+        ),
     )))
     .execute(pool)
     .await?;
@@ -4445,16 +4460,20 @@ pub async fn get_command_approval_policy(
     command_type_name: &str,
 ) -> crate::error::Result<Option<CommandApprovalPolicy>> {
     let schema = schema_ident(bounded_context);
-    let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT approver_role, deadline_seconds FROM {schema}.command_approval_policies \
-             WHERE command_type_name = $1"
-    )))
-    .bind(command_type_name)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(approver_role, deadline_seconds)| {
-        CommandApprovalPolicy::new(approver_role, deadline_seconds)
-    }))
+    let row: Option<(Option<String>, Option<i64>, bool)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT approver_role, deadline_seconds, allow_self_approval \
+             FROM {schema}.command_approval_policies WHERE command_type_name = $1"
+        )))
+        .bind(command_type_name)
+        .fetch_optional(pool)
+        .await?;
+    Ok(
+        row.map(|(approver_role, deadline_seconds, allow_self_approval)| {
+            CommandApprovalPolicy::new(approver_role, deadline_seconds)
+                .allowing_self_approval(allow_self_approval)
+        }),
+    )
 }
 
 /// Writes `policy` for `command_type_name`. `None` removes the row, so the
@@ -4484,14 +4503,17 @@ pub async fn set_command_approval_policy(
             }
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {schema}.command_approval_policies \
-                 (command_type_name, approver_role, deadline_seconds) VALUES ($1, $2, $3) \
+                 (command_type_name, approver_role, deadline_seconds, allow_self_approval) \
+                 VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (command_type_name) DO UPDATE SET \
                     approver_role = EXCLUDED.approver_role, \
-                    deadline_seconds = EXCLUDED.deadline_seconds"
+                    deadline_seconds = EXCLUDED.deadline_seconds, \
+                    allow_self_approval = EXCLUDED.allow_self_approval"
             )))
             .bind(command_type_name)
             .bind(policy.approver_role.as_deref())
             .bind(policy.deadline_seconds)
+            .bind(policy.allow_self_approval)
             .execute(pool)
             .await?;
         }
@@ -4764,6 +4786,7 @@ pub async fn claim_command_proposal(
     bounded_context: &str,
     id: &str,
     approver: &RoleAccessMapping,
+    decision: crate::approvals::ProposalDecision,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandProposal> {
     if approver.bounded_context.name != bounded_context {
@@ -4777,6 +4800,9 @@ pub async fn claim_command_proposal(
         .await?
         .unwrap_or_else(|| CommandApprovalPolicy::new(None, None));
     crate::approvals::check_approver(&policy, approver)?;
+    if decision == crate::approvals::ProposalDecision::Approve {
+        crate::approvals::check_self_approval(&policy, &proposal, approver)?;
+    }
     let stale_cutoff = now - APPROVAL_CLAIM_STALE_AFTER;
     match proposal.status {
         CommandProposalStatus::Pending if proposal.is_expired_at(now) => {
@@ -4976,7 +5002,15 @@ pub async fn reject_command_proposal(
     reason: Option<&str>,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandProposal> {
-    let proposal = claim_command_proposal(pool, bounded_context, id, approver, now).await?;
+    let proposal = claim_command_proposal(
+        pool,
+        bounded_context,
+        id,
+        approver,
+        crate::approvals::ProposalDecision::Reject,
+        now,
+    )
+    .await?;
     // A taken-over stale claim whose command already committed is approved,
     // not rejectable - rejecting it would contradict the command that exists.
     if settle_reclaimed_proposal(pool, bounded_context, &proposal, now).await? {
@@ -5099,7 +5133,15 @@ pub async fn approve_command_proposal(
     encryption_master_key: Option<&EncryptionMasterKey>,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandApprovalOutcome> {
-    let proposal = claim_command_proposal(pool, bounded_context, id, approver, now).await?;
+    let proposal = claim_command_proposal(
+        pool,
+        bounded_context,
+        id,
+        approver,
+        crate::approvals::ProposalDecision::Approve,
+        now,
+    )
+    .await?;
     // A taken-over stale claim may already have produced its command; if so
     // it is marked approved here and the submission below deduplicates.
     settle_reclaimed_proposal(pool, bounded_context, &proposal, now).await?;

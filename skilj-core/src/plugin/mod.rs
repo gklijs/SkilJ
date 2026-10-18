@@ -244,6 +244,14 @@ pub trait CommandType {
         None
     }
 
+    /// Whether the Role that proposed a command may also approve it.
+    /// `false` (the default) requires a different approver; rejecting -
+    /// withdrawing - one's own proposal is always allowed. Ignored for a
+    /// type that does not require approval.
+    fn approval_allows_self_approval() -> bool {
+        false
+    }
+
     /// An extra caller-facing gate, on top of the ordinary write-level
     /// `RoleAccessMapping` check: `None` (the default) means no extra
     /// restriction. Set this by writing `#[requires_role("name")]`

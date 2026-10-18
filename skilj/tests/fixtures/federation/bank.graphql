@@ -27,6 +27,7 @@ enum BankBoundedContextStatus @inaccessible {
 type BankCommandApprovalPolicy @inaccessible {
 	approverRole: String
 	deadlineSeconds: Int
+	allowsSelfApproval: Boolean!
 }
 
 type BankCommandProposal @inaccessible {
@@ -428,7 +429,7 @@ type Mutation {
 	bankArchiveBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankDeleteBoundedContext(name: String!): BankBoundedContext! @inaccessible
 	bankRegisterEventType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, externalCreationAllowed: Boolean!, directCreationAllowed: Boolean!, systemTriggeredAllowed: Boolean!, eventReadAllowed: Boolean!, systemTriggeredSchedule: String, missedOccurrencePolicy: BankMissedOccurrencePolicy): BankEventType! @inaccessible
-	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int): BankCommandType! @inaccessible
+	bankRegisterCommandType(boundedContext: String!, name: String!, schema: String!, tagMappings: [BankTagMappingInput!]!, ownerTagKey: String, sensitiveFields: [BankSensitiveFieldInput!]!, privateFields: [BankPrivateFieldInput!]!, restTriggerAllowed: Boolean!, requiresApproval: Boolean, approvalRole: String, approvalDeadlineSeconds: Int, approvalAllowsSelfApproval: Boolean): BankCommandType! @inaccessible
 	bankRegisterProjection(boundedContext: String!, name: String!, schema: String!, consumedEventTypes: [String!]!, sync: Boolean!): BankProjectionRegistrationResult! @inaccessible
 	bankRebuildProjection(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible
 	bankDiscardProjectionRebuild(boundedContext: String!, name: String!): BankProjectionRebuild! @inaccessible

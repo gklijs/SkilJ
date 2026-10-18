@@ -456,6 +456,7 @@ pub fn command_approval_policy_object(n: &Naming) -> Object {
     gql_object!(CommandApprovalPolicy => n.ty("CommandApprovalPolicy") {
         scalar "approverRole": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.approver_role.clone()),
         scalar "deadlineSeconds": TypeRef::named(TypeRef::INT) => |p| p.deadline_seconds.map(Value::from).unwrap_or(Value::Null),
+        scalar "allowsSelfApproval": TypeRef::named_nn(TypeRef::BOOLEAN) => |p| Value::from(p.allow_self_approval),
     })
 }
 

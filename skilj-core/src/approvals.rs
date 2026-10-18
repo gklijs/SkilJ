@@ -29,14 +29,28 @@ pub struct CommandApprovalPolicy {
     /// deadline. The value is copied onto each proposal's own `expires_at`
     /// when it is created.
     pub deadline_seconds: Option<i64>,
+    /// Whether the Role that proposed a command may also approve it.
+    /// `false` by default: the point of an approval is a second pair of
+    /// eyes, and an admin who submits through GraphQL would otherwise be
+    /// able to wave their own proposal through. Turn it on for a type
+    /// where that is acceptable (a single-user setup, say). Rejecting -
+    /// withdrawing - one's own proposal is always allowed.
+    pub allow_self_approval: bool,
 }
 
 impl CommandApprovalPolicy {
+    /// A policy with self-approval off; see [`Self::allowing_self_approval`].
     pub fn new(approver_role: Option<String>, deadline_seconds: Option<i64>) -> Self {
         Self {
             approver_role,
             deadline_seconds,
+            allow_self_approval: false,
         }
+    }
+
+    pub fn allowing_self_approval(mut self, allow: bool) -> Self {
+        self.allow_self_approval = allow;
+        self
     }
 }
 
@@ -131,6 +145,28 @@ pub fn check_approver(
     Ok(())
 }
 
+/// What a claim on a proposal is for - self-approval only gates approving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalDecision {
+    Approve,
+    Reject,
+}
+
+/// The self-approval gate, applied to approving only - never to rejecting.
+/// A proposal's `metadata.client_id` is the proposing Role's id for a
+/// GraphQL submission; a REST token or an internal path (deadline, route)
+/// has a client id no Role can carry, so it never matches.
+pub fn check_self_approval(
+    policy: &CommandApprovalPolicy,
+    proposal: &CommandProposal,
+    approver: &RoleAccessMapping,
+) -> crate::error::Result<()> {
+    if !policy.allow_self_approval && proposal.metadata.client_id == approver.role.id {
+        return Err(Error::SelfApprovalNotAllowed.into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("no command proposal with id {id:?} exists in this bounded context")]
@@ -147,6 +183,9 @@ pub enum Error {
 
     #[error("an approval policy's deadline must be a positive number of seconds")]
     InvalidApprovalPolicy,
+
+    #[error("the Role that proposed this command may not approve it")]
+    SelfApprovalNotAllowed,
 }
 
 impl Error {
@@ -157,6 +196,7 @@ impl Error {
             Error::ProposalExpired => "command_proposal_expired",
             Error::InsufficientApprovalRole { .. } => "insufficient_approval_role",
             Error::InvalidApprovalPolicy => "invalid_approval_policy",
+            Error::SelfApprovalNotAllowed => "self_approval_not_allowed",
         }
     }
 }
