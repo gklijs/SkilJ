@@ -4729,9 +4729,36 @@ impl ProposalRow {
     }
 }
 
-/// Claims a pending proposal for `approver`, refusing an expired one. The
-/// conditional `UPDATE` is the lock: exactly one concurrent approver can
-/// move a row from `pending` to `approving`.
+/// How long an `approving` claim may sit before another approver may take
+/// it over. A claim normally lives for one `decide_and_submit_command`
+/// call; one older than this was left behind by a crash, or by a failure
+/// to record the outcome after the command committed. Taking it over is
+/// safe even if the original approval is somehow still running: both run
+/// under the same idempotency key ([`approval_idempotency_key`]), so the
+/// second one is deduplicated under the bounded context's lock.
+pub const APPROVAL_CLAIM_STALE_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+
+/// The idempotency key an approval submits under: the proposer's own key,
+/// or a reserved one derived from the proposal id.
+pub fn approval_idempotency_key(proposal: &CommandProposal) -> String {
+    proposal.idempotency_key.clone().unwrap_or_else(|| {
+        format!(
+            "{}{}",
+            crate::event_store::RESERVED_APPROVAL_IDEMPOTENCY_KEY_PREFIX,
+            proposal.id
+        )
+    })
+}
+
+/// Claims a proposal for `approver`: a `pending` one that has not expired,
+/// or an `approving` one whose claim is older than
+/// [`APPROVAL_CLAIM_STALE_AFTER`] (see there). The conditional `UPDATE` is
+/// the lock: exactly one concurrent approver wins the claim.
+///
+/// If the proposal's command type no longer has an approval policy (it was
+/// removed after the proposal was made), the proposal is still decidable by
+/// any active admin of the bounded context, rather than stranded `pending`
+/// with nobody able to approve or reject it.
 pub async fn claim_command_proposal(
     pool: &Pool,
     bounded_context: &str,
@@ -4739,24 +4766,35 @@ pub async fn claim_command_proposal(
     approver: &RoleAccessMapping,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandProposal> {
+    if approver.bounded_context.name != bounded_context {
+        return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
+    }
     expire_command_proposals(pool, bounded_context, now).await?;
     let proposal = get_command_proposal(pool, bounded_context, id)
         .await?
         .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() })?;
-    if approver.bounded_context.name != bounded_context {
-        return Err(crate::access_control::Error::GrantNotActive.into());
-    }
     let policy = get_command_approval_policy(pool, bounded_context, &proposal.command_type_name)
         .await?
-        .ok_or(crate::approvals::Error::ProposalNotPending {
-            status: "not under an approval policy",
-        })?;
+        .unwrap_or_else(|| CommandApprovalPolicy::new(None, None));
     crate::approvals::check_approver(&policy, approver)?;
+    let stale_cutoff = now - APPROVAL_CLAIM_STALE_AFTER;
     match proposal.status {
         CommandProposalStatus::Pending if proposal.is_expired_at(now) => {
             return Err(crate::approvals::Error::ProposalExpired.into())
         }
         CommandProposalStatus::Pending => {}
+        CommandProposalStatus::Approving
+            if proposal
+                .decided_at
+                .is_some_and(|claimed_at| claimed_at <= stale_cutoff) =>
+        {
+            tracing::warn!(
+                bounded_context,
+                proposal_id = id,
+                "taking over a stale approval claim - a previous approval crashed or \
+                 failed to record its outcome"
+            );
+        }
         CommandProposalStatus::Expired => {
             return Err(crate::approvals::Error::ProposalExpired.into())
         }
@@ -4772,12 +4810,15 @@ pub async fn claim_command_proposal(
     let claimed: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.command_proposals \
          SET status = 'approving', decided_at = $2, decided_by_role_id = $3 \
-         WHERE id = $1 AND status = 'pending' AND (expires_at IS NULL OR expires_at > $2) \
+         WHERE id = $1 AND ( \
+             (status = 'pending' AND (expires_at IS NULL OR expires_at > $2)) \
+             OR (status = 'approving' AND decided_at <= $4)) \
          RETURNING id"
     )))
     .bind(id)
     .bind(now)
     .bind(&approver.role.id)
+    .bind(stale_cutoff)
     .fetch_optional(pool)
     .await?;
     if claimed.is_none() {
@@ -4786,6 +4827,61 @@ pub async fn claim_command_proposal(
     get_command_proposal(pool, bounded_context, id)
         .await?
         .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() }.into())
+}
+
+/// After [`claim_command_proposal`] took over a stale claim, settles what
+/// the earlier approval already did, before anything new is decided:
+/// - its command committed (the approval's idempotency key is recorded):
+///   the proposal is finished `Approved`, and `Ok(true)` is returned;
+/// - it did not, but the proposal's deadline has since passed: the
+///   proposal is finished `Expired`, and `ProposalExpired` is returned;
+/// - otherwise `Ok(false)`: nothing happened yet, decide as normal.
+///
+/// For a fresh `pending` claim this is always `Ok(false)`: no command can
+/// exist under the key yet, and an expired proposal cannot be claimed.
+async fn settle_reclaimed_proposal(
+    pool: &Pool,
+    bounded_context: &str,
+    proposal: &CommandProposal,
+    now: DateTime<Utc>,
+) -> crate::error::Result<bool> {
+    if idempotency_key_already_used(
+        pool,
+        bounded_context,
+        &proposal.command_type_name,
+        &proposal.metadata.client_id,
+        &approval_idempotency_key(proposal),
+    )
+    .await?
+    {
+        finish_command_proposal(
+            pool,
+            bounded_context,
+            &proposal.id,
+            CommandProposalStatus::Approved,
+            None,
+            None,
+            None,
+            now,
+        )
+        .await?;
+        return Ok(true);
+    }
+    if proposal.is_expired_at(now) {
+        finish_command_proposal(
+            pool,
+            bounded_context,
+            &proposal.id,
+            CommandProposalStatus::Expired,
+            None,
+            None,
+            None,
+            now,
+        )
+        .await?;
+        return Err(crate::approvals::Error::ProposalExpired.into());
+    }
+    Ok(false)
 }
 
 /// The payload approval hands `decide()`: the stored ciphertext revealed.
@@ -4880,7 +4976,12 @@ pub async fn reject_command_proposal(
     reason: Option<&str>,
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandProposal> {
-    claim_command_proposal(pool, bounded_context, id, approver, now).await?;
+    let proposal = claim_command_proposal(pool, bounded_context, id, approver, now).await?;
+    // A taken-over stale claim whose command already committed is approved,
+    // not rejectable - rejecting it would contradict the command that exists.
+    if settle_reclaimed_proposal(pool, bounded_context, &proposal, now).await? {
+        return Err(crate::approvals::Error::ProposalNotPending { status: "approved" }.into());
+    }
     let schema = schema_ident(bounded_context);
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {schema}.command_proposals SET status = 'rejected', rejection_reason = $2, \
@@ -4894,6 +4995,81 @@ pub async fn reject_command_proposal(
     get_command_proposal(pool, bounded_context, id)
         .await?
         .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() }.into())
+}
+
+/// The approval gate for skilj's own internal submissions - a fired
+/// deadline (`fire_due_deadlines`) and a cross-context route
+/// (`catch_up_cross_context_route_locked`). Both call
+/// `decide_and_submit_command` directly rather than going through REST or
+/// GraphQL, so without this an agent able to cause the *source* event could
+/// get an approval-required command executed with no approver at all.
+///
+/// Returns `true` when `command_type` requires approval, and the occurrence
+/// is then handled by this call: a proposal is created under the internal
+/// caller's own `client_id` and reserved `idempotency_key` (or, after a
+/// crash between a prior call and the caller's cursor/resolution update,
+/// the existing pending proposal is found again by that key; or, if that
+/// proposal was already approved, nothing is proposed twice). Returns
+/// `false` when the type has no approval policy, and the caller submits as
+/// before.
+///
+/// A deadline's `DeadlineContext` is not carried onto the proposal: the
+/// approved command runs at approval time, so its `decide_with` sees no
+/// deadline - an approver deciding late is the approver's call.
+#[allow(clippy::too_many_arguments)]
+pub async fn propose_if_approval_required(
+    pool: &Pool,
+    command_type: &CommandType,
+    payload: &str,
+    client_id: &str,
+    correlation_id: Option<&str>,
+    causation_id: Option<&str>,
+    idempotency_key: &str,
+    encryption_master_key: Option<&EncryptionMasterKey>,
+    now: DateTime<Utc>,
+) -> crate::error::Result<bool> {
+    let bounded_context = &command_type.bounded_context.name;
+    let Some(policy) =
+        get_command_approval_policy(pool, bounded_context, &command_type.name).await?
+    else {
+        return Ok(false);
+    };
+    if idempotency_key_already_used(
+        pool,
+        bounded_context,
+        &command_type.name,
+        client_id,
+        idempotency_key,
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+    let authorised = crate::event_store::CommandAuthorised {
+        command_type: command_type.clone(),
+        payload: payload.to_string(),
+        client_id: client_id.to_string(),
+        correlation_id: correlation_id.map(str::to_string),
+        causation_id: causation_id.map(str::to_string),
+    };
+    let proposal = propose_command(
+        pool,
+        command_type,
+        &authorised,
+        &policy,
+        Some(idempotency_key),
+        encryption_master_key,
+        now,
+    )
+    .await?;
+    tracing::info!(
+        bounded_context = %bounded_context,
+        command_type = %command_type.name,
+        client_id,
+        proposal_id = %proposal.id,
+        "internal submission of an approval-required command became a proposal"
+    );
+    Ok(true)
 }
 
 /// What approving a proposal did: the proposal after its final update,
@@ -4924,6 +5100,9 @@ pub async fn approve_command_proposal(
     now: DateTime<Utc>,
 ) -> crate::error::Result<CommandApprovalOutcome> {
     let proposal = claim_command_proposal(pool, bounded_context, id, approver, now).await?;
+    // A taken-over stale claim may already have produced its command; if so
+    // it is marked approved here and the submission below deduplicates.
+    settle_reclaimed_proposal(pool, bounded_context, &proposal, now).await?;
     let command_type =
         match get_command_type(pool, bounded_context, &proposal.command_type_name).await? {
             Some(command_type) => command_type,
@@ -4947,13 +5126,7 @@ pub async fn approve_command_proposal(
         }
     };
 
-    let idempotency_key = proposal.idempotency_key.clone().unwrap_or_else(|| {
-        format!(
-            "{}{}",
-            crate::event_store::RESERVED_APPROVAL_IDEMPOTENCY_KEY_PREFIX,
-            proposal.id
-        )
-    });
+    let idempotency_key = approval_idempotency_key(&proposal);
     let outcome = decide_and_submit_command(
         pool,
         dispatcher,
@@ -14990,24 +15163,47 @@ async fn catch_up_cross_context_route_locked(
                 // `{bounded_context}:{sequence}` string (`Event` has no
                 // synthetic id of its own to use instead - see that
                 // helper's own doc comment).
-                let outcome = decide_and_submit_command(
+                // Codeberg issue #98: an approval-required target becomes a
+                // proposal here too, never a direct submission - otherwise
+                // whoever can cause the source event bypasses the approver.
+                // `Ok(None)` is "proposed"; errors take the same retry/park
+                // path as a failed submission.
+                let causation_id = crate::event_store::event_causation_id(event);
+                let outcome = match propose_if_approval_required(
                     pool,
-                    command_dispatcher,
-                    projection_dispatcher,
-                    snapshot_dispatcher,
-                    broadcaster,
-                    event_cache,
                     &target_command_type,
                     &target_payload,
                     CROSS_CONTEXT_ROUTE_CLIENT_ID,
                     event.metadata.correlation_id.as_deref(),
-                    Some(&crate::event_store::event_causation_id(event)),
+                    Some(&causation_id),
+                    &idempotency_key,
                     encryption_master_key,
                     Utc::now(),
-                    Some(&idempotency_key),
-                    None,
                 )
-                .await;
+                .await
+                {
+                    Ok(true) => Ok(None),
+                    Ok(false) => decide_and_submit_command(
+                        pool,
+                        command_dispatcher,
+                        projection_dispatcher,
+                        snapshot_dispatcher,
+                        broadcaster,
+                        event_cache,
+                        &target_command_type,
+                        &target_payload,
+                        CROSS_CONTEXT_ROUTE_CLIENT_ID,
+                        event.metadata.correlation_id.as_deref(),
+                        Some(&causation_id),
+                        encryption_master_key,
+                        Utc::now(),
+                        Some(&idempotency_key),
+                        None,
+                    )
+                    .await
+                    .map(Some),
+                    Err(e) => Err(e),
+                };
                 // Codeberg issue #21 - see this function's own doc
                 // comment. `Err` no longer propagates straight out via
                 // `?`; it's retried with backoff, up to `retry_policy`,
@@ -15128,7 +15324,7 @@ async fn catch_up_cross_context_route_locked(
                 // crash recovery, not an anomaly - warned rather than
                 // errored either way, since the cursor still correctly
                 // advances past this occurrence.
-                if matches!(outcome, SubmitCommandOutcome::Deduplicated { .. }) {
+                if matches!(outcome, Some(SubmitCommandOutcome::Deduplicated { .. })) {
                     tracing::warn!(
                         sequence = event.sequence,
                         "cross-context route's own idempotency key was already present - \
@@ -15929,24 +16125,46 @@ pub async fn fire_due_deadlines(
         // is past it - so it can refuse an action it fired too late for.
         let deadline_context =
             crate::plugin::DeadlineContext::new(row.fire_at, row.expires_at, now);
-        let outcome = decide_and_submit_command(
+        // Codeberg issue #98: an approval-required target becomes a
+        // proposal, never a direct submission - otherwise whoever can cause
+        // the scheduling event bypasses the approver. `Ok(None)` is
+        // "proposed"; errors take the same retry/park path as a failed
+        // submission.
+        let outcome = match propose_if_approval_required(
             pool,
-            command_dispatcher,
-            projection_dispatcher,
-            snapshot_dispatcher,
-            broadcaster,
-            event_cache,
             &target_command_type,
             &row.payload,
             DEADLINE_CLIENT_ID,
             row.correlation_id.as_deref(),
             None,
+            &idempotency_key,
             encryption_master_key,
             now,
-            Some(&idempotency_key),
-            Some(deadline_context),
         )
-        .await;
+        .await
+        {
+            Ok(true) => Ok(None),
+            Ok(false) => decide_and_submit_command(
+                pool,
+                command_dispatcher,
+                projection_dispatcher,
+                snapshot_dispatcher,
+                broadcaster,
+                event_cache,
+                &target_command_type,
+                &row.payload,
+                DEADLINE_CLIENT_ID,
+                row.correlation_id.as_deref(),
+                None,
+                encryption_master_key,
+                now,
+                Some(&idempotency_key),
+                Some(deadline_context),
+            )
+            .await
+            .map(Some),
+            Err(e) => Err(e),
+        };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(e) if e.another_instance_can_do_it() => {
@@ -15967,7 +16185,7 @@ pub async fn fire_due_deadlines(
                 continue;
             }
         };
-        if matches!(outcome, SubmitCommandOutcome::Deduplicated { .. }) {
+        if matches!(outcome, Some(SubmitCommandOutcome::Deduplicated { .. })) {
             tracing::warn!(
                 deadline_id = %row.id,
                 "deadline's own idempotency key was already present - expected after a \

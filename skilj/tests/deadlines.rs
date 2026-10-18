@@ -1480,3 +1480,168 @@ fn resolved_deadlines_are_deleted_after_their_retention() {
         assert_eq!(remaining, vec!["pending".to_string()]);
     });
 }
+
+/// Codeberg issue #98: a deadline whose target command type requires
+/// approval must not submit it - it becomes a pending proposal, the same as
+/// a REST or GraphQL submission would. Otherwise whoever can cause the
+/// scheduling event gets the command executed without an approver. A
+/// re-fire of the same deadline (a crash between proposing and marking the
+/// row fired) finds the same proposal by its reserved idempotency key
+/// rather than proposing twice.
+#[test]
+fn a_deadline_targeting_an_approval_required_command_proposes_it() {
+    runtime().block_on(async {
+        let _one_at_a_time = ONE_DEADLINE_TEST_AT_A_TIME.lock().await;
+        let Some((database_url, pool)) = test_db().await else {
+            return;
+        };
+        let external_subject = unique_name("subject");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: external_subject.clone(),
+            name: "Reconciliation Role".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        db::insert_role(&pool, &role).await.unwrap();
+        let mut contexts = Vec::new();
+        for prefix in ["source", "target"] {
+            let bc = BoundedContext {
+                name: unique_name(prefix),
+                status: BoundedContextStatus::Active,
+                created_at: test_now(),
+                created_by: ContextCreator::SystemCreator,
+                template: None,
+            };
+            db::insert_bounded_context(&pool, &bc).await.unwrap();
+            db::insert_role_access_mapping(
+                &pool,
+                &RoleAccessMapping {
+                    role: role.clone(),
+                    bounded_context: bc.clone(),
+                    level: AccessLevel::Admin,
+                    can_read_sensitive: false,
+                    scope: None,
+                    status: RoleStatus::Active,
+                    created_at: test_now(),
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            contexts.push(bc.name);
+        }
+        let (source, target) = (contexts[0].clone(), contexts[1].clone());
+
+        let (skilj, report) = Skilj::builder(database_url)
+            .deadline_poll_interval(std::time::Duration::from_secs(3600))
+            .bounded_context(target.clone())
+            .event_type::<RaceFired>()
+            .command_type::<RaceCommand>()
+            .reconciliation_role(external_subject)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_no_access, Vec::<String>::new());
+        let (command_dispatcher, projection_dispatcher, snapshot_dispatcher) =
+            dispatchers_without_background_ticks(skilj).await;
+        let policy = skilj_core::approvals::CommandApprovalPolicy::new(None, None);
+        db::set_command_approval_policy(&pool, &target, RaceCommand::NAME, Some(&policy))
+            .await
+            .unwrap();
+
+        let deadline_id = unique_name("deadline");
+        let now = test_now();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {}.deadlines \
+             (id, schedule_name, fire_at, tags, correlation_id, target_bounded_context, \
+              target_command_type, payload, status, created_at) \
+             VALUES ($1, 'schedule', $2, '[]'::jsonb, NULL, $3, $4, $5, 'pending', $6)",
+            race_schema(&source)
+        )))
+        .bind(&deadline_id)
+        .bind(now - chrono::Duration::seconds(1))
+        .bind(&target)
+        .bind(RaceCommand::NAME)
+        .bind(serde_json::json!({ "order_id": "order-1" }).to_string())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let broadcaster = skilj_core::event_store::EventBroadcaster::new(16);
+        let event_cache = skilj_core::event_cache::EventCache::new(0);
+        let retry_policy = skilj_retry::RetryPolicy::default();
+        let fire = || {
+            db::fire_due_deadlines(
+                &pool,
+                &*command_dispatcher,
+                &*projection_dispatcher,
+                &*snapshot_dispatcher,
+                &broadcaster,
+                &event_cache,
+                &source,
+                now,
+                None,
+                &retry_policy,
+                &[],
+            )
+        };
+        fire().await.unwrap();
+
+        let deadline_status = || async {
+            let (status,): (String,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT status FROM {}.deadlines WHERE id = $1",
+                race_schema(&source)
+            )))
+            .bind(&deadline_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            status
+        };
+        assert_eq!(deadline_status().await, "fired");
+        assert!(
+            db::list_events_for_bounded_context(&pool, &target)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an approval-required command must not run on its own"
+        );
+        let proposals = db::list_command_proposals(&pool, &target, None, None, now)
+            .await
+            .unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].status,
+            skilj_core::approvals::CommandProposalStatus::Pending
+        );
+        assert_eq!(proposals[0].metadata.client_id, db::DEADLINE_CLIENT_ID);
+
+        // A crash before the row was marked fired: the next tick fires it
+        // again, and must find the same proposal, not make a second one.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {}.deadlines SET status = 'pending', resolved_at = NULL WHERE id = $1",
+            race_schema(&source)
+        )))
+        .bind(&deadline_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        fire().await.unwrap();
+        assert_eq!(deadline_status().await, "fired");
+        assert_eq!(
+            db::list_command_proposals(&pool, &target, None, None, now)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db::list_events_for_bounded_context(&pool, &target)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}

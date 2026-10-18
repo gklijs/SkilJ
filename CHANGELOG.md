@@ -19,7 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server starts it with `--local` or `SKILJ_LOCAL_MODE=1`, with
   `SKILJ_LOCAL_PORT`/`SKILJ_LOCAL_DATABASE`/`SKILJ_LOCAL_CLEANUP` and
   local mode taking precedence over `DATABASE_URL`. Same schema,
-  migrations and API as production.
+  migrations and API as production. The superuser password is generated
+  randomly per data directory and kept owner-only in `<data_dir>.pgpass`
+  (a Postgres superuser can run programs as the server's user, so it is a
+  real secret); `display_url()` gives a printable URL without it. The
+  Postgres major version is pinned to 18, so a newer major is never
+  installed onto an existing data directory. Running as root uses the
+  system's Postgres binaries as the `postgres` user, with the same random
+  password over TCP and peer authentication on a private socket (never
+  `trust`); `cleanup: true` also removes the password file.
 - Generic command approval (docs/architecture.md §214, Codeberg issue
   #98). `CommandType::requires_approval()`, `approval_role()` and
   `approval_deadline_seconds()` make a submission a pending
@@ -37,7 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because they are attributed to a `Role`; REST submissions still create
   proposals. New error codes `command_proposal_not_found`,
   `command_proposal_not_pending`, `command_proposal_expired`,
-  `insufficient_approval_role` and `invalid_approval_policy`.
+  `insufficient_approval_role` and `invalid_approval_policy`. Fired
+  deadlines and cross-context routes targeting an approval-required type
+  create a proposal too (`db::propose_if_approval_required`), instead of
+  submitting it with no approver. An `approving` claim older than
+  `APPROVAL_CLAIM_STALE_AFTER` (left by a crash) can be taken over, and is
+  first settled against what already committed. Proposals stay decidable
+  after their type's policy is removed.
 - Documented external-worker guarantees around private fields
   (docs/architecture.md §215, Codeberg issue #99): `EventReadToken`
   REST reads redact every private field unconditionally and serve

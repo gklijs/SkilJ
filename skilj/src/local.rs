@@ -11,24 +11,43 @@
 //! `cleanup: true` deletes it when
 //! [`LocalPostgres::shutdown`](crate::local::LocalPostgres::shutdown) runs
 //! (or on `Drop`, via `postgresql_embedded`'s own `temporary` setting). The
-//! server listens on `127.0.0.1` only, with a fixed `postgres`/
-//! `skilj-local` credential - a local-only convenience, not a secret, and
-//! deliberately not exposed on a network interface.
+//! server listens on `127.0.0.1` only (`listen_addresses`), never on a
+//! network interface.
+//!
+//! **The password is a real secret.** The login is the cluster's
+//! superuser, and anyone who can log in as a Postgres superuser can run
+//! programs as the user the server runs as (`COPY ... TO PROGRAM`) and read
+//! every private field in plaintext. Listening on `127.0.0.1` keeps other
+//! machines out, not other processes or users on this one. So the password
+//! is generated randomly (256 bits) on first start and kept in
+//! `<data_dir>.pgpass`, readable by the owner only (`0600` on Unix), and
+//! read back on every later start so the same data directory keeps working.
+//!
+//! **The Postgres major version is pinned** ([`postgres_version`](crate::local::postgres_version)). A data
+//! directory can only be opened by the major version that created it; left
+//! unpinned, `postgresql_embedded` installs the newest release it finds, so
+//! a new machine or a cleared install cache could fetch a newer major and
+//! fail to start on existing data. Moving to a newer major is a deliberate
+//! dump-and-restore, not something a dependency update should do.
 //!
 //! Enabled by the `local` feature, so a consuming application that
 //! already brings its own Postgres pays nothing for it.
 
-use postgresql_embedded::{PostgreSQL, Settings};
+use postgresql_embedded::{PostgreSQL, Settings, VersionReq};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// This mode's fixed local-only superuser credential. `postgresql_embedded`
-/// always initializes the `postgres` role (`BOOTSTRAP_SUPERUSER`); the
-/// password is fixed so a data directory survives a restart, unlike the
-/// crate's random default.
+/// `postgresql_embedded` always initializes the `postgres` role
+/// (`BOOTSTRAP_SUPERUSER`).
 const LOCAL_USER: &str = "postgres";
-const LOCAL_PASSWORD: &str = "skilj-local";
 const DEFAULT_DATABASE: &str = "skilj";
+
+/// The Postgres major version local mode installs and runs: any 18.x, never
+/// 19. See this module's own docs.
+pub fn postgres_version() -> VersionReq {
+    postgresql_embedded::V18.clone()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalConfig {
@@ -127,9 +146,6 @@ pub fn default_data_dir() -> PathBuf {
     PathBuf::from(".skilj").join("postgresql")
 }
 
-/// A running embedded Postgres. Keep it alive for as long as the `Skilj`
-/// built against its URL is in use; call [shutdown](Self::shutdown) (or
-/// drop it) to stop the server.
 enum Backend {
     Embedded(Box<PostgreSQL>),
     /// System server binaries run as the `postgres` user, for when this
@@ -139,11 +155,72 @@ enum Backend {
     },
 }
 
+/// A running local Postgres. Keep it alive for as long as the `Skilj`
+/// built against its URL is in use; call [shutdown](Self::shutdown) (or
+/// drop it) to stop the server.
 pub struct LocalPostgres {
     server: Backend,
     database_url: String,
+    display_url: String,
     data_dir: PathBuf,
     cleanup: bool,
+}
+
+/// `<data_dir>.pgpass` - outside `data_dir`, because `initdb` refuses a
+/// directory that already has anything in it.
+pub fn password_file(data_dir: &Path) -> PathBuf {
+    data_dir.with_extension("pgpass")
+}
+
+/// Reads the password from `path`, or, the first time, generates one and
+/// writes it there owner-only. `postgresql_embedded` only writes its own
+/// password file when none exists, so creating it here first is what
+/// decides its permissions. An existing file readable by anyone else is
+/// narrowed to owner-only rather than trusted as is.
+pub fn load_or_create_password(path: &Path) -> Result<String, Error> {
+    let io_error = |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    if path.exists() {
+        restrict_to_owner(path).map_err(io_error)?;
+        let password = std::fs::read_to_string(path).map_err(io_error)?;
+        let password = password.trim().to_string();
+        if password.is_empty() {
+            return Err(Error::EmptyPasswordFile {
+                path: path.to_path_buf(),
+            });
+        }
+        return Ok(password);
+    }
+    let password = skilj_core::shared::generate_token_secret();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(io_error)?;
+    file.write_all(password.as_bytes()).map_err(io_error)?;
+    Ok(password)
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// On Windows the file lives under the user's own profile directory, whose
+/// default ACL already keeps other users out.
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl LocalPostgres {
@@ -163,16 +240,21 @@ impl LocalPostgres {
             source,
         })?;
 
+        let password_file = password_file(&config.data_dir);
+        let password = load_or_create_password(&password_file)?;
+
         let mut settings = Settings::new();
+        settings.version = postgres_version();
         settings.data_dir = config.data_dir.clone();
-        // Outside `data_dir`: `initdb` refuses a directory that already
-        // has anything in it, and `initialize` writes this file before it
-        // runs.
-        settings.password_file = config.data_dir.with_extension("pgpass");
+        settings.password_file = password_file;
         settings.host = "127.0.0.1".to_string();
+        // `host` only shapes the URL; this is what the server binds to.
+        settings
+            .configuration
+            .insert("listen_addresses".to_string(), "127.0.0.1".to_string());
         settings.port = config.port.unwrap_or(0);
         settings.username = LOCAL_USER.to_string();
-        settings.password = LOCAL_PASSWORD.to_string();
+        settings.password = password.clone();
         // `temporary` is `postgresql_embedded`'s own cleanup switch; a
         // persistent local mode leaves it false, a throwaway one true.
         settings.temporary = config.cleanup;
@@ -185,9 +267,11 @@ impl LocalPostgres {
             server.create_database(&config.database).await?;
         }
         let database_url = server.settings().url(&config.database);
+        let display_url = database_url.replace(&password, "***");
         Ok(Self {
             server: Backend::Embedded(Box::new(server)),
             database_url,
+            display_url,
             data_dir: config.data_dir,
             cleanup: config.cleanup,
         })
@@ -197,8 +281,19 @@ impl LocalPostgres {
     /// the system's server binaries are run as the `postgres` user via
     /// `runuser` - the same arrangement as `scripts/ci-postgres-local.sh`
     /// and `skilj_test_support::FailoverServer`.
+    ///
+    /// Same login rules as the embedded path: TCP on `127.0.0.1` needs the
+    /// random password from `<data_dir>.pgpass` (`scram-sha-256`), set by
+    /// `initdb` itself. This process's own setup commands use a Unix socket
+    /// in `<data_dir>.sockets`, owner-only, with `peer` authentication - so
+    /// only the operating-system user `postgres` gets in that way. Never
+    /// `trust`: on a shared machine that would let any local process in as
+    /// superuser with no password at all.
     async fn start_system(config: LocalConfig) -> Result<Self, Error> {
-        let bin_dir = system_pg_bin().ok_or_else(|| Error::InvalidConfig {
+        let existing_major = std::fs::read_to_string(config.data_dir.join("PG_VERSION"))
+            .ok()
+            .and_then(|version| version.trim().parse::<u32>().ok());
+        let bin_dir = system_pg_bin(existing_major).ok_or_else(|| Error::InvalidConfig {
             variable: "SKILJ_TEST_PGBIN".to_string(),
             value: "running as root, and no system PostgreSQL server binaries were found (install `postgresql`, or set SKILJ_TEST_PGBIN)".to_string(),
         })?;
@@ -206,32 +301,61 @@ impl LocalPostgres {
             path: config.data_dir.clone(),
             source,
         })?;
-        run_as_postgres_output(
-            tokio::process::Command::new("chown")
-                .arg("postgres:postgres")
-                .arg(&config.data_dir),
-        )
-        .await?;
-        // Trust auth on the loopback socket: a fixed local-only
-        // convenience, matching the embedded path's fixed credential.
-        let socket_dir = config.data_dir.join("sockets");
+        chown_to_postgres(&config.data_dir).await?;
+        // Outside `data_dir`: `initdb` refuses a directory that already has
+        // anything in it.
+        let socket_dir = config.data_dir.with_extension("sockets");
         std::fs::create_dir_all(&socket_dir).map_err(|source| Error::Io {
             path: socket_dir.clone(),
             source,
         })?;
-        run_as_postgres_output(
-            tokio::process::Command::new("chown")
-                .arg("postgres:postgres")
-                .arg(&socket_dir),
-        )
-        .await?;
-        if !config.data_dir.join("PG_VERSION").exists() {
-            let mut initdb = as_postgres(&bin_dir, "initdb");
-            initdb
-                .args(["-A", "trust", "-U", "postgres", "-D"])
-                .arg(&config.data_dir);
-            run_as_postgres_output(&mut initdb).await?;
+        set_owner_only_dir(&socket_dir)?;
+        chown_to_postgres(&socket_dir).await?;
+
+        let password = load_or_create_password(&password_file(&config.data_dir))?;
+        if existing_major.is_none() {
+            // `initdb` reads the superuser password from a file it can open
+            // as `postgres`; the `.pgpass` file stays root-only, so this is a
+            // short-lived owner-only copy, removed straight after.
+            let pwfile = config.data_dir.with_extension("initpw");
+            let _ = std::fs::remove_file(&pwfile);
+            {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let io_error = |source| Error::Io {
+                    path: pwfile.clone(),
+                    source,
+                };
+                let mut file = options.open(&pwfile).map_err(io_error)?;
+                file.write_all(password.as_bytes()).map_err(io_error)?;
+            }
+            let initialized = async {
+                chown_to_postgres(&pwfile).await?;
+                let mut initdb = as_postgres(&bin_dir, "initdb");
+                initdb
+                    .args([
+                        "--auth-host=scram-sha-256",
+                        "--auth-local=peer",
+                        "-U",
+                        LOCAL_USER,
+                    ])
+                    .arg(format!("--pwfile={}", pwfile.display()))
+                    .arg("-D")
+                    .arg(&config.data_dir);
+                run_as_postgres_output(&mut initdb).await
+            }
+            .await;
+            let _ = std::fs::remove_file(&pwfile);
+            initialized?;
+        } else {
+            refuse_trust_authentication(&config.data_dir)?;
         }
+
         let port = match config.port {
             Some(port) if port != 0 => port,
             _ => free_port()?,
@@ -250,6 +374,8 @@ impl LocalPostgres {
             .arg("-o")
             .arg(&options);
         run_as_postgres_output(&mut start).await?;
+        let socket = socket_dir.display().to_string();
+        let port_arg = port.to_string();
         // `config.validate` already restricts the name to ASCII letters,
         // digits, `_` and `-`, so interpolating it is safe.
         let check = format!(
@@ -258,36 +384,41 @@ impl LocalPostgres {
         );
         let mut query = as_postgres(&bin_dir, "psql");
         query.args([
-            "-h",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-            "-U",
-            "postgres",
-            "-d",
-            "postgres",
-            "-tAc",
-            &check,
+            "-h", &socket, "-p", &port_arg, "-U", LOCAL_USER, "-d", "postgres", "-tAc", &check,
         ]);
         let exists = run_as_postgres_output(&mut query).await?;
         if String::from_utf8_lossy(&exists.stdout).trim() != "1" {
             let mut createdb = as_postgres(&bin_dir, "createdb");
             createdb
-                .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-U", "postgres"])
+                .args(["-h", &socket, "-p", &port_arg, "-U", LOCAL_USER])
                 .arg(&config.database);
             run_as_postgres_output(&mut createdb).await?;
         }
-        let database_url = format!("postgres://postgres@127.0.0.1:{port}/{}", config.database);
+        let database_url = format!(
+            "postgres://{LOCAL_USER}:{password}@127.0.0.1:{port}/{}",
+            config.database
+        );
+        let display_url = database_url.replace(&password, "***");
         Ok(Self {
             server: Backend::System { bin_dir },
             database_url,
+            display_url,
             data_dir: config.data_dir,
             cleanup: config.cleanup,
         })
     }
 
+    /// The connection URL, **including the superuser password** - pass it
+    /// to `Skilj`, never print or log it; use [display_url](Self::display_url)
+    /// for that.
     pub fn database_url(&self) -> &str {
         &self.database_url
+    }
+
+    /// [database_url](Self::database_url) with the password replaced by
+    /// `***`, safe to print.
+    pub fn display_url(&self) -> &str {
+        &self.display_url
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -303,21 +434,32 @@ impl LocalPostgres {
             }
             Backend::System { bin_dir, .. } => {
                 let mut stop = as_postgres(bin_dir, "pg_ctl");
-                stop.args(["stop", "-m", "immediate", "-w", "-D"])
+                // `fast`, not `immediate`: a clean shutdown, so the next
+                // start needs no crash recovery.
+                stop.args(["stop", "-m", "fast", "-w", "-D"])
                     .arg(&self.data_dir);
                 run_as_postgres_output(&mut stop).await?;
             }
         }
         drop(self.server);
         if self.cleanup {
-            match std::fs::remove_dir_all(&self.data_dir) {
-                Ok(()) => {}
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(Error::Io {
-                        path: self.data_dir.clone(),
-                        source,
-                    })
+            // Everything this mode keeps next to the data directory too -
+            // above all the password file, which must not outlive the data.
+            for path in [
+                self.data_dir.clone(),
+                password_file(&self.data_dir),
+                self.data_dir.with_extension("sockets"),
+                self.data_dir.with_extension("log"),
+            ] {
+                let removed = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                match removed {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => return Err(Error::Io { path, source }),
                 }
             }
         }
@@ -359,6 +501,50 @@ fn free_port() -> Result<u16, Error> {
         .map_err(Error::IoSocket)
 }
 
+async fn chown_to_postgres(path: &Path) -> Result<(), Error> {
+    run_as_postgres_output(
+        tokio::process::Command::new("chown")
+            .arg("postgres:postgres")
+            .arg(path),
+    )
+    .await
+    .map(|_| ())
+}
+
+#[cfg(unix)]
+fn set_owner_only_dir(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
+        Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_dir(_path: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
+/// A data directory an earlier development build initialized with `trust`
+/// authentication lets any local process in as superuser. Refused rather
+/// than silently kept; it has no password to migrate to.
+fn refuse_trust_authentication(data_dir: &Path) -> Result<(), Error> {
+    let hba = data_dir.join("pg_hba.conf");
+    let Ok(contents) = std::fs::read_to_string(&hba) else {
+        return Ok(());
+    };
+    let trusts = contents.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or("");
+        line.split_whitespace().any(|word| word == "trust")
+    });
+    if trusts {
+        return Err(Error::TrustAuthentication { path: hba });
+    }
+    Ok(())
+}
+
 /// Whether this process runs as root, which Postgres refuses to.
 fn running_as_root() -> bool {
     std::process::Command::new("id")
@@ -367,12 +553,20 @@ fn running_as_root() -> bool {
         .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
 }
 
-/// The system's Postgres server binaries: `SKILJ_TEST_PGBIN`, else the
-/// newest `/usr/lib/postgresql/<version>/bin` (Debian's layout), else
-/// wherever `pg_ctl` is on the `PATH`.
-fn system_pg_bin() -> Option<PathBuf> {
+/// The system's Postgres server binaries: `SKILJ_TEST_PGBIN`; else, for
+/// an existing data directory, the `/usr/lib/postgresql/<major>/bin` that
+/// matches its `PG_VERSION` (a data directory only opens under the major
+/// version that created it); else the newest one there (Debian's layout);
+/// else wherever `pg_ctl` is on the `PATH`.
+fn system_pg_bin(existing_major: Option<u32>) -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("SKILJ_TEST_PGBIN") {
         return Some(dir.into());
+    }
+    if let Some(major) = existing_major {
+        let bin = PathBuf::from(format!("/usr/lib/postgresql/{major}/bin"));
+        if bin.join("pg_ctl").exists() {
+            return Some(bin);
+        }
     }
     let newest = std::fs::read_dir("/usr/lib/postgresql")
         .ok()
@@ -427,4 +621,96 @@ pub enum Error {
         "local Postgres: database name {database:?} must be ASCII letters, digits, '_' or '-'"
     )]
     InvalidDatabase { database: String },
+
+    #[error("local Postgres: password file {path} is empty")]
+    EmptyPasswordFile { path: PathBuf },
+
+    #[error(
+        "local Postgres: {path} allows `trust` logins, which let any local process in as \
+         superuser without a password; this data directory was initialized by an earlier \
+         development build - move it aside and start again"
+    )]
+    TrustAuthentication { path: PathBuf },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "skilj-local-unit-{label}-{}",
+            skilj_core::shared::generate_token_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("data.pgpass")
+    }
+
+    #[test]
+    fn a_first_start_generates_a_random_password() {
+        let first = load_or_create_password(&temp_path("a")).unwrap();
+        let second = load_or_create_password(&temp_path("b")).unwrap();
+        assert_eq!(first.len(), 64, "256 bits, hex-encoded");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_later_start_reads_the_same_password_back() {
+        let path = temp_path("reuse");
+        let created = load_or_create_password(&path).unwrap();
+        assert_eq!(load_or_create_password(&path).unwrap(), created);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_password_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("mode");
+        load_or_create_password(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_readable_file_is_narrowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("narrow");
+        std::fs::write(&path, "existing-password\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load_or_create_password(&path).unwrap(), "existing-password");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn an_empty_password_file_is_refused() {
+        let path = temp_path("empty");
+        std::fs::write(&path, "\n").unwrap();
+        assert!(matches!(
+            load_or_create_password(&path),
+            Err(Error::EmptyPasswordFile { .. })
+        ));
+    }
+
+    #[test]
+    fn a_data_directory_with_trust_logins_is_refused() {
+        let dir = temp_path("hba").with_extension("");
+        std::fs::create_dir_all(&dir).unwrap();
+        let hba = dir.join("pg_hba.conf");
+        std::fs::write(&hba, "# trust is mentioned in a comment only\nlocal all all peer\nhost all all 127.0.0.1/32 scram-sha-256\n").unwrap();
+        assert!(refuse_trust_authentication(&dir).is_ok());
+        std::fs::write(&hba, "host all all 127.0.0.1/32 trust\n").unwrap();
+        assert!(matches!(
+            refuse_trust_authentication(&dir),
+            Err(Error::TrustAuthentication { .. })
+        ));
+    }
+
+    #[test]
+    fn the_major_version_is_pinned() {
+        let version = postgres_version();
+        assert!(version.matches(&postgresql_embedded::Version::new(18, 1, 0)));
+        assert!(!version.matches(&postgresql_embedded::Version::new(19, 0, 0)));
+    }
 }

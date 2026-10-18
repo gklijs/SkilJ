@@ -410,7 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let postgres = skilj::local::LocalPostgres::start(config).await?;
         println!(
             "local mode: embedded Postgres at {} (data in {})",
-            postgres.database_url(),
+            postgres.display_url(),
             postgres.data_dir().display()
         );
         Some(postgres)

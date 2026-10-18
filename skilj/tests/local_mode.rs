@@ -82,7 +82,56 @@ fn local_mode_can_delete_its_data_on_shutdown() {
         })
         .await
         .expect("the embedded Postgres starts");
+        let password_file = skilj::local::password_file(&data_dir);
+        assert!(password_file.exists());
         postgres.shutdown().await.expect("it stops");
         assert!(!data_dir.exists());
+        assert!(
+            !password_file.exists(),
+            "the password must not outlive the data it protects"
+        );
+    });
+}
+
+/// The login is enforced, not just configured: the URL's password gets in,
+/// a wrong one and none at all do not. Applies to whichever backend this
+/// process gets (embedded, or the system server when running as root).
+#[test]
+fn local_mode_refuses_a_login_without_the_password() {
+    runtime().block_on(async {
+        let data_dir = temp_dir("auth");
+        let postgres = skilj::local::LocalPostgres::start(LocalConfig {
+            data_dir: data_dir.clone(),
+            port: None,
+            database: "skilj_auth_test".to_string(),
+            cleanup: true,
+        })
+        .await
+        .expect("local Postgres starts");
+        let url = postgres.database_url().to_string();
+        assert!(!postgres.display_url().contains(
+            std::fs::read_to_string(skilj::local::password_file(&data_dir))
+                .unwrap()
+                .trim()
+        ));
+
+        let pool = skilj_core::db::connect(&url)
+            .await
+            .expect("the URL's password gets in");
+        pool.close().await;
+
+        let (before_at, after_at) = url.split_once('@').unwrap();
+        let user_part = before_at.rsplit_once(':').unwrap().0;
+        let wrong = format!("{user_part}:not-the-password@{after_at}");
+        assert!(
+            skilj_core::db::connect(&wrong).await.is_err(),
+            "a wrong password must be refused"
+        );
+        let none = format!("{user_part}@{after_at}");
+        assert!(
+            skilj_core::db::connect(&none).await.is_err(),
+            "no password must be refused"
+        );
+        postgres.shutdown().await.expect("it stops");
     });
 }

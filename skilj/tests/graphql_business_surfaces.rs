@@ -3411,3 +3411,213 @@ fn dry_run_command_fails_like_the_submission_without_a_master_key() {
         }
     });
 }
+
+/// Submits one `TransferMoney` proposal and returns its id.
+async fn propose_transfer(router: &axum::Router, jwt: &str, bc_name: &str) -> String {
+    let submitted = graphql_request(
+        router,
+        Some(jwt),
+        SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL,
+        json!({
+            "bc": bc_name,
+            "name": "TransferMoney",
+            "payload": json!({ "amount": 7 }).to_string()
+        }),
+    )
+    .await;
+    assert_eq!(submitted["errors"], serde_json::Value::Null, "{submitted}");
+    submitted["data"]["submitCommand"]["proposalId"]
+        .as_str()
+        .expect("a pending submission returns its proposal id")
+        .to_string()
+}
+
+/// Puts a proposal back into `approving` with a claim made `age` ago -
+/// what a crash mid-approval leaves behind.
+async fn leave_claim_behind(pool: &Pool, bc_name: &str, id: &str, age: chrono::Duration) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE \"bc_{bc_name}\".command_proposals \
+         SET status = 'approving', decided_at = $2, command_external_id = NULL WHERE id = $1"
+    )))
+    .bind(id)
+    .bind(chrono::Utc::now() - age)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn transfer_command_count(router: &axum::Router, jwt: &str, bc_name: &str) -> usize {
+    let commands = graphql_request(
+        router,
+        Some(jwt),
+        "query($bc: String!) { fetchCommands(boundedContext: $bc, commandTypes: [\"TransferMoney\"]) { id } }",
+        json!({ "bc": bc_name }),
+    )
+    .await;
+    assert_eq!(commands["errors"], serde_json::Value::Null, "{commands}");
+    commands["data"]["fetchCommands"].as_array().unwrap().len()
+}
+
+const APPROVE_MUTATION: &str = "mutation($bc: String!, $id: ID!) { \
+    approveCommand(boundedContext: $bc, proposalId: $id) { accepted proposal { status } } }";
+const REJECT_MUTATION: &str = "mutation($bc: String!, $id: ID!) { \
+    rejectCommand(boundedContext: $bc, proposalId: $id, reason: \"no\") { proposal { status } } }";
+
+/// A crash between claiming a proposal and running it leaves the proposal
+/// `approving`. A fresh claim is still protected, but once it is older than
+/// `APPROVAL_CLAIM_STALE_AFTER` another approval takes it over and runs the
+/// command - instead of the proposal being stuck forever.
+#[test]
+fn a_stale_approval_claim_is_taken_over() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let id = propose_transfer(&router, &jwt, &bc_name).await;
+
+        leave_claim_behind(&pool, &bc_name, &id, chrono::Duration::seconds(5)).await;
+        let fresh = graphql_request(
+            &router,
+            Some(&jwt),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": id }),
+        )
+        .await;
+        assert_eq!(
+            fresh["errors"][0]["extensions"]["code"],
+            json!("command_proposal_not_pending"),
+            "a claim younger than the stale window still belongs to its approver: {fresh}"
+        );
+
+        leave_claim_behind(&pool, &bc_name, &id, chrono::Duration::minutes(11)).await;
+        let approved = graphql_request(
+            &router,
+            Some(&jwt),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": id }),
+        )
+        .await;
+        assert_eq!(approved["errors"], serde_json::Value::Null, "{approved}");
+        assert_eq!(approved["data"]["approveCommand"]["accepted"], json!(true));
+        assert_eq!(
+            approved["data"]["approveCommand"]["proposal"]["status"],
+            json!("APPROVED")
+        );
+        assert_eq!(transfer_command_count(&router, &jwt, &bc_name).await, 1);
+    });
+}
+
+/// A crash *after* the approved command committed, before the proposal was
+/// marked approved. Taking the stale claim over must settle it as approved:
+/// a rejection would contradict the command that exists, and an approval
+/// must not run it a second time.
+#[test]
+fn a_stale_claim_whose_command_committed_settles_as_approved() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let id = propose_transfer(&router, &jwt, &bc_name).await;
+        let approved = graphql_request(
+            &router,
+            Some(&jwt),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": id }),
+        )
+        .await;
+        assert_eq!(
+            approved["data"]["approveCommand"]["accepted"],
+            json!(true),
+            "{approved}"
+        );
+
+        leave_claim_behind(&pool, &bc_name, &id, chrono::Duration::minutes(11)).await;
+        let rejected = graphql_request(
+            &router,
+            Some(&jwt),
+            REJECT_MUTATION,
+            json!({ "bc": bc_name, "id": id }),
+        )
+        .await;
+        assert_eq!(
+            rejected["errors"][0]["extensions"]["code"],
+            json!("command_proposal_not_pending"),
+            "{rejected}"
+        );
+        let listed = graphql_request(
+            &router,
+            Some(&jwt),
+            "query($bc: String!) { commandProposals(boundedContext: $bc) { id status } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            listed["data"]["commandProposals"][0]["status"],
+            json!("APPROVED"),
+            "{listed}"
+        );
+
+        leave_claim_behind(&pool, &bc_name, &id, chrono::Duration::minutes(11)).await;
+        let again = graphql_request(
+            &router,
+            Some(&jwt),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": id }),
+        )
+        .await;
+        assert_eq!(again["errors"], serde_json::Value::Null, "{again}");
+        assert_eq!(
+            again["data"]["approveCommand"]["proposal"]["status"],
+            json!("APPROVED")
+        );
+        assert_eq!(
+            transfer_command_count(&router, &jwt, &bc_name).await,
+            1,
+            "the command must not run twice"
+        );
+    });
+}
+
+/// Removing a command type's approval policy must not strand the proposals
+/// already waiting: an admin can still reject or approve them.
+#[test]
+fn proposals_stay_decidable_after_their_policy_is_removed() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, jwt, _) = setup().await;
+        let router = skilj.graphql_router().await.unwrap();
+        let to_reject = propose_transfer(&router, &jwt, &bc_name).await;
+        let to_approve = propose_transfer(&router, &jwt, &bc_name).await;
+        skilj_core::db::set_command_approval_policy(&pool, &bc_name, "TransferMoney", None)
+            .await
+            .unwrap();
+
+        let rejected = graphql_request(
+            &router,
+            Some(&jwt),
+            REJECT_MUTATION,
+            json!({ "bc": bc_name, "id": to_reject }),
+        )
+        .await;
+        assert_eq!(rejected["errors"], serde_json::Value::Null, "{rejected}");
+        assert_eq!(
+            rejected["data"]["rejectCommand"]["proposal"]["status"],
+            json!("REJECTED")
+        );
+        let approved = graphql_request(
+            &router,
+            Some(&jwt),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": to_approve }),
+        )
+        .await;
+        assert_eq!(approved["errors"], serde_json::Value::Null, "{approved}");
+        assert_eq!(approved["data"]["approveCommand"]["accepted"], json!(true));
+    });
+}

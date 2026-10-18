@@ -12332,10 +12332,49 @@ The proposal row records `decided_at`, `decided_by_role_id`, the resulting
 
 The claim is a conditional `UPDATE` from `pending` to `approving`, so
 two concurrent approvers cannot both accept one proposal. A transient
-failure releases the claim back to `pending`; a retry after a crash is
-idempotent because approval runs under
+failure releases the claim back to `pending`. Approval runs under
 `skilj-approval:<proposal id>` (or the caller's own key, if it supplied
-one) - the reserved-prefix check refuses that namespace from callers.
+one) - the reserved-prefix check refuses that namespace from callers -
+so running it twice is deduplicated, never executed twice.
+
+**A crash mid-approval does not strand the proposal.** A process that dies
+after claiming, or that commits the command and then fails to record the
+outcome, leaves the row `approving` with nobody to finish it. A claim
+older than `APPROVAL_CLAIM_STALE_AFTER` (ten minutes) can be taken over
+by the next approval or rejection, which first settles what the earlier
+attempt already did (`settle_reclaimed_proposal`): if the approval's
+idempotency key is recorded, the command committed, so the proposal is
+finished `approved` (a rejection is refused - it would contradict the
+command that exists - and an approval deduplicates); if not, and the
+deadline has passed meanwhile, it is finished `expired`; otherwise the
+decision proceeds normally. Taking over a claim that is in fact still
+running is harmless for the same reason: both run under one key.
+
+**Every submission path proposes, including skilj's own.** A fired
+deadline and a cross-context route call `decide_and_submit_command`
+directly rather than through REST or GraphQL, so they go through
+`propose_if_approval_required` first: an approval-required target becomes
+a proposal under the internal `client_id` (`deadline`/
+`cross-context-route`) and that path's own reserved idempotency key, and
+the deadline or route occurrence counts as handled. Without this, anyone
+able to cause the *source* event - an agent allowed to create one, say -
+would get the command executed with no approver. A crash between
+proposing and the deadline/route recording its progress re-finds the
+same pending proposal by that key. A deadline's `DeadlineContext` is not
+carried onto the proposal: the command runs when it is approved, and
+deciding late is the approver's call.
+
+**A removed policy does not strand pending proposals.** Removing a type's
+policy (`requiresApproval: false`) stops new submissions from becoming
+proposals, but proposals already waiting stay decidable by any active
+admin of the bounded context, rather than being left `pending` with
+nobody able to approve or reject them.
+
+**Not re-checked at approval: the proposer.** The approved command runs
+under the proposer's `client_id`, but the proposer's credential is only
+checked when the proposal is made - a token revoked afterwards does not
+cancel its pending proposals. The approver's decision is what authorises
+the command; a revoked proposer's waiting proposals are best rejected.
 
 **Why approvals are GraphQL-only.** A decision has to be attributed to a
 `Role` (`decided_by_role_id`), and REST's bearer credentials are
@@ -12346,8 +12385,16 @@ proposals but not approve them; `commandProposals`/`approveCommand`/
 **Tests.** `skilj/tests/graphql_business_surfaces.rs` submits, lists,
 approves, re-approves (refused), rejects, and expires a proposal, and
 checks that the approved command and its event exist while the rejected
-one does not. `skilj/tests/command_trigger.rs` pins the REST submission's
-`pendingApproval`/`proposalId` answer and the stored proposal.
+one does not; `a_stale_approval_claim_is_taken_over`,
+`a_stale_claim_whose_command_committed_settles_as_approved` and
+`proposals_stay_decidable_after_their_policy_is_removed` cover the three
+paragraphs above. `skilj/tests/command_trigger.rs` pins the REST
+submission's `pendingApproval`/`proposalId` answer and the stored
+proposal. `skilj/tests/deadlines.rs`'s
+`a_deadline_targeting_an_approval_required_command_proposes_it` fires a
+deadline at an approval-required type, finds a proposal and no event,
+and re-fires it to check no second proposal appears. The cross-context
+route uses the same helper; it has no test of its own.
 
 ## 215. External workers and private fields (Codeberg issue #99)
 
@@ -12430,8 +12477,30 @@ shutdown). `LocalPostgres::start()` installs Postgres on first use,
 initializes the data directory, starts the server, creates the database
 if it is missing and returns the URL; `shutdown()` stops it (and removes
 the directory only when `cleanup` is set). The server listens on
-`127.0.0.1` with the fixed `postgres`/`skilj-local` credential - a
-local-only convenience, not a secret, and not a network service.
+`127.0.0.1` only (`listen_addresses`; `postgresql_embedded`'s `host`
+setting only shapes the URL).
+
+**The password is a secret, generated per data directory.** The login is
+the cluster's superuser, and a Postgres superuser can run programs as the
+operating-system user the server runs as (`COPY ... TO PROGRAM`) and read
+every private field in plaintext. Listening on `127.0.0.1` keeps other
+machines out, not other users or processes on the same one, so a fixed,
+published password would hand all of that to anything running locally.
+Instead `start()` generates a random password (256 bits from the OS
+random source) the first time, writes it to `<data_dir>.pgpass` before
+`postgresql_embedded` would (which then leaves it alone), owner-only
+(`0600` on Unix; an existing file readable by others is narrowed), and
+reads it back on every later start. `database_url()` contains it, so it is
+for handing to `Skilj` only; `display_url()` has it replaced by `***` and
+is what the demo prints. Losing the file means losing the login to that
+data directory, so it belongs in the same backup as the directory.
+
+**The Postgres major version is pinned to 18** (`local::postgres_version`).
+A data directory opens only under the major version that created it, and
+`postgresql_embedded` without its `bundled` feature defaults to *any*
+version (`*`), installing the newest it finds. Unpinned, a new machine or
+a cleared install cache would fetch a newer major and fail to start on the
+existing data. Moving to a new major is a deliberate dump and restore.
 
 It is the same Postgres schema, migrations and API as production; the
 only difference is who owns the server process. The demo does not infer
@@ -12440,10 +12509,36 @@ forgot its environment variable fails loudly rather than silently
 starting a private database. If both are set, local mode wins and logs a
 warning.
 
-The data directory is initialized once and reused. `postgresql_embedded`
-keeps its password file outside it (`<data_dir>.pgpass`) because `initdb`
-refuses a non-empty directory; that file and the fixed password are what
-let a restart connect to the existing cluster. A crash can leave a stale
+**Running as root: the system's Postgres instead.** `initdb` and
+`postgres` refuse to run as root, so when this process is root `start()`
+uses the system's server binaries (`SKILJ_TEST_PGBIN`, or for an existing
+data directory the `/usr/lib/postgresql/<major>/bin` matching its
+`PG_VERSION`, else the newest installed, else `pg_ctl` on the `PATH`), run
+as the `postgres` user through `runuser`. The login rules are the same as
+the embedded path's: `initdb --auth-host=scram-sha-256` with the random
+password from `<data_dir>.pgpass` (handed to `initdb` through a
+short-lived owner-only copy, since the `.pgpass` file stays root-only),
+and the database URL carries it. This process's own setup commands
+(`psql`, `createdb`) use a Unix socket in `<data_dir>.sockets` - a
+directory outside the data directory, mode `0700`, owned by `postgres` -
+with `--auth-local=peer`, so only the operating-system user `postgres`
+gets in that way. It is never `trust`: on `127.0.0.1` that would let any
+process on the machine in as superuser with no password at all. A data
+directory an earlier development build initialized with `trust` is
+refused with an error asking to move it aside. Shutdown is `pg_ctl stop
+-m fast`, a clean stop. The version pin above applies to the embedded
+path; this one runs whatever the system has installed, matched to an
+existing directory's major version. The data directory must be somewhere
+the `postgres` user can reach - not under `/root`, whose `0700` mode
+keeps it out.
+
+`cleanup: true` removes the password file, socket directory and log along
+with the data directory, so the password never outlives the data.
+
+The data directory is initialized once and reused. The password file
+lives outside it (`<data_dir>.pgpass`) because `initdb` refuses a
+non-empty directory; that file is what lets a restart connect to the
+existing cluster. A crash can leave a stale
 `postmaster.pid`; the next `start()` goes through `pg_ctl`, which handles
 it, but concurrent processes pointed at one directory remain unsupported
 - local mode is single-user.
@@ -12453,4 +12548,12 @@ without starting anything, and starts, migrates, stops, restarts from the
 same directory, checks the migrations are still applied, and checks
 `cleanup: true` removes the directory. Running that suite needs the same
 first-run embedded-Postgres download as the other DB-backed suites'
-`DATABASE_URL` fallback.
+`DATABASE_URL` fallback, and the `local` feature, so CI's plain
+`cargo test --workspace` does not run it. `skilj::local`'s own unit tests
+(no Postgres needed, also behind the feature) cover the password file:
+random on first start, read back after, owner-only, an over-readable one
+narrowed, an empty one refused, a `trust` data directory refused, and the
+version pin. `local_mode_refuses_a_login_without_the_password` checks the
+login is enforced - the URL's password connects, a wrong one and none do
+not - against whichever backend the process gets; as root it exercises
+the system path, and it fails if `initdb` is switched back to `trust`.
