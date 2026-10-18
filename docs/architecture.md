@@ -12367,18 +12367,23 @@ deciding late is the approver's call.
 **No self-approval, unless a type opts in.** The point of an approval is
 a second pair of eyes, but an admin who submits through GraphQL is also an
 admin who could approve - their own proposal included. So by default the
-Role that proposed may not approve (`self_approval_not_allowed`, checked
-before the claim, so the proposal stays `pending` for someone else). A
-type opts in with `CommandType::approval_allows_self_approval() -> true`,
-or `registerCommandType(approvalAllowsSelfApproval: true)` (omitted means
-`false`); it is stored as `command_approval_policies.allow_self_approval`
-(added to existing contexts at startup, `false` for existing rows) and
-exposed as `CommandApprovalPolicy.allowsSelfApproval`. That suits a
-single-user setup, where the only human is also the proposer. "Self" is
-the proposal's `client_id`, which for a GraphQL submission is the Role's
-id; a REST token or an internal path (`deadline`, `cross-context-route`)
-has a client id no Role carries, so for those any admin may approve.
-Rejecting one's own proposal - withdrawing it - is always allowed.
+account that proposed may not approve (`self_approval_not_allowed`,
+checked before the claim, so the proposal stays `pending` for someone
+else). A type opts in with `CommandType::approval_allows_self_approval()
+-> true`, or `registerCommandType(approvalAllowsSelfApproval: true)`
+(omitted means `false`); it is stored as
+`command_approval_policies.allow_self_approval` (added to existing
+contexts at startup, `false` for existing rows) and exposed as
+`CommandApprovalPolicy.allowsSelfApproval`. That suits a single-user
+setup, where the only human is also the proposer. "Self" is the proposing
+human, not the proposing Role row: the proposal's `client_id` (the
+proposing Role's id for a GraphQL submission) is resolved back to its
+Role and compared by `external_subject`, so approving under a second
+Role with the same subject is still refused - even if the proposing Role
+was revoked since. A REST token or an internal path (`deadline`,
+`cross-context-route`) resolves to no Role at all, so for those any
+admin may approve. Rejecting one's own proposal - withdrawing it - is
+always allowed.
 
 **A removed policy does not strand pending proposals.** Removing a type's
 policy (`requiresApproval: false`) stops new submissions from becoming
@@ -12407,8 +12412,8 @@ one does not; `a_stale_approval_claim_is_taken_over`,
 `proposals_stay_decidable_after_their_policy_is_removed` cover the stale
 claim and removed-policy paragraphs above, and
 `self_approval_is_refused_by_default` the self-approval one (refused,
-proposal still pending, approved by a second admin, withdrawn by its
-proposer). `skilj/tests/command_trigger.rs` pins the REST
+proposal still pending, approved by a second human, refused again for a
+fresh Role row with the proposer's subject, withdrawn by its proposer). `skilj/tests/command_trigger.rs` pins the REST
 submission's `pendingApproval`/`proposalId` answer and the stored
 proposal. `skilj/tests/deadlines.rs`'s
 `a_deadline_targeting_an_approval_required_command_proposes_it` fires a

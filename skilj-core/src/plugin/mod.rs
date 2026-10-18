@@ -244,10 +244,11 @@ pub trait CommandType {
         None
     }
 
-    /// Whether the Role that proposed a command may also approve it.
-    /// `false` (the default) requires a different approver; rejecting -
-    /// withdrawing - one's own proposal is always allowed. Ignored for a
-    /// type that does not require approval.
+    /// Whether the account that proposed a command may also approve it.
+    /// `false` (the default) requires a different approver - a different
+    /// human, not merely a different Role row; rejecting - withdrawing -
+    /// one's own proposal is always allowed. Ignored for a type that does
+    /// not require approval.
     fn approval_allows_self_approval() -> bool {
         false
     }

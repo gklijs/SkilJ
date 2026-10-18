@@ -3646,9 +3646,11 @@ fn proposals_stay_decidable_after_their_policy_is_removed() {
 }
 
 /// A second admin on `bc_name`, returning its bearer token - an approver
-/// other than the Role `setup()` proposes with.
-async fn second_admin(pool: &Pool, bc_name: &str) -> String {
-    let subject = unique_name("approver");
+/// other than the Role `setup()` proposes with. `subject` lets the caller
+/// pick the human: the default (off) path of `check_self_approval`
+/// compares `external_subject`, so passing the proposer's own subject
+/// builds the two-Roles-one-human case.
+async fn second_admin_with_subject(pool: &Pool, bc_name: &str, subject: String) -> String {
     let role = Role {
         id: generate_token_id(),
         external_subject: subject.clone(),
@@ -3681,9 +3683,17 @@ async fn second_admin(pool: &Pool, bc_name: &str) -> String {
     sign_jwt(&subject)
 }
 
-/// Self-approval is off unless a type opts in: the Role that proposed may
-/// not approve its own proposal (the proposal stays pending), but may still
-/// withdraw it by rejecting, and a different admin may approve.
+/// A second admin on `bc_name`, returning its bearer token - an approver
+/// other than the Role `setup()` proposes with.
+async fn second_admin(pool: &Pool, bc_name: &str) -> String {
+    second_admin_with_subject(pool, bc_name, unique_name("approver")).await
+}
+
+/// Self-approval is off unless a type opts in: the account that proposed
+/// may not approve its own proposal (the proposal stays pending), but may
+/// still withdraw it by rejecting, and a different human may approve.
+/// "Account" is the human (`external_subject`), not the Role row: a
+/// second Role with the same subject is still refused.
 #[test]
 fn self_approval_is_refused_by_default() {
     runtime().block_on(async {
@@ -3742,10 +3752,63 @@ fn self_approval_is_refused_by_default() {
         assert_eq!(approved["errors"], serde_json::Value::Null, "{approved}");
         assert_eq!(approved["data"]["approveCommand"]["accepted"], json!(true));
 
-        let withdrawn = propose_transfer(&router, &jwt, &bc_name).await;
+        // A second Role row for the same human is still self-approval: the
+        // gate compares `external_subject`, not the Role id. Revoking the
+        // proposing Role and re-registering its subject under a fresh id
+        // must not launder the proposer into an approver. (Two active
+        // Roles can never share a subject -
+        // `roles_unique_active_external_subject` - so the rotation goes
+        // through revocation, the only way this state arises.)
+        let rotated = propose_transfer(&router, &jwt, &bc_name).await;
+        let proposer = skilj_core::db::get_command_proposal(&pool, &bc_name, &rotated)
+            .await
+            .unwrap()
+            .expect("the proposal just created exists");
+        let proposer_role = skilj_core::db::get_role(&pool, &proposer.metadata.client_id)
+            .await
+            .unwrap()
+            .expect("a GraphQL proposal's client_id is its Role's id");
+        let mappings =
+            skilj_core::db::list_active_role_access_mappings_for_role(&pool, &proposer_role.id)
+                .await
+                .unwrap();
+        let at = test_now();
+        let revoked_role = Role {
+            status: RoleStatus::Revoked,
+            revoked_at: Some(at),
+            ..proposer_role.clone()
+        };
+        let revoked_mappings: Vec<_> = mappings
+            .into_iter()
+            .map(|m| RoleAccessMapping {
+                status: RoleStatus::Revoked,
+                revoked_at: Some(at),
+                ..m
+            })
+            .collect();
+        skilj_core::db::revoke_role_and_mappings(&pool, &revoked_role, &revoked_mappings)
+            .await
+            .unwrap();
+        let laundered =
+            second_admin_with_subject(&pool, &bc_name, proposer_role.external_subject.clone())
+                .await;
+        let laundered_attempt = graphql_request(
+            &router,
+            Some(&laundered),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": rotated }),
+        )
+        .await;
+        assert_eq!(
+            laundered_attempt["errors"][0]["extensions"]["code"],
+            json!("self_approval_not_allowed"),
+            "a fresh Role row for the same subject is still the proposer: {laundered_attempt}"
+        );
+
+        let withdrawn = propose_transfer(&router, &laundered, &bc_name).await;
         let rejected = graphql_request(
             &router,
-            Some(&jwt),
+            Some(&laundered),
             REJECT_MUTATION,
             json!({ "bc": bc_name, "id": withdrawn }),
         )

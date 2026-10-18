@@ -4801,7 +4801,15 @@ pub async fn claim_command_proposal(
         .unwrap_or_else(|| CommandApprovalPolicy::new(None, None));
     crate::approvals::check_approver(&policy, approver)?;
     if decision == crate::approvals::ProposalDecision::Approve {
-        crate::approvals::check_self_approval(&policy, &proposal, approver)?;
+        // Resolve the proposer to a Role, if it is one: a GraphQL
+        // submission stamps `access_mapping.role.id`, while a REST token
+        // or an internal path (deadline, route) stamps an id no Role
+        // carries - `None`, so any admin may approve those. Matching on
+        // `external_subject` (the human) rather than the Role id closes
+        // the two-Roles-one-human gap; a proposer Role since revoked
+        // still carries its subject, so it still refuses.
+        let proposer_role = get_role(pool, &proposal.metadata.client_id).await?;
+        crate::approvals::check_self_approval(&policy, proposer_role.as_ref(), approver)?;
     }
     let stale_cutoff = now - APPROVAL_CLAIM_STALE_AFTER;
     match proposal.status {

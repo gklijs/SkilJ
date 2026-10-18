@@ -29,12 +29,13 @@ pub struct CommandApprovalPolicy {
     /// deadline. The value is copied onto each proposal's own `expires_at`
     /// when it is created.
     pub deadline_seconds: Option<i64>,
-    /// Whether the Role that proposed a command may also approve it.
+    /// Whether the account that proposed a command may also approve it.
     /// `false` by default: the point of an approval is a second pair of
     /// eyes, and an admin who submits through GraphQL would otherwise be
-    /// able to wave their own proposal through. Turn it on for a type
-    /// where that is acceptable (a single-user setup, say). Rejecting -
-    /// withdrawing - one's own proposal is always allowed.
+    /// able to wave their own proposal through - under any of their Roles.
+    /// Turn it on for a type where that is acceptable (a single-user
+    /// setup, say). Rejecting - withdrawing - one's own proposal is
+    /// always allowed.
     pub allow_self_approval: bool,
 }
 
@@ -153,15 +154,27 @@ pub enum ProposalDecision {
 }
 
 /// The self-approval gate, applied to approving only - never to rejecting.
-/// A proposal's `metadata.client_id` is the proposing Role's id for a
-/// GraphQL submission; a REST token or an internal path (deadline, route)
-/// has a client id no Role can carry, so it never matches.
+/// "Self" is the proposing human, not the proposing Role row: the caller
+/// passes the Role the proposal's `metadata.client_id` resolves to (via
+/// `db::get_role`), if any, and approval is refused when its
+/// `external_subject` is the approver's own. Comparing subjects closes
+/// the two-Roles-one-human gap a bare `client_id == role.id` check
+/// leaves: revoking the proposing Role and approving under a fresh one
+/// with the same subject is still self-approval. A REST token or an
+/// internal path (deadline, route) resolves to no Role at all, so any
+/// admin may approve those - by lookup, not by betting no token id ever
+/// collides with a Role id.
 pub fn check_self_approval(
     policy: &CommandApprovalPolicy,
-    proposal: &CommandProposal,
+    proposer_role: Option<&crate::access_control::Role>,
     approver: &RoleAccessMapping,
 ) -> crate::error::Result<()> {
-    if !policy.allow_self_approval && proposal.metadata.client_id == approver.role.id {
+    if policy.allow_self_approval {
+        return Ok(());
+    }
+    if proposer_role
+        .is_some_and(|proposer| proposer.external_subject == approver.role.external_subject)
+    {
         return Err(Error::SelfApprovalNotAllowed.into());
     }
     Ok(())
@@ -184,7 +197,7 @@ pub enum Error {
     #[error("an approval policy's deadline must be a positive number of seconds")]
     InvalidApprovalPolicy,
 
-    #[error("the Role that proposed this command may not approve it")]
+    #[error("the account that proposed this command may not approve it")]
     SelfApprovalNotAllowed,
 }
 
@@ -208,5 +221,60 @@ impl crate::error::SkiljRejection for Error {
 
     fn message(&self) -> String {
         self.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access_control::Role;
+
+    fn role(id: &str, subject: &str) -> Role {
+        Role {
+            id: id.to_string(),
+            external_subject: subject.to_string(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            revoked_at: None,
+        }
+    }
+
+    fn mapping(role: Role) -> RoleAccessMapping {
+        RoleAccessMapping {
+            role,
+            bounded_context: crate::event_store::BoundedContext {
+                name: "banking".to_string(),
+                status: crate::event_store::BoundedContextStatus::Active,
+                created_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+                created_by: crate::bootstrap::ContextCreator::SystemCreator,
+                template: None,
+            },
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: None,
+            status: RoleStatus::Active,
+            created_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            revoked_at: None,
+        }
+    }
+
+    #[test]
+    fn self_is_the_subject_not_the_role_row() {
+        let policy = CommandApprovalPolicy::new(None, None);
+        let approver = mapping(role("role-new", "alice"));
+        // Same human under a fresh Role id: still refused.
+        let proposer = role("role-old", "alice");
+        assert!(check_self_approval(&policy, Some(&proposer), &approver).is_err());
+        // A different human: allowed.
+        let stranger = role("role-other", "bob");
+        assert!(check_self_approval(&policy, Some(&stranger), &approver).is_ok());
+        // No Role behind the proposal (REST token, deadline, route):
+        // allowed.
+        assert!(check_self_approval(&policy, None, &approver).is_ok());
+        // Opt-in: the proposer themself may approve.
+        let opt_in = CommandApprovalPolicy::new(None, None).allowing_self_approval(true);
+        assert!(check_self_approval(&opt_in, Some(&role("role-new", "alice")), &approver).is_ok());
     }
 }

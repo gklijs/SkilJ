@@ -52,8 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `APPROVAL_CLAIM_STALE_AFTER` (left by a crash) can be taken over, and is
   first settled against what already committed. Proposals stay decidable
   after their type's policy is removed. Self-approval is off by default:
-  the Role that proposed may not approve (`self_approval_not_allowed`),
-  though it may still reject (withdraw); a type opts in with
+  the account that proposed may not approve (`self_approval_not_allowed`,
+  matched on the human's `external_subject`, so a second Role for the
+  same subject is still refused, while a REST token or internal path
+  resolves to no Role and any admin may approve those), though it may
+  still reject (withdraw); a type opts in with
   `CommandType::approval_allows_self_approval()` or
   `registerCommandType(approvalAllowsSelfApproval: true)`, exposed as
   `CommandApprovalPolicy.allowsSelfApproval`.
