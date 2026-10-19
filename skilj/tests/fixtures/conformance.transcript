@@ -1,4 +1,4 @@
-# recorded against skilj 0.0.10
+# recorded against skilj 0.1.0
 submit_accepted	graphql	200	{"accepted":true,"correlationId":"conformance","deduplicated":false,"triggeredEventSequences":[0]}
 submit_accepted	rest	200	{"accepted":true,"correlationId":"conformance","deduplicated":false,"triggeredEventSequences":[0]}
 submit_rejected	graphql	200	{"accepted":false,"deduplicated":false,"rejectionKind":"over_limit","rejectionReason":"over the deposit limit"}

@@ -40,6 +40,13 @@ the same reason `skilj-tui`/`skilj-inspector` need no entry).
    `SKILJ_RECORD_CONFORMANCE=1 cargo test -p skilj --test conformance`.
    Review its diff: only the first line should change, unless the
    release changes what either surface answers.
+4. Point `templates/skilj-template/Cargo.toml`'s `skilj`/`skilj-core`
+   requirements at the new version, in the same commit as the bump.
+   CI's `scripts/check-template.sh` builds the template against the
+   workspace through a `[patch.crates-io]`, which Cargo only applies
+   when the workspace version satisfies the requirement - so the two
+   change together, and the template already matches the moment the
+   crates are on crates.io.
 
 ### Doing this with `cargo-release`
 
@@ -159,10 +166,7 @@ root available; wherever the publish actually runs needs this too,
 ## After publishing
 
 - Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-- Point `templates/skilj-template/Cargo.toml`'s `skilj`/`skilj-core`
-  requirements at the new version, then run
-  `scripts/check-template.sh --published` - it generates the template and
-  builds it against what crates.io now serves. (CI's own
-  `scripts/check-template.sh` builds it against the workspace instead, so
-  an API change that breaks the template shows up before a release.) 0.0.8
-  shipped with the template still on 0.0.7, where it didn't compile at all.
+- Run `scripts/check-template.sh --published` - it generates the
+  template and builds it against what crates.io now serves (step 4 of
+  "Version sync" already pointed it at the new version). 0.0.8 shipped
+  with the template still on 0.0.7, where it didn't compile at all.
