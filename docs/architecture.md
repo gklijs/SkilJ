@@ -12732,7 +12732,7 @@ rejecting the last proposal of the first page leaves the next pages intact,
 then an empty one. An admin scoped to one owner gets full pages past the
 other owner's proposals. A bad cursor is refused.
 
-## 219. Every public enum is `#[non_exhaustive]`
+## 219. Every public enum of the library crates is `#[non_exhaustive]`
 
 §217 marked the error enums and left the rest exhaustive - the status and
 outcome enums (`SubmitCommandOutcome`, `CommandProposalStatus`,
@@ -12771,17 +12771,38 @@ crate is an older patch release than the one defining the enum:
   output enum value outside the enum, so an enum-typed field fails with a
   field error rather than serving a wrong value. The two `kind: String`
   fields (`ContextCreator`, `EventOrigin`) show it as is.
-- Each broker bridge's `BridgeError` gained `Unsupported { what }`, which
-  is permanent: `dispatch_inbound_message` refuses an `InboundAction` it
-  predates, and the message is parked on the first failure, to be
-  redriven after the update. The retry loops now ask `is_permanent()`
-  rather than matching `MalformedPayload` themselves. Every bridge's
-  `BridgeError` also gained `OtherSkilj(SkiljError)` for a `SkiljError`
-  it predates, retried like any other failure. A `RetryDecision` a bridge
-  predates waits the policy's first backoff.
-- `skilj`'s cross-instance listener logs and skips a notification it
-  predates; its startup reconciliation refuses a `ProjectionRegistration`
-  with `Unsupported`.
+- Each broker bridge's `BridgeError` gained `Unsupported { what }`.
+  `dispatch_inbound_message` refuses an `InboundAction` it predates
+  before it parses the payload, so a malformed message on such a mapping
+  is refused the same way rather than parked. The inbound loop then
+  halts until the process restarts on an updated build, and nothing is
+  parked or guessed at: a parked record would need a request body the
+  bridge had to invent. How it halts depends on the broker:
+  - Kafka halts that partition with the message uncommitted; the other
+    partitions and topics carry on. `run_inbound_until` logs each such
+    topic once at start.
+  - NATS stops pulling and keeps the message claimed with in-progress
+    acks (§100). Left unacknowledged, JetStream would redeliver it every
+    `ack_wait`, and a consumer with `max_deliver` set would eventually
+    discard it. Messages already pulled behind it come back once, after
+    `ack_wait`, for another consumer.
+  - AMQP releases the delivery and withdraws the link's credit, then
+    releases whatever was already on its way. With credit left, the
+    halted link would take each released message straight back and hold
+    it, and a credit-window of others, unsettled (§98).
+
+  NATS and AMQP check the mapping before consuming anything, and halt at
+  once. The retry loops ask `is_permanent()`, which covers malformed JSON
+  only. Every bridge's `BridgeError` also gained `OtherSkilj(SkiljError)`
+  for a `SkiljError` it predates, retried like any other failure. A
+  `RetryDecision` a bridge predates halts the same way, rather than
+  retrying blind.
+- `skilj`'s cross-instance listener treats a notification it predates as
+  a `Resync` (rebuild, template refresh, gap signal). That is the safe
+  reading of a notification it can't interpret, at the cost of a schema
+  rebuild per notification if a frequent one is added; it only arises
+  with crates of different versions in one build. Its startup
+  reconciliation refuses a `ProjectionRegistration` with `Unsupported`.
 - `Subscription::set_access_mapping` replaced a match in `skilj-graphql`,
   so that one stays exhaustive inside `skilj-core`.
 - Tests and `skilj-test-fixture`'s assertions panic on an unexpected

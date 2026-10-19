@@ -4139,8 +4139,17 @@ impl SkiljBuilder {
                             cross_instance_revocation_broadcaster.publish(revoked);
                         }
                     }
-                    message @ (skilj_core::cross_instance::Message::RegistrationChanged
-                    | skilj_core::cross_instance::Message::Resync) => {
+                    message => {
+                        if !matches!(
+                            message,
+                            skilj_core::cross_instance::Message::RegistrationChanged
+                                | skilj_core::cross_instance::Message::Resync
+                        ) {
+                            tracing::warn!(
+                                "cross-instance notification this build does not support - \
+                                 treating it as a resync; update all skilj crates to the same version"
+                            );
+                        }
                         if let Err(err) = cross_instance_schema_registry
                             .rebuild(cross_instance_state.clone())
                             .await
@@ -4163,7 +4172,10 @@ impl SkiljBuilder {
                         // while the listener was reconnecting. Signalled
                         // after the rebuild above, so a subscriber that
                         // reconnects in response finds the fresh schema.
-                        if matches!(message, skilj_core::cross_instance::Message::Resync) {
+                        if !matches!(
+                            message,
+                            skilj_core::cross_instance::Message::RegistrationChanged
+                        ) {
                             // A failover always drops the listener's
                             // connection, so this is where one is noticed
                             // (docs/architecture.md §176).
@@ -4171,7 +4183,6 @@ impl SkiljBuilder {
                             cross_instance_event_broadcaster.signal_gap();
                         }
                     }
-                    _ => tracing::warn!("ignoring a cross-instance notification this build does not support; update all skilj crates to the same version"),
                 }
             }
         });

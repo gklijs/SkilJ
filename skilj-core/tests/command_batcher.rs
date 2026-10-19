@@ -921,7 +921,9 @@ impl skilj_core::plugin::SnapshotDispatcher for NoSnapshots {
     }
 }
 
-/// The `warn` events a test thread logs, by their fields.
+/// The `warn` events `skilj_core` logs on a test thread, by their fields.
+/// Other crates' are left out: sqlx warns about any statement slower than
+/// a second, which a loaded CI runner's setup can be.
 #[derive(Clone, Default)]
 struct Warnings(Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -937,7 +939,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
                 self.0.push_str(&format!("{}={value:?} ", field.name()));
             }
         }
-        if *event.metadata().level() == tracing::Level::WARN {
+        if *event.metadata().level() == tracing::Level::WARN
+            && event.metadata().target().starts_with("skilj_core")
+        {
             let mut fields = Fields(String::new());
             event.record(&mut fields);
             self.0.lock().unwrap().push(fields.0);
@@ -994,11 +998,14 @@ fn a_slow_read_or_decide_before_the_lock_warns_once_per_command_type_and_interva
             }
         };
 
+        // Only what the submits below log counts, not the setup above.
+        warnings.0.lock().unwrap().clear();
         let quiet = CommandBatcher::new()
             .with_slow_read_warning(None)
             .with_slow_decide_warning(None);
         submit_with(quiet, "quiet").await;
-        assert!(warnings.0.lock().unwrap().is_empty());
+        let logged = warnings.0.lock().unwrap().clone();
+        assert!(logged.is_empty(), "{logged:?}");
 
         let batcher = CommandBatcher::new()
             .with_slow_read_warning(Some(std::time::Duration::ZERO))

@@ -218,8 +218,8 @@ pub enum BridgeError {
     OtherSkilj(skilj_bridge::SkiljError),
     /// A mapping's `InboundAction` this bridge predates - a newer
     /// `skilj-bridge` than it was released with (docs/architecture.md
-    /// §219). Permanent: [`run_inbound`] parks the message on the first
-    /// failure, to be redriven once every skilj crate is updated.
+    /// §219). Neither retried nor parked: the message's partition halts,
+    /// uncommitted, until the process restarts on an updated build.
     #[error("{what} has a value this bridge does not support; update all skilj crates to the same version")]
     Unsupported { what: &'static str },
 }
@@ -233,10 +233,7 @@ impl skilj_bridge::BridgeError for BridgeError {
     }
 
     fn is_permanent(&self) -> bool {
-        matches!(
-            self,
-            BridgeError::MalformedPayload(_) | BridgeError::Unsupported { .. }
-        )
+        matches!(self, BridgeError::MalformedPayload(_))
     }
 }
 
@@ -446,6 +443,15 @@ pub fn header_str<'a, H: Headers>(headers: Option<&'a H>, key: &str) -> Option<&
         .and_then(|v| std::str::from_utf8(v).ok())
 }
 
+/// Whether this bridge knows `action` - false for a variant a newer
+/// `skilj-bridge` added (docs/architecture.md §219).
+fn action_supported(action: &InboundAction) -> bool {
+    matches!(
+        action,
+        InboundAction::Record { .. } | InboundAction::Trigger { .. }
+    )
+}
+
 /// Dispatches one Kafka message to skilj - the one place [`InboundAction`]
 /// is interpreted. Exposed separately from [`run_inbound`] so it can be
 /// tested directly against raw `(topic, partition, offset, payload)`
@@ -490,9 +496,9 @@ fn inbound_request_body(
             "correlationId": correlation_id,
             "causationId": causation_id,
         }),
-        // Only the parked record of an action `dispatch_inbound_message`
-        // refuses as unsupported (docs/architecture.md §219).
-        _ => serde_json::json!({ "payload": payload_json }),
+        // Not reached: an action this bridge predates halts its partition
+        // before anything is parked (docs/architecture.md §219).
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -527,17 +533,16 @@ pub async fn dispatch_inbound_message(
     correlation_id: Option<&str>,
     causation_id: Option<&str>,
 ) -> Result<(), BridgeError> {
-    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
-    // An action this bridge predates is parked, not guessed at
-    // (docs/architecture.md §219).
-    if !matches!(
-        mapping.action,
-        InboundAction::Record { .. } | InboundAction::Trigger { .. }
-    ) {
+    // An action this bridge predates is refused, not guessed at: the
+    // caller halts its partition (docs/architecture.md §219). Checked before
+    // the payload is parsed, so a malformed message on such a mapping
+    // halts too rather than being parked with a body nobody could build.
+    if !action_supported(&mapping.action) {
         return Err(BridgeError::Unsupported {
             what: "InboundAction",
         });
     }
+    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
     let partition_key = format!("{topic}:{partition}");
     let body = inbound_request_body(
         mapping,
@@ -707,14 +712,25 @@ async fn dispatch_with_retry(
             Ok(()) => return Handled::Commit,
             Err(e) => e,
         };
+        if let BridgeError::Unsupported { what } = &e {
+            tracing::error!(
+                topic,
+                partition,
+                offset,
+                what,
+                "message has a value this build predates - halting this partition \
+                 uncommitted until the bridge is updated (docs/architecture.md §219)"
+            );
+            stopping(stop.clone()).await;
+            return Handled::Stopped;
+        }
         let backoff = match retry.on_failure(
             retry_policy,
             Utc::now(),
             |at| (Utc::now() - at).to_std().unwrap_or_default(),
             // docs/architecture.md §161: no attempt spent, never parked.
             e.another_instance_can_do_it(),
-            // Not JSON, or an action this bridge predates: no retry can
-            // change that (§144, §219).
+            // Not JSON: no retry can change that (§144).
             e.is_permanent(),
         ) {
             skilj_retry::RetryDecision::Park {
@@ -779,7 +795,18 @@ async fn dispatch_with_retry(
                 return Handled::Commit;
             }
             skilj_retry::RetryDecision::Wait(backoff) => backoff,
-            _ => retry_policy.next_backoff(1),
+            _ => {
+                tracing::error!(
+                    topic,
+                    partition,
+                    offset,
+                    error = %e,
+                    "retry decision this build predates - halting this partition \
+                     uncommitted until the bridge is updated (docs/architecture.md §219)"
+                );
+                stopping(stop.clone()).await;
+                return Handled::Stopped;
+            }
         };
         tracing::warn!(
             topic,
@@ -873,6 +900,19 @@ pub async fn run_inbound_until(
     stop: impl std::future::Future<Output = ()>,
 ) {
     let mut stop = std::pin::pin!(stop);
+    // Said once up front rather than first on a message: each partition
+    // of such a topic halts on its first message, while the other topics
+    // carry on (docs/architecture.md §219).
+    for (topic, mapping) in mappings {
+        if !action_supported(&mapping.action) {
+            tracing::error!(
+                topic,
+                "this topic's InboundAction is one this build predates - each of its \
+                 partitions halts, uncommitted, until the bridge is updated \
+                 (docs/architecture.md §219)"
+            );
+        }
+    }
     let (stopping_tx, stopping_rx) = tokio::sync::watch::channel(false);
     let start = |msg: OwnedMessage, mapping| {
         handle_inbound_message(

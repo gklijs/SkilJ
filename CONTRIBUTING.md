@@ -17,8 +17,8 @@ cargo deny check   # advisories and licenses, per deny.toml
 The minimum supported Rust version is 1.95 (`rust-version` in
 `Cargo.toml`), and CI builds the libraries with it: code using a newer
 standard-library API needs that raised, which is a minor-release change
-(README.md, "Status and stability"). Every public enum is
-`#[non_exhaustive]`, and a new one must be too (docs/architecture.md
+(README.md, "Status and stability"). Every public enum of the library
+crates is `#[non_exhaustive]`, and a new one must be too (docs/architecture.md
 §219). A match in another crate needs a `_` arm answering
 `skilj_core::Error::Unsupported`, so adding a variant compiles without
 complaint: search for the enum's matches in the other crates and handle
@@ -255,6 +255,11 @@ far as a test exercises them, and some aren't checked at all
   versions running side by side during a rolling deploy are not; §164
   records one known gap, and §205 another: a version from before blind
   tags would derive a blind tag's value in the clear.
+- **Fallbacks for a variant a crate predates** (§219): the `_` arms
+  that answer `Unsupported`, halt a bridge's partition or consumer, or
+  treat a cross-instance notification as a resync. No such variant
+  exists to send them, so they run only with crates of different
+  versions in one build.
 - **Spec against code.** No test is generated from `specs/skilj.allium`.
   Their alignment is checked by periodic drift audits.
 - **Interleavings in general.** Races someone thought of have tests.

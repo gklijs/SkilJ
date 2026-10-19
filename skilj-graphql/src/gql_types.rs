@@ -252,7 +252,10 @@ pub fn role_access_mapping_object(n: &Naming) -> Object {
 /// `entity ContextCreator`. `kind` stands in for the Rust sum type's own
 /// variant tag (the same "the enum variant tag is the field" treatment
 /// the Rust side already gives it - see `ContextCreator`'s own doc
-/// comment); `role` is present only for `SUPERADMIN`.
+/// comment); `role` is present only for `SUPERADMIN`. A creator this
+/// build predates reads `kind: UNSUPPORTED` with a null `role`: an object
+/// field can't carry an error (docs/architecture.md §219), so `kind` is
+/// where a client sees it.
 pub fn context_creator_object(n: &Naming) -> Object {
     gql_object!(ContextCreator => n.ty("ContextCreator") {
         scalar "kind": TypeRef::named_nn(TypeRef::STRING) => |c| {

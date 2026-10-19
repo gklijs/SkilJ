@@ -179,8 +179,9 @@ pub enum BridgeError {
     OtherSkilj(skilj_bridge::SkiljError),
     /// A mapping's `InboundAction` this bridge predates - a newer
     /// `skilj-bridge` than it was released with (docs/architecture.md
-    /// §219). Permanent: [`run_inbound`] parks the message on the first
-    /// failure, to be redriven once every skilj crate is updated.
+    /// §219). Neither retried nor parked: the consumer halts, keeping the
+    /// message claimed, until the process restarts on an updated build. A
+    /// mapping with such an action halts before consuming anything.
     #[error("{what} has a value this bridge does not support; update all skilj crates to the same version")]
     Unsupported { what: &'static str },
 }
@@ -209,10 +210,7 @@ impl skilj_bridge::BridgeError for BridgeError {
     }
 
     fn is_permanent(&self) -> bool {
-        matches!(
-            self,
-            BridgeError::MalformedPayload(_) | BridgeError::Unsupported { .. }
-        )
+        matches!(self, BridgeError::MalformedPayload(_))
     }
 }
 
@@ -443,6 +441,15 @@ impl InboundMessageMeta {
     }
 }
 
+/// Whether this bridge knows `action` - false for a variant a newer
+/// `skilj-bridge` added (docs/architecture.md §219).
+fn action_supported(action: &InboundAction) -> bool {
+    matches!(
+        action,
+        InboundAction::Record { .. } | InboundAction::Trigger { .. }
+    )
+}
+
 /// The exact `ExternalEventRequest`/`CommandTriggerRequest` body
 /// [`dispatch_inbound_message`] sends for `mapping`/`payload_json`/`meta` -
 /// factored out so [`report_parked_delivery`] can store the identical
@@ -472,9 +479,9 @@ fn inbound_request_body(
             "correlationId": meta.correlation_id,
             "causationId": meta.causation_id,
         }),
-        // Only the parked record of an action `dispatch_inbound_message`
-        // refuses as unsupported (docs/architecture.md §219).
-        _ => serde_json::json!({ "payload": payload_json }),
+        // Not reached: an action this bridge predates halts the consumer
+        // before anything is parked (docs/architecture.md §219).
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -509,17 +516,16 @@ pub async fn dispatch_inbound_message(
     meta: &InboundMessageMeta,
     payload: &[u8],
 ) -> Result<(), BridgeError> {
-    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
-    // An action this bridge predates is parked, not guessed at
-    // (docs/architecture.md §219).
-    if !matches!(
-        mapping.action,
-        InboundAction::Record { .. } | InboundAction::Trigger { .. }
-    ) {
+    // An action this bridge predates is refused, not guessed at: the
+    // caller halts the consumer (docs/architecture.md §219). Checked before
+    // the payload is parsed, so a malformed message on such a mapping
+    // halts too rather than being parked with a body nobody could build.
+    if !action_supported(&mapping.action) {
         return Err(BridgeError::Unsupported {
             what: "InboundAction",
         });
     }
+    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
     let body = inbound_request_body(mapping, meta, &payload_json);
 
     skilj_bridge::post_inbound(
@@ -641,6 +647,14 @@ pub async fn run_inbound_until(
     // sees it go unacknowledged long enough to redeliver it underneath us.
     let claim_heartbeat =
         (consumer.cached_info().config.ack_wait / 2).max(std::time::Duration::from_millis(100));
+    if !action_supported(&mapping.action) {
+        tracing::error!(
+            "this consumer's InboundAction is one this build predates - not consuming \
+             until the bridge is updated (docs/architecture.md §219)"
+        );
+        stop.await;
+        return;
+    }
     loop {
         let subscribed = tokio::select! {
             biased;
@@ -694,14 +708,26 @@ pub async fn run_inbound_until(
                         break;
                     }
                     Err(e) => {
+                        if let BridgeError::Unsupported { what } = &e {
+                            tracing::error!(
+                                stream = meta.stream,
+                                stream_sequence = meta.stream_sequence,
+                                what,
+                                "message has a value this build predates - halting this \
+                                 consumer with the message claimed until the bridge is \
+                                 updated (docs/architecture.md §219)"
+                            );
+                            drop(messages);
+                            halt_holding_claim(&message, claim_heartbeat, stop.as_mut()).await;
+                            return;
+                        }
                         let backoff = match retry.on_failure(
                             retry_policy,
                             Utc::now(),
                             |at| (Utc::now() - at).to_std().unwrap_or_default(),
                             // docs/architecture.md §161: no attempt spent, never parked.
                             e.another_instance_can_do_it(),
-                            // Not JSON, or an action this bridge predates: no retry can
-                            // change that (§144, §219).
+                            // Not JSON: no retry can change that (§144).
                             e.is_permanent(),
                         ) {
                             skilj_retry::RetryDecision::Park {
@@ -748,7 +774,19 @@ pub async fn run_inbound_until(
                                 break;
                             }
                             skilj_retry::RetryDecision::Wait(backoff) => backoff,
-                            _ => retry_policy.next_backoff(1),
+                            _ => {
+                                tracing::error!(
+                                    stream = meta.stream,
+                                    stream_sequence = meta.stream_sequence,
+                                    error = %e,
+                                    "retry decision this build predates - halting this consumer \
+                                     with the message claimed until the bridge is updated \
+                                     (docs/architecture.md §219)"
+                                );
+                                drop(messages);
+                                halt_holding_claim(&message, claim_heartbeat, stop.as_mut()).await;
+                                return;
+                            }
                         };
                         tracing::warn!(
                             stream = meta.stream,
@@ -769,6 +807,38 @@ pub async fn run_inbound_until(
                 }
             }
         }
+    }
+}
+
+/// Halts [`run_inbound_until`] on a value this build predates until
+/// `stop` resolves (docs/architecture.md §219), keeping `message` claimed
+/// with an in-progress ack every `heartbeat` - left unacknowledged,
+/// JetStream would redeliver it every `ack_wait`, and a consumer with
+/// `max_deliver` set would discard it once that ran out. The caller drops
+/// its message stream first, so no further messages are pulled; the ones
+/// it had already pulled come back after `ack_wait`, once, for another
+/// consumer. On `stop` the message is left unacknowledged, as after a
+/// crash (§129).
+async fn halt_holding_claim(
+    message: &JetstreamMessage,
+    heartbeat: std::time::Duration,
+    stop: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) {
+    let hold = async {
+        loop {
+            if let Err(e) = message
+                .ack_with(async_nats::jetstream::AckKind::Progress)
+                .await
+            {
+                tracing::warn!("sending an in-progress ack for a JetStream message failed: {e}");
+            }
+            tokio::time::sleep(heartbeat).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        () = stop => {}
+        () = hold => {}
     }
 }
 

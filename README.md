@@ -104,10 +104,10 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
 - **Semantic versioning, Cargo-style.** Within a `0.x` series, patch releases (`0.1.0` →
   `0.1.1`) are compatible; a breaking change to the Rust API, the GraphQL or REST contract, or
   configuration needs the next minor release (`0.2.0`), and is listed in
-  [`CHANGELOG.md`](CHANGELOG.md). Public enums are `#[non_exhaustive]`, so a new variant - an
-  error, a status, an outcome - can come in a patch release: match them with a `_` arm. GraphQL
-  and REST enums may likewise gain a value; treat one you don't know as unknown rather than
-  failing.
+  [`CHANGELOG.md`](CHANGELOG.md). Public enums of the library crates are `#[non_exhaustive]`,
+  so a new variant - an error, a status, an outcome - can come in a patch release: match them
+  with a `_` arm. GraphQL and REST enums may likewise gain a value; treat one you don't know as
+  unknown rather than failing.
 - **Database upgrades are automatic and forward-only.** Startup patches an older schema in place;
   an upgrade from the very first release's schema is part of the test suite
   ([`docs/architecture.md` §159](docs/architecture.md)). Take a backup before upgrading

@@ -2378,7 +2378,9 @@ fn a_batch_folds_its_events_into_a_sync_projection_at_once() {
     });
 }
 
-/// The `warn` events a test thread logs, by their fields.
+/// The `warn` events `skilj_core` logs on a test thread, by their fields.
+/// Other crates' are left out: sqlx warns about any statement slower than
+/// a second, which a loaded CI runner's setup can be.
 #[derive(Clone, Default)]
 struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -2394,7 +2396,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
                 self.0.push_str(&format!("{}={value:?} ", field.name()));
             }
         }
-        if *event.metadata().level() == tracing::Level::WARN {
+        if *event.metadata().level() == tracing::Level::WARN
+            && event.metadata().target().starts_with("skilj_core")
+        {
             let mut fields = Fields(String::new());
             event.record(&mut fields);
             self.0.lock().unwrap().push(fields.0);

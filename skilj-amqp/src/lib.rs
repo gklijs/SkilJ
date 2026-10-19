@@ -174,8 +174,10 @@ pub enum BridgeError {
     OtherSkilj(skilj_bridge::SkiljError),
     /// A mapping's `InboundAction` this bridge predates - a newer
     /// `skilj-bridge` than it was released with (docs/architecture.md
-    /// §219). Permanent: [`run_inbound`] parks the message on the first
-    /// failure, to be redriven once every skilj crate is updated.
+    /// §219). Neither retried nor parked: the delivery is released and the
+    /// consumer halts, its link credit withdrawn, until the process
+    /// restarts on an updated build. A mapping with such an action halts
+    /// before consuming anything.
     #[error("{what} has a value this bridge does not support; update all skilj crates to the same version")]
     Unsupported { what: &'static str },
 }
@@ -204,10 +206,7 @@ impl skilj_bridge::BridgeError for BridgeError {
     }
 
     fn is_permanent(&self) -> bool {
-        matches!(
-            self,
-            BridgeError::MalformedPayload(_) | BridgeError::Unsupported { .. }
-        )
+        matches!(self, BridgeError::MalformedPayload(_))
     }
 }
 
@@ -446,6 +445,15 @@ fn message_id_to_string(id: &MessageId) -> String {
     }
 }
 
+/// Whether this bridge knows `action` - false for a variant a newer
+/// `skilj-bridge` added (docs/architecture.md §219).
+fn action_supported(action: &InboundAction) -> bool {
+    matches!(
+        action,
+        InboundAction::Record { .. } | InboundAction::Trigger { .. }
+    )
+}
+
 /// The exact `ExternalEventRequest`/`CommandTriggerRequest` body
 /// [`dispatch_inbound_message`] sends for `mapping`/`meta`/`payload_json` -
 /// factored out so [`report_parked_delivery`] can store the identical
@@ -471,9 +479,9 @@ fn inbound_request_body(
             "correlationId": correlation_id,
             "causationId": meta.causation_id,
         }),
-        // Only the parked record of an action `dispatch_inbound_message`
-        // refuses as unsupported (docs/architecture.md §219).
-        _ => serde_json::json!({ "payload": payload_json }),
+        // Not reached: an action this bridge predates halts the consumer
+        // before anything is parked (docs/architecture.md §219).
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -531,17 +539,16 @@ pub async fn dispatch_inbound_message(
     meta: &InboundMessageMeta,
     payload: &[u8],
 ) -> Result<(), BridgeError> {
-    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
-    // An action this bridge predates is parked, not guessed at
-    // (docs/architecture.md §219).
-    if !matches!(
-        mapping.action,
-        InboundAction::Record { .. } | InboundAction::Trigger { .. }
-    ) {
+    // An action this bridge predates is refused, not guessed at: the
+    // caller halts the consumer (docs/architecture.md §219). Checked before
+    // the payload is parsed, so a malformed message on such a mapping
+    // halts too rather than being parked with a body nobody could build.
+    if !action_supported(&mapping.action) {
         return Err(BridgeError::Unsupported {
             what: "InboundAction",
         });
     }
+    let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
     let body = inbound_request_body(mapping, meta, &payload_json);
 
     skilj_bridge::post_inbound(
@@ -651,6 +658,44 @@ pub async fn run_inbound(
     unreachable!("run_inbound_until only returns once `stop` resolves, and `pending()` never does")
 }
 
+/// Halts [`run_inbound_until`] on a value this build predates until
+/// `stop` resolves (docs/architecture.md §219). The link's credit goes to
+/// zero first, so the broker sends it nothing more; a delivery already on
+/// its way is released as it arrives, for a consumer that can handle it.
+/// Left with credit, the halted link would take each released message
+/// straight back, plus a credit-window of others, and hold them all
+/// unsettled until the connection closed (§98).
+async fn halt(
+    receiver: &mut AmqpReceiver,
+    address: &str,
+    mut stop: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) {
+    if let Err(e) = receiver.set_credit(0).await {
+        tracing::error!(address, "withdrawing an AMQP link's credit failed: {e}");
+    }
+    loop {
+        let received = tokio::select! {
+            biased;
+            () = stop.as_mut() => return,
+            received = receiver.recv::<Data>() => received,
+        };
+        let released = match received {
+            Ok(delivery) => receiver.release(&delivery).await,
+            Err(fe2o3_amqp::link::RecvError::MessageDecode(e)) => receiver.release(e.info).await,
+            Err(e) => {
+                // Most likely the link itself is gone: nothing more can
+                // arrive on it to release.
+                tracing::error!(address, "AMQP receive error while halted: {e}");
+                stop.as_mut().await;
+                return;
+            }
+        };
+        if let Err(e) = released {
+            tracing::error!(address, "releasing an AMQP delivery failed: {e}");
+        }
+    }
+}
+
 /// [`run_inbound`] until `stop` resolves (docs/architecture.md §129).
 /// `stop` is raced against the wait for the next delivery and against the
 /// backoff between a failing delivery's retries - never against a
@@ -668,6 +713,18 @@ pub async fn run_inbound_until(
     stop: impl std::future::Future<Output = ()>,
 ) {
     let mut stop = std::pin::pin!(stop);
+    if mappings
+        .get(address)
+        .is_some_and(|mapping| !action_supported(&mapping.action))
+    {
+        tracing::error!(
+            address,
+            "this address's InboundAction is one this build predates - not consuming \
+             it until the bridge is updated (docs/architecture.md §219)"
+        );
+        halt(receiver, address, stop.as_mut()).await;
+        return;
+    }
     loop {
         let received = tokio::select! {
             biased;
@@ -734,14 +791,27 @@ pub async fn run_inbound_until(
                     break;
                 }
                 Err(e) => {
+                    if let BridgeError::Unsupported { what } = &e {
+                        tracing::error!(
+                            address,
+                            what,
+                            "message has a value this build predates - releasing it and \
+                             halting this consumer until the bridge is updated \
+                             (docs/architecture.md §219)"
+                        );
+                        if let Err(release_err) = receiver.release(&delivery).await {
+                            tracing::error!("releasing an AMQP delivery failed: {release_err}");
+                        }
+                        halt(receiver, address, stop.as_mut()).await;
+                        return;
+                    }
                     let backoff = match retry.on_failure(
                         retry_policy,
                         Utc::now(),
                         |at| (Utc::now() - at).to_std().unwrap_or_default(),
                         // docs/architecture.md §161: no attempt spent, never parked.
                         e.another_instance_can_do_it(),
-                        // Not JSON, or an action this bridge predates: no retry can
-                        // change that (§144, §219).
+                        // Not JSON: no retry can change that (§144).
                         e.is_permanent(),
                     ) {
                         skilj_retry::RetryDecision::Park {
@@ -796,7 +866,19 @@ pub async fn run_inbound_until(
                             break;
                         }
                         skilj_retry::RetryDecision::Wait(backoff) => backoff,
-                        _ => retry_policy.next_backoff(1),
+                        _ => {
+                            tracing::error!(
+                                address,
+                                error = %e,
+                                "retry decision this build predates - releasing it and halting \
+                                 this consumer until the bridge is updated (docs/architecture.md §219)"
+                            );
+                            if let Err(release_err) = receiver.release(&delivery).await {
+                                tracing::error!("releasing an AMQP delivery failed: {release_err}");
+                            }
+                            halt(receiver, address, stop.as_mut()).await;
+                            return;
+                        }
                     };
                     tracing::warn!(
                         address,
