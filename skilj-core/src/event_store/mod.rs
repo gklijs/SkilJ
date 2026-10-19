@@ -105,6 +105,7 @@ use crate::shared::{
 
 /// See `entity BoundedContext`'s `status` field/transition graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BoundedContextStatus {
     Active,
     Archived,
@@ -163,6 +164,7 @@ impl BoundedContext {
 /// see that type's own doc comment on why this library never picks one
 /// on a bounded context's behalf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MissedOccurrencePolicy {
     Skip,
     FireOnce,
@@ -275,6 +277,7 @@ impl CommandType {
 
 /// See `entity EncryptionKey`'s `status` field/transition graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncryptionKeyStatus {
     Active,
     Destroyed,
@@ -356,6 +359,7 @@ pub struct Command {
 /// would size every `Event` - including the far more common
 /// `DirectlyCreated`/`ExternalTriggered` ones - to its worst case.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EventOrigin {
     CommandTriggered {
         command: Box<Command>,
@@ -431,6 +435,7 @@ pub struct EventTypeSubscription {
 /// below - to whichever variant happens to be larger. Same reasoning
 /// `EventOrigin::CommandTriggered`'s boxed `Command` has.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Subscription {
     AllEventsSubscription(Box<AllEventsSubscription>),
     EventTypeSubscription(Box<EventTypeSubscription>),
@@ -451,6 +456,15 @@ impl Subscription {
         }
     }
 
+    /// Replaces the grant this subscription delivers under, once its
+    /// caller's grant has been re-read.
+    pub fn set_access_mapping(&mut self, access_mapping: RoleAccessMapping) {
+        match self {
+            Subscription::AllEventsSubscription(s) => s.access_mapping = access_mapping,
+            Subscription::EventTypeSubscription(s) => s.access_mapping = access_mapping,
+        }
+    }
+
     fn starting_sequence(&self) -> i64 {
         match self {
             Subscription::AllEventsSubscription(s) => s.from_sequence,
@@ -461,6 +475,7 @@ impl Subscription {
 
 /// See `enum AckMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AckMode {
     AutoAdvance,
     ManualAck,
@@ -2692,6 +2707,7 @@ fn decrypt_sensitive_fields(
 /// test) can tell "this registration created a new row" from "this
 /// registration updated one in place" without comparing timestamps.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EventTypeRegistration {
     Created(EventType),
     Updated(EventType),
@@ -2886,6 +2902,7 @@ pub fn register_event_type(
 
 /// See `EventTypeRegistration` above - same shape, for `CommandType`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommandTypeRegistration {
     Created(CommandType),
     Updated(CommandType),
@@ -3782,6 +3799,7 @@ pub fn fetch_events_page(
 /// `project()` use (§1.1), extended here since this rule's own logic has
 /// no I/O of its own either.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CursorUpdate {
     /// First `ConsumeEvents` call for this token - `ReadCursor.created`.
     /// Boxed: `ReadCursor` embeds a whole `EventReadToken` (itself grown to

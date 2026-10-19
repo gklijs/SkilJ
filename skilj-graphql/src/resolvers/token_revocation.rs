@@ -65,6 +65,11 @@ async fn resolve_token(
             let scope = token.command_type.bounded_context.name.clone();
             (AccessToken::CommandToken(token), scope)
         }
+        _ => {
+            return Err(to_graphql_error(skilj_core::error::Error::Unsupported {
+                what: "AccessTokenKind",
+            }))
+        }
     })
 }
 
@@ -108,6 +113,11 @@ pub fn revoke_token_field(n: &Naming) -> Field {
                         }
                         AccessToken::CommandToken(t) => {
                             FieldValue::owned_any(t).with_type(state.naming.ty("CommandToken"))
+                        }
+                        _ => {
+                            return Err(to_graphql_error(skilj_core::error::Error::Unsupported {
+                                what: "AccessToken",
+                            }))
                         }
                     };
                 Ok(Some(field_value))

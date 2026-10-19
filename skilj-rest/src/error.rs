@@ -230,6 +230,7 @@ fn status_for(err: &CoreError) -> StatusCode {
         // from - the identical `INTERNAL_SERVER_ERROR` `CoreError::Database`
         // already gets.
         CoreError::BatchFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        CoreError::Unsupported { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         // `skilj_core::Error` is `#[non_exhaustive]`; a variant added
         // without a rule here answers 500 until it gets one.
         _ => StatusCode::INTERNAL_SERVER_ERROR,

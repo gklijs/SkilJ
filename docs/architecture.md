@@ -12333,7 +12333,7 @@ the same idempotency key returns the original proposal (a partial unique
 index on the pending row does the deduplication).
 
 **Approval, not a second command type.** GraphQL adds
-`commandProposals(boundedContext, commandTypeName, status)`,
+`commandProposals(boundedContext, commandTypeName, status, after)` (paged, §218),
 `approveCommand(boundedContext, proposalId)` and
 `rejectCommand(boundedContext, proposalId, reason)`. All three require an
 active admin-level `RoleAccessMapping`; a type's `approval_role` narrows
@@ -12632,10 +12632,10 @@ real finding: an admin grant's owner `scope` did not confine proposals, so
 an admin confined to one tenant could list, approve and reject every other
 tenant's (§214, "An approver's owner scope confines proposals"). And in local
 mode's root path, `chown` followed a symbolic link at the data or socket
-directory; both are now refused, and `chown -h` is used (§216). Also noted,
-not changed: `commandProposals` returns every proposal ever made, with no
-paging - fine while proposals are few, worth a `first`/`after` before
-anyone keeps years of them. And a proposal whose sensitive-field subject is
+directory; both are now refused, and `chown -h` is used (§216). Also noted: `commandProposals`
+returned every proposal ever made, with no paging - paged before the
+release, since adding it later would change a public `skilj-core` function
+(§218). Noted, not changed: a proposal whose sensitive-field subject is
 forgotten before approval can no longer be revealed, so approving it fails
 and releases the claim each time; it stays pending until an admin rejects
 it.
@@ -12647,12 +12647,9 @@ could not ship. `skilj_core::Error`, `approvals::Error`, `skilj-codegen`'s
 `Error`, `skilj-rest`'s `RestError`, `skilj-tui`'s `ClientError`, the four
 bridges' `BridgeError` and `skilj::local::Error` joined the ones that already
 had it. `skilj-rest`'s status mapping gained a `_ => 500` arm for it, as
-its inner matches already had. Deliberately left exhaustive:
-`skilj-bridge`'s `SkiljError`, which each bridge matches to decide whether
-to retry - a new variant there should fail their build, not fall into a
-default - and the status and outcome enums (`SubmitCommandOutcome`,
-`CommandProposalStatus`, ...), which this workspace's own crates match
-exhaustively and a consumer is expected to handle in full. Structs were
+its inner matches already had. Left exhaustive at first:
+`skilj-bridge`'s `SkiljError` and the status and outcome enums; §219 then
+marked those too. Structs were
 not marked: tests and consumers build `RoleAccessMapping`, `CommandType`
 and their kin as literals, which the attribute would forbid.
 
@@ -12696,3 +12693,108 @@ yet: `skilj-core` (572, mostly `db`, `event_store` and `access_control`,
 60 in the `plugin` module users implement), `skilj-graphql` (82),
 `skilj-tui` (92) and the bridges and tools (12-26 each). The plugin module
 and `skilj-graphql` are the next ones worth closing.
+
+## 218. Bounded pages for `commandProposals`
+
+`commandProposals` (§214) loaded every proposal in the bounded context -
+pending and decided, kept forever - rendered each, and returned them all;
+§217's audit flagged it. Paged now, before 0.1.0: the GraphQL argument
+could be added in any release, but the Rust function behind it is public,
+and changing its parameters after 0.1.0 would break a patch release.
+
+The same shape as `parkedDeliveries` (§86):
+- **Bounded:** at most `max_events_per_read` proposals per call, continued
+  with a new `after: String` argument. `commandProposals` joins
+  `EXPENSIVE_FIELDS`.
+- **Stable order:** `(created_at, id)` ascending - oldest first, the order
+  an approval queue is worked in; the listing's order before, now with a
+  page index, `command_proposals_page_order`, created with the table and
+  patched into existing contexts at startup.
+- **Deletion-safe cursor:** each `CommandProposal` has a `cursor` field
+  encoding its position (`{created_at µs}:{id}`,
+  `db::CommandProposalCursor`), not naming the row. Deciding the last
+  proposal of a page - which takes it out of a `status: PENDING` listing,
+  the normal way to work the queue - doesn't invalidate the next page. A
+  malformed cursor is `invalid_cursor`.
+- **Scope:** proposals outside a scoped admin's owner (§214) are skipped
+  and the page is filled from as many stored pages as that takes, so a
+  page shorter than the limit still means the end. That walk is in
+  `db::list_command_proposals_page`, not the resolver as for
+  `parkedDeliveries`, because the scope check is `skilj-core`'s.
+
+`db::list_command_proposals` stays, unbounded, for tests and internal
+checks.
+
+Test: `command_proposals_are_served_in_bounded_stable_pages`
+(`skilj/tests/graphql_business_surfaces.rs`, page size 2, six proposals
+over two owners): an unscoped admin's `PENDING` pages come oldest first;
+rejecting the last proposal of the first page leaves the next pages intact,
+then an empty one. An admin scoped to one owner gets full pages past the
+other owner's proposals. A bad cursor is refused.
+
+## 219. Every public enum is `#[non_exhaustive]`
+
+§217 marked the error enums and left the rest exhaustive - the status and
+outcome enums (`SubmitCommandOutcome`, `CommandProposalStatus`,
+`ProjectionRegistration`, ...), the options a consumer builds
+(`MissedRunPolicy`, `CrossContextRouteStartFrom`, `FilterOperator`,
+`InboundAction`, ...), and `skilj-bridge`'s `SkiljError` - on the argument
+that a new variant there is a change in meaning that should fail every
+`match` that doesn't handle it, a minor-release change. The user's
+decision: mark them all.
+
+**Why.** An exhaustive enum can never gain a variant in a patch release:
+every crate is depended on with a caret range, so an older `skilj-graphql`
+or bridge that matches it exhaustively would stop compiling against the
+newer `skilj-core` or `skilj-bridge` Cargo hands it. A compile error in a
+consumer's build is no help there - it is the breaking change. With the
+attribute, a variant can ship in a patch, and the matches that most need
+to handle it are this workspace's own, where an unknown value can be
+answered with an error.
+
+**What changed.** `#[non_exhaustive]` on the 44 public enums of the
+library crates that lacked it (`skilj-core`, `skilj-bridge`,
+`skilj-retry`, `skilj-codegen`, `skilj-temporal`), `SkiljError` included.
+Not on the tools' (`skilj-tui`, `skilj-inspector`: their command line is
+their promise) or on code `skilj-codegen` generates. Each match in another
+crate gained an arm for a value it predates - only reachable when that
+crate is an older patch release than the one defining the enum:
+
+- A new `skilj_core::Error::Unsupported { what }` (code `unsupported`,
+  HTTP 500) naming the enum, for a resolver or REST route that meets an
+  outcome it doesn't know (`SubmitCommandOutcome`, `DryRunDecision`,
+  `CreateExternalEventOutcome`, `ProjectionRegistration`,
+  `AccessTokenKind`, `AccessToken`, `ParkedDeliveryKind`). Its message says
+  to update all skilj crates to the same version.
+- `skilj-graphql`'s `*_name` functions answer `UNSUPPORTED_VALUE`. It is no
+  GraphQL enum's item, and async-graphql's dynamic schema refuses an
+  output enum value outside the enum, so an enum-typed field fails with a
+  field error rather than serving a wrong value. The two `kind: String`
+  fields (`ContextCreator`, `EventOrigin`) show it as is.
+- Each broker bridge's `BridgeError` gained `Unsupported { what }`, which
+  is permanent: `dispatch_inbound_message` refuses an `InboundAction` it
+  predates, and the message is parked on the first failure, to be
+  redriven after the update. The retry loops now ask `is_permanent()`
+  rather than matching `MalformedPayload` themselves. Every bridge's
+  `BridgeError` also gained `OtherSkilj(SkiljError)` for a `SkiljError`
+  it predates, retried like any other failure. A `RetryDecision` a bridge
+  predates waits the policy's first backoff.
+- `skilj`'s cross-instance listener logs and skips a notification it
+  predates; its startup reconciliation refuses a `ProjectionRegistration`
+  with `Unsupported`.
+- `Subscription::set_access_mapping` replaced a match in `skilj-graphql`,
+  so that one stays exhaustive inside `skilj-core`.
+- Tests and `skilj-test-fixture`'s assertions panic on an unexpected
+  variant, as a test should.
+
+**What it costs.** This workspace's own crates no longer get a compile
+error when a variant is added: forgetting to handle it in `skilj-graphql`
+or `skilj-rest` now surfaces as an `unsupported` error at run time, so a
+new variant needs a search for its enum's matches, and a test through
+each surface. And on the wire, a GraphQL enum (`CommandProposalStatus`,
+`ParkedDeliveryKind`, ...) may gain a value in a patch release - README.md
+says so, and that a client should treat an unknown value as unknown
+rather than fail.
+
+The bridge and GraphQL fallbacks have no test: an unknown variant of an
+enum cannot be built to drive them.

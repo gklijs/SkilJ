@@ -104,8 +104,10 @@ pub fn correlation_key(key_tag_key: Option<&str>, tags: &[Tag]) -> Option<String
 }
 
 /// A failed call to skilj. Each bridge converts it into its own
-/// `BridgeError`'s `Skilj`/`SkiljStatus`/`EventTypeMismatch` variants.
+/// `BridgeError`'s `Skilj`/`SkiljStatus`/`EventTypeMismatch` variants, and
+/// a variant it predates into `OtherSkilj` (docs/architecture.md §219).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SkiljError {
     #[error("calling skilj's own REST surface: {0}")]
     Http(#[from] reqwest::Error),
@@ -244,6 +246,7 @@ pub struct InboundMapping {
 /// own `event_type`/`command_type` field is sent on the wire - each token
 /// is already scoped to exactly one type - they exist so a mapping list
 /// reads clearly.
+#[non_exhaustive]
 pub enum InboundAction {
     /// `POST /v1/events/external` - record the message verbatim as a
     /// fact. Redelivery-safe via the `dedupe` mechanism

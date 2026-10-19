@@ -71,6 +71,7 @@ pub const EXPENSIVE_FIELDS: &[&str] = &[
     "fetchCommands",
     "projection",
     "parkedDeliveries",
+    "commandProposals",
 ];
 
 /// Refuses an operation selecting more than `max` [`EXPENSIVE_FIELDS`].

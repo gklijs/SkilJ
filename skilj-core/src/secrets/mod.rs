@@ -79,6 +79,7 @@ pub fn subject_value(name: &str, version: i64) -> String {
 /// scheduled rotation from a deliberate revocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SecretStatus {
     Active,
     Rotated,
@@ -150,6 +151,7 @@ pub struct SecretGrant {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SecretGrantStatus {
     Active,
     Revoked,

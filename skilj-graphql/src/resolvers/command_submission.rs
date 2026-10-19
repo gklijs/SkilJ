@@ -322,6 +322,11 @@ pub fn submit_command_field(n: &Naming) -> Field {
                         pending_approval: false,
                         proposal_id: None,
                     },
+                    _ => {
+                        return Err(to_graphql_error(skilj_core::error::Error::Unsupported {
+                            what: "SubmitCommandOutcome",
+                        }))
+                    }
                 })))
             })
         },
@@ -521,6 +526,11 @@ pub fn dry_run_command_field(n: &Naming) -> Field {
                             matching_events,
                             matching_events_truncated,
                         }
+                    }
+                    _ => {
+                        return Err(to_graphql_error(skilj_core::error::Error::Unsupported {
+                            what: "DryRunDecision",
+                        }))
                     }
                 };
                 Ok(Some(FieldValue::owned_any(result)))

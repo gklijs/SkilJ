@@ -37,8 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `skilj_core::approvals` types, `command_approval_policies`/
   `command_proposals` tables (patched into existing contexts at startup),
   `db::propose_command`/`approve_command_proposal`/
-  `reject_command_proposal`/`list_command_proposals`, GraphQL
-  `commandProposals`/`approveCommand`/`rejectCommand` plus
+  `reject_command_proposal`/`list_command_proposals`/
+  `list_command_proposals_page`, GraphQL `commandProposals` (paged with
+  `after` and each proposal's `cursor`, at most `max_events_per_read` per
+  call, docs/architecture.md §218)/`approveCommand`/`rejectCommand` plus
   `SubmitCommandPayload.pendingApproval`/`proposalId`,
   `CommandType.requiresApproval`/`approvalPolicy`, new
   `registerCommandType` arguments, and REST `CommandTrigger`'s
@@ -161,6 +163,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BridgeError` and `skilj::local::Error`, joining those that already
   were. A `match` on one from outside its crate needs a `_` arm; in
   return, a new error variant is no longer a breaking change.
+- **Breaking:** every other public enum of the library crates is now
+  `#[non_exhaustive]` too (docs/architecture.md §219): the status and
+  outcome enums (`SubmitCommandOutcome`, `CommandProposalStatus`,
+  `ProjectionRegistration`, ...), the options a consumer builds
+  (`MissedRunPolicy`, `CrossContextRouteStartFrom`, `FilterOperator`,
+  `InboundAction`, ...) and `skilj_bridge::SkiljError`. New
+  `skilj_core::Error::Unsupported` (code `unsupported`) and, on each
+  broker bridge's `BridgeError`, `Unsupported` and `OtherSkilj`: what an
+  older crate answers for a variant a newer one added.
+  `Subscription::set_access_mapping` is new.
 - Minimum supported Rust version declared: `rust-version = "1.95"` on
   every crate, checked in CI.
 - README.md gained a "Status and stability" section stating what a 0.1.x

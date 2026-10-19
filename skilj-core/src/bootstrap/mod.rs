@@ -59,6 +59,7 @@ pub struct BootstrapSecret {
 /// `AccessToken`/`purpose` get - there is no separate `kind` field to
 /// carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContextCreator {
     /// See `variant SuperadminCreator`.
     SuperadminCreator { role: Role },

@@ -4171,6 +4171,7 @@ impl SkiljBuilder {
                             cross_instance_event_broadcaster.signal_gap();
                         }
                     }
+                    _ => tracing::warn!("ignoring a cross-instance notification this build does not support; update all skilj crates to the same version"),
                 }
             }
         });
@@ -5168,6 +5169,11 @@ async fn reconcile_projections(
             }
             ProjectionRegistration::RebuildStaged(rebuild) => {
                 skilj_core::db::upsert_projection_rebuild(pool, &rebuild).await?;
+            }
+            _ => {
+                return Err(skilj_core::error::Error::Unsupported {
+                    what: "ProjectionRegistration",
+                })
             }
         }
         // Stamped on the live row even when a rebuild was staged, so an

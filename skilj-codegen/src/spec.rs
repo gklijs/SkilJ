@@ -74,6 +74,7 @@ fn first_version() -> u32 {
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErasureSpec {
     Keep,
     WithSubject,
@@ -165,6 +166,7 @@ pub struct FieldSpec {
 /// of describing it here, not a gap to widen this enum for casually.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum FieldType {
     String,
     I64,

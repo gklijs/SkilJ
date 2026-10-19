@@ -275,6 +275,11 @@ async fn redrive_parked_delivery(
                 )
                 .await?;
         }
+        _ => {
+            return Err(skilj_core::error::Error::Unsupported {
+                what: "ParkedDeliveryKind",
+            })
+        }
     }
     Ok(())
 }

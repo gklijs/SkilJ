@@ -472,6 +472,11 @@ pub fn register_projection_field(n: &Naming) -> Field {
                             rebuild: Some(rebuild),
                         }
                     }
+                    _ => {
+                        return Err(to_graphql_error(skilj_core::error::Error::Unsupported {
+                            what: "ProjectionRegistration",
+                        }))
+                    }
                 };
 
                 Ok(Some(FieldValue::owned_any(result)))

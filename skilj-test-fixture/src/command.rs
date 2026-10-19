@@ -165,6 +165,9 @@ impl CommandOutcome {
                 "expected CommandDecision::Rejected(kind: {expected_kind:?}), got Accepted: {}",
                 pretty(&events_to_value(events)),
             ),
+            other => {
+                panic!("expected CommandDecision::Rejected(kind: {expected_kind:?}), got {other:?}")
+            }
         }
     }
 

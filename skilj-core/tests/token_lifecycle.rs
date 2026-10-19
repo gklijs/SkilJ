@@ -780,6 +780,7 @@ fn revoke_token_succeeds_for_every_variant_and_stamps_revoked_at() {
             AccessToken::DirectCreationToken(t) => (t.status, t.revoked_at),
             AccessToken::CommandToken(t) => (t.status, t.revoked_at),
             AccessToken::EventReadToken(t) => (t.status, t.revoked_at),
+            other => panic!("unexpected {other:?}"),
         };
         assert_eq!(status, TokenStatus::Revoked);
         // when-presence/entity-optional.AccessToken.revoked_at - present now that status = revoked

@@ -69,6 +69,7 @@ pub struct EventTypeMapping {
 }
 
 /// Which Temporal call a mapped event triggers.
+#[non_exhaustive]
 pub enum MappingAction {
     /// `SignalWorkflowExecution` - the "await external event /
     /// human-in-the-loop" leg (Axon's `awaitEvent`, done by Temporal).
@@ -179,6 +180,11 @@ pub enum BridgeError {
          to \"{actual}\" - wrong token for this mapping"
     )]
     EventTypeMismatch { declared: String, actual: String },
+    /// A `skilj_bridge::SkiljError` this bridge predates - a newer
+    /// `skilj-bridge` than it was released with (docs/architecture.md
+    /// §219). Retried like any other failure.
+    #[error(transparent)]
+    OtherSkilj(skilj_bridge::SkiljError),
 }
 
 impl From<skilj_bridge::SkiljError> for BridgeError {
@@ -191,6 +197,7 @@ impl From<skilj_bridge::SkiljError> for BridgeError {
             skilj_bridge::SkiljError::EventTypeMismatch { declared, actual } => {
                 BridgeError::EventTypeMismatch { declared, actual }
             }
+            other => BridgeError::OtherSkilj(other),
         }
     }
 }

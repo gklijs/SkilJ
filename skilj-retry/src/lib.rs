@@ -189,6 +189,7 @@ impl Default for RetryPolicy {
 /// What to do after one failed attempt at a message - see
 /// [`MessageRetry::on_failure`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RetryDecision<T> {
     /// Give up on it and park it: `attempt` attempts, the first failing at
     /// `first_failed_at`.

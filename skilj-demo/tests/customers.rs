@@ -195,6 +195,7 @@ impl Customers {
             SubmitCommandOutcome::Accepted { .. } => "accepted".into(),
             SubmitCommandOutcome::Rejected { kind, .. } => kind,
             SubmitCommandOutcome::Deduplicated { .. } => "deduplicated".into(),
+            other => panic!("unexpected {other:?}"),
         }
     }
 

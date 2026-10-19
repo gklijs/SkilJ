@@ -99,6 +99,14 @@ where
     })
 }
 
+/// What the `*_name` functions answer for a value of a
+/// `#[non_exhaustive]` `skilj-core` enum this build doesn't know - only
+/// possible when `skilj-core` is a newer patch release than this crate
+/// (docs/architecture.md §219). It is no GraphQL enum's item, so an
+/// enum-typed field serving it fails with a field error instead of a
+/// wrong value; a `kind: String` field shows it as is.
+pub const UNSUPPORTED_VALUE: &str = "UNSUPPORTED";
+
 fn optional_timestamp(t: Option<chrono::DateTime<chrono::Utc>>) -> Value {
     match t {
         Some(t) => Value::from(t.to_rfc3339()),
@@ -110,6 +118,7 @@ pub fn role_status_name(status: RoleStatus) -> &'static str {
     match status {
         RoleStatus::Active => "ACTIVE",
         RoleStatus::Revoked => "REVOKED",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -118,6 +127,7 @@ pub fn access_level_name(level: AccessLevel) -> &'static str {
         AccessLevel::Read => "READ",
         AccessLevel::Write => "WRITE",
         AccessLevel::Admin => "ADMIN",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -125,6 +135,7 @@ pub fn bounded_context_status_name(status: BoundedContextStatus) -> &'static str
     match status {
         BoundedContextStatus::Active => "ACTIVE",
         BoundedContextStatus::Archived => "ARCHIVED",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -167,6 +178,7 @@ pub fn missed_occurrence_policy_name(policy: MissedOccurrencePolicy) -> &'static
         MissedOccurrencePolicy::Skip => "SKIP",
         MissedOccurrencePolicy::FireOnce => "FIRE_ONCE",
         MissedOccurrencePolicy::ReplayBacklog => "REPLAY_BACKLOG",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -190,6 +202,7 @@ pub fn event_read_start_position_name(position: EventReadStartPosition) -> &'sta
         EventReadStartPosition::Latest => "LATEST",
         EventReadStartPosition::AtSequence => "AT_SEQUENCE",
         EventReadStartPosition::AtTime => "AT_TIME",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -246,11 +259,13 @@ pub fn context_creator_object(n: &Naming) -> Object {
             Value::from(match c {
                 ContextCreator::SuperadminCreator { .. } => "SUPERADMIN",
                 ContextCreator::SystemCreator => "SYSTEM",
+                _ => UNSUPPORTED_VALUE,
             })
         },
         object "role": TypeRef::named(n.ty("Role")) => |c| match c {
             ContextCreator::SuperadminCreator { role } => Some(role.clone()),
             ContextCreator::SystemCreator => None,
+            _ => None,
         },
     })
 }
@@ -289,6 +304,7 @@ pub fn access_token_status_name(status: TokenStatus) -> &'static str {
     match status {
         TokenStatus::Active => "ACTIVE",
         TokenStatus::Revoked => "REVOKED",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -302,6 +318,7 @@ pub fn projection_rebuild_status_name(status: ProjectionRebuildStatus) -> &'stat
     match status {
         ProjectionRebuildStatus::Pending => "PENDING",
         ProjectionRebuildStatus::Building => "BUILDING",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -367,6 +384,7 @@ fn private_field_kind_name(kind: PrivateFieldKind) -> &'static str {
         PrivateFieldKind::Own => "OWN",
         PrivateFieldKind::Team => "TEAM",
         PrivateFieldKind::Addressed => "ADDRESSED",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -672,6 +690,7 @@ pub fn parked_delivery_kind_name(kind: skilj_core::db::ParkedDeliveryKind) -> &'
         skilj_core::db::ParkedDeliveryKind::ExternalEvent => "EXTERNAL_EVENT",
         skilj_core::db::ParkedDeliveryKind::CommandTrigger => "COMMAND_TRIGGER",
         skilj_core::db::ParkedDeliveryKind::Deadline => "DEADLINE",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -923,6 +942,7 @@ pub fn event_origin_object(n: &Naming) -> Object {
                 EventOrigin::DirectlyCreated => "DIRECTLY_CREATED",
                 EventOrigin::SystemTriggered => "SYSTEM_TRIGGERED",
                 EventOrigin::CommandTriggered { .. } => "COMMAND_TRIGGERED",
+                _ => UNSUPPORTED_VALUE,
             })
         },
         scalar "sourceContent": TypeRef::named(TypeRef::STRING) => |o| match o {
@@ -1112,6 +1132,7 @@ pub fn command_proposal_status_name(status: CommandProposalStatus) -> &'static s
         CommandProposalStatus::Approved => "APPROVED",
         CommandProposalStatus::Rejected => "REJECTED",
         CommandProposalStatus::Expired => "EXPIRED",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 
@@ -1152,6 +1173,8 @@ pub fn command_proposal_object(n: &Naming) -> Object {
         scalar "rejectionReason": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.proposal.rejection_reason.clone()),
         scalar "rejectionKind": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.proposal.rejection_kind.clone()),
         scalar "commandId": TypeRef::named(TypeRef::STRING) => |p| optional_string(p.proposal.command_id.clone()),
+        // Pass as `commandProposals(after:)` for the next page.
+        scalar "cursor": TypeRef::named_nn(TypeRef::STRING) => |p| Value::from(skilj_core::db::CommandProposalCursor::of(&p.proposal).encode()),
     })
 }
 
@@ -1231,6 +1254,7 @@ pub fn encryption_key_status_name(status: EncryptionKeyStatus) -> &'static str {
     match status {
         EncryptionKeyStatus::Active => "ACTIVE",
         EncryptionKeyStatus::Destroyed => "DESTROYED",
+        _ => UNSUPPORTED_VALUE,
     }
 }
 

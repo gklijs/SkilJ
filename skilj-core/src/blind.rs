@@ -175,6 +175,7 @@ impl std::fmt::Debug for BlindIndexKey {
 /// What `forgetSubject` does with a blind tag (docs/architecture.md §205).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
 pub enum Erasure {
     /// The hash stays on the subject's events and commands after its key
     /// is destroyed, so the value stays taken: "this address may never

@@ -205,6 +205,7 @@ fn an_injected_now_reaches_decide_with_no_deadline() {
                 assert_eq!(reason, &now.to_rfc3339());
             }
             CommandDecision::Accepted { .. } => panic!("expected a rejection"),
+            other => panic!("unexpected {other:?}"),
         });
 }
 
@@ -290,6 +291,7 @@ fn escape_hatch_sees_raw_decision() {
         .then(|decision| match decision {
             CommandDecision::Accepted { events } => assert_eq!(events.len(), 1),
             CommandDecision::Rejected { .. } => panic!("expected acceptance"),
+            other => panic!("unexpected {other:?}"),
         });
 }
 

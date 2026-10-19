@@ -3848,6 +3848,42 @@ fn self_approval_is_refused_by_default() {
     });
 }
 
+/// A JWT for a fresh Role with an admin grant on `bc_name` confined to
+/// the owner `scope`.
+async fn scoped_admin_jwt(pool: &Pool, bc_name: &str, scope: &str) -> String {
+    let bc = skilj_core::db::get_bounded_context(pool, bc_name)
+        .await
+        .unwrap()
+        .unwrap();
+    let subject = unique_name(&format!("{scope}-approver"));
+    let role = Role {
+        id: generate_token_id(),
+        external_subject: subject.clone(),
+        name: "Approver".to_string(),
+        superadmin: false,
+        status: RoleStatus::Active,
+        created_at: test_now(),
+        revoked_at: None,
+    };
+    skilj_core::db::insert_role(pool, &role).await.unwrap();
+    skilj_core::db::insert_role_access_mapping(
+        pool,
+        &RoleAccessMapping {
+            role,
+            bounded_context: bc,
+            level: AccessLevel::Admin,
+            can_read_sensitive: false,
+            scope: Some(scope.to_string()),
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    sign_jwt(&subject)
+}
+
 /// An admin grant scoped to one owner confines approvals the way it
 /// confines `fetchCommands`: a proposal for another owner is left out of
 /// `commandProposals`, and approving or rejecting it answers
@@ -3865,37 +3901,7 @@ fn a_scoped_approver_only_sees_and_decides_its_own_owners_proposals() {
         })
         .await;
         let router = skilj.graphql_router().await.unwrap();
-        let bc = skilj_core::db::get_bounded_context(&pool, &bc_name)
-            .await
-            .unwrap()
-            .unwrap();
-        let subject = unique_name("acme-approver");
-        let role = Role {
-            id: generate_token_id(),
-            external_subject: subject.clone(),
-            name: "Approver".to_string(),
-            superadmin: false,
-            status: RoleStatus::Active,
-            created_at: test_now(),
-            revoked_at: None,
-        };
-        skilj_core::db::insert_role(&pool, &role).await.unwrap();
-        skilj_core::db::insert_role_access_mapping(
-            &pool,
-            &RoleAccessMapping {
-                role,
-                bounded_context: bc,
-                level: AccessLevel::Admin,
-                can_read_sensitive: false,
-                scope: Some("acme".to_string()),
-                status: RoleStatus::Active,
-                created_at: test_now(),
-                revoked_at: None,
-            },
-        )
-        .await
-        .unwrap();
-        let acme_jwt = sign_jwt(&subject);
+        let acme_jwt = scoped_admin_jwt(&pool, &bc_name, "acme").await;
 
         let mut proposals = std::collections::HashMap::new();
         for company in ["acme", "globex"] {
@@ -3966,6 +3972,114 @@ fn a_scoped_approver_only_sees_and_decides_its_own_owners_proposals() {
             listed["data"]["commandProposals"],
             json!([{ "id": proposals["globex"] }]),
             "{listed}"
+        );
+    });
+}
+
+/// `commandProposals` serves at most `max_events_per_read` proposals (2
+/// here), oldest first, and pages on with the last one's `cursor` - which
+/// stays valid when that proposal is decided between pages and so leaves
+/// a `status: PENDING` listing. A scoped approver's pages are filled past
+/// the proposals it may not see. Before, one call returned every
+/// proposal ever made.
+#[test]
+fn command_proposals_are_served_in_bounded_stable_pages() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, author_jwt, _author_role) = setup_with(|builder| {
+            builder
+                .event_type::<CaseNoteAdded>()
+                .command_type::<ProposeCaseNote>()
+                .max_events_per_read(2)
+        })
+        .await;
+        let router = skilj.graphql_router().await.unwrap();
+        let acme_jwt = scoped_admin_jwt(&pool, &bc_name, "acme").await;
+
+        let companies = ["acme", "globex", "globex", "acme", "globex", "acme"];
+        let mut ids = Vec::new();
+        for (i, company) in companies.iter().enumerate() {
+            let payload = json!({ "case_id": "c1", "company_id": company, "note": i.to_string() });
+            let submitted = graphql_request(
+                &router,
+                Some(&author_jwt),
+                SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL,
+                json!({ "bc": bc_name, "name": "ProposeCaseNote", "payload": payload.to_string() }),
+            )
+            .await;
+            assert_eq!(submitted["errors"], serde_json::Value::Null, "{submitted}");
+            ids.push(
+                submitted["data"]["submitCommand"]["proposalId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+
+        let page = |jwt: String, after: Option<String>| {
+            let router = router.clone();
+            let bc_name = bc_name.clone();
+            async move {
+                let response = graphql_request(
+                    &router,
+                    Some(&jwt),
+                    "query($bc: String!, $after: String) { \
+                        commandProposals(boundedContext: $bc, status: PENDING, after: $after) { id cursor } }",
+                    json!({ "bc": bc_name, "after": after }),
+                )
+                .await;
+                assert_eq!(response["errors"], serde_json::Value::Null, "{response}");
+                let rows = response["data"]["commandProposals"].as_array().unwrap();
+                let page_ids: Vec<String> = rows
+                    .iter()
+                    .map(|row| row["id"].as_str().unwrap().to_string())
+                    .collect();
+                let cursor = rows
+                    .last()
+                    .map(|row| row["cursor"].as_str().unwrap().to_string());
+                (page_ids, cursor)
+            }
+        };
+
+        let (first, cursor) = page(author_jwt.clone(), None).await;
+        assert_eq!(first, ids[0..2]);
+        // Deciding the page's last proposal takes it out of the PENDING
+        // listing; its cursor still marks the position.
+        let rejected = graphql_request(
+            &router,
+            Some(&author_jwt),
+            REJECT_MUTATION,
+            json!({ "bc": bc_name, "id": ids[1] }),
+        )
+        .await;
+        assert_eq!(rejected["errors"], serde_json::Value::Null, "{rejected}");
+        let (second, cursor) = page(author_jwt.clone(), cursor).await;
+        assert_eq!(second, ids[2..4]);
+        let (third, cursor) = page(author_jwt.clone(), cursor).await;
+        assert_eq!(third, ids[4..6]);
+        let (fourth, _) = page(author_jwt.clone(), cursor).await;
+        assert!(fourth.is_empty(), "{fourth:?}");
+
+        // The acme approver's first page skips globex's two to reach
+        // acme's second proposal; the next holds the last one.
+        let (first, cursor) = page(acme_jwt.clone(), None).await;
+        assert_eq!(first, vec![ids[0].clone(), ids[3].clone()]);
+        let (second, _) = page(acme_jwt.clone(), cursor).await;
+        assert_eq!(second, vec![ids[5].clone()]);
+
+        let refused = graphql_request(
+            &router,
+            Some(&author_jwt),
+            "query($bc: String!) { commandProposals(boundedContext: $bc, after: \"nope\") { id } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            refused["errors"][0]["extensions"]["code"],
+            json!("invalid_cursor"),
+            "{refused}"
         );
     });
 }

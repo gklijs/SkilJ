@@ -684,10 +684,7 @@ async fn deliver_batch(
     }
 
     let reader = fresh_mapping.role.clone();
-    match current {
-        Subscription::AllEventsSubscription(s) => s.access_mapping = fresh_mapping,
-        Subscription::EventTypeSubscription(s) => s.access_mapping = fresh_mapping,
-    }
+    current.set_access_mapping(fresh_mapping);
     let private_field_grants = skilj_core::db::list_active_private_field_grants_for_grantee(
         &state.pool,
         bounded_context_name,

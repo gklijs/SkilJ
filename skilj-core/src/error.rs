@@ -89,6 +89,14 @@ pub enum Error {
     /// rejected one query.
     #[error("migration error: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
+
+    /// A value of a `#[non_exhaustive]` enum this crate's caller doesn't
+    /// know (docs/architecture.md §219): only reachable when that caller -
+    /// `skilj-graphql`, `skilj-rest`, a bridge - is an older patch release
+    /// than the `skilj-core` it runs with, and the newer one added a
+    /// variant. Names the enum, so the log says what to update.
+    #[error("{what} has a value this build does not support; update all skilj crates to the same version")]
+    Unsupported { what: &'static str },
 }
 
 impl Error {
@@ -144,6 +152,7 @@ impl SkiljRejection for Error {
             Error::Database(_) => "database_error",
             Error::Migration(_) => "migration_error",
             Error::BatchFailed { code, .. } => code,
+            Error::Unsupported { .. } => "unsupported",
         }
     }
 
@@ -172,6 +181,7 @@ impl SkiljRejection for Error {
             Error::Database(_) => "an internal database error occurred".to_string(),
             Error::Migration(_) => "an internal database migration error occurred".to_string(),
             Error::BatchFailed { message, .. } => message.clone(),
+            Error::Unsupported { .. } => self.to_string(),
         }
     }
 

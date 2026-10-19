@@ -1049,6 +1049,12 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX command_proposals_page_order \
+         ON {schema}.command_proposals (created_at, id)"
+    )))
+    .execute(&mut **tx)
+    .await?;
 
     // docs/architecture.md §104 - after every table it touches exists.
     add_registration_version_columns(&mut **tx, bounded_context).await?;
@@ -1216,6 +1222,17 @@ pub async fn ensure_command_approval_tables(
             "CREATE UNIQUE INDEX command_proposals_pending_idempotency \
              ON {schema}.command_proposals (command_type_name, metadata_client_id, idempotency_key) \
              WHERE status = 'pending' AND idempotency_key IS NOT NULL"
+        ),
+    )))
+    .execute(pool)
+    .await?;
+    // `commandProposals`' page order (docs/architecture.md §218).
+    sqlx::query(sqlx::AssertSqlSafe(create_index_patch(
+        &schema,
+        "command_proposals_page_order",
+        format!(
+            "CREATE INDEX command_proposals_page_order \
+             ON {schema}.command_proposals (created_at, id)"
         ),
     )))
     .execute(pool)
@@ -2923,6 +2940,7 @@ pub async fn make_bounded_context_current(
 /// Which registration table [`registration_version`]/
 /// [`set_registration_version`] address (docs/architecture.md §104).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegistrationTable {
     EventTypes,
     CommandTypes,
@@ -4661,11 +4679,7 @@ pub async fn list_command_proposals(
     expire_command_proposals(pool, bounded_context, now).await?;
     let schema = schema_ident(bounded_context);
     let rows: Vec<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, command_type_name, payload, metadata_version, metadata_client_id, \
-                metadata_created_at, metadata_correlation_id, metadata_causation_id, status, \
-                idempotency_key, created_at, expires_at, decided_at, decided_by_role_id, \
-                rejection_reason, rejection_kind, command_external_id \
-         FROM {schema}.command_proposals \
+        "SELECT {PROPOSAL_COLUMNS} FROM {schema}.command_proposals \
          WHERE ($1::text IS NULL OR status = $1) \
            AND ($2::text IS NULL OR command_type_name = $2) \
          ORDER BY created_at, id"
@@ -4675,32 +4689,148 @@ pub async fn list_command_proposals(
     .fetch_all(pool)
     .await?;
     let bc = require_bounded_context(pool, bounded_context).await?;
-    let proposals = rows.into_iter().map(|row| row.into_domain(bc.clone()));
-    if scope.is_none() {
-        return Ok(proposals.collect());
-    }
-    let mut command_types: std::collections::HashMap<String, Option<CommandType>> =
-        std::collections::HashMap::new();
+    let mut scope_filter = ProposalScopeFilter::default();
     let mut visible = Vec::new();
-    for proposal in proposals {
-        if !command_types.contains_key(&proposal.command_type_name) {
-            let command_type =
-                get_command_type(pool, bounded_context, &proposal.command_type_name).await?;
-            command_types.insert(proposal.command_type_name.clone(), command_type);
-        }
-        // A type that no longer exists has no owner dimension left to
-        // prove the proposal in scope: left out, failing closed.
-        let in_scope = command_types[&proposal.command_type_name]
-            .as_ref()
-            .is_some_and(|command_type| {
-                crate::approvals::proposal_owner_scope_satisfied(command_type, &proposal, scope)
-            });
-        if in_scope {
+    for proposal in rows.into_iter().map(|row| row.into_domain(bc.clone())) {
+        if scope_filter
+            .in_scope(pool, bounded_context, &proposal, scope)
+            .await?
+        {
             visible.push(proposal);
         }
     }
     Ok(visible)
 }
+
+/// `commandProposals(boundedContext:, after:)`'s own read: at most `limit`
+/// proposals in [`list_command_proposals`]'s order (oldest first, the
+/// order an approval queue is worked in), strictly after `after`. Like
+/// `parkedDeliveries` (docs/architecture.md §86), proposals outside
+/// `scope` are skipped and the page is filled from as many stored pages
+/// as that takes, so a page shorter than `limit` means the end.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
+pub async fn list_command_proposals_page(
+    pool: &Pool,
+    bounded_context: &str,
+    status: Option<CommandProposalStatus>,
+    command_type_name: Option<&str>,
+    scope: Option<&str>,
+    after: Option<&CommandProposalCursor>,
+    limit: i64,
+    now: DateTime<Utc>,
+) -> crate::error::Result<Vec<CommandProposal>> {
+    expire_command_proposals(pool, bounded_context, now).await?;
+    let schema = schema_ident(bounded_context);
+    let bc = require_bounded_context(pool, bounded_context).await?;
+    let mut scope_filter = ProposalScopeFilter::default();
+    let mut visible = Vec::new();
+    let mut after = after.cloned();
+    loop {
+        let rows: Vec<ProposalRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {PROPOSAL_COLUMNS} FROM {schema}.command_proposals \
+             WHERE ($1::text IS NULL OR status = $1) \
+               AND ($2::text IS NULL OR command_type_name = $2) \
+               AND ($3::timestamptz IS NULL OR (created_at, id) > ($3, $4)) \
+             ORDER BY created_at, id LIMIT $5"
+        )))
+        .bind(status.map(CommandProposalStatus::as_str))
+        .bind(command_type_name)
+        .bind(after.as_ref().map(|c| c.created_at))
+        .bind(after.as_ref().map(|c| c.id.clone()))
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        let exhausted = (rows.len() as i64) < limit;
+        for proposal in rows.into_iter().map(|row| row.into_domain(bc.clone())) {
+            after = Some(CommandProposalCursor::of(&proposal));
+            if scope_filter
+                .in_scope(pool, bounded_context, &proposal, scope)
+                .await?
+            {
+                visible.push(proposal);
+                if visible.len() as i64 == limit {
+                    return Ok(visible);
+                }
+            }
+        }
+        if exhausted {
+            return Ok(visible);
+        }
+    }
+}
+
+/// A position in [`list_command_proposals_page`]'s order. Like
+/// [`ParkedDeliveryCursor`] it carries the position rather than naming a
+/// row, so approving or rejecting the last proposal of a page - and with
+/// a `status` filter, that moves it out of the listing - doesn't
+/// invalidate the next page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandProposalCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: String,
+}
+
+impl CommandProposalCursor {
+    pub fn of(proposal: &CommandProposal) -> Self {
+        Self {
+            created_at: proposal.created_at,
+            id: proposal.id.clone(),
+        }
+    }
+
+    /// `{microseconds since the epoch}:{id}` - opaque to clients.
+    pub fn encode(&self) -> String {
+        format!("{}:{}", self.created_at.timestamp_micros(), self.id)
+    }
+
+    pub fn decode(cursor: &str) -> Option<Self> {
+        let (micros, id) = cursor.split_once(':')?;
+        Some(Self {
+            created_at: DateTime::from_timestamp_micros(micros.parse().ok()?)?,
+            id: id.to_string(),
+        })
+    }
+}
+
+/// Whether a proposal is inside an admin's owner scope, looking each
+/// command type up once per listing.
+#[derive(Default)]
+struct ProposalScopeFilter {
+    command_types: std::collections::HashMap<String, Option<CommandType>>,
+}
+
+impl ProposalScopeFilter {
+    async fn in_scope(
+        &mut self,
+        pool: &Pool,
+        bounded_context: &str,
+        proposal: &CommandProposal,
+        scope: Option<&str>,
+    ) -> crate::error::Result<bool> {
+        if scope.is_none() {
+            return Ok(true);
+        }
+        if !self.command_types.contains_key(&proposal.command_type_name) {
+            let command_type =
+                get_command_type(pool, bounded_context, &proposal.command_type_name).await?;
+            self.command_types
+                .insert(proposal.command_type_name.clone(), command_type);
+        }
+        // A type that no longer exists has no owner dimension left to
+        // prove the proposal in scope: left out, failing closed.
+        Ok(self.command_types[&proposal.command_type_name]
+            .as_ref()
+            .is_some_and(|command_type| {
+                crate::approvals::proposal_owner_scope_satisfied(command_type, proposal, scope)
+            }))
+    }
+}
+
+const PROPOSAL_COLUMNS: &str = "id, command_type_name, payload, metadata_version, \
+    metadata_client_id, metadata_created_at, metadata_correlation_id, metadata_causation_id, \
+    status, idempotency_key, created_at, expires_at, decided_at, decided_by_role_id, \
+    rejection_reason, rejection_kind, command_external_id";
 
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_command_proposal(
@@ -10360,6 +10490,7 @@ pub struct DedupeCursor<'a> {
 /// "both" unrepresentable the way [`DedupeCursor`] makes "only one of the
 /// pair" unrepresentable.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum ExternalEventDedupe<'a> {
     /// The per-partition watermark (docs/architecture.md §39): for a
     /// source that replays a partition in order from a committed position.
@@ -10390,6 +10521,7 @@ pub enum ExternalEventDedupe<'a> {
 /// message became, since its record names it, and says so in `sequence`;
 /// a watermark hit leaves it `None`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CreateExternalEventOutcome {
     Created(Box<Event>),
     Redelivered { sequence: Option<i64> },
@@ -10781,6 +10913,7 @@ pub async fn create_and_insert_direct_event(
 /// optimistic `dispatch` call if a DCB conflict forced a retry, see
 /// `submit_command`'s own doc comment.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SubmitCommandOutcome {
     Accepted {
         // Boxed for the same reason `EventOrigin::CommandTriggered`'s own
@@ -13564,6 +13697,7 @@ pub struct CommandDryRun {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DryRunDecision {
     /// Unrendered: plaintext, as `decide()` emitted them. See
     /// `event_store::render_would_be_event`.
@@ -13988,6 +14122,7 @@ async fn defer_cross_context_route(
 /// `CommandTrigger` populate `access_token_id` instead (see
 /// `ParkedDelivery`'s own doc comment for the full column-by-kind story).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParkedDeliveryKind {
     CrossContextRoute,
     ExternalEvent,
@@ -18948,6 +19083,7 @@ pub async fn promote_projection_rebuild(
 /// variant... is a 403, not a 404") without needing three separate
 /// lookups to find out which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AccessTokenKind {
     ExternalEvent,
     DirectCreation,

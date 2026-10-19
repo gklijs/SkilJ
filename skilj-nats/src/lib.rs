@@ -172,6 +172,17 @@ pub enum BridgeError {
     /// source.
     #[error("reading a JetStream message's own stream/sequence info: {0}")]
     MessageInfo(#[source] async_nats::Error),
+    /// A `skilj_bridge::SkiljError` this bridge predates - a newer
+    /// `skilj-bridge` than it was released with (docs/architecture.md
+    /// §219). Retried like any other failure.
+    #[error(transparent)]
+    OtherSkilj(skilj_bridge::SkiljError),
+    /// A mapping's `InboundAction` this bridge predates - a newer
+    /// `skilj-bridge` than it was released with (docs/architecture.md
+    /// §219). Permanent: [`run_inbound`] parks the message on the first
+    /// failure, to be redriven once every skilj crate is updated.
+    #[error("{what} has a value this bridge does not support; update all skilj crates to the same version")]
+    Unsupported { what: &'static str },
 }
 
 impl From<skilj_bridge::SkiljError> for BridgeError {
@@ -184,6 +195,7 @@ impl From<skilj_bridge::SkiljError> for BridgeError {
             skilj_bridge::SkiljError::EventTypeMismatch { declared, actual } => {
                 BridgeError::EventTypeMismatch { declared, actual }
             }
+            other => BridgeError::OtherSkilj(other),
         }
     }
 }
@@ -197,7 +209,10 @@ impl skilj_bridge::BridgeError for BridgeError {
     }
 
     fn is_permanent(&self) -> bool {
-        matches!(self, BridgeError::MalformedPayload(_))
+        matches!(
+            self,
+            BridgeError::MalformedPayload(_) | BridgeError::Unsupported { .. }
+        )
     }
 }
 
@@ -457,6 +472,9 @@ fn inbound_request_body(
             "correlationId": meta.correlation_id,
             "causationId": meta.causation_id,
         }),
+        // Only the parked record of an action `dispatch_inbound_message`
+        // refuses as unsupported (docs/architecture.md §219).
+        _ => serde_json::json!({ "payload": payload_json }),
     }
 }
 
@@ -474,6 +492,7 @@ fn inbound_idempotency_key(mapping: &InboundMapping, meta: &InboundMessageMeta) 
     match mapping.action {
         InboundAction::Record { .. } => Some(format!("{}:{}", meta.stream, meta.stream_sequence)),
         InboundAction::Trigger { .. } => meta.message_id.clone(),
+        _ => None,
     }
 }
 
@@ -491,6 +510,16 @@ pub async fn dispatch_inbound_message(
     payload: &[u8],
 ) -> Result<(), BridgeError> {
     let payload_json: serde_json::Value = serde_json::from_slice(payload)?;
+    // An action this bridge predates is parked, not guessed at
+    // (docs/architecture.md §219).
+    if !matches!(
+        mapping.action,
+        InboundAction::Record { .. } | InboundAction::Trigger { .. }
+    ) {
+        return Err(BridgeError::Unsupported {
+            what: "InboundAction",
+        });
+    }
     let body = inbound_request_body(mapping, meta, &payload_json);
 
     skilj_bridge::post_inbound(
@@ -671,8 +700,9 @@ pub async fn run_inbound_until(
                             |at| (Utc::now() - at).to_std().unwrap_or_default(),
                             // docs/architecture.md §161: no attempt spent, never parked.
                             e.another_instance_can_do_it(),
-                            // Not JSON: no retry can change that (§144).
-                            matches!(e, BridgeError::MalformedPayload(_)),
+                            // Not JSON, or an action this bridge predates: no retry can
+                            // change that (§144, §219).
+                            e.is_permanent(),
                         ) {
                             skilj_retry::RetryDecision::Park {
                                 attempt,
@@ -718,6 +748,7 @@ pub async fn run_inbound_until(
                                 break;
                             }
                             skilj_retry::RetryDecision::Wait(backoff) => backoff,
+                            _ => retry_policy.next_backoff(1),
                         };
                         tracing::warn!(
                             stream = meta.stream,

@@ -102,6 +102,7 @@ pub struct Projection {
 /// and discarding both end a rebuild by making the row cease to exist,
 /// neither is a further `status` transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProjectionRebuildStatus {
     Pending,
     Building,
@@ -132,6 +133,7 @@ pub struct ProjectionRebuild {
 /// returned `ProjectionRebuild`'s own fields already show what a caller
 /// needs either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProjectionRegistration {
     Created {
         projection: Projection,

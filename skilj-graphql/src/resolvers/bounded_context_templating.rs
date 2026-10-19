@@ -224,6 +224,11 @@ async fn apply_template_registrations(
                     .await
                     .map_err(to_graphql_error)?;
             }
+            _ => {
+                return Err(to_graphql_error(skilj_core::error::Error::Unsupported {
+                    what: "ProjectionRegistration",
+                }))
+            }
         }
     }
 

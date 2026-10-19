@@ -59,6 +59,7 @@ impl CommandApprovalPolicy {
 /// claim an approver takes before running the submission pipeline, so two
 /// concurrent approvals cannot both accept the same proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommandProposalStatus {
     Pending,
     Approving,
@@ -170,6 +171,7 @@ pub fn check_approver(
 
 /// What a claim on a proposal is for - self-approval only gates approving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProposalDecision {
     Approve,
     Reject,

@@ -460,6 +460,7 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
             SubmitCommandOutcome::Deduplicated { .. } => {
                 panic!("no idempotency_key was given - Deduplicated must be unreachable")
             }
+            other => panic!("unexpected {other:?}"),
         }
 
         // Nothing this submission tried to write landed - only the

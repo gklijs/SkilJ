@@ -44,6 +44,7 @@ use crate::event_store::BoundedContext;
 
 /// See `entity Role`'s `status` field/transition graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RoleStatus {
     Active,
     Revoked,
@@ -65,6 +66,7 @@ pub struct Role {
 
 /// See `enum AccessLevel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AccessLevel {
     Read,
     Write,
@@ -151,6 +153,7 @@ pub struct PrivateFieldGrant {
 /// shape, the same "no need for a third type to tell them apart"
 /// reasoning `RoleAccessMapping` reusing `RoleStatus` already gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TokenStatus {
     Active,
     Revoked,
@@ -209,6 +212,7 @@ pub struct EventReadToken {
 /// note) - the two are deliberately separate types, not a shared one,
 /// since nothing here depends on the plugin module or vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EventReadStartPosition {
     Beginning,
     Latest,
@@ -276,6 +280,7 @@ pub struct CommandToken {
 /// that operates on "any `AccessToken`" polymorphically rather than on one
 /// concrete variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AccessToken {
     ExternalEventToken(ExternalEventToken),
     DirectCreationToken(DirectCreationToken),
@@ -625,6 +630,7 @@ impl IdpConfig {
 /// verifies a JWT an external IdP already signed with its own private
 /// key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SigningAlgorithm {
     Rs256,
     Rs384,

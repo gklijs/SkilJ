@@ -22,6 +22,7 @@ use crate::gql_types::{CommandProposalData, CommandProposalDecisionResult};
 use crate::naming::Naming;
 use crate::GraphqlState;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, TypeRef};
+use async_graphql::ErrorExtensions;
 use chrono::Utc;
 use skilj_core::access_control::RoleAccessMapping;
 use skilj_core::approvals::CommandProposalStatus;
@@ -96,7 +97,7 @@ async fn render_proposal(
     Ok(CommandProposalData { proposal, payload })
 }
 
-/// `commandProposals(boundedContext: String!, commandTypeName: String, status: CommandProposalStatus): [CommandProposal!]!`
+/// `commandProposals(boundedContext: String!, commandTypeName: String, status: CommandProposalStatus, after: String): [CommandProposal!]!`
 pub fn command_proposals_field(n: &Naming) -> Field {
     Field::new(
         n.root("commandProposals"),
@@ -126,12 +127,35 @@ pub fn command_proposals_field(n: &Naming) -> Field {
                     .and_then(|v| v.string().ok())
                     .map(str::to_string);
 
-                let proposals = skilj_core::db::list_command_proposals(
+                // Bounded like every other list read (docs/architecture.md
+                // §218): at most `max_events_per_read` proposals, continued
+                // with the last one's `cursor` as `after`.
+                let after = match ctx.args.get("after").filter(|v| !v.is_null()) {
+                    Some(value) => {
+                        let raw = value.string()?;
+                        Some(
+                            skilj_core::db::CommandProposalCursor::decode(raw).ok_or_else(
+                                || {
+                                    async_graphql::Error::new(format!(
+                                        "{raw:?} is not a commandProposals cursor"
+                                    ))
+                                    .extend_with(|_, ext| ext.set("code", "invalid_cursor"))
+                                },
+                            )?,
+                        )
+                    }
+                    None => None,
+                };
+                let limit = i64::try_from(state.max_events_per_read.max(1)).unwrap_or(i64::MAX);
+
+                let proposals = skilj_core::db::list_command_proposals_page(
                     &state.pool,
                     &bounded_context_name,
                     status,
                     command_type_name.as_deref(),
                     access_mapping.scope.as_deref(),
+                    after.as_ref(),
+                    limit,
                     Utc::now(),
                 )
                 .await
@@ -159,6 +183,7 @@ pub fn command_proposals_field(n: &Naming) -> Field {
         "status",
         TypeRef::named(n.ty("CommandProposalStatus")),
     ))
+    .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
 }
 
 /// `approveCommand(boundedContext: String!, proposalId: ID!): CommandProposalDecisionPayload!`
@@ -206,6 +231,11 @@ pub fn approve_command_field(n: &Naming) -> Field {
                         skilj_core::db::SubmitCommandOutcome::Deduplicated {
                             triggered_event_sequences,
                         } => (true, None, None, Some(triggered_event_sequences.clone())),
+                        _ => {
+                            return Err(to_graphql_error(skilj_core::error::Error::Unsupported {
+                                what: "SubmitCommandOutcome",
+                            }))
+                        }
                     };
                 let proposal = render_proposal(state, &access_mapping, approval.proposal).await?;
                 Ok(Some(FieldValue::owned_any(CommandProposalDecisionResult {

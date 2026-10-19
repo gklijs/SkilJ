@@ -826,6 +826,7 @@ pub trait BlindTag {
 
 /// What `forgetSubject` does with a [`BlindTag`]'s hashes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlindErasure {
     /// The hash stays: the value is still taken after the subject is
     /// forgotten. For a rule that outlives the person - a trial used once,
@@ -1425,6 +1426,7 @@ pub trait CrossContextRoute {
 /// actually compared against event timestamps
 /// (`db::catch_up_cross_context_route`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CrossContextRouteStartFrom {
     Beginning,
     Latest,
@@ -1491,6 +1493,7 @@ pub trait CrossContextRouteDispatcher: Send + Sync {
 /// than `DateTime<Utc>` - the identical reasoning (a trait associated
 /// const has to be const-evaluable) applies here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeadlinePollStartFrom {
     Beginning,
     Latest,
@@ -1510,6 +1513,7 @@ pub enum DeadlinePollStartFrom {
 /// one uses: `Skip` never replays, `FireOnce` collapses a backlog to one
 /// firing, `FireAll` steps through every missed occurrence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MissedRunPolicy {
     Skip,
     FireOnce,

@@ -67,6 +67,7 @@ pub const REGISTRATION_CHANGED_CHANNEL: &str = "skilj_registration_changed";
 /// the one that made the change, ever rebuilds its schema, so a
 /// same-instance echo of it must always be acted on, never skipped.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Message {
     /// `skilj_events` - a pointer, not the full event (Postgres's own
     /// 8000-byte `NOTIFY` payload cap, and every subscriber already

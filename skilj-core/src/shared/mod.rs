@@ -24,6 +24,7 @@ pub struct Filter {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FilterOperator {
     Equals,
     Contains,
@@ -311,6 +312,7 @@ pub struct PrivateField {
 /// here is shaped around it and nothing here forecloses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PrivateFieldKind {
     Own,
     Team,
@@ -322,6 +324,7 @@ pub enum PrivateFieldKind {
 /// §4.1/§5.4/§7.3 for why a rejection is typed data, never a
 /// GraphQL/HTTP-level error.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum CommandDecision {
     Accepted { events: Vec<EventSpec> },
     Rejected { reason: String, kind: String },

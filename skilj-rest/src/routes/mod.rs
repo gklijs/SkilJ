@@ -915,6 +915,12 @@ async fn post_events_external(
     let (sequence, redelivered) = match outcome {
         db::CreateExternalEventOutcome::Created(event) => (Some(event.sequence), false),
         db::CreateExternalEventOutcome::Redelivered { sequence } => (sequence, true),
+        _ => {
+            return Err(skilj_core::error::Error::Unsupported {
+                what: "CreateExternalEventOutcome",
+            }
+            .into())
+        }
     };
 
     Ok((
@@ -1397,6 +1403,12 @@ async fn post_commands_trigger(
             pending_approval: false,
             proposal_id: None,
         },
+        _ => {
+            return Err(skilj_core::error::Error::Unsupported {
+                what: "SubmitCommandOutcome",
+            }
+            .into())
+        }
     }))
 }
 
@@ -1447,6 +1459,12 @@ async fn post_commands_dry_run(
             rejection_reason: Some(reason),
             rejection_kind: Some(kind),
         },
+        _ => {
+            return Err(skilj_core::error::Error::Unsupported {
+                what: "DryRunDecision",
+            }
+            .into())
+        }
     }))
 }
 

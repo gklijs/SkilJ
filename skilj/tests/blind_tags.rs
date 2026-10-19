@@ -451,6 +451,7 @@ fn kind(outcome: &SubmitCommandOutcome) -> String {
         SubmitCommandOutcome::Accepted { .. } => "accepted".into(),
         SubmitCommandOutcome::Rejected { kind, .. } => kind.clone(),
         SubmitCommandOutcome::Deduplicated { .. } => "deduplicated".into(),
+        other => panic!("unexpected {other:?}"),
     }
 }
 

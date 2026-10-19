@@ -44,6 +44,7 @@ type LedgerCommandProposal @inaccessible {
 	rejectionReason: String
 	rejectionKind: String
 	commandId: String
+	cursor: String!
 }
 
 type LedgerCommandProposalDecisionPayload @inaccessible {
@@ -461,7 +462,7 @@ type Query {
 	ledgerEpoch: String!
 	ledgerInspectSnapshot(boundedContext: String!, snapshotName: String!, tagValue: String!): LedgerInspectedSnapshot @inaccessible
 	ledgerFetchCommands(boundedContext: String!, commandTypes: [String!]!, afterCommandId: String, after: String, before: String, triggeredEvent: Int, correlationId: String): [LedgerQueriedCommand!]! @inaccessible
-	ledgerCommandProposals(boundedContext: String!, commandTypeName: String, status: LedgerCommandProposalStatus): [LedgerCommandProposal!]! @inaccessible
+	ledgerCommandProposals(boundedContext: String!, commandTypeName: String, status: LedgerCommandProposalStatus, after: String): [LedgerCommandProposal!]! @inaccessible
 	ledgerDryRunCommand(boundedContext: String!, commandTypeName: String!, payload: String!): LedgerDryRunCommandPayload! @inaccessible
 	ledgerListPrivateFieldGrants(boundedContext: String!, grantorRoleId: ID): [LedgerPrivateFieldGrant!]!
 	ledgerParkedDeliveries(boundedContext: String!, after: String): [LedgerParkedDelivery!]! @inaccessible

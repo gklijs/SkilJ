@@ -399,6 +399,7 @@ fn kind(outcome: &SubmitCommandOutcome) -> &str {
         SubmitCommandOutcome::Accepted { .. } => "accepted",
         SubmitCommandOutcome::Rejected { kind, .. } => kind,
         SubmitCommandOutcome::Deduplicated { .. } => "deduplicated",
+        other => panic!("unexpected {other:?}"),
     }
 }
 
