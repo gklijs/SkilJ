@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed onto an existing data directory. Running as root uses the
   system's Postgres binaries as the `postgres` user, with the same random
   password over TCP and peer authentication on a private socket (never
-  `trust`); `cleanup: true` also removes the password file.
+  `trust`), and refuses a data directory or socket directory that is a
+  symbolic link; `cleanup: true` also removes the password file.
 - Generic command approval (docs/architecture.md §214, Codeberg issue
   #98). `CommandType::requires_approval()`, `approval_role()` and
   `approval_deadline_seconds()` make a submission a pending
@@ -59,7 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still reject (withdraw); a type opts in with
   `CommandType::approval_allows_self_approval()` or
   `registerCommandType(approvalAllowsSelfApproval: true)`, exposed as
-  `CommandApprovalPolicy.allowsSelfApproval`.
+  `CommandApprovalPolicy.allowsSelfApproval`. An approver's owner
+  `scope` confines proposals as it confines `fetchCommands`: one for
+  another owner is left out of `commandProposals` and is
+  `command_proposal_not_found` to `approveCommand`/`rejectCommand`.
 - Documented external-worker guarantees around private fields
   (docs/architecture.md §215, Codeberg issue #99): `EventReadToken`
   REST reads redact every private field unconditionally and serve
@@ -150,6 +154,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** every public error enum is now `#[non_exhaustive]`
+  (docs/architecture.md §217): `skilj_core::Error`,
+  `skilj_core::approvals::Error`, `skilj_codegen::Error`,
+  `skilj_rest::RestError`, `skilj_tui`'s `ClientError`, each bridge's
+  `BridgeError` and `skilj::local::Error`, joining those that already
+  were. A `match` on one from outside its crate needs a `_` arm; in
+  return, a new error variant is no longer a breaking change.
+- Minimum supported Rust version declared: `rust-version = "1.95"` on
+  every crate, checked in CI.
+- README.md gained a "Status and stability" section stating what a 0.1.x
+  release promises and which crates it covers; `skilj-macros`,
+  `skilj-retry` and `skilj-bridge` are documented as internal.
+- CI runs `cargo deny check` (`deny.toml`: advisories, licenses, bans,
+  sources) and an MSRV build; RELEASING.md runs `cargo semver-checks`
+  before each publish.
+- `skilj`, `skilj-rest`, `skilj-retry`, `skilj-test-fixture` and
+  `skilj-macros` document every public item, enforced by
+  `#![warn(missing_docs)]`.
+- `db::list_command_proposals` takes the reading admin's `scope`.
 - `CommandDispatcher::dispatch_with` and `dispatch_from_snapshot`,
   `CommandType::decide_from_snapshot`, and the facade's
   `DeciderFn`/`DecideFromSnapshotFn` take a `&DecisionContext`

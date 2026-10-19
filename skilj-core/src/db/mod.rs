@@ -4646,12 +4646,16 @@ pub async fn expire_command_proposals(
     Ok(())
 }
 
+/// `scope` is the reading admin's own `RoleAccessMapping.scope`: a
+/// proposal outside it is left out, as `fetch_commands` leaves out a
+/// command (`approvals::proposal_owner_scope_satisfied`).
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn list_command_proposals(
     pool: &Pool,
     bounded_context: &str,
     status: Option<CommandProposalStatus>,
     command_type_name: Option<&str>,
+    scope: Option<&str>,
     now: DateTime<Utc>,
 ) -> crate::error::Result<Vec<CommandProposal>> {
     expire_command_proposals(pool, bounded_context, now).await?;
@@ -4671,10 +4675,31 @@ pub async fn list_command_proposals(
     .fetch_all(pool)
     .await?;
     let bc = require_bounded_context(pool, bounded_context).await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| row.into_domain(bc.clone()))
-        .collect())
+    let proposals = rows.into_iter().map(|row| row.into_domain(bc.clone()));
+    if scope.is_none() {
+        return Ok(proposals.collect());
+    }
+    let mut command_types: std::collections::HashMap<String, Option<CommandType>> =
+        std::collections::HashMap::new();
+    let mut visible = Vec::new();
+    for proposal in proposals {
+        if !command_types.contains_key(&proposal.command_type_name) {
+            let command_type =
+                get_command_type(pool, bounded_context, &proposal.command_type_name).await?;
+            command_types.insert(proposal.command_type_name.clone(), command_type);
+        }
+        // A type that no longer exists has no owner dimension left to
+        // prove the proposal in scope: left out, failing closed.
+        let in_scope = command_types[&proposal.command_type_name]
+            .as_ref()
+            .is_some_and(|command_type| {
+                crate::approvals::proposal_owner_scope_satisfied(command_type, &proposal, scope)
+            });
+        if in_scope {
+            visible.push(proposal);
+        }
+    }
+    Ok(visible)
 }
 
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
@@ -4793,9 +4818,25 @@ pub async fn claim_command_proposal(
         return Err(crate::access_control::Error::GrantBoundedContextMismatch.into());
     }
     expire_command_proposals(pool, bounded_context, now).await?;
+    let not_found = || crate::approvals::Error::ProposalNotFound { id: id.to_string() };
     let proposal = get_command_proposal(pool, bounded_context, id)
         .await?
-        .ok_or_else(|| crate::approvals::Error::ProposalNotFound { id: id.to_string() })?;
+        .ok_or_else(not_found)?;
+    // Outside the approver's owner scope reads as not found, the same
+    // answer a missing id gets, so the scope is no existence oracle.
+    let in_scope = approver.scope.is_none()
+        || get_command_type(pool, bounded_context, &proposal.command_type_name)
+            .await?
+            .is_some_and(|command_type| {
+                crate::approvals::proposal_owner_scope_satisfied(
+                    &command_type,
+                    &proposal,
+                    approver.scope.as_deref(),
+                )
+            });
+    if !in_scope {
+        return Err(not_found().into());
+    }
     let policy = get_command_approval_policy(pool, bounded_context, &proposal.command_type_name)
         .await?
         .unwrap_or_else(|| CommandApprovalPolicy::new(None, None));

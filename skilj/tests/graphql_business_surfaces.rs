@@ -579,6 +579,33 @@ impl CommandType for AddCaseNote {
     }
 }
 
+/// `AddCaseNote` held for approval - an approval-required type with an
+/// owner dimension, for the scoped-approver test.
+struct ProposeCaseNote;
+
+impl CommandType for ProposeCaseNote {
+    type Payload = CaseNotePayload;
+    type Event = CaseEvent;
+    const NAME: &'static str = "ProposeCaseNote";
+    fn tag_mappings() -> Vec<TagMapping> {
+        case_tag_mappings()
+    }
+    fn owner_tag_key() -> Option<&'static str> {
+        Some("company")
+    }
+    fn requires_approval() -> bool {
+        true
+    }
+    fn decide(payload: &Self::Payload, _matching_events: &[Self::Event]) -> CommandDecision {
+        CommandDecision::Accepted {
+            events: vec![EventSpec {
+                event_type: "CaseNoteAdded".to_string(),
+                payload: serde_json::to_value(payload).unwrap(),
+            }],
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CloseCasePayload {
     case_id: String,
@@ -3817,6 +3844,128 @@ fn self_approval_is_refused_by_default() {
         assert_eq!(
             rejected["data"]["rejectCommand"]["proposal"]["status"],
             json!("REJECTED")
+        );
+    });
+}
+
+/// An admin grant scoped to one owner confines approvals the way it
+/// confines `fetchCommands`: a proposal for another owner is left out of
+/// `commandProposals`, and approving or rejecting it answers
+/// `command_proposal_not_found` - the same as an id that does not exist.
+#[test]
+fn a_scoped_approver_only_sees_and_decides_its_own_owners_proposals() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let (skilj, pool, bc_name, author_jwt, _author_role) = setup_with(|builder| {
+            builder
+                .event_type::<CaseNoteAdded>()
+                .command_type::<ProposeCaseNote>()
+        })
+        .await;
+        let router = skilj.graphql_router().await.unwrap();
+        let bc = skilj_core::db::get_bounded_context(&pool, &bc_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let subject = unique_name("acme-approver");
+        let role = Role {
+            id: generate_token_id(),
+            external_subject: subject.clone(),
+            name: "Approver".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &role).await.unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role,
+                bounded_context: bc,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: Some("acme".to_string()),
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let acme_jwt = sign_jwt(&subject);
+
+        let mut proposals = std::collections::HashMap::new();
+        for company in ["acme", "globex"] {
+            let payload = json!({ "case_id": "c1", "company_id": company, "note": company });
+            let submitted = graphql_request(
+                &router,
+                Some(&author_jwt),
+                SUBMIT_COMMAND_MUTATION_WITH_PROPOSAL,
+                json!({ "bc": bc_name, "name": "ProposeCaseNote", "payload": payload.to_string() }),
+            )
+            .await;
+            assert_eq!(submitted["errors"], serde_json::Value::Null, "{submitted}");
+            let id = submitted["data"]["submitCommand"]["proposalId"]
+                .as_str()
+                .expect("a pending submission returns its proposal id")
+                .to_string();
+            proposals.insert(company, id);
+        }
+
+        let listed = graphql_request(
+            &router,
+            Some(&acme_jwt),
+            "query($bc: String!) { commandProposals(boundedContext: $bc) { id } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(listed["errors"], serde_json::Value::Null, "{listed}");
+        assert_eq!(
+            listed["data"]["commandProposals"],
+            json!([{ "id": proposals["acme"] }]),
+            "only the acme proposal is visible to an acme-scoped approver"
+        );
+
+        for mutation in [APPROVE_MUTATION, REJECT_MUTATION] {
+            let refused = graphql_request(
+                &router,
+                Some(&acme_jwt),
+                mutation,
+                json!({ "bc": bc_name, "id": proposals["globex"] }),
+            )
+            .await;
+            assert_eq!(
+                refused["errors"][0]["extensions"]["code"],
+                json!("command_proposal_not_found"),
+                "{refused}"
+            );
+        }
+
+        let approved = graphql_request(
+            &router,
+            Some(&acme_jwt),
+            APPROVE_MUTATION,
+            json!({ "bc": bc_name, "id": proposals["acme"] }),
+        )
+        .await;
+        assert_eq!(approved["errors"], serde_json::Value::Null, "{approved}");
+        assert_eq!(approved["data"]["approveCommand"]["accepted"], json!(true));
+
+        // The unscoped author still sees both, globex's untouched.
+        let listed = graphql_request(
+            &router,
+            Some(&author_jwt),
+            "query($bc: String!) { commandProposals(boundedContext: $bc, status: PENDING) { id } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            listed["data"]["commandProposals"],
+            json!([{ "id": proposals["globex"] }]),
+            "{listed}"
         );
     });
 }

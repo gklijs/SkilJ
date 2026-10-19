@@ -17,7 +17,9 @@ use axum::http::request::Parts;
 /// doc comment for why that's each route handler's job, not this
 /// extractor's.
 pub struct BearerCredential {
+    /// The token id, the part before the `.`.
     pub id: String,
+    /// The token secret, the part after the `.`.
     pub secret: String,
 }
 

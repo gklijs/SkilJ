@@ -25,6 +25,7 @@ pub struct GivenEvents<T: CommandType> {
 }
 
 impl<T: CommandType> GivenEvents<T> {
+    /// No prior events, no snapshots, and `now` at the Unix epoch.
     pub fn new() -> Self {
         Self {
             events: Vec::new(),
@@ -51,11 +52,13 @@ impl<T: CommandType> GivenEvents<T> {
         self
     }
 
+    /// One more prior event, after those already given.
     pub fn event(mut self, event: T::Event) -> Self {
         self.events.push(event);
         self
     }
 
+    /// More prior events, in order, after those already given.
     pub fn events(mut self, events: impl IntoIterator<Item = T::Event>) -> Self {
         self.events.extend(events);
         self

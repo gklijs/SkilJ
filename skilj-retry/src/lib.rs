@@ -7,6 +7,15 @@
 //! this crate only ever answers two questions a caller asks it: "how
 //! long should I wait before the next attempt" and "have I tried enough
 //! (or for long enough) that I should give up".
+//!
+//! **Stability:** an internal crate, published only because `skilj-core`
+//! and the bridges depend on it. A patch release never breaks it (those
+//! crates' published versions build against it), but its API exists for
+//! them and may change in any minor release without migration notes;
+//! depend on them instead (README.md, "Status and stability").
+
+// Every public item is documented; CI fails on a gap (`-D warnings`).
+#![warn(missing_docs)]
 
 use std::time::Duration;
 
@@ -47,10 +56,16 @@ pub const ANOTHER_INSTANCE_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// `CrossContextRoute` and each bridge's inbound path want instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RetryPolicy {
+    /// The wait after the first failure.
     pub initial_backoff: Duration,
+    /// What each wait is multiplied by for the next one.
     pub multiplier: f64,
+    /// The longest any single wait gets.
     pub max_backoff: Duration,
+    /// Give up after this many attempts; `None` for no attempt cap.
     pub max_attempts: Option<u32>,
+    /// Give up once this long has passed since the first failure; `None`
+    /// for no time cap.
     pub max_elapsed: Option<Duration>,
 }
 
@@ -177,7 +192,12 @@ impl Default for RetryPolicy {
 pub enum RetryDecision<T> {
     /// Give up on it and park it: `attempt` attempts, the first failing at
     /// `first_failed_at`.
-    Park { attempt: u32, first_failed_at: T },
+    Park {
+        /// How many attempts were made.
+        attempt: u32,
+        /// When the first of them failed.
+        first_failed_at: T,
+    },
     /// Try again after this long.
     Wait(Duration),
 }

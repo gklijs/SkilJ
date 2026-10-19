@@ -16,9 +16,12 @@ use skilj_core::error::SkiljRejection;
 use skilj_core::event_store::Error as EventStoreError;
 use skilj_core::Error as CoreError;
 
+/// The JSON body of every REST error response.
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
+    /// Machine-readable, stable error code (`SkiljRejection::code`).
     pub code: String,
+    /// Human-readable description; not stable, not for matching on.
     pub message: String,
     /// The current request's OTel trace id, hex-encoded, for a caller to
     /// quote back when escalating - `None` when no real
@@ -55,9 +58,13 @@ fn current_trace_id() -> Option<String> {
 /// `skilj-core` in the first place, so there's no `Error` variant for it
 /// to map from.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RestError {
+    /// A `skilj-core` error, mapped to a status by what it means.
     Core(CoreError),
+    /// No `Authorization: Bearer` header (401).
     MissingCredential,
+    /// An `Authorization` header that is not `<id>.<secret>` (401).
     MalformedCredential,
     /// No `AccessToken` matches the presented `id`, or one does but the
     /// presented `secret` doesn't match it - both read as "this isn't a
@@ -223,6 +230,9 @@ fn status_for(err: &CoreError) -> StatusCode {
         // from - the identical `INTERNAL_SERVER_ERROR` `CoreError::Database`
         // already gets.
         CoreError::BatchFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        // `skilj_core::Error` is `#[non_exhaustive]`; a variant added
+        // without a rule here answers 500 until it gets one.
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

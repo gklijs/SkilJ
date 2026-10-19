@@ -58,6 +58,35 @@ Not wired into CI and not run automatically - install and run it
 yourself when cutting a release. Dry-run first (omit `--execute`) to
 see exactly what it would do.
 
+## Compatibility check before publishing
+
+From 0.1.0 on, a patch release (`0.1.0` → `0.1.1`) must be compatible
+with the previous one - README.md's "Status and stability" promise, and
+what Cargo assumes when it hands a user `0.1.1` for a `"0.1"`
+requirement. That covers every published crate, the internal ones
+(`skilj-macros`, `skilj-retry`, `skilj-bridge`) included: an older
+`skilj-kafka` built against `skilj-bridge` `0.1.0` gets `0.1.1` too.
+[`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
+(`cargo install cargo-semver-checks --locked`) compares each crate's
+public API against the version crates.io serves:
+
+```sh
+cargo semver-checks --workspace
+```
+
+- **Patch release:** it must report no breaking change. One it finds
+  goes into the next minor release instead, or is reworked to stay
+  compatible (a new function next to the old one, a defaulted trait
+  method, a `#[non_exhaustive]` enum's new variant).
+- **Minor release:** breaking changes are allowed; check that each one
+  it reports is in CHANGELOG.md.
+
+It reads the Rust API only. The GraphQL/REST contract is the
+conformance transcript's job (step 3 above): a patch release's
+re-recorded transcript should differ in its version line alone, or only
+add fields and types. A raised `rust-version` is a minor-release change
+too.
+
 ## Publish order (if publishing by hand)
 
 Derived from the real internal dependency graph:

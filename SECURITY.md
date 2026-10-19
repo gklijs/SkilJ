@@ -22,5 +22,8 @@ understood.
 
 ## Supported versions
 
-`skilj` is pre-1.0 (`0.0.x`). Only the latest published version is
-supported; there is no long-term-support branch at this stage.
+`skilj` is pre-1.0. Only the latest published release is supported:
+a fix ships as a new patch release of the current minor series (for
+example `0.1.x`), which is compatible by the project's semver promise
+(README.md, "Status and stability"). There is no long-term-support
+branch, and older minor series get no backports.

@@ -24,6 +24,16 @@
 //! `auto_register` sit on the right kind of impl; splicing `gql_object!`'s
 //! own field list into three different helper-function calls depending on
 //! each field's declared kind).
+//!
+//! **Stability:** use these through their re-exports in `skilj`/
+//! `skilj-core`, where their syntax follows those crates' compatibility
+//! promise. `gql_object!` is `skilj-graphql`'s internal helper: like any
+//! crate here it never breaks in a patch release, but it may change in
+//! any minor release without migration notes (README.md, "Status and
+//! stability").
+
+// Every public item is documented; CI fails on a gap (`-D warnings`).
+#![warn(missing_docs)]
 
 use proc_macro::TokenStream;
 use quote::quote;

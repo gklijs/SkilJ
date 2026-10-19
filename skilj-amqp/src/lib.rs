@@ -131,6 +131,7 @@ const CAUSATION_ID_PROPERTY: &str = "Skilj-Causation-Id";
 // --- outbound: skilj event -> AMQP ---
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BridgeError {
     #[error("calling skilj's own REST surface: {0}")]
     Skilj(#[from] reqwest::Error),

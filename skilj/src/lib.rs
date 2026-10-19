@@ -17,6 +17,9 @@
 //! and this bounded context's raw `Event`s into `T::decide()`. See
 //! `RegisteredCommandType`'s own doc comment for the closure itself.
 
+// Every public item is documented; CI fails on a gap (`-D warnings`).
+#![warn(missing_docs)]
+
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::KeyValue;
@@ -855,6 +858,9 @@ impl Skilj {
         report
     }
 
+    /// Starts configuring a `Skilj` against the Postgres server at
+    /// `database_url`; [`SkiljBuilder::build`] connects, migrates and
+    /// reconciles the declared types.
     pub fn builder(database_url: impl Into<String>) -> SkiljBuilder {
         SkiljBuilder {
             database_url: database_url.into(),
@@ -1115,7 +1121,10 @@ async fn warn_unpublishable(
 /// registration was genuinely rejected. Each entry is `"bounded_context/name"`.
 #[derive(Debug, Default)]
 pub struct ReconciliationReport {
+    /// Types registered, or already registered in this shape.
     pub registered: Vec<String>,
+    /// Types in a bounded context the reconciliation Role has no admin
+    /// grant on yet - skipped, not an error.
     pub skipped_no_access: Vec<String>,
     /// `EventType`s/`CommandType`s/`Projection`s this process declares in
     /// an *older* shape than the one already stored - a newer version of the
@@ -2226,6 +2235,7 @@ struct RegisteredBlindTag {
     normalize: skilj_core::blind::Normalizer,
 }
 
+/// Configures and builds a [`Skilj`]; see [`Skilj::builder`].
 pub struct SkiljBuilder {
     database_url: String,
     current_bounded_context: String,
@@ -2328,6 +2338,9 @@ impl SkiljBuilder {
         self
     }
 
+    /// Declares `T` in the current bounded context, registered by
+    /// [`build`](Self::build)'s reconciliation. `#[auto_register]` does
+    /// this without a call.
     pub fn event_type<T: EventType + 'static>(mut self) -> Self {
         let bc = self.current_bounded_context();
         self.event_types
@@ -2335,6 +2348,8 @@ impl SkiljBuilder {
         self
     }
 
+    /// Declares `T` in the current bounded context, and its `decide()` as
+    /// this process's decider for it; see [`event_type`](Self::event_type).
     pub fn command_type<T: CommandType + 'static>(mut self) -> Self {
         let bc = self.current_bounded_context();
         self.command_types
@@ -2342,6 +2357,8 @@ impl SkiljBuilder {
         self
     }
 
+    /// Declares `T` in the current bounded context, and its `fold()` as
+    /// this process's folder for it; see [`event_type`](Self::event_type).
     pub fn projection<T: Projection + 'static>(mut self) -> Self {
         let bc = self.current_bounded_context();
         self.projections

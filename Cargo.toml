@@ -103,6 +103,9 @@ members = [
 [workspace.package]
 version = "0.0.10"
 edition = "2021"
+# The oldest Rust the workspace builds on: sqlx 0.9 and postgresql_embedded
+# need 1.94, and `AtomicUsize::try_update` (skilj-graphql) 1.95. CI checks it.
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://codeberg.org/gklijs/SkilJ"
 

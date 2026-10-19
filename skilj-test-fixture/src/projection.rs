@@ -19,15 +19,18 @@ pub struct GivenEvents<T: Projection> {
 }
 
 impl<T: Projection> GivenEvents<T> {
+    /// No events yet; the fold starts from `T::State::default()`.
     pub fn new() -> Self {
         Self { events: Vec::new() }
     }
 
+    /// One more event, after those already given.
     pub fn event(mut self, event: T::Event) -> Self {
         self.events.push(event);
         self
     }
 
+    /// More events, in order, after those already given.
     pub fn events(mut self, events: impl IntoIterator<Item = T::Event>) -> Self {
         self.events.extend(events);
         self

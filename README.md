@@ -97,6 +97,31 @@ banking and courses) if you want to see more before committing. It also has a su
 single-user local mode: `cargo run -p skilj-demo --bin server -- --local` starts an embedded
 Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/architecture.md §216).
 
+## Status and stability
+
+`skilj` is pre-1.0 and maintained by one person. What a release promises:
+
+- **Semantic versioning, Cargo-style.** Within a `0.x` series, patch releases (`0.1.0` →
+  `0.1.1`) are compatible; a breaking change to the Rust API, the GraphQL or REST contract, or
+  configuration needs the next minor release (`0.2.0`), and is listed in
+  [`CHANGELOG.md`](CHANGELOG.md). Error enums are `#[non_exhaustive]`, so a new error variant is
+  not a breaking change - match them with a `_` arm.
+- **Database upgrades are automatic and forward-only.** Startup patches an older schema in place;
+  an upgrade from the very first release's schema is part of the test suite
+  ([`docs/architecture.md` §159](docs/architecture.md)). Take a backup before upgrading
+  production; there is no tool to go back to an older schema.
+- **Minimum supported Rust version: 1.95**, checked in CI. Raising it is a minor-release change.
+- **Which crates the promise covers.** `skilj`, `skilj-core`, `skilj-graphql`, `skilj-rest`,
+  `skilj-codegen`, `skilj-test-fixture` and the bridges (`skilj-kafka`, `skilj-amqp`,
+  `skilj-nats`, `skilj-temporal`). `skilj-tui` and `skilj-inspector` are tools: their command
+  line is covered, their Rust API is not. `skilj-macros`, `skilj-retry` and `skilj-bridge` are
+  internal, published because other crates need them: a patch release never breaks them either,
+  but they may change in any minor release without migration notes. Use the macros through
+  `skilj`'s re-exports, and the other two not at all.
+- **Security.** Only the latest release gets fixes; see [`SECURITY.md`](SECURITY.md). The design
+  has been through many rounds of internal review, recorded in
+  [`docs/architecture.md`](docs/architecture.md), but has had no independent third-party audit.
+
 ## Crates in this workspace
 
 | Crate | What it is |

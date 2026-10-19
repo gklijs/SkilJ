@@ -5,6 +5,9 @@
 //! remote workflows, adapters - never for general application access,
 //! which is what `skilj-graphql` is for. See §7.1.
 
+// Every public item is documented; CI fails on a gap (`-D warnings`).
+#![warn(missing_docs)]
+
 pub mod auth;
 pub mod error;
 pub mod routes;

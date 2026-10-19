@@ -11,7 +11,15 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo fmt --check
+cargo deny check   # advisories and licenses, per deny.toml
 ```
+
+The minimum supported Rust version is 1.95 (`rust-version` in
+`Cargo.toml`), and CI builds the libraries with it: code using a newer
+standard-library API needs that raised, which is a minor-release change
+(README.md, "Status and stability"). Public error enums are
+`#[non_exhaustive]`, and a new public enum that is likely to grow should
+be too (docs/architecture.md §217).
 
 Without `DATABASE_URL` set, integration tests spin up a real, embedded
 Postgres via `postgresql_embedded`. On some Linux setups (observed on WSL after a

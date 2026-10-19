@@ -9,6 +9,13 @@
 //! re-exports the types its own public API names, so their APIs are
 //! unchanged.
 //!
+//! **Stability:** an internal crate, published only because `skilj-kafka`,
+//! `skilj-amqp`, `skilj-nats` and `skilj-temporal` depend on it. A patch
+//! release never breaks it (those crates' published versions build
+//! against it), but its API exists for them and may change in any minor
+//! release without migration notes; depend on a bridge instead (README.md,
+//! "Status and stability").
+//!
 //! Speaks skilj's wire protocol only - no dependency on `skilj-core` -
 //! the same posture every bridge crate has.
 

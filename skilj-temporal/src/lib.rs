@@ -142,6 +142,7 @@ fn signal_request_id(bounded_context: &str, event_type: &str, sequence: i64) -> 
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BridgeError {
     #[error("calling skilj's own REST surface: {0}")]
     Skilj(#[from] reqwest::Error),

@@ -121,6 +121,28 @@ impl CommandProposal {
     }
 }
 
+/// Whether `proposal` falls inside an admin's owner `scope` - the same
+/// check `fetch_commands` applies to a real command
+/// (`event_store::command_owner_scope_satisfied`), so an admin confined
+/// to one owner can neither list nor decide another owner's proposals.
+/// The tags are derived from the stored payload: a tag mapping may not
+/// name a sensitive field, so encryption at rest leaves every field a
+/// plain mapping reads untouched.
+pub fn proposal_owner_scope_satisfied(
+    command_type: &crate::event_store::CommandType,
+    proposal: &CommandProposal,
+    scope: Option<&str>,
+) -> bool {
+    if scope.is_none() || command_type.owner_tag_key.is_none() {
+        return true;
+    }
+    crate::event_store::tag_owner_scope_satisfied(
+        &crate::event_store::derive_plain_tags(&command_type.tag_mappings, &proposal.payload),
+        command_type.owner_tag_key.as_deref(),
+        scope,
+    )
+}
+
 /// See `entity CommandProposal`'s approval gate. Reuses the access
 /// control module's own rejections: an inactive grant is `GrantNotActive`,
 /// one below admin `InsufficientAccessLevel`, and a role-name mismatch
@@ -181,6 +203,7 @@ pub fn check_self_approval(
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("no command proposal with id {id:?} exists in this bounded context")]
     ProposalNotFound { id: String },

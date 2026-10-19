@@ -191,6 +191,8 @@ async fn trace_request(request: Request, next: Next) -> Response {
     .await
 }
 
+/// The REST surface's `axum` router, every route under `/v1`. Usually
+/// built for you by `skilj::Skilj::rest_router`.
 #[allow(clippy::too_many_arguments)]
 pub fn router(
     pool: Pool,

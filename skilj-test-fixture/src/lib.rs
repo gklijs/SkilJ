@@ -35,6 +35,9 @@
 //! See `skilj-demo/tests/banking_fixture.rs` for this against real,
 //! codegen'd `CommandType`/`Projection` impls.
 
+// Every public item is documented; CI fails on a gap (`-D warnings`).
+#![warn(missing_docs)]
+
 pub mod command;
 pub mod projection;
 

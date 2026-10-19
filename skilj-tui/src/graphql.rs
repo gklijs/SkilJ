@@ -52,6 +52,7 @@ impl fmt::Display for GraphQlError {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ClientError {
     Http(reqwest::Error),
     Graphql(Vec<GraphQlError>),

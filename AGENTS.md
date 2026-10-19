@@ -37,11 +37,23 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+## Dependencies
+
+```sh
+cargo deny check
+```
+
+`deny.toml` allows only licenses compatible with distributing skilj under MIT OR Apache-2.0; an advisory that does not apply goes in its `ignore` list with the reason.
+
 ## Docs
 
 ```sh
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
+
+`skilj`, `skilj-rest`, `skilj-retry`, `skilj-test-fixture` and `skilj-macros` have `#![warn(missing_docs)]`, which clippy's `-D warnings` makes an error: a new public item there needs a doc comment.
+
+Public error enums are `#[non_exhaustive]` (docs/architecture.md §217): match one from another crate with a `_` arm.
 
 ## CI checks
 
@@ -51,8 +63,10 @@ The full CI pipeline (see `.woodpecker.yml`) runs:
 3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace
 4. `scripts/check-federation-composition.sh` — composes the recorded federation descriptions with Apollo's and Hive's composition
 5. `cargo fmt --all -- --check`
-6. `scripts/ci-test.sh --setup-only` — settles the CI step's Postgres before the long build, preferring the `services:` container and falling back to one inside the step
-7. `cargo build --workspace --all-targets`
-8. `cargo clippy --workspace --all-targets -- -D warnings`
-9. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
-10. `scripts/ci-test.sh` — `cargo test --workspace -- --nocapture` against that database, plus the silent-skip guard for Postgres tests
+6. `cargo deny check` — RustSec advisories, licenses, banned crates and sources, per `deny.toml`
+7. `cargo +1.95 check --workspace --lib --bins` — the declared minimum supported Rust version (`rust-version` in `Cargo.toml`) still builds
+8. `scripts/ci-test.sh --setup-only` — settles the CI step's Postgres before the long build, preferring the `services:` container and falling back to one inside the step
+9. `cargo build --workspace --all-targets`
+10. `cargo clippy --workspace --all-targets -- -D warnings`
+11. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
+12. `scripts/ci-test.sh` — `cargo test --workspace -- --nocapture` against that database, plus the silent-skip guard for Postgres tests

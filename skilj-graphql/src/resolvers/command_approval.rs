@@ -131,6 +131,7 @@ pub fn command_proposals_field(n: &Naming) -> Field {
                     &bounded_context_name,
                     status,
                     command_type_name.as_deref(),
+                    access_mapping.scope.as_deref(),
                     Utc::now(),
                 )
                 .await

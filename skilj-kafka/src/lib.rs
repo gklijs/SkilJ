@@ -184,6 +184,7 @@ const CAUSATION_ID_HEADER: &str = "Skilj-Causation-Id";
 // --- outbound: skilj event -> Kafka ---
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BridgeError {
     #[error("calling skilj's own REST surface: {0}")]
     Skilj(#[from] reqwest::Error),

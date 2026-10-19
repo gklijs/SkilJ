@@ -112,6 +112,29 @@ steps:
       - rustup component add rustfmt
       - cargo fmt --all -- --check
 
+  - name: deny
+    image: rust:1-bookworm
+    commands:
+      # RustSec advisories, licenses, banned crates and sources, per
+      # deny.toml. A pinned release binary rather than `cargo install`,
+      # which would compile cargo-deny itself on every run.
+      - curl -sSfL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+      - /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny check
+
+  - name: msrv
+    image: rust:1-bookworm
+    environment:
+      CARGO_INCREMENTAL: "0"
+    commands:
+      # The workspace's declared `rust-version` (Cargo.toml) must keep
+      # building. Libraries and binaries only - what a dependent compiles;
+      # the tests run on stable below. Its own target directory, removed
+      # afterwards, so it neither churns nor fills the main build's.
+      - apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      - rustup toolchain install 1.95 --profile minimal
+      - CARGO_TARGET_DIR=target/msrv cargo +1.95 check --workspace --lib --bins
+      - rm -rf target/msrv
+
   - name: build-clippy-test
     image: rust:1-bookworm
     # The Postgres the tests below run against, and the reason CI can

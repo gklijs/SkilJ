@@ -13,6 +13,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
     AccessControl(#[from] crate::access_control::Error),

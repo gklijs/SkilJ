@@ -59,6 +59,7 @@ pub use spec::{
 };
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The `.skilj.toml` file itself doesn't parse, or doesn't match
     /// the expected shape - a real user-facing error, surfaced through

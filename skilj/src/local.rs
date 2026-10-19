@@ -49,12 +49,14 @@ pub fn postgres_version() -> VersionReq {
     postgresql_embedded::V18.clone()
 }
 
+/// Where and how [`LocalPostgres::start`] runs its server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalConfig {
     /// Where Postgres keeps its data. Created if missing.
     pub data_dir: PathBuf,
     /// `None`/`Some(0)` asks Postgres for an ephemeral port.
     pub port: Option<u16>,
+    /// The database skilj uses, created if missing.
     pub database: String,
     /// Delete `data_dir` on shutdown.
     pub cleanup: bool,
@@ -127,6 +129,8 @@ impl LocalConfig {
     }
 }
 
+/// The platform's per-user data directory, `skilj/postgresql` under it:
+/// `%LOCALAPPDATA%`, else `$XDG_DATA_HOME`, else `~/.local/share`.
 pub fn default_data_dir() -> PathBuf {
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local_app_data)
@@ -297,14 +301,19 @@ impl LocalPostgres {
             variable: "SKILJ_TEST_PGBIN".to_string(),
             value: "running as root, and no system PostgreSQL server binaries were found (install `postgresql`, or set SKILJ_TEST_PGBIN)".to_string(),
         })?;
+        // Outside `data_dir`: `initdb` refuses a directory that already has
+        // anything in it.
+        let socket_dir = config.data_dir.with_extension("sockets");
+        // Root hands these to `postgres`; a symlink planted at either path
+        // (a data directory in a shared, writable place) would hand over
+        // whatever it points at instead.
+        refuse_symlink(&config.data_dir)?;
+        refuse_symlink(&socket_dir)?;
         std::fs::create_dir_all(&config.data_dir).map_err(|source| Error::Io {
             path: config.data_dir.clone(),
             source,
         })?;
         chown_to_postgres(&config.data_dir).await?;
-        // Outside `data_dir`: `initdb` refuses a directory that already has
-        // anything in it.
-        let socket_dir = config.data_dir.with_extension("sockets");
         std::fs::create_dir_all(&socket_dir).map_err(|source| Error::Io {
             path: socket_dir.clone(),
             source,
@@ -421,6 +430,7 @@ impl LocalPostgres {
         &self.display_url
     }
 
+    /// Where this server keeps its data.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -503,12 +513,23 @@ fn free_port() -> Result<u16, Error> {
 
 async fn chown_to_postgres(path: &Path) -> Result<(), Error> {
     run_as_postgres_output(
+        // `-h`: change a symlink itself, never what it points at.
         tokio::process::Command::new("chown")
+            .arg("-h")
             .arg("postgres:postgres")
             .arg(path),
     )
     .await
     .map(|_| ())
+}
+
+fn refuse_symlink(path: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::SymbolicLink {
+            path: path.to_path_buf(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(unix)]
@@ -592,45 +613,87 @@ fn system_pg_bin(existing_major: Option<u32>) -> Option<PathBuf> {
     })
 }
 
+/// Why local mode could not start or stop its server.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
+    /// The embedded server failed to install, start or stop.
     #[error("local Postgres: {0}")]
     Embedded(#[from] postgresql_embedded::Error),
 
+    /// A system Postgres command (root mode) exited unsuccessfully.
     #[error("local Postgres: {command} failed: stdout={stdout} stderr={stderr}")]
     Command {
+        /// The program that failed.
         command: String,
+        /// Its standard output.
         stdout: String,
+        /// Its standard error.
         stderr: String,
     },
 
+    /// No free local port could be found.
     #[error("local Postgres: cannot bind a socket: {0}")]
     IoSocket(#[source] std::io::Error),
 
+    /// A file or directory local mode manages could not be used.
     #[error("local Postgres: {path}: {source}")]
     Io {
+        /// The file or directory.
         path: PathBuf,
+        /// What went wrong.
         #[source]
         source: std::io::Error,
     },
 
+    /// An environment variable (or the system binaries it names) is not
+    /// usable.
     #[error("local Postgres: {variable}={value:?} is not valid")]
-    InvalidConfig { variable: String, value: String },
+    InvalidConfig {
+        /// The variable's name.
+        variable: String,
+        /// Its value, or why nothing usable was found.
+        value: String,
+    },
 
+    /// The configured database name has characters other than ASCII
+    /// letters, digits, `_` and `-`.
     #[error(
         "local Postgres: database name {database:?} must be ASCII letters, digits, '_' or '-'"
     )]
-    InvalidDatabase { database: String },
+    InvalidDatabase {
+        /// The refused name.
+        database: String,
+    },
 
+    /// The password file exists but holds no password.
     #[error("local Postgres: password file {path} is empty")]
-    EmptyPasswordFile { path: PathBuf },
+    EmptyPasswordFile {
+        /// The password file.
+        path: PathBuf,
+    },
 
+    /// Running as root, the data or socket directory is a symbolic link,
+    /// which root would hand to the `postgres` user.
+    #[error(
+        "local Postgres: {path} is a symbolic link; running as root, local mode only uses a \
+         real directory"
+    )]
+    SymbolicLink {
+        /// The linked path.
+        path: PathBuf,
+    },
+
+    /// An existing data directory allows `trust` logins.
     #[error(
         "local Postgres: {path} allows `trust` logins, which let any local process in as \
          superuser without a password; this data directory was initialized by an earlier \
          development build - move it aside and start again"
     )]
-    TrustAuthentication { path: PathBuf },
+    TrustAuthentication {
+        /// The data directory's `pg_hba.conf`.
+        path: PathBuf,
+    },
 }
 
 #[cfg(test)]

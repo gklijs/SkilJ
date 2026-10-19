@@ -365,6 +365,7 @@ fn an_approval_required_trigger_creates_a_pending_proposal() {
             &bc_name,
             Some(skilj_core::approvals::CommandProposalStatus::Pending),
             Some("TransferMoney"),
+            None,
             Utc::now(),
         )
         .await

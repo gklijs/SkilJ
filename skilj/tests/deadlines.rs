@@ -1610,7 +1610,7 @@ fn a_deadline_targeting_an_approval_required_command_proposes_it() {
                 .is_empty(),
             "an approval-required command must not run on its own"
         );
-        let proposals = db::list_command_proposals(&pool, &target, None, None, now)
+        let proposals = db::list_command_proposals(&pool, &target, None, None, None, now)
             .await
             .unwrap();
         assert_eq!(proposals.len(), 1);
@@ -1633,7 +1633,7 @@ fn a_deadline_targeting_an_approval_required_command_proposes_it() {
         fire().await.unwrap();
         assert_eq!(deadline_status().await, "fired");
         assert_eq!(
-            db::list_command_proposals(&pool, &target, None, None, now)
+            db::list_command_proposals(&pool, &target, None, None, None, now)
                 .await
                 .unwrap()
                 .len(),

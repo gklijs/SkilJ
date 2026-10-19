@@ -2,6 +2,7 @@
 name = "skilj-demo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Worked example built on `skilj`: two bounded contexts (banking, courses) showing what the dynamic consistency boundary buys over classic per-aggregate event sourcing. Not part of the library - see src/lib.rs."

@@ -12415,6 +12415,20 @@ checked when the proposal is made - a token revoked afterwards does not
 cancel its pending proposals. The approver's decision is what authorises
 the command; a revoked proposer's waiting proposals are best rejected.
 
+**An approver's owner scope confines proposals.** An admin grant with a
+`scope` sees only the commands of that owner (`fetchCommands`,
+`command_owner_scope_satisfied`), and proposals follow the same rule:
+`commandProposals` leaves out a proposal whose derived owner tag is not
+the approver's scope, and `approveCommand`/`rejectCommand` answer
+`command_proposal_not_found` for it - the same answer a missing id gets,
+so the scope is no existence oracle. Without this, an admin confined to
+one tenant could read, approve and reject every other tenant's
+proposals. The owner tag is derived from the stored payload
+(`approvals::proposal_owner_scope_satisfied`): a tag mapping may not name
+a sensitive field, so encryption at rest leaves every field a plain
+mapping reads untouched. A type with no `owner_tag_key` is unrestricted,
+as it is for commands.
+
 **Why approvals are GraphQL-only.** A decision has to be attributed to a
 `Role` (`decided_by_role_id`), and REST's bearer credentials are
 capability tokens with no `Role` behind them. REST can therefore create
@@ -12430,7 +12444,9 @@ one does not; `a_stale_approval_claim_is_taken_over`,
 claim and removed-policy paragraphs above, and
 `self_approval_is_refused_by_default` the self-approval one (refused,
 proposal still pending, approved by a second human, refused again for a
-fresh Role row with the proposer's subject, withdrawn by its proposer). `skilj/tests/command_trigger.rs` pins the REST
+fresh Role row with the proposer's subject, withdrawn by its proposer),
+and `a_scoped_approver_only_sees_and_decides_its_own_owners_proposals`
+the owner-scope one. `skilj/tests/command_trigger.rs` pins the REST
 submission's `pendingApproval`/`proposalId` answer and the stored
 proposal. `skilj/tests/deadlines.rs`'s
 `a_deadline_targeting_an_approval_required_command_proposes_it` fires a
@@ -12572,7 +12588,11 @@ refused with an error asking to move it aside. Shutdown is `pg_ctl stop
 path; this one runs whatever the system has installed, matched to an
 existing directory's major version. The data directory must be somewhere
 the `postgres` user can reach - not under `/root`, whose `0700` mode
-keeps it out.
+keeps it out. Root hands the data and socket directories to `postgres`,
+so either one being a symbolic link is refused (a link planted in a
+shared, writable parent would otherwise hand over whatever it points
+at), and `chown -h` changes a link itself, never its target, should one
+appear between that check and the `chown`.
 
 `cleanup: true` removes the password file, socket directory and log along
 with the data directory, so the password never outlives the data.
@@ -12599,3 +12619,80 @@ version pin. `local_mode_refuses_a_login_without_the_password` checks the
 login is enforced - the URL's password connects, a wrong one and none do
 not - against whichever backend the process gets; as root it exercises
 the system path, and it fails if `initdb` is switched back to `trust`.
+
+## 217. Preparing the 0.1 compatibility promise
+
+From 0.1.0 Cargo treats `0.1.x` releases as compatible, so a patch release
+becomes a promise not to break anything a dependent compiles against or
+talks to. README.md's "Status and stability" states that promise; this
+section records what was changed to make it keepable.
+
+**An audit of command approvals (§214) and local mode (§216) first.** One
+real finding: an admin grant's owner `scope` did not confine proposals, so
+an admin confined to one tenant could list, approve and reject every other
+tenant's (§214, "An approver's owner scope confines proposals"). And in local
+mode's root path, `chown` followed a symbolic link at the data or socket
+directory; both are now refused, and `chown -h` is used (§216). Also noted,
+not changed: `commandProposals` returns every proposal ever made, with no
+paging - fine while proposals are few, worth a `first`/`after` before
+anyone keeps years of them. And a proposal whose sensitive-field subject is
+forgotten before approval can no longer be revealed, so approving it fails
+and releases the claim each time; it stays pending until an admin rejects
+it.
+
+**`#[non_exhaustive]` on every public error enum.** An error enum grows
+whenever a new rule can refuse something, and without the attribute a new
+variant breaks every downstream `match` - a breaking change a patch release
+could not ship. `skilj_core::Error`, `approvals::Error`, `skilj-codegen`'s
+`Error`, `skilj-rest`'s `RestError`, `skilj-tui`'s `ClientError`, the four
+bridges' `BridgeError` and `skilj::local::Error` joined the ones that already
+had it. `skilj-rest`'s status mapping gained a `_ => 500` arm for it, as
+its inner matches already had. Deliberately left exhaustive:
+`skilj-bridge`'s `SkiljError`, which each bridge matches to decide whether
+to retry - a new variant there should fail their build, not fall into a
+default - and the status and outcome enums (`SubmitCommandOutcome`,
+`CommandProposalStatus`, ...), which this workspace's own crates match
+exhaustively and a consumer is expected to handle in full. Structs were
+not marked: tests and consumers build `RoleAccessMapping`, `CommandType`
+and their kin as literals, which the attribute would forbid.
+
+**A minimum supported Rust version, checked.** `rust-version = "1.95"` in
+`[workspace.package]`, inherited by every crate: sqlx 0.9 and
+postgresql_embedded 0.21 need 1.94, and `AtomicUsize::try_update`
+(`skilj-graphql`'s limits) was stabilised in 1.95. CI's `msrv` step builds
+the libraries and binaries with 1.95, in a target directory of its own that
+it removes afterwards (the runner's disk is the constraint, see the
+`build-clippy-test` step's comments).
+
+**Dependency policy in CI.** `cargo deny check` (`deny.toml`) fails on a
+RustSec advisory, a license that does not allow distributing skilj under
+MIT OR Apache-2.0, a wildcard version or an unknown source. The allowed
+list adds to the usual permissive licenses only what the tree needs:
+`PostgreSQL` (postgresql_embedded), `CDLA-Permissive-2.0` (webpki's root
+certificate data), `MIT-0`, and `MPL-2.0`, whose file-level copyleft only
+applies to changes to those crates' own files. It runs as a pinned release
+binary rather than `cargo install`. Advisories make CI red the day one is
+published against a dependency, unrelated to the change being built; that
+is the point.
+
+**`cargo semver-checks` at release time, not in CI.** It compares against
+what crates.io serves, and every 0.0.x release so far was allowed to break,
+so in CI it would have failed on every push. RELEASING.md runs it before
+each publish: a patch release must report nothing.
+
+**Which crates the promise covers.** All of them, for patch releases: the
+internal ones too (`skilj-macros`, `skilj-retry`, `skilj-bridge`), because a
+published `skilj-kafka` requires `skilj-bridge` with an ordinary caret
+range and gets the newest compatible one. What "internal" adds is that
+their API may change in any minor release without migration notes; each
+says so in its crate docs. `skilj-tui` and `skilj-inspector` promise their
+command line, not their Rust API.
+
+**`missing_docs` where it was nearly met.** `skilj`, `skilj-rest`,
+`skilj-retry`, `skilj-test-fixture` and `skilj-macros` had 0-9 undocumented
+public items each; those were documented and the crates now
+`#![warn(missing_docs)]`, an error under CI's clippy `-D warnings`. Not
+yet: `skilj-core` (572, mostly `db`, `event_store` and `access_control`,
+60 in the `plugin` module users implement), `skilj-graphql` (82),
+`skilj-tui` (92) and the bridges and tools (12-26 each). The plugin module
+and `skilj-graphql` are the next ones worth closing.
