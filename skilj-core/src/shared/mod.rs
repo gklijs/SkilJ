@@ -16,20 +16,32 @@ use serde::{Deserialize, Serialize};
 pub type FieldPath = String;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// One condition on a payload field, as `queryEvents` and projection queries
+/// take it: `field` compared with `value` by `operator`.
 pub struct Filter {
+    /// The payload field compared.
     pub field: FieldPath,
+    /// How it is compared.
     pub operator: FilterOperator,
+    /// What it is compared with; the operator says how the string is read.
     pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
+/// How a [`Filter`] compares a payload field with its value.
 pub enum FilterOperator {
+    /// The field equals the value.
     Equals,
+    /// The string field contains the value.
     Contains,
+    /// The string field matches the value as a SQL `LIKE` pattern (`%` and `_`
+    /// wildcards).
     IsLike,
+    /// The field is greater than the value.
     GreaterThan,
+    /// The field is less than the value.
     LessThan,
     /// Only valid against a string leaf with `format: "geo-point"`
     /// (`"lat,lng"`). `Filter.value` is `"lat,lng,radius_meters"` - the
@@ -73,11 +85,20 @@ pub enum FilterOperator {
 /// from the store itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Metadata {
+    /// The name of the event or command type the message conforms to.
     pub r#type: String,
+    /// The type's `schema_version` when the message was created.
     pub version: i64,
+    /// The client or caller that produced the message.
     pub client_id: String,
+    /// When the message was created.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The business transaction the message belongs to: every command and
+    /// event in one causal chain carries the same value. Supplied by the
+    /// caller or generated.
     pub correlation_id: Option<String>,
+    /// The id of the command or event that directly produced this message;
+    /// `None` when a caller originated it.
     pub causation_id: Option<String>,
 }
 
@@ -86,7 +107,9 @@ pub struct Metadata {
 /// the spec for why that's deliberate, not an oversight.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct Tag {
+    /// The tag key, from the [`TagMapping`] that derived it.
     pub key: String,
+    /// The mapped field's value; `None` when the payload left the field out.
     pub value: Option<String>,
 }
 
@@ -101,9 +124,13 @@ pub struct Tag {
 /// declare it and so refuses rather than storing the value in the clear.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TagMapping {
+    /// The tag key.
     pub key: String,
+    /// The payload field the tag value comes from.
     pub field: FieldPath,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Whether the tag value is a keyed hash of the field rather than the
+    /// field itself.
     pub blind: bool,
 }
 
@@ -159,8 +186,13 @@ impl TagMapping {
 /// instead of events - see [`QueryItemMapping::snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct QueryItemMapping {
+    /// The event types the item matches; empty for any type.
     pub event_types: Vec<String>,
+    /// Tags derived from the command's payload, all of which a matching event
+    /// must carry.
     pub tag_mappings: Vec<TagMapping>,
+    /// Only this many matching events, those with the highest sequences;
+    /// `None` for every match.
     pub latest: Option<u32>,
     /// A `Snapshot::NAME`: this item is that snapshot's state for the tag
     /// value its one tag mapping derives (docs/architecture.md §202).
@@ -246,7 +278,9 @@ impl QueryItemMapping {
 /// QueryItem` in specs/skilj.allium, recorded on `Command.consistency_query`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct QueryItem {
+    /// The event types the item matches; empty for any type.
     pub event_types: Vec<String>,
+    /// The tags a matching event must all carry.
     pub tags: Vec<Tag>,
     /// See [`QueryItemMapping::latest`].
     pub latest: Option<u32>,
@@ -263,8 +297,11 @@ pub struct QueryItem {
 /// `protect_sensitive_fields` in `event_store`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SensitiveField {
+    /// The payload field that is encrypted.
     pub field: FieldPath,
+    /// The namespace of the subject whose key encrypts it, e.g. `customer`.
     pub subject_key: String,
+    /// The payload field holding the subject's identifier, never encrypted.
     pub subject_field: FieldPath,
 }
 
@@ -294,9 +331,15 @@ impl SensitiveField {
 /// unused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PrivateField {
+    /// The payload field that is redacted.
     pub field: FieldPath,
+    /// Who may read it.
     pub kind: PrivateFieldKind,
+    /// The role name that may read it, for [`PrivateFieldKind::Team`]; `None`
+    /// otherwise.
     pub team: Option<String>,
+    /// The payload field naming the reader, for
+    /// [`PrivateFieldKind::Addressed`]; `None` otherwise.
     pub addressee_field: Option<FieldPath>,
 }
 
@@ -314,8 +357,12 @@ pub struct PrivateField {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PrivateFieldKind {
+    /// Readable by the record's creator.
     Own,
+    /// Readable by any role named [`PrivateField::team`].
     Team,
+    /// Readable by the party [`PrivateField::addressee_field`] names in the
+    /// payload.
     Addressed,
 }
 
@@ -326,14 +373,28 @@ pub enum PrivateFieldKind {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum CommandDecision {
-    Accepted { events: Vec<EventSpec> },
-    Rejected { reason: String, kind: String },
+    /// The command is accepted, and these events are appended with it,
+    /// atomically.
+    Accepted {
+        /// The events to append, in order; empty for none.
+        events: Vec<EventSpec>,
+    },
+    /// The command is refused, and nothing is appended.
+    Rejected {
+        /// A human-readable explanation.
+        reason: String,
+        /// A stable, machine-readable code, e.g. `insufficient_funds`.
+        kind: String,
+    },
 }
 
 /// One event a `decide()` call wants appended, on acceptance.
 #[derive(Debug, Clone)]
 pub struct EventSpec {
+    /// A registered `EventType::NAME` in the command's bounded context.
     pub event_type: String,
+    /// The event's payload, which must match the event type's payload
+    /// shape.
     pub payload: serde_json::Value,
 }
 

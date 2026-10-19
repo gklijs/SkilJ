@@ -50,6 +50,7 @@ pub fn stamp_admin_bounded_context(
 /// See `entity BootstrapSecret`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapSecret {
+    /// The secret a `createSuperadmin` claim must present.
     pub secret: String,
 }
 
@@ -62,7 +63,10 @@ pub struct BootstrapSecret {
 #[non_exhaustive]
 pub enum ContextCreator {
     /// See `variant SuperadminCreator`.
-    SuperadminCreator { role: Role },
+    SuperadminCreator {
+        /// The superadmin role that created it.
+        role: Role,
+    },
     /// See `variant SystemCreator` - no variant-specific fields, exactly
     /// as `EventOrigin::SystemTriggered` has none: SkilJ is the creator,
     /// so there is no Role to point at.
@@ -73,12 +77,15 @@ pub enum ContextCreator {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A superadmin Role already exists; the bootstrap secret can never be used again.
     #[error("a superadmin Role already exists; the bootstrap secret can never be used again")]
     SuperadminAlreadyExists,
 
+    /// The presented bootstrap secret doesn't match.
     #[error("the presented bootstrap secret doesn't match")]
     BootstrapSecretMismatch,
 
+    /// A bounded context with this name already exists.
     #[error("a bounded context with this name already exists")]
     BoundedContextNameTaken,
 
@@ -86,23 +93,31 @@ pub enum Error {
         "bounded context names must start with a lowercase letter, contain only lowercase \
          letters, digits and underscores, and be at most 40 characters long"
     )]
+    /// The name isn't a lowercase letter followed by up to 39 lowercase
+    /// letters, digits and underscores.
     InvalidBoundedContextName,
 
+    /// The admin bounded context can never be archived.
     #[error("the admin bounded context can never be archived")]
     CannotArchiveAdminContext,
 
+    /// A bounded context must be archived before it can be deleted.
     #[error("a bounded context must be archived before it can be deleted")]
     BoundedContextNotArchived,
 
+    /// The admin bounded context can never be deleted.
     #[error("the admin bounded context can never be deleted")]
     CannotDeleteAdminContext,
 
+    /// This external_subject is already bound to another active Role.
     #[error("this external_subject is already bound to another active Role")]
     ExternalSubjectAlreadyClaimed,
 
+    /// A BoundedContext used as a template must have no template of its own.
     #[error("a BoundedContext used as a template must have no template of its own")]
     TemplateItselfTemplated,
 
+    /// This bounded context has no template to resync from.
     #[error("this bounded context has no template to resync from")]
     BoundedContextHasNoTemplate,
 }
@@ -153,6 +168,7 @@ impl SkiljRejection for Error {
 pub struct BootstrapGate(std::sync::Arc<tokio::sync::Mutex<Option<BootstrapSecret>>>);
 
 impl BootstrapGate {
+    /// A gate holding `secret`; `None` when an active superadmin exists.
     pub fn new(secret: Option<BootstrapSecret>) -> Self {
         Self(std::sync::Arc::new(tokio::sync::Mutex::new(secret)))
     }
@@ -173,6 +189,8 @@ impl BootstrapGate {
     }
 }
 
+/// A fresh bootstrap secret, or `None` when `existing_roles` holds an active
+/// superadmin and no secret may be claimed.
 pub fn generate_bootstrap_secret(existing_roles: &[Role]) -> Option<BootstrapSecret> {
     if existing_roles
         .iter()

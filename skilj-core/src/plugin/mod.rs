@@ -67,7 +67,10 @@ pub trait BoundedContextEvent: Sized {
 /// final deserialization) comes next.
 #[derive(Clone, Copy)]
 pub struct UpcastStep {
+    /// The schema version `transform` produces.
     pub to_version: i64,
+    /// Rewrites a payload written before `to_version` into that version's
+    /// shape.
     pub transform: fn(serde_json::Value) -> serde_json::Value,
 }
 
@@ -162,6 +165,8 @@ pub trait CommandType {
     /// into it before calling `decide()`.
     type Event: BoundedContextEvent;
 
+    /// The command type's name, unique within its bounded context - what
+    /// GraphQL, REST and `EventSpec::event_type` name it by.
     const NAME: &'static str;
 
     /// Which bounded context `skilj::SkiljBuilder::auto_register()`
@@ -179,6 +184,9 @@ pub trait CommandType {
     /// `const BOUNDED_CONTEXT: &'static str = BOUNDED_CONTEXT;`.
     const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT;
 
+    /// The consistency tags this command's payload carries: each maps a tag
+    /// key to a payload field. `decide()` is handed every event sharing at
+    /// least one of the resulting tags. Empty by default.
     fn tag_mappings() -> Vec<TagMapping> {
         Vec::new()
     }
@@ -196,6 +204,8 @@ pub trait CommandType {
         None
     }
 
+    /// Payload fields encrypted per subject, so `forgetSubject` makes them
+    /// unreadable. Empty by default.
     fn sensitive_fields() -> Vec<SensitiveField> {
         Vec::new()
     }
@@ -399,8 +409,12 @@ pub trait CommandType {
 /// pure declaration (its schema, its tag/sensitivity mappings, which
 /// origins may create it).
 pub trait EventType {
+    /// The payload shape, and the source of its JSON Schema - derived via
+    /// `schemars`, never hand-written.
     type Payload: Serialize + DeserializeOwned + JsonSchema;
 
+    /// The event type's name, unique within its bounded context - what
+    /// `EventSpec::event_type` and the API surfaces name it by.
     const NAME: &'static str;
 
     /// See `CommandType::BOUNDED_CONTEXT`'s own doc comment - identical
@@ -408,6 +422,9 @@ pub trait EventType {
     /// `EventType` side.
     const BOUNDED_CONTEXT: &'static str = DEFAULT_BOUNDED_CONTEXT;
 
+    /// The tags this event's payload carries: each maps a tag key to a payload
+    /// field. A command whose tags overlap an event's sees that event in
+    /// `decide()`. Empty by default.
     fn tag_mappings() -> Vec<TagMapping> {
         Vec::new()
     }
@@ -427,6 +444,8 @@ pub trait EventType {
         None
     }
 
+    /// Payload fields encrypted per subject, so `forgetSubject` makes them
+    /// unreadable. Empty by default.
     fn sensitive_fields() -> Vec<SensitiveField> {
         Vec::new()
     }
@@ -439,14 +458,23 @@ pub trait EventType {
         Vec::new()
     }
 
+    /// Opt-in: whether an external system holding an external-event token
+    /// (`createExternalEventToken`) may create this event over REST, as the
+    /// broker bridges do. `false` by default.
     fn external_creation_allowed() -> bool {
         false
     }
 
+    /// Opt-in: whether this event may be created without a command, by a
+    /// caller holding a direct-creation token (`createDirectCreationToken`).
+    /// `false` by default.
     fn direct_creation_allowed() -> bool {
         false
     }
 
+    /// Opt-in: whether event read tokens may be minted for this event type
+    /// (`createEventReadToken`), so REST can serve its events. `false` by
+    /// default.
     fn event_read_allowed() -> bool {
         false
     }
@@ -523,6 +551,8 @@ pub trait EventDispatcher: Send + Sync {
 /// `project()` folds exactly one event into this projection's stored
 /// state - synchronous, like `decide()`, and for the same reason (§1.1).
 pub trait Projection {
+    /// The state `project()` folds events into, stored as JSON. `Default` is
+    /// the state before any event.
     type State: Serialize + DeserializeOwned + JsonSchema + Default;
 
     /// Same generated per-bounded-context event enum `CommandType::Event`
@@ -530,6 +560,8 @@ pub trait Projection {
     /// one. Same `: BoundedContextEvent` bound and reasoning.
     type Event: BoundedContextEvent;
 
+    /// The projection's name, unique within its bounded context - what
+    /// `queryProjection` names it by.
     const NAME: &'static str;
 
     /// See `CommandType::BOUNDED_CONTEXT`'s own doc comment - identical
@@ -691,6 +723,8 @@ pub trait Projection {
 /// balance, so they share one `AccountBalanceSnapshot` rather than each
 /// computing their own, free to drift apart.
 pub trait Snapshot {
+    /// The state `fold()` builds per tag value, stored as JSON. `Default` is
+    /// the state before any event.
     type State: Serialize + DeserializeOwned + JsonSchema + Default;
 
     /// Same generated per-bounded-context event enum `CommandType::Event`/
@@ -698,6 +732,8 @@ pub trait Snapshot {
     /// carrying its `TAG_KEY`, not just one.
     type Event: BoundedContextEvent;
 
+    /// The snapshot's name, unique within its bounded context - what
+    /// `SnapshotState::snapshot` and `Decision::snapshot` name it by.
     const NAME: &'static str;
 
     /// See `CommandType::BOUNDED_CONTEXT`'s own doc comment - identical
@@ -838,7 +874,10 @@ pub enum BlindErasure {
     /// tagging the blind key must also tag `subject_tag`; `build()`
     /// checks.
     WithSubject {
+        /// The `SensitiveField` subject key whose forgetting removes the tag.
         subject_key: &'static str,
+        /// The plain tag carrying the subject's value on every event and
+        /// command that carries the blind tag.
         subject_tag: &'static str,
     },
 }
@@ -879,7 +918,9 @@ impl From<BlindErasure> for crate::blind::Erasure {
 pub struct SnapshotState {
     /// `Snapshot::NAME`.
     pub snapshot: String,
+    /// The tag value this state was folded for.
     pub tag_value: String,
+    /// The folded state, JSON-encoded.
     pub state_json: String,
     /// The position `state_json` holds every event carrying the value
     /// through: the stored row's `as_of_sequence`, or the last event
@@ -952,6 +993,7 @@ pub struct DeadlineContext {
 }
 
 impl DeadlineContext {
+    /// A deadline's context: `expired` is whether `now` is past `deadline_at`.
     pub fn new(
         scheduled_at: chrono::DateTime<chrono::Utc>,
         deadline_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -977,6 +1019,7 @@ pub struct Decision<'a, E> {
 }
 
 impl<'a, E> Decision<'a, E> {
+    /// Built by the framework for each decision.
     pub fn new(
         events: &'a [E],
         snapshots: &'a [SnapshotState],
@@ -1428,8 +1471,12 @@ pub trait CrossContextRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CrossContextRouteStartFrom {
+    /// From the first event in the source bounded context.
     Beginning,
+    /// From the events committed after the route first starts; earlier ones
+    /// are skipped.
     Latest,
+    /// From the event after this sequence number.
     AtSequence(i64),
     /// Unix timestamp, seconds, UTC - see this enum's own doc comment
     /// for why not `DateTime<Utc>`.
@@ -1441,10 +1488,16 @@ pub enum CrossContextRouteStartFrom {
 /// catch-up loop (`db::catch_up_cross_context_route`).
 #[derive(Debug, Clone, Copy)]
 pub struct CrossContextRouteInfo {
+    /// `CrossContextRoute::NAME`: the route's identity and the name of its
+    /// cursor.
     pub name: &'static str,
+    /// The bounded context the source event type lives in.
     pub source_bounded_context: &'static str,
+    /// The event type whose events the route reacts to.
     pub source_event_type: &'static str,
+    /// The bounded context the target command type lives in.
     pub target_bounded_context: &'static str,
+    /// The command type the route submits.
     pub target_command_type: &'static str,
     /// `CrossContextRoute::START_FROM`, carried through so
     /// `db::catch_up_cross_context_route` can act on it without needing
@@ -1495,8 +1548,12 @@ pub trait CrossContextRouteDispatcher: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DeadlinePollStartFrom {
+    /// From the first event in the source bounded context.
     Beginning,
+    /// From the events committed after the reactor first starts; earlier ones
+    /// are skipped.
     Latest,
+    /// From the event after this sequence number.
     AtSequence(i64),
     /// Unix timestamp, seconds, UTC.
     AtTime(i64),
@@ -1515,8 +1572,13 @@ pub enum DeadlinePollStartFrom {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MissedRunPolicy {
+    /// Missed occurrences are not fired; the chain resumes at the next
+    /// occurrence still ahead.
     Skip,
+    /// A backlog of missed occurrences fires once, then the chain resumes
+    /// ahead.
     FireOnce,
+    /// Every missed occurrence fires, in order.
     FireAll,
 }
 
@@ -1529,10 +1591,17 @@ pub enum MissedRunPolicy {
 /// due. All three are optional: absent means unbounded that way.
 #[derive(Debug, Clone)]
 pub struct RecurrenceSpec {
+    /// A 7-field Quartz-dialect cron expression (`cron` crate) the occurrences
+    /// follow.
     pub schedule: String,
+    /// What happens to occurrences missed while nothing could fire them.
     pub policy: MissedRunPolicy,
+    /// No occurrence before this instant; `None` for no lower bound.
     pub start_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// No occurrence after this instant; `None` for no upper bound.
     pub end_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A pending firing past this instant never fires and schedules nothing
+    /// further; `None` for no limit.
     pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -1628,11 +1697,17 @@ pub fn next_recurrence_fire_at(
 /// `RecurrenceSpec::valid_until`.
 #[derive(Debug, Clone)]
 pub struct DeadlineSpec<P> {
+    /// When the deadline fires.
     pub fire_at: chrono::DateTime<chrono::Utc>,
     /// See this struct's own doc comment (Codeberg issue #97).
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The tags a `CancelDeadline` matches to cancel this deadline before it
+    /// fires.
     pub tags: Vec<Tag>,
+    /// The target command's payload, submitted when the deadline fires.
     pub payload: P,
+    /// Makes this the first firing of a recurring chain; `None` for a one-shot
+    /// deadline.
     pub recurrence: Option<RecurrenceSpec>,
 }
 
@@ -1745,20 +1820,33 @@ pub trait CancelDeadline {
 /// `CrossContextRouteInfo`.
 #[derive(Debug, Clone, Copy)]
 pub struct ScheduleDeadlineInfo {
+    /// `ScheduleDeadline::NAME`: the schedule's identity and the name of its
+    /// cursor.
     pub name: &'static str,
+    /// The bounded context the source event type lives in.
     pub source_bounded_context: &'static str,
+    /// The event type whose events schedule deadlines.
     pub source_event_type: &'static str,
+    /// The bounded context the target command type lives in.
     pub target_bounded_context: &'static str,
+    /// The command type a firing submits.
     pub target_command_type: &'static str,
+    /// `ScheduleDeadline::START_FROM`.
     pub start_from: DeadlinePollStartFrom,
 }
 
 /// One registered `CancelDeadline`'s own static identity.
 #[derive(Debug, Clone, Copy)]
 pub struct CancelDeadlineInfo {
+    /// `CancelDeadline::NAME`: the cancel reactor's identity and the name of
+    /// its cursor.
     pub name: &'static str,
+    /// The bounded context the cancelling event type lives in.
     pub source_bounded_context: &'static str,
+    /// The event type whose events cancel deadlines.
     pub source_event_type: &'static str,
+    /// The paired `ScheduleDeadline::NAME` whose pending deadlines this
+    /// cancels.
     pub deadline_schedule_name: &'static str,
     /// `Self::Deadline::Source::BOUNDED_CONTEXT` - where the paired
     /// `ScheduleDeadline`'s own `deadlines`/`deadline_cursors` rows
@@ -1775,6 +1863,7 @@ pub struct CancelDeadlineInfo {
     /// schedule has processed every such event that precedes the
     /// cancelling one (docs/architecture.md §130).
     pub deadline_schedule_source_event_type: &'static str,
+    /// `CancelDeadline::START_FROM`.
     pub start_from: DeadlinePollStartFrom,
 }
 
@@ -1810,12 +1899,16 @@ pub trait ScheduleDeadlineDispatcher: Send + Sync {
 /// payload type only, never the schedule's own recurrence decision.
 #[derive(Debug, Clone)]
 pub struct ErasedDeadlineSpec {
+    /// `DeadlineSpec::fire_at`.
     pub fire_at: chrono::DateTime<chrono::Utc>,
     /// `DeadlineSpec::expires_at`, carried through verbatim (Codeberg
     /// issue #97).
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `DeadlineSpec::tags`.
     pub tags: Vec<Tag>,
+    /// `DeadlineSpec::payload`, serialized to JSON.
     pub payload_json: String,
+    /// `DeadlineSpec::recurrence`, carried through as is.
     pub recurrence: Option<RecurrenceSpec>,
 }
 

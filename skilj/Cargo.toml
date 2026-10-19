@@ -8,6 +8,12 @@ repository.workspace = true
 readme = "../README.md"
 description = "SkilJ: a Rust library for building event-sourced, DDD-style applications backed by Postgres, exposing a GraphQL surface and a REST surface. A thin facade over skilj-core/skilj-graphql/skilj-rest - see docs/architecture.md §3.1."
 
+# docs.rs documents `skilj::local` too. `postgresql_embedded` downloads
+# nothing at build time without its `bundled` feature, so this builds
+# without network access.
+[package.metadata.docs.rs]
+features = ["local"]
+
 [features]
 default = []
 # Codeberg issue #100: the single-user local mode's embedded Postgres.

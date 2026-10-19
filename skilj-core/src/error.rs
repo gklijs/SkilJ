@@ -12,35 +12,52 @@
 
 use thiserror::Error;
 
+/// Every library-level failure `skilj-core` reports, and a command a
+/// `decide()` rejected. [`SkiljRejection::code`] gives each a stable code.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A grant, token or role refused the operation.
     #[error(transparent)]
     AccessControl(#[from] crate::access_control::Error),
 
+    /// A registration, event or command broke an event-store rule.
     #[error(transparent)]
     EventStore(#[from] crate::event_store::Error),
 
+    /// A projection registration, rebuild or query was refused.
     #[error(transparent)]
     Projections(#[from] crate::projections::Error),
 
+    /// Creating a bounded context or the first superadmin was refused.
     #[error(transparent)]
     Bootstrap(#[from] crate::bootstrap::Error),
 
+    /// Encrypting or decrypting a sensitive field failed.
     #[error(transparent)]
     Encryption(#[from] crate::encryption::Error),
 
+    /// A blind tag could not be derived or checked.
     #[error(transparent)]
     Blind(#[from] crate::blind::Error),
 
+    /// A secret operation was refused.
     #[error(transparent)]
     Secrets(#[from] crate::secrets::Error),
 
+    /// A command proposal could not be approved or rejected.
     #[error(transparent)]
     Approvals(#[from] crate::approvals::Error),
 
+    /// A `decide()` rejected the command: a business outcome, not a
+    /// library failure.
     #[error("command rejected: {reason}")]
-    CommandRejected { reason: String, kind: String },
+    CommandRejected {
+        /// The human-readable explanation `decide()` gave.
+        reason: String,
+        /// The machine-readable code `decide()` gave.
+        kind: String,
+    },
 
     /// Only ever produced by `db::submit_command`'s own DCB-conflict
     /// retry path (see its own doc comment) - the redispatch it runs
@@ -56,6 +73,8 @@ pub enum Error {
     #[error("this CommandType has no decide() registered in the running process")]
     NoDeciderRegistered,
 
+    /// A query failed. Its detail is logged, never shown to a caller
+    /// (docs/architecture.md §93).
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -80,7 +99,12 @@ pub enum Error {
     /// generic value; only the typed variant itself (and so its HTTP
     /// status mapping, always 500 here) is lost.
     #[error("command batch failed: {message}")]
-    BatchFailed { code: String, message: String },
+    BatchFailed {
+        /// The original error's code.
+        code: String,
+        /// The original error's message.
+        message: String,
+    },
 
     /// Distinct from `Database` above - a migration failure means the
     /// schema itself couldn't be brought up to date (a startup-time
@@ -96,7 +120,10 @@ pub enum Error {
     /// than the `skilj-core` it runs with, and the newer one added a
     /// variant. Names the enum, so the log says what to update.
     #[error("{what} has a value this build does not support; update all skilj crates to the same version")]
-    Unsupported { what: &'static str },
+    Unsupported {
+        /// The enum's name.
+        what: &'static str,
+    },
 }
 
 impl Error {
@@ -122,7 +149,9 @@ impl Error {
 /// machine-readable identifier (`extensions.code` on the wire, GraphQL or
 /// REST alike - §5.4, §7.5); `message()` is the human-readable text.
 pub trait SkiljRejection {
+    /// The stable, machine-readable code, e.g. `insufficient_funds`.
     fn code(&self) -> &str;
+    /// The human-readable message a caller may see.
     fn message(&self) -> String;
 
     /// Detail that must not reach a caller but belongs in the server's
@@ -232,4 +261,5 @@ impl Error {
     }
 }
 
+/// `skilj-core`'s result type.
 pub type Result<T> = std::result::Result<T, Error>;

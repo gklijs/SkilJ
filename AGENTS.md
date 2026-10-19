@@ -51,7 +51,7 @@ cargo deny check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
-`skilj`, `skilj-rest`, `skilj-retry`, `skilj-test-fixture` and `skilj-macros` have `#![warn(missing_docs)]`, which clippy's `-D warnings` makes an error: a new public item there needs a doc comment.
+`skilj`, `skilj-core`, `skilj-rest`, `skilj-retry`, `skilj-test-fixture` and `skilj-macros` have `#![warn(missing_docs)]`, which clippy's `-D warnings` makes an error: a new public item there needs a doc comment.
 
 Every public enum of the library crates is `#[non_exhaustive]` (docs/architecture.md §217, §219), and a new one must be too: match one from another crate with a `_` arm that answers `skilj_core::Error::Unsupported` (or the bridge's `BridgeError::Unsupported`). Adding a variant therefore compiles everywhere - search for the enum's matches in the other crates and handle it there.
 

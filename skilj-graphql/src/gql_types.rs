@@ -1135,6 +1135,7 @@ pub fn command_proposal_status_name(status: CommandProposalStatus) -> &'static s
         CommandProposalStatus::Approved => "APPROVED",
         CommandProposalStatus::Rejected => "REJECTED",
         CommandProposalStatus::Expired => "EXPIRED",
+        CommandProposalStatus::Forgotten => "FORGOTTEN",
         _ => UNSUPPORTED_VALUE,
     }
 }
@@ -1146,6 +1147,7 @@ pub fn command_proposal_status_enum(n: &Naming) -> Enum {
         .item("APPROVED")
         .item("REJECTED")
         .item("EXPIRED")
+        .item("FORGOTTEN")
 }
 
 /// `approveCommand`/`rejectCommand`'s answer: the proposal after the

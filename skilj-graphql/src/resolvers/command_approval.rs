@@ -35,6 +35,7 @@ fn status_from_graphql(value: &str) -> Option<CommandProposalStatus> {
         "APPROVED" => CommandProposalStatus::Approved,
         "REJECTED" => CommandProposalStatus::Rejected,
         "EXPIRED" => CommandProposalStatus::Expired,
+        "FORGOTTEN" => CommandProposalStatus::Forgotten,
         _ => return None,
     })
 }

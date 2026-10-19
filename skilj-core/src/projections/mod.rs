@@ -45,6 +45,7 @@ use crate::event_store::{BoundedContext, BoundedContextStatus, Event, EventType}
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A projection may only consume EventTypes from its own bounded context.
     #[error("a projection may only consume EventTypes from its own bounded context")]
     ConsumedEventTypeNotInBoundedContext,
 
@@ -54,6 +55,7 @@ pub enum Error {
     #[error("consumedEventTypes names the EventType {0:?} more than once")]
     DuplicateConsumedEventType(String),
 
+    /// No pending ProjectionRebuild is staged for this projection.
     #[error("no pending ProjectionRebuild is staged for this projection")]
     NoProjectionRebuildStaged,
 
@@ -88,12 +90,20 @@ impl SkiljRejection for Error {
 /// omitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Projection {
+    /// The bounded context the projection is registered in.
     pub bounded_context: BoundedContext,
+    /// The projection's name, unique within its bounded context.
     pub name: String,
+    /// The state's JSON Schema, as registered.
     pub schema: String,
+    /// Incremented by each re-registration that changes the schema.
     pub schema_version: i64,
+    /// The event types it folds.
     pub consumed_event_types: Vec<EventType>,
+    /// Whether it is updated in the same transaction as the events it folds,
+    /// rather than caught up in the background.
     pub sync: bool,
+    /// The last sequence it has processed; `None` before any.
     pub caught_up_to: Option<i64>,
 }
 
@@ -104,19 +114,28 @@ pub struct Projection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProjectionRebuildStatus {
+    /// Staged by a re-registration, waiting for an admin to start the rebuild.
     Pending,
+    /// Replaying the bounded context's events; promoted when caught up.
     Building,
 }
 
 /// See `entity ProjectionRebuild`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionRebuild {
+    /// The live projection it would replace.
     pub projection: Projection,
+    /// The new state schema.
     pub schema: String,
+    /// The schema version it would take.
     pub schema_version: i64,
+    /// The event types it would fold.
     pub consumed_event_types: Vec<EventType>,
+    /// Whether it would be a sync projection.
     pub sync: bool,
+    /// The last sequence the rebuild has processed; `None` before any.
     pub caught_up_to: Option<i64>,
+    /// Where the rebuild is.
     pub status: ProjectionRebuildStatus,
 }
 
@@ -135,7 +154,9 @@ pub struct ProjectionRebuild {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProjectionRegistration {
+    /// A new projection was registered.
     Created {
+        /// The projection.
         projection: Projection,
         /// `true` only for a first-time registration where `sync` is
         /// true and the bounded context already has committed events
@@ -159,7 +180,11 @@ pub enum ProjectionRegistration {
         /// an in-progress fold.
         needs_history_fold: bool,
     },
+    /// The registration changed what the projection computes: a rebuild is
+    /// staged, and the live projection keeps serving until it is promoted.
     RebuildStaged(ProjectionRebuild),
+    /// Nothing that needs a rebuild changed; the live projection was updated
+    /// in place.
     ReconciledTrivially(Projection),
 }
 
@@ -475,8 +500,11 @@ pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey
 /// required team - every projection before this pass, and most after
 /// it.
 pub struct ProjectionAccessScope<'a> {
+    /// Whether the projection declares an owner tag key.
     pub declares_owner: bool,
+    /// The queried instance's stored owner; `None` for none.
     pub instance_owner: Option<&'a str>,
+    /// The team the projection is restricted to; `None` for no restriction.
     pub team_only: Option<&'a str>,
 }
 

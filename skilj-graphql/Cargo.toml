@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "SkilJ's GraphQL surface: a unified async-graphql::dynamic schema rebuilt at runtime, and resolvers for every GraphQL-facing surface. See docs/architecture.md §5."
+description = "SkilJ's GraphQL surface (internal - use it through the skilj crate): a unified async-graphql::dynamic schema rebuilt at runtime, and resolvers for every GraphQL-facing surface. See docs/architecture.md §5."
 
 [dependencies]
 skilj-core.workspace = true

@@ -20,6 +20,40 @@ the value. That's how "an email address is registered once" stays an ordinary co
 without the address ever being stored in the clear - see
 [`docs/architecture.md` §205](docs/architecture.md#blind-tags).
 
+## Why skilj?
+
+The name first: *skilj* is an anagram of Klijs, the author's last name, and in Swedish
+*skilja* (stem *skilj*) means to separate. That's most of the design. A command is decided
+against only the events it shares tags with, kept apart from everything else. Bounded contexts
+never contend with each other. Personal data is kept separate from the event log, so it can be
+forgotten without rewriting history. Reads are served by projections built separately from the
+write path.
+
+What you get in one library on one Postgres database, without running a separate event store:
+
+- **Consistency per command, not per aggregate** (see below), with gapless sequence numbers
+  per bounded context.
+- **GraphQL and REST APIs, generated from your registered types.** The GraphQL schema is
+  tailored to each caller's grants, can serve as an Apollo Federation subgraph, and has live
+  subscriptions.
+- **Personal data handling built in:** sensitive fields are encrypted per subject, and
+  `forgetSubject` makes them unreadable. Blind tags check uniqueness without storing the value.
+- **The parts an event-sourced system usually builds itself:** projections, snapshots,
+  deadlines and recurring schedules, idempotency keys, command approval, upcasting, parked
+  deliveries with redrive, and bridges to Kafka, AMQP 1.0, NATS JetStream and Temporal.
+
+When it's probably not the right choice:
+
+- **You can't or won't run Postgres.** skilj is Postgres only, by design.
+- **One bounded context needs thousands of commands per second.** Commands for the same
+  bounded context are serialized through one lock (group-committed). Measured rates are in the
+  hundreds per second per context, and contexts scale independently; see
+  [`docs/performance.md`](docs/performance.md).
+- **You want aggregates, or a polyglot event store** that services in other languages append to
+  directly. Other services reach skilj over GraphQL, REST or a broker bridge, not by writing to
+  its tables.
+- **You need a vendor's support or an independent audit.** See "Status and stability" below.
+
 ## A quick look
 
 This is trimmed from [`templates/skilj-template/src/wallet.rs`](templates/skilj-template/src/wallet.rs)
@@ -89,7 +123,7 @@ To add `skilj` to an existing project instead:
 
 ```toml
 [dependencies]
-skilj = "0.0"
+skilj = "0.1"
 ```
 
 [`skilj-demo`](skilj-demo) in this repository is a larger worked example (two bounded contexts:
@@ -113,13 +147,16 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
   ([`docs/architecture.md` §159](docs/architecture.md)). Take a backup before upgrading
   production; there is no tool to go back to an older schema.
 - **Minimum supported Rust version: 1.95**, checked in CI. Raising it is a minor-release change.
-- **Which crates the promise covers.** `skilj`, `skilj-core`, `skilj-graphql`, `skilj-rest`,
-  `skilj-codegen`, `skilj-test-fixture` and the bridges (`skilj-kafka`, `skilj-amqp`,
-  `skilj-nats`, `skilj-temporal`). `skilj-tui` and `skilj-inspector` are tools: their command
-  line is covered, their Rust API is not. `skilj-macros`, `skilj-retry` and `skilj-bridge` are
-  internal, published because other crates need them: a patch release never breaks them either,
-  but they may change in any minor release without migration notes. Use the macros through
-  `skilj`'s re-exports, and the other two not at all.
+- **Which crates the promise covers.** `skilj`, `skilj-core`, `skilj-rest`, `skilj-codegen`,
+  `skilj-test-fixture` and the bridges (`skilj-kafka`, `skilj-amqp`, `skilj-nats`,
+  `skilj-temporal`). `skilj-tui` and `skilj-inspector` are tools: their command line is
+  covered, their Rust API is not. `skilj-graphql`, `skilj-macros`, `skilj-retry` and
+  `skilj-bridge` are internal, published because other crates need them: a patch release never
+  breaks them either, but they may change in any minor release without migration notes. The
+  GraphQL contract itself is covered, like REST's; use `skilj-graphql` and the macros through
+  `skilj`'s router and re-exports, and the other two not at all. Items hidden from the documentation
+  (`#[doc(hidden)]`) aren't covered either; `skilj-core`'s `db` module is the largest
+  ([`docs/architecture.md` §220](docs/architecture.md)).
 - **Security.** Only the latest release gets fixes; see [`SECURITY.md`](SECURITY.md). The design
   has been through many rounds of internal review, recorded in
   [`docs/architecture.md`](docs/architecture.md), but has had no independent third-party audit.
@@ -130,7 +167,7 @@ Postgres in a persistent data directory, with no `DATABASE_URL` needed (docs/arc
 |---|---|
 | [`skilj`](skilj) | The main library - start here. A thin facade over `skilj-core`/`skilj-graphql`/`skilj-rest`. |
 | [`skilj-core`](skilj-core) | The domain engine: events, commands, projections, and persistence. No web framework dependency. |
-| [`skilj-graphql`](skilj-graphql) | The GraphQL surface - usable on its own if you don't need REST, and optionally an Apollo Federation subgraph for Apollo Router, Hive Router or Cosmo to compose (docs/architecture.md §194). |
+| [`skilj-graphql`](skilj-graphql) | The GraphQL surface `Skilj::graphql_router()` serves - optionally an Apollo Federation subgraph for Apollo Router, Hive Router or Cosmo to compose (docs/architecture.md §194). Internal: use it through `skilj`. |
 | [`skilj-rest`](skilj-rest) | The REST surface - authenticated routes for agents and automated callers. |
 | [`skilj-codegen`](skilj-codegen) | Optional: generate event/command boilerplate from a declarative `.skilj.toml` file instead of hand-writing it. |
 | [`skilj-tui`](skilj-tui) | `cargo install skilj-tui` - a terminal console (GraphQL client) for browsing and operating a running deployment. |

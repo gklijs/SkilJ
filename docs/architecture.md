@@ -12819,3 +12819,91 @@ rather than fail.
 
 The bridge and GraphQL fallbacks have no test: an unknown variant of an
 enum cannot be built to drive them.
+
+## 220. `skilj-core`'s internal modules are `#[doc(hidden)]`
+
+§217 left all of `skilj-core` covered by the patch-release promise, which
+then included its 227 public `db` functions - SQL helpers `skilj` and
+`skilj-graphql` call several hundred times - and the caches and
+coordinators behind the facade. Every one of those signatures would have
+been fixed until 0.2, though no application should call them. The user's
+decision: hide them.
+
+**What is hidden.** `db`, `command_batcher`, `cross_instance`,
+`event_cache`, `template_cache` and `slow_command` are
+`#[doc(hidden)]`, and so is `BlindIndex::with_templates`, which takes
+a `TemplateCache`. They stay `pub`: the other workspace crates call them.
+A hidden item is outside the promise and may change in a patch release;
+`cargo semver-checks` skips it as well. What stays public is what an
+application writes against or meets: `plugin`, `shared`, `error`,
+`event_store`, `access_control`, `approvals`, `blind`, `bootstrap`,
+`encryption`, `projections` and `secrets`.
+
+**What needed a public path.** `SkiljBuilder::pool_options` takes sqlx's
+`PgPoolOptions`, which was only reachable as `skilj_core::db::PgPoolOptions`;
+`skilj` re-exports it as `skilj::PgPoolOptions`. No other signature of a
+covered crate (`skilj`, `skilj-rest`, `skilj-test-fixture`, the bridges)
+names a hidden type. `skilj-graphql`'s `AppState` does - its pool, event
+cache, template cache and command batcher - so assembling `skilj-graphql`
+by hand, without `skilj`, depends on hidden items. Its Rust API is
+therefore internal, like `skilj-retry`'s and `skilj-bridge`'s (§217): a
+patch release never breaks it, a minor one may without migration notes.
+The GraphQL contract it serves stays covered, and `FederationOptions` and
+`GraphqlLimits` are covered as `skilj`'s re-exports. The README no longer
+calls it usable on its own.
+
+**A public way to seed a development database.** The template's and
+`skilj-demo`'s `server.rs` seeded a role, its Admin grants and command
+tokens through `db::*` directly - the first code a new user copies,
+leaning on hidden functions. `skilj::dev` replaces that:
+`seed_admin(database_url, name, bounded_contexts)` connects (a pool of
+two), migrates, creates each bounded context that is missing and a new
+Admin role over them, and `DevAdmin::create_command_token(bc, command)`
+mints a REST token as `<id>.<secret>` once `build()` has registered the
+type. An unregistered type or a bounded context it wasn't given is
+`Error::Database(RowNotFound)`, which REST already answers as not found.
+Its docs say what the doc comments of both servers already did: a
+production deployment claims the bootstrap secret instead (§109).
+Test: `skilj/tests/dev_seed.rs` - seeded twice (the bounded context is
+reused, the roles differ), reconciliation registers under the seeded
+role, the minted token's command is accepted over REST, and the two
+not-found cases are refused.
+
+**`missing_docs` on `skilj-core`.** §217 left 572 undocumented public
+items. Hiding the internal modules took that to 464 - `missing_docs`
+skips `#[doc(hidden)]` items - and those were documented: the plugin
+traits' items, the entity fields, the enum variants and the error
+variants, 41 of them from their own `#[error]` message. The crate is
+now `#![warn(missing_docs)]`, an error under CI's clippy `-D warnings`.
+`skilj-graphql`, internal now, isn't held to it.
+
+**docs.rs and `local`.** `skilj`'s `[package.metadata.docs.rs]` turns on
+the `local` feature, so `skilj::local` is documented there.
+`postgresql_embedded` downloads Postgres at build time only with its
+`bundled` feature, which skilj doesn't enable, so the docs.rs build
+needs no network.
+
+<a id="forgotten-proposals"></a>
+## 221. `forgetSubject` forgets pending command proposals too
+
+A command proposal (§214) stores its payload encrypted with the command type's sensitive fields, as a command does. When one of those subjects was forgotten, the proposal could never be approved: revealing the payload for `decide()` found no key and failed with `encryption_key_not_active`. The claim was then released back to `pending`, so the proposal stayed in the queue, looking approvable, and failed the same way on every attempt. It ended only when an admin rejected it, or when its approval deadline passed, if it had one. Approving it anyway isn't an option even in principle: submitting would provision the forgotten subject a fresh key and store their data again, the problem §132 fixed for deadlines.
+
+The fix is the user's choice, out of four options: leave it documented, close the proposals in `forgetSubject`, close them when an approval fails, or hide them when listing. It does the second, with the third as a safety net.
+
+**In `forgetSubject`.** `db::forget_subject_in_command_proposals` runs before the key is destroyed, like the deadline and blind-tag steps, so a failure leaves the call retryable:
+
+- **Where it looks:** the erased bounded context's own `command_proposals`, `pending` rows only, 1000 at a time. A proposal lives in its command's bounded context, so unlike deadlines there is no walk over every context.
+- **When a row names the subject:** when its payload does through its command type's sensitive fields (`sensitive_field_subjects`) - the subject field itself is stored in the clear. `command_type_name` references `command_types`, so the type can't be gone, but should it be, it falls back to the subject value appearing anywhere in the payload, as the deadline step does.
+- **What happens to it:** a new terminal status, `forgotten` (GraphQL `FORGOTTEN`), with `decided_at` set and no deciding role. A status of its own, rather than `rejected` with a kind, keeps it apart from a human's decision in the audit trail, matching the deadline status of the same name. The payload stays: it is encrypted as a command's is, so the proposal renders as a command of a forgotten subject does.
+- **An `approving` claim** is past stopping and left alone, as a `firing` deadline is. If that approval revealed the payload just before the key went, its submission provisions a fresh key and stores the data again. This is the same narrow window §132 accepts for deadlines.
+
+**When approving.** A subject can also be forgotten without that step: by an instance running an older build, or by code calling `db::destroy_encryption_key` directly. So when revealing the payload fails, `approve_command_proposal` now checks whether any of the proposal's subjects had a key destroyed at or after the proposal was made (`proposal_subject_forgotten`). Making the proposal provisioned or reused that subject's active key, and a subject has at most one active key, so any destruction since means the payload's key is gone - even when a later submission has provisioned a fresh one, which `get_active_data_key` alone can't tell apart. If so, the proposal is finished `forgotten` instead of released, and the approval fails with the new `approvals::Error::ProposalSubjectForgotten` (`command_proposal_subject_forgotten`; 409 on REST, where decisions aren't served today). Any other failure still releases the claim, so a transient one stays retryable.
+
+**Schema.** The `status` CHECK of `command_proposals` gains `forgotten`. The table hasn't been released (it is new since 0.0.10), so only its `CREATE TABLE` changes, with no startup patch. A development database whose table was created by an earlier build of `main` keeps the old constraint, and `forgetSubject` fails there on a matching proposal until the table is recreated.
+
+Test: `forgetting_a_subject_forgets_its_pending_proposals` (`skilj/tests/subject_erasure.rs`), with the approval-required `ProposeEmail` sharing the event's sensitive `email`/`user_id`:
+- forgetting user 42 makes 42's pending proposal `forgotten`, leaves 43's `pending` and a claimed 42 proposal `approving`;
+- `commandProposals(status: FORGOTTEN)` lists exactly that proposal, and approving it is `command_proposal_not_pending`, while 43's approves;
+- a proposal for user 44 whose key is destroyed directly, with a second proposal provisioning 44 a fresh key in between, fails to approve with `command_proposal_subject_forgotten` and is `forgotten` afterwards, while the second one approves.
+
+Without the `forgetSubject` step, 42's proposal stayed `pending`.

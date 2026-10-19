@@ -49,6 +49,7 @@ impl CommandApprovalPolicy {
         }
     }
 
+    /// Whether the account that proposed a command may approve it too.
     pub fn allowing_self_approval(mut self, allow: bool) -> Self {
         self.allow_self_approval = allow;
         self
@@ -61,14 +62,25 @@ impl CommandApprovalPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CommandProposalStatus {
+    /// Waiting for an approver.
     Pending,
+    /// Claimed by an approver whose submission is running.
     Approving,
+    /// Approved, and the command submitted.
     Approved,
+    /// Rejected by an approver, or by the command's own `decide()` at
+    /// approval.
     Rejected,
+    /// Its approval deadline passed first.
     Expired,
+    /// A subject its sensitive fields are encrypted for was forgotten
+    /// (`forgetSubject`) first, so it can never be approved
+    /// (docs/architecture.md §221).
+    Forgotten,
 }
 
 impl CommandProposalStatus {
+    /// The lowercase name stored and served, e.g. `pending`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -76,9 +88,11 @@ impl CommandProposalStatus {
             Self::Approved => "approved",
             Self::Rejected => "rejected",
             Self::Expired => "expired",
+            Self::Forgotten => "forgotten",
         }
     }
 
+    /// Parses [`Self::as_str`]'s output; `None` for anything else.
     pub fn from_db(value: &str) -> Option<Self> {
         Some(match value {
             "pending" => Self::Pending,
@@ -86,6 +100,7 @@ impl CommandProposalStatus {
             "approved" => Self::Approved,
             "rejected" => Self::Rejected,
             "expired" => Self::Expired,
+            "forgotten" => Self::Forgotten,
             _ => return None,
         })
     }
@@ -96,18 +111,31 @@ impl CommandProposalStatus {
 /// (`render_command`) before it reaches a reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandProposal {
+    /// The proposal's id.
     pub id: String,
+    /// The bounded context the command was submitted to.
     pub bounded_context: crate::event_store::BoundedContext,
+    /// The command type submitted.
     pub command_type_name: String,
+    /// The submitted payload, JSON, encrypted at rest as a command's is.
     pub payload: String,
+    /// The submission's metadata; `client_id` is the proposer.
     pub metadata: Metadata,
+    /// Where the proposal is in its lifecycle.
     pub status: CommandProposalStatus,
+    /// The submission's idempotency key, applied when it is approved.
     pub idempotency_key: Option<String>,
+    /// When it was proposed.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Its approval deadline; `None` for none.
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When it was approved, rejected, expired or forgotten.
     pub decided_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The role that approved or rejected it.
     pub decided_by_role_id: Option<String>,
+    /// Why it was rejected, by the approver or by `decide()`.
     pub rejection_reason: Option<String>,
+    /// The rejection's machine-readable code.
     pub rejection_kind: Option<String>,
     /// The accepted command's own `Command.id` (`commands.external_id`),
     /// present once approval produced one.
@@ -173,7 +201,9 @@ pub fn check_approver(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProposalDecision {
+    /// The claim is for approving.
     Approve,
+    /// The claim is for rejecting.
     Reject,
 }
 
@@ -204,29 +234,54 @@ pub fn check_self_approval(
     Ok(())
 }
 
+/// Why a command proposal could not be approved or rejected.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// No such proposal, or one outside the caller's owner scope.
     #[error("no command proposal with id {id:?} exists in this bounded context")]
-    ProposalNotFound { id: String },
+    ProposalNotFound {
+        /// The id asked for.
+        id: String,
+    },
 
+    /// The proposal was already decided, or is being approved.
     #[error("this command proposal is {status}, not pending approval")]
-    ProposalNotPending { status: &'static str },
+    ProposalNotPending {
+        /// Its current status, as [`CommandProposalStatus::as_str`] names it.
+        status: &'static str,
+    },
 
+    /// Its approval deadline passed.
     #[error("this command proposal's approval deadline has passed")]
     ProposalExpired,
 
+    /// The approver's role isn't the one the command type requires.
     #[error("this command type must be approved by a Role named {required:?}")]
-    InsufficientApprovalRole { required: String },
+    InsufficientApprovalRole {
+        /// The role name required.
+        required: String,
+    },
 
+    /// An approval deadline of zero or fewer seconds.
     #[error("an approval policy's deadline must be a positive number of seconds")]
     InvalidApprovalPolicy,
 
+    /// The proposer tried to approve their own command.
     #[error("the account that proposed this command may not approve it")]
     SelfApprovalNotAllowed,
+
+    /// A subject the proposal's sensitive fields are encrypted for was
+    /// forgotten, so its payload can no longer be read; approving it
+    /// recorded it as forgotten (docs/architecture.md §221).
+    #[error(
+        "a subject this command proposal names was forgotten, so it can no longer be approved"
+    )]
+    ProposalSubjectForgotten,
 }
 
 impl Error {
+    /// The stable code served for it, e.g. `command_proposal_not_found`.
     pub fn code(&self) -> &'static str {
         match self {
             Error::ProposalNotFound { .. } => "command_proposal_not_found",
@@ -235,6 +290,7 @@ impl Error {
             Error::InsufficientApprovalRole { .. } => "insufficient_approval_role",
             Error::InvalidApprovalPolicy => "invalid_approval_policy",
             Error::SelfApprovalNotAllowed => "self_approval_not_allowed",
+            Error::ProposalSubjectForgotten => "command_proposal_subject_forgotten",
         }
     }
 }

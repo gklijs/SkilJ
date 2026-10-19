@@ -1155,7 +1155,7 @@ fn command_proposals_table_ddl(schema: &str) -> String {
             metadata_correlation_id TEXT,
             metadata_causation_id TEXT,
             status TEXT NOT NULL CHECK (status IN \
-                ('pending', 'approving', 'approved', 'rejected', 'expired')),
+                ('pending', 'approving', 'approved', 'rejected', 'expired', 'forgotten')),
             idempotency_key TEXT,
             created_at TIMESTAMPTZ NOT NULL,
             expires_at TIMESTAMPTZ,
@@ -5173,6 +5173,116 @@ pub async fn release_command_proposal(
     Ok(())
 }
 
+/// Whether a subject `proposal`'s sensitive fields are encrypted for had
+/// a key destroyed at or after the proposal was made. Making it provisioned
+/// (or reused) that subject's active key, and a subject has at most one
+/// active key, so any destruction since means the key the payload was
+/// encrypted under is gone - even if a later submission has provisioned a
+/// fresh one (docs/architecture.md §221).
+async fn proposal_subject_forgotten(
+    pool: &Pool,
+    command_type: &CommandType,
+    proposal: &CommandProposal,
+) -> crate::error::Result<bool> {
+    let schema = schema_ident(&proposal.bounded_context.name);
+    for (subject_key, subject_value) in crate::event_store::sensitive_field_subjects(
+        &command_type.sensitive_fields,
+        &proposal.payload,
+    ) {
+        let destroyed: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {schema}.encryption_keys \
+             WHERE subject_key = $1 AND subject_value = $2 \
+               AND status = 'destroyed' AND destroyed_at >= $3)"
+        )))
+        .bind(&subject_key)
+        .bind(&subject_value)
+        .bind(proposal.created_at)
+        .fetch_one(pool)
+        .await?;
+        if destroyed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `forgetSubject`'s proposal half (docs/architecture.md §221): every
+/// `pending` proposal in `bounded_context` whose sensitive fields are
+/// encrypted for the subject is finished as `forgotten`. Once the key is
+/// destroyed its payload can never be revealed, so it could never be
+/// approved; left alone it would sit in the queue until someone rejected
+/// it, or failed to approve it. Called before the key goes, like
+/// [`forget_subject_in_deadlines`]. A proposal names the subject when its
+/// payload does through its command type's sensitive fields
+/// (`sensitive_field_subjects`) - the subject field itself is stored in
+/// the clear - or, should that type be gone, when the subject value
+/// appears anywhere in it. The payload is kept, encrypted as a command's
+/// is, so the proposal renders as a command of a forgotten subject does.
+/// An `approving` claim is past stopping and left alone, as a `firing`
+/// deadline is: if it already revealed the payload, its submission
+/// provisions a fresh key. Returns how many proposals were forgotten.
+pub async fn forget_subject_in_command_proposals(
+    pool: &Pool,
+    bounded_context: &str,
+    subject_key: &str,
+    subject_value: &str,
+    now: DateTime<Utc>,
+) -> crate::error::Result<u64> {
+    const PAGE: i64 = 1000;
+    let schema = schema_ident(bounded_context);
+    let mut sensitive_fields: std::collections::HashMap<String, Option<Vec<SensitiveField>>> =
+        std::collections::HashMap::new();
+    let mut forgotten = 0;
+    let mut after = String::new();
+    loop {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT id, command_type_name, payload FROM {schema}.command_proposals \
+             WHERE status = 'pending' AND id > $1 ORDER BY id LIMIT $2"
+        )))
+        .bind(&after)
+        .bind(PAGE)
+        .fetch_all(pool)
+        .await?;
+        let Some((last_id, _, _)) = rows.last() else {
+            break;
+        };
+        after = last_id.clone();
+        for (id, command_type, payload) in &rows {
+            if !sensitive_fields.contains_key(command_type) {
+                let fields = get_command_type(pool, bounded_context, command_type)
+                    .await?
+                    .map(|ct| ct.sensitive_fields);
+                sensitive_fields.insert(command_type.clone(), fields);
+            }
+            let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
+            let names_subject = match (&sensitive_fields[command_type], &parsed) {
+                (Some(fields), Some(_)) => {
+                    crate::event_store::sensitive_field_subjects(fields, payload)
+                        .iter()
+                        .any(|(key, value)| key == subject_key && value == subject_value)
+                }
+                (_, Some(json)) => json_mentions(json, subject_value),
+                (_, None) => payload.contains(subject_value),
+            };
+            if names_subject {
+                forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {schema}.command_proposals SET status = 'forgotten', decided_at = $1 \
+                     WHERE id = $2 AND status = 'pending'"
+                )))
+                .bind(now)
+                .bind(id)
+                .execute(pool)
+                .await?
+                .rows_affected();
+            }
+        }
+        if (rows.len() as i64) < PAGE {
+            break;
+        }
+    }
+    Ok(forgotten)
+}
+
 pub async fn reject_command_proposal(
     pool: &Pool,
     bounded_context: &str,
@@ -5341,6 +5451,30 @@ pub async fn approve_command_proposal(
     .await
     {
         Ok(payload) => payload,
+        // docs/architecture.md §221: a subject forgotten without
+        // `forget_subject_in_command_proposals` (an older instance, or a
+        // direct `destroy_encryption_key`) - the payload is gone for good,
+        // so the proposal is finished rather than released to fail again.
+        Err(e) if proposal_subject_forgotten(pool, &command_type, &proposal).await? => {
+            tracing::info!(
+                bounded_context,
+                proposal_id = id,
+                error = %e,
+                "a subject this proposal names was forgotten - recording it as forgotten"
+            );
+            finish_command_proposal(
+                pool,
+                bounded_context,
+                id,
+                CommandProposalStatus::Forgotten,
+                None,
+                None,
+                None,
+                now,
+            )
+            .await?;
+            return Err(crate::approvals::Error::ProposalSubjectForgotten.into());
+        }
         Err(e) => {
             release_command_proposal(pool, bounded_context, id).await?;
             return Err(e);

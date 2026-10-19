@@ -107,7 +107,9 @@ use crate::shared::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BoundedContextStatus {
+    /// Accepts commands and events.
     Active,
+    /// Accepts no new writes; its history is kept.
     Archived,
 }
 
@@ -121,9 +123,13 @@ pub enum BoundedContextStatus {
 /// treatment every other relationship projection in this codebase gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedContext {
+    /// The bounded context's unique name.
     pub name: String,
+    /// Whether it accepts writes.
     pub status: BoundedContextStatus,
+    /// When it was created.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Who created it.
     pub created_by: crate::bootstrap::ContextCreator,
     /// See `entity BoundedContext`'s own `template` field doc comment
     /// (Codeberg issue #13). `None` for every context `AddBoundedContext`
@@ -166,18 +172,26 @@ impl BoundedContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MissedOccurrencePolicy {
+    /// Missed occurrences are not fired.
     Skip,
+    /// A backlog of missed occurrences fires once.
     FireOnce,
+    /// Every missed occurrence fires, in order.
     ReplayBacklog,
 }
 
 /// See `entity EventType`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventType {
+    /// The bounded context the type is registered in.
     pub bounded_context: BoundedContext,
+    /// The type's name, unique within its bounded context.
     pub name: String,
+    /// The payload's JSON Schema, as registered.
     pub schema: String,
+    /// Incremented by each re-registration that changes the schema.
     pub schema_version: i64,
+    /// The tags derived from each event's payload.
     pub tag_mappings: Vec<TagMapping>,
     /// See `plugin::EventType::owner_tag_key`'s own doc comment - names
     /// which of `tag_mappings`' own keys is this type's "owner"
@@ -189,6 +203,7 @@ pub struct EventType {
     /// per-event predicate (docs/architecture.md's own write-up of these
     /// passes).
     pub owner_tag_key: Option<String>,
+    /// Payload fields encrypted per subject.
     pub sensitive_fields: Vec<SensitiveField>,
     /// See `value PrivateField`'s own doc comment - a plain read-time
     /// redaction rule standing beside `sensitive_fields`, not inside it.
@@ -200,12 +215,18 @@ pub struct EventType {
     /// gets, and for the same reason. Validated at registration by
     /// `valid_private_fields`.
     pub private_fields: Vec<PrivateField>,
+    /// Whether external systems may create this event with an external-event
+    /// token.
     pub external_creation_allowed: bool,
+    /// Whether callers may create this event without a command, with a
+    /// direct-creation token.
     pub direct_creation_allowed: bool,
     /// See `EventOrigin::SystemTriggered`'s registration opt-in, and
     /// `rule CreateSystemEvent`/`rule SkipMissedOccurrences`, the real
     /// scheduler mechanism these fields drive.
     pub system_triggered_allowed: bool,
+    /// The cron expression a scheduled type fires on; `None` for an
+    /// unscheduled type.
     pub system_triggered_schedule: Option<String>,
     /// What this type owes for an occurrence of its own schedule that
     /// passed while nothing was watching for it - `None` for a type that
@@ -230,6 +251,7 @@ pub struct EventType {
     /// comment). `None` until the first one fires; never reset by
     /// switching scheduling off.
     pub last_fired_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether event read tokens may be minted for this type.
     pub event_read_allowed: bool,
 }
 
@@ -251,19 +273,26 @@ impl EventType {
 /// `*_tokens` relationships get) is omitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandType {
+    /// The bounded context the type is registered in.
     pub bounded_context: BoundedContext,
+    /// The type's name, unique within its bounded context.
     pub name: String,
+    /// The payload's JSON Schema, as registered.
     pub schema: String,
+    /// Incremented by each re-registration that changes the schema.
     pub schema_version: i64,
+    /// The consistency tags derived from each command's payload.
     pub tag_mappings: Vec<TagMapping>,
     /// See `EventType.owner_tag_key`'s own doc comment - identical role,
     /// for `Command.consistency_tags` instead of `Event.tags`. Cross-tenant
     /// read fix (docs/architecture.md's own write-up of these passes).
     pub owner_tag_key: Option<String>,
+    /// Payload fields encrypted per subject.
     pub sensitive_fields: Vec<SensitiveField>,
     /// See `EventType.private_fields`'s own doc comment - identical role,
     /// for `Command.payload` instead of `Event.payload`.
     pub private_fields: Vec<PrivateField>,
+    /// Whether REST command tokens may submit this type.
     pub rest_trigger_allowed: bool,
 }
 
@@ -279,7 +308,9 @@ impl CommandType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EncryptionKeyStatus {
+    /// Encrypts and decrypts.
     Active,
+    /// Destroyed by `forgetSubject`: what it encrypted can no longer be read.
     Destroyed,
 }
 
@@ -292,18 +323,26 @@ pub enum EncryptionKeyStatus {
 /// (`forget_subject`) are real.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionKey {
+    /// The bounded context the key belongs to.
     pub bounded_context: BoundedContext,
+    /// The subject namespace, e.g. `customer`.
     pub subject_key: String,
+    /// The subject's identifier within that namespace.
     pub subject_value: String,
+    /// Whether the key still exists.
     pub status: EncryptionKeyStatus,
+    /// When the key was created.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was destroyed; `None` while active.
     pub destroyed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// See `value EncryptedPayload`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectedPayload {
+    /// The payload JSON with its sensitive fields encrypted.
     pub payload: String,
+    /// The keys used.
     pub encryption_keys: Vec<EncryptionKey>,
 }
 
@@ -326,11 +365,17 @@ pub struct Command {
     /// primary key (still unexposed here, purely an FK-linking detail -
     /// see `db::insert_command`'s own doc comment).
     pub id: String,
+    /// The bounded context the command was submitted to.
     pub bounded_context: BoundedContext,
+    /// Its command type.
     pub command_type: CommandType,
+    /// The payload JSON, sensitive fields encrypted.
     pub payload: String,
+    /// Who submitted it, when, and in which causal chain.
     pub metadata: Metadata,
+    /// The keys its sensitive fields are encrypted with.
     pub encryption_keys: Vec<EncryptionKey>,
+    /// The consistency tags derived from its payload.
     pub consistency_tags: Vec<Tag>,
     /// The consistency query this command was decided with, derived from
     /// its payload (docs/architecture.md §198). Empty for a command type
@@ -361,27 +406,42 @@ pub struct Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventOrigin {
+    /// Appended by an accepted command.
     CommandTriggered {
+        /// The command.
         command: Box<Command>,
     },
+    /// Created by an external system, over REST or a broker bridge.
     ExternalTriggered {
+        /// The source's own message, e.g. a raw JSON blob.
         source_content: String,
+        /// Where it came from, e.g. a Kafka topic, partition and offset.
         source_context: Option<String>,
     },
+    /// Created without a command, with a direct-creation token.
     DirectlyCreated,
+    /// Fired by the scheduler for a scheduled event type.
     SystemTriggered,
 }
 
 /// See `entity Event`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
+    /// The bounded context the event belongs to.
     pub bounded_context: BoundedContext,
+    /// Its event type.
     pub event_type: EventType,
+    /// The payload JSON, sensitive fields encrypted.
     pub payload: String,
+    /// Who created it, when, and in which causal chain.
     pub metadata: Metadata,
+    /// Its position in the bounded context's log: gapless and increasing.
     pub sequence: i64,
+    /// The tags derived from its payload.
     pub tags: Vec<Tag>,
+    /// The keys its sensitive fields are encrypted with.
     pub encryption_keys: Vec<EncryptionKey>,
+    /// How it came to be.
     pub origin: EventOrigin,
 }
 
@@ -405,10 +465,15 @@ pub fn event_causation_id(event: &Event) -> String {
 /// `AccessToken`'s four variants get.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllEventsSubscription {
+    /// The bounded context subscribed to.
     pub bounded_context: BoundedContext,
+    /// The grant the events are delivered under.
     pub access_mapping: RoleAccessMapping,
+    /// When the subscription started.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Delivery starts after this sequence.
     pub from_sequence: i64,
+    /// The event types delivered; empty for every type in the bounded context.
     pub event_types: Vec<EventType>,
 }
 
@@ -416,11 +481,17 @@ pub struct AllEventsSubscription {
 /// treatment as `AllEventsSubscription` above.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventTypeSubscription {
+    /// The bounded context subscribed to.
     pub bounded_context: BoundedContext,
+    /// The grant the events are delivered under.
     pub access_mapping: RoleAccessMapping,
+    /// When the subscription started.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Delivery starts after this sequence.
     pub from_sequence: i64,
+    /// The event type delivered.
     pub event_type: EventType,
+    /// Only events matching every filter are delivered.
     pub filters: Vec<Filter>,
 }
 
@@ -437,7 +508,9 @@ pub struct EventTypeSubscription {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Subscription {
+    /// Events of several types, or all of them.
     AllEventsSubscription(Box<AllEventsSubscription>),
+    /// Events of one type, filtered.
     EventTypeSubscription(Box<EventTypeSubscription>),
 }
 
@@ -477,7 +550,9 @@ impl Subscription {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AckMode {
+    /// Each read moves the cursor past what it served.
     AutoAdvance,
+    /// The cursor moves only when the reader acknowledges.
     ManualAck,
 }
 
@@ -488,10 +563,17 @@ pub enum AckMode {
 /// §53.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadCursor {
+    /// The token the cursor belongs to.
     pub token: EventReadToken,
+    /// How the cursor advances, chosen at the first read.
     pub ack_mode: AckMode,
+    /// The last sequence consumed (`auto_advance`) or acknowledged
+    /// (`manual_ack`).
     pub sequence: i64,
+    /// When the cursor last moved.
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// When a `manual_ack` read last claimed the cursor; `None` when it is not
+    /// claimed.
     pub checked_out_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -499,9 +581,11 @@ pub struct ReadCursor {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// This bounded context is archived and accepts no new writes.
     #[error("this bounded context is archived and accepts no new writes")]
     BoundedContextArchived,
 
+    /// This schema change is not backwards compatible.
     #[error("this schema change is not backwards compatible")]
     SchemaIncompatible,
 
@@ -525,6 +609,7 @@ pub enum Error {
          its value is longer than 4096 characters (an IS_LIKE pattern, 1024), or more \
          than 32 filters were given"
     )]
+    /// A filter refused - see the message for the limits.
     InvalidFilter,
 
     /// More tags than `MAX_QUERY_TAGS` in one `queryEvents`/`countEvents`
@@ -547,6 +632,7 @@ pub enum Error {
     #[error("this schema is not well-formed JSON Schema")]
     InvalidSchema,
 
+    /// This tag mapping names a field the schema doesn't declare.
     #[error("this tag mapping names a field the schema doesn't declare")]
     InvalidTagMapping,
 
@@ -557,9 +643,11 @@ pub enum Error {
     #[error("this owner_tag_key does not name a key present in tag_mappings")]
     InvalidOwnerTagKey,
 
+    /// A TagMapping and a SensitiveField may not name the same field.
     #[error("a TagMapping and a SensitiveField may not name the same field")]
     SensitiveFieldTagOverlap,
 
+    /// This sensitive field names a field the schema doesn't declare.
     #[error("this sensitive field names a field the schema doesn't declare")]
     InvalidSensitiveField,
 
@@ -583,6 +671,7 @@ pub enum Error {
     #[error("a private field may not also be a tag mapping or a sensitive field")]
     PrivateFieldOverlap,
 
+    /// A re-registration may not drop a tag mapping key already in use.
     #[error("a re-registration may not drop a tag mapping key already in use")]
     TagMappingKeyDropped,
 
@@ -608,8 +697,11 @@ pub enum Error {
          {declared}"
     )]
     BlindNormalizerChanged {
+        /// The blind tag key.
         tag_key: String,
+        /// The normalizer version stored.
         stored: i64,
+        /// The normalizer version this process declares.
         declared: u32,
     },
 
@@ -622,7 +714,9 @@ pub enum Error {
          blind_index_key than this process's"
     )]
     BlindIndexKeyChanged {
+        /// The bounded context.
         bounded_context: String,
+        /// The blind tag key.
         tag_key: String,
     },
 
@@ -631,15 +725,19 @@ pub enum Error {
     #[error("tag key `{0}` is already mapped in the clear by a registered type")]
     BlindTagKeyInUse(String),
 
+    /// This EncryptionKey is not active.
     #[error("this EncryptionKey is not active")]
     EncryptionKeyNotActive,
 
+    /// This named EventType belongs to a different bounded context than the grant's.
     #[error("this named EventType belongs to a different bounded context than the grant's")]
     EventTypeNotInBoundedContext,
 
+    /// This named CommandType belongs to a different bounded context than the grant's.
     #[error("this named CommandType belongs to a different bounded context than the grant's")]
     CommandTypeNotInBoundedContext,
 
+    /// This triggered_event belongs to a different bounded context than the grant's.
     #[error("this triggered_event belongs to a different bounded context than the grant's")]
     TriggeredEventNotInBoundedContext,
 
@@ -648,27 +746,35 @@ pub enum Error {
     #[error("this after_command belongs to a different bounded context than the grant's")]
     AfterCommandNotInBoundedContext,
 
+    /// This EventReadToken's cursor mode doesn't match what was requested.
     #[error("this EventReadToken's cursor mode doesn't match what was requested")]
     CursorAckModeMismatch,
 
+    /// Acknowledging requires a manual_ack cursor.
     #[error("acknowledging requires a manual_ack cursor")]
     NotManualAckCursor,
 
+    /// This EventType is not opted into event reads.
     #[error("this EventType is not opted into event reads")]
     EventReadNotAllowed,
 
+    /// This EventReadToken has no read cursor yet - consume before acknowledging.
     #[error("this EventReadToken has no read cursor yet - consume before acknowledging")]
     NoReadCursor,
 
+    /// An acknowledgement may not move a cursor backwards.
     #[error("an acknowledgement may not move a cursor backwards")]
     AcknowledgementRegresses,
 
+    /// This EventType is not opted into external event ingestion.
     #[error("this EventType is not opted into external event ingestion")]
     ExternalCreationNotAllowed,
 
+    /// This EventType is not opted into direct event creation.
     #[error("this EventType is not opted into direct event creation")]
     DirectCreationNotAllowed,
 
+    /// This CommandType is not opted into REST triggering.
     #[error("this CommandType is not opted into REST triggering")]
     RestTriggerNotAllowed,
 
@@ -722,7 +828,12 @@ pub enum Error {
          epoch {current} (a failover or restore): events after an earlier point may be gone \
          and their sequences reused - start again from a position read in the current epoch"
     )]
-    EpochChanged { supplied: String, current: String },
+    EpochChanged {
+        /// The epoch the position was read in.
+        supplied: String,
+        /// The database's epoch now.
+        current: String,
+    },
 
     /// Not spec-modeled: the spec's own `ProcessCommand` assumes `decide()`
     /// only ever names an `EventType` its bounded context actually
@@ -1246,6 +1357,8 @@ pub fn blind_unchanged(existing: &[TagMapping], new: &[TagMapping]) -> bool {
 /// guard - no real downstream constraint drives the exact number.
 pub const CORRELATION_ID_MAX_LEN: usize = 200;
 
+/// Whether `id` is acceptable as a correlation or causation id: absent, empty,
+/// or at most [`CORRELATION_ID_MAX_LEN`] characters.
 pub fn valid_correlation_id(id: Option<&str>) -> bool {
     match id {
         None => true,
@@ -1538,6 +1651,7 @@ pub const MAX_LIKE_PATTERN_CHARS: usize = 1024;
 /// Every filter is evaluated against every event examined - for a
 /// subscription, every event committed for as long as it lives.
 pub const MAX_FILTERS: usize = 32;
+/// See [`MAX_FILTERS`].
 pub const MAX_FILTER_VALUE_CHARS: usize = 4096;
 
 /// The most tags one `queryEvents`/`countEvents` may give; each becomes
@@ -1567,7 +1681,10 @@ pub fn valid_query_tags(tags: Option<&[Tag]>) -> crate::error::Result<()> {
 /// (docs/architecture.md §207).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryTag {
+    /// The tag.
     pub tag: Tag,
+    /// Whether the value is a blind tag's plaintext, to be hashed before the
+    /// query.
     pub plaintext: bool,
 }
 
@@ -2310,8 +2427,11 @@ pub fn sensitive_field_is_granted(access_mapping: &RoleAccessMapping, subject_va
 /// already plays for `sensitive_fields`, just needing one more field read
 /// (`private_fields`) than that walk does.
 pub trait PrivateFieldRecord {
+    /// The record's private-field declarations.
     fn private_fields(&self) -> &[PrivateField];
+    /// The record's creator.
     fn client_id(&self) -> &str;
+    /// The record's payload JSON.
     fn payload(&self) -> &str;
 }
 
@@ -2516,8 +2636,11 @@ pub fn render_command(
 /// plaintext; render it with [`render_would_be_event`] before showing it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WouldBeEvent {
+    /// The event type.
     pub event_type: EventType,
+    /// The payload JSON, in plaintext.
     pub payload: String,
+    /// The tags it would carry.
     pub tags: Vec<Tag>,
     /// The submitter's, as `process_command` would stamp it.
     pub client_id: String,
@@ -2709,11 +2832,14 @@ fn decrypt_sensitive_fields(
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventTypeRegistration {
+    /// The type was new.
     Created(EventType),
+    /// An existing type was re-registered.
     Updated(EventType),
 }
 
 impl EventTypeRegistration {
+    /// The registered event type.
     pub fn event_type(&self) -> &EventType {
         match self {
             EventTypeRegistration::Created(et) | EventTypeRegistration::Updated(et) => et,
@@ -2904,11 +3030,14 @@ pub fn register_event_type(
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CommandTypeRegistration {
+    /// The type was new.
     Created(CommandType),
+    /// An existing type was re-registered.
     Updated(CommandType),
 }
 
 impl CommandTypeRegistration {
+    /// The registered command type.
     pub fn command_type(&self) -> &CommandType {
         match self {
             CommandTypeRegistration::Created(ct) | CommandTypeRegistration::Updated(ct) => ct,
@@ -3282,7 +3411,9 @@ pub fn count_events(
 /// output alone doesn't.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventInspected {
+    /// The event, as stored.
     pub event: Event,
+    /// Its payload as this reader may see it.
     pub rendered_payload: String,
 }
 
@@ -3546,8 +3677,11 @@ pub fn create_event_type_subscription(
 /// value" treatment `EventInspected` gives the two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventDelivered {
+    /// The subscription delivered to.
     pub subscription: Subscription,
+    /// The event, as stored.
     pub event: Event,
+    /// Its payload as the subscriber may see it.
     pub rendered_payload: String,
 }
 
@@ -3816,7 +3950,9 @@ pub enum CursorUpdate {
     /// So this fires on every `auto_advance` call after the first, not
     /// only when something new was served.
     Advanced {
+        /// The cursor's new sequence.
         sequence: i64,
+        /// When it moved.
         updated_at: chrono::DateTime<chrono::Utc>,
     },
     /// `manual_ack`, cursor not already claimed (or a stale claim just
@@ -3826,6 +3962,7 @@ pub enum CursorUpdate {
     /// (docs/architecture.md §53); see `ReadCursor.checked_out_at`'s own
     /// spec doc comment for why this exists.
     Claimed {
+        /// When the claim was taken.
         checked_out_at: chrono::DateTime<chrono::Utc>,
     },
     /// `manual_ack`, cursor already claimed by a live (not stale) lease -
@@ -3835,8 +3972,11 @@ pub enum CursorUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// What `consume_events` served, and what it did to the cursor.
 pub struct ConsumeEventsResult {
+    /// The events served.
     pub served: Vec<Event>,
+    /// The cursor change for the caller to store.
     pub cursor_update: CursorUpdate,
 }
 
@@ -4499,8 +4639,11 @@ pub fn skip_missed_occurrences(
 /// hashed, when it is resolved (docs/architecture.md §205).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandAuthorised {
+    /// The command type authorised.
     pub command_type: CommandType,
+    /// The payload JSON.
     pub payload: String,
+    /// The caller's id, stamped as the command's `client_id`.
     pub client_id: String,
     /// The caller's own opaque value, threaded through unvalidated here -
     /// same footing `idempotency_key` already has at this layer.
@@ -4508,6 +4651,7 @@ pub struct CommandAuthorised {
     /// `valid_correlation_id` actually gates it and where an absent
     /// `correlation_id` gets generated.
     pub correlation_id: Option<String>,
+    /// The caller's causation id, unvalidated here.
     pub causation_id: Option<String>,
 }
 
@@ -4920,7 +5064,9 @@ pub fn query_boundary(query: &[QueryItem], events: &[Event]) -> Option<i64> {
 /// each individual event, not this pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessCommandResult {
+    /// The command.
     pub command: Command,
+    /// The events it appended.
     pub events: Vec<Event>,
 }
 

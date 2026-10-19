@@ -48,6 +48,8 @@ pub enum Error {
         "sensitive_fields declares a field to encrypt, but no encryption_master_key was \
          configured (SkiljBuilder::encryption_master_key)"
     )]
+    /// A type declares sensitive fields, but no encryption master key is
+    /// configured.
     MasterKeyNotConfigured,
 
     /// Covers both an `EncryptionKey`'s own wrapped `DataKey` failing to
@@ -83,6 +85,8 @@ impl crate::error::SkiljRejection for Error {
 pub struct EncryptionMasterKey([u8; KEY_LEN]);
 
 impl EncryptionMasterKey {
+    /// The key from its 32 bytes, which should come from a secure random
+    /// source and be kept secret.
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         Self(bytes)
     }

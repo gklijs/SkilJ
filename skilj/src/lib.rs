@@ -87,8 +87,8 @@ pub const MIN_POOL_CONNECTIONS: u32 = 2;
 /// one failed request per pooled connection. With the user's choice
 /// (docs/architecture.md §196). Pass `PgPoolOptions::new()` to
 /// [`SkiljBuilder::pool_options`] to have the ping back.
-pub fn default_pool_options() -> skilj_core::db::PgPoolOptions {
-    skilj_core::db::PgPoolOptions::new().test_before_acquire(false)
+pub fn default_pool_options() -> PgPoolOptions {
+    PgPoolOptions::new().test_before_acquire(false)
 }
 
 /// [`SkiljBuilder::idempotency_key_retention`]'s default: 48 hours, long
@@ -160,12 +160,18 @@ async fn contain_panic(
 /// directly by hand-written code; `SkiljBuilder::auto_register()` is the
 /// intended entry point.
 pub use inventory;
+/// Seeding a development database with an admin role and command tokens
+/// (docs/architecture.md §220) - see `dev`'s own module docs.
+pub mod dev;
 /// Codeberg issue #100: the supported single-user local mode, behind the
 /// `local` feature. See `local`'s own module docs.
 #[cfg(feature = "local")]
 pub mod local;
 pub use skilj_core::access_control::{IdpConfig, SigningAlgorithm};
 pub use skilj_core::blind::{normalize, BlindIndexKey};
+/// `sqlx`'s pool options, for [`SkiljBuilder::pool_options`] - re-exported
+/// here because `skilj_core::db` is internal (docs/architecture.md §220).
+pub use skilj_core::db::PgPoolOptions;
 pub use skilj_core::encryption::EncryptionMasterKey;
 pub use skilj_core::plugin::{
     requires_role, BlindErasure, BlindTag, CancelDeadline, CommandType, CrossContextRoute,
@@ -2285,7 +2291,7 @@ pub struct SkiljBuilder {
     encryption_master_key: Option<EncryptionMasterKey>,
     event_broadcast_capacity: usize,
     event_cache_warm_up_count: usize,
-    pool_options: Option<skilj_core::db::PgPoolOptions>,
+    pool_options: Option<PgPoolOptions>,
     statement_cache_capacity: Option<usize>,
     idempotency_key_retention: Option<std::time::Duration>,
     deadline_retention: Option<std::time::Duration>,
@@ -2866,7 +2872,7 @@ impl SkiljBuilder {
     /// so start from [`default_pool_options`] to keep that, or from
     /// `PgPoolOptions::new()` to have every connection pinged as it is
     /// taken (docs/architecture.md §196).
-    pub fn pool_options(mut self, options: skilj_core::db::PgPoolOptions) -> Self {
+    pub fn pool_options(mut self, options: PgPoolOptions) -> Self {
         self.pool_options = Some(options);
         self
     }
@@ -5214,7 +5220,7 @@ mod tests {
         assert!(!options.get_test_before_acquire());
         assert_eq!(
             options.get_max_connections(),
-            skilj_core::db::PgPoolOptions::new().get_max_connections()
+            super::PgPoolOptions::new().get_max_connections()
         );
     }
     use skilj_core::bootstrap::ContextCreator;

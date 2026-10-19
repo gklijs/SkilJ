@@ -45,7 +45,9 @@ pub enum Error {
          process declares no BlindTag for it (or has no blind_index_key)"
     )]
     NotDeclared {
+        /// The bounded context.
         bounded_context: String,
+        /// The blind tag key.
         tag_key: String,
     },
 
@@ -57,7 +59,10 @@ pub enum Error {
         "looking up blind tag `{tag_key}` by its plaintext value needs a grant that can read \
          sensitive fields"
     )]
-    LookupNotGranted { tag_key: String },
+    LookupNotGranted {
+        /// The blind tag key.
+        tag_key: String,
+    },
 
     /// The constraint is stored at a key generation this process has no
     /// root key for (docs/architecture.md §209): it was rotated to a key
@@ -68,8 +73,11 @@ pub enum Error {
          {generation}, and this process has no blind_index_key for it"
     )]
     KeyNotConfigured {
+        /// The bounded context.
         bounded_context: String,
+        /// The blind tag key.
         tag_key: String,
+        /// The key generation the constraint is stored at.
         generation: u32,
     },
 
@@ -78,7 +86,10 @@ pub enum Error {
     /// retries it once, rehashed; it surfaces only if a second rotation
     /// lands in between.
     #[error("the blind tags of bounded context `{bounded_context}` were rotated meanwhile; retry")]
-    Rotated { bounded_context: String },
+    Rotated {
+        /// The bounded context.
+        bounded_context: String,
+    },
 }
 
 impl crate::error::SkiljRejection for Error {
@@ -107,6 +118,8 @@ impl crate::error::SkiljRejection for Error {
 pub struct BlindIndexKey([u8; KEY_LEN]);
 
 impl BlindIndexKey {
+    /// The key from its 32 bytes, which should come from a secure random
+    /// source and be kept secret.
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         Self(bytes)
     }
@@ -198,8 +211,11 @@ pub enum Erasure {
 /// version is what's compared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlindTagDeclaration {
+    /// The blind tag key.
     pub tag_key: String,
+    /// The version of the normalizer values are hashed after.
     pub normalizer_version: u32,
+    /// What `forgetSubject` does with the hashes.
     pub erasure: Erasure,
     /// The constraint's key fingerprint (docs/architecture.md §208), so an
     /// instance with a different `blind_index_key` refuses to start rather
@@ -335,6 +351,7 @@ impl BlindIndex {
 
     /// Resolves a bounded context that declares nothing itself through
     /// `templates`, to the template it was created from.
+    #[doc(hidden)]
     pub fn with_templates(self, templates: crate::template_cache::TemplateCache) -> Self {
         Self(self.0.map(|inner| {
             Arc::new(Inner {

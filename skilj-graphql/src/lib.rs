@@ -5,6 +5,14 @@
 //! `EventQuery`/`CommandQuery`/`CommandSubmission` - see
 //! `resolvers::command_submission`'s own doc comment for why
 //! `ProjectionQuery`/`EventSubscription` stay out of this phase too.
+//!
+//! **Stability:** an internal crate, published because `skilj` depends on
+//! it (docs/architecture.md §220). A patch release never breaks it, but
+//! its Rust API - `AppState` holds `skilj-core`'s hidden internals - may
+//! change in any minor release without migration notes. The GraphQL
+//! contract it serves is covered; serve it with `Skilj::graphql_router()`,
+//! and use `FederationOptions`/`GraphqlLimits` through `skilj`'s
+//! re-exports (README.md, "Status and stability").
 
 pub mod auth;
 mod error;

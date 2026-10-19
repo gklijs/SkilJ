@@ -46,7 +46,9 @@ use crate::event_store::BoundedContext;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RoleStatus {
+    /// In force.
     Active,
+    /// Revoked; it grants nothing.
     Revoked,
 }
 
@@ -55,12 +57,21 @@ pub enum RoleStatus {
 /// omitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Role {
+    /// The role's id.
     pub id: String,
+    /// The identity at the IdP this role belongs to: a verified JWT's subject
+    /// claim is matched against it.
     pub external_subject: String,
+    /// A display name.
     pub name: String,
+    /// Whether it is a superadmin: it may add bounded contexts and manage
+    /// every role and grant, independently of its own grants.
     pub superadmin: bool,
+    /// Whether it is in force.
     pub status: RoleStatus,
+    /// When it was created.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was revoked; `None` while active.
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -68,8 +79,12 @@ pub struct Role {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AccessLevel {
+    /// May read events, commands and projections.
     Read,
+    /// May also submit commands.
     Write,
+    /// May also register types, mint tokens and administer the bounded
+    /// context.
     Admin,
 }
 
@@ -79,9 +94,13 @@ pub enum AccessLevel {
 /// revoked grant" by type alone (each already lives on its own struct).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleAccessMapping {
+    /// The role granted.
     pub role: Role,
+    /// The bounded context it is granted on.
     pub bounded_context: BoundedContext,
+    /// What it may do there.
     pub level: AccessLevel,
+    /// Whether it may read every subject's sensitive fields, not only its own.
     pub can_read_sensitive: bool,
     /// Orthogonal to `level`, exactly as `can_read_sensitive` is: `None`
     /// (the default for every mapping today) means unrestricted within
@@ -96,8 +115,11 @@ pub struct RoleAccessMapping {
     /// `projections::query_projection`'s own enforcement and
     /// specs/skilj.allium's `owner_scope_satisfied`.
     pub scope: Option<String>,
+    /// Whether the grant is in force.
     pub status: RoleStatus,
+    /// When it was granted.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was revoked; `None` while active.
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -131,9 +153,13 @@ pub struct RoleAccessMapping {
 /// already made in an earlier pass (docs/architecture.md's own write-up).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateFieldGrant {
+    /// The grant's id.
     pub id: String,
+    /// The bounded context of the shared record.
     pub bounded_context: BoundedContext,
+    /// The role sharing its private fields.
     pub grantor: Role,
+    /// The role they are shared with.
     pub grantee: Role,
     /// At most one of the two is ever set - see the invariant
     /// `PrivateFieldGrantNamesAtMostOneRecord` in the spec. Both `None` is
@@ -142,9 +168,13 @@ pub struct PrivateFieldGrant {
     /// every read rather than trusted from grant time (see
     /// `event_store::is_default_private_reader`'s own doc comment).
     pub event_sequence: Option<i64>,
+    /// The `Command::id` of the one command shared; see `event_sequence`.
     pub command_id: Option<String>,
+    /// Whether the grant is in force.
     pub status: TokenStatus,
+    /// When it was granted.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was revoked; `None` while active.
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -155,7 +185,9 @@ pub struct PrivateFieldGrant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TokenStatus {
+    /// Accepted.
     Active,
+    /// Revoked; refused from then on.
     Revoked,
 }
 
@@ -166,11 +198,17 @@ pub enum TokenStatus {
 /// variant to carry the same base fields uniformly).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventReadToken {
+    /// The token's id: the part before the `.` in a bearer credential.
     pub id: String,
+    /// The token's secret: the part after the `.`.
     pub secret: String,
+    /// Whether it is accepted.
     pub status: TokenStatus,
+    /// When it was minted.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was revoked; `None` while active.
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The event type it reads.
     pub event_type: crate::event_store::EventType,
     /// Cross-tenant read fix (docs/architecture.md's own write-up of
     /// these passes) - the REST track's own counterpart to
@@ -214,7 +252,9 @@ pub struct EventReadToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventReadStartPosition {
+    /// From the first event of its type.
     Beginning,
+    /// From events committed after the first read; earlier ones are skipped.
     Latest,
     /// See `EventReadToken.start_at_sequence` - the value this variant
     /// reads is carried on the token itself, not on this tag.
@@ -227,11 +267,17 @@ pub enum EventReadStartPosition {
 /// See `variant ExternalEventToken`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalEventToken {
+    /// The token's id: the part before the `.` in a bearer credential.
     pub id: String,
+    /// The token's secret: the part after the `.`.
     pub secret: String,
+    /// Whether it is accepted.
     pub status: TokenStatus,
+    /// When it was minted.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was revoked; `None` while active.
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The event type it creates.
     pub event_type: crate::event_store::EventType,
     /// Cross-tenant write fix (docs/architecture.md's own write-up of
     /// these passes) - `EventReadToken.scope`'s own write-side
@@ -248,12 +294,19 @@ pub struct ExternalEventToken {
 /// above, `scope` included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectCreationToken {
+    /// The token's id: the part before the `.` in a bearer credential.
     pub id: String,
+    /// The token's secret: the part after the `.`.
     pub secret: String,
+    /// Whether it is accepted.
     pub status: TokenStatus,
+    /// When it was minted.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was revoked; `None` while active.
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The event type it creates.
     pub event_type: crate::event_store::EventType,
+    /// The one owner it may create events for; `None` for any.
     pub scope: Option<String>,
 }
 
@@ -263,12 +316,19 @@ pub struct DirectCreationToken {
 /// `event_store::owner_scope_satisfied` in `authorise_command_trigger`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandToken {
+    /// The token's id: the part before the `.` in a bearer credential.
     pub id: String,
+    /// The token's secret: the part after the `.`.
     pub secret: String,
+    /// Whether it is accepted.
     pub status: TokenStatus,
+    /// When it was minted.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When it was revoked; `None` while active.
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The command type it submits.
     pub command_type: crate::event_store::CommandType,
+    /// The one owner it may submit commands for; `None` for any.
     pub scope: Option<String>,
 }
 
@@ -282,9 +342,13 @@ pub struct CommandToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AccessToken {
+    /// Lets an external system create one event type.
     ExternalEventToken(ExternalEventToken),
+    /// Lets a caller create one event type without a command.
     DirectCreationToken(DirectCreationToken),
+    /// Lets a REST caller submit one command type.
     CommandToken(CommandToken),
+    /// Lets a REST caller read one event type.
     EventReadToken(EventReadToken),
 }
 
@@ -330,15 +394,19 @@ impl AccessToken {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// This Role is not active.
     #[error("this Role is not active")]
     RoleNotActive,
 
+    /// This RoleAccessMapping is not active.
     #[error("this RoleAccessMapping is not active")]
     GrantNotActive,
 
+    /// This grant's access level is too low for this action.
     #[error("this grant's access level is too low for this action")]
     InsufficientAccessLevel,
 
+    /// This RoleAccessMapping is scoped to a different bounded context.
     #[error("this RoleAccessMapping is scoped to a different bounded context")]
     GrantBoundedContextMismatch,
 
@@ -393,6 +461,7 @@ pub enum Error {
     #[error("only the Role that made this PrivateFieldGrant may revoke it")]
     NotGrantor,
 
+    /// This PrivateFieldGrant is not active.
     #[error("this PrivateFieldGrant is not active")]
     PrivateFieldGrantNotActive,
 
@@ -403,24 +472,31 @@ pub enum Error {
     #[error("this record does not belong to the grantor's own bounded context")]
     PrivateFieldRecordWrongBoundedContext,
 
+    /// This AccessToken is not active.
     #[error("this AccessToken is not active")]
     TokenNotActive,
 
+    /// Only an active superadmin Role may perform this action.
     #[error("only an active superadmin Role may perform this action")]
     NotSuperadmin,
 
+    /// No active Role's external_subject matches this JWT's subject claim.
     #[error("no active Role's external_subject matches this JWT's subject claim")]
     UnrecognisedSubject,
 
+    /// This external_subject is already claimed by another active Role.
     #[error("this external_subject is already claimed by another active Role")]
     ExternalSubjectAlreadyClaimed,
 
+    /// This Role already holds an active RoleAccessMapping for this bounded context.
     #[error("this Role already holds an active RoleAccessMapping for this bounded context")]
     DuplicateActiveMapping,
 
     #[error("the presented JWT is malformed: {0}")]
+    /// The presented JWT is malformed.
     MalformedJwt(String),
 
+    /// The presented JWT has no key id (kid) header, so no JWKS entry can verify it.
     #[error("the presented JWT has no key id (kid) header, so no JWKS entry can verify it")]
     JwtMissingKeyId,
 
@@ -428,15 +504,20 @@ pub enum Error {
         "the presented JWT's key id (kid) doesn't match any key in the trusted IdP's JWKS, \
          even after a refetch"
     )]
+    /// The JWT's key id matches no key in the IdP's JWKS, even after a
+    /// refetch.
     UnknownSigningKey,
 
     #[error("the presented JWT failed verification: {0}")]
+    /// The JWT failed verification: signature, issuer, audience or time.
     JwtVerificationFailed(String),
 
     #[error("the presented JWT's verified claims have no {0} claim to trust as the subject")]
+    /// The verified claims lack the configured subject claim.
     MissingSubjectClaim(String),
 
     #[error("fetching the trusted IdP's JWKS failed: {0}")]
+    /// Fetching the IdP's JWKS failed.
     JwksFetchFailed(String),
 
     /// `rule CreateEventReadToken`'s first `start_at_sequence`/
@@ -569,8 +650,11 @@ pub fn require_active_superadmin(caller: &Role) -> crate::error::Result<()> {
 /// below.
 #[derive(Debug, Clone)]
 pub struct IdpConfig {
+    /// Where the IdP publishes its signing keys.
     pub jwks_endpoint: reqwest::Url,
+    /// The `iss` a JWT must carry.
     pub issuer: String,
+    /// The algorithm a JWT must be signed with.
     pub signing_algorithm: SigningAlgorithm,
     /// The `aud` values a JWT must carry (at least one of) to be accepted:
     /// this deployment's own client id(s) at the IdP. Required, never
@@ -614,6 +698,7 @@ impl IdpConfig {
         self
     }
 
+    /// Trusts `claim` as the subject instead of `sub`.
     pub fn with_subject_claim(mut self, claim: impl Into<String>) -> Self {
         self.subject_claim = claim.into();
         self
@@ -632,10 +717,15 @@ impl IdpConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SigningAlgorithm {
+    /// RSA PKCS#1 v1.5 with SHA-256.
     Rs256,
+    /// RSA PKCS#1 v1.5 with SHA-384.
     Rs384,
+    /// RSA PKCS#1 v1.5 with SHA-512.
     Rs512,
+    /// ECDSA on P-256 with SHA-256.
     Es256,
+    /// ECDSA on P-384 with SHA-384.
     Es384,
 }
 
@@ -695,6 +785,8 @@ impl JwksCache {
         self
     }
 
+    /// A cache for the JWKS at `jwks_endpoint`, empty until the first JWT is
+    /// verified.
     pub fn new(jwks_endpoint: reqwest::Url) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -1167,7 +1259,9 @@ pub fn list_private_field_grants(
 /// own publish payload.
 #[derive(Debug, Clone)]
 pub struct RevokedMapping {
+    /// The role whose grant was revoked.
     pub role_id: String,
+    /// The bounded context it was revoked on.
     pub bounded_context: String,
 }
 
@@ -1205,6 +1299,7 @@ pub struct RevocationBroadcaster {
 }
 
 impl RevocationBroadcaster {
+    /// A broadcaster no one listens to yet.
     pub fn new() -> Self {
         let (sender, _receiver) = tokio::sync::broadcast::channel(256);
         Self {

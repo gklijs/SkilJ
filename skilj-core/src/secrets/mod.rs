@@ -81,12 +81,16 @@ pub fn subject_value(name: &str, version: i64) -> String {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SecretStatus {
+    /// The current version, which an adapter may fetch.
     Active,
+    /// Superseded by a newer version.
     Rotated,
+    /// Revoked explicitly.
     Revoked,
 }
 
 impl SecretStatus {
+    /// The lowercase name stored and served, e.g. `active`.
     pub fn as_str(&self) -> &'static str {
         match self {
             SecretStatus::Active => "active",
@@ -103,14 +107,19 @@ impl SecretStatus {
 /// its object field by field, as it does for every other entity.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Secret {
+    /// The bounded context the secret belongs to.
     pub bounded_context: BoundedContext,
+    /// The secret's name.
     pub name: String,
+    /// This version's number, counting up from 1.
     pub version: i64,
+    /// Whether this version may still be fetched.
     pub status: SecretStatus,
     /// When this version stops being valid and the adapter should refresh
     /// it. `None` for a secret that does not expire. Common for a secret,
     /// unlike personal data - an OAuth refresh token has a real lifetime.
     pub expires_at: Option<DateTime<Utc>>,
+    /// When this version was stored.
     pub created_at: DateTime<Utc>,
     /// Set when a later `put_secret_value` superseded this version.
     pub rotated_at: Option<DateTime<Utc>>,
@@ -122,12 +131,14 @@ pub struct Secret {
     /// adapter refreshes on a timer; "who last read it, when" is what an
     /// audit actually needs.
     pub last_read_at: Option<DateTime<Utc>>,
+    /// The id of the role that last fetched it; see `last_read_at`.
     pub last_read_by: Option<String>,
 }
 
 /// Whether a version is one an adapter may still fetch. Rotated/revoked are
 /// terminal.
 impl Secret {
+    /// Whether an adapter may still fetch this version.
     pub fn is_active(&self) -> bool {
         self.status == SecretStatus::Active
     }
@@ -140,24 +151,35 @@ impl Secret {
 /// grant is refused, by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretGrant {
+    /// The grant's id.
     pub id: String,
+    /// The bounded context the secret belongs to.
     pub bounded_context: BoundedContext,
+    /// The secret's name.
     pub name: String,
+    /// The id of the role that may fetch it.
     pub grantee_role_id: String,
+    /// Whether the grant is in force.
     pub status: SecretGrantStatus,
+    /// When it was granted.
     pub created_at: DateTime<Utc>,
+    /// When it was revoked; `None` while active.
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
+/// Whether a [`SecretGrant`] is in force.
 pub enum SecretGrantStatus {
+    /// In force.
     Active,
+    /// Revoked; it grants nothing.
     Revoked,
 }
 
 impl SecretGrantStatus {
+    /// The lowercase name stored and served, e.g. `active`.
     pub fn as_str(&self) -> &'static str {
         match self {
             SecretGrantStatus::Active => "active",
@@ -181,6 +203,7 @@ impl SecretGrantStatus {
 pub struct SecretValue(String);
 
 impl SecretValue {
+    /// Wraps a plaintext value.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -212,18 +235,31 @@ pub enum Error {
     #[error(
         "a secret name must be 1-{MAX_NAME_LEN} characters of ASCII letters, digits, '_', '.' or '-'"
     )]
+    /// The name is empty, too long, or has characters outside ASCII letters,
+    /// digits, `_`, `.` and `-`.
     InvalidName,
 
     #[error("no secret named \"{name}\" has an active version")]
-    NotActive { name: String },
+    /// No version of the named secret is active.
+    NotActive {
+        /// The secret's name.
+        name: String,
+    },
 
     #[error("this caller is not granted read access to secret \"{name}\"")]
-    AccessNotGranted { name: String },
+    /// The caller holds no grant for the named secret.
+    AccessNotGranted {
+        /// The secret's name.
+        name: String,
+    },
 
+    /// A secret grant must name the Role it is granted to.
     #[error("a secret grant must name the Role it is granted to")]
     InvalidGrantee,
 
     #[error("the subject key \"{SUBJECT_KEY}\" is reserved for secrets")]
+    /// The subject key reserved for secrets' encryption keys was used for a
+    /// sensitive field.
     ReservedSubjectKey,
 }
 

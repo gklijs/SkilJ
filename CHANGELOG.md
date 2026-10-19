@@ -4,11 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-(pre-1.0: breaking changes may land in minor/patch versions until 1.0).
+(Cargo-style for `0.x`: patch releases within a minor series are
+compatible, and a breaking change needs the next minor release - see
+README.md, "Status and stability").
 
 ## [Unreleased]
 
 ### Added
+
+- `skilj::dev` (docs/architecture.md §220): `seed_admin(database_url,
+  name, bounded_contexts)` creates missing bounded contexts and a new
+  Admin role over them, and `DevAdmin::create_command_token` mints a REST
+  command token once `build()` has registered the type. The template's
+  and `skilj-demo`'s servers use it instead of `skilj_core::db`. A
+  development shortcut: production claims the bootstrap secret instead.
 
 - A supported single-user local mode (docs/architecture.md §216, Codeberg
   issue #100). The `skilj` crate's `local` feature exposes
@@ -66,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scope` confines proposals as it confines `fetchCommands`: one for
   another owner is left out of `commandProposals` and is
   `command_proposal_not_found` to `approveCommand`/`rejectCommand`.
+  `forgetSubject` finishes the bounded context's pending proposals
+  encrypted for the subject with a new terminal status `forgotten`
+  (GraphQL `FORGOTTEN`, `db::forget_subject_in_command_proposals`,
+  docs/architecture.md §221), since they could never be approved; an
+  approval that finds a subject forgotten some other way records the
+  proposal `forgotten` too, and fails with
+  `command_proposal_subject_forgotten`, instead of returning it to
+  pending.
 - Documented external-worker guarantees around private fields
   (docs/architecture.md §215, Codeberg issue #99): `EventReadToken`
   REST reads redact every private field unconditionally and serve
@@ -155,6 +172,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to blind tags; the `skilj` and `skilj-event-modeling` skills point to it.
 
 ### Changed
+
+- `skilj-graphql`'s Rust API is internal, like `skilj-retry`'s and
+  `skilj-bridge`'s: a patch release never breaks it, a minor one may
+  without migration notes (docs/architecture.md §220). The GraphQL
+  contract it serves is covered as before; serve it with
+  `Skilj::graphql_router()`.
+- Every public item of `skilj-core` outside its hidden modules is
+  documented, and the crate is `#![warn(missing_docs)]`. docs.rs builds
+  `skilj` with the `local` feature, so `skilj::local` is documented.
+
+- `skilj-core`'s internal modules - `db`, `command_batcher`,
+  `cross_instance`, `event_cache`, `template_cache` and `slow_command` -
+  and `BlindIndex::with_templates` are `#[doc(hidden)]` and outside the
+  compatibility promise (docs/architecture.md §220). They stay `pub` and
+  keep working. `PgPoolOptions`, which `SkiljBuilder::pool_options` takes,
+  is re-exported as `skilj::PgPoolOptions`.
 
 - **Breaking:** every public error enum is now `#[non_exhaustive]`
   (docs/architecture.md §217): `skilj_core::Error`,
