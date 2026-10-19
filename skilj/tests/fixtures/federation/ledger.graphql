@@ -61,6 +61,7 @@ enum LedgerCommandProposalStatus @inaccessible {
 	APPROVED
 	REJECTED
 	EXPIRED
+	FORGOTTEN
 }
 
 type LedgerCommandToken @inaccessible {

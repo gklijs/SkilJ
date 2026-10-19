@@ -122,6 +122,32 @@ impl skilj::CommandType for EmailUser {
     }
 }
 
+/// For the proposal half of forgetSubject (docs/architecture.md §221): an
+/// approval-required command with the same sensitive field. Self-approval
+/// is on so the one admin can approve its own proposals.
+struct ProposeEmail;
+
+impl skilj::CommandType for ProposeEmail {
+    type Payload = AccountOpenedPayload;
+    type Event = NoEvent;
+    const NAME: &'static str = "ProposeEmail";
+    fn sensitive_fields() -> Vec<SensitiveField> {
+        AccountOpened::sensitive_fields()
+    }
+    fn requires_approval() -> bool {
+        true
+    }
+    fn approval_allows_self_approval() -> bool {
+        true
+    }
+    fn decide(
+        _payload: &Self::Payload,
+        _matching_events: &[Self::Event],
+    ) -> skilj_core::shared::CommandDecision {
+        skilj_core::shared::CommandDecision::Accepted { events: vec![] }
+    }
+}
+
 // --- provisioning: DATABASE_URL, else embedded Postgres, else skip ---
 
 struct TestDb {
@@ -598,5 +624,207 @@ fn subject_erasure_end_to_end() {
             response["errors"][0]["extensions"]["code"],
             "grant_not_active"
         );
+    });
+}
+
+const PROPOSE_MUTATION: &str = "\
+    mutation($bc: String!, $payload: String!) { \
+        submitCommand(boundedContext: $bc, commandTypeName: \"ProposeEmail\", payload: $payload) { \
+            pendingApproval proposalId \
+        } \
+    }";
+
+const APPROVE_MUTATION: &str = "mutation($bc: String!, $id: ID!) { \
+    approveCommand(boundedContext: $bc, proposalId: $id) { accepted proposal { status } } }";
+
+/// docs/architecture.md §221: once a subject is forgotten, a proposal
+/// whose sensitive fields are encrypted for it can never be approved.
+/// forgetSubject finishes the pending ones as `forgotten`, leaving other
+/// subjects' proposals and an in-flight `approving` claim alone. A subject
+/// forgotten some other way - here `destroy_encryption_key` directly - is
+/// caught when approving instead: the proposal becomes `forgotten` rather
+/// than going back to `pending` to fail again, even when a later submission
+/// has provisioned the subject a fresh key.
+#[test]
+fn forgetting_a_subject_forgets_its_pending_proposals() {
+    runtime().block_on(async {
+        if test_database_url().await.is_none() {
+            return;
+        }
+        let database_url = test_database_url().await.unwrap();
+        let jwks_url = serve_jwks().await;
+        let pool = skilj_core::db::connect(&database_url).await.unwrap();
+
+        let admin_subject = unique_name("admin");
+        let admin_role = Role {
+            id: generate_token_id(),
+            external_subject: admin_subject.clone(),
+            name: "Admin".to_string(),
+            superadmin: false,
+            status: RoleStatus::Active,
+            created_at: test_now(),
+            revoked_at: None,
+        };
+        skilj_core::db::insert_role(&pool, &admin_role)
+            .await
+            .unwrap();
+        let bc_name = unique_name("crm");
+        let bc = BoundedContext {
+            name: bc_name.clone(),
+            status: BoundedContextStatus::Active,
+            created_at: test_now(),
+            created_by: ContextCreator::SystemCreator,
+            template: None,
+        };
+        skilj_core::db::insert_bounded_context(&pool, &bc)
+            .await
+            .unwrap();
+        skilj_core::db::insert_role_access_mapping(
+            &pool,
+            &RoleAccessMapping {
+                role: admin_role.clone(),
+                bounded_context: bc,
+                level: AccessLevel::Admin,
+                can_read_sensitive: false,
+                scope: None,
+                status: RoleStatus::Active,
+                created_at: test_now(),
+                revoked_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (skilj, _report) = Skilj::builder(database_url.clone())
+            .identity_provider(IdpConfig::new(
+                jwks_url.parse().unwrap(),
+                TEST_ISSUER,
+                TEST_AUDIENCE,
+                SigningAlgorithm::Rs256,
+            ))
+            .bounded_context(bc_name.clone())
+            .event_type::<AccountOpened>()
+            .command_type::<ProposeEmail>()
+            .reconciliation_role(admin_subject)
+            .encryption_master_key(EncryptionMasterKey::from_bytes([42u8; 32]))
+            .build()
+            .await
+            .unwrap();
+        let router = skilj.graphql_router().await.unwrap();
+        let jwt = sign_jwt(&admin_role.external_subject);
+
+        let propose = |user_id: &'static str| {
+            let router = router.clone();
+            let jwt = jwt.clone();
+            let bc_name = bc_name.clone();
+            async move {
+                let payload = json!({ "email": "person@example.com", "user_id": user_id });
+                let response = graphql_request(
+                    &router,
+                    &jwt,
+                    PROPOSE_MUTATION,
+                    json!({ "bc": bc_name, "payload": payload.to_string() }),
+                )
+                .await;
+                assert_eq!(
+                    response["data"]["submitCommand"]["pendingApproval"],
+                    true,
+                    "{response}"
+                );
+                response["data"]["submitCommand"]["proposalId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let status = |id: String| {
+            let pool = pool.clone();
+            let bc_name = bc_name.clone();
+            async move {
+                skilj_core::db::get_command_proposal(&pool, &bc_name, &id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .as_str()
+            }
+        };
+        let approve = |id: String| {
+            let router = router.clone();
+            let jwt = jwt.clone();
+            let bc_name = bc_name.clone();
+            async move {
+                graphql_request(
+                    &router,
+                    &jwt,
+                    APPROVE_MUTATION,
+                    json!({ "bc": bc_name, "id": id }),
+                )
+                .await
+            }
+        };
+
+        let naming_42 = propose("42").await;
+        let naming_43 = propose("43").await;
+        // An approval already under way when the subject is forgotten.
+        let claimed_42 = propose("42").await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE \"bc_{bc_name}\".command_proposals \
+             SET status = 'approving', decided_at = now() WHERE id = $1"
+        )))
+        .bind(&claimed_42)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = graphql_request(
+            &router,
+            &jwt,
+            FORGET_SUBJECT_MUTATION,
+            json!({ "bc": bc_name, "subjectKey": "user", "subjectValue": "42" }),
+        )
+        .await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(status(naming_42.clone()).await, "forgotten");
+        assert_eq!(status(naming_43.clone()).await, "pending");
+        assert_eq!(status(claimed_42).await, "approving");
+
+        let listed = graphql_request(
+            &router,
+            &jwt,
+            "query($bc: String!) { commandProposals(boundedContext: $bc, status: FORGOTTEN) { id status } }",
+            json!({ "bc": bc_name }),
+        )
+        .await;
+        assert_eq!(
+            listed["data"]["commandProposals"],
+            json!([{ "id": naming_42, "status": "FORGOTTEN" }]),
+            "{listed}"
+        );
+        let response = approve(naming_42).await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "command_proposal_not_pending",
+            "{response}"
+        );
+        let response = approve(naming_43).await;
+        assert_eq!(response["data"]["approveCommand"]["accepted"], true, "{response}");
+
+        // Forgotten without forgetSubject: caught when approving.
+        let naming_44 = propose("44").await;
+        skilj_core::db::destroy_encryption_key(&pool, &bc_name, "user", "44", chrono::Utc::now())
+            .await
+            .unwrap();
+        // ...even after a later submission provisioned 44 a fresh key.
+        let after_fresh_key = propose("44").await;
+        let response = approve(naming_44.clone()).await;
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"],
+            "command_proposal_subject_forgotten",
+            "{response}"
+        );
+        assert_eq!(status(naming_44).await, "forgotten");
+        let response = approve(after_fresh_key).await;
+        assert_eq!(response["data"]["approveCommand"]["accepted"], true, "{response}");
     });
 }

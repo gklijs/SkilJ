@@ -61,6 +61,7 @@ enum BankCommandProposalStatus @inaccessible {
 	APPROVED
 	REJECTED
 	EXPIRED
+	FORGOTTEN
 }
 
 type BankCommandToken @inaccessible {
