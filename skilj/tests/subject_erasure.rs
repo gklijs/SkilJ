@@ -826,5 +826,29 @@ fn forgetting_a_subject_forgets_its_pending_proposals() {
         assert_eq!(status(naming_44).await, "forgotten");
         let response = approve(after_fresh_key).await;
         assert_eq!(response["data"]["approveCommand"]["accepted"], true, "{response}");
+
+        // A failure that is no forgotten subject - here the keys table is
+        // unreadable, so both the reveal and the forgotten check fail -
+        // releases the claim, and the approval succeeds once it's back.
+        let naming_46 = propose("46").await;
+        let rename = |from: &'static str, to: &'static str| {
+            let pool = pool.clone();
+            let bc_name = bc_name.clone();
+            async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ALTER TABLE \"bc_{bc_name}\".{from} RENAME TO {to}"
+                )))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        rename("encryption_keys", "encryption_keys_away").await;
+        let response = approve(naming_46.clone()).await;
+        rename("encryption_keys_away", "encryption_keys").await;
+        assert!(response.get("errors").is_some(), "{response}");
+        assert_eq!(status(naming_46.clone()).await, "pending");
+        let response = approve(naming_46).await;
+        assert_eq!(response["data"]["approveCommand"]["accepted"], true, "{response}");
     });
 }

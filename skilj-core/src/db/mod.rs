@@ -5451,31 +5451,42 @@ pub async fn approve_command_proposal(
     .await
     {
         Ok(payload) => payload,
-        // docs/architecture.md §221: a subject forgotten without
-        // `forget_subject_in_command_proposals` (an older instance, or a
-        // direct `destroy_encryption_key`) - the payload is gone for good,
-        // so the proposal is finished rather than released to fail again.
-        Err(e) if proposal_subject_forgotten(pool, &command_type, &proposal).await? => {
-            tracing::info!(
-                bounded_context,
-                proposal_id = id,
-                error = %e,
-                "a subject this proposal names was forgotten - recording it as forgotten"
-            );
-            finish_command_proposal(
-                pool,
-                bounded_context,
-                id,
-                CommandProposalStatus::Forgotten,
-                None,
-                None,
-                None,
-                now,
-            )
-            .await?;
-            return Err(crate::approvals::Error::ProposalSubjectForgotten.into());
-        }
         Err(e) => {
+            // docs/architecture.md §221: a subject forgotten without
+            // `forget_subject_in_command_proposals` (an older instance, or a
+            // direct `destroy_encryption_key`) - the payload is gone for
+            // good, so the proposal is finished rather than released to
+            // fail again. Anything else, the check failing included,
+            // releases the claim, so the approval stays retryable.
+            match proposal_subject_forgotten(pool, &command_type, &proposal).await {
+                Ok(true) => {
+                    tracing::info!(
+                        bounded_context,
+                        proposal_id = id,
+                        error = %e,
+                        "a subject this proposal names was forgotten - recording it as forgotten"
+                    );
+                    finish_command_proposal(
+                        pool,
+                        bounded_context,
+                        id,
+                        CommandProposalStatus::Forgotten,
+                        None,
+                        None,
+                        None,
+                        now,
+                    )
+                    .await?;
+                    return Err(crate::approvals::Error::ProposalSubjectForgotten.into());
+                }
+                Ok(false) => {}
+                Err(check) => tracing::warn!(
+                    bounded_context,
+                    proposal_id = id,
+                    error = %check,
+                    "could not check whether a subject this proposal names was forgotten"
+                ),
+            }
             release_command_proposal(pool, bounded_context, id).await?;
             return Err(e);
         }
