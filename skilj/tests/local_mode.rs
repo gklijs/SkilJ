@@ -1,4 +1,4 @@
-//! Codeberg issue #100 - the supported local mode.
+//! issue #100 - the supported local mode.
 //!
 //! These start a real embedded Postgres (installing it on first run), the
 //! same dependency the DB-backed suites already fall back to when

@@ -1,5 +1,5 @@
 //! Generates a small form from a command/event type's own JSON Schema
-//! (`TypeRegistration`'s `commandTypes`/`eventTypes` queries, Codeberg
+//! (`TypeRegistration`'s `commandTypes`/`eventTypes` queries,
 //! issue #6's "5a" - each result carries `schema` alongside `name`) -
 //! `app.rs`'s Commands/Query Events tabs both build one of these once a
 //! real registered type is picked, replacing v1's raw-JSON payload entry

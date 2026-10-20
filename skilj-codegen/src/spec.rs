@@ -1,6 +1,6 @@
 //! The declarative shape a `.skilj.toml` file describes - one bounded
 //! context's event/command *shapes* only (fields, DCB tags, consistency
-//! queries, `rest_trigger_allowed`). Deliberately narrow (Codeberg issue #5's
+//! queries, `rest_trigger_allowed`). Deliberately narrow (issue #5's
 //! own "narrower cut" - see this crate's own root doc comment and
 //! [docs/architecture.md §17](../../docs/architecture.md#event-command-codegen-real)): `decide()` bodies,
 //! scheduling, `#[requires_role]`, and every `Projection` concept are

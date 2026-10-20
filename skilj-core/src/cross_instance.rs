@@ -1,4 +1,4 @@
-//! Cross-instance push completeness (Codeberg issue #2; `@guarantee
+//! Cross-instance push completeness (issue #2; `@guarantee
 //! DeliverySpansInstances`/`RegistrationReachesEveryInstance` in
 //! specs/skilj.allium) - see docs/architecture.md's own write-up of this
 //! pass for the full design and its narrower spec `Excludes` entry for

@@ -2,7 +2,7 @@
 //! Postgres, for browsing a skilj deployment's registered types,
 //! projections and events when `skilj-graphql` itself isn't running (the
 //! exact moment an operator most wants to look). See docs/architecture.md
-//! [§14](../../docs/architecture.md#skilj-inspector) for the full design and Codeberg issue #6's own "5b".
+//! [§14](../../docs/architecture.md#skilj-inspector) for the full design and issue #6's own "5b".
 //!
 //! **Read-only by construction, not just by convention**: every function
 //! in [`data`] calls only `skilj_core::db` read functions - never

@@ -69,7 +69,7 @@ pub enum FilterOperator {
 /// sequence-adjacent integer in this codebase is `i64` - see
 /// docs/architecture.md §2.2.1.
 ///
-/// `correlation_id`/`causation_id` (Codeberg issue #18) are `Option`
+/// `correlation_id`/`causation_id` (issue #18) are `Option`
 /// here regardless of the "every stored `Command`/`Event` ends up with a
 /// `correlation_id`" guarantee the spec's `CorrelationIdIsAlwaysRecorded`
 /// invariant makes - that guarantee is a property of the write path

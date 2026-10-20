@@ -1,5 +1,5 @@
 //! `surface BoundedContextTemplating` - `createBoundedContextFromTemplate`,
-//! `resyncBoundedContextFromTemplate` (Codeberg issue #13). `Superadmin`-
+//! `resyncBoundedContextFromTemplate` (issue #13). `Superadmin`-
 //! gated, like `bounded_context_creation`/`bounded_context_deletion`
 //! (`@guarantee SuperadminOnly`) - not a per-context `RoleAccessMapping`,
 //! since both are operations on the set of contexts a deployment has

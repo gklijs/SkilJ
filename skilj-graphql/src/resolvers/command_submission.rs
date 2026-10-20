@@ -61,7 +61,7 @@ pub fn submit_command_field(n: &Naming) -> Field {
                     ctx.args.try_get("boundedContext")?.string()?.to_string();
                 let command_type_name = ctx.args.try_get("commandTypeName")?.string()?.to_string();
                 let payload = ctx.args.try_get("payload")?.string()?.to_string();
-                // Codeberg issue #12: optional, backward compatible -
+                // issue #12: optional, backward compatible -
                 // omitted (the existing default for every caller) means
                 // skip the idempotency mechanism entirely, not "generate
                 // a key anyway" - see skilj_core::db::submit_command's
@@ -86,7 +86,7 @@ pub fn submit_command_field(n: &Naming) -> Field {
                     idempotency_key.as_deref(),
                 )
                 .map_err(to_graphql_error)?;
-                // Codeberg issue #18 - both optional, same "absent" shape
+                // issue #18 - both optional, same "absent" shape
                 // as idempotencyKey above, but a different meaning: an
                 // absent correlationId is generated server-side, never
                 // skipped (see valid_correlation_id's own doc comment).
@@ -149,7 +149,7 @@ pub fn submit_command_field(n: &Naming) -> Field {
                     Some(_) => {}
                 }
 
-                // Codeberg issue #98: an approval-required command becomes
+                // issue #98: an approval-required command becomes
                 // a pending proposal. Nothing is decided yet; the approver
                 // runs the ordinary pipeline at approval time. A key that
                 // already produced an accepted command (a proposal
@@ -210,7 +210,7 @@ pub fn submit_command_field(n: &Naming) -> Field {
                 // this call, not folded into it, since REST triggering
                 // never needs it (§1.3.1). Routed through
                 // `state.command_batcher` rather than calling that
-                // function directly (Codeberg issue #32, round two) -
+                // function directly (issue #32, round two) -
                 // this resolver's own real-world concurrent traffic is
                 // exactly what `CommandBatcher` exists to coalesce into
                 // fewer bounded-context lock acquisitions; see its own
@@ -236,7 +236,7 @@ pub fn submit_command_field(n: &Naming) -> Field {
                     .await
                     .map_err(to_graphql_error)?;
 
-                // Codeberg issue #7's DCB conflict visualizer, for an
+                // issue #7's DCB conflict visualizer, for an
                 // Admin-level caller only: this WriteAccess-gated resolver
                 // lets any Write-level caller submit commands, but the
                 // matching events are event content - what queryEvents/
@@ -303,11 +303,11 @@ pub fn submit_command_field(n: &Naming) -> Field {
                             proposal_id: None,
                         }
                     }
-                    // Codeberg issue #12: a cached prior answer, not a
+                    // issue #12: a cached prior answer, not a
                     // fresh decision - no live matchingEvents to show
                     // (nothing was redispatched), same as a normal
                     // Accepted response otherwise. No correlationId
-                    // either, for the same reason (Codeberg issue #18).
+                    // either, for the same reason (issue #18).
                     skilj_core::db::SubmitCommandOutcome::Deduplicated {
                         triggered_event_sequences,
                     } => SubmitCommandResult {
@@ -408,7 +408,7 @@ async fn render_matching_events(
 }
 
 /// `dryRunCommand(boundedContext: String!, commandTypeName: String!, payload: String!): DryRunCommandPayload!`,
-/// `rule DryRunCommand` (Codeberg issue #47). What `submitCommand` would
+/// `rule DryRunCommand` (issue #47). What `submitCommand` would
 /// decide for this payload right now, with nothing persisted: no command,
 /// no event, no sequence, no encryption key, no idempotency record (see
 /// `skilj_core::db::dry_run_command`). A query, not a mutation, for that

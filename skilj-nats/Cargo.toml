@@ -18,7 +18,7 @@ thiserror.workspace = true
 futures-util.workspace = true
 async-nats = "0.50"
 chrono.workspace = true
-# Codeberg issue #21 - the shared backoff/attempt-cap policy both
+# issue #21 - the shared backoff/attempt-cap policy both
 # directions now apply: bounded (park-on-exhaustion) inbound, unbounded
 # (skip-on-exhaustion, if a cap is configured at all) outbound. See
 # docs/architecture.md's parked-deliveries section.

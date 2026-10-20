@@ -72,7 +72,7 @@
 //! (`skilj_bridge::wire_idempotency_key`, [§195](../../docs/architecture.md#review-since-0-0-9)),
 //! for the message and its parked-delivery report alike.
 //!
-//! # Dead-letter/parking (Codeberg issue #21)
+//! # Dead-letter/parking (issue #21)
 //!
 //! Both directions apply a [`skilj_retry::RetryPolicy`], but to different
 //! ends - see docs/architecture.md's parked-deliveries section for the
@@ -126,7 +126,7 @@ pub use skilj_bridge::{
     InboundMapping, OutboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
 };
 
-/// Header names for the two Codeberg-issue-#18 ids this bridge carries,
+/// Header names for the two issue #18 ids this bridge carries,
 /// both directions. **Deliberately not `Skilj-Correlation-Key`** -
 /// that's a pre-existing, unrelated header (a DCB-tag-derived value for
 /// a downstream consumer's own filtering/grouping, see
@@ -242,7 +242,7 @@ impl skilj_bridge::OutboundSink for JetstreamSink<'_> {
         if let Some(key) = correlation_key(self.mapping.key_tag_key.as_deref(), &event.tags) {
             publish = publish.header("Skilj-Correlation-Key", key.as_str());
         }
-        // Codeberg issue #18 - always present on correlation_id (the spec's
+        // issue #18 - always present on correlation_id (the spec's
         // own CorrelationIdIsAlwaysRecorded invariant), absent for a root
         // event's causation_id. Distinct headers from `Skilj-Correlation-Key`
         // above - see this module's own doc comment on `CORRELATION_ID_HEADER`.
@@ -396,7 +396,7 @@ pub struct InboundMessageMeta {
     pub stream_sequence: u64,
     pub message_id: Option<String>,
     /// `CORRELATION_ID_HEADER`/`CAUSATION_ID_HEADER`'s own values
-    /// (Codeberg issue #18) - both sender-optional, the same
+    /// (issue #18) - both sender-optional, the same
     /// "may or may not be populated" story `message_id` above already
     /// has.
     pub correlation_id: Option<String>,
@@ -544,7 +544,7 @@ pub async fn dispatch_inbound_message(
     Ok(())
 }
 
-/// Codeberg issue #21 - reports a message [`run_inbound`] gave up
+/// issue #21 - reports a message [`run_inbound`] gave up
 /// retrying to skilj's own `POST /v1/parked-deliveries`, using the same
 /// credential `mapping` already carries (that route resolves the
 /// bounded context from the presented token itself, the identical
@@ -590,7 +590,7 @@ async fn report_parked_delivery(
 /// confirms" shape `skilj_kafka::run_inbound`/`skilj_amqp::run_inbound`
 /// already have.
 ///
-/// Codeberg issue #21: a dispatch failure is retried, *for this one
+/// issue #21: a dispatch failure is retried, *for this one
 /// message*, with backoff up to `retry_policy` - not by relying on
 /// JetStream's own redelivery, which only replays after this consumer's
 /// own ack-wait timeout elapses, not on the very next pulled message in

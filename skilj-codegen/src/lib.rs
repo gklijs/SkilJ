@@ -1,5 +1,5 @@
 //! `build.rs` codegen for skilj's own declarative bounded-context
-//! format, Codeberg issue #5's "narrower cut" (see `docs/architecture.md`
+//! format, issue #5's "narrower cut" (see `docs/architecture.md`
 //! [§17](../../docs/architecture.md#event-command-codegen-real) for the full design, and [§16](../../docs/architecture.md#declarative-bounded-context-codegen-prototype) for the prototype that scoped it
 //! down to this). A `.skilj.toml` file describes one bounded context's
 //! event/command type *shapes* only, fields, DCB tags, sensitive fields

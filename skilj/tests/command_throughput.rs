@@ -1,4 +1,4 @@
-//! Command throughput benchmark for Codeberg issue #45 - not a test, so
+//! Command throughput benchmark for issue #45 - not a test, so
 //! `#[ignore]`d. Run with:
 //!
 //! ```sh

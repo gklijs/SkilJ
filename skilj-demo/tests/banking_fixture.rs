@@ -1,4 +1,4 @@
-//! `skilj-test-fixture`'s real-world adopter proof (Codeberg issue #19,
+//! `skilj-test-fixture`'s real-world adopter proof (issue #19,
 //! docs/architecture.md §45): the same `banking.rs` scenarios the real
 //! Postgres-backed integration suite (`tests/banking.rs`) exercises end
 //! to end, here run purely in-process against `decide()`/`project()`

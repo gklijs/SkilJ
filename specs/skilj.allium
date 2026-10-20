@@ -4157,7 +4157,7 @@ rule ProcessCommand {
     -- (see the archiving note above), the decider is handed that firing's
     -- timing context too - when the deadline was scheduled, and whether it
     -- ran past its own expiry. Deadlines themselves are outside this
-    -- spec's scope; the instant is not, and is always present. (Codeberg
+    -- spec's scope; the instant is not, and is always present. (
     -- issue #97.)
     let decision = decide(command_type, payload, matching_events, now)
     requires: decision.accepted = true

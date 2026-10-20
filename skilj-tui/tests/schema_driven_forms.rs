@@ -1,4 +1,4 @@
-//! End-to-end (within-process) tests for Codeberg issue #8: `App`'s
+//! End-to-end (within-process) tests for issue #8: `App`'s
 //! Commands picker/form flow and Query Events' checklist, driven purely
 //! through `App::handle` the same way `main.rs`'s own loop would -
 //! `AppEvent::Term` for real keypresses, and the two new
@@ -233,7 +233,7 @@ async fn query_events_checklist_toggles_and_runs_with_only_checked_types() {
     assert!(app.query_events.query_error.is_none());
 }
 
-/// Codeberg issue #21 - `App`'s Parked Deliveries tab: entering it fetches
+/// issue #21 - `App`'s Parked Deliveries tab: entering it fetches
 /// the list, navigating and discarding/retrying update `action_pending`
 /// correctly, and a successful action removes the row while a failed one
 /// leaves it in place - driven purely through `App::handle`, the same

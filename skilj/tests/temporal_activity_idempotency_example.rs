@@ -1,5 +1,5 @@
 //! Phase 1 of [docs/architecture.md §34](../../docs/architecture.md#skilj-temporal-plan)'s `skilj-temporal` plan: proof
-//! that skilj's existing `Idempotency-Key` mechanism (Codeberg issue
+//! that skilj's existing `Idempotency-Key` mechanism (issue
 //! #12, [§21](../../docs/architecture.md#optional-idempotency-key-submission)) is a drop-in fit for a Temporal Activity that calls
 //! `POST /v1/commands/trigger`, using Temporal's own documented
 //! idempotency-key derivation - a Workflow Run ID plus an Activity ID,

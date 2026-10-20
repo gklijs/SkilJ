@@ -1,0 +1,195 @@
+## CI - see docs/architecture.md §222/§223 and CONTRIBUTING.md for the checks
+## themselves. Replaces the Woodpecker pipeline skilj ran on Codeberg.
+##
+## The Rust jobs run in `rust:1-bookworm`, as the Woodpecker steps did,
+## so the scripts they call (scripts/ci-test.sh and the Postgres scripts
+## behind it) see the same Debian container, running as root, that they
+## were written against. The independent checks are separate jobs and run
+## in parallel; only `test` needs a database.
+##
+## rust-cache saves only on main: a PR reads main's cache, and PR-scoped
+## caches nothing else can read would only evict it from the 10 GB
+## repository limit.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # Checks this file, including shellcheck on every `run:` block.
+      - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+  check-section-refs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # Validates every "§N" citation of docs/architecture.md's own section
+      # headings (a past renumbering silently broke ~600 of them).
+      - run: scripts/check-section-refs.sh
+
+  check-template:
+    runs-on: ubuntu-24.04
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v5
+      # Generates templates/skilj-template and builds it against this
+      # workspace's crates - the template isn't a workspace member, so
+      # nothing else notices when a change breaks it (docs/architecture.md §105).
+      - run: scripts/check-template.sh
+
+  check-federation-composition:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      # Composes the federation descriptions skilj publishes, as recorded
+      # by skilj/tests/graphql_federation.rs, with Apollo's and Hive's
+      # composition next to another subgraph (docs/architecture.md §194).
+      - run: scripts/check-federation-composition.sh
+
+  fmt:
+    runs-on: ubuntu-24.04
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check
+
+  deny:
+    runs-on: ubuntu-24.04
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v5
+      # RustSec advisories, licenses, banned crates and sources, per
+      # deny.toml. A pinned release binary rather than `cargo install`,
+      # which would compile cargo-deny itself on every run.
+      - run: curl -sSfL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+      - run: /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny check
+
+  msrv:
+    runs-on: ubuntu-24.04
+    container: rust:1-bookworm
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+      # The workspace's declared `rust-version` (Cargo.toml) must keep
+      # building. Libraries and binaries only - what a dependent compiles;
+      # the tests run on stable below.
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      - run: rustup toolchain install 1.95 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo +1.95 check --workspace --lib --bins
+
+  # Its own job, next to `test` rather than before it: neither needs the
+  # other's output, since clippy and rustdoc build dependencies as
+  # metadata only, which `cargo test` can't reuse anyway.
+  clippy-doc:
+    runs-on: ubuntu-24.04
+    container: rust:1-bookworm
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+      # rdkafka's build script still builds librdkafka under clippy.
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev
+      - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Broken intra-doc links and public docs linking to private items
+      # don't fail a build, and docs.rs renders them as dead text.
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  test:
+    runs-on: ubuntu-24.04
+    container:
+      image: rust:1-bookworm
+      # The runner's preinstalled SDKs, mounted so the first step can
+      # delete them: the workspace's ~110 integration-test binaries ran a
+      # CI disk full before (see CARGO_PROFILE_DEV_DEBUG below), and these
+      # directories are most of the runner's used space.
+      volumes:
+        - /usr/share/dotnet:/host/dotnet
+        - /usr/local/lib/android:/host/android
+        - /opt/ghc:/host/ghc
+        - /opt/hostedtoolcache/CodeQL:/host/codeql
+    # The Postgres the tests run against. A service's name is its
+    # hostname from inside a container job, and the health check makes
+    # the job wait until it accepts connections.
+    services:
+      skilj-postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # Trust removes any client/server password mismatch, which is
+          # invisible from the job's side. Safe for what this is: a
+          # per-job container on a private network with no published
+          # ports, holding throwaway test databases.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # ci-test.sh reads this to find the service; its credentials default
+      # to postgres/postgres/postgres, which is also what the service gets.
+      CI_POSTGRES_HOST: skilj-postgres
+      # Disk, not speed: no run reuses the incremental cache, and line
+      # tables keep file:line in panic backtraces while dropping the
+      # variable/type debug info that is most of each binary's size.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - name: Free runner disk space
+        run: rm -rf /host/dotnet/* /host/android/* /host/ghc/* /host/codeql/* && df -h /
+      - uses: actions/checkout@v5
+      # cmake and libcurl4-openssl-dev: skilj-kafka's rdkafka vendors
+      # librdkafka via cmake, and that source #includes curl/curl.h even
+      # with curl support compiled out. `postgresql` is the server: the
+      # failover test (skilj_test_support::FailoverServer, docs/architecture.md
+      # §176) runs a primary and a standby of its own, as the `postgres`
+      # user this package creates, since Postgres refuses to run as root.
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake libcurl4-openssl-dev postgresql-client postgresql
+      # Settle the database first, so a missing one shows in seconds
+      # rather than after the whole workspace is built. Prefers the
+      # service and falls back to a Postgres inside this container.
+      - run: bash scripts/ci-test.sh --setup-only
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Compiles exactly what the run below needs, as its own step so a
+      # compile error is told apart from a failing test. Not `cargo build
+      # --all-targets`: `cargo test` recompiled the workspace crates after
+      # it (1m43s on the first GitHub run).
+      - run: cargo test --workspace --no-run
+      # Every Postgres-backed test runs against a real server, and the
+      # broker suites against containers on the runner's Docker, which
+      # this container job reaches through its mounted socket. ci-test.sh
+      # fails the build if any test skipped anyway (§223).
+      - run: bash scripts/ci-test.sh

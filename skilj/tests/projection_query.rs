@@ -237,7 +237,7 @@ impl Projection for AccountBalance {
 }
 
 /// Identical to `AccountBalance` in every way except `TEAM_ONLY` -
-/// exists purely to exercise Codeberg issue #17's whole-projection team
+/// exists purely to exercise issue #17's whole-projection team
 /// gate end to end, on both the `projection` field and (the fix itself)
 /// `projectionSchema`.
 struct StaffOnlyBalance;
@@ -948,7 +948,7 @@ fn projection_schema_end_to_end() {
     });
 }
 
-/// Codeberg issue #17's own gap and fix, end to end over real HTTP: a
+/// issue #17's own gap and fix, end to end over real HTTP: a
 /// `TEAM_ONLY`-declaring projection rejects a Role not carrying the
 /// required name on *both* `projection` and `projectionSchema`. Before
 /// the fix, `projectionSchema` skipped this check entirely while

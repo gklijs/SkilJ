@@ -111,7 +111,7 @@ fn timestamp(secs: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(secs, 0).unwrap()
 }
 
-/// `consume_events`'s own `checkout_lease` parameter (Codeberg issue #25,
+/// `consume_events`'s own `checkout_lease` parameter (issue #25,
 /// docs/architecture.md §53) - matches both `config.read_cursor_checkout_lease`'s
 /// own spec default and `SkiljBuilder::read_cursor_checkout_lease`'s own
 /// Rust default, so a test relying on this fixture is exercising the
@@ -302,7 +302,7 @@ fn consume_events_provisions_a_cursor_on_first_use() {
             assert_eq!(cursor.ack_mode, AckMode::AutoAdvance);
             assert_eq!(cursor.sequence, 1); // highest served
             assert_eq!(cursor.updated_at, timestamp(100));
-            // Codeberg issue #25 (docs/architecture.md §53) -
+            // issue #25 (docs/architecture.md §53) -
             // auto_advance never claims: it has no equivalent gap to
             // close (see `ReadCursor.checked_out_at`'s own spec doc
             // comment).
@@ -462,7 +462,7 @@ fn consume_events_auto_advance_moves_the_cursor_to_the_highest_served_sequence()
 }
 
 /// `sequence`/`position` never moves on serve, in either mode - but
-/// unlike before Codeberg issue #25's investigation (docs/architecture.md
+/// unlike before issue #25's investigation (docs/architecture.md
 /// §53), a `manual_ack` cursor with no live claim now *does* get one:
 /// `Claimed`, not `Unchanged`. See
 /// `consume_events_manual_ack_with_a_live_claim_serves_nothing` below for
@@ -507,7 +507,7 @@ fn consume_events_manual_ack_never_moves_the_cursor_on_serve() {
     );
 }
 
-/// Codeberg issue #25's investigation (docs/architecture.md §53) - the
+/// issue #25's investigation (docs/architecture.md §53) - the
 /// gap this closes: a second caller racing a still-live claim on the
 /// same token must be served nothing, not the identical unacknowledged
 /// batch a first caller may still be acting on externally.
@@ -547,7 +547,7 @@ fn consume_events_manual_ack_with_a_live_claim_serves_nothing() {
     assert_eq!(cursor_update, CursorUpdate::Unchanged);
 }
 
-/// Codeberg issue #25's investigation - the other half of the same
+/// issue #25's investigation - the other half of the same
 /// guarantee: a claim older than `checkout_lease` is abandoned, not
 /// live, so this call succeeds exactly as if nothing had claimed it -
 /// serving the batch and reclaiming the cursor with a fresh
@@ -595,7 +595,7 @@ fn consume_events_manual_ack_reclaims_a_stale_claim() {
     );
 }
 
-/// Codeberg issue #25's investigation - the `manual_ack` twin of
+/// issue #25's investigation - the `manual_ack` twin of
 /// `consume_events_provisions_a_cursor_on_first_use`: a brand new
 /// cursor's very first serve claims it too, unlike `auto_advance`, which
 /// never sets `checked_out_at` at all (that test's own assertion).
@@ -630,7 +630,7 @@ fn consume_events_manual_ack_provisions_a_claimed_cursor_on_first_use() {
 /// new matched and `next_position` falls back to the unchanged `position`
 /// (`highest_sequence(served) ?? position`) - so this is still
 /// `Advanced`, at the same sequence, not `Unchanged`. `Unchanged` is only
-/// reachable for `manual_ack` with a still-live claim (Codeberg issue
+/// reachable for `manual_ack` with a still-live claim (issue
 /// #25's investigation narrowed this - see
 /// `consume_events_manual_ack_with_a_live_claim_serves_nothing` below).
 #[test]

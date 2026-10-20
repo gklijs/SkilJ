@@ -31,7 +31,7 @@ fn respond_to(body: &Value) -> Value {
 
     if query.contains("__typename") && !query.contains("... on") {
         // Step 1: resolve which concrete union member this instance is.
-        // Codeberg issue #7's time-travel projection viewer - the query
+        // issue #7's time-travel projection viewer - the query
         // itself always declares `waitForSequence: $wait` now.
         assert!(
             query.contains("waitForSequence: $wait"),
@@ -101,7 +101,7 @@ async fn resolves_an_arbitrary_projections_shape_via_introspection_and_fetches_i
     );
 }
 
-/// Codeberg issue #7's time-travel projection viewer - `wait_for_sequence`
+/// issue #7's time-travel projection viewer - `wait_for_sequence`
 /// reaches every one of `fetch`'s own real requests as the `wait`
 /// variable, `None` rendering as JSON `null` (the "no wait, don't ask
 /// for one" case, not the number `0`, which would ask to wait for

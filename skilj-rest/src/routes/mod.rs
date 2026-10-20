@@ -9,7 +9,7 @@
 //! - `GET  /v1/events/consume`     - EventFetch::ConsumeEvents (server-tracked)
 //! - `POST /v1/events/consume/ack` - EventFetch::AcknowledgeEvents (manual_ack only)
 //! - `POST /v1/commands/trigger`   - CommandTrigger
-//! - `POST /v1/parked-deliveries`  - ParkedDeliveryReport (Codeberg issue
+//! - `POST /v1/parked-deliveries`  - ParkedDeliveryReport (issue
 //!   #21) - a message-broker bridge's own "I gave up retrying this
 //!   inbound delivery" report, authenticated with the same
 //!   `ExternalEventToken`/`CommandToken` credential the bridge already
@@ -93,13 +93,13 @@ struct AppState {
     event_cache: EventCache,
     /// `ConsumeEvents`' own `manual_ack` claim lease - see
     /// `skilj::SkiljBuilder::read_cursor_checkout_lease`'s own doc
-    /// comment (Codeberg issue #25, docs/architecture.md §53).
+    /// comment (issue #25, docs/architecture.md §53).
     read_cursor_checkout_lease: chrono::Duration,
     /// `config.max_events_per_read` - the most events one `GET
     /// /v1/events` or `GET /v1/events/consume` serves. See
     /// `skilj::SkiljBuilder::max_events_per_read`.
     max_events_per_read: usize,
-    /// Codeberg issue #32 (round two) - `post_commands_trigger`'s own
+    /// issue #32 (round two) - `post_commands_trigger`'s own
     /// real, externally-triggered submission volume is exactly what
     /// `CommandBatcher` exists to coalesce; see its own module doc
     /// comment.
@@ -365,7 +365,7 @@ struct ExternalEventRequest {
     // before this handler ever sees it - see db::DedupeCursor's own doc
     // comment for the full reasoning.
     dedupe: Option<DedupeRequest>,
-    // Codeberg issue #18 - an adapter's own attachment point for an
+    // issue #18 - an adapter's own attachment point for an
     // upstream trace id (a message-broker bridge forwarding the id its
     // own broker already carried). `correlation_id` omitted means
     // generated server-side, never that the mechanism is skipped -
@@ -398,7 +398,7 @@ struct ExternalEventResponse {
 #[serde(rename_all = "camelCase")]
 struct DirectEventRequest {
     payload: serde_json::Value,
-    // See `ExternalEventRequest`'s own identical pair (Codeberg issue #18).
+    // See `ExternalEventRequest`'s own identical pair (issue #18).
     correlation_id: Option<String>,
     causation_id: Option<String>,
 }
@@ -416,7 +416,7 @@ struct MetadataDto {
     version: i64,
     client_id: String,
     created_at: chrono::DateTime<Utc>,
-    // Codeberg issue #18. `correlation_id` is `None` only for a record
+    // issue #18. `correlation_id` is `None` only for a record
     // written before this field existed - see `Metadata`'s own doc
     // comment.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -585,7 +585,7 @@ struct EventsQuery {
     // docs/architecture.md §176: the `epoch` the response carrying `after`
     // as its `nextCursor` came with. Since §195 the cursor carries it too.
     epoch: Option<String>,
-    // Codeberg issue #18 - "show me everything in this transaction",
+    // issue #18 - "show me everything in this transaction",
     // the REST-side counterpart to `queryEvents`'s own `correlationId`
     // GraphQL argument.
     correlation_id: Option<String>,
@@ -727,7 +727,7 @@ struct EmptyResponse {}
 #[serde(rename_all = "camelCase")]
 struct CommandTriggerRequest {
     payload: serde_json::Value,
-    // See `ExternalEventRequest`'s own identical pair (Codeberg issue
+    // See `ExternalEventRequest`'s own identical pair (issue
     // #18) - unlike that surface, a plain command trigger has no
     // upstream event of its own to attach a `causation_id` from, but a
     // bridge fronting this route may still know one (an upstream
@@ -770,13 +770,13 @@ struct CommandTriggerResponse {
     rejection_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rejection_kind: Option<String>,
-    // Codeberg issue #12: `true` only when an `Idempotency-Key` header
+    // issue #12: `true` only when an `Idempotency-Key` header
     // was given and it matched a prior `Accepted` outcome -
     // `triggered_event_sequences` is that prior outcome's, not a fresh
     // decision. Always `false` when no header was given, matching
     // today's behaviour exactly.
     deduplicated: bool,
-    // Codeberg issue #18: echoes back the correlation_id the resulting
+    // issue #18: echoes back the correlation_id the resulting
     // Command actually ended up with - the caller's own, if it supplied
     // one, or the one skilj generated on its behalf otherwise. `None`
     // for a rejection (`process_command` never runs, so nothing was ever
@@ -785,7 +785,7 @@ struct CommandTriggerResponse {
     // Command itself isn't re-fetched to answer this).
     #[serde(skip_serializing_if = "Option::is_none")]
     correlation_id: Option<String>,
-    // Codeberg issue #98: `true` when the command type requires approval.
+    // issue #98: `true` when the command type requires approval.
     // Nothing was decided or stored as a command; `proposal_id` names the
     // pending `CommandProposal` an admin approves over GraphQL.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -794,7 +794,7 @@ struct CommandTriggerResponse {
     proposal_id: Option<String>,
 }
 
-/// Codeberg issue #21 - which credential kind (and therefore which
+/// issue #21 - which credential kind (and therefore which
 /// original REST route) this parked delivery came from. Deliberately
 /// not `CrossContextRoute` here - that kind is only ever written by
 /// `db::catch_up_cross_context_route` directly (same process, real DB
@@ -1079,7 +1079,7 @@ async fn get_events_consume(
         }
     };
 
-    // Codeberg issue #25's investigation (docs/architecture.md §53): the
+    // issue #25's investigation (docs/architecture.md §53): the
     // cursor is read and written in one transaction, guarded end to end by
     // `lock_read_cursor_for_consume`'s advisory lock, so a second concurrent
     // request for the same token blocks until the first commits rather than
@@ -1252,7 +1252,7 @@ async fn post_commands_trigger(
     let token = resolve_token::<CommandToken>(&state, &credential).await?;
     let payload = serde_json::to_string(&body.payload)
         .expect("serde_json::Value serialization is infallible");
-    // Codeberg issue #12: optional, backward compatible - omitted (the
+    // issue #12: optional, backward compatible - omitted (the
     // existing default for every caller) means skip the idempotency
     // mechanism entirely, not "generate a key anyway" - see
     // skilj_core::db::submit_command's own doc comment for why that's
@@ -1281,7 +1281,7 @@ async fn post_commands_trigger(
     span.record("bounded_context", bounded_context_name.as_str());
     span.record("command_type", authorised.command_type.name.as_str());
 
-    // Codeberg issue #98: an approval-required command becomes a pending
+    // issue #98: an approval-required command becomes a pending
     // proposal; `decide()` runs only when an approver accepts it. A key
     // that already produced an accepted command (an earlier proposal was
     // approved) falls through to the ordinary dedup path below.
@@ -1336,7 +1336,7 @@ async fn post_commands_trigger(
     // cross-context event router) via `skilj_core::db::
     // decide_and_submit_command` rather than each duplicating the dance.
     // Routed through `state.command_batcher` rather than calling that
-    // function directly (Codeberg issue #32, round two) - this route's
+    // function directly (issue #32, round two) - this route's
     // own real-world concurrent traffic is exactly what
     // `CommandBatcher` exists to coalesce into fewer bounded-context
     // lock acquisitions; see its own module doc comment.
@@ -1365,7 +1365,7 @@ async fn post_commands_trigger(
         // whether this was the first decision or a DCB-conflict retry
         // inside submit_command, a rejection renders identically either
         // way.
-        // `matching_events` (Codeberg issue #7's DCB conflict visualizer)
+        // `matching_events` (issue #7's DCB conflict visualizer)
         // stays a `skilj-tui`/GraphQL-only debugging affordance - out of
         // scope for REST's narrower, machine-caller-facing wire shape
         // (§7.1) - so it's computed and immediately dropped here.
@@ -1389,7 +1389,7 @@ async fn post_commands_trigger(
             pending_approval: false,
             proposal_id: None,
         },
-        // Codeberg issue #12: a cached prior answer, not a fresh
+        // issue #12: a cached prior answer, not a fresh
         // decision.
         db::SubmitCommandOutcome::Deduplicated {
             triggered_event_sequences,
@@ -1412,7 +1412,7 @@ async fn post_commands_trigger(
     }))
 }
 
-/// `DryRunTriggerCommand` (Codeberg issue #47): `post_commands_trigger`'s
+/// `DryRunTriggerCommand` (issue #47): `post_commands_trigger`'s
 /// authorisation and `decide()`, and nothing after - no command, no
 /// event, no sequence, no encryption key, and no idempotency record, so
 /// it takes no `Idempotency-Key` and no correlation ids. The answer is
@@ -1468,7 +1468,7 @@ async fn post_commands_dry_run(
     }))
 }
 
-/// `ParkedDeliveryReport` (Codeberg issue #21) - authenticated with the
+/// `ParkedDeliveryReport` (issue #21) - authenticated with the
 /// same `ExternalEventToken`/`CommandToken` credential the bridge
 /// already presents for the delivery itself, `kind` saying which -
 /// resolving it here (rather than accepting a bare `boundedContext`

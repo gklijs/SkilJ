@@ -12,7 +12,7 @@
 //! folds `matching_events` (empty, the first time) to find the current
 //! balance, so an unopened account reads as balance zero.
 //!
-//! **Codeberg issue #5's narrower cut ([docs/architecture.md §17](../../docs/architecture.md#event-command-codegen-real))**: the
+//! **issue #5's narrower cut ([docs/architecture.md §17](../../docs/architecture.md#event-command-codegen-real))**: the
 //! event/command *shape* half of this file - the payload structs, the
 //! `EventType`/`CommandType` impls' declarative fields, and the shared
 //! `BankingEvent` enum + its `BoundedContextEvent` impl - is generated

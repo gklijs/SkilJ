@@ -1,4 +1,4 @@
-//! Inbound throughput benchmark for Codeberg issue #41 - not a test, so
+//! Inbound throughput benchmark for issue #41 - not a test, so
 //! `#[ignore]`d. Run with:
 //!
 //! ```sh

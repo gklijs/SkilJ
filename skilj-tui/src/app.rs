@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 /// The five v1 tabs - see [docs/architecture.md §11](../../docs/architecture.md#skilj-tui-console) for what's
 /// deliberately not here yet (schema-driven forms, the superadmin
-/// directory, admin-console operations). `ParkedDeliveries` (Codeberg
+/// directory, admin-console operations). `ParkedDeliveries` (
 /// issue #21) is the exception to "not here yet": a real admin
 /// list+retry+discard view, the first of its kind in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +77,7 @@ pub enum AppEvent {
     CommandResult(Result<Value, ClientError>),
     CommandTypesResult(Result<Value, ClientError>),
     ProjectionResult(Result<Value, ClientError>),
-    /// Codeberg issue #21.
+    /// issue #21.
     ParkedDeliveriesResult(Result<Value, ClientError>),
     /// The outcome of whichever `retryParkedDelivery`/`discardParkedDelivery`
     /// call `ParkedDeliveriesTab::action_pending` names - see its own doc
@@ -117,9 +117,9 @@ fn parse_type_options(data: &Value, field: &str) -> Vec<TypeOption> {
         .unwrap_or_default()
 }
 
-/// Query Events - Codeberg issue #8: the free-text, comma-separated
+/// Query Events - issue #8: the free-text, comma-separated
 /// `event_types` field became a real picker over `eventTypes(boundedContext)`
-/// ([§13](../../docs/architecture.md#self-describing-graphql-surface)/Codeberg issue #6's "5a"). One flat struct rather than a
+/// ([§13](../../docs/architecture.md#self-describing-graphql-surface)/issue #6's "5a"). One flat struct rather than a
 /// `CommandsTab`-style two-stage enum: picking which types to include and
 /// seeing the last query's results are never mutually exclusive views
 /// the way Commands' picker/form are - both stay visible together, the
@@ -138,7 +138,7 @@ pub struct QueryEventsTab {
     pub queried_types: Vec<Value>,
 }
 
-/// Commands - Codeberg issue #8. Picking a type and filling in its
+/// Commands - issue #8. Picking a type and filling in its
 /// generated form are mutually exclusive views (unlike Query Events'
 /// picker+results, which coexist), so this is a real two-stage enum:
 /// `Picking` a real, registered command type, then a `Form` generated
@@ -173,7 +173,7 @@ pub struct CommandsTab {
 pub enum ProjectionField {
     Name,
     Key,
-    // Codeberg issue #7's time-travel projection viewer -
+    // issue #7's time-travel projection viewer -
     // `projection_query::fetch`'s own `wait_for_sequence` param, see its
     // doc comment for why this is a freshness guarantee, not a
     // historical snapshot.
@@ -190,7 +190,7 @@ pub struct ProjectionsTab {
     pub loading: bool,
 }
 
-/// Codeberg issue #21 - `parkedDeliveries(boundedContext)`/
+/// issue #21 - `parkedDeliveries(boundedContext)`/
 /// `retryParkedDelivery`/`discardParkedDelivery`. Shaped like
 /// `QueryEventsTab` (a list, no picker/form sub-stage), not
 /// `CommandsTab`'s two-stage enum - there's no second view to switch
@@ -460,7 +460,7 @@ impl App {
 
         // Digits switch the main tab regardless of what's focused
         // in-tab - true for every tab except one with real free-text
-        // entry live right now: Commands' own generated form (Codeberg
+        // entry live right now: Commands' own generated form (
         // issue #8) and Projections' three fields (issue #7's own
         // `waitForSequence` addition made this a real, not just latent,
         // gap there too - see `ProjectionField::WaitForSequence`'s own
@@ -520,7 +520,7 @@ impl App {
         }
     }
 
-    // --- Live Events: `/`-gated substring filter (Codeberg issue #7) ---
+    // --- Live Events: `/`-gated substring filter (issue #7) ---
 
     /// `/` enters filter-compose mode (matching `less`/`vim`'s own
     /// well-known search key) rather than always-on free text - the
@@ -548,7 +548,7 @@ impl App {
     }
 
     // --- Query Events: a checklist over real eventTypes, replacing v1's
-    //     free-text comma-separated field (Codeberg issue #8) ---
+    //     free-text comma-separated field (issue #8) ---
 
     fn handle_query_events_key(&mut self, key: KeyEvent) {
         match key.code {
@@ -647,7 +647,7 @@ impl App {
     }
 
     // --- Commands: pick a real, registered command type, then fill in
-    //     the form generated from its own schema (Codeberg issue #8) ---
+    //     the form generated from its own schema (issue #8) ---
 
     fn handle_commands_key(&mut self, key: KeyEvent) {
         match &self.commands.stage {
@@ -908,7 +908,7 @@ impl App {
         });
     }
 
-    // --- Parked Deliveries: list + retry + discard (Codeberg issue #21) ---
+    // --- Parked Deliveries: list + retry + discard (issue #21) ---
 
     fn handle_parked_deliveries_key(&mut self, key: KeyEvent) {
         match key.code {

@@ -138,7 +138,7 @@ pub struct GraphqlState {
     /// `submitCommand`'s and parked-delivery redrive's own real,
     /// externally-triggered submission volume - exactly what
     /// `CommandBatcher` exists to coalesce into fewer bounded-context
-    /// lock acquisitions (Codeberg issue #32, round two) - the identical
+    /// lock acquisitions (issue #32, round two) - the identical
     /// `CommandBatcher` `Skilj::rest_router()` hands `skilj-rest`'s own
     /// `CommandTrigger` route, reused here for the same reason
     /// `dispatcher`/`event_broadcaster` above are: one shared, process-

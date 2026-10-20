@@ -1,4 +1,4 @@
-//! Codeberg issue #15: a real, timed A/B proof that
+//! issue #15: a real, timed A/B proof that
 //! `stream::iter(...).buffer_unordered(N)` concurrent fan-out over
 //! per-bounded-context startup warm-up work is actually faster than the
 //! plain sequential `for` loop it replaced in `SkiljBuilder::build()` -

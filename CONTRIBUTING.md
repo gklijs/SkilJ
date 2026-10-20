@@ -49,11 +49,11 @@ previous run was killed rather than exited and left sessions attached,
 enough privilege to terminate them. Locally a real Postgres is
 preferable anyway: an embedded server is downloaded and `initdb`'d on
 first use, where a local Postgres is already there. CI sets it for the
-same reason, to a `services:` container in `.woodpecker.yml`
+same reason, to a `services:` container in `.github/workflows/ci.yml`
 (docs/architecture.md §166).
 
 CI's database setup and test run live in `scripts/ci-test.sh` rather
-than inline in `.woodpecker.yml`, and `bash scripts/ci-test.sh`
+than inline in `.github/workflows/ci.yml`, and `bash scripts/ci-test.sh`
 reproduces them by hand. It prefers the pipeline's `services:`
 container, and falls back to a Postgres started inside the step's own
 container (`scripts/ci-postgres-local.sh`) when the service doesn't
@@ -61,23 +61,14 @@ answer - so a database that isn't there is a loud `[ci-test] WARNING` in
 the step's output rather than a red build, and the tests still run
 against something real. `scripts/ci-wait-for-postgres.sh` is the
 poller, and on failure prints what the step can see (name resolution,
-hosts file, routes, a raw `/dev/tcp` connect, psql's own error); the
-service's logs are not in the step's output, so that is the whole of
-what there is to go on.
+hosts file, routes, a raw `/dev/tcp` connect, psql's own error). The
+service's own logs are in the job's "Stop containers" step.
 
-Two CI-config facts worth knowing before editing `.woodpecker.yml`:
-
-- **`services:` is a workflow-level key, not a step-level one.** Drone's
-  shape put it under the step; Woodpecker's schema has it at the top
-  level, and a step object has no such property. Getting that wrong is
-  what made five CI runs chase a Postgres that was never started - see
-  docs/architecture.md §166.
-- **Woodpecker's own linter reports schema problems without failing the
-  pipeline.** `scripts/check-woodpecker-config.sh` (a CI step) validates
-  the file against that same schema and *does* fail the build, so a key
-  that would only warn cannot cost a run. It needs `python3-yaml` and
-  `python3-jsonschema`, and network access for the schema fetch;
-  `WOODPECKER_SCHEMA_URL` pins a specific version.
+CI runs on GitHub Actions (docs/architecture.md §222). The Rust jobs run
+in a `rust:1-bookworm` container, as root, because the scripts above
+were written against that; a job that runs on the bare runner instead
+would need `sudo` for the in-job Postgres fallback and the failover
+test. The `actionlint` job checks `.github/workflows/ci.yml` itself.
 
 Building `skilj-temporal` ([docs/architecture.md §34](docs/architecture.md#skilj-temporal-plan)) no longer needs a
 system `protoc` binary: `temporalio-client`/`temporalio-common` 1.0.0
@@ -146,11 +137,12 @@ available), after applying the `unset DOCKER_HOST` workaround on WSL:
 cargo test -p skilj-kafka -p skilj-amqp -p skilj-nats -p skilj-temporal
 ```
 
-CI does not run these (see `.woodpecker.yml`'s `build-clippy-test`
-step: the `rust:1-bookworm` image has no Docker daemon), so they
-always skip in the pipeline - run them by hand before merging changes
-that touch any bridge crate. `skilj-temporal`'s own ephemeral-server
-download also needs outbound network access on first run.
+CI runs these in `.github/workflows/ci.yml`'s `test` job, and fails if
+any of them skip (docs/architecture.md §223). The brokers start next to
+the job's container, on the runner's Docker, so a test connects to
+`get_host()` rather than `127.0.0.1` - keep it that way in a new broker
+test. `skilj-temporal`'s own ephemeral-server download also needs
+outbound network access on first run.
 
 The embedded Postgres a test binary starts (via `skilj-test-support`),
 and the Kafka/Artemis/NATS containers the bridge crates' tests start,
@@ -241,10 +233,6 @@ far as a test exercises them, and some aren't checked at all
   behind Apollo Router and Hive Router, but downloads them, so it runs by
   hand only. Apollo Router's subscriptions need GraphOS, so only Hive
   Router's are exercised (§194).
-- **The broker bridges in CI.** The Kafka, AMQP, NATS and Temporal tests
-  need Docker. The CI image has none, so they skip on every run, and the
-  skip guard ignores their notes on purpose. Run them by hand (above)
-  before merging a bridge change.
 - **Postgres versions.** CI runs `postgres:17-alpine`. Locally you get
   whatever `DATABASE_URL` points at, or the embedded fallback. Nothing
   runs the suite against several major versions.

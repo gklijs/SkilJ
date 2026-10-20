@@ -71,7 +71,7 @@
 //! succeeded, so a redelivery (a consumer crash before its own accept
 //! lands) calls skilj again rather than silently skipping the message.
 //!
-//! # Dead-letter/parking (Codeberg issue #21)
+//! # Dead-letter/parking (issue #21)
 //!
 //! Both directions apply a [`skilj_retry::RetryPolicy`], the identical
 //! shape `skilj-kafka` uses - see that crate's own "Dead-letter/parking"
@@ -120,7 +120,7 @@ pub use skilj_bridge::{
 };
 
 /// The `application-properties` key this bridge uses for causation_id
-/// (Codeberg issue #18) - AMQP 1.0's standard `Properties` has a real
+/// (issue #18) - AMQP 1.0's standard `Properties` has a real
 /// `correlation-id` field (used directly, see [`produce_once`]/
 /// [`InboundMessageMeta::correlation_id`]) but no causation equivalent,
 /// so this rides in the message's own free-form application properties
@@ -243,7 +243,7 @@ impl skilj_bridge::OutboundSink for AmqpSink<'_> {
             }
         };
         let payload = event.payload.to_string().into_bytes();
-        // Codeberg issue #18 - `correlation-id` is a real AMQP 1.0 standard
+        // issue #18 - `correlation-id` is a real AMQP 1.0 standard
         // property (`Properties::correlation_id`), set directly;
         // `causation_id` has no standard equivalent, so it rides in
         // `application-properties` instead (see `CAUSATION_ID_PROPERTY`'s
@@ -413,7 +413,7 @@ pub struct InboundMessageMeta {
     pub group_id: Option<String>,
     pub group_sequence: Option<u32>,
     pub message_id: Option<MessageId>,
-    /// AMQP 1.0's own standard `correlation-id` property (Codeberg issue
+    /// AMQP 1.0's own standard `correlation-id` property (issue
     /// #18) - rendered via `message_id_to_string`, same treatment
     /// `message_id` above already gets. Forwarded as `correlationId` on
     /// whichever skilj call `dispatch_inbound_message` makes; `None`
@@ -567,7 +567,7 @@ pub async fn dispatch_inbound_message(
     Ok(())
 }
 
-/// Codeberg issue #21 - reports a message [`run_inbound`] gave up
+/// issue #21 - reports a message [`run_inbound`] gave up
 /// retrying to skilj's own `POST /v1/parked-deliveries`, the identical
 /// `skilj_kafka::report_parked_delivery` shape. `request` is
 /// [`inbound_request_body`]'s own output, stored verbatim so a later
@@ -620,7 +620,7 @@ async fn report_parked_delivery(
 /// configured mapping (unusual, but not prevented by AMQP itself) has a
 /// defined lookup, not because this function itself multiplexes several
 /// receivers.
-/// Codeberg issue #21: a dispatch failure is retried, *for this one
+/// issue #21: a dispatch failure is retried, *for this one
 /// message*, with backoff up to `retry_policy` - a purely local,
 /// in-process loop, since (unlike `skilj-kafka`'s broker-assigned
 /// offsets) AMQP 1.0 gives this bridge no delivery/redelivery count to

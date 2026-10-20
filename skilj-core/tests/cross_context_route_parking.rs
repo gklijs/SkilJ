@@ -1,4 +1,4 @@
-//! Codeberg issue #21 - proves `db::catch_up_cross_context_route`'s own
+//! issue #21 - proves `db::catch_up_cross_context_route`'s own
 //! retry-then-park mechanism for real: a target command submission that
 //! fails repeatedly no longer blocks the route's cursor forever (the gap
 //! the issue names). Same "test the layer in isolation" shape
@@ -666,7 +666,7 @@ fn a_persistently_failing_target_parks_instead_of_blocking_forever() {
     });
 }
 
-/// Codeberg issue #25 review (docs/architecture.md §56): two concurrent
+/// issue #25 review (docs/architecture.md §56): two concurrent
 /// catch-up ticks for the identical route/occurrence must never both
 /// park it - `catch_up_cross_context_route`'s own advisory lock should
 /// serialize them so only the first ever gets far enough to see the

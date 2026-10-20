@@ -1,4 +1,4 @@
-//! End-to-end tests for Codeberg issue #13's templated bounded-context
+//! End-to-end tests for issue #13's templated bounded-context
 //! tenants (`createBoundedContextFromTemplate`/
 //! `resyncBoundedContextFromTemplate`, `surface BoundedContextTemplating`
 //! in specs/skilj.allium). Same real-HTTP-through-`Skilj::graphql_router()`,

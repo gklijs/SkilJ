@@ -132,7 +132,7 @@ pub struct BoundedContext {
     /// Who created it.
     pub created_by: crate::bootstrap::ContextCreator,
     /// See `entity BoundedContext`'s own `template` field doc comment
-    /// (Codeberg issue #13). `None` for every context `AddBoundedContext`
+    /// (issue #13). `None` for every context `AddBoundedContext`
     /// makes and for the admin context - the ordinary case. Set once, at
     /// creation, by `CreateBoundedContextFromTemplate`, and never
     /// afterward - the one write it can still take is `DeleteBoundedContext`
@@ -446,7 +446,7 @@ pub struct Event {
 }
 
 /// The stable, composed string identifying an `Event` as a *cause*
-/// (Codeberg issue #18) - `Event` deliberately has no synthetic id of
+/// (issue #18) - `Event` deliberately has no synthetic id of
 /// its own the way `Command.id` does (see the doc comment on `Command`'s
 /// own `id` field for why only that entity needed one), only `sequence`,
 /// which is unique per bounded context but not globally. Prefixing it
@@ -558,7 +558,7 @@ pub enum AckMode {
 
 /// See `entity ReadCursor`. `checked_out_at` is `manual_ack` only - always
 /// `None` for an `auto_advance` cursor, which has no equivalent gap to
-/// close (see the field's own doc comment in the spec). Codeberg issue
+/// close (see the field's own doc comment in the spec). issue
 /// #25's investigation found the gap this closes: docs/architecture.md
 /// §53.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,7 +790,7 @@ pub enum Error {
     /// Not spec-modeled: a security-review finding on `CrossContextRoute`
     /// ([docs/architecture.md §36](../../../docs/architecture.md#cross-context-route)) - the `idempotency_keys` table's own
     /// primary key is `(command_type_name, idempotency_key)` with no
-    /// caller/client_id column at all (Codeberg issue #12's original
+    /// caller/client_id column at all (issue #12's original
     /// design never needed one - every prior caller only ever collided
     /// with its own past submissions). `CrossContextRoute`'s background
     /// task is the first caller to place an *unauthenticated internal*
@@ -865,7 +865,7 @@ pub enum Error {
     #[error("stored payload did not decode into its expected type: {0}")]
     PayloadDecodeFailed(String),
 
-    /// Codeberg issue #18 - `valid_correlation_id`'s own rejection,
+    /// issue #18 - `valid_correlation_id`'s own rejection,
     /// shared by `correlation_id` and `causation_id` alike (see that
     /// function's own doc comment for why the two get identical, looser-
     /// than-`valid_bounded_context_name` treatment: no charset
@@ -875,7 +875,7 @@ pub enum Error {
     #[error("correlation_id/causation_id must be at most {CORRELATION_ID_MAX_LEN} characters")]
     CorrelationIdTooLong,
 
-    /// Not spec-modeled (parked deliveries are Rust-only, Codeberg issue
+    /// Not spec-modeled (parked deliveries are Rust-only, issue
     /// #21): a parked delivery's own `request` body doesn't have the wire
     /// shape its `kind`'s original REST route takes (`POST
     /// /v1/events/external`'s or `POST /v1/commands/trigger`'s body).
@@ -1336,7 +1336,7 @@ pub fn blind_unchanged(existing: &[TagMapping], new: &[TagMapping]) -> bool {
     })
 }
 
-/// The one gate `Metadata.correlation_id`/`causation_id` (Codeberg issue
+/// The one gate `Metadata.correlation_id`/`causation_id` (issue
 /// #18) each pass through, independently (`rule ProcessCommand`/
 /// `CreateExternalEvent`/`CreateDirectEvent` all call this twice, once
 /// per field). `None` or empty is vacuously valid - deliberately, the
@@ -1524,7 +1524,7 @@ fn compiled_schema(schema: &str) -> Option<std::sync::Arc<jsonschema::Validator>
 /// scenario the reservation itself is meant to make unreachable).
 pub const RESERVED_IDEMPOTENCY_KEY_PREFIX: &str = "skilj-cross-context-route:";
 
-/// Codeberg issue #20's own sibling reservation - the identical
+/// issue #20's own sibling reservation - the identical
 /// defense-in-depth `RESERVED_IDEMPOTENCY_KEY_PREFIX` gives
 /// `CrossContextRoute`, extended proactively to `db::fire_due_deadlines`'s
 /// own internally-derived keys (`"{RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX}{deadline_id}"`,
@@ -2231,7 +2231,7 @@ pub fn protect_sensitive_fields(
 
 /// `protect_sensitive_fields`' inverse, for the one internal caller that
 /// needs the plaintext back without being a reader: approving a command
-/// proposal (Codeberg issue #98). A proposal's payload is stored
+/// proposal (issue #98). A proposal's payload is stored
 /// encrypted, exactly like a real command's, so approving it must decrypt
 /// it before `decide()` sees it.
 ///
@@ -3326,7 +3326,7 @@ pub fn query_events_select(
         })
         .filter(|e| tags.is_none_or(|wanted| wanted.iter().any(|t| e.tags.contains(t))))
         .filter(|e| e.sequence > after)
-        // Codeberg issue #18 - "show me everything in this transaction",
+        // issue #18 - "show me everything in this transaction",
         // the same `Option`-filter shape every other criterion here
         // already has: `None` matches everything, `Some(id)` requires an
         // exact match against this event's own (always-present, per the
@@ -3569,7 +3569,7 @@ pub fn fetch_commands_select(
                 _ => false,
             })
         })
-        // Codeberg issue #18 - same "show me everything in this
+        // issue #18 - same "show me everything in this
         // transaction" filter `query_events`/`count_events` gained.
         .filter(|c| {
             correlation_id.is_none_or(|id| c.metadata.correlation_id.as_deref() == Some(id))
@@ -3760,7 +3760,7 @@ pub fn subscription_selects(subscription: &Subscription, event: &Event) -> bool 
 /// Postgres-`LISTEN`/`NOTIFY`- or broker-backed, since every local
 /// `EventSubscription` subscriber already lives in this one process and
 /// needs nothing more elaborate to be reached. Multi-instance delivery
-/// (Codeberg issue #2; `crate::cross_instance`) builds on top of this
+/// (issue #2; `crate::cross_instance`) builds on top of this
 /// rather than replacing it: another instance's committed event still
 /// arrives here, republished by this instance's own cross-instance
 /// listener - see `instance_id`'s own doc comment for how a duplicate
@@ -3916,7 +3916,7 @@ pub fn fetch_events_page(
         .filter(|e| e.event_type.same_as(read_type))
         .filter(|e| e.sequence > after)
         .filter(|e| matches_filters(e, filters))
-        // Codeberg issue #18 - the REST-side counterpart to
+        // issue #18 - the REST-side counterpart to
         // `query_events`/`count_events`'s own identical filter.
         .filter(|e| {
             correlation_id.is_none_or(|id| e.metadata.correlation_id.as_deref() == Some(id))
@@ -3958,7 +3958,7 @@ pub enum CursorUpdate {
     /// `manual_ack`, cursor not already claimed (or a stale claim just
     /// reclaimed) - `ReadCursor.checked_out_at` becomes `now`, `sequence`
     /// untouched (manual_ack never moves it here, claimed or not - only
-    /// `AcknowledgeEvents` does). Codeberg issue #25's investigation
+    /// `AcknowledgeEvents` does). issue #25's investigation
     /// (docs/architecture.md §53); see `ReadCursor.checked_out_at`'s own
     /// spec doc comment for why this exists.
     Claimed {
@@ -3985,7 +3985,7 @@ pub struct ConsumeEventsResult {
 /// token has never consumed before) - the get-or-create lookup itself is
 /// the caller's persistence concern, not this rule's. `checkout_lease` is
 /// `config.read_cursor_checkout_lease` - the caller's own
-/// `SkiljBuilder`-configured value, not a spec-time constant (Codeberg
+/// `SkiljBuilder`-configured value, not a spec-time constant (
 /// issue #25's investigation, docs/architecture.md §53).
 pub fn consume_events(
     token: &EventReadToken,
@@ -4316,7 +4316,7 @@ fn check_event_creation(
     if !valid_payload(&event_type.schema, payload) {
         return Err(Error::PayloadDoesNotMatchSchema.into());
     }
-    // Codeberg issue #18 - see `valid_correlation_id`'s own doc comment.
+    // issue #18 - see `valid_correlation_id`'s own doc comment.
     // Neither field takes any part in the adjacent dedup mechanism
     // (`dedupe_partition_key`/`dedupe_sequence`, docs/architecture.md
     // §39): a redelivery with a fresh correlation_id is still the same
@@ -4582,7 +4582,7 @@ pub fn create_system_event(
             client_id: "system".to_string(),
             created_at: now,
             // Always a root - a scheduler tick has no caller and no
-            // upstream cause to inherit (Codeberg issue #18).
+            // upstream cause to inherit (issue #18).
             correlation_id: Some(crate::shared::generate_token_id()),
             causation_id: None,
         },
@@ -4647,7 +4647,7 @@ pub struct CommandAuthorised {
     pub client_id: String,
     /// The caller's own opaque value, threaded through unvalidated here -
     /// same footing `idempotency_key` already has at this layer.
-    /// `process_command` (Codeberg issue #18) is where
+    /// `process_command` (issue #18) is where
     /// `valid_correlation_id` actually gates it and where an absent
     /// `correlation_id` gets generated.
     pub correlation_id: Option<String>,
@@ -5094,7 +5094,7 @@ pub struct ProcessCommandResult {
 /// per accepted event, in order - the same Postgres-lock-backed,
 /// caller-supplied value as `create_external_event`/`create_direct_event`'s.
 ///
-/// A dozen parameters (`correlation_id`/`causation_id`, Codeberg issue
+/// A dozen parameters (`correlation_id`/`causation_id`, issue
 /// #18, are the newest two) because this function's own scope is
 /// genuinely that wide - it's `ProcessCommand`'s entire `let`/`ensures`
 /// body, not something a smaller grouping would simplify without
@@ -5180,7 +5180,7 @@ pub(crate) fn process_command_at_boundary(
     resolve_key: impl Fn(&str, &str) -> (EncryptionKey, DataKey),
     blind: &BlindIndex,
 ) -> crate::error::Result<ProcessCommandResult> {
-    // Codeberg issue #18 - see `valid_correlation_id`'s own doc comment.
+    // issue #18 - see `valid_correlation_id`'s own doc comment.
     // Checked here rather than only at the authorisation layer above
     // this function (docs/architecture.md §8 item 4's own "resolving the
     // wiring isn't this pure function's job" split notwithstanding):
@@ -5258,7 +5258,7 @@ pub(crate) fn process_command_at_boundary(
                 created_at: now,
                 // Every event a command triggers inherits that command's
                 // correlation_id (always present by this point) and is
-                // caused by it directly - Codeberg issue #18.
+                // caused by it directly - issue #18.
                 correlation_id: command.metadata.correlation_id.clone(),
                 causation_id: Some(command.id.clone()),
             },

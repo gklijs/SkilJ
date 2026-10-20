@@ -448,7 +448,7 @@ fn submit_command_redispatches_and_rejects_on_a_genuine_dcb_conflict() {
                 ..
             } => {
                 assert_eq!(kind, "already_shipped");
-                // Codeberg issue #7: the *final*, post-redispatch matching
+                // issue #7: the *final*, post-redispatch matching
                 // set - the concurrent writer's own event - not the
                 // caller's stale, empty pre-lock one.
                 assert_eq!(matching_events.len(), 1);
@@ -624,7 +624,7 @@ fn submit_command_persists_a_real_command_id_that_round_trips() {
     });
 }
 
-/// Codeberg issue #12: the actual idempotency short-circuit. Mirrors a
+/// issue #12: the actual idempotency short-circuit. Mirrors a
 /// real retry - the caller re-runs its own optimistic `dispatch()` a
 /// second time too (as it genuinely would on a network-timeout retry),
 /// same `idempotency_key` both times. The second `submit_command` call
@@ -1244,7 +1244,7 @@ fn submit_command_without_an_idempotency_key_still_double_processes_a_repeated_s
     });
 }
 
-/// Codeberg issue #12's migration-gap fix: `ensure_idempotency_keys_table`
+/// issue #12's migration-gap fix: `ensure_idempotency_keys_table`
 /// is what `SkiljBuilder::build()`'s own per-bounded-context startup loop
 /// calls unconditionally, every startup, precisely because
 /// `provision_bounded_context_schema` only ever runs once, at creation -
@@ -1479,7 +1479,7 @@ fn submit_command_rolls_back_the_command_and_every_event_together_when_a_later_e
 
 #[test]
 fn submit_command_batches_sequence_allocation_for_a_multi_event_command() {
-    // Codeberg issue #32: `submit_command` claims every sequence number a
+    // issue #32: `submit_command` claims every sequence number a
     // multi-event `CommandDecision::Accepted` needs in one
     // `next_sequence_batch` round trip rather than one `next_sequence`
     // call per event. Same `TriggerTwoEvents` decider as the poison-pill
@@ -1584,7 +1584,7 @@ fn batched(
 
 #[test]
 fn submit_command_batch_detects_a_dcb_conflict_between_two_commands_in_the_same_batch() {
-    // Codeberg issue #32, round two: `db::submit_command_batch` lets two
+    // issue #32, round two: `db::submit_command_batch` lets two
     // *different* commands share one lock acquisition. The DB-committed-
     // delta half of the DCB conflict check (`locked_highest >
     // original_highest`) alone cannot catch a conflict *within* the same
@@ -1781,7 +1781,7 @@ fn submit_command_batch_isolates_a_failing_commands_savepoint_from_its_batch_mat
 #[test]
 fn submit_command_batch_recycles_a_failed_commands_sequence_numbers_for_a_later_command_in_the_same_batch(
 ) {
-    // Codeberg issue #32, round three: `commit_command_batch` now pools
+    // issue #32, round three: `commit_command_batch` now pools
     // sequence-number reservations across the whole batch (one bigger
     // `next_sequence_batch` call instead of one per command) rather than
     // allocating strictly per command inside each one's own `SAVEPOINT`.

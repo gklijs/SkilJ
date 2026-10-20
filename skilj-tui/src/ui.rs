@@ -61,7 +61,7 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Codeberg issue #7: `/` enters filter-compose mode (see
+/// issue #7: `/` enters filter-compose mode (see
 /// `App::handle_live_events_key`'s own doc comment for why), substring-
 /// matched case-insensitively against each event's own compact JSON
 /// rendering - client-side only, no server round trip.
@@ -115,7 +115,7 @@ fn draw_live_events(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, chunks[1]);
 }
 
-/// Codeberg issue #8: a real multi-select checklist over
+/// issue #8: a real multi-select checklist over
 /// `eventTypes(boundedContext)`, replacing v1's free-text comma-separated
 /// field - `Space` toggles, `Enter` runs the query with whatever's
 /// checked, `r` refreshes the list.
@@ -179,7 +179,7 @@ fn draw_query_events(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Codeberg issue #8: a real picker over `commandTypes(boundedContext)`
+/// issue #8: a real picker over `commandTypes(boundedContext)`
 /// replacing v1's free-text type name, then a form generated from the
 /// picked type's own schema (`form::fields_from_schema`) replacing v1's
 /// raw-JSON payload entry.
@@ -355,7 +355,7 @@ fn draw_projections(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(key_input, chunks[1]);
 
-    // Codeberg issue #7's time-travel projection viewer - see
+    // issue #7's time-travel projection viewer - see
     // `projection_query::fetch`'s own doc comment for why the title says
     // "at least as fresh as", not "as of".
     let wait_style = focus_style(app.projections.focus == ProjectionField::WaitForSequence);
@@ -383,7 +383,7 @@ fn draw_projections(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Codeberg issue #21 - `parkedDeliveries`/`retryParkedDelivery`/
+/// issue #21 - `parkedDeliveries`/`retryParkedDelivery`/
 /// `discardParkedDelivery`: a list of parked deliveries (Enter retries
 /// the selected row, `d` discards it, `r` refreshes), with the selected
 /// row's own full JSON (including `requestJson` - what a retry actually

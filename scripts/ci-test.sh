@@ -3,10 +3,10 @@
 # CI's database setup and test run, as a script rather than a wall of
 # YAML.
 #
-# Three reasons it isn't inline in .woodpecker.yml:
+# Three reasons it isn't inline in .github/workflows/ci.yml:
 #
-#   * The Postgres setup needs to export DATABASE_URL, and a step whose
-#     `commands:` are each their own process can't rely on that
+#   * The Postgres setup needs to export DATABASE_URL, and a job whose
+#     `run:` steps are each their own process can't rely on that
 #     surviving from one line to the next. A single script makes the
 #     environment a fact rather than a hope.
 #   * The service-reachable-or-fallback decision is a branch, and a
@@ -44,7 +44,7 @@ setup_database() {
     # 2. Otherwise, a server in this container, so a broken service is a
     #    loud note in the log rather than a red pipeline.
     log "WARNING: the postgres service container was not usable; falling back to a"
-    log "WARNING: Postgres inside this step. The service block in .woodpecker.yml is"
+    log "WARNING: Postgres inside this job. The service block in .github/workflows/ci.yml is"
     log "WARNING: not doing what it says it does - worth fixing, but not worth a red"
     log "WARNING: build over."
     bash "$HERE/ci-postgres-local.sh"
@@ -83,14 +83,14 @@ if [ "${1:-}" = "--setup-only" ]; then
   exit 0
 fi
 
-# 4. The run itself, and the guard that makes a silently skipped
-#    database a red build rather than a green one. Only the
-#    Postgres-flavoured skip messages are checked, not every "skipping: "
-#    line: this container has no Docker daemon, so the
-#    Kafka/AMQP/NATS/Temporal bridge tests skip on every CI run today
-#    too (a separate, pre-existing, already-accepted gap in CI's own
-#    coverage - see CONTRIBUTING.md's DOCKER_HOST note), and their notes
-#    are about containers and mapped ports rather than databases.
+# 4. The run itself, and the guard that makes a silently skipped test a
+#    red build rather than a green one. Every test that needs something
+#    external - Postgres, a Docker daemon for the Kafka/AMQP/NATS
+#    brokers, Temporal's test server - prints a `skipping: ` line and
+#    passes when it can't get it. CI provides all of them, so any such
+#    line means a suite didn't run. Until the move to GitHub Actions
+#    (docs/architecture.md §222) only the Postgres-flavoured lines were
+#    checked, because Woodpecker's container had no Docker daemon.
 #
 # `--nocapture` is what makes this check work at all: the skip note is
 # printed from inside a test that then passes, and libtest swallows a
@@ -100,15 +100,18 @@ fi
 # tests, zero matches). Not anchored with `^` for the same reason: with
 # tests running in parallel, a note can land mid-line after another
 # test's own `test ... ` prefix.
+#
+# `--no-fail-fast` so one failing suite doesn't hide what the others
+# would have said, or that they would have skipped.
 log_output="${CI_TEST_LOG:-/tmp/test-output.log}"
 test_exit=0
-cargo test --workspace -- --nocapture >"$log_output" 2>&1 || test_exit=$?
+cargo test --workspace --no-fail-fast -- --nocapture >"$log_output" 2>&1 || test_exit=$?
 cat "$log_output"
 
-if grep -qiE 'skipping:.*(postgres|database)' "$log_output"; then
-  log "ERROR: one or more Postgres-backed tests silently skipped (see the 'skipping: ...'"
-  log "ERROR: lines above) instead of running - CI must never report green without"
-  log "ERROR: actually exercising the persistence layer."
+if grep -qE 'skipping: ' "$log_output"; then
+  log "ERROR: one or more tests silently skipped (see the 'skipping: ...' lines"
+  log "ERROR: above) instead of running - CI must never report green without"
+  log "ERROR: actually exercising Postgres, the brokers and Temporal."
   exit 1
 fi
 

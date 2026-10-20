@@ -1,4 +1,4 @@
-//! Codeberg issue #98 - proposals held for human approval.
+//! issue #98 - proposals held for human approval.
 //!
 //! `submitCommand` and REST `POST /v1/commands/trigger` create a pending
 //! `CommandProposal` when the command type's `requires_approval()` is

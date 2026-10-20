@@ -1,4 +1,4 @@
-//! sqlx statement cache benchmark for Codeberg issue #56 - not a test, so
+//! sqlx statement cache benchmark for issue #56 - not a test, so
 //! `#[ignore]`d. Run with:
 //!
 //! ```sh

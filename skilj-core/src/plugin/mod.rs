@@ -222,7 +222,7 @@ pub trait CommandType {
         false
     }
 
-    /// Opt-in approval flow (Codeberg issue #98, docs/architecture.md
+    /// Opt-in approval flow (issue #98, docs/architecture.md
     /// §214): when `true`, a submission - REST or GraphQL - creates a
     /// pending `CommandProposal` instead of running `decide()`. An
     /// approver with an active admin-level `RoleAccessMapping` on the
@@ -387,7 +387,7 @@ pub trait CommandType {
     /// the multi-tag case above), but one this trait can still fail
     /// safely on rather than silently producing a wrong decision.
     ///
-    /// `context` (Codeberg issue #97) is the same [`DecisionContext`]
+    /// `context` (issue #97) is the same [`DecisionContext`]
     /// `decide_with` reads through [`Decision::context`].
     fn decide_from_snapshot(
         _payload: &Self::Payload,
@@ -647,7 +647,7 @@ pub trait Projection {
     /// that specific record; a projection's stored state is one shared
     /// value folded from possibly many events by `project()`, with no
     /// single record each field individually traces back to, so nothing
-    /// short of a whole-instance gate generalizes to it (Codeberg issue
+    /// short of a whole-instance gate generalizes to it (issue
     /// #17's own finding, closing the gap left by `private_fields`
     /// itself: it protects `queryEvents`/`fetchCommands`, surfaces no
     /// `Write`-level Role can reach anyway, while `ProjectionQuery` - the
@@ -656,7 +656,7 @@ pub trait Projection {
     const TEAM_ONLY: Option<&'static str> = None;
 
     /// How many partitions this projection's own `keys()` values hash
-    /// into for async catch-up (Codeberg issue #25,
+    /// into for async catch-up (issue #25,
     /// docs/architecture.md §51) - `1` (the default, and every
     /// projection that predates this) means every key hashes to the
     /// same partition, so `catch_up_bounded_context` takes its original,
@@ -775,7 +775,7 @@ pub trait Snapshot {
     const VERSION: u64;
 
     /// How many partitions this snapshot's own tag values hash into for
-    /// catch-up (Codeberg issue #25, docs/architecture.md §52 - the
+    /// catch-up (issue #25, docs/architecture.md §52 - the
     /// `Snapshot` twin of `Projection::PARTITION_COUNT`, see that
     /// const's own doc comment for the full reasoning, identical here
     /// with the derived tag *value* playing the role `Projection`'s own
@@ -929,7 +929,7 @@ pub struct SnapshotState {
 }
 
 /// The time a decision is made against, and, for a command a deadline
-/// fired, that deadline's own schedule and expiry (Codeberg issue #97).
+/// fired, that deadline's own schedule and expiry (issue #97).
 ///
 /// `decide()` never reads a clock itself (`CommandType`'s own doc comment,
 /// §1.1): the framework stamps every submission with the `now` it uses for
@@ -958,7 +958,7 @@ impl DecisionContext {
         }
     }
 
-    /// A deadline firing's context (Codeberg issue #97): `scheduled_at` is
+    /// A deadline firing's context (issue #97): `scheduled_at` is
     /// the fired row's own `fire_at`, `deadline_at` its optional
     /// `expires_at`.
     pub fn for_deadline(
@@ -973,7 +973,7 @@ impl DecisionContext {
     }
 }
 
-/// What a deadline-fired command's `decide()` may reason about (Codeberg
+/// What a deadline-fired command's `decide()` may reason about (
 /// issue #97): `scheduled_at` is the deadline's own `fire_at` (when the
 /// chain intended it to fire), `deadline_at` its optional `expires_at`,
 /// and `expired` whether this firing happened after `deadline_at`. A
@@ -1010,7 +1010,7 @@ impl DeadlineContext {
 /// What `CommandType::decide_with` decides from (docs/architecture.md
 /// §202): the events the command's query selects, the state of every
 /// snapshot item it derives, and the [`DecisionContext`] the decision is
-/// made against (Codeberg issue #97). Built by the framework; room to grow
+/// made against (issue #97). Built by the framework; room to grow
 /// without changing `decide_with`'s signature.
 pub struct Decision<'a, E> {
     events: &'a [E],
@@ -1050,7 +1050,7 @@ impl<'a, E> Decision<'a, E> {
     }
 
     /// The time this decision is made against, and, for a deadline firing,
-    /// the deadline's own context (Codeberg issue #97).
+    /// the deadline's own context (issue #97).
     pub fn context(&self) -> &'a DecisionContext {
         self.context
     }
@@ -1063,7 +1063,7 @@ impl<'a, E> Decision<'a, E> {
     }
 
     /// Shorthand for `self.context().deadline`: the deadline that fired
-    /// this command, when one did (Codeberg issue #97).
+    /// this command, when one did (issue #97).
     pub fn deadline(&self) -> Option<&'a DeadlineContext> {
         self.context.deadline.as_ref()
     }
@@ -1098,7 +1098,7 @@ pub trait CommandDispatcher: Send + Sync {
 
     /// `dispatch`, with the states of the query's snapshot items
     /// (docs/architecture.md §202) and the [`DecisionContext`] the
-    /// decision is made against (Codeberg issue #97) - what the command
+    /// decision is made against (issue #97) - what the command
     /// path calls. The default ignores `snapshots` and `context`, calling
     /// `dispatch`, right for a dispatcher whose command types declare no
     /// snapshot items and don't read time.
@@ -1280,7 +1280,7 @@ pub trait ProjectionDispatcher: Send + Sync {
     }
 
     /// The registered projection's own `Projection::PARTITION_COUNT`
-    /// (Codeberg issue #25, docs/architecture.md §51) - `None` for the
+    /// (issue #25, docs/architecture.md §51) - `None` for the
     /// same "pair isn't registered at all" case every method here
     /// already has, treated by every real caller (`db::
     /// catch_up_bounded_context`) identically to `Some(1)`: unpartitioned.
@@ -1365,7 +1365,7 @@ pub trait SnapshotDispatcher: Send + Sync {
     fn default_state(&self, bounded_context: &str, snapshot_name: &str) -> Option<String>;
 
     /// The registered snapshot's own `Snapshot::PARTITION_COUNT`
-    /// (Codeberg issue #25, docs/architecture.md §52) -
+    /// (issue #25, docs/architecture.md §52) -
     /// `ProjectionDispatcher::partition_count`'s identical shape and
     /// defaulting: `None` for the same "pair isn't registered at all"
     /// case every method here already has, treated by every real caller
@@ -1536,7 +1536,7 @@ pub trait CrossContextRouteDispatcher: Send + Sync {
     ) -> Option<Result<Option<String>, serde_json::Error>>;
 }
 
-/// Codeberg issue #20's own "where does this cursor start" const, one per
+/// issue #20's own "where does this cursor start" const, one per
 /// `ScheduleDeadline`/`CancelDeadline` implementor - identical in shape to
 /// `CrossContextRouteStartFrom` but its own type rather than a reuse of
 /// it: a deadline reactor isn't a route, and giving it a name that says
@@ -1558,7 +1558,7 @@ pub enum DeadlinePollStartFrom {
     /// Unix timestamp, seconds, UTC.
     AtTime(i64),
 }
-/// Missed-run policy for recurring deadlines (Codeberg issue #95).
+/// Missed-run policy for recurring deadlines (issue #95).
 ///
 /// Mirrors the global scheduler's own `MissedOccurrencePolicy`
 /// (`ReplayBacklog`/`FireOnce`/`Skip`) but is deliberately its own type:
@@ -1582,7 +1582,7 @@ pub enum MissedRunPolicy {
     FireAll,
 }
 
-/// Recurrence specification for per-entity deadlines (Codeberg issue
+/// Recurrence specification for per-entity deadlines (issue
 /// #95). `schedule` is the same 7-field Quartz-dialect cron expression
 /// (`cron` crate) the global scheduler evaluates, so one mental model
 /// covers both surfaces. `start_at`/`end_at` bound the occurrences
@@ -1678,14 +1678,14 @@ pub fn next_recurrence_fire_at(
 /// one-shot, per-entity timer needs: when it fires (`fire_at`), what it's
 /// scoped to for a later `CancelDeadline` lookup (`tags`), and what to
 /// submit when it does (`payload`, `Self::Target`'s own payload type).
-/// `recurrence` (Codeberg issue #95) turns the one-shot into the first
+/// `recurrence` (issue #95) turns the one-shot into the first
 /// firing of a chain: after it fires, `db::fire_due_deadlines` derives
 /// the next `fire_at` from the cron schedule and the missed-run policy,
 /// until the validity window ends or a `CancelDeadline` cancels the
 /// pending row. `None` - the default every existing schedule passes - is
 /// the unchanged one-shot.
 ///
-/// `expires_at` (Codeberg issue #97) is an optional latest instant this
+/// `expires_at` (issue #97) is an optional latest instant this
 /// firing is still meaningful. It is carried to the fired command's
 /// `decide_with` through [`DecisionContext::deadline`] as
 /// `deadline_at`/`expired`, so a target that only makes sense soon after
@@ -1699,7 +1699,7 @@ pub fn next_recurrence_fire_at(
 pub struct DeadlineSpec<P> {
     /// When the deadline fires.
     pub fire_at: chrono::DateTime<chrono::Utc>,
-    /// See this struct's own doc comment (Codeberg issue #97).
+    /// See this struct's own doc comment (issue #97).
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The tags a `CancelDeadline` matches to cancel this deadline before it
     /// fires.
@@ -1711,7 +1711,7 @@ pub struct DeadlineSpec<P> {
     pub recurrence: Option<RecurrenceSpec>,
 }
 
-/// Codeberg issue #20: a native one-shot, per-entity deadline/timer -
+/// issue #20: a native one-shot, per-entity deadline/timer -
 /// "cancel this order if not paid within 30 minutes," without reaching
 /// for `skilj-temporal` (docs/architecture.md §34) or hand-building it on
 /// top of the recurring, `EventType`-wide scheduler (`rule
@@ -1762,7 +1762,7 @@ pub trait ScheduleDeadline {
     ) -> Option<DeadlineSpec<<Self::Target as CommandType>::Payload>>;
 }
 
-/// Codeberg issue #20's own cancellation half - "cancellable if the
+/// issue #20's own cancellation half - "cancellable if the
 /// awaited thing happens first." Bound to a specific `ScheduleDeadline`
 /// via `Deadline` (not just any deadline sharing a tag) so two unrelated
 /// schedules that happen to reuse a tag key never cross-cancel each
@@ -1895,13 +1895,13 @@ pub trait ScheduleDeadlineDispatcher: Send + Sync {
 /// the same "erase the payload's own concrete type at the dispatcher
 /// boundary" treatment every other dispatcher trait in this module
 /// already gives its own typed payloads. `recurrence` is carried through
-/// verbatim (Codeberg issue #95) - the dispatcher boundary erases the
+/// verbatim (issue #95) - the dispatcher boundary erases the
 /// payload type only, never the schedule's own recurrence decision.
 #[derive(Debug, Clone)]
 pub struct ErasedDeadlineSpec {
     /// `DeadlineSpec::fire_at`.
     pub fire_at: chrono::DateTime<chrono::Utc>,
-    /// `DeadlineSpec::expires_at`, carried through verbatim (Codeberg
+    /// `DeadlineSpec::expires_at`, carried through verbatim (
     /// issue #97).
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `DeadlineSpec::tags`.

@@ -202,7 +202,7 @@ pub fn register_command_type_field(n: &Naming) -> Field {
                     parse_sensitive_fields(&ctx.args.try_get("sensitiveFields")?)?;
                 let private_fields = parse_private_fields(&ctx.args.try_get("privateFields")?)?;
                 let rest_trigger_allowed = ctx.args.try_get("restTriggerAllowed")?.boolean()?;
-                // Codeberg issue #98. Omitted leaves any stored policy
+                // issue #98. Omitted leaves any stored policy
                 // alone (the same compatibility stance startup
                 // reconciliation takes); explicit `false` removes it.
                 let requires_approval = ctx
@@ -717,7 +717,7 @@ pub fn scheduled_event_types_field(n: &Naming) -> Field {
 
 /// `eventTypes(boundedContext: String!): [EventType!]!` - satisfies
 /// `TypeRegistration`'s own `exposes: for event_type in
-/// bounded_context.event_types` (Codeberg issue #6's "5a": the
+/// bounded_context.event_types` (issue #6's "5a": the
 /// self-describing surface a real command/event type picker needs -
 /// `scheduledEventTypes` above only ever returns the scheduled subset).
 /// `db::list_event_types_for_bounded_context` is the identical query

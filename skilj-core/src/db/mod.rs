@@ -612,7 +612,7 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
-    // Codeberg issue #18 - backs `event_store::fetch_commands`' own new
+    // issue #18 - backs `event_store::fetch_commands`' own new
     // correlation_id filter, same "cold-start/large-history nicety, not
     // a correctness requirement" register the `events` table's own
     // sibling index below has, since that function already filters an
@@ -628,7 +628,7 @@ async fn provision_bounded_context_schema(
     ensure_external_message_cursors_table(&mut **tx, bounded_context).await?;
     ensure_external_message_keys_table(&mut **tx, bounded_context).await?;
     ensure_deadline_cursors_table(&mut **tx, bounded_context).await?;
-    // Codeberg issue #21 - `parked_deliveries`, a brand-new table, so no
+    // issue #21 - `parked_deliveries`, a brand-new table, so no
     // `ALTER TABLE` patch is needed here the way `cross_context_route_cursors`'
     // own new retry columns need `ensure_cross_context_route_retry_columns`
     // (build()'s own startup loop only, not here - see that function's
@@ -644,7 +644,7 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
-    // Codeberg issue #20 - `ensure_deadlines_table`'s own two-index shape
+    // issue #20 - `ensure_deadlines_table`'s own two-index shape
     // run directly against this transaction rather than calling that
     // function (it takes `&Pool`, not a transaction - see its own doc
     // comment), the identical split `private_field_grants_table_ddl`'s
@@ -778,7 +778,7 @@ async fn provision_bounded_context_schema(
     // `catch_up_bounded_context` reaches this key first - there is no
     // single call site that knows every instance a projection will ever
     // have ahead of time.
-    // `as_of_sequence` (Codeberg issue #25's investigation - see
+    // `as_of_sequence` (issue #25's investigation - see
     // `apply_projection_fold_update`'s own doc comment for the full
     // story): the highest event sequence actually folded into *this row*,
     // mirroring `snapshots.as_of_sequence` exactly. Without it, two
@@ -837,7 +837,7 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
-    // Codeberg issue #25 - `projection_partition_progress`, a brand-new
+    // issue #25 - `projection_partition_progress`, a brand-new
     // table, so `ensure_projection_partition_progress_table`'s own
     // `CREATE TABLE IF NOT EXISTS` is the whole story here too - see its
     // own doc comment. Must run after `projections` (just above) exists,
@@ -887,7 +887,7 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
-    // Codeberg issue #18 - backs `event_store::query_events`/`count_events`'
+    // issue #18 - backs `event_store::query_events`/`count_events`'
     // own new correlation_id filter. Same "cold-start/large-history
     // nicety, not a correctness requirement" register as §19's tag index
     // was: both functions already operate on an in-memory slice.
@@ -947,7 +947,7 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
-    // Codeberg issue #25 (docs/architecture.md §52) -
+    // issue #25 (docs/architecture.md §52) -
     // `snapshot_partition_progress`, a brand-new table, so
     // `ensure_snapshot_partition_progress_table`'s own `CREATE TABLE IF
     // NOT EXISTS` is the whole story here too - see its own doc
@@ -1025,7 +1025,7 @@ async fn provision_bounded_context_schema(
     )))
     .execute(&mut **tx)
     .await?;
-    // Codeberg issue #98 - the approval policy and proposal tables. Both
+    // issue #98 - the approval policy and proposal tables. Both
     // are brand new, so the same DDL `ensure_command_approval_tables`
     // patches an existing context with works here too.
     sqlx::query(sqlx::AssertSqlSafe(command_approval_policies_table_ddl(
@@ -1118,7 +1118,7 @@ pub async fn ensure_private_field_grants_table(
     Ok(())
 }
 
-// --- Command approvals (Codeberg issue #98) ---
+// --- Command approvals (issue #98) ---
 
 /// `entity CommandApprovalPolicy` - kept in its own table rather than as
 /// columns on `command_types`, so adding it changed no `CommandType`
@@ -1532,7 +1532,7 @@ pub async fn update_private_field_grant(
 }
 
 /// `idempotency_keys` - a caller-supplied idempotency key on command
-/// submission (Codeberg issue #12), one row per `(command_type_name,
+/// submission (issue #12), one row per `(command_type_name,
 /// client_id, idempotency_key)` that has ever produced a real `Accepted`
 /// outcome. A duplicate submission bearing the same key from the same
 /// caller short-circuits to the stored `triggered_event_sequences`
@@ -1753,7 +1753,7 @@ pub async fn delete_expired_deadlines(
 /// through ever does real DDL work, and two skilj instances patching
 /// the same shared Postgres at startup (the existing
 /// concurrent-bounded-context warm-up loop in `skilj/src/lib.rs`,
-/// Codeberg issue #15, only protects against a race *within* one
+/// issue #15, only protects against a race *within* one
 /// process - a real fleet runs more than one) don't churn the catalog
 /// once each for no reason. `_xact` (transaction-scoped, not
 /// session-scoped) releases automatically at this function's own commit
@@ -1837,7 +1837,7 @@ pub async fn migrate_idempotency_keys_client_id_scoping(
 /// context on every `build()`, is the whole migration story.
 ///
 /// `retry_attempt_count`/`retry_first_failed_at`/`retry_next_attempt_at`
-/// (Codeberg issue #21) - the durable backoff state one route's own
+/// (issue #21) - the durable backoff state one route's own
 /// blocked head-of-line occurrence carries between ticks, applying
 /// `skilj_retry::RetryPolicy` to what used to be an unbounded, un-
 /// throttled "retry every single tick forever" - see
@@ -1925,7 +1925,7 @@ pub async fn ensure_cross_context_route_retry_columns(
     Ok(())
 }
 
-/// Codeberg issue #20 - the durable cursor table `catch_up_schedule_deadline`/
+/// issue #20 - the durable cursor table `catch_up_schedule_deadline`/
 /// `catch_up_cancel_deadline` share, one row per registered
 /// `ScheduleDeadline::NAME`/`CancelDeadline::NAME` (a schedule and its own
 /// cancel counterpart advance independently, even though they're paired -
@@ -1955,7 +1955,7 @@ pub async fn ensure_deadline_cursors_table<'e>(
     Ok(())
 }
 
-/// Codeberg issue #25's investigation (docs/architecture.md §50/§51) -
+/// issue #25's investigation (docs/architecture.md §50/§51) -
 /// one row per `(projection_name, partition_index)` a partitioned async
 /// `Projection` (`Projection::PARTITION_COUNT > 1`) has ever had a
 /// `catch_up_partitioned_projection` tick seed or advance. `caught_up_to`
@@ -2022,7 +2022,7 @@ pub async fn ensure_snapshot_partition_progress_table<'e>(
     Ok(())
 }
 
-/// Codeberg issue #20's own row store - one row per deadline a
+/// issue #20's own row store - one row per deadline a
 /// `ScheduleDeadline` has ever scheduled, living in
 /// `ScheduleDeadline::Source::BOUNDED_CONTEXT`'s own schema (mirroring
 /// `cross_context_route_cursors`' placement choice: the reactor's own
@@ -2042,7 +2042,7 @@ pub async fn ensure_snapshot_partition_progress_table<'e>(
 /// instance's claim can be reclaimed after it goes stale - see
 /// `fire_due_deadlines`'s own doc comment for the reclaim window.
 ///
-/// Codeberg issue #95 - the recurrence columns make one pending row the
+/// issue #95 - the recurrence columns make one pending row the
 /// current head of a chain: `recurrence_schedule` (the 7-field
 /// Quartz-dialect cron expression) with `recurrence_policy`
 /// (`'skip'`/`'fire_once'`/`'fire_all'`), and the validity window
@@ -2122,7 +2122,7 @@ pub async fn ensure_deadlines_table(
     )))
     .execute(pool)
     .await?;
-    // Codeberg issue #97 - a deadline's optional expiry, carried to the
+    // issue #97 - a deadline's optional expiry, carried to the
     // fired command's `decide_with`. Nullable, no `DEFAULT`, so every row
     // scheduled before this feature reads as "no expiry".
     sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
@@ -2154,7 +2154,7 @@ pub async fn ensure_deadlines_table(
     )))
     .execute(pool)
     .await?;
-    // Codeberg issue #95 - a recurring chain's own state, one pending row
+    // issue #95 - a recurring chain's own state, one pending row
     // the head. Nullable throughout, so every row scheduled before this
     // feature reads as the one-shot it is.
     sqlx::query(sqlx::AssertSqlSafe(add_columns_patch(
@@ -3078,7 +3078,7 @@ pub async fn ensure_projection_state_owner_columns(
 }
 
 /// `projection_state.as_of_sequence`/`projection_rebuild_state.as_of_sequence`
-/// - the real fix behind Codeberg issue #25's investigation, following
+/// - the real fix behind issue #25's investigation, following
 /// `ensure_projection_state_owner_columns`'s own pattern exactly (see its
 /// own doc comment): a bounded context provisioned before this column
 /// existed gets it patched in here, `DEFAULT -1` matching a brand-new
@@ -3127,7 +3127,7 @@ pub async fn ensure_projection_state_as_of_sequence_columns(
     Ok(())
 }
 
-/// `read_cursors.checked_out_at` - the real fix behind Codeberg issue
+/// `read_cursors.checked_out_at` - the real fix behind issue
 /// #25's investigation of the Kafka/AMQP/NATS outbound bridges
 /// (docs/architecture.md §53): a bounded context provisioned before this
 /// column existed gets it patched in here, following
@@ -3233,7 +3233,7 @@ pub async fn ensure_private_field_columns(
 }
 
 /// `commands.metadata_correlation_id`/`metadata_causation_id`,
-/// `events.metadata_correlation_id`/`metadata_causation_id` (Codeberg
+/// `events.metadata_correlation_id`/`metadata_causation_id` (
 /// issue #18), following `ensure_event_scoping_columns`'s own pattern
 /// and reasoning exactly for a bounded context provisioned before these
 /// columns existed. The two partial indexes mirror
@@ -3582,7 +3582,7 @@ struct BoundedContextRow {
     created_at: DateTime<Utc>,
     created_by_kind: String,
     created_by_role_id: Option<String>,
-    /// Codeberg issue #13 - just the referenced row's own name; hydrated
+    /// issue #13 - just the referenced row's own name; hydrated
     /// into a full `BoundedContext` by `get_bounded_context`/
     /// `list_bounded_contexts`, matching how `created_by_role_id` is
     /// hydrated into a full `Role` below.
@@ -3820,7 +3820,7 @@ pub async fn get_bounded_context(
 /// expects (see its own doc comment: unrestricted, same full-snapshot
 /// treatment `list_roles`/`list_role_access_mappings` get). Backs the
 /// `BoundedContextDirectory` surface's `boundedContexts` query - and,
-/// Codeberg issue #15, `SkiljBuilder::build()`'s startup warm-up loop
+/// issue #15, `SkiljBuilder::build()`'s startup warm-up loop
 /// plus all three background pollers, which is why this used to be a
 /// real N+1 (one `get_role` query per row) worth fixing: `list_roles`
 /// already fetches every `Role` in one query, so one full-table fetch
@@ -3839,7 +3839,7 @@ pub async fn list_bounded_contexts(pool: &Pool) -> crate::error::Result<Vec<Boun
         .map(|role| (role.id.clone(), role))
         .collect();
 
-    // Codeberg issue #13: a template is always some other row already in
+    // issue #13: a template is always some other row already in
     // this same full-table fetch (invariant TemplateIsNeverItselfTemplated
     // rules out a template needing a template of its own), so resolving
     // `template` here is a map lookup, not an extra query per row - the
@@ -3954,7 +3954,7 @@ fn missed_occurrence_policy_from_str(s: &str) -> MissedOccurrencePolicy {
     }
 }
 
-/// Codeberg issue #95 - a recurring chain's own policy, as stored.
+/// issue #95 - a recurring chain's own policy, as stored.
 fn recurrence_policy_to_str(policy: crate::plugin::MissedRunPolicy) -> &'static str {
     match policy {
         crate::plugin::MissedRunPolicy::Skip => "skip",
@@ -4100,7 +4100,7 @@ pub async fn get_event_type(
     get_event_type_with_bc(pool, &bc, name).await
 }
 
-/// [`get_event_type`]'s own `bc`-in-hand sibling (Codeberg issue #32,
+/// [`get_event_type`]'s own `bc`-in-hand sibling (issue #32,
 /// round four - same precedent §60 already set for
 /// `list_events_for_bounded_context_matching_tags_with_bc`): skips the
 /// `get_bounded_context` call entirely for a caller who already has the
@@ -4181,7 +4181,7 @@ pub async fn list_scheduled_event_types(
 }
 
 /// Every `EventType` registered in `bounded_context`, unfiltered -
-/// `TypeRegistration`'s own `eventTypes` GraphQL query (Codeberg issue
+/// `TypeRegistration`'s own `eventTypes` GraphQL query (issue
 /// #6's "5a": the self-describing surface `skilj-tui`'s Commands/Query
 /// Events tabs need to offer a real type picker instead of a name typed
 /// by hand). Same shape as `list_scheduled_event_types` immediately
@@ -4469,7 +4469,7 @@ pub async fn upsert_command_type(pool: &Pool, ct: &CommandType) -> crate::error:
     Ok(())
 }
 
-// --- Command approvals (Codeberg issue #98) ---
+// --- Command approvals (issue #98) ---
 
 #[tracing::instrument(skip_all, fields(bounded_context = %bounded_context))]
 pub async fn get_command_approval_policy(
@@ -6775,7 +6775,7 @@ struct CommandRow {
     metadata_version: i64,
     metadata_client_id: String,
     metadata_created_at: DateTime<Utc>,
-    // Codeberg issue #18 - `None` only for a row written before these
+    // issue #18 - `None` only for a row written before these
     // columns existed.
     metadata_correlation_id: Option<String>,
     metadata_causation_id: Option<String>,
@@ -7326,7 +7326,7 @@ async fn upsert_projection_in_tx(
 /// same generalisation `insert_event` itself already has) so both
 /// callers can run this inside their own already-open transaction.
 ///
-/// Also returns the row's own `as_of_sequence` (Codeberg issue #25's
+/// Also returns the row's own `as_of_sequence` (issue #25's
 /// investigation finding - see `apply_projection_fold_update`'s own doc
 /// comment) - every caller needs it immediately after to decide whether
 /// this specific row has already folded the event it's about to fold,
@@ -7374,7 +7374,7 @@ async fn get_or_create_projection_state_for_update(
 /// already-established owner. See `plugin::Projection::OWNER_TAG_KEY`'s
 /// own doc comment for the full contract.
 ///
-/// Also advances `as_of_sequence` to `event.sequence` (Codeberg issue
+/// Also advances `as_of_sequence` to `event.sequence` (issue
 /// #25's investigation finding) - every call site's own `event.sequence`
 /// only ever increases within its own walk, so a plain unconditional
 /// `SET` is correct here without needing a `GREATEST(...)` guard; what
@@ -7665,7 +7665,7 @@ pub async fn resolve_snapshot_context(
 }
 
 /// The background catch-up task's own progress marker for every
-/// registered snapshot in one bounded context, in one query - Codeberg
+/// registered snapshot in one bounded context, in one query -
 /// issue #15's batched replacement for what used to be a `get_snapshot_progress`
 /// call per snapshot name (one query each). A name absent from the
 /// returned map has never had a catch-up tick yet - `catch_up_snapshots`
@@ -7931,7 +7931,7 @@ pub async fn list_projections_for_bounded_context(
 /// `insert_event_and_update_sync_projections_in_tx` needs of them (the
 /// `ProjectionDispatcher` answers everything else by name). Every call
 /// site fetches it once per commit and passes the same slice to every
-/// event that commit inserts (Codeberg issue #32).
+/// event that commit inserts (issue #32).
 ///
 /// Read on the caller's own transaction, after it took this bounded
 /// context's `sequence` row lock: `promote_projection_rebuild` - the one
@@ -8609,7 +8609,7 @@ pub async fn next_sequence<'e>(
 /// events (`CommandDecision::Accepted { events }` with more than one
 /// `EventSpec`) used to call `next_sequence` once per event, each its own
 /// round trip to Postgres, all of them while `submit_command`'s own
-/// bounded-context lock is held (Codeberg issue #32: that lock hold
+/// bounded-context lock is held (issue #32: that lock hold
 /// duration, not pool size, is what caps real-world write throughput).
 /// This claims the whole range in one `UPDATE ... RETURNING`, exactly the
 /// same row-lock-based serialisation as the single-value form (already
@@ -8934,7 +8934,7 @@ struct EventRowAnyType {
     metadata_version: i64,
     metadata_client_id: String,
     metadata_created_at: DateTime<Utc>,
-    // Codeberg issue #18 - `None` only for a row written before these
+    // issue #18 - `None` only for a row written before these
     // columns existed.
     metadata_correlation_id: Option<String>,
     metadata_causation_id: Option<String>,
@@ -9002,7 +9002,7 @@ pub async fn list_events_for_bounded_context_from(
 }
 
 /// `list_events_for_bounded_context_from`'s own capped sibling -
-/// Codeberg issue #25's `catch_up_partitioned_projection` is the one
+/// issue #25's `catch_up_partitioned_projection` is the one
 /// caller (`MAX_EVENTS_PER_PARTITION_TICK`'s own doc comment explains
 /// why it needs a cap that function's other caller, `catch_up_snapshots`,
 /// doesn't). A separate function rather than an optional `limit`
@@ -10453,7 +10453,7 @@ pub async fn insert_event_and_update_sync_projections(
 /// folded in.
 ///
 /// `sync_projections` - the names of the bounded context's `sync`
-/// projections - is the caller's job (Codeberg issue #32): fetched once
+/// projections - is the caller's job (issue #32): fetched once
 /// per commit via [`sync_projection_names`], on this same transaction
 /// after its `sequence` row lock is held - see that function's doc
 /// comment for why both halves of that matter.
@@ -10547,7 +10547,7 @@ async fn fold_event_into_sync_projections_in_tx(
             .flatten();
 
         for key in &keys {
-            // `as_of_sequence` guard (Codeberg issue #25's investigation
+            // `as_of_sequence` guard (issue #25's investigation
             // finding) - unreachable in practice on this particular path
             // (every call here shares the one transaction that also
             // holds `insert_event`'s own bounded-context `sequence` row
@@ -11071,7 +11071,7 @@ pub enum SubmitCommandOutcome {
     Rejected {
         reason: String,
         kind: String,
-        // Codeberg issue #7's DCB conflict visualizer: the tag-scoped
+        // issue #7's DCB conflict visualizer: the tag-scoped
         // event set `decide()` actually evaluated against for *this*
         // rejection - the caller-supplied `matching_events` parameter
         // below for an ordinary rejection, or the freshly-recomputed
@@ -11082,7 +11082,7 @@ pub enum SubmitCommandOutcome {
         matching_events: Vec<Event>,
     },
     /// A duplicate submission bearing an `idempotency_key` that already
-    /// produced a real `Accepted` outcome (Codeberg issue #12) - not a
+    /// produced a real `Accepted` outcome (issue #12) - not a
     /// new decision, the *original* one, verbatim. `decide()` never ran
     /// again; no event was inserted again. Rejected outcomes are never
     /// deduplicated - they have zero side effects, so a duplicate one is
@@ -11192,7 +11192,7 @@ pub async fn submit_command(
 ) -> crate::error::Result<SubmitCommandOutcome> {
     let bounded_context_name = command_type.bounded_context.name.clone();
 
-    // Codeberg issue #32: a pre-lock warm-up for the common, no-DCB-conflict
+    // issue #32: a pre-lock warm-up for the common, no-DCB-conflict
     // path - mirrors `create_and_insert_external_event`/
     // `create_and_insert_direct_event`'s own "resolve encryption keys
     // before opening the transaction" shape, extended here to event-type
@@ -11211,7 +11211,7 @@ pub async fn submit_command(
 
     let mut tx = pool.begin().await?;
     let locked_highest = lock_bounded_context_sequence(&mut tx, &bounded_context_name).await?;
-    // Fetched once for the whole submission, not once per event (Codeberg
+    // Fetched once for the whole submission, not once per event (
     // issue #32) - and only now, after the lock above is already held,
     // which is what keeps this read race-free against
     // `promote_projection_rebuild` (see
@@ -11330,7 +11330,7 @@ pub async fn warm_up_event_types_and_encryption_keys(
 /// The `SELECT ... FOR UPDATE` peek `submit_command`'s own doc comment
 /// describes, pulled out so `submit_command_batch`'s leader can take it
 /// exactly once per batch too, instead of once per command - the actual
-/// mechanism this whole pass (Codeberg issue #32, round two) exists to
+/// mechanism this whole pass (issue #32, round two) exists to
 /// amortise across as many concurrently-arriving commands as possible.
 async fn lock_bounded_context_sequence(
     tx: &mut Transaction<'_, Postgres>,
@@ -11535,7 +11535,7 @@ enum DecideOutcome {
 }
 
 /// The read-only, no-sequence-number-needed half of what used to be one
-/// `submit_one_command_in_tx` - split out (Codeberg issue #32, round
+/// `submit_one_command_in_tx` - split out (issue #32, round
 /// three: shrinking a batch's own per-command round trips further, after
 /// round two's group commit already amortised the lock acquisition
 /// itself) so `commit_command_batch`'s loop can run this directly
@@ -11588,7 +11588,7 @@ async fn decide_command_in_tx(
     let bounded_context_name = command_type.bounded_context.name.clone();
     let schema = schema_ident(&bounded_context_name);
 
-    // Codeberg issue #12: a cached prior answer, not a new decision -
+    // issue #12: a cached prior answer, not a new decision -
     // checked as early as possible, right after the lock that makes this
     // race-free (see `lookup_idempotency_key`'s own doc comment).
     // `initial_decision`/the redispatch logic below never runs on a hit -
@@ -11666,7 +11666,7 @@ async fn decide_command_in_tx(
     let mut consistency_boundary =
         crate::event_store::query_boundary(&query, bounded_context_events)
             .max(states_boundary(snapshot_states));
-    // Codeberg issue #7: `None` is the caller's own pre-lock set,
+    // issue #7: `None` is the caller's own pre-lock set,
     // replaced below only if a DCB conflict forced a redispatch -
     // whichever one actually produced `final_decision` is the one a
     // rejection reports (see `SubmitCommandOutcome::Rejected`'s own doc
@@ -11754,7 +11754,7 @@ async fn decide_command_in_tx(
         // doc comment for why re-fetching it per command was pure
         // round-trip waste inside the batch leader's held lock.
         //
-        // Timed separately (Codeberg issue #32, round four investigation)
+        // Timed separately (issue #32, round four investigation)
         // - `commit_command_batch`'s own per-batch `decide_us` total was
         // far higher than CPU-only decide work should cost; this pins
         // down whether this specific query, firing whenever a busy
@@ -12213,7 +12213,7 @@ async fn submit_one_command_in_tx(
 
     // Allocated inside `tx`, after the lock above, in one round trip for
     // every event this command decided - `next_sequence_batch`, not
-    // `event_specs.len()` separate `next_sequence` calls (Codeberg issue
+    // `event_specs.len()` separate `next_sequence` calls (issue
     // #32). A failure anywhere below (an unregistered event type,
     // encryption resolution, the inserts themselves) rolls the whole
     // allocation back with the rest of this command's own work - the
@@ -12308,7 +12308,7 @@ pub type BatchedCommandResult = crate::error::Result<SubmitCommandOutcome>;
 
 /// What [`begin_command_batch_leader_tx`] hands to [`commit_command_batch`] -
 /// see each of their own doc comments for why acquiring the lock and
-/// running the batch are split into two functions at all (Codeberg issue
+/// running the batch are split into two functions at all (issue
 /// #36).
 pub struct CommandBatchLeaderTx {
     tx: Transaction<'static, Postgres>,
@@ -12318,7 +12318,7 @@ pub struct CommandBatchLeaderTx {
 }
 
 /// The lock-acquiring half of [`submit_command_batch`], pulled out
-/// (Codeberg issue #36) so `command_batcher::CommandBatcher::run_as_leader`
+/// (issue #36) so `command_batcher::CommandBatcher::run_as_leader`
 /// can await this - the one part of the batch's own processing whose
 /// duration is meant to grow the batch, per this module's own doc comment
 /// on the self-tuning design - *before* draining the queue, not after.
@@ -12332,7 +12332,7 @@ pub struct CommandBatchLeaderTx {
 ///
 /// `idle_in_transaction_session_timeout`, when `Some`, is issued as a
 /// `SET LOCAL` on this transaction's own connection right after opening
-/// it, before the lock wait - a defense-in-depth backstop (Codeberg issue
+/// it, before the lock wait - a defense-in-depth backstop (issue
 /// #36's own recommendation #3): if this transaction's connection ever
 /// does stall indefinitely - a stuck decider, a hung downstream await,
 /// anything that leaves it holding the bounded-context lock without
@@ -12389,7 +12389,7 @@ pub async fn begin_command_batch_leader_tx(
 
 /// A prefetched, batch-local block of not-yet-consumed sequence numbers -
 /// `commit_command_batch`'s own answer to `next_sequence_batch` being
-/// called once per command instead of once per batch (Codeberg issue #32,
+/// called once per command instead of once per batch (issue #32,
 /// round three). Reserves numbers in chunks against the *leader's own*
 /// `tx`, never a per-command `SAVEPOINT` - specifically so a reservation
 /// survives a later command's real failure instead of being rolled back
@@ -12527,7 +12527,7 @@ impl SequencePool {
 ///
 /// This is what makes batching commands from *different*, concurrently-
 /// submitting callers into one lock acquisition possible at all
-/// (Codeberg issue #32, round two - see `command_batcher`'s own module
+/// (issue #32, round two - see `command_batcher`'s own module
 /// doc comment for the throughput problem this exists to close): the
 /// lock `leader_tx` already holds is held for the combined work of every
 /// command in `batch`, not re-acquired per command, so N commands that
@@ -12660,7 +12660,7 @@ pub async fn commit_command_batch(
 }
 
 /// Where a batch's time under the lock went, for `commit_command_batch`'s
-/// one timing line per batch (Codeberg issue #32, round four).
+/// one timing line per batch (issue #32, round four).
 #[derive(Default)]
 struct BatchPhaseTiming {
     /// Whether the batch was written as a set (docs/architecture.md §196)
@@ -13431,7 +13431,7 @@ async fn commit_command_batch_per_command(
     batch: Vec<BatchedCommand>,
     slow: Option<&crate::slow_command::SlowCommandWarnings>,
 ) -> crate::error::Result<(Vec<BatchedCommandResult>, BatchPhaseTiming)> {
-    // Per-phase wall-clock accumulators (Codeberg issue #32,
+    // Per-phase wall-clock accumulators (issue #32,
     // round four investigation) - the batch-size histogram above already
     // ruled out "batches aren't forming large enough to amortise" as the
     // explanation for the flat ~27/s ceiling; this is the next
@@ -13856,7 +13856,7 @@ pub enum DryRunDecision {
 }
 
 /// `rule DryRunCommand`/`rule DryRunTriggerCommand` past authorisation
-/// (Codeberg issue #47): what a submission of `payload` would decide
+/// (issue #47): what a submission of `payload` would decide
 /// right now. It is [`resolve_command_submission`] - the same snapshot
 /// resolution, the same tag-indexed read, the same `decide()` - and
 /// nothing after it. No lock is taken, nothing is written, no sequence
@@ -13978,7 +13978,7 @@ pub async fn dry_run_command(
 /// the direct, unbatched path, still exactly what it always was. High-
 /// volume, externally-triggered submission (REST/GraphQL command
 /// submission, parked-delivery redrive) uses `CommandBatcher::decide_and_submit`
-/// instead (Codeberg issue #32, round two); the lower-volume, periodic
+/// instead (issue #32, round two); the lower-volume, periodic
 /// internal ones (the cross-context event router's own tick,
 /// `fire_due_deadlines`) still call through here, deliberately - batching
 /// buys the least where a caller is already ticking on its own schedule
@@ -14133,7 +14133,7 @@ async fn get_cross_context_route_cursor(
     Ok(row.map(|(seq,)| seq))
 }
 
-/// Also unconditionally clears any retry backoff state (Codeberg issue
+/// Also unconditionally clears any retry backoff state (issue
 /// #21) - every call site advances the cursor past an occurrence that is
 /// now *done* one way or another (skipped, rejected, accepted, or
 /// parked after retries were exhausted), so whatever retry state applied
@@ -14260,7 +14260,7 @@ async fn defer_cross_context_route(
     Ok(())
 }
 
-/// Codeberg issue #21 - which family of thing a [`ParkedDelivery`]
+/// issue #21 - which family of thing a [`ParkedDelivery`]
 /// originally was, and therefore how `retryParkedDelivery` redrives it.
 /// `target_bounded_context`/`target_command_type` are populated only for
 /// `CrossContextRoute` and `Deadline`; `ExternalEvent`/
@@ -14296,7 +14296,7 @@ fn parked_delivery_kind_from_str(s: &str) -> ParkedDeliveryKind {
     }
 }
 
-/// Codeberg issue #21's own generic "parked delivery" record - see
+/// issue #21's own generic "parked delivery" record - see
 /// `docs/architecture.md`'s parked-deliveries section for the full
 /// design. `request_json` always carries enough to redrive a retry on
 /// its own:
@@ -14371,7 +14371,7 @@ const PARKED_DELIVERY_COLUMNS: &str = "id, source, kind, identifier, access_toke
     target_bounded_context, target_command_type, request_json, error, attempt_count, \
     first_failed_at, last_failed_at";
 
-/// Codeberg issue #21 - `parked_deliveries`, one row per persistently-
+/// issue #21 - `parked_deliveries`, one row per persistently-
 /// failed delivery. A brand-new table, so (unlike
 /// `cross_context_route_cursors`'s own retry columns above) no
 /// already-provisioned bounded context needs a separate `ALTER TABLE`
@@ -14441,7 +14441,7 @@ fn parked_deliveries_occurrence_index_ddl(schema: &str) -> String {
     )
 }
 
-/// Codeberg issue #25 review (docs/architecture.md §56): belt-and-suspenders
+/// issue #25 review (docs/architecture.md §56): belt-and-suspenders
 /// for `catch_up_cross_context_route`'s own advisory-lock fix above -
 /// a `UNIQUE` index identifying one real failed occurrence (see
 /// `parked_deliveries_occurrence_index_ddl` for its exact key) so
@@ -14776,7 +14776,7 @@ pub fn parked_delivery_redrive_identity(
 /// often operators retry parked deliveries.
 ///
 /// Used even when the bridge's request carried a cursor of its own
-/// (Codeberg issue #58). By the time a parked message is retried, the
+/// (issue #58). By the time a parked message is retried, the
 /// bridge has committed past it and kept recording that partition, so
 /// the partition's watermark is usually beyond the parked sequence, and
 /// redriving under the original cursor was deduped away - nothing
@@ -15325,7 +15325,7 @@ pub async fn delete_parked_delivery(
 /// seeded and only ever sees genuinely new occurrences, the same as a
 /// `Beginning` route always has.
 ///
-/// **Codeberg issue #21**: `decide_and_submit_command`'s own `Err` used
+/// **issue #21**: `decide_and_submit_command`'s own `Err` used
 /// to propagate straight out of this function via a bare `?`, which
 /// stopped this tick immediately without advancing the cursor - correct
 /// as far as it went (a crash-safe "the next tick retries the identical
@@ -15342,7 +15342,7 @@ pub async fn delete_parked_delivery(
 /// operator gets a visible, retryable/discardable record instead of a
 /// route silently stuck forever.
 ///
-/// **Codeberg issue #25 review (docs/architecture.md §56)**: this whole
+/// **issue #25 review (docs/architecture.md §56)**: this whole
 /// tick - reading `retry_attempt_count`, deciding whether the policy is
 /// exhausted, and either recording another backoff or parking - is a
 /// plain read-then-write with no lock of its own, so two instances
@@ -15478,7 +15478,7 @@ async fn catch_up_cross_context_route_locked(
     )
     .await?;
 
-    // Codeberg issue #21 - see this function's own doc comment. Read
+    // issue #21 - see this function's own doc comment. Read
     // once per tick, ahead of the loop: only the loop's own first
     // occurrence can ever be a retry of a previously-failed one, since
     // the cursor never advances past a blocked occurrence - the same
@@ -15568,7 +15568,7 @@ async fn catch_up_cross_context_route_locked(
                 // second layer, not the load-bearing defense it was.
                 let idempotency_key =
                     cross_context_route_idempotency_key(route.name, &event.sequence.to_string());
-                // Codeberg issue #18: the routed command finally gets a
+                // issue #18: the routed command finally gets a
                 // real answer to "what caused this" - forward-carrying
                 // the source event's own correlation_id (always present
                 // by this point) and naming the source event itself as
@@ -15576,7 +15576,7 @@ async fn catch_up_cross_context_route_locked(
                 // `{bounded_context}:{sequence}` string (`Event` has no
                 // synthetic id of its own to use instead - see that
                 // helper's own doc comment).
-                // Codeberg issue #98: an approval-required target becomes a
+                // issue #98: an approval-required target becomes a
                 // proposal here too, never a direct submission - otherwise
                 // whoever can cause the source event bypasses the approver.
                 // `Ok(None)` is "proposed"; errors take the same retry/park
@@ -15617,7 +15617,7 @@ async fn catch_up_cross_context_route_locked(
                     .map(Some),
                     Err(e) => Err(e),
                 };
-                // Codeberg issue #21 - see this function's own doc
+                // issue #21 - see this function's own doc
                 // comment. `Err` no longer propagates straight out via
                 // `?`; it's retried with backoff, up to `retry_policy`,
                 // before this occurrence is parked.
@@ -15761,7 +15761,7 @@ async fn catch_up_cross_context_route_locked(
     Ok(())
 }
 
-// --- Codeberg issue #20: native one-shot, per-entity deadlines ---
+// --- issue #20: native one-shot, per-entity deadlines ---
 //
 // `catch_up_schedule_deadline`/`catch_up_cancel_deadline` are
 // `catch_up_cross_context_route`'s own shape, applied to
@@ -15903,7 +15903,7 @@ pub async fn catch_up_schedule_deadline(
                 // apply - a real, expected outcome, not an error.
             }
             Some(Ok(Some(spec))) => {
-                // Codeberg issue #95 - a recurring spec's own initial
+                // issue #95 - a recurring spec's own initial
                 // `fire_at` must lie inside its own validity window, or
                 // the chain would emit a row that is already expired.
                 // Skipped with a warning, cursor still advances - a caller
@@ -16287,7 +16287,7 @@ struct DueDeadlineRow {
     recurrence_sequence: Option<i64>,
 }
 
-/// Codeberg issue #95 - one due row's own recurrence state, reconstituted
+/// issue #95 - one due row's own recurrence state, reconstituted
 /// from its columns. `None` for a one-shot (`recurrence_schedule` is
 /// `NULL`) or for a row whose stored policy no known writer could have
 /// stored (defensive; the `CHECK` constraint already refuses those) - a
@@ -16370,7 +16370,7 @@ pub const DEADLINE_CLIENT_ID: &str = "deadline";
 /// retry or discard it like a parked route delivery. Either way the rest
 /// of the tick carries on (docs/architecture.md §115).
 ///
-/// Codeberg issue #95 - a row carrying recurrence state is the head of a
+/// issue #95 - a row carrying recurrence state is the head of a
 /// chain, and a firing advances it: the next row is inserted *before*
 /// this one is marked `fired` (deterministic id, `ON CONFLICT DO
 /// NOTHING`), so a crash between the two re-fires idempotently under the
@@ -16445,7 +16445,7 @@ pub async fn fire_due_deadlines(
                 continue 'rows;
             }
         }
-        // Codeberg issue #95 - the chain's kill-switch: a pending row
+        // issue #95 - the chain's kill-switch: a pending row
         // already past its own `valid_until` never submits and begets
         // nothing, marked `fired` like any other chain end. The claim
         // below is skipped deliberately - no side effect has happened, so
@@ -16525,20 +16525,20 @@ pub async fn fire_due_deadlines(
             crate::event_store::RESERVED_DEADLINE_IDEMPOTENCY_KEY_PREFIX,
             row.id
         );
-        // Codeberg issue #18: carries the scheduling event's own
+        // issue #18: carries the scheduling event's own
         // correlation_id forward (stored on the row at schedule time) -
         // no `causation_id` of its own, since there's no `Event` this
         // firing directly descends from the way a `CrossContextRoute`'s
         // own submission descends from the `Source` event that triggered
         // it (`event_causation_id`); a fired deadline's real cause is a
         // clock, not a prior commit.
-        // Codeberg issue #97: the target's `decide_with` gets the deadline
+        // issue #97: the target's `decide_with` gets the deadline
         // this command descends from - when it was scheduled to fire
         // (`fire_at`), its optional `expires_at`, and whether this firing
         // is past it - so it can refuse an action it fired too late for.
         let deadline_context =
             crate::plugin::DeadlineContext::new(row.fire_at, row.expires_at, now);
-        // Codeberg issue #98: an approval-required target becomes a
+        // issue #98: an approval-required target becomes a
         // proposal, never a direct submission - otherwise whoever can cause
         // the scheduling event bypasses the approver. `Ok(None)` is
         // "proposed"; errors take the same retry/park path as a failed
@@ -16606,7 +16606,7 @@ pub async fn fire_due_deadlines(
                  unexpected otherwise, since the key space is reserved"
             );
         }
-        // Codeberg issue #95 - the next row lands before this one is
+        // issue #95 - the next row lands before this one is
         // marked `fired`, so a crash between the two re-fires idempotently
         // and re-inserts the same next id as a no-op.
         advance_deadline_chain(pool, &schema, &row, recurrence.as_ref(), now).await?;
@@ -16615,7 +16615,7 @@ pub async fn fire_due_deadlines(
     Ok(())
 }
 
-/// Codeberg issue #95 - advances one recurring chain past the firing of
+/// issue #95 - advances one recurring chain past the firing of
 /// `row`: derives the next `fire_at` from the recurrence math and inserts
 /// the next pending row (deterministic id, `ON CONFLICT DO NOTHING`),
 /// carrying the chain's tags, payload, correlation, target and recurrence
@@ -16922,7 +16922,7 @@ async fn insert_idempotency_key<'e>(
     Ok(())
 }
 
-/// Codeberg issue #15: the batched replacement for looping every
+/// issue #15: the batched replacement for looping every
 /// registered projection through `get_projection_rebuild` - that path
 /// cost up to `~2P` queries per tick for `P` projections even when
 /// nothing was building (`get_projection_rebuild` alone is 3 queries:
@@ -17077,7 +17077,7 @@ pub async fn catch_up_bounded_context(
             .into_iter()
             .filter(|p| dispatcher.default_state(bounded_context, &p.name).is_some())
             .collect();
-    // Codeberg issue #25 (docs/architecture.md §51) - every async
+    // issue #25 (docs/architecture.md §51) - every async
     // projection is split here by its own `Projection::PARTITION_COUNT`
     // (via the dispatcher, since that's a Rust-only config the domain
     // `Projection` struct itself never carries). `unpartitioned_async_projections`
@@ -17227,7 +17227,7 @@ pub async fn catch_up_bounded_context(
         }
     }
 
-    // Codeberg issue #25 (docs/architecture.md §51) - sequential across
+    // issue #25 (docs/architecture.md §51) - sequential across
     // partitioned projections, not `for_each_concurrent`: the real
     // scale-out value comes from separate *instances* racing for
     // partitions, not from one instance's own intra-tick fan-out, and
@@ -17588,7 +17588,7 @@ async fn lock_chunk_states(
 }
 
 /// Folds `event` into each of `keys`' states, keeping the
-/// `as_of_sequence` guard (Codeberg issue #25): another instance may have
+/// `as_of_sequence` guard (issue #25): another instance may have
 /// folded a row past `event` already. `owner` is the one `event` gives
 /// (`event_owner`).
 fn fold_into_chunk_states(
@@ -17668,7 +17668,7 @@ async fn write_chunk_states(
 }
 
 /// `catch_up_bounded_context`'s own per-tick body for one async
-/// `Projection` whose `Projection::PARTITION_COUNT > 1` (Codeberg issue
+/// `Projection` whose `Projection::PARTITION_COUNT > 1` (issue
 /// #25's investigation, docs/architecture.md §50/§51 - see that
 /// section for the full design writeup). Reuses `keys()` itself as the
 /// partitioning input - no separate "partition key" concept - hashing
@@ -18149,7 +18149,7 @@ async fn fold_snapshot_chunk_in_tx(
             .expect("every planned value's row was just read");
         let refolded = row.history_through.is_some_and(|h| event.sequence <= h);
         if !refolded {
-            // `as_of_sequence` guard (Codeberg issue #25): another
+            // `as_of_sequence` guard (issue #25): another
             // instance may have folded this row past `event` already.
             if row.as_of_sequence >= event.sequence {
                 continue;
@@ -18372,7 +18372,7 @@ pub async fn catch_up_snapshots(
     let latest = latest_sequence(pool, bounded_context).await?.unwrap_or(-1);
 
     let all_snapshot_names = dispatcher.snapshot_names(bounded_context);
-    // Codeberg issue #25 (docs/architecture.md §52) - split by
+    // issue #25 (docs/architecture.md §52) - split by
     // `Snapshot::PARTITION_COUNT` (via the dispatcher, the only place
     // this Rust-only config lives, exactly like `Projection`'s own
     // split in `catch_up_bounded_context`). `unpartitioned_snapshot_names`
@@ -18475,7 +18475,7 @@ pub async fn catch_up_snapshots(
         }
     }
 
-    // Codeberg issue #25 (docs/architecture.md §52) - sequential across
+    // issue #25 (docs/architecture.md §52) - sequential across
     // partitioned snapshots, not `for_each_concurrent`, the identical
     // reasoning `catch_up_bounded_context`'s own partitioned-projection
     // loop already documents (§51): the real scale-out value comes from
@@ -18498,7 +18498,7 @@ pub async fn catch_up_snapshots(
 }
 
 /// `catch_up_snapshots`'s own per-tick body for one `Snapshot` whose
-/// `Snapshot::PARTITION_COUNT > 1` (Codeberg issue #25, docs/architecture.md
+/// `Snapshot::PARTITION_COUNT > 1` (issue #25, docs/architecture.md
 /// §52 - the `Snapshot` twin of `catch_up_partitioned_projection`, see
 /// that function's own doc comment for the full design writeup, not
 /// repeated in full here). The one structural difference: `Snapshot`
@@ -19169,7 +19169,7 @@ pub async fn promote_projection_rebuild(
     // ownership it derived while building, exactly as `state` does
     // (cross-tenant projection read fix, docs/architecture.md's own
     // write-up of this pass). `as_of_sequence` carried across for the
-    // identical reason (Codeberg issue #25's investigation finding) -
+    // identical reason (issue #25's investigation finding) -
     // and load-bearing here, not just consistency: leaving it out would
     // have every promoted row's `as_of_sequence` default back to `-1`
     // while `state` already reflects the rebuild's full replay, so the
@@ -19213,7 +19213,7 @@ pub async fn promote_projection_rebuild(
 
     tx.commit().await?;
     // The live `schema` just changed, so every instance's GraphQL type
-    // for this projection is stale - this one's included (Codeberg #69).
+    // for this projection is stale - this one's included (#69).
     notify_registration_changed(pool).await;
     Ok(true)
 }
@@ -19753,7 +19753,7 @@ struct ReadCursorRow {
 /// sqlx::PgExecutor` (the same generalisation `insert_event` itself
 /// already has) so `GET /v1/events/consume?mode=manual` can call this
 /// inside the same transaction `lock_read_cursor_for_consume`'s own
-/// advisory lock spans (Codeberg issue #25's investigation,
+/// advisory lock spans (issue #25's investigation,
 /// docs/architecture.md §53) - see that function's own doc comment for
 /// why a plain call against `&Pool` here wouldn't actually be protected
 /// by a lock taken on a different pooled connection.
@@ -19780,7 +19780,7 @@ pub async fn get_read_cursor(
 }
 
 /// The primitive that actually closes the `manual_ack` claim race
-/// (Codeberg issue #25's investigation, docs/architecture.md §53) - not
+/// (issue #25's investigation, docs/architecture.md §53) - not
 /// a row lock on `read_cursors` (a `SELECT ... FOR UPDATE` protects
 /// nothing for a token's very first-ever call, before any row exists to
 /// lock - proven by a real concurrent test that failed exactly there
@@ -19842,7 +19842,7 @@ async fn upsert_read_cursor(
 /// `impl sqlx::PgExecutor` (the same generalisation `insert_event` itself
 /// already has) so `GET /v1/events/consume?mode=manual` can call this
 /// inside the same transaction `get_read_cursor_for_update`'s own row
-/// lock spans (Codeberg issue #25's investigation, docs/architecture.md
+/// lock spans (issue #25's investigation, docs/architecture.md
 /// §53) - without that, the read and this write would each be free to
 /// land on a different pooled connection, making the lock meaningless
 /// (the identical failure mode `migrate_idempotency_keys_client_id_scoping`'s
@@ -19870,7 +19870,7 @@ pub async fn apply_cursor_update(
             .await?;
             Ok(())
         }
-        // Codeberg issue #25's investigation (docs/architecture.md §53) -
+        // issue #25's investigation (docs/architecture.md §53) -
         // `sequence`/`updated_at` deliberately untouched: a claim alone
         // never moves the cursor's own position, only `AcknowledgeEvents`
         // does.
@@ -19896,7 +19896,7 @@ pub async fn apply_cursor_update(
 /// `checked_out_at` is cleared unconditionally alongside `sequence`/
 /// `updated_at` - `rule AcknowledgeEvents`' own `ensures` block does the
 /// same, unconditionally, regardless of whether a live claim was even
-/// held (Codeberg issue #25's investigation, docs/architecture.md §53).
+/// held (issue #25's investigation, docs/architecture.md §53).
 #[tracing::instrument(skip_all)]
 pub async fn record_acknowledgement(
     executor: impl sqlx::PgExecutor<'_>,

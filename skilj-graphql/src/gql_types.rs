@@ -469,7 +469,7 @@ pub fn event_type_object(n: &Naming) -> Object {
     })
 }
 
-/// `CommandType.approvalPolicy` (Codeberg issue #98): present when the
+/// `CommandType.approvalPolicy` (issue #98): present when the
 /// type requires approval. `requiresApproval`/`approvalPolicy` are
 /// resolved from `command_approval_policies`, since the loaded
 /// `CommandType` row itself deliberately carries no approval fields.
@@ -684,7 +684,7 @@ pub fn projection_registration_result_object(n: &Naming) -> Object {
     })
 }
 
-/// Codeberg issue #21 - see `skilj_core::db::ParkedDeliveryKind`'s own
+/// issue #21 - see `skilj_core::db::ParkedDeliveryKind`'s own
 /// doc comment for what each variant means and which other
 /// `ParkedDelivery` fields it implies are populated.
 pub fn parked_delivery_kind_name(kind: skilj_core::db::ParkedDeliveryKind) -> &'static str {
@@ -912,7 +912,7 @@ pub fn queried_command_object(n: &Naming) -> Object {
     })
 }
 
-/// `SubmitCommandResult.matchingEvents`' own per-row shape (Codeberg
+/// `SubmitCommandResult.matchingEvents`' own per-row shape (
 /// issue #7's DCB conflict visualizer) - a real `Event`, not
 /// `QueriedEvent`'s `(i64, String)` pair, since `eventTypeName` matters
 /// here in a way it doesn't for `queryEvents` (a caller there already
@@ -986,7 +986,7 @@ pub fn event_meta_object(n: &Naming) -> Object {
 
     gql_object!(Event => n.ty("EventMeta") {
         scalar "createdAt": TypeRef::named_nn(TypeRef::STRING) => |e| Value::from(e.metadata.created_at.to_rfc3339()),
-        // Codeberg issue #18. `correlationId` is null only for a record
+        // issue #18. `correlationId` is null only for a record
         // written before this field existed.
         scalar "correlationId": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.metadata.correlation_id.clone()),
         scalar "causationId": TypeRef::named(TypeRef::STRING) => |e| optional_string(e.metadata.causation_id.clone()),
@@ -1046,7 +1046,7 @@ pub struct SubmitCommandResult {
     pub triggered_event_sequences: Option<Vec<i64>>,
     pub rejection_reason: Option<String>,
     pub rejection_kind: Option<String>,
-    // Codeberg issue #7's DCB conflict visualizer - `Some` only on
+    // issue #7's DCB conflict visualizer - `Some` only on
     // rejection (see the resolver's own construction of this struct for
     // why `Accepted` gets `None`), the tag-scoped set `decide()`
     // actually evaluated against for the rejection that governed.
@@ -1055,18 +1055,18 @@ pub struct SubmitCommandResult {
     /// were left out for `max_events_per_read` (docs/architecture.md
     /// §118). `None` whenever `matching_events` is.
     pub matching_events_truncated: Option<bool>,
-    // Codeberg issue #12: `true` only when an `idempotencyKey` was given
+    // issue #12: `true` only when an `idempotencyKey` was given
     // and it matched a prior `Accepted` outcome - `triggered_event_sequences`
     // is that prior outcome's, not a fresh decision. Always `false` when
     // no key was given, matching today's behaviour exactly.
     pub deduplicated: bool,
-    // Codeberg issue #18: the resulting Command's own correlation_id -
+    // issue #18: the resulting Command's own correlation_id -
     // the caller's, if it supplied one, or generated server-side
     // otherwise. `None` for a rejection (nothing was stored) and for a
     // deduplicated outcome (the cached prior answer doesn't carry it -
     // see the resolver's own construction of this struct).
     pub correlation_id: Option<String>,
-    // Codeberg issue #98: `true` when the command became a proposal
+    // issue #98: `true` when the command became a proposal
     // instead of being decided. `proposal_id` names it; `accepted` is
     // false in that case (nothing was accepted yet).
     pub pending_approval: bool,
@@ -1217,7 +1217,7 @@ pub fn command_proposal_decision_object(n: &Naming) -> Object {
     ))
 }
 
-/// `dryRunCommand`'s response (`rule DryRunCommand`, Codeberg issue #47):
+/// `dryRunCommand`'s response (`rule DryRunCommand`, issue #47):
 /// what `decide()` would say about a command right now. Admin-only, so
 /// unlike `SubmitCommandPayload` it always carries the matching events,
 /// accepted or not.

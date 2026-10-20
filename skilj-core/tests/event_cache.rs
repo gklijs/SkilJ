@@ -524,7 +524,7 @@ fn a_recreated_bounded_context_never_sees_its_predecessors_cached_events() {
     });
 }
 
-/// docs/architecture.md §180 (Codeberg #67): `private_fields` is a live
+/// docs/architecture.md §180 (#67): `private_fields` is a live
 /// declaration - declaring a field private hides it across the type's
 /// whole history at once. A cached event used to keep the copy of its
 /// type it was cached with, so after a re-registration (here by another
@@ -786,7 +786,7 @@ fn concurrent_startups_all_patch_in_the_counter() {
     });
 }
 
-/// docs/architecture.md §187 (Codeberg #50): a tag read returns only the
+/// docs/architecture.md §187 (#50): a tag read returns only the
 /// matching events, and says it is complete through the window's highest
 /// sequence - matching or not - which is where a command's re-check under
 /// the lock starts (§178).
@@ -828,7 +828,7 @@ fn a_tag_read_serves_the_matching_events_complete_through_the_whole_window() {
     });
 }
 
-/// docs/architecture.md §187 (Codeberg #50): once a window has evicted
+/// docs/architecture.md §187 (#50): once a window has evicted
 /// the first event, a tag read - which needs the whole history - misses
 /// without the freshen round trip it used to pay first. Shown with a pool
 /// that is closed by then: the tag read still misses cleanly, while a
@@ -867,7 +867,7 @@ fn a_tag_read_past_the_windows_first_event_misses_without_a_round_trip() {
     });
 }
 
-/// docs/architecture.md §188 (Codeberg #51): a command deciding from a
+/// docs/architecture.md §188 (#51): a command deciding from a
 /// snapshot only needs the events after the snapshot's `as_of_sequence`,
 /// which a window that no longer reaches the first event can still hold.
 /// It used to miss whenever the window didn't reach the start, so a

@@ -39,7 +39,7 @@ impl ProjectionDispatcher for TestDispatcher {
         event: &Event,
     ) -> Option<Vec<String>> {
         match projection_name {
-            // Codeberg issue #15: "AccountBalanceCopy" is a second,
+            // issue #15: "AccountBalanceCopy" is a second,
             // identically-behaved registered name - existing only so
             // `two_registered_projections_with_only_one_building_are_not_confused`
             // below has two real projections to distinguish, proving the
@@ -54,7 +54,7 @@ impl ProjectionDispatcher for TestDispatcher {
                 Some(vec![String::new()])
             }
             "AccountBalance" | "AccountBalanceCopy" => Some(Vec::new()),
-            // Codeberg issue #25 - a real multi-key projection, keyed by
+            // issue #25 - a real multi-key projection, keyed by
             // the payload's own `account` field, for the new partitioned
             // catch-up tests below. `PARTITION_COUNT` for this name is
             // `4` - see `partition_count` below.
@@ -134,7 +134,7 @@ impl ProjectionDispatcher for TestDispatcher {
         }
     }
 
-    /// Codeberg issue #25 - `AccountBalance`/`AccountBalanceCopy` are
+    /// issue #25 - `AccountBalance`/`AccountBalanceCopy` are
     /// deliberately left unmatched here (falling through to `None`,
     /// `catch_up_bounded_context`'s own "not recognized" treatment,
     /// identical in effect to `Some(1)`): the realistic default for a
@@ -285,7 +285,7 @@ async fn insert_plain_event(pool: &Pool, bc: &BoundedContext, et: &EventType, am
     seq
 }
 
-/// `event`'s own keyed twin (Codeberg issue #25) - carries an `account`
+/// `event`'s own keyed twin (issue #25) - carries an `account`
 /// field alongside `amount` so `TestDispatcher`'s `"PartitionedAccountBalances"`
 /// arm has something real to key/partition by.
 fn keyed_event(
@@ -542,7 +542,7 @@ fn a_building_rebuild_replays_from_the_start_and_promotes_once_caught_up() {
     });
 }
 
-/// Codeberg issue #15: `catch_up_bounded_context`'s rebuild-check now
+/// issue #15: `catch_up_bounded_context`'s rebuild-check now
 /// runs one batched query for every `building` rebuild in the bounded
 /// context, rather than one `get_projection_rebuild` call per registered
 /// projection - real risk that's new to that batching: incorrectly
@@ -898,7 +898,7 @@ fn a_real_concurrent_event_and_promotion_never_strand_the_event() {
     });
 }
 
-/// Codeberg issue #25's investigation: while checking whether the
+/// issue #25's investigation: while checking whether the
 /// existing "every instance redundantly redoes the same idempotent work"
 /// design (docs/architecture.md §22) actually holds for async
 /// `Projection` catch-up (unlike the scheduler/deadline paths, which are
@@ -988,7 +988,7 @@ fn two_concurrent_first_time_registrations_never_double_fold_history() {
     });
 }
 
-/// Codeberg issue #25 (docs/architecture.md §51) - proves
+/// issue #25 (docs/architecture.md §51) - proves
 /// `catch_up_partitioned_projection`'s core correctness claim under a
 /// real race: `M` concurrent instances (`tokio::join!`, the same
 /// real-concurrency pattern `two_concurrent_instances_never_double_fold_the_same_event`
@@ -1051,7 +1051,7 @@ fn partitioned_projection_concurrent_instances_fold_every_key_exactly_once() {
     });
 }
 
-/// Codeberg issue #25 - `projections.caught_up_to` (the single external
+/// issue #25 - `projections.caught_up_to` (the single external
 /// source of truth GraphQL's `caughtUpTo`/`wait_until_caught_up` depend
 /// on) must stay a correct, monotonically non-decreasing rollup across
 /// several ticks interleaved with new events landing, exactly reaching
@@ -1103,7 +1103,7 @@ fn partitioned_projection_caught_up_to_never_regresses_and_reaches_latest() {
     });
 }
 
-/// Codeberg issue #25 - `PARTITION_COUNT = 4` with only one real key
+/// issue #25 - `PARTITION_COUNT = 4` with only one real key
 /// touched: three of the four partitions have no matching key at all in
 /// any event, proving `catch_up_partitioned_projection`'s own idle
 /// partitions still advance their own progress (so the rollup can still
@@ -1146,7 +1146,7 @@ fn partitioned_projection_uneven_key_distribution_converges() {
     });
 }
 
-/// Codeberg issue #25 - one bounded context registering both an
+/// issue #25 - one bounded context registering both an
 /// unpartitioned (`AccountBalance`) and a partitioned
 /// (`PartitionedAccountBalances`) projection at once, proving the
 /// `unpartitioned_async_projections`/`partitioned_async_projections`

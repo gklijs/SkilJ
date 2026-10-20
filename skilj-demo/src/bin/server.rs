@@ -7,7 +7,7 @@
 //!
 //! Needs `DATABASE_URL` pointing at a real Postgres (`PORT` optionally
 //! overrides the default `8080`), or `--local`/`SKILJ_LOCAL_MODE=1` to
-//! start a supported embedded single-user Postgres instead (Codeberg
+//! start a supported embedded single-user Postgres instead (
 //! issue #100; data persists under `SKILJ_LOCAL_DATA_DIR` or the platform
 //! data directory). `SKILJ_FEDERATION_PREFIX` makes
 //! `/graphql` a federation subgraph under that prefix, publishing both
@@ -217,7 +217,7 @@ impl TelemetryProviders {
     }
 }
 
-/// `--local`/`SKILJ_LOCAL_MODE` (Codeberg issue #100) - an explicit flag,
+/// `--local`/`SKILJ_LOCAL_MODE` (issue #100) - an explicit flag,
 /// never inferred from a missing `DATABASE_URL`, so a production process
 /// that simply forgot its environment variable fails loudly instead of
 /// quietly starting a private database.
@@ -389,7 +389,7 @@ fn init_telemetry() -> Option<TelemetryProviders> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let telemetry = init_telemetry();
 
-    // Codeberg issue #100: `--local` (or `SKILJ_LOCAL_MODE=1`) starts an
+    // issue #100: `--local` (or `SKILJ_LOCAL_MODE=1`) starts an
     // embedded Postgres owned by this process, with no `DATABASE_URL`
     // needed. See `skilj::local`'s own docs for the persistent data
     // directory and its `SKILJ_LOCAL_*` settings.

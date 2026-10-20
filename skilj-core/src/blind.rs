@@ -290,7 +290,7 @@ impl Inner {
 /// every deployment that doesn't use them: deriving a plain tag never
 /// looks here.
 ///
-/// A tenant created from a template (Codeberg issue #13) is resolved to
+/// A tenant created from a template (issue #13) is resolved to
 /// its template's declaration through the [`TemplateCache`]: the template's
 /// normalizer, but a key derived from the tenant's own name, so two
 /// tenants' hashes of the same value differ.

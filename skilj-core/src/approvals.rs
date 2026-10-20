@@ -1,4 +1,4 @@
-//! Command approvals (Codeberg issue #98): a command type can declare that
+//! Command approvals (issue #98): a command type can declare that
 //! a submission is only a proposal, held until a human (a Role with an
 //! active admin grant, optionally narrowed to one role name) approves it.
 //!

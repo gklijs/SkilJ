@@ -15,7 +15,7 @@ cargo build --workspace --all-targets
 cargo test --workspace
 ```
 
-The CI pipeline (`scripts/ci-test.sh`, which runs `cargo test --workspace -- --nocapture`) additionally checks that no Postgres-backed tests silently skip. It runs against a `postgres` service container via `DATABASE_URL`, falling back to a Postgres inside the CI step's own container when that service doesn't answer (docs/architecture.md §166). `bash scripts/ci-test.sh` reproduces that setup and run by hand.
+The CI pipeline (`scripts/ci-test.sh`, which runs `cargo test --workspace -- --nocapture`) additionally checks that no test silently skips. It runs against a `postgres` service container via `DATABASE_URL`, falling back to a Postgres inside the CI step's own container when that service doesn't answer (docs/architecture.md §166). `bash scripts/ci-test.sh` reproduces that setup and run by hand.
 
 CONTRIBUTING.md's "What the tests do and don't verify" lists which guarantees hold by construction, which the tests verify, and which nothing verifies (docs/architecture.md §183). In particular, no SQL is checked at compile time, so the Postgres suites are its only check.
 
@@ -27,7 +27,7 @@ CONTRIBUTING.md's "What the tests do and don't verify" lists which guarantees ho
 
 Some integration tests require external services:
 - **Postgres** — `skilj-core`, `skilj`, `skilj-inspector` and `skilj-demo` integration tests use `DATABASE_URL` when it is set, and otherwise fall back to `postgresql_embedded`. Set `DATABASE_URL` to a real Postgres to avoid embedded-server issues. `DATABASE_URL` supplies the server, not the database: every test binary drops and recreates a named database of its own on it (docs/architecture.md §167), so the role needs `CREATEDB`.
-- **Kafka** (`skilj-kafka`), **AMQP** (`skilj-amqp`), **NATS** (`skilj-nats`) — these tests use `testcontainers-modules` and need a reachable Docker daemon. They skip gracefully if Docker is unavailable.
+- **Kafka** (`skilj-kafka`), **AMQP** (`skilj-amqp`), **NATS** (`skilj-nats`) — these tests use `testcontainers-modules` and need a reachable Docker daemon. They skip gracefully if Docker is unavailable, except in CI, where any skip fails the build (docs/architecture.md §223).
 - **Temporal** (`skilj-temporal`) — downloads Temporal's test server from temporal.download on first run and skips if it can't. Where that host is blocked, set `SKILJ_TEMPORAL_TEST_SERVER` to a `temporal-test-server` binary; the Java SDK's GitHub releases publish it (`temporal-test-server_<version>_linux_amd64.tar.gz`).
 
 ## Lint
@@ -57,16 +57,15 @@ Every public enum of the library crates is `#[non_exhaustive]` (docs/architectur
 
 ## CI checks
 
-The full CI pipeline (see `.woodpecker.yml`) runs:
-1. `scripts/check-woodpecker-config.sh` — validates `.woodpecker.yml` against Woodpecker's own JSON schema, so a key Woodpecker would only warn about fails the build instead
+The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each:
+1. actionlint — checks the workflow file itself, including shellcheck on its `run:` blocks
 2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`
 3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace
 4. `scripts/check-federation-composition.sh` — composes the recorded federation descriptions with Apollo's and Hive's composition
 5. `cargo fmt --all -- --check`
 6. `cargo deny check` — RustSec advisories, licenses, banned crates and sources, per `deny.toml`
 7. `cargo +1.95 check --workspace --lib --bins` — the declared minimum supported Rust version (`rust-version` in `Cargo.toml`) still builds
-8. `scripts/ci-test.sh --setup-only` — settles the CI step's Postgres before the long build, preferring the `services:` container and falling back to one inside the step
-9. `cargo build --workspace --all-targets`
+8. `scripts/ci-test.sh --setup-only` — settles the CI job's Postgres before the long build, preferring the `services:` container and falling back to one inside the job's own container
+9. `cargo test --workspace --no-run`, then `scripts/ci-test.sh` — `cargo test --workspace -- --nocapture` against that database, plus the guard that fails the build if any test skipped (Postgres, brokers or Temporal)
 10. `cargo clippy --workspace --all-targets -- -D warnings`
 11. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
-12. `scripts/ci-test.sh` — `cargo test --workspace -- --nocapture` against that database, plus the silent-skip guard for Postgres tests

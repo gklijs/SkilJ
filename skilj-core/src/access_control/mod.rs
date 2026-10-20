@@ -429,7 +429,7 @@ pub enum Error {
     GrantScopeMismatch,
 
     /// `projections::query_projection`'s own whole-instance team gate
-    /// (Codeberg issue #17, docs/architecture.md's own write-up of this
+    /// (issue #17, docs/architecture.md's own write-up of this
     /// pass): a projection declares `Projection::TEAM_ONLY` and the
     /// querying `access_mapping.role.name` doesn't match it. Kept
     /// distinct from `GrantScopeMismatch` above even though both reject
@@ -613,7 +613,7 @@ pub fn scope_matches_owner(owner: Option<&str>, scope: Option<&str>) -> bool {
 /// call sites that both needed it: `event_store::entitled_to_read_private_field`'s
 /// `PrivateFieldKind::Team` arm (a `PrivateField`'s own declared `team`)
 /// and `projections::query_projection`'s `team_only` check
-/// (`Projection::TEAM_ONLY`, Codeberg issue #17). Kept as one function
+/// (`Projection::TEAM_ONLY`, issue #17). Kept as one function
 /// specifically so a future change to what "matching a team" means
 /// (case-insensitive names, multiple teams per Role, team hierarchies)
 /// has exactly one definition to update rather than two that could drift

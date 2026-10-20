@@ -1,4 +1,4 @@
-//! Tests for Codeberg issue #95's per-entity recurrence with missed-run
+//! Tests for issue #95's per-entity recurrence with missed-run
 //! policy. Two layers, matching the implementation's own split:
 //!
 //! 1. `plugin::next_recurrence_fire_at` - pure cron/policy/window math, no

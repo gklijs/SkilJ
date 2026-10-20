@@ -127,7 +127,7 @@ pub fn revoke_role_field(n: &Naming) -> Field {
 
 /// `grantRoleAccessMapping(roleId: ID!, boundedContext: String!, level: AccessLevel!, canReadSensitive: Boolean!, scope: String): RoleAccessMapping!`
 ///
-/// `scope` (Codeberg cross-tenant projection read fix,
+/// `scope` (cross-tenant projection read fix,
 /// docs/architecture.md's own write-up of this pass): omitted or
 /// explicitly `null` grants unrestricted read within `boundedContext`,
 /// identical to this mutation's own behaviour before this argument

@@ -3,8 +3,8 @@
 # Starts a Postgres *inside* the CI step's own container, as a fallback
 # for when the step's `services:` container isn't reachable.
 #
-# Why this exists: Woodpecker (as Codeberg runs it) gives a step's
-# services no readiness signal and, so far, no way for the step to find
+# Why this exists: Woodpecker, which ran skilj's CI on Codeberg, gave a
+# step's services no readiness signal and no way for the step to find
 # out whether a service is merely slow, exited, or was never reachable
 # at all. `scripts/ci-wait-for-postgres.sh` now answers that question,
 # but a red CI run is still a wasted run - so the step prefers the

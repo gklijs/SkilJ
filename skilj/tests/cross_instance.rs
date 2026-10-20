@@ -1,4 +1,4 @@
-//! End-to-end tests for cross-instance push completeness (Codeberg issue
+//! End-to-end tests for cross-instance push completeness (issue
 //! #2; `@guarantee DeliverySpansInstances`/`RegistrationReachesEveryInstance`
 //! in specs/skilj.allium) - two real `Skilj` instances, each its own
 //! `axum::serve` listener with its own background tasks (including its
@@ -652,7 +652,7 @@ fn cross_instance_push_reaches_a_second_instance_sharing_one_database() {
     });
 }
 
-/// Codeberg ultra-review bug_001: Postgres delivers a `NOTIFY` to every
+/// Ultra-review bug_001: Postgres delivers a `NOTIFY` to every
 /// listening backend, including ones opened by the same process that
 /// sent it, so the write path's own direct `EventBroadcaster::publish`
 /// and this instance's own cross-instance listener republishing its own
@@ -815,7 +815,7 @@ async fn type_fields(router: &axum::Router, jwt: &str, type_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
-/// Codeberg #69: `promote_projection_rebuild` swapped in the rebuild's
+/// #69: `promote_projection_rebuild` swapped in the rebuild's
 /// schema without a `skilj_registration_changed` NOTIFY, so no instance -
 /// not even the one whose catch-up tick promoted it - rebuilt its GraphQL
 /// schema, and a field the rebuild added stayed unknown until a restart.
