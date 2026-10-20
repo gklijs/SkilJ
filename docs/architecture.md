@@ -64,17 +64,17 @@ listed separately here; see that section itself for its own structure.
 - [10b. OpenTelemetry tracing, logging, and metrics](#otel-tracing-logging-metrics)
   - [10b.1 Four smaller follow-ups](#10b1-four-smaller-follow-ups)
 - [11. `skilj-tui` - a Ratatui operator console](#skilj-tui-console)
-- [12. Cross-instance push completeness (Codeberg issue #2)](#cross-instance-push-completeness)
-- [13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (Codeberg issue #6, "5a")](#self-describing-graphql-surface)
-- [14. `skilj-inspector` - a standalone read-only Postgres console (Codeberg issue #6, "5b")](#skilj-inspector)
-- [15. `skilj-tui` debugging enhancements (Codeberg issue #7)](#skilj-tui-debugging-enhancements)
-- [16. Declarative bounded-context format + codegen: a prototype, not a build (Codeberg issue #5)](#declarative-bounded-context-codegen-prototype)
-- [17. Event/command codegen, for real: the narrower cut (Codeberg issue #5)](#event-command-codegen-real)
+- [12. Cross-instance push completeness (issue #2)](#cross-instance-push-completeness)
+- [13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (issue #6, "5a")](#self-describing-graphql-surface)
+- [14. `skilj-inspector` - a standalone read-only Postgres console (issue #6, "5b")](#skilj-inspector)
+- [15. `skilj-tui` debugging enhancements (issue #7)](#skilj-tui-debugging-enhancements)
+- [16. Declarative bounded-context format + codegen: a prototype, not a build (issue #5)](#declarative-bounded-context-codegen-prototype)
+- [17. Event/command codegen, for real: the narrower cut (issue #5)](#event-command-codegen-real)
 - [18. Ultra-review fixes: an access-control leak, a duplicate-delivery bug, and two nits](#ultra-review-fixes)
 - [19. Optional snapshotting for `matching_events`: a discussion, not a build](#optional-snapshotting-matching-events)
 - [20. Four new filter operators: geo, color, IP subnet, and generic `in`](#four-new-filter-operators)
-- [21. Optional idempotency key for command submission (Codeberg issue #12)](#optional-idempotency-key-submission)
-- [22. Background-polling and startup scaling (Codeberg issue #15)](#background-polling-startup-scaling)
+- [21. Optional idempotency key for command submission (issue #12)](#optional-idempotency-key-submission)
+- [22. Background-polling and startup scaling (issue #15)](#background-polling-startup-scaling)
 - [23. Cross-tenant projection read fix: owner-tag scoping on `RoleAccessMapping`](#cross-tenant-projection-read-fix-owner-tag)
 - [24. Cross-tenant read fix, part two: raw events (`FetchEvents`, `QueryEvents`/`CountEvents`/`InspectEvent`, `EventSubscription`)](#cross-tenant-read-fix-raw-events)
 - [25. Cross-tenant read fix, part three: `CommandQuery`/`FetchCommands`](#cross-tenant-read-fix-command-query)
@@ -84,8 +84,8 @@ listed separately here; see that section itself for its own structure.
 - [29. Hardening: `list_role_access_mappings` no longer panics on a concurrent bounded-context deletion](#hardening-list-role-access-mappings)
 - [30. Cross-tenant write fix: owner-tag scoping on `SubmitCommand`/`TriggerCommand`/`CreateExternalEvent`/`CreateDirectEvent`](#cross-tenant-write-fix-owner-tag-scoping)
 - [31. Private fields: a third field-level protection, alongside `sensitive_fields` and the owner-tag `scope` series](#private-fields-third-protection)
-- [32. Closing `ProjectionQuery`'s own team gate (Codeberg issue #17)](#projection-query-team-gate)
-- [33. Payload upcasting (Codeberg issue #14): every option, and the one built](#payload-upcasting)
+- [32. Closing `ProjectionQuery`'s own team gate (issue #17)](#projection-query-team-gate)
+- [33. Payload upcasting (issue #14): every option, and the one built](#payload-upcasting)
 - [34. `skilj-temporal`: a plan, partially built (long-running/cross-system processes)](#skilj-temporal-plan)
 - [35. Configurable connection pool sizing](#connection-pool-sizing)
 - [36. `CrossContextRoute`: crossing bounded contexts without an external system](#cross-context-route)
@@ -96,25 +96,25 @@ listed separately here; see that section itself for its own structure.
 - [41. `skilj-amqp`: a bridge to any AMQP 1.0 broker (Solace/Azure Service Bus/Artemis)](#skilj-amqp-bridge)
 - [42. `skilj-nats`: a bridge to NATS JetStream](#skilj-nats-bridge)
 - [43. Stopping a new subscriber from replaying all of history](#new-subscriber-replay-fix)
-- [44. Correlation/causation ids on commands and events (Codeberg issue #18)](#correlation-causation-ids)
-- [45. A given/when/then test fixture for decide()/project() (Codeberg issue #19)](#given-when-then-test-fixture)
-- [46. A native one-shot, per-entity deadline/timer (Codeberg issue #20)](#native-deadlines)
-- [47. Dead-letter/parking for failed event/message handler delivery (Codeberg issue #21)](#parked-deliveries)
-- [48. Investigation: atomic transactions spanning multiple command types (Codeberg issue #22)](#atomic-transactions-multiple-commands)
-- [49. A GraphQL subscription for Projections: `projectionUpdates` (Codeberg issue #23)](#projection-subscription)
-- [50. Investigation: segmented/parallel event processing for horizontal scale-out (Codeberg issue #25)](#segmented-parallel-investigation)
-- [51. Segmented/parallel event processing, built (Codeberg issue #25, part two)](#segmented-parallel-built)
+- [44. Correlation/causation ids on commands and events (issue #18)](#correlation-causation-ids)
+- [45. A given/when/then test fixture for decide()/project() (issue #19)](#given-when-then-test-fixture)
+- [46. A native one-shot, per-entity deadline/timer (issue #20)](#native-deadlines)
+- [47. Dead-letter/parking for failed event/message handler delivery (issue #21)](#parked-deliveries)
+- [48. Investigation: atomic transactions spanning multiple command types (issue #22)](#atomic-transactions-multiple-commands)
+- [49. A GraphQL subscription for Projections: `projectionUpdates` (issue #23)](#projection-subscription)
+- [50. Investigation: segmented/parallel event processing for horizontal scale-out (issue #25)](#segmented-parallel-investigation)
+- [51. Segmented/parallel event processing, built (issue #25, part two)](#segmented-parallel-built)
 - [52. Scoping parallelism beyond Projection catch-up, and building the Snapshot half](#parallelism-scoping-snapshot)
 - [53. Closing the Kafka/AMQP/NATS bridges' double-publish gap: `ReadCursor.checked_out_at`](#bridge-double-publish-gap)
 - [54. Bridge partitioning: skilj-kafka/skilj-amqp/skilj-nats, on top of §53](#bridge-partitioning)
 - [55. Closing the `CancelDeadline` fire-vs-cancel race](#cancel-deadline-race)
 - [56. Closing the parked-delivery duplication race in `catch_up_cross_context_route`](#parked-delivery-duplication-race)
-- [57. Shortening `submit_command`'s own lock hold (Codeberg issue #32)](#submit-command-lock-hold)
-- [58. Group-commit batching for `submit_command` (Codeberg issue #32, round two)](#group-commit-batching)
-- [59. Fixing §58's own permanent-hang regression, and closing the cross-instance routing investigation alongside it (Codeberg issues #36, #35)](#group-commit-hang-regression)
-- [60. Shrinking a batch's own per-command round trips further (Codeberg issue #32, round three)](#batch-round-trips)
-- [61. Closing §60's own measurement gap, a real load-test surprise about `skilj-helpdesk`'s own tenancy shape, and one more round-trip cut (Codeberg issue #32, round four)](#batch-measurement-gap)
-- [62. Finding and fixing the real ceiling: a redispatch check's own row-materialization cost (Codeberg issue #32, round four, continued)](#batch-redispatch-ceiling)
+- [57. Shortening `submit_command`'s own lock hold (issue #32)](#submit-command-lock-hold)
+- [58. Group-commit batching for `submit_command` (issue #32, round two)](#group-commit-batching)
+- [59. Fixing §58's own permanent-hang regression, and closing the cross-instance routing investigation alongside it (issues #36, #35)](#group-commit-hang-regression)
+- [60. Shrinking a batch's own per-command round trips further (issue #32, round three)](#batch-round-trips)
+- [61. Closing §60's own measurement gap, a real load-test surprise about `skilj-helpdesk`'s own tenancy shape, and one more round-trip cut (issue #32, round four)](#batch-measurement-gap)
+- [62. Finding and fixing the real ceiling: a redispatch check's own row-materialization cost (issue #32, round four, continued)](#batch-redispatch-ceiling)
 - [63. Code-review fixes for the group-commit batcher (post-0.0.7 review)](#group-commit-review-fixes)
 - [64. Hardening `POST /v1/parked-deliveries` (§47 follow-up)](#parked-deliveries-hardening)
 - [65. Two concurrency bugs: JWKS cold-cache 401s and double-redriven parked deliveries](#jwks-cold-cache-double-redrive)
@@ -2496,7 +2496,7 @@ in DCB's own [implementation list](https://dcb.events/resources/libraries/)
 
 ### 10.1 The query algebra is narrower than the spec's, deliberately
 
-Raised as Codeberg issue #24. The DCB [specification](https://dcb.events/specification/)'s
+Raised as issue #24. The DCB [specification](https://dcb.events/specification/)'s
 own `Query` is a list of independently-scoped items, each `{types?,
 tags?}`, OR'd together (with AND between one item's own types and tags).
 That lets a single query express something like "conflict if there's a
@@ -2905,7 +2905,7 @@ included, and catching one real mismatch this way: `allEvents`'s
 `QueriedEvent` has no `eventType` field, only `sequence`/`payload` - the
 schema-builder source alone didn't make that obvious).
 
-**Schema-driven command/event forms landed (Codeberg issue #8)**, once
+**Schema-driven command/event forms landed (issue #8)**, once
 [§13](#self-describing-graphql-surface)'s `eventTypes`/`commandTypes` queries gave this crate something to
 build one from - the v1 gap this same section used to name is closed,
 not just narrowed. The Commands tab's free-text type name became a real
@@ -2979,10 +2979,10 @@ operations (role/access management, type registration) - a distinct
 `AdminAccess`-vs-`Superadmin` concern from the "operate one bounded
 context" core this v1 targets; an in-app IdP login flow (v1 only ever
 takes a bearer token as config). Schema-driven command/event forms used
-to be listed here too - closed by Codeberg issue #8, see above.
+to be listed here too - closed by issue #8, see above.
 
 <a id="cross-instance-push-completeness"></a>
-## 12. Cross-instance push completeness (Codeberg issue #2)
+## 12. Cross-instance push completeness (issue #2)
 
 **A deliberate reversal, not a drift fix.** [§8](#open-for-a-future-pass)'s own `EventBroadcaster`
 writeup and the async-projection poller's writeup both cite the spec's
@@ -3110,7 +3110,7 @@ briefly since the rebuild is asynchronous) without instance B ever
 restarting.
 
 <a id="self-describing-graphql-surface"></a>
-## 13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (Codeberg issue #6, "5a")
+## 13. Self-describing GraphQL surface: `eventTypes`/`commandTypes` (issue #6, "5a")
 
 `TypeRegistration`'s `projections`/`scheduledEventTypes` queries already
 let a caller discover what's registered without already knowing its
@@ -3149,7 +3149,7 @@ empty-bounded-context and unauthenticated-caller cases every other field
 on this surface already covers.
 
 <a id="skilj-inspector"></a>
-## 14. `skilj-inspector` - a standalone read-only Postgres console (Codeberg issue #6, "5b")
+## 14. `skilj-inspector` - a standalone read-only Postgres console (issue #6, "5b")
 
 Even with [§13](#self-describing-graphql-surface)'s fix, everything about a running `skilj` deployment still
 requires `skilj-graphql` itself to be up - the exact moment an operator
@@ -3217,7 +3217,7 @@ field rendered as ciphertext on screen (not just in the test assertion),
 and quit cleanly with `q`.
 
 <a id="skilj-tui-debugging-enhancements"></a>
-## 15. `skilj-tui` debugging enhancements (Codeberg issue #7)
+## 15. `skilj-tui` debugging enhancements (issue #7)
 
 Four independently shippable additions to [§11](#skilj-tui-console)'s console, picked up right
 after [§13](#self-describing-graphql-surface) landed (one of them was blocked on it). **One correction to
@@ -3331,7 +3331,7 @@ current state rather than hanging, and real ANSI colour codes confirmed
 in the captured pane output (not just present in the test suite).
 
 <a id="declarative-bounded-context-codegen-prototype"></a>
-## 16. Declarative bounded-context format + codegen: a prototype, not a build (Codeberg issue #5)
+## 16. Declarative bounded-context format + codegen: a prototype, not a build (issue #5)
 
 Issue #5 proposes a small YAML/TOML format describing an event/command/
 projection's *shape* (fields, DCB tags, sensitive fields), plus a
@@ -3349,7 +3349,7 @@ what a generator was assumed capable of.
 **Two facts settled before prototyping, neither in the issue's own
 text.** First: the issue asks readers to weigh this against its own
 cheaper sibling proposal, a `cargo generate`-once scaffolding template -
-that already shipped, as `templates/skilj-template/` (Codeberg issue
+that already shipped, as `templates/skilj-template/` (issue
 #10, closed before this pass). The issue's own "which one first"
 question already has its first half answered; what was actually open
 was just "is the expensive, continuously-regenerating option still
@@ -3478,7 +3478,7 @@ worth building. The final call - build the narrower first cut, or close
 numbers rather than the issue's own upfront guess.
 
 <a id="event-command-codegen-real"></a>
-## 17. Event/command codegen, for real: the narrower cut (Codeberg issue #5)
+## 17. Event/command codegen, for real: the narrower cut (issue #5)
 
 [§16](#declarative-bounded-context-codegen-prototype)'s recommendation was the narrower cut - event/command type
 generation only, `Projection` generation deferred (its Finding 3,
@@ -3682,7 +3682,7 @@ change.
 <a id="optional-snapshotting-matching-events"></a>
 ## 19. Optional snapshotting for `matching_events`: a discussion, not a build
 
-User-initiated investigation, not tied to a Codeberg issue: for a
+User-initiated investigation, not tied to a issue: for a
 bounded context with a lot of history, a command's `matching_events`
 (the tag-scoped union of prior events `decide()` folds) can be large and
 slow to assemble, especially past what `EventCache` can serve. This
@@ -4244,7 +4244,7 @@ regression suite passes unchanged; `cargo build/clippy/test --workspace`
 clean; `allium check` clean on the spec change.
 
 <a id="optional-idempotency-key-submission"></a>
-## 21. Optional idempotency key for command submission (Codeberg issue #12)
+## 21. Optional idempotency key for command submission (issue #12)
 
 Command submission had no idempotency mechanism - `Command.id` is
 always server-generated (`generate_token_id()`), never derived from or
@@ -4396,7 +4396,7 @@ real. `cargo build/clippy/test --workspace` clean; `allium check` clean
 on the spec change.
 
 <a id="background-polling-startup-scaling"></a>
-## 22. Background-polling and startup scaling (Codeberg issue #15)
+## 22. Background-polling and startup scaling (issue #15)
 
 `SkiljBuilder::build()`'s startup warm-up loop and all three
 per-bounded-context background pollers (async-projection catch-up,
@@ -4414,7 +4414,7 @@ the common "nothing building" case, not just `P`, before its own
 early-exit even fired.
 
 Raised while investigating a "route commands to specific instances"
-idea for multi-tenancy (Codeberg issue #13) - that idea was not
+idea for multi-tenancy (issue #13) - that idea was not
 adopted: every skilj instance is fully interchangeable for any bounded
 context today, a deliberate, twice-confirmed design decision ([§12](#cross-instance-push-completeness)), and
 building instance routing would have reversed it for no correctness
@@ -5207,7 +5207,7 @@ write alike.
 ## 31. Private fields: a third field-level protection, alongside `sensitive_fields` and the owner-tag `scope` series
 
 A genuinely new mechanism, not a bugfix - user-initiated, prompted by a
-Codeberg issue proposing a whole-*projection* staff-only gate
+issue proposing a whole-*projection* staff-only gate
 (`Projection::PRIVATE`/`can_read_private`, a single bounded-context-wide
 boolean) that turned out, on inspection, to be one instance of a broader
 and more useful primitive: a field visible by default only to a
@@ -5439,7 +5439,7 @@ re-swept with a corrected, insertion-only (never whole-span-replacing)
 script, then re-audited clean.
 
 <a id="projection-query-team-gate"></a>
-## 32. Closing `ProjectionQuery`'s own team gate (Codeberg issue #17)
+## 32. Closing `ProjectionQuery`'s own team gate (issue #17)
 
 A real, pre-existing gap left by [§31](#private-fields-third-protection) rather than a new proposal: that
 pass's `team`-kind private field redacts one field of one raw
@@ -5449,7 +5449,7 @@ anyway, since both need read-level access at minimum. `ProjectionQuery`,
 the one surface a `Write`-level Role *can* reach, was never touched by
 that mechanism at all: nothing stopped a Role of any name from reading
 any projection instance its `RoleAccessMapping` otherwise covered. The
-original Codeberg issue that prompted [§31](#private-fields-third-protection) - a whole-*projection*
+original issue that prompted [§31](#private-fields-third-protection) - a whole-*projection*
 staff-only gate - was absorbed into the `team` private-field kind on the
 understanding that it covered every reader-facing surface; issue #17 is
 the finding that it didn't.
@@ -5560,7 +5560,7 @@ unchanged (spec untouched - `team_only_satisfied` already covers
 needed to close a gap that was purely in the Rust wiring).
 
 <a id="payload-upcasting"></a>
-## 33. Payload upcasting (Codeberg issue #14): every option, and the one built
+## 33. Payload upcasting (issue #14): every option, and the one built
 
 Issue #14 names a real trade-off and deliberately doesn't resolve it:
 `schema_is_backwards_compatible` (§ note above `entity CommandType` in
@@ -5711,7 +5711,7 @@ skilj's job is being a correct, auditable event store with an atomic
 effect boundary; a process's job is tracking multi-step state, retries,
 and durable waits. Temporal already does the second job well, and
 skilj already has the one piece a Temporal integration actually needs -
-idempotent command submission (Codeberg issue #12, [§21](#optional-idempotency-key-submission)). The plan below
+idempotent command submission (issue #12, [§21](#optional-idempotency-key-submission)). The plan below
 is a thin bridge between two systems that each keep their own history,
 correlated by convention, not a shared abstraction.
 
@@ -5952,7 +5952,7 @@ integration tests) passes clean with no `protoc` on `PATH` and no
 was a welcome upstream fix landing four days before this release, not a
 signal the API has stopped evolving.
 
-**Relationship to native deadlines ([§46](#native-deadlines), Codeberg issue #20)**: `skilj-temporal` stays the
+**Relationship to native deadlines ([§46](#native-deadlines), issue #20)**: `skilj-temporal` stays the
 right answer for a genuine multi-step process - retries, compensation,
 state that outlives any one command, real waits on an external system.
 [§46](#native-deadlines)'s `ScheduleDeadline`/`CancelDeadline` is the lightweight native option for
@@ -6116,7 +6116,7 @@ cursor. `cargo build/clippy -D warnings/test --workspace` and `cargo fmt
 **Security-review follow-up: the shared `idempotency_keys` namespace has
 no caller column.** `idempotency_keys`'s primary key is
 `(command_type_name, idempotency_key)` - no `client_id`/caller column at
-all, because every prior caller (Codeberg issue #12's design, and the
+all, because every prior caller (issue #12's design, and the
 `skilj-temporal` bridge in [§34](#skilj-temporal-plan)) only ever collided with its *own* past
 submissions, so nothing needed to scope the namespace by who wrote a
 key. `CrossContextRoute`'s background task is the first caller to place
@@ -6249,7 +6249,7 @@ guarded by a check against `information_schema.key_column_usage` (skip
 if `client_id` is already part of the primary key) and a
 `pg_advisory_xact_lock` keyed by the bounded context's own schema name
 for the transaction's whole duration - a real fleet runs more than one
-instance, and the existing per-process warm-up concurrency (Codeberg
+instance, and the existing per-process warm-up concurrency (
 issue #15) only serializes work *within* one process. Verified directly
 that the lock isn't there because skipping it would be unsafe: a real
 test racing several concurrent callers against the same pre-migration
@@ -7027,7 +7027,7 @@ first pass); `allium analyse` byte-identical to baseline.
 ---
 
 <a id="correlation-causation-ids"></a>
-## 44. Correlation/causation ids on commands and events (Codeberg issue #18)
+## 44. Correlation/causation ids on commands and events (issue #18)
 
 Raised comparing skilj against Axon Framework and other event-sourcing
 frameworks for gaps: nothing recorded "which command caused this event"
@@ -7196,7 +7196,7 @@ introduced - every test that hit it passes cleanly in isolation
 ---
 
 <a id="given-when-then-test-fixture"></a>
-## 45. A given/when/then test fixture for decide()/project() (Codeberg issue #19)
+## 45. A given/when/then test fixture for decide()/project() (issue #19)
 
 Raised comparing skilj against Axon Framework (`AggregateTestFixture`),
 Occurrent's Decider testing DSL, and Disintegrate's `Decision` testing
@@ -7291,14 +7291,14 @@ fmt --check --all` clean.
 ### Left for later
 
 The issue's own closing note - pairing this with the `skilj` Claude Code
-skill (Codeberg #3) as the natural next thing it points a plugin author
+skill (#3) as the natural next thing it points a plugin author
 at once they've added a `CommandType`/`Projection` - is a real, wanted
 follow-up (the skill package now mentions `skilj-test-fixture` as a
 pointer), not fully built out into a worked example inside the skill
 itself yet.
 
 <a id="native-deadlines"></a>
-## 46. A native one-shot, per-entity deadline/timer (Codeberg issue #20)
+## 46. A native one-shot, per-entity deadline/timer (issue #20)
 
 Raised comparing skilj against Axon Framework's `DeadlineManager` -
 schedule a one-off timer tied to a *specific* entity/tag ("cancel this
@@ -7492,7 +7492,7 @@ has no fault-injection hook to force a real redelivery, only ever
 exercising the ordinary, non-redelivered path.
 
 <a id="parked-deliveries"></a>
-## 47. Dead-letter/parking for failed event/message handler delivery (Codeberg issue #21)
+## 47. Dead-letter/parking for failed event/message handler delivery (issue #21)
 
 The gap the issue named: a persistently-failing delivery had no
 operator-visible surface anywhere in this codebase. `CrossContextRoute`'s
@@ -7644,7 +7644,7 @@ updated to reflect the fresh attempt. A `CrossContextRoute` redrive
 deliberately doesn't reconstruct the original source event's own
 `correlation_id`/`causation_id` (not stored on the parked row) - the
 retried command gets a fresh, server-generated `correlation_id` instead,
-the same "omitted means generated server-side" register Codeberg issue
+the same "omitted means generated server-side" register issue
 #18 ([§44](#correlation-causation-ids)) already established for every
 other caller with none to hand.
 
@@ -7778,7 +7778,7 @@ change to DCB's own model or the Allium spec.
   `skilj-kafka`/`skilj-amqp`/`skilj-nats`/`skilj-tui`).
 
 <a id="atomic-transactions-multiple-commands"></a>
-## 48. Investigation: atomic transactions spanning multiple command types (Codeberg issue #22)
+## 48. Investigation: atomic transactions spanning multiple command types (issue #22)
 
 Issue #22 asked whether `skilj` needs a way to atomically process
 multiple independently-registered `CommandType`s in one transaction,
@@ -7847,7 +7847,7 @@ gap identified; issue closed as already-solved, pointing at
 `EnrollStudentInCourse` as the existing proof.
 
 <a id="projection-subscription"></a>
-## 49. A GraphQL subscription for Projections: `projectionUpdates` (Codeberg issue #23)
+## 49. A GraphQL subscription for Projections: `projectionUpdates` (issue #23)
 
 `EventSubscription` ([§9](#next-steps)'s "last surface out of the
 backlog") already gave clients a live push of raw events, but a client
@@ -7939,7 +7939,7 @@ test-support, this project's own established call):
 - Key-filtering: a keyed `CustomerPurchaseHistory` projection proves an
   event for a *different* key never pushes anything, while one for the
   subscribed key does.
-- `TEAM_ONLY` (Codeberg issue #17's gate, reached through this new
+- `TEAM_ONLY` (issue #17's gate, reached through this new
   surface): a Role missing the required team name is rejected as the
   subscription's own first and only message, before any event could
   possibly be involved - proving the check runs before
@@ -7967,7 +7967,7 @@ tests) all pass unchanged against real embedded Postgres, confirming the
 behaviour.
 
 <a id="segmented-parallel-investigation"></a>
-## 50. Investigation: segmented/parallel event processing for horizontal scale-out (Codeberg issue #25)
+## 50. Investigation: segmented/parallel event processing for horizontal scale-out (issue #25)
 
 Speculative, not a commitment - the issue asked whether skilj should
 adopt Axon Framework's Tracking Event Processor model (parallel
@@ -8072,7 +8072,7 @@ one-off timing fluke) and pass deterministically after it.
 suites unchanged.
 
 <a id="segmented-parallel-built"></a>
-## 51. Segmented/parallel event processing, built (Codeberg issue #25, part two)
+## 51. Segmented/parallel event processing, built (issue #25, part two)
 
 §50 above recommended a narrow fix over segmentation - no evidence of a
 real throughput ceiling, and the redundant-work model's real cost was
@@ -8568,7 +8568,7 @@ tests) pass unchanged. `cargo build/clippy --workspace --all-targets --
 
 ### What this completes
 
-Codeberg issue #25, in full: §51 (Projection partitioning), §52
+issue #25, in full: §51 (Projection partitioning), §52
 (scoping - Snapshot partitioning built, CrossContextRoute found not to
 fit, the bridge gap found), §53 (the `read_cursors` checkout mechanism
 that gap needed), and this section (partitioning built on top of it).
@@ -8725,7 +8725,7 @@ temporarily reverted, reproducing exactly two parked rows for the one
 occurrence), then verified passing again with the fix restored.
 
 <a id="submit-command-lock-hold"></a>
-## 57. Shortening `submit_command`'s own lock hold (Codeberg issue #32)
+## 57. Shortening `submit_command`'s own lock hold (issue #32)
 
 A load test of `skilj-helpdesk` against this library (its own
 `docs/load-test-report-2026-09-17.md`) found that total write throughput
@@ -8844,7 +8844,7 @@ sequences roll back together on the poison event's failure, same as
 before this pass.
 
 <a id="group-commit-batching"></a>
-## 58. Group-commit batching for `submit_command` (Codeberg issue #32, round two)
+## 58. Group-commit batching for `submit_command` (issue #32, round two)
 
 §57's round-trip reductions helped, but a follow-up load test against
 `skilj-helpdesk` still found the same ceiling, because shortening one
@@ -8994,15 +8994,15 @@ and idempotency-key deduplication (§37) is checked per command, inside
 its own savepoint, unchanged.
 
 <a id="group-commit-hang-regression"></a>
-## 59. Fixing §58's own permanent-hang regression, and closing the cross-instance routing investigation alongside it (Codeberg issues #36, #35)
+## 59. Fixing §58's own permanent-hang regression, and closing the cross-instance routing investigation alongside it (issues #36, #35)
 
-A real load test against `skilj-helpdesk` (Codeberg issue #36) found
+A real load test against `skilj-helpdesk` (issue #36) found
 that §58's `CommandBatcher` didn't just fail to raise the throughput
 ceiling under heavy load - it could wedge a whole bounded context
 *permanently*: one connection stuck `idle in transaction` holding the
 `sequence` row's lock forever, every other writer queueing behind it
 with no self-recovery short of a server restart. Investigated alongside
-Codeberg issue #35 (cross-instance command routing), filed in the same
+issue #35 (cross-instance command routing), filed in the same
 window and sharing the identical lock/leader machinery - closing both
 together turned out to matter, not just be convenient: §35's own
 recommended future design (see below) builds on exactly the seam this
@@ -9065,7 +9065,7 @@ bounded context still completes - verified to actually fail (timing out
 at 5s) with the timeout disabled, before being restored, so the test is
 known to exercise the real mechanism and not pass vacuously.
 
-**Codeberg issue #35, closed alongside this rather than separately**:
+**issue #35, closed alongside this rather than separately**:
 investigated whether multiple `skilj` instances routing commands with
 overlapping DCB tags to different instances is a correctness risk.
 Conclusion: no bug. The `sequence` row's `FOR UPDATE` lock is a standard
@@ -9120,7 +9120,7 @@ this pass introduced; every test file this pass actually touches passes
 cleanly and repeatably in isolation.
 
 <a id="batch-round-trips"></a>
-## 60. Shrinking a batch's own per-command round trips further (Codeberg issue #32, round three)
+## 60. Shrinking a batch's own per-command round trips further (issue #32, round three)
 
 A follow-up load test against `skilj-helpdesk` (post-§59) confirmed the
 wedge was fixed and found roughly double the pre-batching throughput
@@ -9227,7 +9227,7 @@ so treat the ceiling improvement as directionally expected rather than
 quantified until re-run against `skilj-helpdesk`.
 
 <a id="batch-measurement-gap"></a>
-## 61. Closing §60's own measurement gap, a real load-test surprise about `skilj-helpdesk`'s own tenancy shape, and one more round-trip cut (Codeberg issue #32, round four)
+## 61. Closing §60's own measurement gap, a real load-test surprise about `skilj-helpdesk`'s own tenancy shape, and one more round-trip cut (issue #32, round four)
 
 §60 shipped without a fresh load-test number. This pass re-ran the exact
 `docs/load-test-report-2026-09-18c.md` methodology against §60's own
@@ -9284,7 +9284,7 @@ not further round-trip work here.
   `sensitive_fields` (`skilj-demo`, or a future `skilj-helpdesk` PII
   feature), just not this one. `futures-util` moved from `skilj-core`'s
   `dev-dependencies` to real `[dependencies]` for this (previously only
-  a test dependency for the Codeberg issue #15 warm-up-concurrency A/B
+  a test dependency for the issue #15 warm-up-concurrency A/B
   test).
 
 - **Moving the same-batch idempotency check off `tx` entirely, removing
@@ -9331,12 +9331,12 @@ genuine overlap available is CPU-only `dispatcher.decide()` work (and a
 no-conflict case `decide_command_in_tx` now does close to zero I/O
 already, leaving little to actually overlap. Building a full tag-based
 dependency scheduler for that uncertain a return, in the same code area
-that already produced two real regressions (§59, Codeberg issues #36/#35),
+that already produced two real regressions (§59, issues #36/#35),
 wasn't judged worth it this round. Landed on `perf/batch-round-trip-reduction`,
 same branch as §60.
 
 <a id="batch-redispatch-ceiling"></a>
-## 62. Finding and fixing the real ceiling: a redispatch check's own row-materialization cost (Codeberg issue #32, round four, continued)
+## 62. Finding and fixing the real ceiling: a redispatch check's own row-materialization cost (issue #32, round four, continued)
 
 §61's SAVEPOINT removal, measured directly against `skilj-helpdesk`,
 moved throughput by an amount indistinguishable from this environment's
@@ -10139,7 +10139,7 @@ Tests (`skilj-core/tests/command_batcher.rs`):
 
 A permanent failure isn't exotic. A deadline stores its command payload when it's scheduled and fires it later, possibly after a deploy changed the command: a payload that no longer deserialises fails with `PayloadDecodeFailed` every time - the test's case. So does a command handler that errors on the stored input.
 
-Routes had the answer to the same problem since Codeberg issue #21: retry with backoff per a `RetryPolicy`, then record a `ParkedDelivery` an operator can retry or discard. Deadlines now do the same (the user's choice, over marking the deadline `failed` with no operator surface, or only keeping the tick going):
+Routes had the answer to the same problem since issue #21: retry with backoff per a `RetryPolicy`, then record a `ParkedDelivery` an operator can retry or discard. Deadlines now do the same (the user's choice, over marking the deadline `failed` with no operator surface, or only keeping the tick going):
 
 - **Retry state on the row:** new `deadlines` columns `attempt_count`, `first_failed_at`, `next_attempt_at` and `last_error`. They're in the DDL for new contexts and patched into existing ones by `ensure_deadlines_table` with `ADD COLUMN IF NOT EXISTS`; the defaults mean "never failed".
 - **On a failed submission** (`record_deadline_failure`): the attempt is counted against `SkiljBuilder::deadline_retry_policy` (default `RetryPolicy::default()`, the same as routes: 1 s doubling to 5 min, 5 attempts).
@@ -10215,7 +10215,7 @@ Tests (3-connection pools; the "before" runs used the pre-§117 code):
 <a id="rejection-matching-events"></a>
 ## 118. A rejection's `matchingEvents` is served like `queryEvents`
 
-A rejected `submitCommand` gives an Admin-level caller `matchingEvents`: the events the decision was made against, for debugging a conflict (Codeberg issue #7). A Write-level caller never gets them (`MatchingEventsRequiresAdminLevel`). For an Admin, though, they were returned exactly as stored, skipping everything `queryEvents` applies to the same Admin:
+A rejected `submitCommand` gives an Admin-level caller `matchingEvents`: the events the decision was made against, for debugging a conflict (issue #7). A Write-level caller never gets them (`MatchingEventsRequiresAdminLevel`). For an Admin, though, they were returned exactly as stored, skipping everything `queryEvents` applies to the same Admin:
 
 - **Private fields in plaintext.** A private field is stored in plaintext, and `render_event` hides it unless the Role is entitled (the author, a grant, the team). Any Admin read them all here.
 - **No owner scope.** A command's consistency tags can match events owned by others - a note on a shared case, tagged `case` and `company`, matches a command for the same case from another company. An Admin scoped to one company read the other company's events.
@@ -10724,7 +10724,7 @@ The map now holds `Option<DataKey>`, and a miss is recorded as `None`. The rende
 
 The fold now takes `SELECT caught_up_to, sync FROM projections WHERE name = $1 FOR UPDATE` before any state row, the same order promotion uses. It also re-reads under that lock what the tick's snapshot of the projection may have missed: a projection already past the event (another instance folded it, or a promotion just replaced it), one that promotion turned `sync`, or one that is gone is skipped. Two instances folding the same projection now wait on its row rather than on its state rows. They already serialized per event, so this costs nothing new. The sync insert path already takes the sequence lock first, as promotion does, so it could never interleave with promotion.
 
-The partitioned path (Codeberg issue #25) advances `caught_up_to` from a separate statement after its partition transactions commit, so it never holds a state row while waiting on the projection row. `create_projection` writes the projection row before folding history into state. Neither needed a change.
+The partitioned path (issue #25) advances `caught_up_to` from a separate statement after its partition transactions commit, so it never holds a state row while waiting on the projection row. `create_projection` writes the projection row before folding history into state. Neither needed a change.
 
 `skilj-core/tests/async_projections.rs` `an_async_fold_never_deadlocks_against_a_promotion` holds the projection row in a transaction the way promotion does, waits (via `pg_stat_activity`) until the fold is blocked, then deletes the state rows. With the old order this fails with `40P01 deadlock detected`.
 
@@ -10746,7 +10746,7 @@ Every `Skilj::build()` runs the `ensure_*` patches on every bounded context, to 
 
 Each patch now goes through `add_columns_patch` or `create_index_patch`, which wrap the DDL in a `DO` block. The block checks `pg_attribute` (`attisdropped` excluded) or `to_regclass` first and runs the DDL only when a column or index is missing. The catalog read takes no table lock. The patches keep their signatures, so the same functions still serve `provision_bounded_context_schema`'s transaction. A table that is itself missing still runs the DDL and fails as before. `ensure_registration_version_columns` and the two real migrations (`migrate_idempotency_keys_client_id_scoping`, `migrate_parked_deliveries_dedup_and_unique_index`) already checked the catalog first. A patch that really has work to do still takes its lock, once, on the first instance to start on the new version.
 
-Writing the test for "a missing column is still added" found a second bug: startup warmed the event cache before patching. The warm-up selects every `events` column, including `metadata_correlation_id`/`metadata_causation_id` (Codeberg issue #18), so a bounded context from before them failed the warm-up, and so startup, before `ensure_correlation_causation_columns` could add them. The warm-up now runs after the patches.
+Writing the test for "a missing column is still added" found a second bug: startup warmed the event cache before patching. The warm-up selects every `events` column, including `metadata_correlation_id`/`metadata_causation_id` (issue #18), so a bounded context from before them failed the warm-up, and so startup, before `ensure_correlation_causation_columns` could add them. The warm-up now runs after the patches.
 
 Tests in `skilj/tests/startup_bounded_contexts.rs` (renamed from `startup_deleted_bounded_context.rs`, §157):
 
@@ -10782,7 +10782,7 @@ Tests: `skilj-core/tests/async_projections.rs` `catch_up_leaves_a_projection_it_
 <a id="another-instance-parked"></a>
 ## 161. Work another instance can do isn't parked by one that can't
 
-§160 left two refusals that mean "not this instance, but another one can": `NoDeciderRegistered` (the instance doesn't declare the command type) and the new `SyncProjectionNotDeclared`. Background work retries failures under a `RetryPolicy` and parks once it is exhausted. That covers a deadline's command (§115), a cross-context route's target command (Codeberg issue #21), and a bridge's inbound message. The default policy is 5 attempts in about 15 seconds. During a rolling deploy, instances that don't yet (or no longer) declare a command type or a sync projection keep claiming such work, so the attempts could all land on them. Work with nothing wrong with it was then parked, waiting for an operator's `retryParkedDelivery`.
+§160 left two refusals that mean "not this instance, but another one can": `NoDeciderRegistered` (the instance doesn't declare the command type) and the new `SyncProjectionNotDeclared`. Background work retries failures under a `RetryPolicy` and parks once it is exhausted. That covers a deadline's command (§115), a cross-context route's target command (issue #21), and a bridge's inbound message. The default policy is 5 attempts in about 15 seconds. During a rolling deploy, instances that don't yet (or no longer) declare a command type or a sync projection keep claiming such work, so the attempts could all land on them. Work with nothing wrong with it was then parked, waiting for an operator's `retryParkedDelivery`.
 
 With the user's choice (not counted and never parked, over parking after a long cap or leaving it as is), these refusals no longer count:
 
@@ -10912,7 +10912,7 @@ Result: a documented guarantee - "exactly one of two colliding projections is se
 
 `ee3086a` batched `produce_once`: it split a consumed page into events this instance owns and events another partition owns, acknowledged the not-owned ones straight away, then sent the owned ones concurrently and acknowledged them afterwards. The idea was to let `rdkafka` batch the sends. It never shipped in a release, and it was reverted before one, because the order of acknowledgements is not a detail here.
 
-A manual-ack read cursor is a single position, and `AcknowledgeEvents` refuses to move it backwards (`acknowledgement_regresses`, §75). Acknowledging not-owned sequence 10 before producing owned sequence 5 therefore moves the cursor past 5. If producing 5 then fails, the next `consume` starts after 10 and 5 is never fetched again - lost, with nothing in the log saying so. If producing 5 succeeds, its own acknowledgement is refused as a regression, so the cycle reports an error for an event that was in fact delivered. Batch failures were also blamed on the batch's first event, so a bounded retry policy (Codeberg issue #21) skipped whichever event happened to lead, not the one that failed, and every successfully sent event in a failing batch was sent again on each retry.
+A manual-ack read cursor is a single position, and `AcknowledgeEvents` refuses to move it backwards (`acknowledgement_regresses`, §75). Acknowledging not-owned sequence 10 before producing owned sequence 5 therefore moves the cursor past 5. If producing 5 then fails, the next `consume` starts after 10 and 5 is never fetched again - lost, with nothing in the log saying so. If producing 5 succeeds, its own acknowledgement is refused as a regression, so the cycle reports an error for an event that was in fact delivered. Batch failures were also blamed on the batch's first event, so a bounded retry policy (issue #21) skipped whichever event happened to lead, not the one that failed, and every successfully sent event in a failing batch was sent again on each retry.
 
 **Fix: back to strict sequence order.** Each event is produced and then acknowledged before the next one is looked at, owned or not. That is also what keeps per-key order in Kafka without depending on the producer's configuration: concurrent sends keep their order only with `enable.idempotence` set, because without it a broker-side retry can land a later record first. The crate docs no longer claim that `enable.idempotence` gives exactly-once delivery: it deduplicates the producer's own internal retries, not a second `send` of the same event after skilj refused or missed its acknowledgement, so delivery to Kafka is at-least-once.
 
@@ -10921,7 +10921,7 @@ The test mock now refuses a regressing acknowledgement with 409, the way the rea
 <a id="kafgres-ideas-not-adopted"></a>
 ## 170. Ideas from kafgres that don't fit SkilJ
 
-[kafgres](https://github.com/RayElg/kafgres) is a PostgreSQL extension that runs a Kafka broker inside the database: topics, offsets and consumer groups are rows, and unmodified Kafka clients connect to it. Like SkilJ it is an event log stored in Postgres, but the hard problems differ - kafgres has to reproduce Kafka's wire protocol and semantics well enough for real clients, SkilJ has to give `decide()` exactly the events sharing its consistency tags over a gapless sequence. A read-through for SkilJ's benefit was written in October 2026 (`docs/kafgres-learnings.md`, commit `3e79006`, since removed). What was worth doing became Codeberg issues #39-#56. This section keeps the three things that were rejected, and why, so they don't need re-deriving.
+[kafgres](https://github.com/RayElg/kafgres) is a PostgreSQL extension that runs a Kafka broker inside the database: topics, offsets and consumer groups are rows, and unmodified Kafka clients connect to it. Like SkilJ it is an event log stored in Postgres, but the hard problems differ - kafgres has to reproduce Kafka's wire protocol and semantics well enough for real clients, SkilJ has to give `decide()` exactly the events sharing its consistency tags over a gapless sequence. A read-through for SkilJ's benefit was written in October 2026 (`docs/kafgres-learnings.md`, commit `3e79006`, since removed). What was worth doing became issues #39-#56. This section keeps the three things that were rejected, and why, so they don't need re-deriving.
 
 **A WAL/CDC ingest path.** kafgres can turn row changes into records through logical decoding, with mappings written as SQL over `new`/`old`. SkilJ should not have one: a row change never passes through `decide()`, so it has no consistency boundary, no tags and no relationship to the command that caused it. SkilJ's events are decisions, not row diffs. kafgres documents the deciding caveat itself: an enrichment query runs when the change is rendered and sees *current* state, because Postgres cannot query as of a past LSN - the very property `decide()`'s matching events exist to provide. Foreign data enters SkilJ as a command or an external event (§40-§42), and `decide()` runs as normal.
 
@@ -10932,7 +10932,7 @@ The test mock now refuses a regressing acknowledgement with 409, the way the rea
 <a id="bridge-outbound-ack-per-run"></a>
 ## 171. The bridges acknowledge once per contiguous run, from one shared loop
 
-Codeberg issue #40. Every outbound event cost two round trips: one to the broker and one `POST /v1/events/consume/ack` to skilj, made one after another. A read cursor is a single position (§75), so acknowledging sequence N acknowledges everything at or below it - one call for the last event of a run of handled events does the work of one call per event, without the reordering risk that concurrent sends to the broker had (§169).
+issue #40. Every outbound event cost two round trips: one to the broker and one `POST /v1/events/consume/ack` to skilj, made one after another. A read cursor is a single position (§75), so acknowledging sequence N acknowledges everything at or below it - one call for the last event of a run of handled events does the work of one call per event, without the reordering risk that concurrent sends to the broker had (§169).
 
 **The loop moved into `skilj-bridge`.** `skilj-kafka`, `skilj-amqp` and `skilj-nats` each had their own copy of the outbound cycle - backoff check, consume, the per-event loop, partition skips, retry bookkeeping, give-up - differing only in how one event reaches the broker and in the broker's name in a log line. §165 had left it in the bridges; changing the acknowledgement rule three times is what moving it avoids. `skilj_bridge::outbound_cycle` now runs the cycle, and each bridge supplies an `OutboundSink`, a one-method trait (`deliver` one event, resolving once the broker accepted it) implemented over its own producer, sender or JetStream context. `OutboundRetryState` moved with it and is re-exported under each bridge's old path, so the bridges' public APIs (`produce_once`, `run_outbound`, `OutboundRetryState`) are unchanged. The `owns_partition_for` wrappers and their duplicate unit tests went too; `skilj-bridge` already tests `owns_partition` itself.
 
@@ -10950,7 +10950,7 @@ Tests: `skilj-bridge/tests/outbound_cycle.rs` drives the cycle against a mock of
 <a id="inbound-throughput-investigation"></a>
 ## 172. Inbound throughput: measured, and no batch endpoint yet
 
-Codeberg issue #41 asked whether the broker bridges' inbound side (broker -> `POST /v1/events/external` or `POST /v1/commands/trigger`) needs batching. Each bridge sends one message, awaits skilj's answer, then takes the next - one message in flight per consumer, across every partition it is assigned.
+issue #41 asked whether the broker bridges' inbound side (broker -> `POST /v1/events/external` or `POST /v1/commands/trigger`) needs batching. Each bridge sends one message, awaits skilj's answer, then takes the next - one message in flight per consumer, across every partition it is assigned.
 
 **Measured** with `skilj/tests/inbound_throughput.rs`, an `#[ignore]`d benchmark that sends 400 messages per scenario through `Skilj::rest_router()` in-process (no network) into one bounded context, against the embedded Postgres on a development machine. Two rounds, after a warm-up:
 
@@ -10966,13 +10966,13 @@ The absolute numbers depend on the machine and on Postgres's commit cost; the ra
 **Conclusions:**
 
 - **No batch REST endpoint for now.** It would amortize the lock and the commit further, but it is new API surface: per-item results, per-item parking, and a dedupe watermark per item. Concurrency across partitions gets most of the gain with the existing endpoints.
-- **Concurrency is only safe per partition.** The §39 watermark drops any sequence at or below the highest one recorded for its partition key, and `decide()` needs commands in order, so at most one message per partition key may be in flight. For Kafka that means one per Kafka partition: possible today by running more bridge instances in one consumer group, and in one process by Codeberg issue #60.
+- **Concurrency is only safe per partition.** The §39 watermark drops any sequence at or below the highest one recorded for its partition key, and `decide()` needs commands in order, so at most one message per partition key may be in flight. For Kafka that means one per Kafka partition: possible today by running more bridge instances in one consumer group, and in one process by issue #60.
 - **The same watermark rule exposed two problems**, filed separately. #58 is a confirmed bug: a parked external event whose partition later messages overtook is deduped away when it's redriven, and the row is deleted as if it had succeeded (`a_parked_message_overtaken_on_its_partition_is_still_created_on_retry`, ignored until it's fixed). #59 is an investigation: NATS uses the whole stream as one partition key, and AMQP uses the group id, so competing consumers on either can record a lower sequence after a higher one and silently drop it.
 
 <a id="parked-external-event-redrive-cursor"></a>
 ## 173. A retried parked external event no longer reuses the bridge's dedupe cursor
 
-Codeberg issue #58, found while measuring inbound throughput (§172). A bridge parks an inbound message that carries a `dedupe` cursor - Kafka always sends one, NATS always, AMQP when the message has a group id and sequence - commits past it (§97), and carries on. Later messages on that partition are recorded, so its watermark (§39) moves past the parked sequence. `retryParkedDelivery` redrove the parked request with its original cursor, `create_and_insert_external_event` saw a sequence at or below the watermark and returned `Redelivered`, the resolver ignored the outcome, and the row was deleted as if the retry had succeeded. The message was gone and nothing said so. §96's per-row cursor fallback had only covered requests *without* a cursor; with one, the request "kept it" so a redrive would also dedupe against the bridge's original attempt.
+issue #58, found while measuring inbound throughput (§172). A bridge parks an inbound message that carries a `dedupe` cursor - Kafka always sends one, NATS always, AMQP when the message has a group id and sequence - commits past it (§97), and carries on. Later messages on that partition are recorded, so its watermark (§39) moves past the parked sequence. `retryParkedDelivery` redrove the parked request with its original cursor, `create_and_insert_external_event` saw a sequence at or below the watermark and returned `Redelivered`, the resolver ignored the outcome, and the row was deleted as if the retry had succeeded. The message was gone and nothing said so. §96's per-row cursor fallback had only covered requests *without* a cursor; with one, the request "kept it" so a redrive would also dedupe against the bridge's original attempt.
 
 The watermark keeps only the highest sequence per partition, so a redrive can't tell "later messages overtook it" from "the original attempt committed after all, and the bridge never heard back". Three ways out were considered: redrive under a per-row cursor; record which sequences were actually created; or stop a partition's watermark from passing a parked position. **With the user's choice, the first:** every `ExternalEvent` redrive now uses `db::parked_delivery_redrive_dedupe_partition_key` - partition `skilj-parked-delivery:{id}` at sequence 1 - whether or not the stored request has a cursor. Repeated redrives of one row still dedupe against each other (`a_retry_after_a_failed_row_delete_does_not_land_the_event_twice` is unchanged). The bridge's cursor stays in the stored request, so an operator can still see it, but the redrive no longer decodes it.
 
@@ -10986,7 +10986,7 @@ Test: `a_parked_message_overtaken_on_its_partition_is_still_created_on_retry` (`
 <a id="kafka-inbound-per-partition-concurrency"></a>
 ## 174. `skilj-kafka` dispatches inbound partitions concurrently
 
-Codeberg issue #60, following §172's measurement. `run_inbound` handled every assigned partition one message at a time: the next message, from any partition, waited for the previous call to skilj. Now one message is in flight *per partition*, and partitions run concurrently. That is the most concurrency §39's watermark and `decide()` allow (§172), and it gives one bridge instance what §172 measured for "8 partitions in flight": about 2.5× for external events and 3× for command triggers, more over a real network.
+issue #60, following §172's measurement. `run_inbound` handled every assigned partition one message at a time: the next message, from any partition, waited for the previous call to skilj. Now one message is in flight *per partition*, and partitions run concurrently. That is the most concurrency §39's watermark and `decide()` allow (§172), and it gives one bridge instance what §172 measured for "8 partitions in flight": about 2.5× for external events and 3× for command triggers, more over a real network.
 
 **Shape.** One task still receives every message; there is no task or partition queue per partition on the librdkafka side (`split_partition_queue` would need a rebalance hook through the caller's `ConsumerContext`, and `run_inbound` takes a plain `StreamConsumer`). Each received message goes to its partition's in-process queue. A partition with nothing in flight starts its message at once, as one future in a `FuturesUnordered` the same loop polls; when it finishes, its offset is committed and the partition's next queued message starts. Retrying, parking and the §97 "report before moving on" rule are unchanged, but per partition: a failing message now holds up only the messages behind it in its own partition, where it used to stall the whole consumer. Commits go through `Consumer::commit` with an explicit offset, since queued messages are detached (`OwnedMessage`) and `commit_message` needs the borrowed one.
 
@@ -11005,7 +11005,7 @@ Test: `a_failing_message_holds_up_only_its_own_partition` keeps one message on p
 <a id="external-message-keys"></a>
 ## 175. External events from NATS and AMQP are deduplicated per message, not by watermark
 
-Codeberg issue #59 asked whether §39's dedupe watermark - the highest `dedupe.sequence` recorded per `(adapter, partitionKey)`, anything at or below it answered `redelivered` - holds for every bridge. It holds only when a partition's messages reach skilj in order *including redeliveries*. Kafka gives that: a consumer replays a partition from its committed offset, so every writer covers a contiguous range, and anything at or below the watermark really was recorded (or parked, and redriven under its own cursor, §173). That holds across a rebalance too, and with §174's per-partition buffers, because the old and the new owner both replay from the same committed offset.
+issue #59 asked whether §39's dedupe watermark - the highest `dedupe.sequence` recorded per `(adapter, partitionKey)`, anything at or below it answered `redelivered` - holds for every bridge. It holds only when a partition's messages reach skilj in order *including redeliveries*. Kafka gives that: a consumer replays a partition from its committed offset, so every writer covers a contiguous range, and anything at or below the watermark really was recorded (or parked, and redriven under its own cursor, §173). That holds across a rebalance too, and with §174's per-partition buffers, because the old and the new owner both replay from the same committed offset.
 
 NATS JetStream and AMQP redeliver one message at a time instead. JetStream hands out newer messages while an unacknowledged one waits for `ack_wait`. An AMQP broker returns a released message after deliveries the link already holds. So the watermark answered the redelivery `redelivered`, the bridge acknowledged it, and the message was never created. The issue suspected competing consumers. A single instance was enough. `messages_redelivered_after_a_restart_are_all_created` (`skilj-nats/tests/nats_bridge.rs`, real JetStream, the mock skilj now applies §39's watermark) stops a bridge while it retries message 1 of 3, publishes 4, and starts a new bridge. Before the fix the requests went `[4, 1, 2, 3]` and only 4 was created. A failed park report did the same without a restart: the loop moved on, and the redelivery came after the next message. §97 and §98 had reasoned that per-message redelivery made these bridges safe there, but they missed the watermark.
 
@@ -11024,7 +11024,7 @@ Tests: `an_idempotency_key_recognises_its_message_in_any_order` and `an_expired_
 <a id="database-epoch"></a>
 ## 176. Positions from before a failover are refused, and the event cache drops what the failover lost
 
-Codeberg issue #42. When the database fails over to an asynchronous standby, the new primary can lack the tail of the old one's log. A point-in-time restore does the same. The next commits then reuse those sequence numbers for different events.
+issue #42. When the database fails over to an asynchronous standby, the new primary can lack the tail of the old one's log. A point-in-time restore does the same. The next commits then reuse those sequence numbers for different events.
 
 **What goes stale, checked rather than assumed.** The issue expected the §39 dedupe watermarks and the read cursors to go stale. They don't: every position skilj stores sits in the same transactions as the events it describes, so it rolls back with them. What does go stale lives outside the database:
 
@@ -11066,7 +11066,7 @@ The first CI run skipped the test, and the silent-skip guard failed the build: `
 <a id="advertised-vs-enforced"></a>
 ## 177. What the self-describing surface advertises, checked against where it's enforced
 
-Codeberg issue #48, from the kafgres read-through: kafgres refuses to report settings it doesn't enforce. Two questions: does SkilJ's self-description (`eventTypes`, `commandTypes`, `projections`, `scheduledEventTypes`, §13) ever claim a protection that doesn't hold for the caller? And would a generated capability manifest with a CI check be worth having?
+issue #48, from the kafgres read-through: kafgres refuses to report settings it doesn't enforce. Two questions: does SkilJ's self-description (`eventTypes`, `commandTypes`, `projections`, `scheduledEventTypes`, §13) ever claim a protection that doesn't hold for the caller? And would a generated capability manifest with a CI check be worth having?
 
 **Who sees the self-description.** Each field requires admin access to the bounded context it names, and since §138 a caller is only served its own bounded contexts' schema. Nothing leaks across callers or contexts.
 
@@ -11090,7 +11090,7 @@ Codeberg issue #48, from the kafgres read-through: kafgres refuses to report set
 <a id="command-recheck-position"></a>
 ## 178. A command's re-check under the lock starts where its read ended
 
-Codeberg issue #45: refresh the performance baseline, profile the command commit path, then decide on follow-ups. The old baseline (~45-60 commands/s per bounded context) came from the `skilj-helpdesk` app's load runs. This repo had no command benchmark of its own.
+issue #45: refresh the performance baseline, profile the command commit path, then decide on follow-ups. The old baseline (~45-60 commands/s per bounded context) came from the `skilj-helpdesk` app's load runs. This repo had no command benchmark of its own.
 
 **Benchmark.** `skilj/tests/command_throughput.rs` (`#[ignore]`d, like §172's `inbound_throughput.rs`) sends 800 commands per scenario through `POST /v1/commands/trigger` on the in-process router, from 1, 8, 32 and 80 callers, in a **spread** workload (each command on its own account) and a **hot** one (all on one account). A tracing layer sums the batcher's own `debug` events (`command batch leader lock wait`, `command batch phase timing`, `command decide delta query`) per scenario, so each row says how large the batches were and what each command spent inside the lock. The results and their reading are in `docs/performance.md`.
 
@@ -11113,7 +11113,7 @@ The DCB guarantee is unchanged. Everything committed after the position is still
 
 ## 179. A conformance transcript across GraphQL and REST
 
-Codeberg issue #43, from kafgres' practice of running real clients against itself and diffing what they observe. SkilJ has no reference implementation to diff against, so the baseline is a recorded transcript, and the two tracks are checked against each other where they offer the same operation.
+issue #43, from kafgres' practice of running real clients against itself and diffing what they observe. SkilJ has no reference implementation to diff against, so the baseline is a recorded transcript, and the two tracks are checked against each other where they offer the same operation.
 
 **The suite.** `skilj/tests/conformance.rs` runs each scenario once over GraphQL (a Role's JWT: `submitCommand`, `queryEvents`) and once over REST (an admin-minted `CommandToken`/`EventReadToken`: `POST /v1/commands/trigger`, `GET /v1/events`). Each surface gets its own fresh bounded context with the same history, so sequences line up. A scenario prints one line per surface: name, surface, HTTP status, and the outcome as canonical JSON. The outcome is the error `code`, or the fields both surfaces answer that operation with. It never includes raw bytes, timing, messages or generated ids; an accepted command's correlation id is supplied by the scenario, so its echo is stable. The scenarios cover accepted, rejected and deduplicated submissions, a key reused for another payload, the reserved key prefix, payloads off the schema, a missing credential, paged reads, a read past the end, and both operations against an archived bounded context.
 
@@ -11132,11 +11132,11 @@ Some differences are recorded but not compared, because they belong to a track a
 
 **Fix.** `BoundedContext::same_as` compares names. `EventType::same_as` and `CommandType::same_as` compare the name and the bounded context's name. Every rule that asks "is this the same context or type" now uses them: the read and count rules, subscriptions and their start positions, `fetch_events`/`consume_events`/cursor start, `inspect_event`, private-field grant matching, token minting and the same-context guards in `access_control`, `projections` and `bootstrap`. `==` stays derived for tests that compare whole values. Identity is the name alone, on purpose. Every other field of a `BoundedContext` except `created_at` can change while it stays the same context: `status`, `template`, and `created_by`, which embeds a `Role` whose `status` changes on revocation. Every field of a type except its name can change on re-registration, and a re-registered type is still that type. `created_at` would tell two lives of a reused name apart. It isn't used, for two reasons. Deleting a context already removes its mappings and tokens, and the event cache drops its events (§95). And a `BoundedContext` built in Rust carries nanoseconds where one read from Postgres carries microseconds, so the same context could compare unequal: the bug this section fixes, in another form. Tests: `fetch_events_matches_an_event_whose_type_snapshot_is_stale` (`skilj-core/tests/event_fetch_surface.rs`) and `subscription_selects_an_event_whose_type_copy_has_moved_on` (`skilj-core/tests/event_broadcast.rs`); the subscription one failed before the fix. In the transcript, `read_archived` serves both events on both surfaces.
 
-**Left open.** The cached copies are still stale where a rule reads a *declaration* from them, not the identity. `private_fields` is a live declaration (§31): changing it is meant to change what every reader sees of the type's whole history at once. But rendering an event (`redact_private_fields`, `render_event`) reads `event.event_type.private_fields`, so an event served from the cache is redacted by the declaration as it was when the cache took the event in. A field newly declared private is still served in the clear over REST until the cache drops the event. Tracked as Codeberg issue #67. Fixed in §180.
+**Left open.** The cached copies are still stale where a rule reads a *declaration* from them, not the identity. `private_fields` is a live declaration (§31): changing it is meant to change what every reader sees of the type's whole history at once. But rendering an event (`redact_private_fields`, `render_event`) reads `event.event_type.private_fields`, so an event served from the cache is redacted by the declaration as it was when the cache took the event in. A field newly declared private is still served in the clear over REST until the cache drops the event. Tracked as issue #67. Fixed in §180.
 
 ## 180. Cached events are served with their type's current registration
 
-Codeberg issue #67, left open by §179. An `Event` carries a copy of its `EventType`, and the event cache kept the copy it took the event in with. Several declarations on a type are live: changing them changes what every reader sees of the type's whole history at once. `private_fields` is one (§31), and so is `owner_tag_key`, the read scoping. Rendering (`redact_private_fields` on REST, `render_event` on GraphQL) and scoping (`event_owner_scope_satisfied`) read them off `event.event_type`. So after a re-registration declared a field private, an event served from the cache went out over REST with the field in the clear, until the cache dropped the event. A read served from Postgres loaded the type fresh and redacted it. `inspectEvent` had the same gap one level down: it renders the originating command with `command.command_type.private_fields`, from the copy cached inside the event's origin.
+issue #67, left open by §179. An `Event` carries a copy of its `EventType`, and the event cache kept the copy it took the event in with. Several declarations on a type are live: changing them changes what every reader sees of the type's whole history at once. `private_fields` is one (§31), and so is `owner_tag_key`, the read scoping. Rendering (`redact_private_fields` on REST, `render_event` on GraphQL) and scoping (`event_owner_scope_satisfied`) read them off `event.event_type`. So after a re-registration declared a field private, an event served from the cache went out over REST with the field in the clear, until the cache dropped the event. A read served from Postgres loaded the type fresh and redacted it. `inspectEvent` had the same gap one level down: it renders the originating command with `command.command_type.private_fields`, from the copy cached inside the event's origin.
 
 **Options weighed.**
 - *Render with the current registration, looked up at each call site.* The token's or grant's type is current, but not every read has one: `queryEvents` and `inspectEvent` span types, and the origin command's type would be another lookup. Every rule reading a declaration would have to remember to do it, and the next rule added would be a new gap.
@@ -11154,7 +11154,7 @@ Tests (`skilj-core/tests/event_cache.rs`): `a_re_registration_applies_to_events_
 <a id="promoted-rebuild-notifies"></a>
 ## 181. A promoted rebuild refreshes every instance's GraphQL schema
 
-Codeberg issue #69. Re-registering a projection with a changed schema doesn't change its live schema: it stages a rebuild (§9), and the new schema goes live only when a catch-up tick promotes it (`promote_projection_rebuild`). Every other write that changes what the GraphQL schema exposes ends with `notify_registration_changed`, which every instance's cross-instance listener answers with a `SchemaRegistry::rebuild`, the sending instance included (§5.1). Promotion didn't. No instance rebuilt its schema, not even the one whose tick promoted, so a field the rebuild added was `Unknown field` until a restart, and a removed one was still advertised. `upsert_projection`'s own notification at re-registration doesn't help: it fires while the live schema is still the old one.
+issue #69. Re-registering a projection with a changed schema doesn't change its live schema: it stages a rebuild (§9), and the new schema goes live only when a catch-up tick promotes it (`promote_projection_rebuild`). Every other write that changes what the GraphQL schema exposes ends with `notify_registration_changed`, which every instance's cross-instance listener answers with a `SchemaRegistry::rebuild`, the sending instance included (§5.1). Promotion didn't. No instance rebuilt its schema, not even the one whose tick promoted, so a field the rebuild added was `Unknown field` until a restart, and a removed one was still advertised. `upsert_projection`'s own notification at re-registration doesn't help: it fires while the live schema is still the old one.
 
 **Fix.** `promote_projection_rebuild` notifies after its commit when it promotes. A deferred promotion (`Ok(false)`) writes nothing and doesn't notify. The doc comment on `notify_registration_changed` now lists all of its callers, `register_new_sync_projection` and `promote_projection_rebuild` included. No other write changes a live projection's `schema`. `@guarantee RegistrationReachesEveryInstance` already promised this: promotion is when a re-registration's schema takes effect, so the spec is unchanged.
 
@@ -11162,7 +11162,7 @@ Test (`skilj/tests/cross_instance.rs`): `a_promoted_rebuild_refreshes_the_graphq
 
 ## 182. Async projection catch-up folds a chunk of events per transaction
 
-Codeberg issue #52: check how async projections apply events, and whether a chunk per transaction would cut commit overhead, as the command batcher (§58) and `deliver_batch` (§154) did.
+issue #52: check how async projections apply events, and whether a chunk per transaction would cut commit overhead, as the command batcher (§58) and `deliver_batch` (§154) did.
 
 **What it did.** The unpartitioned path of `catch_up_bounded_context` used one transaction per event. Per event and per projection it locked and re-read the projection row, ran a get-or-create-with-lock for every key the event touched, wrote each key back, stamped `caught_up_to`, and committed. The same applied to every `building` rebuild. The partitioned path (§51) already used one transaction per partition per tick, at up to `MAX_EVENTS_PER_PARTITION_TICK` events.
 
@@ -11179,7 +11179,7 @@ Codeberg issue #52: check how async projections apply events, and whether a chun
 2. From the locked positions it works out which target folds which event, exactly as the per-event loop did. A live projection folds every event past its position. A rebuild folds an event only if it has processed exactly up to the one before it (§151), and from then on every one.
 3. A rebuild restarted to `caught_up_to = NULL` that folds this chunk has its old `projection_rebuild_state` deleted first, under its lock, as before.
 4. It reads and locks every key the chunk touches with one `INSERT ... SELECT unnest(...) ON CONFLICT DO UPDATE ... RETURNING` per target.
-5. It folds the events in memory, keeping the `as_of_sequence` guard per key (Codeberg #25).
+5. It folds the events in memory, keeping the `as_of_sequence` guard per key (#25).
 6. It writes every folded key back with one `UPDATE ... FROM unnest(...)` per target, stamps `caught_up_to`, and commits.
 
 An owner tag sets a key's `owner` from the last event that carried one; a key no event gave an owner keeps the stored one (`COALESCE`), as `apply_projection_fold_update` does.
@@ -11199,14 +11199,14 @@ An owner tag sets a key's `owner` from the last event that carried one; a key no
 <a id="what-the-tests-cover"></a>
 ## 183. What the test suite does and doesn't verify
 
-Codeberg issue #44. `CONTRIBUTING.md` ("What the tests do and don't verify") now sorts the guarantees three ways: those that hold by construction (Postgres transactions and constraints), those that tests verify, and those nothing verifies. The main entry under "nothing" is SQL. Every statement is `AssertSqlSafe(format!(...))` because of per-bounded-context schemas, so nothing checks SQL at compile time. The Postgres suites, and §67's guard that makes sure they ran, are the only check.
+issue #44. `CONTRIBUTING.md` ("What the tests do and don't verify") now sorts the guarantees three ways: those that hold by construction (Postgres transactions and constraints), those that tests verify, and those nothing verifies. The main entry under "nothing" is SQL. Every statement is `AssertSqlSafe(format!(...))` because of per-bounded-context schemas, so nothing checks SQL at compile time. The Postgres suites, and §67's guard that makes sure they ran, are the only check.
 
 **A hole in that guard, found while writing it.** The guard matches `skipping:.*(postgres|database)`, case-insensitive. `skilj/tests/metrics_background_tasks.rs` and `skilj/tests/tracing_background_tasks.rs` printed `skipping: connecting failed: {e}` and `skipping: migrating failed: {e}`, so they matched only when sqlx's error text happened to contain "database". `error communicating with database` does. `pool timed out while waiting for an open connection` doesn't, so those two binaries could skip under a slow or overloaded server and CI would stay green. They now say "the test database", as the other binaries' notes have since §167. Every other Postgres skip note names the database or Postgres in its fixed text.
 
 <a id="coresident-cost"></a>
 ## 184. What a co-resident application loses, measured
 
-Codeberg issue #46. skilj shares the application's own Postgres (§2.2), but `docs/performance.md` only reported skilj's own throughput. A deployment decision needs the other side: what the neighbouring OLTP workload loses. kafgres reports this as pgbench degradation, so this does the same.
+issue #46. skilj shares the application's own Postgres (§2.2), but `docs/performance.md` only reported skilj's own throughput. A deployment decision needs the other side: what the neighbouring OLTP workload loses. kafgres reports this as pgbench degradation, so this does the same.
 
 **Benchmark.** `skilj/tests/coresident_pgbench.rs` (`#[ignore]`d) creates pgbench's tables (`pgbench -i -s 10`) in the same database as skilj's, then runs `pgbench -c 8 -j 4` for a fixed time per phase: twice with no `Skilj` built (the baseline, and the noise between two identical runs), with a running `Skilj` and no commands, alongside a `Deposit` load paced at 100 and 250 commands/s, flat out from 8 and 32 callers on separate accounts, flat out from 8 callers on one account, and alone again after `Skilj::shutdown`. Latency percentiles come from pgbench's per-transaction log (`-l`). pgbench is `PGBENCH`, else the embedded server's own (`skilj_test_support::embedded_binary_dir`, new), else `PATH`. The `Deposit` types and setup it shares with `command_throughput.rs` moved into `skilj/tests/deposit_bench/`. `Setup` now keeps the `Skilj` instead of leaking it, so both benchmarks shut it down.
 
@@ -11217,7 +11217,7 @@ Codeberg issue #46. skilj shares the application's own Postgres (§2.2), but `do
 <a id="command-dry-run"></a>
 ## 185. Command dry-run: what would this command decide right now?
 
-Codeberg issue #47. `decide()` is pure (§1.1), so asking what it would say costs only the read a submission does first. `db::resolve_command_submission` already is that read: snapshot resolution, the tag-indexed matching events, one `decide()`. `db::dry_run_command` runs it and stops. It takes no lock, uses no sequence, provisions no encryption key, and neither looks up nor records an idempotency key. Spec: `rule DryRunCommand`, `rule DryRunTriggerCommand`, and the `DryRunPersistsNothing`/`DryRunRevealsOnlyTheOutcome` guarantees on `CommandSubmission`/`CommandTrigger`.
+issue #47. `decide()` is pure (§1.1), so asking what it would say costs only the read a submission does first. `db::resolve_command_submission` already is that read: snapshot resolution, the tag-indexed matching events, one `decide()`. `db::dry_run_command` runs it and stops. It takes no lock, uses no sequence, provisions no encryption key, and neither looks up nor records an idempotency key. Spec: `rule DryRunCommand`, `rule DryRunTriggerCommand`, and the `DryRunPersistsNothing`/`DryRunRevealsOnlyTheOutcome` guarantees on `CommandSubmission`/`CommandTrigger`.
 
 **GraphQL: `dryRunCommand(boundedContext, commandTypeName, payload)`, a query, Admin level only** (user choice). `submitCommand` needs Write, but a dry-run shows what `decide()` would emit, and that can carry the history it read (a balance, a status). The reasoning is §118's for matching events, so the same level applies. It returns `accepted`, `rejectionReason`/`rejectionKind`, `events` (`eventTypeName`, `payload`), and `matchingEvents`/`matchingEventsTruncated` on acceptance and rejection alike, scoped and rendered as `submitCommand`'s (the rendering is now one helper, `render_matching_events`). Authorisation is `authorise_command_dry_run`: the Admin check, then `authorise_command_submission`'s checks (archived context, schema, owner scope). `#[requires_role]` is checked before `decide()`, as for `submitCommand`.
 
@@ -11236,7 +11236,7 @@ Tests: `dry_run_command_shows_the_decision_and_persists_nothing`, `dry_run_comma
 <a id="pool-sizing"></a>
 ## 186. Pool sizing: a documented budget, not a core count
 
-Codeberg issue #49. `SkiljBuilder::pool_options_performance_optimized()` set `max_connections` to twice the application host's cores and `min_connections` to half that. That count says nothing about the database: on a 2-core container it gave 4 connections, fewer than sqlx's default 10. Its 30s acquire timeout and 10min idle timeout were sqlx's defaults already. **Removed** (user choice), and replaced by a sizing budget in docs/performance.md ("Sizing the connection pool"), built from what skilj itself takes from the pool:
+issue #49. `SkiljBuilder::pool_options_performance_optimized()` set `max_connections` to twice the application host's cores and `min_connections` to half that. That count says nothing about the database: on a 2-core container it gave 4 connections, fewer than sqlx's default 10. Its 30s acquire timeout and 10min idle timeout were sqlx's defaults already. **Removed** (user choice), and replaced by a sizing budget in docs/performance.md ("Sizing the connection pool"), built from what skilj itself takes from the pool:
 
 - the cross-instance listener (§83): one connection, held for the process's lifetime;
 - batch leaders: at most half the pool by default (§116/§117), each holding one connection for its batch;
@@ -11254,7 +11254,7 @@ The `pool_options` doc comment said sqlx's default had no timeouts; it has a 30s
 
 ## 187. Event cache tag reads: measured, two fixes, no index
 
-Codeberg issue #50 asked whether `EventCache`'s tag-matching reads want a tag -> positions index, or `ArcSwap`-style snapshot reads in place of the `tokio::sync::RwLock`. Measured with temporary timing around the cache's part of a command's pre-read, in the `command_throughput` benchmark (§178, 800 commands per scenario):
+issue #50 asked whether `EventCache`'s tag-matching reads want a tag -> positions index, or `ArcSwap`-style snapshot reads in place of the `tokio::sync::RwLock`. Measured with temporary timing around the cache's part of a command's pre-read, in the `command_throughput` benchmark (§178, 800 commands per scenario):
 
 - **Read lock wait: 0-50 µs** per read, even at 80 callers. The lock isn't worth replacing.
 - **The scan, while the window held the whole history: 0.45-0.75 ms** per read. Almost none of that was scanning: `try_events_matching_tags` served (cloned, with its registrations substituted, §180) *every* event in the window and then filtered by tag. It now filters first, so only matching events are cloned (`try_events_where`). The tag comparison over 1000 events takes microseconds, so an index isn't worth it either.
@@ -11270,7 +11270,7 @@ Tests (`skilj-core/tests/event_cache.rs`): `a_tag_read_serves_the_matching_event
 
 ## 188. Event cache tag reads after a snapshot's position
 
-Codeberg issue #51 asked whether a command deciding from a snapshot (§19) benefits from the event cache, and whether a window that doesn't reach back to the first event could serve it. It didn't benefit: `resolve_command_submission` passed the snapshot's `as_of_sequence` to `list_events_for_bounded_context_matching_tags_cached`, but the cache half always read from `-1` and filtered afterwards. So once a bounded context outgrew the cache's capacity (1000 events by default), every snapshot command missed. Since §187 the miss is free, but the read still went to Postgres.
+issue #51 asked whether a command deciding from a snapshot (§19) benefits from the event cache, and whether a window that doesn't reach back to the first event could serve it. It didn't benefit: `resolve_command_submission` passed the snapshot's `as_of_sequence` to `list_events_for_bounded_context_matching_tags_cached`, but the cache half always read from `-1` and filtered afterwards. So once a bounded context outgrew the cache's capacity (1000 events by default), every snapshot command missed. Since §187 the miss is free, but the read still went to Postgres.
 
 `EventCache::try_events_matching_tags` now takes `after_sequence`, and serves the read whenever the window holds everything after it (`after_sequence >= covers_from - 1`, the same coverage rule `try_events_after` has always used). The §187 shortcut is generalised the same way: a window stamped with a table whose first event is already past `after_sequence + 1` misses without freshening. Freshening only moves the first event forward, so it could only ever produce the same miss. `covered_through` is still the window's highest sequence. The events the caller gets are the ones the Postgres fallback would give, so the re-check under the lock (§178) is unchanged. `QueryEvents`/`CountEvents` with a `tags` filter and an `after` position go through the same function and benefit the same way.
 
@@ -11280,11 +11280,11 @@ Measured with a new **hot-snap** workload in `skilj/tests/command_throughput.rs`
 
 Tests (`skilj-core/tests/event_cache.rs`): `a_tag_read_after_a_position_is_served_by_a_window_that_holds_it`, and `a_tag_read_past_the_windows_first_event_misses_without_a_round_trip`, extended: a read after a position the window can't reach misses on a closed pool, while one it can serve tries to freshen and fails.
 
-**Not done.** A hit still pays `freshen`'s round trip (`events_table_identity`, ~0.5 ms with one caller), most of it hashing the bounded context's type registrations into the stamp (§180) on every read. Tracked as Codeberg #78. Done in §189.
+**Not done.** A hit still pays `freshen`'s round trip (`events_table_identity`, ~0.5 ms with one caller), most of it hashing the bounded context's type registrations into the stamp (§180) on every read. Tracked as #78. Done in §189.
 
 ## 189. The registrations stamp is a counter, not a hash
 
-Codeberg issue #78, left open by §188. Every cache-served read first runs `events_table_identity` (§95, §176, §180), and since §180 that round trip also hashed every `event_types` and `command_types` row of the bounded context into the `RegistrationsStamp`. Measured on embedded Postgres, 1000 calls each, release build, types with a 40-field schema:
+issue #78, left open by §188. Every cache-served read first runs `events_table_identity` (§95, §176, §180), and since §180 that round trip also hashed every `event_types` and `command_types` row of the bounded context into the `RegistrationsStamp`. Measured on embedded Postgres, 1000 calls each, release build, types with a 40-field schema:
 
 | registered types | identity read | without the stamp | `SELECT 1` |
 |---|---|---|---|
@@ -11312,7 +11312,7 @@ Tests (`skilj-core/tests/event_cache.rs`): `only_a_changed_registration_changes_
 
 ## 190. Read replicas: not now, and what a design would need
 
-Codeberg issue #53 asked whether read-heavy paths could go to a read replica. **Not now** (no change to the code). Every read that would move has to answer for replication lag, and several of skilj's reads can't run on a standby at all. Checked against a streaming hot standby of the embedded Postgres 18, and against the code.
+issue #53 asked whether read-heavy paths could go to a read replica. **Not now** (no change to the code). Every read that would move has to answer for replication lag, and several of skilj's reads can't run on a standby at all. Checked against a streaming hot standby of the embedded Postgres 18, and against the code.
 
 **What fails on a standby outright.**
 - **The epoch (§176).** `EPOCH_SQL` calls `pg_current_wal_lsn()`, which a standby refuses: `recovery is in progress`. That query is part of `events_table_identity` (so of every cache-served read) and of `GET /v1/events` and the consume endpoint. A standby has no exact replacement. `pg_control_checkpoint()`'s timeline moves only at the next restartpoint, and `pg_stat_wal_receiver.received_tli` is what was received, not what was replayed. Until a standby can name its epoch, its reads can't be stamped with one. A standby still following an old primary's timeline would then serve the lost tail §176 refuses.
@@ -11338,7 +11338,7 @@ Codeberg issue #53 asked whether read-heavy paths could go to a read replica. **
 
 ## 191. Generated code is checked in as a copy, and `build.rs` stays
 
-Codeberg issue #54. `skilj-codegen` runs from `build.rs` and writes to `OUT_DIR` (§17), so neither a `.skilj.toml` change nor a generator change shows up in a review diff. kafgres checks its generated code in and verifies it in CI. Most of the churn here is the generator: five commits touched `skilj-codegen`, one touched `banking.skilj.toml`.
+issue #54. `skilj-codegen` runs from `build.rs` and writes to `OUT_DIR` (§17), so neither a `.skilj.toml` change nor a generator change shows up in a review diff. kafgres checks its generated code in and verifies it in CI. Most of the churn here is the generator: five commits touched `skilj-codegen`, one touched `banking.skilj.toml`.
 
 **Options weighed** (user choice):
 - *Check the generated file in and compile it, dropping `build.rs`* (kafgres' way). The diff shows, but a consumer has to remember to regenerate, which is what §17 chose `build.rs` to avoid, and the copy can go stale between a change and the check.
@@ -11353,7 +11353,7 @@ The copy sits under `tests/fixtures/`. No target reaches it, so it isn't compile
 
 ## 192. Deployment settings: `linger.ms`, measured; `random_page_cost`, checked
 
-Codeberg issue #55 asked for deployment tuning notes in one place: `random_page_cost` for Postgres, the Kafka producer's compression, `linger.ms` and `enable.idempotence`, and pool sizing. Pool sizing was §186. The rest is in docs/performance.md ("Deployment settings"). Each item was checked, not copied from general advice.
+issue #55 asked for deployment tuning notes in one place: `random_page_cost` for Postgres, the Kafka producer's compression, `linger.ms` and `enable.idempotence`, and pool sizing. Pool sizing was §186. The rest is in docs/performance.md ("Deployment settings"). Each item was checked, not copied from general advice.
 
 **`linger.ms` is the one that matters.** `skilj-kafka` produces one record at a time and waits for Kafka to accept it before producing the next (§169), so per-key order needs no producer setting. librdkafka's `linger.ms` (default 5 ms, `rdkafka-sys` 4.10 / librdkafka 2.12) waits for more records to fill a batch. With one record in flight there is never a second one, so every event waits the full 5 ms. The new ignored benchmark `producer_settings_throughput` (`skilj-kafka/tests/kafka_bridge.rs`) runs 500 events through `produce_once` against the mock skilj server and a local broker. It measured 165-168 events/s per mapping with librdkafka's defaults and 2,113-2,138 with `linger.ms=0`. Idempotence plus lz4 measured 141-160, or 1,802-2,141 with `linger.ms=0`. The producer is the caller's, so skilj can't set it. The crate docs and docs/performance.md say to set it. Pipelining several records would amortize the linger instead, but that is what §169 reverted.
 
@@ -11365,7 +11365,7 @@ Codeberg issue #55 asked for deployment tuning notes in one place: `random_page_
 
 ## 193. The statement cache: measured per bounded context, a knob and a warning
 
-Codeberg issue #56. sqlx prepares every statement and keeps up to `statement_cache_capacity` (default 100) per connection, least recently used out. On a miss, sqlx sends Parse/Describe and waits for the answer before the execute. When the cache is full it also closes the evicted statement and waits for that too (`sqlx-postgres` 0.9, `get_or_prepare`). So a missed statement takes three round trips instead of one. skilj's SQL names each bounded context's schema, so the question was how many statements a bounded context brings and when they stop fitting.
+issue #56. sqlx prepares every statement and keeps up to `statement_cache_capacity` (default 100) per connection, least recently used out. On a miss, sqlx sends Parse/Describe and waits for the answer before the execute. When the cache is full it also closes the evicted statement and waits for that too (`sqlx-postgres` 0.9, `get_or_prepare`). So a missed statement takes three round trips instead of one. skilj's SQL names each bounded context's schema, so the question was how many statements a bounded context brings and when they stop fitting.
 
 **Counted.** The new ignored benchmark `skilj/tests/statement_cache.rs` records the distinct SQL of every `sqlx::query` event while deposits run. With one bounded context the command path sent 33 distinct statements: 20 of the bounded context's own and 13 shared (roles, `access_token_index`, `bounded_contexts`, `pg_notify`, transaction control, the admin context's background ticks). With 8 it sent 130: 14 per bounded context and 18 shared. The difference is background-tick statements, which only one of the eight happened to run during the window. The other paths (GraphQL queries, projections, subscriptions, snapshots) bring more of their own; this counts only commands. The tag query has one `OR` term per tag, so a command type with more tags adds variants. Lists already use `= ANY($1)`, which keeps one text.
 
@@ -11559,7 +11559,7 @@ skilj-helpdesk's create-ticket latency report (2026-10-09) found the limit after
 **Change.** `fold_snapshot_chunk_in_tx` folds a run of events into one snapshot, on the caller's transaction:
 1. It locks or creates every tag value the events touch, in one `INSERT ... SELECT unnest(...) ON CONFLICT DO UPDATE ... RETURNING`, sorted by value. The version reset is the same `CASE` as before, in the same statement.
 2. A row at -1 is refolded from the default state over its tag value's history, through its last event in the run (`refold_snapshot_histories`). That is what folding the history at its first event and then each later event did. One paged read (`tags @> ANY(...)`, 1000 a page) covers every such row at once.
-3. The other events are folded in memory, keeping the `as_of_sequence` guard per row (Codeberg #25).
+3. The other events are folded in memory, keeping the `as_of_sequence` guard per row (#25).
 4. Every row is written back with one `UPDATE ... FROM unnest(...)`. A row's owner is the last owner tag a folded event carried; a row no event gave one keeps the stored one (`COALESCE`).
 
 The unpartitioned path calls it through `fold_snapshots_chunk` for chunks of `CATCH_UP_EVENTS_PER_TRANSACTION` (100) events, once per snapshot (in name order), then moves each snapshot's progress to the chunk's end and commits. The partitioned path calls it once per partition transaction, with that partition's values only.
@@ -11825,7 +11825,7 @@ The user asked for a baked-in way to enforce a uniqueness constraint on personal
 
 The constraint is declared once per bounded context and tag key by a new plugin trait, `BlindTag`: `TAG_KEY`, `normalize()` (ready-made `blind::normalize::email` and `compact_uppercase`), `NORMALIZER_VERSION`, and `ERASURE`. It registers like a snapshot, with `.blind_tag::<B>()` or `#[auto_register]`. Choices the user made:
 
-- **A separate root key, one derived key per constraint.** `SkiljBuilder::blind_index_key` is a root secret apart from the encryption master key; startup checks it against a stored fingerprint (§208), and it can be rotated (§209). Each `(bounded context, tag key)` gets its own HMAC key from it through HKDF-SHA256 (length-prefixed info, so no two pairs collide). A leaked derived key exposes one constraint, and the same address hashes differently in two bounded contexts or under two constraints, so hashes can't be joined across them. A tenant made from a template (Codeberg #13) uses its template's normalizer but a key derived from its own name.
+- **A separate root key, one derived key per constraint.** `SkiljBuilder::blind_index_key` is a root secret apart from the encryption master key; startup checks it against a stored fingerprint (§208), and it can be rotated (§209). Each `(bounded context, tag key)` gets its own HMAC key from it through HKDF-SHA256 (length-prefixed info, so no two pairs collide). A leaked derived key exposes one constraint, and the same address hashes differently in two bounded contexts or under two constraints, so hashes can't be joined across them. A tenant made from a template (#13) uses its template's normalizer but a key derived from its own name.
 - **A normalizer is code the implementer supplies.** It decides which spellings are one value, and can mix in a pepper the database never sees. skilj can't compare two functions, so `NORMALIZER_VERSION` is stored and startup refuses one that differs (`blind_normalizer_changed`): values hashed the old way would stop matching, and a taken value could be taken again.
 - **Both erasure behaviours.** `BlindErasure::WithSubject { subject_key, subject_tag }`: `forgetSubject` for that `subject_key` removes the tag from every event and command whose plain `subject_tag` tag carries the subject's value, so the value is free and no hash of it is left. `BlindErasure::Keep`: the hash stays and the value stays taken - a trial used once, a banned address. Payloads are crypto-shredded either way.
 - **Commands store the hash too, and erasure cleans it.** `commands.consistency_tags` is the command's own tags (`derive_tags`), what owner scoping, the conflict re-check and command tag queries read; with a blind mapping it holds the hash, as do the items of `consistency_query`. `WithSubject` erasure removes the tag from both.
@@ -11882,7 +11882,7 @@ Found while reviewing §205-§207 with the user. Startup refuses a changed norma
 
 **The fingerprint.** `blind_tags` gains `key_fingerprint`: for each constraint, the hex HMAC-SHA256 of an empty message under a key derived from the root like the constraint's own, but with a fixed label ahead of the HKDF info (`BlindIndexKey::fingerprint`). It reveals nothing about the constraint key, and can't equal a tag: a constraint key's info starts with the bounded context name's 8-byte length, which the label's first 8 bytes would make an impossible length, so the two derivations never share an info. Reconciliation stores it with the row (`register_blind_tag`, which refuses a mismatch too), and `check_stored_blind_tags` compares it at startup next to the normalizer version, reconciling or not, refusing with `blind_index_key_changed`. The constraint key's own derivation is unchanged (an empty label adds nothing to the info), so stored tags are unaffected.
 
-**Tenants.** A tenant made from a template (Codeberg #13) hashes under a key derived from its own name, so its fingerprint differs from its template's. `apply_template_registrations` computes it with `BlindIndex::tenant_fingerprint` - the template cache may not know the tenant yet. An instance that doesn't declare the template's `BlindTag` can't, and stores none; the column is nullable for that case only, and the next instance that declares it records it at startup. Startup therefore checks every bounded context whose effective (template-resolved) bounded context declares a blind tag, not only the declared ones, at one query each. The missing fingerprints are recorded only after every check passed, so a refused instance records nothing. The first instance to record one is trusted: a tenant created by an instance without the `BlindTag` and first checked by one with a wrong key adopts the wrong key's fingerprint, and the right instances then refuse to start - loud, not silent, and fixed by clearing the column.
+**Tenants.** A tenant made from a template (#13) hashes under a key derived from its own name, so its fingerprint differs from its template's. `apply_template_registrations` computes it with `BlindIndex::tenant_fingerprint` - the template cache may not know the tenant yet. An instance that doesn't declare the template's `BlindTag` can't, and stores none; the column is nullable for that case only, and the next instance that declares it records it at startup. Startup therefore checks every bounded context whose effective (template-resolved) bounded context declares a blind tag, not only the declared ones, at one query each. The missing fingerprints are recorded only after every check passed, so a refused instance records nothing. The first instance to record one is trusted: a tenant created by an instance without the `BlindTag` and first checked by one with a wrong key adopts the wrong key's fingerprint, and the right instances then refuse to start - loud, not silent, and fixed by clearing the column.
 
 **What it doesn't do.** It doesn't make the key rotatable; §209 does. (An earlier draft of this section, and of the `skilj-uniqueness` skill, said a leaked key could be replaced by a new tag key and `BlindTag` with its claims migrated over. That doesn't help: every constraint key is derived from the one root key, so a new constraint's key is as exposed as the old one's. Only a pepper mixed in by the normalizer, a secret the attacker didn't get, would have protected it.)
 
@@ -11939,7 +11939,7 @@ Asked on Discord what the GIN index on `events.tags` (§19) is still for. The ho
 - blind-tag erasure (§205), finding a subject's events;
 - blind-index key rotation (§209), finding the events of a key.
 
-Every event paid for it on insert, inside the transaction that holds the bounded context's sequence lock, and in about 50 bytes of storage (Codeberg #92's measurement).
+Every event paid for it on insert, inside the transaction that holds the bounded context's sequence lock, and in about 50 bytes of storage (#92's measurement).
 
 **The benchmark.** `skilj/tests/tag_read_bench.rs` (ignored; `cargo test --release -p skilj --test tag_read_bench -- --ignored --nocapture`) writes 1,000,000 events with an `account` and a `customer` tag each, of three types: one long-lived account with 100,000 events, every other with ten. Each row is the median of repeated reads through the public functions with an empty event cache; embedded Postgres 18.
 
@@ -12184,7 +12184,7 @@ kept separate so this one stays reviewable and doesn't move two fixture
 surfaces at once.
 
 <a id="deadline-recurrence"></a>
-## 212. Per-entity recurrence for deadlines, with a missed-run policy (Codeberg issue #95)
+## 212. Per-entity recurrence for deadlines, with a missed-run policy (issue #95)
 
 Raised against the gap between the two schedulers §46 and §22 left: the
 global scheduler is cron-based and recurring but fires one system event
@@ -12244,7 +12244,7 @@ where one order's every-second chain fires several times then stops at
 cancel.
 
 <a id="deadline-firing-time-and-expiry"></a>
-## 213. The firing time, and a deadline's expiry, handed to `decide()` (Codeberg issue #97)
+## 213. The firing time, and a deadline's expiry, handed to `decide()` (issue #97)
 
 Raised against §46's deadline: a `decide()` that wants to reason about
 time - "is this reminder still worth sending?", "is this auto-reply too
@@ -12297,7 +12297,7 @@ deadline. `skilj-test-fixture/tests/fixture.rs` pins the pure
 `Decision::now`/`Decision::deadline` plumbing.
 
 
-## 214. Generic command approval (Codeberg issue #98)
+## 214. Generic command approval (issue #98)
 
 Some commands are too consequential for the credential that can submit
 them: an agent may be allowed to ask for a refund, but not to approve
@@ -12454,7 +12454,7 @@ deadline at an approval-required type, finds a proposal and no event,
 and re-fires it to check no second proposal appears. The cross-context
 route uses the same helper; it has no test of its own.
 
-## 215. External workers and private fields (Codeberg issue #99)
+## 215. External workers and private fields (issue #99)
 
 The question this section answers: what can be promised to a service
 outside this process that reads events with an `EventReadToken`?
@@ -12519,7 +12519,7 @@ field appear. The fail-closed redaction is the guarantee worth keeping.
 route with an `EventReadToken`, and asserts both that the field is `null`
 and that the plaintext appears nowhere in the response.
 
-## 216. Local mode: a supported embedded Postgres (Codeberg issue #100)
+## 216. Local mode: a supported embedded Postgres (issue #100)
 
 The embedded Postgres already used by the test harness is now a supported
 runtime mode, not only a test fixture: the `skilj` crate's `local`
@@ -12659,7 +12659,7 @@ postgresql_embedded 0.21 need 1.94, and `AtomicUsize::try_update`
 (`skilj-graphql`'s limits) was stabilised in 1.95. CI's `msrv` step builds
 the libraries and binaries with 1.95, in a target directory of its own that
 it removes afterwards (the runner's disk is the constraint, see the
-`build-clippy-test` step's comments).
+`test` job's comments).
 
 **Dependency policy in CI.** `cargo deny check` (`deny.toml`) fails on a
 RustSec advisory, a license that does not allow distributing skilj under
@@ -12908,3 +12908,38 @@ Test: `forgetting_a_subject_forgets_its_pending_proposals` (`skilj/tests/subject
 - with the bounded context's `encryption_keys` table renamed away, so both the reveal and the check fail, an approval errors and leaves the proposal `pending`; once the table is back, it approves. Before the check's failure released the claim, the proposal stayed `approving` until the stale-claim takeover.
 
 Without the `forgetSubject` step, 42's proposal stayed `pending`.
+
+## 222. CI moves from Woodpecker on Codeberg to GitHub Actions
+
+skilj moved its primary repository from Codeberg to GitHub. Codeberg's terms of use, amended in July 2026, no longer allow projects that mostly consist of code written by generative AI tools, and skilj is built with Claude. The issues and pull requests moved with their numbers kept: every Codeberg PR became a closed GitHub issue labelled `pr (codeberg)` naming its merge commit, and the numbers Codeberg no longer had (#25, #32) are closed placeholders. So "issue #N" anywhere in the code and docs means GitHub's #N.
+
+`.github/workflows/ci.yml` replaces `.woodpecker.yml` and runs the same checks, as parallel jobs rather than sequential steps:
+
+- **The Rust jobs run in `rust:1-bookworm`, as the Woodpecker steps did.** `scripts/ci-test.sh`, the Postgres fallback (`scripts/ci-postgres-local.sh`) and the failover test (§176) assume a Debian container running as root. A job on the bare runner would need `sudo` for each, and the first run on a new CI should differ from the old one as little as possible.
+- **The Postgres service** keeps its name, `skilj-postgres`, which is its hostname from a container job, so `CI_POSTGRES_HOST` is unchanged. A health check (`pg_isready`) makes the job wait for it, which Woodpecker had no way to do (§166). `ci-test.sh --setup-only` still runs first and still falls back to an in-job Postgres.
+- **Disk.** `build-clippy-test` mounts the runner's preinstalled SDK directories (.NET, Android, GHC, CodeQL) into the container and deletes them first, keeping the `line-tables-only` and no-incremental settings that kept the ~110 test binaries on Woodpecker's disk.
+- **Caching.** `Swatinem/rust-cache` caches dependencies for `msrv` and `build-clippy-test`; Woodpecker built everything from scratch each run.
+- **`scripts/check-woodpecker-config.sh` is gone.** It existed because Woodpecker only warned on a schema problem (§166). GitHub refuses an invalid workflow outright, and an `actionlint` job checks the rest, including shellcheck on each `run:` block.
+
+**Not changed:** the bridge suites (Kafka, AMQP, NATS) still skip in CI. The runner has Docker, but the `rust:1-bookworm` container doesn't reach it. Running them in CI is a separate change, and the Kafka suite is flaky under load (§90).
+
+That last point was wrong: the container does reach the runner's Docker, and the first run failed on it. See §223.
+
+<a id="ci-broker-suites-and-job-split"></a>
+## 223. CI runs the broker suites, and splits clippy from the tests
+
+The first GitHub Actions run (§222) took 18 minutes and failed. Both have one fix each.
+
+**The broker suites run, and must.** GitHub mounts the runner's Docker socket into a container job, so §222's claim that the bridge suites skip was wrong: `testcontainers` started Artemis, and all 11 tests in `skilj-amqp/tests/amqp_bridge.rs` failed with "Connection refused". The container runs next to the job container, not inside it, so its mapped port is on the Docker host, and the test connected to `127.0.0.1` - the job container itself. `cargo test` stopped at that binary, so the Kafka and NATS suites never ran.
+
+- The AMQP and Kafka tests connect to `ContainerAsync::get_host()`, as the NATS test already did. Outside a container it answers `localhost`. Inside one (`/.dockerenv` exists) it answers the gateway of Docker's `bridge` network, which reaches the host's published ports.
+- Kafka also needs the broker to advertise that host. `testcontainers_modules::kafka::apache` writes a start script advertising `PLAINTEXT://127.0.0.1:<port>` once the port is known, so a client in the job container would bootstrap and then fail to reach the broker. The test wraps it in `ReachableKafka`, which keeps the module's image, environment and port but waits for a start script of its own. `provision_kafka` writes that script with the `get_host()` address, then waits for `Kafka Server started`.
+- With the user's choice, the bridge suites always run in CI. `scripts/ci-test.sh` fails the build on any `skipping: ` line, not only Postgres ones: Postgres, the Docker daemon and Temporal's test server are all there, so a skip means a suite didn't run. `cargo test` runs with `--no-fail-fast`, so one failing suite no longer hides whether the rest pass or skip.
+
+**Clippy and rustdoc are their own job.** On the first run, one job built for 4m45s, ran clippy for 2m30s, rustdoc for 45s and the tests for 8m15s, one after another. Clippy and rustdoc build dependencies as metadata only, which `cargo test` can't reuse, so they gained nothing from running first. They are now `clippy-doc`, next to the renamed `test` job.
+
+**`test` compiles with `cargo test --workspace --no-run`,** not `cargo build --workspace --all-targets`. After the latter, `cargo test` recompiled `skilj-macros` and the seven workspace crates depending on it, which took 1m43s of the test step. Why the two disagree wasn't pinned down; `--no-run` compiles exactly what the run uses.
+
+**rust-cache saves only on `main`** (`save-if`). A pull request reads `main`'s cache, and a cache scoped to one PR, which nothing else can read, would only push `main`'s out of the repository's 10 GB limit. The caches start paying off once this is on `main`.
+
+Not done: `cargo-nextest`, which runs each test in its own process. Every test binary drops and recreates its own database on first use (§167), so processes of one binary would drop it from under each other. After these changes the test run itself is about 6.5 minutes, 157s of it `skilj/tests/graphql_business_surfaces.rs`.

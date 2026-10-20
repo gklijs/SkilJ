@@ -248,7 +248,7 @@ async fn a_failed_delivery_acknowledges_the_run_before_it_and_nothing_past_it() 
     assert!(retry_state.is_none());
 }
 
-/// Codeberg issue #39 / §169: events another partition owns join the run,
+/// issue #39 / §169: events another partition owns join the run,
 /// but the run is never acknowledged past an owned event that failed.
 #[tokio::test]
 async fn a_partition_skip_never_acknowledges_past_a_failed_owned_event() {

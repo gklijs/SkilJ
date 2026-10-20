@@ -483,7 +483,7 @@ pub fn read_projection(state_json: &str, data_keys: &[crate::encryption::DataKey
 /// `owner_scope_satisfied(projection, key, access_mapping)`'s three
 /// caller-resolved inputs (cross-tenant projection read fix,
 /// docs/architecture.md's own write-up of this pass) plus `team_only`
-/// (Codeberg issue #17), grouped into one value rather than three/four
+/// (issue #17), grouped into one value rather than three/four
 /// adjacent positional parameters on `query_projection` itself -
 /// `instance_owner`/`team_only` are both `Option<&str>` and answer
 /// unrelated questions, so left as bare positional arguments they could
@@ -517,7 +517,7 @@ pub struct ProjectionAccessScope<'a> {
 /// nothing has touched yet) is treated the same as a proven mismatch,
 /// not the same as a proven match.
 ///
-/// `access.team_only` (Codeberg issue #17's own gap, docs/architecture.md's
+/// `access.team_only` (issue #17's own gap, docs/architecture.md's
 /// own write-up of this pass): vacuously satisfied when `None`,
 /// regardless of the caller's own Role. When `Some`, the query is
 /// rejected unless `access_mapping.role.name` equals it exactly
@@ -558,7 +558,7 @@ pub fn query_projection(
             }
         }
     }
-    // Whole-instance team gate (Codeberg issue #17, docs/architecture.md's
+    // Whole-instance team gate (issue #17, docs/architecture.md's
     // own write-up of this pass) - independent from the owner-scope check
     // just above, not a replacement for it: a projection may declare
     // both, and both must hold. See this function's own doc comment.

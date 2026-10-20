@@ -1,4 +1,4 @@
-//! End-to-end proof of Codeberg issue #95's per-entity recurrence with
+//! End-to-end proof of issue #95's per-entity recurrence with
 //! missed-run policy: a real `OrderPlaced` event schedules a recurring
 //! deadline via the background poll task; each firing inserts the next
 //! occurrence until the validity window ends, and a same-tagged

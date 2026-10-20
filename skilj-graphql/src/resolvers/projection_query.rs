@@ -92,7 +92,7 @@ pub(crate) async fn wait_until_caught_up(
 /// `get_projection_state_and_owner`, decrypt-on-read, and
 /// `projections::query_projection`, all as `field()` used to have them
 /// inlined. Pulled out so the new `projectionUpdates` subscription
-/// (Codeberg issue #23) can push through the *identical* authorization/
+/// (issue #23) can push through the *identical* authorization/
 /// decrypt path the plain query already has coverage for, instead of a
 /// second hand-rolled copy that could silently drift from it - both the
 /// subscription's initial snapshot and every one of its per-event
@@ -487,7 +487,7 @@ pub fn entity_resolver(ctx: async_graphql::dynamic::ResolverContext<'_>) -> Fiel
 /// rather than a second, narrower gate response readers would have to
 /// reason about differently from `projections`' own.
 ///
-/// `TEAM_ONLY`-gated exactly like the `projection` field above (Codeberg
+/// `TEAM_ONLY`-gated exactly like the `projection` field above (
 /// issue #17): a projection's own declared schema is whole-projection
 /// data, the same thing the gate protects there, so a Role not on the
 /// required team gets the identical rejection here rather than being

@@ -30,7 +30,7 @@ impl<T: CommandType> GivenEvents<T> {
         Self {
             events: Vec::new(),
             snapshots: Vec::new(),
-            // A fixed, replayable default (Codeberg issue #97): a test that
+            // A fixed, replayable default (issue #97): a test that
             // doesn't set one gets the same `now` every run.
             now: chrono::DateTime::UNIX_EPOCH,
             deadline: None,
@@ -65,14 +65,14 @@ impl<T: CommandType> GivenEvents<T> {
     }
 
     /// The `now` `decide()` is handed through `Decision::now()`, and the
-    /// instant a `.deadline()` expiry is judged against (Codeberg issue
+    /// instant a `.deadline()` expiry is judged against (issue
     /// #97). Defaults to the Unix epoch.
     pub fn now(mut self, now: chrono::DateTime<chrono::Utc>) -> Self {
         self.now = now;
         self
     }
 
-    /// Marks this decision a deadline firing (Codeberg issue #97):
+    /// Marks this decision a deadline firing (issue #97):
     /// `scheduled_at` is the deadline's own `fire_at`, `deadline_at` its
     /// optional `expires_at`. `expired` is computed from the current
     /// `now`, so call `.now()` first to control it.

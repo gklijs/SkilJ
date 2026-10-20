@@ -46,7 +46,7 @@
 //! mechanisms above make that redelivered call a no-op, not a
 //! duplicate.
 //!
-//! # Dead-letter/parking (Codeberg issue #21)
+//! # Dead-letter/parking (issue #21)
 //!
 //! Both directions apply a [`skilj_retry::RetryPolicy`], but to different
 //! ends - see docs/architecture.md's parked-deliveries section for the
@@ -170,7 +170,7 @@ pub use skilj_bridge::{
     InboundMapping, OutboundMapping, OutboundRetryState, Tag, HTTP_REQUEST_TIMEOUT,
 };
 
-/// Header names for the two Codeberg-issue-#18 ids this bridge carries
+/// Header names for the two issue #18 ids this bridge carries
 /// across the Kafka boundary, both directions. Kafka's own message
 /// headers are fully custom (no native correlation/causation concept the
 /// way AMQP has `correlation-id`), so both get a `Skilj-`-prefixed
@@ -273,7 +273,7 @@ impl skilj_bridge::OutboundSink for KafkaSink<'_> {
         if let Some(k) = key.as_deref() {
             record = record.key(k);
         }
-        // Codeberg issue #18 - forwards the event's own correlation_id/
+        // issue #18 - forwards the event's own correlation_id/
         // causation_id (always present on correlation_id, per the spec's
         // own CorrelationIdIsAlwaysRecorded invariant; causation_id absent
         // for a root event) as headers, distinct from `key` above.
@@ -457,7 +457,7 @@ fn action_supported(action: &InboundAction) -> bool {
 /// tested directly against raw `(topic, partition, offset, payload)`
 /// values, without needing a real `rdkafka` message object at all - the
 /// same "pure fields in, one HTTP call out" shape [`produce_once`]'s own
-/// per-event body has. `correlation_id`/`causation_id` (Codeberg issue
+/// per-event body has. `correlation_id`/`causation_id` (issue
 /// #18) are plain `Option<&str>` for the identical reason - `run_inbound`
 /// extracts them from the real message's own headers via [`header_str`]
 /// before calling.
@@ -570,7 +570,7 @@ pub async fn dispatch_inbound_message(
     Ok(())
 }
 
-/// Codeberg issue #21 - reports a message [`run_inbound`] gave up
+/// issue #21 - reports a message [`run_inbound`] gave up
 /// retrying to skilj's own `POST /v1/parked-deliveries`, using the same
 /// credential `mapping` already carries (that route resolves the
 /// bounded context from the presented token itself, the identical
@@ -834,7 +834,7 @@ async fn dispatch_with_retry(
 ///
 /// Messages of one partition are dispatched one at a time, in offset
 /// order; different partitions are dispatched concurrently, one message
-/// in flight each (docs/architecture.md §174, Codeberg issue #60). So
+/// in flight each (docs/architecture.md §174, issue #60). So
 /// this instance has as many requests to skilj in flight as it has
 /// assigned partitions with work. Messages received for a partition
 /// while one of its messages is in flight wait in a queue; once
@@ -843,7 +843,7 @@ async fn dispatch_with_retry(
 /// concurrency* section for what this means for the order messages reach
 /// skilj in.
 ///
-/// Codeberg issue #21: a dispatch failure is retried, *for this one
+/// issue #21: a dispatch failure is retried, *for this one
 /// message*, with backoff up to `retry_policy` - not by relying on
 /// Kafka's own redelivery, which doesn't apply within one running
 /// session (an uncommitted offset only replays after a restart/

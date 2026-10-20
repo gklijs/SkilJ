@@ -1,4 +1,4 @@
-# The declarative shape half of banking.rs (Codeberg issue #5's
+# The declarative shape half of banking.rs (issue #5's
 # narrower cut - docs/architecture.md §17) - build.rs turns this into
 # real Rust at $OUT_DIR/banking_generated.rs, included from banking.rs
 # itself. decide() bodies (decide_deposit_money/decide_withdraw_money)

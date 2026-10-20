@@ -38,7 +38,7 @@ const INTROSPECT_TYPE_QUERY: &str = "query($name: String!) { \
     } \
 }";
 
-/// Codeberg issue #7's own naming honesty note: `wait_for_sequence` is a
+/// issue #7's own naming honesty note: `wait_for_sequence` is a
 /// *freshness* guarantee - "don't answer before the projection has
 /// caught up to at least this sequence" - not a historical snapshot. If
 /// the projection has already moved past it, the caller gets *current*

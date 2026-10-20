@@ -1,4 +1,4 @@
-//! End-to-end proof of Codeberg issue #20's native one-shot, per-entity
+//! End-to-end proof of issue #20's native one-shot, per-entity
 //! deadline mechanism (`skilj_core::plugin::ScheduleDeadline`/
 //! `CancelDeadline`): a real `OrderPlaced` event, directly created,
 //! schedules a deadline via the background poll task
@@ -645,7 +645,7 @@ fn a_deadline_fires_when_due_and_never_fires_once_cancelled_by_tag() {
     });
 }
 
-// --- fire-vs-cancel race regression (Codeberg issue #25 review,
+// --- fire-vs-cancel race regression (issue #25 review,
 // docs/architecture.md §55) ---
 //
 // Deliberately doesn't go through `ScheduleDeadline`/`CancelDeadline` at
@@ -1481,7 +1481,7 @@ fn resolved_deadlines_are_deleted_after_their_retention() {
     });
 }
 
-/// Codeberg issue #98: a deadline whose target command type requires
+/// issue #98: a deadline whose target command type requires
 /// approval must not submit it - it becomes a pending proposal, the same as
 /// a REST or GraphQL submission would. Otherwise whoever can cause the
 /// scheduling event gets the command executed without an approver. A

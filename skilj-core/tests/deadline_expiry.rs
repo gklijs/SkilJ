@@ -1,4 +1,4 @@
-//! Codeberg issue #97 - a deadline's optional `expires_at`, and the firing
+//! issue #97 - a deadline's optional `expires_at`, and the firing
 //! time `fire_due_deadlines` hands a command's `decide_with` through
 //! `DecisionContext`.
 //!
@@ -137,7 +137,7 @@ fn schedule_info(bc_name: &'static str) -> ScheduleDeadlineInfo {
 }
 
 /// Schedules one deadline at a fixed `fire_at`, with an optional
-/// `expires_at` (Codeberg issue #97).
+/// `expires_at` (issue #97).
 struct SchedulesAt {
     info: ScheduleDeadlineInfo,
     fire_at: chrono::DateTime<Utc>,
@@ -349,7 +349,7 @@ async fn fire_one(
     (dispatcher.calls(), status)
 }
 
-/// The optional expiry lands on the row (Codeberg issue #97).
+/// The optional expiry lands on the row (issue #97).
 #[test]
 fn a_deadline_row_stores_its_expiry() {
     runtime().block_on(async {
@@ -385,7 +385,7 @@ fn a_deadline_row_stores_its_expiry() {
 
 /// Fired one second past its expiry: `decide_with` is handed the deadline
 /// it descends from, marked `expired`, plus the tick's own `now`
-/// (Codeberg issue #97).
+/// (issue #97).
 #[test]
 fn a_late_fire_hands_decide_an_expired_deadline() {
     runtime().block_on(async {

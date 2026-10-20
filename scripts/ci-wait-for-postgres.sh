@@ -3,10 +3,12 @@
 # Waits for the CI step's Postgres to accept authenticated connections,
 # and says *why* it can't if it never does.
 #
-# Woodpecker gives a `services:` container no readiness signal, so a step
-# has to poll for one. The polling half is trivial; the part that has
+# Woodpecker, skilj's CI before GitHub Actions, gave a `services:`
+# container no readiness signal, so a step had to poll for one; the
+# Actions job's health check now waits first, and this stays as the
+# diagnostic. The polling half is trivial; the part that has
 # repeatedly cost a CI cycle here is the failure half. An earlier inline
-# version of this loop in .woodpecker.yml redirected everything to
+# version of this loop in the Woodpecker config redirected everything to
 # /dev/null and, when the service never came up, printed exactly one
 # line - "didn't accept authenticated connections within 120s" - which
 # is the same message for a slow first-boot initdb, a container that

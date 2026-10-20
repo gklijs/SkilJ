@@ -1,6 +1,6 @@
 //! A given/when/then test harness for a skilj plugin author's own
 //! `CommandType::decide()`/`Projection::project()` - see docs/architecture.md
-//! §45 (Codeberg issue #19).
+//! §45 (issue #19).
 //!
 //! **What this is not**: a way to test skilj's own engine. Computing a
 //! command's own consistency tags from its payload, and filtering a

@@ -1,5 +1,5 @@
 //! `parkedDeliveries(boundedContext:)`, `retryParkedDelivery`,
-//! `discardParkedDelivery` (Codeberg issue #21) - the admin surface over
+//! `discardParkedDelivery` (issue #21) - the admin surface over
 //! `skilj_core::db::ParkedDelivery`. `AdminAccess`-gated, same
 //! `require_admin_mapping` treatment every other admin surface in this
 //! module gets. **No spec entity** - see `ParkedDelivery`'s own doc
@@ -16,7 +16,7 @@
 //! `correlation_id`/`causation_id` (not stored on the parked row) - the
 //! retried command gets a fresh, server-generated `correlation_id`
 //! instead, the same "omitted means generated server-side" register
-//! Codeberg issue #18 already established for every other caller that
+//! issue #18 already established for every other caller that
 //! doesn't have one to hand.
 
 use super::{not_found, require_admin_mapping};
@@ -123,7 +123,7 @@ async fn redrive_parked_delivery(
                 None,
             )
             .expect("CrossContextRoute/Deadline-kind redrives always carry an idempotency key");
-            // Codeberg issue #32 (round two): routed through
+            // issue #32 (round two): routed through
             // `state.command_batcher` rather than calling
             // `db::decide_and_submit_command` directly - a redrive is
             // just as much real, externally-triggerable submission
@@ -177,7 +177,7 @@ async fn redrive_parked_delivery(
             // The original key when the bridge sent one (docs/architecture.md
             // §175): a per-message record, so later messages can't have
             // overtaken it, and an original attempt that committed after all
-            // dedupes too. Otherwise never the bridge's own cursor (Codeberg
+            // dedupes too. Otherwise never the bridge's own cursor (
             // issue #58): the bridge committed past this message and kept
             // recording, so its partition's watermark is usually beyond it
             // already, and reusing the cursor would dedupe the redrive away.
@@ -253,7 +253,7 @@ async fn redrive_parked_delivery(
                 redrive.idempotency_key.as_deref(),
             )
             .expect("CommandTrigger-kind redrives always carry an idempotency key");
-            // Codeberg issue #32 (round two) - see the identical comment
+            // issue #32 (round two) - see the identical comment
             // on the `CrossContextRoute` branch above.
             state
                 .command_batcher

@@ -55,7 +55,7 @@ static BACKGROUND_TASK_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Codeberg issue #15: how many bounded contexts `SkiljBuilder::build()`'s
+/// issue #15: how many bounded contexts `SkiljBuilder::build()`'s
 /// own startup warm-up loop and each background poller tick work on at
 /// once, rather than one at a time in a plain sequential `for` loop -
 /// each bounded context's own work is fully independent (its own
@@ -163,7 +163,7 @@ pub use inventory;
 /// Seeding a development database with an admin role and command tokens
 /// (docs/architecture.md §220) - see `dev`'s own module docs.
 pub mod dev;
-/// Codeberg issue #100: the supported single-user local mode, behind the
+/// issue #100: the supported single-user local mode, behind the
 /// `local` feature. See `local`'s own module docs.
 #[cfg(feature = "local")]
 pub mod local;
@@ -364,7 +364,7 @@ pub struct Skilj {
     /// identical reason: every commit needs to reach the one cache every
     /// read consults, regardless of which surface produced it.
     event_cache: EventCache,
-    /// The live GraphQL schema (Codeberg issue #2; `@guarantee
+    /// The live GraphQL schema (issue #2; `@guarantee
     /// RegistrationReachesEveryInstance` in specs/skilj.allium) - built
     /// once in `.build()`, the same "one shared, process-wide thing"
     /// register `event_broadcaster`/`revocation_broadcaster`/`event_cache`
@@ -375,7 +375,7 @@ pub struct Skilj {
     /// another instance's. `Arc`-wrapped so both `graphql_router()` and
     /// that background task can hold a cheap clone.
     schema_registry: Arc<skilj_graphql::schema::SchemaRegistry>,
-    /// Codeberg issue #13 - see `skilj_core::template_cache`'s own doc
+    /// issue #13 - see `skilj_core::template_cache`'s own doc
     /// comment. Already cheaply `Clone` (`Arc`-wrapped internals), so
     /// unlike `schema_registry` this doesn't need an outer `Arc` of its
     /// own - the background cross-instance listener task and
@@ -385,7 +385,7 @@ pub struct Skilj {
     /// `createBoundedContextFromTemplate`'s own resolver (ultra-review
     /// bug_001).
     template_cache: skilj_core::template_cache::TemplateCache,
-    /// Codeberg issue #32 (round two) - see `skilj_core::command_batcher`'s
+    /// issue #32 (round two) - see `skilj_core::command_batcher`'s
     /// own module doc comment for the group-commit design this exists to
     /// run. One shared, process-wide batcher, constructed once in
     /// `.build()`, the same "one instance, not two" treatment
@@ -781,7 +781,7 @@ impl skilj_core::plugin::CrossContextRouteDispatcher for CrossContextRouteDispat
     }
 }
 
-/// Codeberg issue #20 - `ScheduleDeadlineDispatcher`'s own implementer,
+/// issue #20 - `ScheduleDeadlineDispatcher`'s own implementer,
 /// `CrossContextRouteDispatcherImpl`'s identical shape.
 struct ScheduleDeadlineDispatcherImpl {
     schedules: Arc<HashMap<String, RegisteredScheduleDeadline>>,
@@ -802,7 +802,7 @@ impl skilj_core::plugin::ScheduleDeadlineDispatcher for ScheduleDeadlineDispatch
     }
 }
 
-/// Codeberg issue #20 - `CancelDeadlineDispatcher`'s own implementer.
+/// issue #20 - `CancelDeadlineDispatcher`'s own implementer.
 struct CancelDeadlineDispatcherImpl {
     cancels: Arc<HashMap<String, RegisteredCancelDeadline>>,
 }
@@ -891,14 +891,14 @@ impl Skilj {
             deadline_poll_interval: std::time::Duration::from_millis(500),
             scheduler_poll_interval: std::time::Duration::from_secs(1),
             projection_query_wait_timeout: std::time::Duration::from_secs(5),
-            // Codeberg issue #25's investigation (docs/architecture.md
+            // issue #25's investigation (docs/architecture.md
             // §53) - matches `config.read_cursor_checkout_lease`'s own
             // default in specs/skilj.allium.
             read_cursor_checkout_lease: std::time::Duration::from_secs(5 * 60),
             max_events_per_read: skilj_core::event_store::DEFAULT_MAX_EVENTS_PER_READ,
             graphql_limits: skilj_graphql::limits::GraphqlLimits::default(),
             graphql_federation: None,
-            // Codeberg issue #36's own recommendation #3 - matches
+            // issue #36's own recommendation #3 - matches
             // `command_batcher::DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT`.
             command_batch_idle_in_transaction_timeout: std::time::Duration::from_secs(30),
             command_batch_max_size: skilj_core::command_batcher::DEFAULT_MAX_BATCH_SIZE,
@@ -1005,7 +1005,7 @@ impl Skilj {
             self.encryption_master_key.clone(),
             self.event_broadcaster.clone(),
             self.event_cache.clone(),
-            // Codeberg issue #25 (docs/architecture.md §53) -
+            // issue #25 (docs/architecture.md §53) -
             // `chrono::Duration::from_std` only fails for a duration too
             // large to fit, never a real concern for a checkout lease
             // measured in minutes; the same fallback
@@ -1408,7 +1408,7 @@ struct RegisteredCommandType {
     sensitive_fields: Vec<skilj_core::shared::SensitiveField>,
     private_fields: Vec<skilj_core::shared::PrivateField>,
     rest_trigger_allowed: bool,
-    /// Codeberg issue #98: `Some` when `requires_approval()` is true.
+    /// issue #98: `Some` when `requires_approval()` is true.
     /// Written into `command_approval_policies` at reconciliation; `None`
     /// leaves any stored policy alone (a deploy never removes a
     /// protection, the same stance §102 takes for sensitive/private
@@ -2139,7 +2139,7 @@ fn registered_cross_context_route<R: CrossContextRoute + 'static>() -> Registere
     }
 }
 
-/// Codeberg issue #20 - one registered `ScheduleDeadline`, the identical
+/// issue #20 - one registered `ScheduleDeadline`, the identical
 /// type-erased-closure shape `RegisteredCrossContextRoute` already uses
 /// for the same reason.
 struct RegisteredScheduleDeadline {
@@ -2174,7 +2174,7 @@ fn registered_schedule_deadline<S: ScheduleDeadline + 'static>() -> RegisteredSc
     }
 }
 
-/// Codeberg issue #20 - one registered `CancelDeadline`, `RegisteredScheduleDeadline`'s
+/// issue #20 - one registered `CancelDeadline`, `RegisteredScheduleDeadline`'s
 /// own counterpart.
 struct RegisteredCancelDeadline {
     info: skilj_core::plugin::CancelDeadlineInfo,
@@ -2262,7 +2262,7 @@ pub struct SkiljBuilder {
     /// contexts, so there is no single one to key it against the way
     /// `.bounded_context(...)` scopes every other registration.
     cross_context_routes: HashMap<String, RegisteredCrossContextRoute>,
-    /// Codeberg issue #20 - keyed by `ScheduleDeadline::NAME`/
+    /// issue #20 - keyed by `ScheduleDeadline::NAME`/
     /// `CancelDeadline::NAME` respectively, the identical "spans two
     /// bounded contexts, no single one to key against" reasoning
     /// `cross_context_routes` above already has.
@@ -2271,7 +2271,7 @@ pub struct SkiljBuilder {
     async_projection_poll_interval: std::time::Duration,
     snapshot_poll_interval: std::time::Duration,
     cross_context_route_poll_interval: std::time::Duration,
-    /// Codeberg issue #21 - the backoff/attempt-cap policy
+    /// issue #21 - the backoff/attempt-cap policy
     /// `db::catch_up_cross_context_route` applies to a route's own
     /// blocked head-of-line occurrence before parking it. See
     /// `cross_context_route_retry_policy`'s own builder doc comment.
@@ -2447,7 +2447,7 @@ impl SkiljBuilder {
         self
     }
 
-    /// Codeberg issue #20 - registers a [`ScheduleDeadline`], the same
+    /// issue #20 - registers a [`ScheduleDeadline`], the same
     /// "never scoped by `.bounded_context(...)`, keyed by its own
     /// `NAME`, last registration wins" treatment `cross_context_route`
     /// just above already gives its own trait.
@@ -2457,7 +2457,7 @@ impl SkiljBuilder {
         self
     }
 
-    /// Codeberg issue #20 - registers a [`CancelDeadline`],
+    /// issue #20 - registers a [`CancelDeadline`],
     /// `schedule_deadline`'s own counterpart.
     pub fn cancel_deadline<C: CancelDeadline + 'static>(mut self) -> Self {
         self.cancel_deadlines
@@ -2525,7 +2525,7 @@ impl SkiljBuilder {
         self
     }
 
-    /// Codeberg issue #21 - the backoff/attempt-cap policy
+    /// issue #21 - the backoff/attempt-cap policy
     /// `db::catch_up_cross_context_route` applies to a route's own
     /// blocked head-of-line occurrence: how long to wait before
     /// re-attempting a failed target-command submission, and how many
@@ -2552,7 +2552,7 @@ impl SkiljBuilder {
         self
     }
 
-    /// Codeberg issue #20 - how often each of the three background tasks
+    /// issue #20 - how often each of the three background tasks
     /// backing [`ScheduleDeadline`]/[`CancelDeadline`] runs its own tick
     /// (catching up every registered schedule, catching up every
     /// registered cancel reactor, and scanning every bounded context's
@@ -2596,7 +2596,7 @@ impl SkiljBuilder {
     /// `manual_ack` `ReadCursor` holds before a second concurrent caller
     /// for the same token may reclaim it - `config.read_cursor_checkout_lease`
     /// in specs/skilj.allium, `ReadCursor.checked_out_at`'s own spec doc
-    /// comment. Codeberg issue #25's investigation (docs/architecture.md
+    /// comment. issue #25's investigation (docs/architecture.md
     /// §53): closes the gap where two bridge instances of the same
     /// `skilj-kafka`/`skilj-amqp`/`skilj-nats` `OutboundMapping` (or any
     /// other manual-ack REST consumer) could both be served, and both act
@@ -2666,7 +2666,7 @@ impl SkiljBuilder {
     /// on the transaction holding the bounded-context lock for the whole
     /// batch it's processing - `skilj_core::command_batcher::CommandBatcher
     /// ::with_idle_in_transaction_timeout`'s own doc comment for the full
-    /// design (Codeberg issue #36's own recommendation #3: a defense-in-
+    /// design (issue #36's own recommendation #3: a defense-in-
     /// depth backstop, not a feature to tune for ordinary throughput).
     /// Defaults to 30 seconds - generous for any real batch, short enough
     /// that a genuinely stuck leader's lock is released well before an
@@ -3026,7 +3026,7 @@ impl SkiljBuilder {
         let command_types = Arc::new(self.command_types);
         let snapshots = Arc::new(self.snapshots);
 
-        // Codeberg issue #13: reconciliation (after the schema patches
+        // issue #13: reconciliation (after the schema patches
         // below) never looks up a templated tenant's own name (it only
         // ever loops over the literal keys this process's own
         // `.bounded_context(name)`/`#[auto_register]` calls declared,
@@ -3076,7 +3076,7 @@ impl SkiljBuilder {
         // `EventCache::append`/`try_events_after`'s own doc comments -
         // which is already correct, not a gap this loop needs to cover.
         //
-        // Codeberg issue #15: run concurrently, `BACKGROUND_TASK_CONCURRENCY`
+        // issue #15: run concurrently, `BACKGROUND_TASK_CONCURRENCY`
         // at a time, rather than one bounded context at a time - this used
         // to be a plain sequential `for` loop with `.await` inside, so
         // startup latency scaled linearly with bounded-context count.
@@ -3099,7 +3099,7 @@ impl SkiljBuilder {
                 let event_cache = &event_cache;
                 async move {
                     let prepared = async {
-                        // Codeberg issue #12: `idempotency_keys` patched into
+                        // issue #12: `idempotency_keys` patched into
                         // every bounded context, every startup - including
                         // ones provisioned before this feature existed, since
                         // `provision_bounded_context_schema` itself only ever
@@ -3128,7 +3128,7 @@ impl SkiljBuilder {
                         // comment.
                         skilj_core::db::ensure_projection_state_owner_columns(pool, &bc.name)
                             .await?;
-                        // Codeberg issue #25: `projection_state.as_of_sequence`/
+                        // issue #25: `projection_state.as_of_sequence`/
                         // `projection_rebuild_state.as_of_sequence`, the real
                         // fix for a genuine cross-instance double-fold race
                         // found while investigating that issue - see
@@ -3152,7 +3152,7 @@ impl SkiljBuilder {
                         // comments.
                         skilj_core::db::ensure_private_field_columns(pool, &bc.name).await?;
                         skilj_core::db::ensure_private_field_grants_table(pool, &bc.name).await?;
-                        // Codeberg issue #98: the approval policy and
+                        // issue #98: the approval policy and
                         // proposal tables, same "patched into every bounded
                         // context, every startup" treatment.
                         skilj_core::db::ensure_command_approval_tables(pool, &bc.name).await?;
@@ -3169,7 +3169,7 @@ impl SkiljBuilder {
                         // own doc comment.
                         skilj_core::db::ensure_cross_context_route_cursors_table(pool, &bc.name)
                             .await?;
-                        // Codeberg issue #20: native one-shot, per-entity
+                        // issue #20: native one-shot, per-entity
                         // deadlines - same "patched into every bounded
                         // context, every startup" treatment, for the new
                         // `deadline_cursors`/`deadlines` tables. See
@@ -3177,7 +3177,7 @@ impl SkiljBuilder {
                         // own doc comments.
                         skilj_core::db::ensure_deadline_cursors_table(pool, &bc.name).await?;
                         skilj_core::db::ensure_deadlines_table(pool, &bc.name).await?;
-                        // Codeberg issue #25: partitioned async Projection
+                        // issue #25: partitioned async Projection
                         // catch-up - same "patched into every bounded
                         // context, every startup" treatment, for a brand-new
                         // table that needs no migration dance. See
@@ -3185,14 +3185,14 @@ impl SkiljBuilder {
                         // doc comment.
                         skilj_core::db::ensure_projection_partition_progress_table(pool, &bc.name)
                             .await?;
-                        // Codeberg issue #25 (docs/architecture.md §52):
+                        // issue #25 (docs/architecture.md §52):
                         // partitioned Snapshot catch-up - same treatment,
                         // for `Snapshot`'s own twin table. See
                         // `ensure_snapshot_partition_progress_table`'s own
                         // doc comment.
                         skilj_core::db::ensure_snapshot_partition_progress_table(pool, &bc.name)
                             .await?;
-                        // Codeberg issue #25 (docs/architecture.md §53): the
+                        // issue #25 (docs/architecture.md §53): the
                         // read_cursors checkout mechanism closing the
                         // Kafka/AMQP/NATS outbound bridges' double-publish
                         // gap. See `ensure_read_cursors_checkout_column`'s
@@ -3217,14 +3217,14 @@ impl SkiljBuilder {
                         // doc comment.
                         skilj_core::db::ensure_event_read_token_start_from_column(pool, &bc.name)
                             .await?;
-                        // Correlation/causation ids (Codeberg issue #18) -
+                        // Correlation/causation ids (issue #18) -
                         // same "patched into every bounded context, every
                         // startup" treatment. See
                         // `ensure_correlation_causation_columns`'s own doc
                         // comment.
                         skilj_core::db::ensure_correlation_causation_columns(pool, &bc.name)
                             .await?;
-                        // Codeberg issue #21 (dead-letter/parking for failed
+                        // issue #21 (dead-letter/parking for failed
                         // event/message handler delivery) - `cross_context_route_cursors`'
                         // own three new retry-backoff columns, same "patched
                         // into every bounded context, every startup"
@@ -3242,7 +3242,7 @@ impl SkiljBuilder {
                         // brand-new per-bounded-context table already gets
                         // here.
                         skilj_core::db::ensure_parked_deliveries_table(pool, &bc.name).await?;
-                        // Codeberg issue #25 review (docs/architecture.md
+                        // issue #25 review (docs/architecture.md
                         // §56): the concurrent-instance parked-delivery
                         // duplication fix's own belt-and-suspenders unique
                         // index, plus the one-time dedup a bounded context
@@ -3353,7 +3353,7 @@ impl SkiljBuilder {
             }
         }
 
-        // The initial GraphQL schema (Codeberg issue #2; `@guarantee
+        // The initial GraphQL schema (issue #2; `@guarantee
         // RegistrationReachesEveryInstance`) - built here, ahead of
         // `Skilj` itself, the same "can't call `self.graphql_state()`
         // before `self` exists" reasoning `reconciliation_dispatcher`
@@ -3450,7 +3450,7 @@ impl SkiljBuilder {
                 async {
                     match skilj_core::db::list_bounded_contexts(&poll_pool).await {
                         Ok(bounded_contexts) => {
-                            // Codeberg issue #15: concurrent, not one bc
+                            // issue #15: concurrent, not one bc
                             // at a time - each bc's own catch-up only
                             // ever touches its own schema, so nothing
                             // here is shared mutable state across
@@ -3609,7 +3609,7 @@ impl SkiljBuilder {
                 async {
                     match skilj_core::db::list_bounded_contexts(&snapshot_pool).await {
                         Ok(bounded_contexts) => {
-                            // Codeberg issue #15: concurrent, same
+                            // issue #15: concurrent, same
                             // reasoning as the async-projection task
                             // above.
                             stream::iter(bounded_contexts)
@@ -3764,7 +3764,7 @@ impl SkiljBuilder {
             }
         });
 
-        // Codeberg issue #20: native one-shot, per-entity deadlines -
+        // issue #20: native one-shot, per-entity deadlines -
         // three more shared background tasks, the same "one task, not
         // one per registration, detached, runs for the process's
         // lifetime" treatment the `CrossContextRoute` task just above
@@ -3998,7 +3998,7 @@ impl SkiljBuilder {
             }
         });
 
-        // Cross-instance push completeness (Codeberg issue #2;
+        // Cross-instance push completeness (issue #2;
         // `@guarantee DeliverySpansInstances`/`RegistrationReachesEveryInstance`
         // in specs/skilj.allium) - one more shared background task,
         // spawned the same "one task, detached, runs for the process's
@@ -4013,7 +4013,7 @@ impl SkiljBuilder {
         // from one committed on another, they're already reading through
         // the same broadcaster either way. `Revoked` republishes into
         // `RevocationBroadcaster` the identical way. `RegistrationChanged`
-        // rebuilds and swaps `schema_registry`, and (Codeberg issue #13)
+        // rebuilds and swaps `schema_registry`, and (issue #13)
         // refreshes `template_cache` from the same fresh
         // `list_bounded_contexts` read - `insert_bounded_context` already
         // fires this exact notification for every new context, templated
@@ -4085,7 +4085,7 @@ impl SkiljBuilder {
                         sequence,
                         origin_instance_id,
                     } => {
-                        // Self-NOTIFY dedup (Codeberg ultra-review
+                        // Self-NOTIFY dedup (ultra-review
                         // bug_001): Postgres delivers a NOTIFY to every
                         // listening backend, including ones opened by the
                         // same process that sent it, so this instance's
@@ -4162,7 +4162,7 @@ impl SkiljBuilder {
                         {
                             tracing::warn!(error = %err, "cross-instance schema rebuild failed");
                         }
-                        // Codeberg issue #13 - see the note above this
+                        // issue #13 - see the note above this
                         // task's own spawn for why this shares the same
                         // notification `schema_registry.rebuild` does.
                         if let Err(err) = cross_instance_template_cache
@@ -4358,7 +4358,7 @@ async fn retention_tick(pool: &Pool, target: RetentionTarget, retention: chrono:
         .await;
 }
 
-/// Codeberg issue #20's own firing half - not tied to any one
+/// issue #20's own firing half - not tied to any one
 /// registered `ScheduleDeadline` the way `catch_up_schedule_deadline`/
 /// `catch_up_cancel_deadline` each are (see `db::fire_due_deadlines`'s
 /// own doc comment for why), so this fans out over every *currently
@@ -4523,7 +4523,7 @@ async fn scheduler_tick(
             return;
         }
     };
-    // Codeberg issue #15: concurrent, same reasoning as the async-
+    // issue #15: concurrent, same reasoning as the async-
     // projection/snapshot tasks - each bounded context's own schedule
     // check only ever touches its own schema. The per-event-type/
     // per-occurrence walk *within* one bounded context stays exactly as
@@ -4552,7 +4552,7 @@ async fn scheduler_tick(
 
 /// One bounded context's own share of `scheduler_tick` - an unmodified
 /// extraction of what used to be that function's own loop body, so
-/// Codeberg issue #15's `for_each_concurrent` fan-out has something to
+/// issue #15's `for_each_concurrent` fan-out has something to
 /// call per bounded context.
 #[allow(clippy::too_many_arguments)]
 async fn scheduler_tick_for_bounded_context(

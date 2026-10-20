@@ -1,4 +1,4 @@
-//! A small JSON syntax highlighter (Codeberg issue #7's "even basic
+//! A small JSON syntax highlighter (issue #7's "even basic
 //! key/value colour differentiation would help scanning a large
 //! payload") - walks a `serde_json::Value` and produces styled ratatui
 //! `Line`/`Span`s, replacing `ui.rs`'s previous plain
@@ -169,7 +169,7 @@ fn write_compact(value: &Value, spans: &mut Vec<Span<'static>>) {
 }
 
 /// The plain-text equivalent of [`compact`] - `Live Events`' own
-/// substring filter matches against this (Codeberg issue #7), never
+/// substring filter matches against this (issue #7), never
 /// against styled spans, which have no single obvious "text" to search.
 pub fn compact_plain(value: &Value) -> String {
     value.to_string()

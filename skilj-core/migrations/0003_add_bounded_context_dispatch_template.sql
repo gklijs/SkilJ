@@ -1,4 +1,4 @@
--- Ultra-review bug_005 (Codeberg issue #13's own follow-up): `template`
+-- Ultra-review bug_005 (issue #13's own follow-up): `template`
 -- (0002) is correctly cleared by `ON DELETE SET NULL` when the
 -- referenced template is deleted - that's the right behaviour for the
 -- display/resync-eligibility field ("was this tenant stamped from a

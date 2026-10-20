@@ -1,4 +1,4 @@
-//! Golden-transcript conformance suite across GraphQL and REST (Codeberg
+//! Golden-transcript conformance suite across GraphQL and REST (
 //! issue #43, docs/architecture.md §179).
 //!
 //! Every scenario below is one logical operation - submit a command, read

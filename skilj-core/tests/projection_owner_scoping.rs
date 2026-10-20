@@ -547,7 +547,7 @@ fn a_scoped_grant_can_only_read_its_own_companys_ticket() {
     });
 }
 
-/// Codeberg issue #17's own gap and fix, end to end: `private_fields`
+/// issue #17's own gap and fix, end to end: `private_fields`
 /// (0.0.3) protects `queryEvents`/`fetchCommands` - surfaces no
 /// `Write`-level Role can reach anyway - while leaving `ProjectionQuery`,
 /// the one surface such a Role *can* reach, exactly as open as before

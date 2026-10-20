@@ -1,4 +1,4 @@
-//! `App`-level tests for Codeberg issue #7's own client-side pieces:
+//! `App`-level tests for issue #7's own client-side pieces:
 //! the Live Events `/`-gated substring filter, and the digit-tab-switch
 //! fix extended to `ProjectionsTab` (a real, not just latent, gap once
 //! `waitForSequence` made every one of its fields inherently numeric-

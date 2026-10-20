@@ -75,7 +75,7 @@ pub fn fetch_commands_field(n: &Naming) -> Field {
                     ),
                     None => None,
                 };
-                // Codeberg issue #18 - "show me everything in this
+                // issue #18 - "show me everything in this
                 // transaction".
                 let correlation_id = ctx
                     .args

@@ -1,4 +1,4 @@
-//! Group-commit batching for `db::submit_command` (Codeberg issue #32,
+//! Group-commit batching for `db::submit_command` (issue #32,
 //! round two). The first pass at this issue (docs/architecture.md §57)
 //! shortened how long `submit_command`'s own bounded-context lock is
 //! held per command; a real load test against `skilj-helpdesk` still
@@ -193,7 +193,7 @@ impl CommandBatcher {
             .clone()
     }
 
-    /// Codeberg issue #36's own recommendation #3: a defense-in-depth
+    /// issue #36's own recommendation #3: a defense-in-depth
     /// backstop against a batch leader's transaction stalling - for any
     /// reason, root cause fixed or not - while holding the bounded-context
     /// lock. Issued as `SET LOCAL idle_in_transaction_session_timeout` on
@@ -488,7 +488,7 @@ impl CommandBatcher {
     /// the configured max batch size), so the batch this call ends up processing can
     /// be considerably larger than one.
     ///
-    /// Codeberg issue #36: this ordering - lock first, drain second - used
+    /// issue #36: this ordering - lock first, drain second - used
     /// to be reversed, which quietly defeated the self-tuning design this
     /// module's own doc comment describes. Draining is unconditional once
     /// the lock step finishes, success or failure alike - a follower that

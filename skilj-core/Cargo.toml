@@ -41,7 +41,7 @@ opentelemetry.workspace = true
 # "Payload schema shape" note in specs/skilj.allium), so none of that
 # applies.
 jsonschema = { version = "0.58.0", default-features = false }
-# Codeberg issue #21 - the shared backoff/attempt-cap policy
+# issue #21 - the shared backoff/attempt-cap policy
 # `db::catch_up_cross_context_route` applies before parking a
 # persistently-failing occurrence. See docs/architecture.md's
 # parked-deliveries section.

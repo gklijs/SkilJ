@@ -10,6 +10,13 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Changed
+
+- The repository moved from Codeberg to GitHub
+  (https://github.com/gklijs/SkilJ), issues and pull requests included,
+  with their numbers kept (docs/architecture.md §222). CI runs on GitHub
+  Actions instead of Woodpecker, with the same checks.
+
 ## [0.1.0] - 2026-10-19
 
 ### Added
@@ -21,7 +28,7 @@ README.md, "Status and stability").
   and `skilj-demo`'s servers use it instead of `skilj_core::db`. A
   development shortcut: production claims the bootstrap secret instead.
 
-- A supported single-user local mode (docs/architecture.md §216, Codeberg
+- A supported single-user local mode (docs/architecture.md §216,
   issue #100). The `skilj` crate's `local` feature exposes
   `skilj::local::LocalPostgres`, which installs, starts and owns an
   embedded Postgres in a persistent data directory (platform default, or
@@ -40,7 +47,7 @@ README.md, "Status and stability").
   password over TCP and peer authentication on a private socket (never
   `trust`), and refuses a data directory or socket directory that is a
   symbolic link; `cleanup: true` also removes the password file.
-- Generic command approval (docs/architecture.md §214, Codeberg issue
+- Generic command approval (docs/architecture.md §214, issue
   #98). `CommandType::requires_approval()`, `approval_role()` and
   `approval_deadline_seconds()` make a submission a pending
   `CommandProposal` instead of running `decide()`; approval runs the
@@ -86,14 +93,14 @@ README.md, "Status and stability").
   `command_proposal_subject_forgotten`, instead of returning it to
   pending.
 - Documented external-worker guarantees around private fields
-  (docs/architecture.md §215, Codeberg issue #99): `EventReadToken`
+  (docs/architecture.md §215, issue #99): `EventReadToken`
   REST reads redact every private field unconditionally and serve
   sensitive fields as ciphertext, the GraphQL read paths render through
   the same entitlement checks, and database credentials, projection/
   snapshot state and owner scope remain deliberate boundaries. New
   regression test `an_external_read_token_never_sees_a_private_field`.
 - The firing time, and a deadline's expiry, are handed to `decide()`
-  (docs/architecture.md §213, Codeberg issue #97). `DecisionContext
+  (docs/architecture.md §213, issue #97). `DecisionContext
   { now, deadline: Option<DeadlineContext> }` is built by the framework
   and read through the new `Decision::now()`/`Decision::deadline()`:
   `now` is the submission's own instant (no clock in `decide()`, so a
@@ -107,7 +114,7 @@ README.md, "Status and stability").
   `plugin::DeadlineContext`,
   `Decision::now`/`deadline`/`context`, `ErasedDeadlineSpec.expires_at`.
 - Per-entity recurrence for deadlines, with a missed-run policy
-  (docs/architecture.md §212, Codeberg issue #95):
+  (docs/architecture.md §212, issue #95):
   `DeadlineSpec.recurrence: Option<RecurrenceSpec>` turns a one-shot
   deadline into the first firing of a chain. `RecurrenceSpec` carries the
   same 7-field cron expression the global scheduler evaluates, a
@@ -223,7 +230,7 @@ README.md, "Status and stability").
 - `CommandDispatcher::dispatch_with` and `dispatch_from_snapshot`,
   `CommandType::decide_from_snapshot`, and the facade's
   `DeciderFn`/`DecideFromSnapshotFn` take a `&DecisionContext`
-  (docs/architecture.md §213, Codeberg issue #97); `db::
+  (docs/architecture.md §213, issue #97); `db::
   resolve_command_submission`, `db::submit_command` and
   `db::decide_and_submit_command` thread it through
   (`decide_and_submit_command` gains an `Option<DeadlineContext>`), and
@@ -373,7 +380,7 @@ README.md, "Status and stability").
   composition; `scripts/federation-smoke.sh` runs it behind real routers.
 
 - `SkiljBuilder::statement_cache_capacity(n)` (docs/architecture.md §193,
-  Codeberg issue #56): how many prepared statements each pooled
+  issue #56): how many prepared statements each pooled
   connection keeps. Every bounded context brings its own statements, and
   with 32 or more busy bounded contexts sqlx's default of 100 cost up to
   a quarter of command throughput. `build()` warns when the capacity is
@@ -383,19 +390,19 @@ README.md, "Status and stability").
   `db::effective_statement_cache_capacity`.
 
 - Deployment settings in docs/performance.md (docs/architecture.md §192,
-  Codeberg issue #55). The one that matters is for `skilj-kafka`'s
+  issue #55). The one that matters is for `skilj-kafka`'s
   producer: `linger.ms=0` takes an outbound mapping from about 165 to about
   2,000 events/s, because the bridge produces one record at a time. A
   benchmark, `producer_settings_throughput`, is in
   `skilj-kafka/tests/kafka_bridge.rs`.
 
 - A checked-in copy of what `skilj-codegen` generates for skilj-demo's
-  `banking.skilj.toml` (docs/architecture.md §191, Codeberg issue #54),
+  `banking.skilj.toml` (docs/architecture.md §191, issue #54),
   compared by `skilj-demo/tests/generated_code.rs`, so a change to the
   spec or the generator shows up in review. Re-record with
   `SKILJ_RECORD_GENERATED=1`.
 
-- Command dry-runs (docs/architecture.md §185, Codeberg issue #47): what
+- Command dry-runs (docs/architecture.md §185, issue #47): what
   a command would decide right now, with nothing persisted - no command,
   event, sequence number, encryption key or idempotency record. GraphQL's
   `dryRunCommand` query is Admin-only and returns the would-be events,
@@ -404,11 +411,11 @@ README.md, "Status and stability").
   answers only `accepted` and a rejection's reason and kind.
 
 - `skilj/tests/coresident_pgbench.rs`, a benchmark of what an application
-  sharing skilj's Postgres loses (docs/architecture.md §184, Codeberg
+  sharing skilj's Postgres loses (docs/architecture.md §184,
   issue #46), with results in docs/performance.md.
 
 - A conformance suite across GraphQL and REST (docs/architecture.md
-  §179, Codeberg issue #43): `skilj/tests/conformance.rs` runs the same
+  §179, issue #43): `skilj/tests/conformance.rs` runs the same
   command submissions and event reads over both tracks, compares each
   outcome with a checked-in transcript, and requires the two tracks to
   agree unless the scenario is catalogued as a deliberate divergence
@@ -418,10 +425,10 @@ README.md, "Status and stability").
   private fields: they reach `project()` unredacted, and whatever of
   them a projection keeps in its state, every reader of that projection
   sees, whatever their private-field grants. Now stated in the spec and
-  docs (docs/architecture.md §177, Codeberg issue #48), along with the
+  docs (docs/architecture.md §177, issue #48), along with the
   same for snapshots and cross-context routes; nothing is refused.
 
-- Database epochs (docs/architecture.md §176, Codeberg issue #42): event
+- Database epochs (docs/architecture.md §176, issue #42): event
   reads return the database's `epoch` (system identifier and timeline),
   which changes after a failover to an asynchronous standby or a
   point-in-time restore. `GET /v1/events` (`epoch=` with `after`),
@@ -542,7 +549,7 @@ README.md, "Status and stability").
   snapshot from the event cache, when the cache still holds them,
   instead of always from Postgres once the bounded context outgrew the
   cache. Tag-filtered event queries with an `after` position benefit the
-  same way (docs/architecture.md §188, Codeberg issue #51).
+  same way (docs/architecture.md §188, issue #51).
 
 - A command's DCB pre-read is cheaper in a bounded context with more
   events than the event cache holds (1000 by default): once the cache's
@@ -550,7 +557,7 @@ README.md, "Status and stability").
   straight to Postgres instead of first freshening a window it can't be
   served from - one database round trip less per command. When the
   window does hold the whole history, only the matching events are
-  copied out of it, not all of them (docs/architecture.md §187, Codeberg
+  copied out of it, not all of them (docs/architecture.md §187,
   issue #50).
 
 - Async projection catch-up folds up to 100 events per transaction
@@ -559,7 +566,7 @@ README.md, "Status and stability").
   `projection_catch_up_throughput` benchmark. An event whose fold fails
   still leaves the events before it committed. A registration or
   promotion of a projection now waits for the chunk being folded into
-  it, a few milliseconds (docs/architecture.md §182, Codeberg issue
+  it, a few milliseconds (docs/architecture.md §182, issue
   #52).
 - `skilj-kafka`'s `run_inbound` dispatches the partitions it is assigned
   concurrently, one message in flight per partition, instead of one
@@ -571,7 +578,7 @@ README.md, "Status and stability").
   flight finish and commit. Messages from different partitions reach
   skilj in a less predictable order than before; the crate docs now
   state that messages whose order matters must share a Kafka key
-  (docs/architecture.md §174, Codeberg issue #60).
+  (docs/architecture.md §174, issue #60).
 - `skilj-kafka`, `skilj-amqp` and `skilj-nats` acknowledge outbound
   events to skilj once per contiguous run - one call for a whole page
   in the common case - instead of once per event. Events are still
@@ -580,14 +587,14 @@ README.md, "Status and stability").
   rather than one event (still at-least-once). The outbound loop the
   three shared by copy now lives in `skilj-bridge`
   (`outbound_cycle`, `OutboundSink`); the bridges' public APIs are
-  unchanged (docs/architecture.md §171, Codeberg issue #40).
+  unchanged (docs/architecture.md §171, issue #40).
 
 ### Removed
 
 - `SkiljBuilder::pool_options_performance_optimized()`: it sized the pool
   from the application host's cores, which could give fewer connections
   than sqlx's default. docs/performance.md now has pool sizing guidance
-  instead (docs/architecture.md §186, Codeberg issue #49). Use
+  instead (docs/architecture.md §186, issue #49). Use
   `pool_options(...)`.
 
 ### Fixed
@@ -652,7 +659,7 @@ README.md, "Status and stability").
   while holding the lock, costing more as the bounded context grew. It now
   starts where the command's optimistic read ended. Same DCB guarantee;
   measured in the new `command_throughput` benchmark and refreshed in
-  docs/performance.md (docs/architecture.md §178, Codeberg issue #45).
+  docs/performance.md (docs/architecture.md §178, issue #45).
   `db::submit_command` and `CommandBatcher::submit` take the read's
   position as a new last parameter (`None` keeps the old behaviour), and
   the per-command `command decide delta query` log is now `debug`.
@@ -674,7 +681,7 @@ README.md, "Status and stability").
   events keep their key and are retried under it. Kafka is unchanged. In
   `skilj-core`, `create_and_insert_external_event` takes
   `Option<ExternalEventDedupe>` and `CreateExternalEventOutcome::Redelivered`
-  carries `sequence` (docs/architecture.md §175, Codeberg issue #59).
+  carries `sequence` (docs/architecture.md §175, issue #59).
 
 - Retrying a parked inbound external event (`retryParkedDelivery`) could
   silently lose it. When the bridge's request carried a `dedupe` cursor
@@ -684,7 +691,7 @@ README.md, "Status and stability").
   under a cursor of its own per parked row, so it is created. The one
   case this trades away: an original attempt that committed without the
   bridge hearing back and was parked anyway is created twice on retry
-  (docs/architecture.md §173, Codeberg issue #58).
+  (docs/architecture.md §173, issue #58).
 - Two projections whose generated GraphQL type names collide
   (`{a_b}` + `c` against `{a}` + `b_c`, or a nested `{parent}_{field}`
   against another top-level name) are now resolved the same way on every
@@ -1618,7 +1625,7 @@ README.md, "Status and stability").
   context now share one lock acquisition and one commit, raising measured
   single-bounded-context throughput from ~27/s to ~45-60/s in the
   `skilj-helpdesk` load test. Includes several rounds of round-trip cuts
-  inside the held lock (Codeberg issues #32, #35, #36). See
+  inside the held lock (issues #32, #35, #36). See
   [docs/architecture.md §58-§62](docs/architecture.md) and the new
   [docs/performance.md](docs/performance.md).
 - New builder options `command_batch_max_size` (default 256) and
@@ -1661,13 +1668,13 @@ README.md, "Status and stability").
   (generated when the caller omits one); `causation_id` is `null` for a
   root command and set to the causing event's own stable name otherwise.
   See [docs/architecture.md §44](docs/architecture.md#correlation-causation-ids)
-  (Codeberg issue #18).
+  (issue #18).
 - New `skilj-test-fixture` crate: a given/when/then harness for
   exercising a plugin's own `decide()`/`project()` directly, in memory -
   no Postgres, no license required for a full HTTP round trip just to
   check whether a decision function returns the right event. See
   [docs/architecture.md §45](docs/architecture.md#given-when-then-test-fixture)
-  (Codeberg issue #19).
+  (issue #19).
 - Native one-shot, per-entity deadlines: `plugin::ScheduleDeadline`/
   `CancelDeadline` schedule a deferred command tied to a specific
   entity's own tags - "cancel this order if it has no time to die within
@@ -1675,7 +1682,7 @@ README.md, "Status and stability").
   happens first, without reaching for the much heavier `skilj-temporal`
   for a single deferred command. See
   [docs/architecture.md §46](docs/architecture.md#native-deadlines)
-  (Codeberg issue #20).
+  (issue #20).
 - Dead-letter/parking for failed event and message handler delivery:
   `CrossContextRoute`'s catch-up loop and the `skilj-kafka`/`skilj-amqp`/
   `skilj-nats` bridges now share one backoff/attempt-cap policy (new
@@ -1685,14 +1692,14 @@ README.md, "Status and stability").
   of looping - a failing delivery finally gets to live and let die,
   rather than take the whole route down with it. See
   [docs/architecture.md §47](docs/architecture.md#parked-deliveries)
-  (Codeberg issue #21).
+  (issue #21).
 - New GraphQL subscription `projectionUpdates`: the subscription
   counterpart to `ProjectionQuery`, pushing the already-computed
   `Projection` state itself so a client wanting "push me the current
   balance whenever it changes" no longer has to subscribe to raw events
   and reimplement `project()`'s own fold client-side. See
-  [docs/architecture.md §49](docs/architecture.md#49-a-graphql-subscription-for-projections-projectionupdates-codeberg-issue-23)
-  (Codeberg issue #23).
+  [docs/architecture.md §49](docs/architecture.md#49-a-graphql-subscription-for-projections-projectionupdates-issue-23)
+  (issue #23).
 - Segmented/parallel event processing: async `Projection` and `Snapshot`
   catch-up can now be spread across a fleet of instances, each claiming
   and processing its own segment via `pg_advisory_xact_lock`, for
@@ -1703,10 +1710,10 @@ README.md, "Status and stability").
   (`ReadCursor.checked_out_at`) where two concurrent instances of the
   same mapping could otherwise both be served, and both act on, the
   identical unacknowledged batch. See
-  [docs/architecture.md §50](docs/architecture.md#50-investigation-segmentedparallel-event-processing-for-horizontal-scale-out-codeberg-issue-25)
+  [docs/architecture.md §50](docs/architecture.md#50-investigation-segmentedparallel-event-processing-for-horizontal-scale-out-issue-25)
   through
   [§54](docs/architecture.md#54-bridge-partitioning-skilj-kafkaskilj-amqpskilj-nats-on-top-of-53)
-  (Codeberg issue #25).
+  (issue #25).
 
 ### Fixed
 
@@ -1715,7 +1722,7 @@ README.md, "Status and stability").
   idempotent?" premise directly instead of trusting the existing design
   notes: two instances racing the same fold could each apply an
   overlapping batch of events, double-counting some of them. See
-  [docs/architecture.md §50](docs/architecture.md#50-investigation-segmentedparallel-event-processing-for-horizontal-scale-out-codeberg-issue-25).
+  [docs/architecture.md §50](docs/architecture.md#50-investigation-segmentedparallel-event-processing-for-horizontal-scale-out-issue-25).
 - A fire-vs-cancel race in `CancelDeadline` (§46): `fire_due_deadlines`
   could still exercise a deadline's license to fire its command after a
   concurrent `catch_up_cancel_deadline` tick had already revoked it,
@@ -1815,7 +1822,7 @@ README.md, "Status and stability").
   the projection itself. New `Projection.TEAM_ONLY` (deployed
   configuration only, not a spec field) rejects a query unless the
   caller's Role carries the required name, composing with the existing
-  owner-scope check rather than replacing it (Codeberg issue #17).
+  owner-scope check rather than replacing it (issue #17).
 - The `projectionSchema` GraphQL field was missed by the fix above: a
   Role off the required team could still read a `TEAM_ONLY` projection's
   declared name/schema/schemaVersion through it even though `projection`
@@ -1882,7 +1889,7 @@ README.md, "Status and stability").
   instead of a repeated `match` per event type. Doesn't relax
   `schema_is_backwards_compatible`'s additive-only contract or touch
   registration in any way; operates entirely on the raw JSON before
-  final deserialization (Codeberg issue #14).
+  final deserialization (issue #14).
 - `docs/temporal-integration.md`: documents pairing skilj with Temporal
   via its existing `Idempotency-Key` on `submitCommand`/command
   triggering, keyed by `{run_id}:{activity_id}` per Temporal's own
@@ -1978,20 +1985,20 @@ README.md, "Status and stability").
 
 ### Added
 
-- Templated bounded-context tenants (Codeberg issue #13): a new
+- Templated bounded-context tenants (issue #13): a new
   `createBoundedContextFromTemplate`/`resyncBoundedContextFromTemplate`
   GraphQL surface lets an operator stamp out a new tenant `BoundedContext`
   from an existing one's current `EventType`/`CommandType`/`Projection`
   registrations in a single call - no Rust redeploy per tenant. See
   `specs/skilj.allium`'s `surface BoundedContextTemplating` and
   `docs/architecture.md`.
-- An optional idempotency key on command submission (Codeberg issue
+- An optional idempotency key on command submission (issue
   #12), backwards compatible - a key is generated at random whenever
   the caller omits one, so existing callers see no behavioural change.
 - Four new filterable scalar `FilterOperator`s: geo, color, IP, and enum.
 - `SkiljBuilder::build()`'s startup warm-up and background pollers now
   fan out concurrently across bounded contexts instead of one at a time
-  (Codeberg issue #15) - startup latency no longer scales linearly with
+  (issue #15) - startup latency no longer scales linearly with
   bounded-context count.
 
 ### Fixed
@@ -2025,15 +2032,15 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://codeberg.org/gklijs/SkilJ/compare/v0.1.0...HEAD
-[0.1.0]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.10...v0.1.0
-[0.0.10]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.9...v0.0.10
-[0.0.9]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.8...v0.0.9
-[0.0.8]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.7...v0.0.8
-[0.0.7]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.6...v0.0.7
-[0.0.6]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.5...v0.0.6
-[0.0.5]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.4...v0.0.5
-[0.0.4]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.3...v0.0.4
-[0.0.3]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.2...v0.0.3
-[0.0.2]: https://codeberg.org/gklijs/SkilJ/compare/v0.0.1...v0.0.2
-[0.0.1]: https://codeberg.org/gklijs/SkilJ/releases/tag/v0.0.1
+[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/gklijs/SkilJ/compare/v0.0.10...v0.1.0
+[0.0.10]: https://github.com/gklijs/SkilJ/compare/v0.0.9...v0.0.10
+[0.0.9]: https://github.com/gklijs/SkilJ/compare/v0.0.8...v0.0.9
+[0.0.8]: https://github.com/gklijs/SkilJ/compare/v0.0.7...v0.0.8
+[0.0.7]: https://github.com/gklijs/SkilJ/compare/v0.0.6...v0.0.7
+[0.0.6]: https://github.com/gklijs/SkilJ/compare/v0.0.5...v0.0.6
+[0.0.5]: https://github.com/gklijs/SkilJ/compare/v0.0.4...v0.0.5
+[0.0.4]: https://github.com/gklijs/SkilJ/compare/v0.0.3...v0.0.4
+[0.0.3]: https://github.com/gklijs/SkilJ/compare/v0.0.2...v0.0.3
+[0.0.2]: https://github.com/gklijs/SkilJ/compare/v0.0.1...v0.0.2
+[0.0.1]: https://github.com/gklijs/SkilJ/releases/tag/v0.0.1

@@ -438,7 +438,7 @@ fn concurrent_submits_for_different_orders_all_accept_with_gapless_distinct_sequ
 
 #[test]
 fn a_batch_leader_stuck_past_the_idle_in_transaction_timeout_is_killed_and_releases_the_lock() {
-    // Codeberg issue #36's own recommendation #3, proved end to end rather
+    // issue #36's own recommendation #3, proved end to end rather
     // than just read from the code: a batch leader's transaction that
     // never sends another statement after acquiring the bounded-context
     // lock - for whatever reason, a genuine hang included - must not wedge
@@ -472,7 +472,7 @@ fn a_batch_leader_stuck_past_the_idle_in_transaction_timeout_is_killed_and_relea
         // (200ms, set above) has certainly already fired and killed this
         // session - nothing here sends it another statement in the
         // meantime, exactly the "leader never comes back" failure mode
-        // Codeberg issue #36 describes.
+        // issue #36 describes.
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
         let batcher = CommandBatcher::new();

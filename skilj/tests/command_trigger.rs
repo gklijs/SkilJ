@@ -136,7 +136,7 @@ impl CommandType for CloseAccount {
     }
 }
 
-/// Codeberg issue #98 over REST: a `CommandToken` may submit it, but the
+/// issue #98 over REST: a `CommandToken` may submit it, but the
 /// submission becomes a pending proposal instead of a decided command.
 struct TransferMoney;
 
@@ -603,7 +603,7 @@ fn command_trigger_accepts_and_persists_triggered_events() {
     });
 }
 
-/// Codeberg issue #12, real end-to-end: a genuine retry with the same
+/// issue #12, real end-to-end: a genuine retry with the same
 /// `Idempotency-Key` header returns the identical `triggeredEventSequences`
 /// and `deduplicated: true`, and only one set of events actually exists -
 /// not just that the response looks right, but that nothing was
@@ -1188,7 +1188,7 @@ fn command_trigger_refuses_an_overlong_idempotency_key() {
     });
 }
 
-/// Codeberg issue #47, `rule DryRunTriggerCommand`: `POST
+/// issue #47, `rule DryRunTriggerCommand`: `POST
 /// /v1/commands/dry-run` answers what a trigger with this token would
 /// decide - and only that - while writing nothing. Both outcomes, then
 /// a real trigger to show the dry-runs used up nothing: the first real

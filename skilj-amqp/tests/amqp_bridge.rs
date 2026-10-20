@@ -87,6 +87,16 @@ async fn provision_broker() -> Option<TestBroker> {
             return None;
         }
     };
+    // Not 127.0.0.1: from inside a container (CI's job container), the
+    // broker's mapped port is on the Docker host, which `get_host`
+    // answers with the bridge network's gateway.
+    let host = match container.get_host().await {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("skipping: getting the Artemis container's own host failed: {e}");
+            return None;
+        }
+    };
     let port = match container
         .get_host_port_ipv4(ContainerPort::Tcp(61616))
         .await
@@ -98,7 +108,7 @@ async fn provision_broker() -> Option<TestBroker> {
         }
     };
     Some(TestBroker {
-        url: format!("amqp://127.0.0.1:{port}"),
+        url: format!("amqp://{host}:{port}"),
         _container: container,
     })
 }
@@ -159,7 +169,7 @@ struct MockSkiljState {
     /// The `Idempotency-Key` header of each `external_requests` entry.
     external_request_keys: Arc<Mutex<Vec<Option<String>>>>,
     trigger_requests: Arc<Mutex<Vec<TriggerRequest>>>,
-    /// Codeberg issue #21 - `POST /v1/events/external` returns a 500
+    /// issue #21 - `POST /v1/events/external` returns a 500
     /// while this is `> 0`, decrementing it each time - see
     /// `skilj-kafka/tests/kafka_bridge.rs`'s own identical fields.
     fail_external_requests: Arc<Mutex<usize>>,
@@ -175,7 +185,7 @@ async fn get_events_consume(
     headers: HeaderMap,
 ) -> Json<Value> {
     let token = bearer_token(&headers);
-    // Codeberg issue #21 - peeks rather than drains, so a manual-ack
+    // issue #21 - peeks rather than drains, so a manual-ack
     // caller that fails to ack gets the identical still-unacked event(s)
     // back on its next GET - see `skilj-kafka/tests/kafka_bridge.rs`'s
     // own identical change.
@@ -414,7 +424,7 @@ fn an_order_placed_event_is_sent_with_its_own_tag_as_the_group_id() {
         assert_eq!(properties.group_sequence, Some(7));
         let payload: Value = serde_json::from_slice(delivery.body().0.as_ref()).unwrap();
         assert_eq!(payload, json!({ "orderId": "o-42" }));
-        // Codeberg issue #18 - the event's own correlation_id round-trips
+        // issue #18 - the event's own correlation_id round-trips
         // as AMQP 1.0's real standard correlation-id property, distinct
         // from group_id above (derived from the unrelated `order` DCB
         // tag). No causation_id application-property at all -
@@ -536,7 +546,7 @@ fn an_inbound_record_message_carries_its_own_real_group_id_and_sequence_as_key()
     });
 }
 
-/// Codeberg issue #18 - the inbound half of the same round trip the
+/// issue #18 - the inbound half of the same round trip the
 /// outbound test above already proves: a real AMQP message carrying a
 /// real `correlation-id` property and a `Skilj-Causation-Id`
 /// application-property gets both read back (`InboundMessageMeta`) and
@@ -711,7 +721,7 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_mess
     });
 }
 
-/// Codeberg issue #21 - a message that keeps failing to dispatch is
+/// issue #21 - a message that keeps failing to dispatch is
 /// retried with backoff (the mock's own `fail_external_requests` toggle
 /// makes `POST /v1/events/external` fail exactly twice), then reported
 /// to skilj's own `POST /v1/parked-deliveries` and the delivery accepted
@@ -813,7 +823,7 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
     });
 }
 
-/// Codeberg issue #21 - the outbound direction's own shape: unlike
+/// issue #21 - the outbound direction's own shape: unlike
 /// inbound, exhausting a *configured* `retry_policy` (default is
 /// `RetryPolicy::unbounded`) skips the event instead of parking it -
 /// acknowledged to skilj without ever successfully sending it, no
@@ -907,7 +917,7 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
     });
 }
 
-/// Codeberg issue #25's investigation (docs/architecture.md §54) - the
+/// issue #25's investigation (docs/architecture.md §54) - the
 /// AMQP twin of `skilj_kafka`'s own
 /// `two_partitioned_mappings_together_produce_every_key_exactly_once`:
 /// two `OutboundMapping`s for the same `EventType`, different
@@ -1029,7 +1039,7 @@ fn two_partitioned_mappings_together_send_every_key_exactly_once() {
             "every key must be sent exactly once across both partitions"
         );
 
-        // Codeberg issue #40: each instance acknowledges its whole page -
+        // issue #40: each instance acknowledges its whole page -
         // owned events and partition skips alike - with one call for the
         // last sequence, which moves its cursor past every one of them.
         let last = order_ids.len() as i64 - 1;

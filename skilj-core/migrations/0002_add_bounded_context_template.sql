@@ -1,4 +1,4 @@
--- Codeberg issue #13: templated bounded-context tenants
+-- issue #13: templated bounded-context tenants
 -- (specs/skilj.allium's `BoundedContext.template` field). Nullable - most
 -- contexts have no template, matching AddBoundedContext's own path.
 -- References `bounded_contexts(name)` rather than an id: this table

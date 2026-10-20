@@ -304,7 +304,7 @@ pub fn add_bounded_context(
     })
 }
 
-/// See `rule CreateBoundedContextFromTemplate` (Codeberg issue #13).
+/// See `rule CreateBoundedContextFromTemplate` (issue #13).
 /// Same shape as `add_bounded_context` immediately above - identical
 /// name-uniqueness/validity checks, since this is the spec's own second
 /// and only other way a `BoundedContext` name is chosen - plus the two
@@ -359,7 +359,7 @@ pub fn create_bounded_context_from_template(
     })
 }
 
-/// See `rule ResyncBoundedContextFromTemplate` (Codeberg issue #13).
+/// See `rule ResyncBoundedContextFromTemplate` (issue #13).
 /// Pure validation only, returning the template to resync *from* on
 /// success - applying its current registrations is the caller's own
 /// loop, the identical one `create_bounded_context_from_template`'s own

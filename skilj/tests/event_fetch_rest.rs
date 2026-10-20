@@ -266,7 +266,7 @@ fn get_events_filter_param_narrows_results_for_real_over_rest() {
     });
 }
 
-/// Codeberg issue #18 - `GET /v1/events?correlationId=...` narrows to
+/// issue #18 - `GET /v1/events?correlationId=...` narrows to
 /// exactly the one transaction named, over a real REST round trip: a
 /// direct event posted with an explicit `correlationId` body field comes
 /// back with that same id on `metadata.correlationId`, and is the only
@@ -928,7 +928,7 @@ fn get_events_rejects_a_wrong_secret_for_a_known_token_id_with_401() {
     });
 }
 
-/// Codeberg issue #25's investigation (docs/architecture.md §53) - the
+/// issue #25's investigation (docs/architecture.md §53) - the
 /// real end-to-end proof, not just the pure-function layer
 /// (`skilj-core/tests/event_fetch_surface.rs` covers that): two genuinely
 /// concurrent `GET /v1/events/consume?mode=manual` calls for the same

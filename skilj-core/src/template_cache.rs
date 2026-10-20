@@ -1,4 +1,4 @@
-//! `TemplateCache` - Codeberg issue #13's live `bounded_context ->
+//! `TemplateCache` - issue #13's live `bounded_context ->
 //! dispatch_template` lookup, and ultra-review bug_001/bug_005's own
 //! fix for it. Every `Registered*` dispatch map `skilj`'s facade holds
 //! (`command_types`/`event_types`/`projections`/`snapshots`) is keyed

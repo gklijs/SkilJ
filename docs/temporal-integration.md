@@ -8,7 +8,7 @@ calls skilj's command-submission surface safely, using infrastructure skilj alre
 ## The pattern
 
 skilj's `submitCommand` (GraphQL) and `POST /v1/commands/trigger` (REST) both accept an optional
-idempotency key (Codeberg issue #12) - the second request with the same key returns the *original*
+idempotency key (issue #12) - the second request with the same key returns the *original*
 outcome instead of re-deciding, and never double-applies the command. Temporal's own documented
 guidance for making an Activity idempotent is to derive a key from its **Run ID + Activity ID** -
 stable across every retry of that one invocation, unique across every other invocation, including

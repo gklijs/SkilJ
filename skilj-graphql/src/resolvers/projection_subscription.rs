@@ -1,8 +1,8 @@
 //! `surface ProjectionQuery`'s own subscription counterpart -
-//! `projectionUpdates` (Codeberg issue #23). `ReadAccess`-gated exactly
+//! `projectionUpdates` (issue #23). `ReadAccess`-gated exactly
 //! like `projection`/`projectionSchema` (`require_read_mapping`, not
 //! `require_admin_mapping`), and `team_only`-gated the same way too
-//! (Codeberg issue #17's fix - see `projection_query::fetch_projection_result`'s
+//! (issue #17's fix - see `projection_query::fetch_projection_result`'s
 //! own doc comment, which this field's every push runs through).
 //!
 //! Shaped after `event_subscription.rs`'s own two fields: resolve the

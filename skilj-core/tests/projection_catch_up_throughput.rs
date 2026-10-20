@@ -1,4 +1,4 @@
-//! Async projection catch-up benchmark for Codeberg issue #52 - not a
+//! Async projection catch-up benchmark for issue #52 - not a
 //! test, so `#[ignore]`d. Run with:
 //!
 //! ```sh

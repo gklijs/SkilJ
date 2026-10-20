@@ -1,5 +1,5 @@
 # cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/),
-# run in CI (.woodpecker.yml's `deny` step) and by hand with
+# run in CI (.github/workflows/ci.yml's `deny` job) and by hand with
 # `cargo deny check`.
 
 [graph]

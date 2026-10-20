@@ -138,7 +138,7 @@ impl CommandType for CloseAccount {
     }
 }
 
-// --- Codeberg issue #98: a command type whose submissions are proposals.
+// --- issue #98: a command type whose submissions are proposals.
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct TransferMoneyPayload {
@@ -636,7 +636,7 @@ impl CommandType for CloseCase {
     }
 }
 
-// --- a ledger for `dryRunCommand` (Codeberg issue #47): credits tagged by
+// --- a ledger for `dryRunCommand` (issue #47): credits tagged by
 // account, capped at 100 per account, so `decide()` reads history. Each
 // credit names its holder, whose name is a sensitive field, and carries an
 // `own`-kind private memo. `CreditGhost` decides an event type nobody
@@ -1140,7 +1140,7 @@ fn full_business_surfaces_lifecycle_end_to_end() {
         let commands = response["data"]["fetchCommands"].as_array().unwrap();
         assert_eq!(commands.len(), 2);
 
-        // Codeberg issue #18 - submitCommand echoes back the correlationId
+        // issue #18 - submitCommand echoes back the correlationId
         // it actually stored (the caller's own, verbatim), and both
         // queryEvents and fetchCommands can be scoped to exactly that one
         // transaction via their own new correlationId argument.
@@ -1224,7 +1224,7 @@ const SUBMIT_COMMAND_WITH_IDEMPOTENCY_KEY_MUTATION: &str = "\
         } \
     }";
 
-/// Codeberg issue #12, real end-to-end over GraphQL: a genuine retry
+/// issue #12, real end-to-end over GraphQL: a genuine retry
 /// with the same `idempotencyKey` returns the identical
 /// `triggeredEventSequences` and `deduplicated: true` - and only one
 /// event actually exists, not just that the response looks right.
@@ -1716,7 +1716,7 @@ fn submit_command_rejects_a_reserved_idempotency_key_prefix_over_graphql() {
     });
 }
 
-/// A rejection's `matchingEvents` (Codeberg issue #7's DCB conflict
+/// A rejection's `matchingEvents` (issue #7's DCB conflict
 /// visualizer) is full raw event content - the same visibility
 /// `queryEvents`/`countEvents`/`inspectEvent` require `Admin` level for.
 /// `CommandSubmission` itself faces `WriteAccess` (any write-level grant
@@ -3202,7 +3202,7 @@ fn with_ledger(builder: skilj::SkiljBuilder) -> skilj::SkiljBuilder {
     )
 }
 
-/// Codeberg issue #47, `rule DryRunCommand`: what `decide()` would say,
+/// issue #47, `rule DryRunCommand`: what `decide()` would say,
 /// with the would-be events and the matching events, rendered under the
 /// read rules - and nothing persisted. One real credit of 60 first, so the
 /// dry-runs have history to decide from.

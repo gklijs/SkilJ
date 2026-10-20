@@ -843,7 +843,7 @@ fn apply_cursor_update_created_then_advanced_round_trips() {
     });
 }
 
-/// Codeberg issue #25's investigation (docs/architecture.md §53) -
+/// issue #25's investigation (docs/architecture.md §53) -
 /// `CursorUpdate::Claimed` round-trips through `apply_cursor_update`
 /// without touching `sequence`/`updated_at`, the same "a claim alone
 /// never moves the cursor's own position" guarantee
@@ -934,7 +934,7 @@ fn record_acknowledgement_moves_the_cursor() {
         )
         .await
         .unwrap();
-        // Codeberg issue #25's investigation (docs/architecture.md §53) -
+        // issue #25's investigation (docs/architecture.md §53) -
         // a live claim, so the assertion below actually proves
         // `record_acknowledgement` clears it rather than it having never
         // been set in the first place.

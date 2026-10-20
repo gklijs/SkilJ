@@ -32,11 +32,14 @@ use skilj_kafka::{
     dispatch_inbound_message, header_str, produce_once, run_inbound, run_inbound_until,
     run_outbound_until, InboundAction, InboundMapping, OutboundMapping,
 };
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testcontainers_modules::kafka::apache;
+use testcontainers_modules::testcontainers::core::{ContainerPort, ExecCommand, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::Image;
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
@@ -64,7 +67,7 @@ struct TestKafka {
     // itself is, which is the whole test binary's lifetime. A static is
     // never dropped, so the container is removed by the watchdog
     // `provision_kafka` registers, not by this handle.
-    _container: testcontainers_modules::testcontainers::ContainerAsync<apache::Kafka>,
+    _container: testcontainers_modules::testcontainers::ContainerAsync<ReachableKafka>,
 }
 
 static TEST_KAFKA: tokio::sync::OnceCell<Option<TestKafka>> = tokio::sync::OnceCell::const_new();
@@ -80,8 +83,60 @@ async fn test_kafka() -> Option<&'static str> {
         .map(|k| k.bootstrap_servers.as_str())
 }
 
+/// Where [`ReachableKafka`]'s container waits for its start script.
+const KAFKA_START_SCRIPT: &str = "/tmp/skilj_kafka_start.sh";
+
+/// `apache::Kafka`, except that the broker advertises the host this test
+/// reaches it on. The module's own start script advertises `127.0.0.1`,
+/// which from inside a container (CI's job container) is that container
+/// itself, not the Docker host the mapped port is on: the bootstrap
+/// connection succeeds and every connection to the advertised broker
+/// after it fails. The container waits for a start script, as the
+/// module's does, so `provision_kafka` can write it once
+/// `get_host` and the mapped port are known.
+#[derive(Debug, Clone, Default)]
+struct ReachableKafka(apache::Kafka);
+
+impl Image for ReachableKafka {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn tag(&self) -> &str {
+        self.0.tag()
+    }
+
+    fn ready_conditions(&self) -> Vec<WaitFor> {
+        // Ready once the start script runs - waited for in `provision_kafka`.
+        Vec::new()
+    }
+
+    fn entrypoint(&self) -> Option<&str> {
+        Some("bash")
+    }
+
+    fn env_vars(
+        &self,
+    ) -> impl IntoIterator<Item = (impl Into<Cow<'_, str>>, impl Into<Cow<'_, str>>)> {
+        self.0.env_vars()
+    }
+
+    fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
+        [
+            "-c".to_string(),
+            format!(
+                "while [ ! -f {KAFKA_START_SCRIPT} ]; do sleep 0.1; done; bash {KAFKA_START_SCRIPT}"
+            ),
+        ]
+    }
+
+    fn expose_ports(&self) -> &[ContainerPort] {
+        self.0.expose_ports()
+    }
+}
+
 async fn provision_kafka() -> Option<TestKafka> {
-    let node = match apache::Kafka::default().start().await {
+    let node = match ReachableKafka::default().start().await {
         Ok(node) => {
             skilj_test_support::remove_container_on_exit(node.id());
             node
@@ -95,13 +150,37 @@ async fn provision_kafka() -> Option<TestKafka> {
             return None;
         }
     };
-    let bootstrap_servers = match node.get_host_port_ipv4(apache::KAFKA_PORT).await {
-        Ok(port) => format!("127.0.0.1:{port}"),
+    let host = match node.get_host().await {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("skipping: getting the Kafka container's own host failed: {e}");
+            return None;
+        }
+    };
+    let port = match node.get_host_port_ipv4(apache::KAFKA_PORT).await {
+        Ok(port) => port,
         Err(e) => {
             eprintln!("skipping: getting the Kafka container's own mapped port failed: {e}");
             return None;
         }
     };
+    let bootstrap_servers = format!("{host}:{port}");
+    let start_script = format!(
+        "printf '%s\\n' 'export KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://{bootstrap_servers},BROKER://localhost:9093' \
+         'exec /etc/kafka/docker/run' > {KAFKA_START_SCRIPT}"
+    );
+    let started = node
+        .exec(
+            ExecCommand::new(["sh".to_string(), "-c".to_string(), start_script])
+                .with_container_ready_conditions(vec![WaitFor::message_on_stdout(
+                    "Kafka Server started",
+                )]),
+        )
+        .await;
+    if let Err(e) = started {
+        eprintln!("skipping: starting Kafka in its container failed: {e}");
+        return None;
+    }
     Some(TestKafka {
         bootstrap_servers,
         _container: node,
@@ -130,7 +209,7 @@ struct MockSkiljState {
     external_requests: Arc<Mutex<Vec<Value>>>,
     /// In order - what the inbound `Trigger` tests assert against.
     trigger_requests: Arc<Mutex<Vec<TriggerRequest>>>,
-    /// Codeberg issue #21 - `POST /v1/events/external` returns a 500
+    /// issue #21 - `POST /v1/events/external` returns a 500
     /// while this is `> 0`, decrementing it each time - the deterministic
     /// "the target keeps failing" trigger `an_inbound_message_parks_after_exhausting_retries`
     /// needs.
@@ -161,7 +240,7 @@ async fn get_events_consume(
     headers: HeaderMap,
 ) -> Json<Value> {
     let token = bearer_token(&headers);
-    // Codeberg issue #21 - peeks rather than drains, so a manual-ack
+    // issue #21 - peeks rather than drains, so a manual-ack
     // caller that fails to ack (`produce_once`'s own retry tests) gets
     // the identical still-unacked event(s) back on its next GET, the
     // real semantics `GET /v1/events/consume?mode=manual` has. Removal
@@ -497,7 +576,7 @@ fn an_order_placed_event_is_produced_to_kafka_with_its_own_tag_as_the_key() {
         let payload: Value =
             serde_json::from_slice(msg.payload().expect("message must have a payload")).unwrap();
         assert_eq!(payload, json!({ "orderId": "o-42" }));
-        // Codeberg issue #18 - the event's own correlation_id round-trips
+        // issue #18 - the event's own correlation_id round-trips
         // as a real Kafka header, distinct from `key` above (which is
         // derived from the unrelated `order` DCB tag). No causation_id
         // header at all - `causationId: null` on the consumed event
@@ -594,7 +673,7 @@ fn an_inbound_record_message_carries_its_own_real_partition_and_offset_as_dedupe
     });
 }
 
-/// Codeberg issue #18 - the inbound half of the same round trip the
+/// issue #18 - the inbound half of the same round trip the
 /// outbound test above already proves: a real Kafka message carrying
 /// `Skilj-Correlation-Id`/`Skilj-Causation-Id` headers gets them
 /// extracted (`header_str`) and forwarded as `correlationId`/`causationId`
@@ -755,7 +834,7 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_offs
     });
 }
 
-/// Codeberg issue #21 - a message that keeps failing to dispatch is
+/// issue #21 - a message that keeps failing to dispatch is
 /// retried with backoff (the mock's own `fail_external_requests` toggle
 /// makes `POST /v1/events/external` fail exactly twice), then reported
 /// to skilj's own `POST /v1/parked-deliveries` and the offset committed
@@ -940,7 +1019,7 @@ fn a_parked_trigger_message_reports_the_idempotency_key_it_was_sent_with() {
     });
 }
 
-/// Codeberg issue #21 - the outbound direction's own shape: unlike
+/// issue #21 - the outbound direction's own shape: unlike
 /// inbound, exhausting a *configured* `retry_policy` (default is
 /// `RetryPolicy::unbounded` - this test opts into a bounded one
 /// specifically to exercise the cap) skips the event instead of parking
@@ -1044,7 +1123,7 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
     });
 }
 
-/// Codeberg issue #25's investigation (docs/architecture.md §54) - real
+/// issue #25's investigation (docs/architecture.md §54) - real
 /// partitioning proof against a real Kafka broker: two `OutboundMapping`s
 /// for the same `EventType`, different `credential`s (simulating two
 /// independent `EventReadToken`s, each seeing the identical stream - the
@@ -1146,7 +1225,7 @@ fn two_partitioned_mappings_together_produce_every_key_exactly_once() {
         // Every sequence acknowledged on *both* tokens - a partition-skip
         // still advances this instance's own cursor, it just never
         // produces to Kafka.
-        // Codeberg issue #40: each instance acknowledges its whole page -
+        // issue #40: each instance acknowledges its whole page -
         // owned events and partition skips alike - with one call for the
         // last sequence, which moves its cursor past every one of them.
         let last = order_ids.len() as i64 - 1;
@@ -1158,7 +1237,7 @@ fn two_partitioned_mappings_together_produce_every_key_exactly_once() {
     });
 }
 
-/// Codeberg issue #39: a partitioned mapping must never acknowledge an
+/// issue #39: a partitioned mapping must never acknowledge an
 /// event this instance doesn't own *past* an owned one it hasn't
 /// produced yet. The read cursor is a single position, so that ack
 /// would move it beyond the owned event - and if producing that event
@@ -1343,7 +1422,7 @@ fn a_message_whose_park_report_fails_is_never_committed_past() {
     });
 }
 
-/// docs/architecture.md §174 (Codeberg issue #60): partitions are
+/// docs/architecture.md §174 (issue #60): partitions are
 /// dispatched concurrently, one message in flight each. A message that
 /// keeps failing holds up only the messages behind it in its own
 /// partition: the other partition's message is delivered meanwhile, and

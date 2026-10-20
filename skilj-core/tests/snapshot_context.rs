@@ -407,7 +407,7 @@ fn a_stored_row_at_an_old_version_is_treated_as_absent() {
 }
 
 /// Investigation prompted by scoping partitioned/parallel catch-up for
-/// `Snapshot` (following Codeberg issue #25/docs/architecture.md §51's
+/// `Snapshot` (following issue #25/docs/architecture.md §51's
 /// `Projection` work): before building anything on top of `Snapshot`'s
 /// existing `as_of_sequence` guard (`catch_up_snapshots`'s own
 /// pre-fold check, mirroring the guard §50 had to *add* for
@@ -457,7 +457,7 @@ fn two_concurrent_instances_never_double_fold_the_same_snapshot_row() {
     });
 }
 
-/// Codeberg issue #25 (docs/architecture.md §52) -
+/// issue #25 (docs/architecture.md §52) -
 /// `TestSnapshotDispatcher`'s own partitioned twin, delegating
 /// everything except `partition_count` so the tests below don't need
 /// to touch `TestSnapshotDispatcher` or any of its existing
@@ -510,7 +510,7 @@ impl SnapshotDispatcher for PartitionedTestSnapshotDispatcher {
     }
 }
 
-/// Codeberg issue #25 - the `Snapshot` twin of
+/// issue #25 - the `Snapshot` twin of
 /// `partitioned_projection_concurrent_instances_fold_every_key_exactly_once`:
 /// three concurrent instances (`tokio::join!`), `PARTITION_COUNT = 4`,
 /// three distinct accounts (tag values). Every account's final balance
@@ -576,7 +576,7 @@ fn partitioned_snapshot_concurrent_instances_fold_every_tag_value_exactly_once()
     });
 }
 
-/// Codeberg issue #25 - proves a partitioned snapshot's own per-row
+/// issue #25 - proves a partitioned snapshot's own per-row
 /// `as_of_sequence` reaches the latest committed sequence across several
 /// ticks interleaved with new events, mirroring
 /// `partitioned_projection_caught_up_to_never_regresses_and_reaches_latest`.
@@ -625,7 +625,7 @@ fn partitioned_snapshot_as_of_sequence_reaches_latest_across_ticks() {
     });
 }
 
-/// Codeberg issue #25 - `PARTITION_COUNT = 4` with only one real tag
+/// issue #25 - `PARTITION_COUNT = 4` with only one real tag
 /// value touched: three of the four partitions have no matching tag
 /// value in any event, proving idle partitions still advance their own
 /// progress (so the rollup can still reach `latest`) purely from

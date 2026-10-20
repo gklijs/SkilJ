@@ -361,7 +361,7 @@ fn an_event_in_one_bounded_context_eventually_submits_a_command_in_another() {
         }
         assert_eq!(state, Some(r#"{"total":7}"#.to_string()));
 
-        // Codeberg issue #18 - the routed `ReserveStock` command finally
+        // issue #18 - the routed `ReserveStock` command finally
         // has a real answer to "what caused this": its correlation_id is
         // forward-carried from the source `OrderShipped` event (itself
         // generated, since the direct-event submission above supplied

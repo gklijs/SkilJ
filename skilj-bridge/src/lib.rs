@@ -63,7 +63,7 @@ pub struct ConsumedEvent {
 }
 
 /// The subset of `EventDto.metadata`'s wire shape the bridges need - the
-/// two Codeberg-issue-#18 ids, forwarded onto an outbound message.
+/// two issue #18 ids, forwarded onto an outbound message.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumedEventMetadata {
@@ -357,7 +357,7 @@ pub async fn post_inbound(
     Ok(())
 }
 
-/// Codeberg issue #21 - reports a message a bridge's `run_inbound` gave
+/// issue #21 - reports a message a bridge's `run_inbound` gave
 /// up retrying to skilj's own `POST /v1/parked-deliveries`, with the
 /// credential `mapping` already carries (that route resolves the bounded
 /// context from the presented token). `source` names the bridge
@@ -440,7 +440,7 @@ pub fn owns_partition(partition: Option<(u32, u32)>, key: Option<&str>) -> bool 
     }
 }
 
-/// Codeberg issue #21 - the backoff state one outbound mapping's own
+/// issue #21 - the backoff state one outbound mapping's own
 /// blocked head-of-line event carries across [`outbound_cycle`] calls,
 /// threaded in by each bridge's own `run_outbound` (one instance per
 /// mapping). Only the head can ever be blocked: a cycle never attempts an
@@ -517,14 +517,14 @@ enum FailureOutcome {
 /// Returns how many events this cycle delivered *and* acknowledged (0
 /// when the mapping's read cursor is caught up, or when its head event is
 /// still in backoff). An event this instance doesn't own (§54) or gave up
-/// on (Codeberg issue #21) is acknowledged but not counted, so a caller
+/// on (issue #21) is acknowledged but not counted, so a caller
 /// checking "did this cycle make real progress" isn't misled.
 ///
 /// Events are handled strictly in sequence order, one delivery at a time,
 /// so per-key order holds at the broker. Acknowledgements are not sent
 /// per event: the read cursor is a single position that never moves
 /// backwards (§75), so acknowledging the last event of a contiguous run of
-/// handled ones covers the whole run in one call (Codeberg issue #40). A
+/// handled ones covers the whole run in one call (issue #40). A
 /// run is acknowledged before a failed event is dealt with and at the end
 /// of the page - never past an event that hasn't been delivered, which
 /// would move the cursor beyond it and lose it (§169).

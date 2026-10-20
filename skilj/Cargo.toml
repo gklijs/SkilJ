@@ -16,7 +16,7 @@ features = ["local"]
 
 [features]
 default = []
-# Codeberg issue #100: the single-user local mode's embedded Postgres.
+# issue #100: the single-user local mode's embedded Postgres.
 local = ["dep:postgresql_embedded"]
 
 [dependencies]
@@ -24,7 +24,7 @@ skilj-core.workspace = true
 skilj-graphql.workspace = true
 skilj-rest.workspace = true
 skilj-macros.workspace = true
-# Codeberg issue #21 - `SkiljBuilder::cross_context_route_retry_policy`'s
+# issue #21 - `SkiljBuilder::cross_context_route_retry_policy`'s
 # own type.
 skilj-retry.workspace = true
 tokio.workspace = true
@@ -40,19 +40,19 @@ serde_json.workspace = true
 inventory = "0.3"
 tracing.workspace = true
 opentelemetry.workspace = true
-# Codeberg issue #15: bounded concurrent fan-out over per-bounded-context
+# issue #15: bounded concurrent fan-out over per-bounded-context
 # work in SkiljBuilder::build()'s startup warm-up and the background
 # pollers (buffer_unordered) - was previously only a dev-dependency
 # (used in skilj/tests/ for WebSocket stream handling), promoted to a
 # real dependency now that src/lib.rs uses it too.
 futures-util.workspace = true
 thiserror.workspace = true
-# Codeberg issue #100: only with the `local` feature.
+# issue #100: only with the `local` feature.
 postgresql_embedded = { version = "0.21.0", optional = true }
 
 [dev-dependencies]
 skilj-test-support = { path = "../skilj-test-support" }
-# Codeberg issue #25 review (docs/architecture.md §55): the
+# issue #25 review (docs/architecture.md §55): the
 # `fire_due_deadlines` fire-vs-cancel race regression test needs a
 # `deadlines` row in a known state and a cancel-shaped `UPDATE` it
 # controls precisely - both below `db::`'s own public surface, since

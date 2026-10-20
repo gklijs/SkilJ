@@ -1,5 +1,5 @@
 //! End-to-end tests for `skilj-graphql`'s `projectionUpdates` subscription
-//! (Codeberg issue #23). Same real-Postgres/real-JWKS-server/real-websocket
+//! (issue #23). Same real-Postgres/real-JWKS-server/real-websocket
 //! harness as `skilj/tests/event_subscription.rs` - see its own doc comment
 //! for the details, duplicated here rather than extracted into shared
 //! test-support (the same call every prior pass in this project already
@@ -883,7 +883,7 @@ fn projection_updates_only_fires_for_the_subscribed_key() {
     });
 }
 
-/// Codeberg issue #17's whole-projection team gate, reached through
+/// issue #17's whole-projection team gate, reached through
 /// `projectionUpdates` specifically: a Role not carrying `StaffOnlyBalance`'s
 /// required `"support"` name never even gets a stream - the rejection
 /// arrives as the subscription's own first (and only) message, before any

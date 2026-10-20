@@ -1,4 +1,4 @@
-//! End-to-end tests for Codeberg issue #21's admin surface -
+//! End-to-end tests for issue #21's admin surface -
 //! `parkedDeliveries`/`retryParkedDelivery`/`discardParkedDelivery`. Same
 //! real-HTTP-through-`Skilj::graphql_router()`, real-JWKS-server harness
 //! as `skilj/tests/graphql_type_registration.rs` - see its own doc
@@ -892,7 +892,7 @@ fn concurrent_retries_of_one_parked_delivery_redrive_it_once() {
 /// A bridge parks a message that carries a `dedupe` cursor and then
 /// carries on: later messages on the same partition are recorded, moving
 /// that partition's watermark past the parked one. Redriving the parked
-/// message must still create its event - before the fix (Codeberg issue
+/// message must still create its event - before the fix (issue
 /// #58) it reused the original cursor, was taken for a stale
 /// redelivery, created nothing, and the row was deleted as if it had
 /// succeeded.

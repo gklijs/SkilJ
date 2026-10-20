@@ -1,6 +1,6 @@
 //! What `skilj-codegen` generates from `src/banking.skilj.toml` and
 //! `tests/customers.skilj.toml`, checked in so that a change to either
-//! shows up in review (docs/architecture.md §191, Codeberg issue #54).
+//! shows up in review (docs/architecture.md §191, issue #54).
 //! `build.rs` still generates the code that is compiled; this compares
 //! exactly those files, from `OUT_DIR`, against the checked-in copies in
 //! `fixtures/`. A difference fails here until it is re-recorded on

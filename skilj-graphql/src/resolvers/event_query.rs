@@ -110,7 +110,7 @@ pub fn query_events_field(n: &Naming) -> Field {
                     .filter(|v| !v.is_null())
                     .map(|v| v.i64())
                     .transpose()?;
-                // Codeberg issue #18 - "show me everything in this
+                // issue #18 - "show me everything in this
                 // transaction".
                 let correlation_id = ctx
                     .args

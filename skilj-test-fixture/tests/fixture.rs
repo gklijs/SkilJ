@@ -156,7 +156,7 @@ impl CommandType for AdjustCounterFast {
     }
 }
 
-/// Reads the injected time and deadline context (Codeberg issue #97) and
+/// Reads the injected time and deadline context (issue #97) and
 /// reports what it saw through its rejection kind/reason, so a test can
 /// assert on it.
 struct TimeAware;
@@ -192,7 +192,7 @@ fn ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
 }
 
 /// The injected `now` (not the wall clock) reaches `decide()`, and an
-/// ordinary submission carries no deadline (Codeberg issue #97).
+/// ordinary submission carries no deadline (issue #97).
 #[test]
 fn an_injected_now_reaches_decide_with_no_deadline() {
     let now = ts(1_700_000_000);

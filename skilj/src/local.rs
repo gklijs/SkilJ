@@ -1,4 +1,4 @@
-//! Codeberg issue #100 - a supported single-user local mode.
+//! issue #100 - a supported single-user local mode.
 //!
 //! `postgresql_embedded` (already used by the test harnesses) starts a
 //! real Postgres 18 server in a data directory of this process's own,

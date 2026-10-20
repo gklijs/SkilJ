@@ -158,7 +158,7 @@ struct MockSkiljState {
     ack_cursors: Arc<Mutex<std::collections::HashMap<String, i64>>>,
     external_requests: Arc<Mutex<Vec<Value>>>,
     trigger_requests: Arc<Mutex<Vec<TriggerRequest>>>,
-    /// Codeberg issue #21 - `POST /v1/events/external` returns a 500
+    /// issue #21 - `POST /v1/events/external` returns a 500
     /// while this is `> 0`, decrementing it each time - the deterministic
     /// "the target keeps failing" trigger
     /// `an_inbound_message_parks_and_reports_after_exhausting_retries`
@@ -188,7 +188,7 @@ async fn get_events_consume(
     headers: HeaderMap,
 ) -> Json<Value> {
     let token = bearer_token(&headers);
-    // Codeberg issue #21 - peeks rather than drains, so a manual-ack
+    // issue #21 - peeks rather than drains, so a manual-ack
     // caller that fails to ack (`produce_once`'s own retry tests) gets
     // the identical still-unacked event(s) back on its next GET, the
     // real semantics `GET /v1/events/consume?mode=manual` has. Removal
@@ -442,7 +442,7 @@ fn an_order_placed_event_is_published_with_its_own_tag_as_correlation_header() {
             headers.get("Nats-Msg-Id").map(|v| v.to_string()),
             Some("banking:7".to_string())
         );
-        // Codeberg issue #18 - the event's own correlation_id round-trips
+        // issue #18 - the event's own correlation_id round-trips
         // as a distinct `Skilj-Correlation-Id` header, not to be confused
         // with `Skilj-Correlation-Key` above (an unrelated, pre-existing
         // DCB-tag-derived header). No `Skilj-Causation-Id` header at all -
@@ -524,7 +524,7 @@ fn an_inbound_record_message_carries_its_own_real_stream_and_sequence_as_key() {
     });
 }
 
-/// Codeberg issue #18 - the inbound half of the same round trip the
+/// issue #18 - the inbound half of the same round trip the
 /// outbound test above already proves: a real JetStream message carrying
 /// `Skilj-Correlation-Id`/`Skilj-Causation-Id` headers gets them read
 /// back (`InboundMessageMeta::from_message`) and forwarded as
@@ -645,7 +645,7 @@ fn an_inbound_trigger_message_derives_its_idempotency_key_from_its_own_real_msg_
     });
 }
 
-/// Codeberg issue #21 - a message that keeps failing to dispatch is
+/// issue #21 - a message that keeps failing to dispatch is
 /// retried with backoff (the mock's own `fail_external_requests` toggle
 /// makes `POST /v1/events/external` fail exactly twice), then reported
 /// to skilj's own `POST /v1/parked-deliveries` and the message acked
@@ -723,7 +723,7 @@ fn an_inbound_message_parks_and_reports_after_exhausting_retries() {
     });
 }
 
-/// Codeberg issue #21 - the outbound direction's own shape: unlike
+/// issue #21 - the outbound direction's own shape: unlike
 /// inbound, exhausting a *configured* `retry_policy` (default is
 /// `RetryPolicy::unbounded` - this test opts into a bounded one
 /// specifically to exercise the cap) skips the event instead of parking
@@ -826,7 +826,7 @@ fn an_outbound_event_is_skipped_after_exhausting_a_configured_retry_cap() {
     });
 }
 
-/// Codeberg issue #25's investigation (docs/architecture.md §54) - the
+/// issue #25's investigation (docs/architecture.md §54) - the
 /// NATS twin of `skilj_kafka`/`skilj_amqp`'s own
 /// `two_partitioned_mappings_together_produce_every_key_exactly_once`/
 /// `..._send_every_key_exactly_once`: two `OutboundMapping`s for the
@@ -923,7 +923,7 @@ fn two_partitioned_mappings_together_publish_every_key_exactly_once() {
             "every key must be published exactly once across both partitions"
         );
 
-        // Codeberg issue #40: each instance acknowledges its whole page -
+        // issue #40: each instance acknowledges its whole page -
         // owned events and partition skips alike - with one call for the
         // last sequence, which moves its cursor past every one of them.
         let last = order_ids.len() as i64 - 1;
@@ -1199,7 +1199,7 @@ fn a_non_json_message_is_parked_at_once_with_its_raw_content() {
     });
 }
 
-/// Codeberg issue #59: JetStream redelivers an unacknowledged message only
+/// issue #59: JetStream redelivers an unacknowledged message only
 /// after `ack_wait`, and delivers newer messages meanwhile. A bridge that
 /// stops while retrying a message - an ordinary restart - leaves it (and
 /// everything it had already pulled) unacknowledged; the next bridge

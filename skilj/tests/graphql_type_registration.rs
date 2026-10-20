@@ -861,7 +861,7 @@ fn register_projection_rejects_a_repeated_consumed_event_type() {
     });
 }
 
-/// Codeberg issue #6's "5a" - the self-describing GraphQL surface a real
+/// issue #6's "5a" - the self-describing GraphQL surface a real
 /// command/event type picker needs, closing the gap `scheduledEventTypes`
 /// alone left (only the scheduled subset was ever listable). `eventTypes`/
 /// `commandTypes` return every registered type in the bounded context,

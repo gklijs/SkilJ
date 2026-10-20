@@ -1,4 +1,4 @@
-//! Tests for Codeberg issue #18 (correlation/causation ids on commands
+//! Tests for issue #18 (correlation/causation ids on commands
 //! and events) - `process_command`'s own generate-if-absent/inherit
 //! behaviour, `create_external_event`/`create_direct_event`'s identical
 //! generate-if-absent behaviour, and `valid_correlation_id`'s length

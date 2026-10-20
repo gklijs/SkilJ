@@ -1,4 +1,4 @@
-//! What an application sharing skilj's Postgres loses, for Codeberg issue
+//! What an application sharing skilj's Postgres loses, for issue
 //! #46 - a benchmark, not a test, so `#[ignore]`d. Run with:
 //!
 //! ```sh
