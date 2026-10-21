@@ -60,7 +60,7 @@ Every public enum of the library crates is `#[non_exhaustive]` (docs/architectur
 The full CI pipeline (see `.github/workflows/ci.yml`; GitHub Actions, docs/architecture.md §222) runs these as parallel jobs, steps 8-9 and 10-11 in one each:
 1. actionlint — checks the workflow file itself, including shellcheck on its `run:` blocks
 2. `scripts/check-section-refs.sh` — validates all "§N" citations in `docs/architecture.md`
-3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace
+3. `scripts/check-template.sh` — generates and builds `templates/skilj-template` against this workspace, then runs its quickstart (embedded Postgres, a deposit accepted, an overdraft rejected); `--no-run` skips the run
 4. `scripts/check-federation-composition.sh` — composes the recorded federation descriptions with Apollo's and Hive's composition
 5. `cargo fmt --all -- --check`
 6. `cargo deny check` — RustSec advisories, licenses, banned crates and sources, per `deny.toml`

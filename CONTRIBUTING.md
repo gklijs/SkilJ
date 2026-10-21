@@ -214,8 +214,12 @@ far as a test exercises them, and some aren't checked at all
   value appears in no stored tag, query or payload, that racing claims
   accept one, and that erasure removes the hash from the database and
   from the event cache.
-- **The template**: `scripts/check-template.sh` generates it and builds
-  it, but doesn't run it.
+- **The template**: `scripts/check-template.sh` generates it, builds it
+  with and without its `local` feature, and runs the README's quickstart:
+  the server starts its own embedded Postgres, a deposit is accepted, a
+  larger withdrawal is rejected, and Ctrl-C stops it cleanly. CI runs it
+  on the bare runner, so the embedded Postgres is downloaded as a reader's
+  would be; `--no-run` skips the run on a machine that can't start it.
 - **Federation composition**: `skilj/tests/graphql_federation.rs` checks
   what `/graphql` publishes as a subgraph and records it, and
   `scripts/check-federation-composition.sh` composes that with Apollo's

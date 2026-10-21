@@ -11,18 +11,32 @@ projection - see `src/wallet.rs`).
 ## Run it
 
 ```sh
+cargo run --bin server
+```
+
+With no `DATABASE_URL` set, this starts an embedded Postgres of its own
+(skilj's single-user local mode), downloading it on the first run and
+keeping its data in your user data directory between runs. To use your
+own Postgres instead:
+
+```sh
 export DATABASE_URL=postgres://user:pass@localhost:5432/{{crate_name}}
 cargo run --bin server
 ```
 
-Prints a `CommandToken` for each of `Deposit`/`Withdraw` - use one to
-trigger a command:
+It prints a `CommandToken` for each of `Deposit`/`Withdraw`, and
+ready-to-paste commands to try them from another terminal:
 
 ```sh
-curl -H 'authorization: Bearer <id>.<secret>' -H 'content-type: application/json' \
-     -d '{"payload":{"wallet_id":"w1","amount":100}}' \
-     http://localhost:8080/v1/commands/trigger
+export DEPOSIT=<id>.<secret> WITHDRAW=<id>.<secret>
+curl localhost:8080/v1/commands/trigger -H "authorization: Bearer $DEPOSIT" \
+     -H 'content-type: application/json' -d '{"payload":{"wallet_id":"w1","amount":100}}'
+curl localhost:8080/v1/commands/trigger -H "authorization: Bearer $WITHDRAW" \
+     -H 'content-type: application/json' -d '{"payload":{"wallet_id":"w1","amount":500}}'
 ```
+
+The second one is rejected: the wallet holds 100, and `Withdraw` decides
+against every `Deposited`/`Withdrawn` event of that wallet.
 
 ## Docker
 
@@ -30,6 +44,9 @@ curl -H 'authorization: Bearer <id>.<secret>' -H 'content-type: application/json
 docker build -t {{project-name}} .
 docker run --env DATABASE_URL=postgres://user:pass@host:5432/{{crate_name}} -p 8080:8080 {{project-name}}
 ```
+
+The image is built without the embedded-Postgres `local` feature, so it
+always needs `DATABASE_URL`.
 
 The image is `FROM scratch` - no shell, no package manager, nothing
 besides the binary and a CA bundle. That means `docker exec ... sh` (or

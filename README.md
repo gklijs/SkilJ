@@ -1,9 +1,25 @@
 # SkilJ
 
+[![crates.io](https://img.shields.io/crates/v/skilj.svg)](https://crates.io/crates/skilj)
+[![docs.rs](https://img.shields.io/docsrs/skilj)](https://docs.rs/skilj)
+[![CI](https://github.com/gklijs/SkilJ/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gklijs/SkilJ/actions/workflows/ci.yml)
+[![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
+[![license: MIT OR Apache-2.0](https://img.shields.io/crates/l/skilj.svg)](#license)
+
 `skilj` is a Rust library for building event-sourced applications backed by Postgres. You define
 your domain as **events** (facts that happened) and **commands** (requests to make something
 happen), and `skilj` handles storage, consistency checking, and exposing it all over GraphQL and
 REST — so you can focus on the domain logic itself.
+
+Try it in a minute, with nothing but Rust installed (no database to set up):
+
+```sh
+cargo install cargo-generate
+cargo generate --git https://github.com/gklijs/SkilJ.git templates/skilj-template --name my-wallet
+cd my-wallet && cargo run --bin server
+```
+
+![A generated skilj project starting with its own embedded Postgres, then accepting a deposit, rejecting a withdrawal larger than the balance, and accepting a smaller one](https://raw.githubusercontent.com/gklijs/SkilJ/main/docs/quickstart.gif)
 
 ## Why not classic aggregates?
 
@@ -117,7 +133,9 @@ cargo generate --git https://github.com/gklijs/SkilJ.git templates/skilj-templat
 ```
 
 That gives you a runnable server with one bounded context (the wallet example above) already
-wired up — see its own README for how to run it against Postgres.
+wired up. Without `DATABASE_URL` it starts an embedded Postgres of its own, keeping its data
+between runs (docs/architecture.md §216); set `DATABASE_URL` to use your own Postgres instead.
+See its own README for more.
 
 To add `skilj` to an existing project instead:
 

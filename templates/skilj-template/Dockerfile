@@ -13,7 +13,9 @@ FROM rust:1-alpine AS builder
 RUN apk add --no-cache musl-dev ca-certificates
 WORKDIR /app
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl
+# Without the embedded-Postgres `local` feature: a container is given a
+# DATABASE_URL, and the image has nothing to run a Postgres with anyway.
+RUN cargo build --release --target x86_64-unknown-linux-musl --no-default-features
 
 # `x86_64-unknown-linux-musl` statically links by default (the target's
 # `crt-static` default) - that's the actual precondition for `scratch`

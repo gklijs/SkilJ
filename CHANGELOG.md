@@ -10,6 +10,15 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+### Fixed
+
+- Local mode (`skilj::local`, the template's quickstart, `skilj-demo --local`)
+  failed to start on any machine without Postgres already installed:
+  `invalid value for parameter "TimeZone": "UTC"`. The newest 18.x build
+  (18.6.1) loses its bundled UTC timezone on extraction, an upstream bug
+  (theseus-rs/postgresql-embedded#263). Local mode now installs exactly
+  18.6.0 (docs/architecture.md §224).
+
 ### Changed
 
 - The repository moved from Codeberg to GitHub
@@ -18,6 +27,11 @@ README.md, "Status and stability").
   Actions instead of Woodpecker, with the same checks.
 - The published crates have crates.io keywords and categories, so a
   search for "event-sourcing", "cqrs" or "dcb" finds them.
+- `skilj-template` runs without a database: with no `DATABASE_URL` set,
+  its server starts an embedded Postgres (skilj's local mode, through a
+  default `local` feature the Dockerfile builds without), and it prints
+  ready-to-paste commands to try. The README opens with this quickstart,
+  and CI runs it (`scripts/check-template.sh`).
 
 ## [0.1.0] - 2026-10-19
 

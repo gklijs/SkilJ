@@ -28,7 +28,9 @@
 //! unpinned, `postgresql_embedded` installs the newest release it finds, so
 //! a new machine or a cleared install cache could fetch a newer major and
 //! fail to start on existing data. Moving to a newer major is a deliberate
-//! dump-and-restore, not something a dependency update should do.
+//! dump-and-restore, not something a dependency update should do. For
+//! now it is pinned to one exact release, 18.6.0, working around an
+//! upstream bug in 18.6.1 (docs/architecture.md §224).
 //!
 //! Enabled by the `local` feature, so a consuming application that
 //! already brings its own Postgres pays nothing for it.
@@ -43,10 +45,18 @@ use std::time::Duration;
 const LOCAL_USER: &str = "postgres";
 const DEFAULT_DATABASE: &str = "skilj";
 
-/// The Postgres major version local mode installs and runs: any 18.x, never
-/// 19. See this module's own docs.
+/// The Postgres version local mode installs and runs: exactly 18.6.0 for
+/// now, and never 19. See this module's own docs.
+///
+/// Exactly 18.6.0 rather than any 18.x because of an upstream bug
+/// (theseus-rs/postgresql-embedded#263): the 18.6.1 builds bundle their
+/// own timezone data, with `UTC` and `Etc/UTC` as tar hardlinks that
+/// `postgresql_archive`'s extractor skips, so every connection asking for
+/// `TimeZone=UTC` - sqlx's, and `postgresql_embedded`'s own - is refused.
+/// 18.6.0 uses the system's `/usr/share/zoneinfo` instead. Relax this back
+/// to `postgresql_embedded::V18` once a fixed release is out.
 pub fn postgres_version() -> VersionReq {
-    postgresql_embedded::V18.clone()
+    VersionReq::parse("=18.6.0").expect("a valid version requirement")
 }
 
 /// Where and how [`LocalPostgres::start`] runs its server.
@@ -771,9 +781,11 @@ mod tests {
     }
 
     #[test]
-    fn the_major_version_is_pinned() {
+    fn the_version_is_pinned() {
         let version = postgres_version();
-        assert!(version.matches(&postgresql_embedded::Version::new(18, 1, 0)));
+        assert!(version.matches(&postgresql_embedded::Version::new(18, 6, 0)));
+        // 18.6.1 drops its bundled UTC timezone on extraction (upstream #263).
+        assert!(!version.matches(&postgresql_embedded::Version::new(18, 6, 1)));
         assert!(!version.matches(&postgresql_embedded::Version::new(19, 0, 0)));
     }
 }
