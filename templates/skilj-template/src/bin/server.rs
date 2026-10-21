@@ -26,8 +26,20 @@ use skilj::Skilj;
 
 const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw"];
 
+// A `main` returning `Result` prints its error with `Debug`; this prints
+// the message instead, which for local mode says what to install or set.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "local")]
     let local_postgres = match std::env::var("DATABASE_URL") {
         Ok(_) => None,

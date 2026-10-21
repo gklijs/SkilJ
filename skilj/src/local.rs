@@ -276,6 +276,15 @@ impl LocalPostgres {
 
         let mut server = PostgreSQL::new(settings);
         server.setup().await?;
+        // Every connection asks for `TimeZone=UTC` (sqlx's default, and
+        // `postgresql_embedded`'s own), and the server refuses it with no
+        // hint of why when it has no UTC zone file; say which file instead.
+        if let Some((path, fix)) = missing_utc_zone(
+            &server.settings().installation_dir,
+            Path::new(SYSTEM_ZONEINFO),
+        ) {
+            return Err(Error::MissingTimezoneData { path, fix });
+        }
         server.start().await?;
         if !server.database_exists(&config.database).await? {
             server.create_database(&config.database).await?;
@@ -307,10 +316,7 @@ impl LocalPostgres {
         let existing_major = std::fs::read_to_string(config.data_dir.join("PG_VERSION"))
             .ok()
             .and_then(|version| version.trim().parse::<u32>().ok());
-        let bin_dir = system_pg_bin(existing_major).ok_or_else(|| Error::InvalidConfig {
-            variable: "SKILJ_TEST_PGBIN".to_string(),
-            value: "running as root, and no system PostgreSQL server binaries were found (install `postgresql`, or set SKILJ_TEST_PGBIN)".to_string(),
-        })?;
+        let bin_dir = system_pg_bin(existing_major).ok_or(Error::NoSystemPostgres)?;
         // Outside `data_dir`: `initdb` refuses a directory that already has
         // anything in it.
         let socket_dir = config.data_dir.with_extension("sockets");
@@ -577,6 +583,34 @@ fn refuse_trust_authentication(data_dir: &Path) -> Result<(), Error> {
 }
 
 /// Whether this process runs as root, which Postgres refuses to.
+/// Where a Postgres built `--with-system-tzdata` reads its time zones -
+/// what 18.6.0, the version [`postgres_version`] pins, is built with.
+const SYSTEM_ZONEINFO: &str = "/usr/share/zoneinfo";
+
+/// The UTC zone file the installed server would read, and how to provide
+/// it, when that file is missing. A build with its own `share/timezone`
+/// reads only that one, whatever the system has; any other build reads the
+/// system's tzdata.
+fn missing_utc_zone(installation_dir: &Path, system_zoneinfo: &Path) -> Option<(PathBuf, String)> {
+    let bundled = installation_dir.join("share").join("timezone");
+    if bundled.is_dir() {
+        let utc = bundled.join("UTC");
+        return (!utc.exists()).then(|| {
+            let fix = format!(
+                "this Postgres install lacks its own UTC time zone \
+                 (theseus-rs/postgresql-embedded#263); delete {} to reinstall it",
+                installation_dir.display()
+            );
+            (utc, fix)
+        });
+    }
+    let utc = system_zoneinfo.join("UTC");
+    (!utc.exists()).then(|| {
+        let fix = "install the system's time zone data, the `tzdata` package".to_string();
+        (utc, fix)
+    })
+}
+
 fn running_as_root() -> bool {
     std::process::Command::new("id")
         .arg("-u")
@@ -584,13 +618,16 @@ fn running_as_root() -> bool {
         .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
 }
 
-/// The system's Postgres server binaries: `SKILJ_TEST_PGBIN`; else, for
-/// an existing data directory, the `/usr/lib/postgresql/<major>/bin` that
+/// The system's Postgres server binaries: `SKILJ_LOCAL_PGBIN` (or
+/// `SKILJ_TEST_PGBIN`, its name before 0.1.1, still read); else, for an
+/// existing data directory, the `/usr/lib/postgresql/<major>/bin` that
 /// matches its `PG_VERSION` (a data directory only opens under the major
 /// version that created it); else the newest one there (Debian's layout);
 /// else wherever `pg_ctl` is on the `PATH`.
 fn system_pg_bin(existing_major: Option<u32>) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("SKILJ_TEST_PGBIN") {
+    if let Ok(dir) =
+        std::env::var("SKILJ_LOCAL_PGBIN").or_else(|_| std::env::var("SKILJ_TEST_PGBIN"))
+    {
         return Some(dir.into());
     }
     if let Some(major) = existing_major {
@@ -664,6 +701,25 @@ pub enum Error {
         variable: String,
         /// Its value, or why nothing usable was found.
         value: String,
+    },
+
+    /// Running as root, local mode runs the system's Postgres server
+    /// binaries as the `postgres` user, and none were found.
+    #[error(
+        "local Postgres: running as root, which needs the system's PostgreSQL server \
+         binaries, and none were found; install `postgresql`, or set SKILJ_LOCAL_PGBIN to \
+         their directory"
+    )]
+    NoSystemPostgres,
+
+    /// The installed server has no UTC time zone to read, so it would refuse
+    /// every connection (`invalid value for parameter "TimeZone": "UTC"`).
+    #[error("local Postgres: no UTC time zone at {path}: {fix}")]
+    MissingTimezoneData {
+        /// The zone file the server would read.
+        path: PathBuf,
+        /// How to provide it.
+        fix: String,
     },
 
     /// The configured database name has characters other than ASCII
@@ -778,6 +834,35 @@ mod tests {
             refuse_trust_authentication(&dir),
             Err(Error::TrustAuthentication { .. })
         ));
+    }
+
+    #[test]
+    fn a_bundled_time_zone_database_needs_its_own_utc() {
+        let install = temp_path("tz-bundled").with_extension("install");
+        let zones = install.join("share").join("timezone");
+        std::fs::create_dir_all(&zones).unwrap();
+        // The system has UTC, but a bundled build never reads it.
+        let system = temp_path("tz-system").with_extension("zoneinfo");
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(system.join("UTC"), "TZif").unwrap();
+        let (path, fix) = missing_utc_zone(&install, &system).expect("UTC missing");
+        assert_eq!(path, zones.join("UTC"));
+        assert!(fix.contains("#263"), "{fix}");
+        std::fs::write(zones.join("UTC"), "TZif").unwrap();
+        assert!(missing_utc_zone(&install, &system).is_none());
+    }
+
+    #[test]
+    fn any_other_build_needs_the_system_utc() {
+        let install = temp_path("tz-plain").with_extension("install");
+        std::fs::create_dir_all(install.join("share")).unwrap();
+        let system = temp_path("tz-none").with_extension("zoneinfo");
+        let (path, fix) = missing_utc_zone(&install, &system).expect("UTC missing");
+        assert_eq!(path, system.join("UTC"));
+        assert!(fix.contains("tzdata"), "{fix}");
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(system.join("UTC"), "TZif").unwrap();
+        assert!(missing_utc_zone(&install, &system).is_none());
     }
 
     #[test]

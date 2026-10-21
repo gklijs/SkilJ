@@ -385,8 +385,20 @@ fn init_telemetry() -> Option<TelemetryProviders> {
     })
 }
 
+// A `main` returning `Result` prints its error with `Debug`; this prints
+// the message instead, which for local mode says what to install or set.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let telemetry = init_telemetry();
 
     // issue #100: `--local` (or `SKILJ_LOCAL_MODE=1`) starts an

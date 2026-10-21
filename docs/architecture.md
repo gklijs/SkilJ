@@ -12569,7 +12569,7 @@ warning.
 
 **Running as root: the system's Postgres instead.** `initdb` and
 `postgres` refuse to run as root, so when this process is root `start()`
-uses the system's server binaries (`SKILJ_TEST_PGBIN`, or for an existing
+uses the system's server binaries (`SKILJ_LOCAL_PGBIN` - `SKILJ_TEST_PGBIN` before 0.1.1, still read - or for an existing
 data directory the `/usr/lib/postgresql/<major>/bin` matching its
 `PG_VERSION`, else the newest installed, else `pg_ctl` on the `PATH`), run
 as the `postgres` user through `runuser`. The login rules are the same as
@@ -12951,3 +12951,13 @@ Not done: `cargo-nextest`, which runs each test in its own process. Every test b
 The cause is upstream, from the day of that run (theseus-rs/postgresql-embedded#263). The Postgres 18.6.1 builds bundle their own timezone data instead of reading `/usr/share/zoneinfo` (the fix for a NixOS report, theseus-rs/postgresql-binaries#21). In that archive `share/timezone/UTC` and `Etc/UTC` are tar hardlinks to `UCT`, and `postgresql_archive`'s extractor skips hardlinks, so they never reach the disk. sqlx asks for `TimeZone=UTC` on every connection, so nothing can connect. Local mode accepted any 18.x (`postgresql_embedded::V18`), so every machine without a cached install got 18.6.1 and failed - published 0.1.0 included. Machines with 18.6.0 already installed kept working, which is why it passed locally.
 
 `local::postgres_version` is now `=18.6.0`, which reads the system's timezone data. Its cost is the one #21 was about: a system without `/usr/share/zoneinfo` (NixOS without it, a minimal container) can't use it - as before 18.6.1. A data directory created by 18.6.1 can't have been used, since that version never got past the first connection. Relax the requirement back to `V18` once a release with hardlink extraction is out; `the_version_is_pinned` asserts 18.6.1 is excluded, so that change is a deliberate one.
+
+## 225. Local mode says why it can't start
+
+Two of local mode's start failures named the wrong thing.
+
+**Running as root without the system's Postgres** answered `InvalidConfig` naming `SKILJ_TEST_PGBIN`, the test harness's variable (`skilj-test-support`), in an error a user of `skilj::local` sees. The variable is now `SKILJ_LOCAL_PGBIN`, with `SKILJ_TEST_PGBIN` still read so nothing set up before 0.1.1 breaks, and the error is its own variant, `local::Error::NoSystemPostgres`, saying what to install or set.
+
+**No UTC time zone** surfaced as Postgres refusing the first connection: `invalid value for parameter "TimeZone": "UTC"` - from sqlx's and `postgresql_embedded`'s own `TimeZone=UTC` - which names neither the file nor the fix. With 18.6.0 pinned (§224) local mode reads the system's tzdata, so a minimal container without `tzdata` hits this. After installing, before starting, `start()` now checks the file the server would read and answers `local::Error::MissingTimezoneData` with its path and the fix. A build with its own `share/timezone` reads only that, so it needs `UTC` there (the 18.6.1 bug, fixed by deleting the install); any other build needs `/usr/share/zoneinfo/UTC` (fixed by installing `tzdata`). Checking the build's layout rather than the pinned version keeps the check right once the pin is relaxed.
+
+Tests: `a_bundled_time_zone_database_needs_its_own_utc` and `any_other_build_needs_the_system_utc` (`skilj/src/local.rs`), plus a run of the template's server in an Ubuntu 24.04 container without `tzdata`, as root without `postgresql`, and as a normal user with both.
