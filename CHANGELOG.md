@@ -18,6 +18,15 @@ README.md, "Status and stability").
   (18.6.1) loses its bundled UTC timezone on extraction, an upstream bug
   (theseus-rs/postgresql-embedded#263). Local mode now installs exactly
   18.6.0 (docs/architecture.md §224).
+- Local mode says why it can't start instead of failing obscurely: without
+  the system's time zone data it names the missing file and the `tzdata`
+  package (`local::Error::MissingTimezoneData`), and running as root
+  without the system's Postgres it says what to install
+  (`local::Error::NoSystemPostgres`). The variable naming those binaries is
+  now `SKILJ_LOCAL_PGBIN`; `SKILJ_TEST_PGBIN` is still read
+  (docs/architecture.md §225).
+- The template's and `skilj-demo`'s servers print a startup error's message
+  rather than its `Debug` form, so these messages reach the reader.
 
 ### Changed
 
