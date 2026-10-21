@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "The skilj REST client side the message-broker bridges (skilj-kafka/skilj-amqp/skilj-nats) share: consuming and acknowledging events, recording or triggering from inbound messages, reporting parked deliveries, and partition ownership. Speaks skilj's wire protocol only, no dependency on skilj-core."
+description = "The shared skilj side of the Kafka, AMQP and NATS bridges: consuming skilj's event stream over REST and recording or triggering from inbound messages."
+keywords = ["event-sourcing", "messaging", "skilj"]
+categories = ["network-programming"]
 
 [lib]
 name = "skilj_bridge"

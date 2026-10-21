@@ -16,6 +16,8 @@ README.md, "Status and stability").
   (https://github.com/gklijs/SkilJ), issues and pull requests included,
   with their numbers kept (docs/architecture.md §222). CI runs on GitHub
   Actions instead of Woodpecker, with the same checks.
+- The published crates have crates.io keywords and categories, so a
+  search for "event-sourcing", "cqrs" or "dcb" finds them.
 
 ## [0.1.0] - 2026-10-19
 

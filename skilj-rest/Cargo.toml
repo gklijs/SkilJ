@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "SkilJ's REST surface: narrowly-scoped AccessToken-authenticated routes for agents and automated callers. See docs/architecture.md §7."
+description = "skilj's REST API: token-authenticated routes for services, agents and automated callers. Internal: use it through the skilj crate."
+keywords = ["event-sourcing", "rest", "dcb", "http", "skilj"]
+categories = ["web-programming::http-server"]
 
 [dependencies]
 skilj-core.workspace = true

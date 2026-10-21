@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "build.rs codegen for skilj's own declarative bounded-context format (issue #5's narrower cut, see docs/architecture.md §16/§17) - turns a .skilj.toml file's event/command type shapes into real Rust EventType/CommandType impls, the shared per-bounded-context event enum, and its BoundedContextEvent impl. decide() bodies stay hand-written Rust the generated code calls into; Projection generation is deliberately out of scope, see §17."
+description = "Generates skilj event and command types from a declarative .skilj.toml file in build.rs. Command decisions stay hand-written Rust."
+keywords = ["event-sourcing", "codegen", "build-script", "skilj"]
+categories = ["development-tools::build-utils"]
 
 [dependencies]
 serde.workspace = true

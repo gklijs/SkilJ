@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-description = "A bridge between skilj's own event stream and Temporal, correlating a running Temporal workflow execution to a skilj bounded context's own DCB tags. See docs/architecture.md §34."
+description = "A bridge between skilj and Temporal: starts or signals workflow executions from skilj events, correlated by their DCB tags."
+keywords = ["temporal", "workflow", "saga", "event-sourcing", "skilj"]
+categories = ["asynchronous"]
 
 [dependencies]
 tokio.workspace = true

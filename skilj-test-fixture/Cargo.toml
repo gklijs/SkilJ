@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "A given/when/then test harness for a skilj plugin author's own CommandType::decide()/Projection::project() - no database, no HTTP. See docs/architecture.md §45 (issue #19)."
+description = "Given/when/then tests for skilj command decisions and projections, without a database or HTTP."
+keywords = ["event-sourcing", "testing", "given-when-then", "skilj"]
+categories = ["development-tools::testing"]
 
 [dependencies]
 skilj-core.workspace = true

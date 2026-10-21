@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "Two narrowly-scoped proc-macros (docs/architecture.md §1.3.1/§1.3.2): #[requires_role(...)] on a CommandType impl, and gql_object! for skilj-graphql's own wire-type builders. Neither reopens skilj-core's plugin API to macros generally."
+description = "Proc-macros for skilj: #[auto_register] and #[requires_role] for event and command types, and gql_object! for skilj-graphql."
+keywords = ["event-sourcing", "proc-macro", "skilj"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

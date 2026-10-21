@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "A Ratatui operator console for any skilj deployment - a GraphQL client, independent of every other skilj crate. See docs/architecture.md §11."
+description = "A terminal console for any skilj deployment over GraphQL: browse events and projections, submit commands, handle parked deliveries."
+keywords = ["event-sourcing", "tui", "ratatui", "graphql", "skilj"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 tokio = { workspace = true }

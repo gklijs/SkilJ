@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "A bridge between skilj's own event stream and NATS JetStream - producing mapped EventTypes to a subject, and consuming a subject into ExternalEventIngestion/CommandTrigger. See docs/architecture.md §42."
+description = "A bridge between skilj and NATS JetStream: publishes skilj events to subjects, and turns consumed messages into skilj events or commands."
+keywords = ["nats", "jetstream", "event-sourcing", "messaging", "skilj"]
+categories = ["network-programming"]
 
 [dependencies]
 tokio.workspace = true

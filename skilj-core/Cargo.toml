@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "SkilJ's domain engine: entities, rules, the plugin API, and persistence. Zero web-framework dependency - see docs/architecture.md §3."
+description = "The engine behind skilj: event storage, DCB consistency checks, projections and the plugin API for event and command types. Most applications use it through the skilj crate."
+keywords = ["event-sourcing", "cqrs", "dcb", "postgres", "ddd"]
+categories = ["database"]
 
 [dependencies]
 tokio.workspace = true

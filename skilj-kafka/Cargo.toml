@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-description = "A bridge between skilj's own event stream and Kafka - producing mapped EventTypes to topics, and consuming topics into ExternalEventIngestion/CommandTrigger. See docs/architecture.md §40."
+description = "A bridge between skilj and Kafka: publishes skilj events to topics, and turns consumed messages into skilj events or commands."
+keywords = ["kafka", "event-sourcing", "messaging", "cqrs", "skilj"]
+categories = ["network-programming"]
 
 [dependencies]
 tokio.workspace = true
