@@ -3,6 +3,13 @@ name = "{{project-name}}"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Without DATABASE_URL, `cargo run --bin server` starts an embedded Postgres
+# of its own (skilj's single-user local mode). The Dockerfile builds without
+# it, since a container is always given a DATABASE_URL.
+default = ["local"]
+local = ["skilj/local"]
+
 [dependencies]
 skilj = "0.1"
 skilj-core = "0.1"

@@ -12943,3 +12943,11 @@ The first GitHub Actions run (§222) took 18 minutes and failed. Both have one f
 **rust-cache saves only on `main`** (`save-if`). A pull request reads `main`'s cache, and a cache scoped to one PR, which nothing else can read, would only push `main`'s out of the repository's 10 GB limit. The caches start paying off once this is on `main`.
 
 Not done: `cargo-nextest`, which runs each test in its own process. Every test binary drops and recreates its own database on first use (§167), so processes of one binary would drop it from under each other. After these changes the test run itself is about 6.5 minutes, 157s of it `skilj/tests/graphql_business_surfaces.rs`.
+
+## 224. Local mode pins Postgres 18.6.0
+
+`check-template.sh` runs the README's quickstart on a fresh CI runner (§105), and the first run failed: the embedded Postgres started, but `postgresql_embedded`'s own connection was refused with `FATAL: invalid value for parameter "TimeZone": "UTC"`. Reproduced as a non-root user in an Ubuntu 24.04 container, with and without the host's `tzdata`.
+
+The cause is upstream, from the day of that run (theseus-rs/postgresql-embedded#263). The Postgres 18.6.1 builds bundle their own timezone data instead of reading `/usr/share/zoneinfo` (the fix for a NixOS report, theseus-rs/postgresql-binaries#21). In that archive `share/timezone/UTC` and `Etc/UTC` are tar hardlinks to `UCT`, and `postgresql_archive`'s extractor skips hardlinks, so they never reach the disk. sqlx asks for `TimeZone=UTC` on every connection, so nothing can connect. Local mode accepted any 18.x (`postgresql_embedded::V18`), so every machine without a cached install got 18.6.1 and failed - published 0.1.0 included. Machines with 18.6.0 already installed kept working, which is why it passed locally.
+
+`local::postgres_version` is now `=18.6.0`, which reads the system's timezone data. Its cost is the one #21 was about: a system without `/usr/share/zoneinfo` (NixOS without it, a minimal container) can't use it - as before 18.6.1. A data directory created by 18.6.1 can't have been used, since that version never got past the first connection. Relax the requirement back to `V18` once a release with hardlink extraction is out; `the_version_is_pinned` asserts 18.6.1 is excluded, so that change is a deliberate one.

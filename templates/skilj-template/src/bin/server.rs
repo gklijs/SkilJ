@@ -3,8 +3,11 @@
 //! process serving both REST and GraphQL, prints `CommandToken`
 //! credentials for `Deposit`/`Withdraw`, and then serves until killed.
 //!
-//! Needs `DATABASE_URL` pointing at a real Postgres (`PORT` optionally
-//! overrides the default `8080`). Safe to re-run against the same
+//! Uses the Postgres `DATABASE_URL` points at. Without it, the default
+//! `local` feature starts an embedded Postgres owned by this process, with
+//! its data kept between runs (see `skilj::local` for where, and the
+//! `SKILJ_LOCAL_*` settings). `PORT` optionally overrides the default
+//! `8080`. Safe to re-run against the same
 //! database: the bounded context is only created if it doesn't exist
 //! yet, and each run mints its own fresh admin `Role` and
 //! `CommandToken`s rather than reusing a previous run's.
@@ -25,6 +28,26 @@ const COMMAND_TYPES: &[&str] = &["Deposit", "Withdraw"];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "local")]
+    let local_postgres = match std::env::var("DATABASE_URL") {
+        Ok(_) => None,
+        Err(_) => {
+            let config = skilj::local::LocalConfig::from_env()?;
+            let postgres = skilj::local::LocalPostgres::start(config).await?;
+            println!(
+                "no DATABASE_URL: started an embedded Postgres at {} (data in {})",
+                postgres.display_url(),
+                postgres.data_dir().display()
+            );
+            Some(postgres)
+        }
+    };
+    #[cfg(feature = "local")]
+    let database_url = match &local_postgres {
+        Some(postgres) => postgres.database_url().to_string(),
+        None => std::env::var("DATABASE_URL")?,
+    };
+    #[cfg(not(feature = "local"))]
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set, e.g. postgres://user:pass@localhost:5432/wallet_demo");
     let port: u16 = std::env::var("PORT")
@@ -46,11 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\ncommand tokens (send as `authorization: Bearer <id>.<secret>`):");
+    let mut tokens = Vec::new();
     for command_type_name in COMMAND_TYPES {
         let token = admin
             .create_command_token(bounded_context, command_type_name)
             .await?;
         println!("  {bounded_context}/{command_type_name}: {token}");
+        tokens.push(token);
     }
     admin.close().await;
 
@@ -61,11 +86,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     println!("\nlistening on http://localhost:{port} (REST under /v1/..., GraphQL at /graphql)");
 
-    let example_payload = serde_json::json!({ "payload": { "wallet_id": "w1", "amount": 100 } });
-    println!("\nexample - deposit into wallet \"w1\":");
-    println!("  curl -H 'authorization: Bearer <Deposit token>' -H 'content-type: application/json' \\");
-    println!("       -d '{}' \\", example_payload);
-    println!("       http://localhost:{port}/v1/commands/trigger");
+    println!("\ntry it from another terminal - deposit 100 into wallet \"w1\", then withdraw more:");
+    println!("  export DEPOSIT={} WITHDRAW={}", tokens[0], tokens[1]);
+    for (variable, amount) in [("DEPOSIT", 100), ("WITHDRAW", 500)] {
+        let payload = serde_json::json!({ "payload": { "wallet_id": "w1", "amount": amount } });
+        println!(
+            "  curl localhost:{port}/v1/commands/trigger -H \"authorization: Bearer ${variable}\" \
+             -H 'content-type: application/json' -d '{payload}'"
+        );
+    }
 
     // On Ctrl-C or SIGTERM (what `docker stop` sends): stop taking
     // requests and finish the ones in flight, then let skilj's background
@@ -76,6 +105,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = skilj.shutdown(std::time::Duration::from_secs(10)).await;
     if !report.aborted.is_empty() {
         println!("shutdown: aborted after the timeout: {:?}", report.aborted);
+    }
+    #[cfg(feature = "local")]
+    if let Some(postgres) = local_postgres {
+        postgres.shutdown().await?;
     }
     Ok(())
 }

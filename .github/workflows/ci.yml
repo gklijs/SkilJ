@@ -43,13 +43,19 @@ jobs:
       - run: scripts/check-section-refs.sh
 
   check-template:
+    # On the bare runner, not in rust:1-bookworm: the script runs the
+    # README's quickstart, and as a normal user (not root) skilj's local
+    # mode downloads and starts its embedded Postgres, as it does for a
+    # reader. In a root container it would use Debian's packaged server
+    # instead, and test something else.
     runs-on: ubuntu-24.04
-    container: rust:1-bookworm
     steps:
       - uses: actions/checkout@v5
-      # Generates templates/skilj-template and builds it against this
+      - uses: dtolnay/rust-toolchain@stable
+      # Generates templates/skilj-template, builds it against this
       # workspace's crates - the template isn't a workspace member, so
-      # nothing else notices when a change breaks it (docs/architecture.md §105).
+      # nothing else notices when a change breaks it (docs/architecture.md §105) -
+      # and runs the quickstart: deposit accepted, overdraft rejected.
       - run: scripts/check-template.sh
 
   check-federation-composition:
