@@ -1,6 +1,6 @@
 [package]
 name = "{{project-name}}"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [features]
@@ -11,8 +11,8 @@ default = ["local"]
 local = ["skilj/local"]
 
 [dependencies]
-skilj = "0.1"
-skilj-core = "0.1"
+skilj = "0.1.1"
+skilj-core = "0.1.1"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }

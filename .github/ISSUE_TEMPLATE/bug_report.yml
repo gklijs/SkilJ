@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in skilj doesn't behave as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For a security vulnerability, please don't open a public issue -
+        see [SECURITY.md](https://github.com/gklijs/SkilJ/blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, including the full error message or the GraphQL/REST response.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The smallest setup that shows it: the EventType/CommandType/Projection involved, the
+        command or query you sent, and anything else needed to see it happen.
+    validations:
+      required: true
+  - type: input
+    id: crates
+    attributes:
+      label: Crate(s) and version(s)
+      placeholder: skilj 0.1.1, skilj-kafka 0.1.1
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Postgres version (or local mode), OS, Rust version.
+      placeholder: Postgres 17, Linux, rustc 1.95
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log output, with tokens and personal data removed.
+      render: text

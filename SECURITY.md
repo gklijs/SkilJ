@@ -3,9 +3,13 @@
 ## Reporting a vulnerability
 
 If you find a security vulnerability in `skilj`, please report it
-privately by emailing **g.klijs@gmail.com** rather than opening a
-public issue - this gives time to prepare a fix before the details are
-public.
+privately rather than opening a public issue - this gives time to
+prepare a fix before the details are public. Either:
+
+- open a private report through GitHub's
+  [Report a vulnerability](https://github.com/gklijs/SkilJ/security/advisories/new)
+  form (the repository's Security tab), or
+- email **g.klijs@gmail.com**.
 
 Please include:
 
