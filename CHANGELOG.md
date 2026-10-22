@@ -10,6 +10,8 @@ README.md, "Status and stability").
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-22
+
 ### Fixed
 
 - Local mode (`skilj::local`, the template's quickstart, `skilj-demo --local`)
@@ -33,7 +35,10 @@ README.md, "Status and stability").
 - The repository moved from Codeberg to GitHub
   (https://github.com/gklijs/SkilJ), issues and pull requests included,
   with their numbers kept (docs/architecture.md §222). CI runs on GitHub
-  Actions instead of Woodpecker, with the same checks.
+  Actions instead of Woodpecker, with the same checks. A security
+  vulnerability can be reported privately through GitHub's "Report a
+  vulnerability" form as well as by email (SECURITY.md), and new issues
+  start from bug-report and feature-request templates.
 - The published crates have crates.io keywords and categories, so a
   search for "event-sourcing", "cqrs" or "dcb" finds them.
 - `skilj-template` runs without a database: with no `DATABASE_URL` set,
@@ -2057,7 +2062,8 @@ two Ratatui-based operator consoles. See
 [`specs/skilj.allium`](specs/skilj.allium) for the full design and
 behavioural specification.
 
-[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/gklijs/SkilJ/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/gklijs/SkilJ/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/gklijs/SkilJ/compare/v0.0.10...v0.1.0
 [0.0.10]: https://github.com/gklijs/SkilJ/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/gklijs/SkilJ/compare/v0.0.8...v0.0.9
